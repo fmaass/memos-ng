@@ -10,6 +10,8 @@ vi.mock('@/composables/useApi', () => ({
 }))
 // useMediaEvents opens an SSE channel + uses the query client; stub it out here.
 vi.mock('@/composables/useMediaEvents', () => ({ useMediaEvents: () => {} }))
+// HomeView reads the route's ?tag; provide a stub route.
+vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }) }))
 
 const FeedStub = { template: '<div data-test="feed-stub" />' }
 

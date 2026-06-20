@@ -25,10 +25,18 @@ const router = createRouter({
   ],
 })
 
+// TagList/CalendarHeatmap fetch via vue-query; stub them (covered by their own specs).
+const Empty = { template: '<div />' }
+
 async function mountShell() {
   router.push('/')
   await router.isReady()
-  return mount(AppShell, { global: { plugins: [router, VueQueryPlugin, PrimeVue] } })
+  return mount(AppShell, {
+    global: {
+      plugins: [router, VueQueryPlugin, PrimeVue],
+      stubs: { TagList: Empty, CalendarHeatmap: Empty },
+    },
+  })
 }
 
 describe('AppShell', () => {

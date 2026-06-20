@@ -3,6 +3,8 @@ import Button from 'primevue/button'
 import Drawer from 'primevue/drawer'
 import { ref } from 'vue'
 
+import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
+import TagList from '@/components/TagList.vue'
 import { useApi } from '@/composables/useApi'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
@@ -52,6 +54,10 @@ async function logout(): Promise<void> {
         <i :class="item.icon" />
         <span>{{ item.label }}</span>
       </RouterLink>
+      <div class="overflow-y-auto">
+        <TagList />
+        <CalendarHeatmap />
+      </div>
     </aside>
 
     <!-- Mobile drawer -->
