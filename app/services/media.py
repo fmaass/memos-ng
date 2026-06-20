@@ -3,7 +3,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import blurhash
 import pillow_heif
 from PIL import Image, ImageOps
 from sqlalchemy import select
@@ -11,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import Attachment, AttachmentStatus, JobLane, MediaJob
+from app.services import blurhash_pure
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
@@ -59,7 +59,7 @@ def process_image(attachment: Attachment) -> dict:
         _atomic_save(mobile, mobile_path)
         _stamp_mtime(mobile_path, attachment)
 
-    bhash = blurhash.encode(str(thumb_path), x_components=4, y_components=3)
+        bhash = blurhash_pure.encode(thumb)
     return {"width": width, "height": height, "blurhash": bhash}
 
 
@@ -121,7 +121,8 @@ def process_video_poster(attachment: Attachment) -> dict:
     )
     os.replace(tmp, poster_path)
     _stamp_mtime(poster_path, attachment)
-    meta["blurhash"] = blurhash.encode(str(poster_path), x_components=4, y_components=3)
+    with Image.open(poster_path) as poster:
+        meta["blurhash"] = blurhash_pure.encode(poster)
     return meta
 
 

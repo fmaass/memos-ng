@@ -21,7 +21,6 @@ dependencies = [
     "puremagic>=1.28",
     "pillow>=11",
     "pillow-heif>=0.18",
-    "blurhash-python>=1.2",
 ]
 
 [dependency-groups]
