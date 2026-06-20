@@ -230,9 +230,15 @@ def read_old(source_dsn: str) -> dict[str, Any]:  # pragma: no cover - exercised
                 "WHERE row_status = 'NORMAL'"
             )
             user_cols = ("id", "username", "role", "email", "nickname", "avatar_url")
+            users = [dict(zip(user_cols, r, strict=False)) for r in cur.fetchall()]
+            # The OIDC identity (user_identity.extern_uid) is the Authelia preferred_username
+            # and is the authoritative subject — user.username can be the opaque OIDC sub UUID
+            # (it is for laura). Prefer extern_uid; fall back to username.
+            cur.execute("SELECT user_id, extern_uid FROM user_identity")
+            ident = dict(cur.fetchall())
             users_by_id = {}
-            for r in cur.fetchall():
-                u = dict(zip(user_cols, r, strict=False))
+            for u in users:
+                u["username"] = ident.get(u["id"]) or u["username"]
                 users_by_id[u["id"]] = u
                 out["users"].append(u)
             for uid, u in users_by_id.items():
