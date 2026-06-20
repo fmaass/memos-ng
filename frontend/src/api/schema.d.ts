@@ -736,12 +736,16 @@ export interface components {
         };
         /** SettingsOut */
         SettingsOut: {
+            /** Avatar */
+            avatar: string | null;
             default_visibility: components["schemas"]["Visibility"];
             /** Theme */
             theme: string;
         };
         /** SettingsPatch */
         SettingsPatch: {
+            /** Avatar */
+            avatar?: string | null;
             default_visibility?: components["schemas"]["Visibility"] | null;
             /** Theme */
             theme?: string | null;
@@ -781,6 +785,8 @@ export interface components {
         };
         /** UserOut */
         UserOut: {
+            /** Avatar */
+            avatar?: string | null;
             /** Display Name */
             display_name: string | null;
             /** Email */

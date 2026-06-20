@@ -109,6 +109,13 @@ async function logout(): Promise<void> {
           data-test="dark-toggle"
           @click="toggle"
         />
+        <img
+          v-if="user?.avatar"
+          :src="user.avatar"
+          class="w-7 h-7 rounded-full object-cover"
+          alt="avatar"
+          data-test="header-avatar"
+        />
         <span v-if="user" class="text-sm text-muted-color px-2" data-test="user-name">
           {{ user.display_name ?? user.subject }}
         </span>

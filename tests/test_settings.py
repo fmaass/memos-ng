@@ -28,3 +28,16 @@ def test_memo_create_uses_per_user_default_visibility(logged_in_client):
     # an explicit visibility still wins
     m3 = client.post("/api/memos", json={"content": "explicit", "visibility": "PROTECTED"}).json()
     assert m3["visibility"] == "PROTECTED"
+
+
+def test_avatar_set_validation_and_clear(logged_in_client):
+    client, _ = logged_in_client
+    # rejects a non-data:image URL
+    assert client.patch("/api/settings", json={"avatar": "http://x/a.png"}).status_code == 400
+
+    img = "data:image/png;base64,iVBORw0KGgo="
+    r = client.patch("/api/settings", json={"avatar": img})
+    assert r.status_code == 200 and r.json()["avatar"] == img
+    assert client.get("/api/auth/user").json()["avatar"] == img  # surfaced on the user
+
+    assert client.patch("/api/settings", json={"avatar": ""}).json()["avatar"] is None  # cleared

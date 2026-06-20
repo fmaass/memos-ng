@@ -20,7 +20,7 @@ vi.mock('@/composables/usePushSubscription', () => ({
 }))
 vi.mock('@/composables/useSettings', () => ({
   useSettings: () => ({
-    settings: ref({ default_visibility: 'PUBLIC', theme: 'dark' }),
+    settings: ref({ default_visibility: 'PUBLIC', theme: 'dark', avatar: null }),
     update: { mutate },
   }),
 }))
@@ -41,6 +41,12 @@ describe('SettingsView', () => {
     const theme = wrapper.find('[data-test="theme"]')
     expect(vis.exists()).toBe(true)
     expect(theme.exists()).toBe(true)
+  })
+
+  it('falls back to initials when no avatar is set', () => {
+    const wrapper = mountSettings()
+    expect(wrapper.find('[data-test="avatar-initials"]').text()).toBe('FA') // "Fabian"
+    expect(wrapper.find('[data-test="avatar-img"]').exists()).toBe(false)
   })
 
   it('persists a default-visibility change', async () => {

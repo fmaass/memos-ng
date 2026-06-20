@@ -761,6 +761,17 @@
       },
       "SettingsOut": {
         "properties": {
+          "avatar": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar"
+          },
           "default_visibility": {
             "$ref": "#/components/schemas/Visibility"
           },
@@ -771,13 +782,25 @@
         },
         "required": [
           "default_visibility",
-          "theme"
+          "theme",
+          "avatar"
         ],
         "title": "SettingsOut",
         "type": "object"
       },
       "SettingsPatch": {
         "properties": {
+          "avatar": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar"
+          },
           "default_visibility": {
             "anyOf": [
               {
@@ -897,6 +920,17 @@
       },
       "UserOut": {
         "properties": {
+          "avatar": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar"
+          },
           "display_name": {
             "anyOf": [
               {

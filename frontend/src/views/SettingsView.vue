@@ -2,6 +2,8 @@
 import Button from 'primevue/button'
 import SelectButton from 'primevue/selectbutton'
 
+import { computed } from 'vue'
+
 import PatManager from '@/components/PatManager.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
@@ -10,6 +12,17 @@ import { type SettingsPatch, useSettings } from '@/composables/useSettings'
 
 const version = __APP_VERSION__
 const { data: user } = useSession()
+const initials = computed(() =>
+  (user.value?.display_name ?? user.value?.subject ?? '?').slice(0, 2).toUpperCase(),
+)
+
+function onAvatarFile(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => update.mutate({ avatar: String(reader.result) })
+  reader.readAsDataURL(file)
+}
 const { supported, enabled, busy, enable } = usePushSubscription()
 const { settings, update } = useSettings()
 const { setDark } = useDarkMode()
@@ -42,7 +55,43 @@ function setTheme(value: string) {
 
     <div data-test="profile">
       <h2 class="text-lg font-medium">Profile</h2>
-      <p class="text-sm mt-1" data-test="profile-name">{{ user?.display_name ?? user?.subject }}</p>
+      <div class="flex items-center gap-3 mt-2">
+        <img
+          v-if="settings?.avatar"
+          :src="settings.avatar"
+          class="w-16 h-16 rounded-full object-cover"
+          alt="avatar"
+          data-test="avatar-img"
+        />
+        <div
+          v-else
+          class="w-16 h-16 rounded-full bg-surface-200 dark:bg-surface-700 flex items-center justify-center text-lg"
+          data-test="avatar-initials"
+        >
+          {{ initials }}
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-sm text-primary cursor-pointer" data-test="avatar-upload-label">
+            Change avatar
+            <input
+              type="file"
+              accept="image/*"
+              class="hidden"
+              data-test="avatar-input"
+              @change="onAvatarFile"
+            />
+          </label>
+          <button
+            v-if="settings?.avatar"
+            class="text-sm text-muted-color text-left hover:underline"
+            data-test="avatar-clear"
+            @click="update.mutate({ avatar: '' })"
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+      <p class="text-sm mt-2" data-test="profile-name">{{ user?.display_name ?? user?.subject }}</p>
       <p class="text-sm text-muted-color">{{ user?.email }}</p>
       <p class="text-xs text-muted-color mt-1">Identity is managed by single sign-on.</p>
     </div>

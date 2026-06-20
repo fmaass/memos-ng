@@ -28,6 +28,7 @@ class UserOut(BaseModel):
     display_name: str | None
     email: str | None
     role: str
+    avatar: str | None = None
 
 
 @router.get("/login", include_in_schema=False)
@@ -93,7 +94,11 @@ async def callback(
 @router.get("/user", response_model=UserOut)
 async def whoami(user: User = Depends(auth.require_user)) -> UserOut:
     return UserOut(
-        subject=user.subject, display_name=user.display_name, email=user.email, role=user.role
+        subject=user.subject,
+        display_name=user.display_name,
+        email=user.email,
+        role=user.role,
+        avatar=user.avatar,
     )
 
 

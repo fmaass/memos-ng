@@ -5,6 +5,7 @@ import { useApi } from '@/composables/useApi'
 export interface SettingsPatch {
   default_visibility?: 'PRIVATE' | 'PROTECTED' | 'PUBLIC'
   theme?: string
+  avatar?: string
 }
 
 // The current user's server-persisted settings (default memo visibility + theme).
