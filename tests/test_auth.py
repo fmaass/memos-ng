@@ -133,3 +133,41 @@ def test_security_headers_present(client):
     assert r.headers["X-Content-Type-Options"] == "nosniff"
     assert r.headers["X-Frame-Options"] == "DENY"
     assert "frame-ancestors 'none'" in r.headers["Content-Security-Policy"]
+
+
+def _req(headers: dict, client_host: str = "rl-test") -> "object":
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+            "client": (client_host, 0),
+            "query_string": b"",
+        }
+    )
+
+
+def test_rate_limit_blocks_after_threshold():
+    from fastapi import HTTPException
+
+    auth._RL.pop("rl-unit", None)
+    dep = auth.rate_limit(limit=2, window=60)
+    req = _req({}, client_host="rl-unit")
+    dep(req)
+    dep(req)
+    with pytest.raises(HTTPException) as ei:
+        dep(req)
+    assert ei.value.status_code == 429
+    auth._RL.pop("rl-unit", None)
+
+
+def test_logout_returns_rp_initiated_url(logged_in_client):
+    client, _ = logged_in_client
+    r = client.post("/api/auth/logout")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["logout_url"].startswith(settings.OIDC_END_SESSION_ENDPOINT)
+    assert "post_logout_redirect_uri=" in body["logout_url"]
+    assert "id_token_hint=" in body["logout_url"]

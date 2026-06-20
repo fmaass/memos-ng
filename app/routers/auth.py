@@ -87,12 +87,21 @@ async def whoami(user: User = Depends(auth.require_user)) -> UserOut:
 
 @router.post("/logout")
 async def logout(request: Request, db: AsyncSession = Depends(get_session)) -> JSONResponse:
+    # Kill the local session AND hand back an RP-initiated logout URL (id_token_hint +
+    # post_logout_redirect_uri) so the SPA can end the Authelia session too (plan T1.2).
+    id_token = None
     sid = request.cookies.get(auth.SID_COOKIE)
     if sid:
         ws = await auth.load_session(db, sid)
         if ws:
+            tokens = auth.decrypt(ws.encrypted_tokens) or {}
+            id_token = tokens.get("id_token")
             await db.delete(ws)
             await db.commit()
-    resp = JSONResponse({"ok": True})
+    params = {"post_logout_redirect_uri": settings.OIDC_POST_LOGOUT_REDIRECT_URI}
+    if id_token:
+        params["id_token_hint"] = id_token
+    logout_url = f"{settings.OIDC_END_SESSION_ENDPOINT}?{urlencode(params)}"
+    resp = JSONResponse({"ok": True, "logout_url": logout_url})
     resp.delete_cookie(auth.SID_COOKIE)
     return resp

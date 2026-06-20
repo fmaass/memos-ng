@@ -47,15 +47,17 @@ async def export_memos(
             limit=limit,
         )
 
-    _, _, total = await query(1)
-    if total > EXPORT_MAX:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Export too large ({total} memos > {EXPORT_MAX}). Narrow it with filters.",
-        )
-    items, _, _ = await query(EXPORT_MAX)
-
+    # Acquire the concurrency cap BEFORE the (potentially large) query + materialize + zip,
+    # so concurrent exports can't each pull EXPORT_MAX rows into memory at once.
     async with _sem:
+        _, _, total = await query(1)
+        if total > EXPORT_MAX:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Export too large ({total} memos > {EXPORT_MAX}). Narrow it with filters.",
+            )
+        items, _, _ = await query(EXPORT_MAX)
+
         buf = io.BytesIO()
         manifest = []
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

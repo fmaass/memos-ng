@@ -131,3 +131,25 @@ def test_memoout_has_no_dead_fields():
     for dead in ("externalLink", "motionMedia", "snippet", "property"):
         assert dead not in fields
     assert {"uid", "content", "visibility", "tags", "owner"} <= fields
+
+
+async def test_delete_memo_removes_it(adb):
+    u = await _user(adb, "alice")
+    m = await svc.create_memo(adb, u, content="bye", visibility=Visibility.PUBLIC)
+    await svc.delete_memo(adb, m)
+    assert await svc.get_memo(adb, u, m.uid) is None
+
+
+async def test_heatmap_groups_by_date(adb):
+    from datetime import UTC, datetime
+
+    u = await _user(adb, "alice")
+    a = await svc.create_memo(adb, u, content="x", visibility=Visibility.PUBLIC)
+    a.created_at = datetime(2024, 3, 1, 9, tzinfo=UTC)
+    b = await svc.create_memo(adb, u, content="y", visibility=Visibility.PUBLIC)
+    b.created_at = datetime(2024, 3, 1, 18, tzinfo=UTC)
+    c = await svc.create_memo(adb, u, content="z", visibility=Visibility.PUBLIC)
+    c.created_at = datetime(2024, 3, 2, 9, tzinfo=UTC)
+    await adb.flush()
+    hm = await svc.heatmap(adb, u)
+    assert hm.get("2024-03-01") == 2 and hm.get("2024-03-02") == 1
