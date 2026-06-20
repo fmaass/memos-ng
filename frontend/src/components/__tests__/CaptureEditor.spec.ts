@@ -33,7 +33,7 @@ describe('CaptureEditor', () => {
     await flushPromises()
 
     expect(postMemo).toHaveBeenCalledWith('/api/memos', {
-      body: { content: 'Hello #work', visibility: 'PRIVATE', pinned: false },
+      body: { content: 'Hello #work', visibility: 'PRIVATE', pinned: false, attachment_uids: [] },
     })
     expect(wrapper.emitted('saved')).toBeTruthy()
     expect((textarea.element as HTMLTextAreaElement).value).toBe('')

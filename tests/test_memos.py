@@ -1,8 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
-from app.models import User, Visibility
-from app.routers.memos import MemoOut
+from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
+from app.routers.memos import MemoOut, _out
 from app.services import memos as svc
+from sqlalchemy import select
 
 
 async def _user(adb, subject):
@@ -153,3 +154,51 @@ async def test_heatmap_groups_by_date(adb):
     await adb.flush()
     hm = await svc.heatmap(adb, u)
     assert hm.get("2024-03-01") == 2 and hm.get("2024-03-02") == 1
+
+
+async def test_create_memo_links_only_owners_attachments(adb):
+    alice = await _user(adb, "alice")
+    bob = await _user(adb, "bob")
+    a_att = Attachment(
+        uid="a-att", owner_id=alice.id, filename="a.jpg", mime="image/jpeg",
+        size=1, status=AttachmentStatus.ready,
+    )
+    b_att = Attachment(
+        uid="b-att", owner_id=bob.id, filename="b.jpg", mime="image/jpeg",
+        size=1, status=AttachmentStatus.ready,
+    )
+    adb.add_all([a_att, b_att])
+    await adb.flush()
+
+    memo = await svc.create_memo(
+        adb, alice, content="pics", visibility=Visibility.PRIVATE,
+        attachment_uids=["a-att", "b-att"],  # tries to claim bob's too
+    )
+    await adb.refresh(a_att)
+    await adb.refresh(b_att)
+    # Authz: only alice's attachment links; bob's is silently ignored (not stolen).
+    assert a_att.memo_id == memo.id
+    assert b_att.memo_id is None
+
+
+async def test_memo_out_serializes_attachment_tier_urls(adb):
+    alice = await _user(adb, "alice")
+    att = Attachment(
+        uid="att1", owner_id=alice.id, filename="v.mp4", mime="video/mp4",
+        size=1, status=AttachmentStatus.processing, blurhash="LKO2",
+    )
+    adb.add(att)
+    await adb.flush()
+    memo = await svc.create_memo(
+        adb, alice, content="vid", visibility=Visibility.PRIVATE, attachment_uids=["att1"]
+    )
+    # Re-select so the selectin attachments/owner/tags relationships are eagerly loaded.
+    m2 = (await adb.execute(select(Memo).where(Memo.uid == memo.uid))).scalar_one()
+    out = _out(m2)
+    assert len(out.attachments) == 1
+    a = out.attachments[0]
+    assert a.uid == "att1" and a.status is AttachmentStatus.processing and a.blurhash == "LKO2"
+    assert a.thumbnailUrl == "/api/attachments/att1/thumb"
+    assert a.webUrl == "/api/attachments/att1/web"
+    assert a.posterUrl == "/api/attachments/att1/poster"
+    assert a.downloadUrl == "/api/attachments/att1/original"

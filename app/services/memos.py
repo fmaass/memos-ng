@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy import String, and_, cast, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Memo, Tag, User, Visibility, memo_tags
+from app.models import Attachment, Memo, Tag, User, Visibility, memo_tags
 
 TAG_RE = re.compile(r"#(\w+)")
 
@@ -52,7 +52,13 @@ async def _get_or_create_tags(db: AsyncSession, names: Sequence[str]) -> list[Ta
 
 
 async def create_memo(
-    db: AsyncSession, owner: User, *, content: str, visibility: Visibility, pinned: bool = False
+    db: AsyncSession,
+    owner: User,
+    *,
+    content: str,
+    visibility: Visibility,
+    pinned: bool = False,
+    attachment_uids: Sequence[str] | None = None,
 ) -> Memo:
     memo = Memo(
         uid=gen_uid(), owner_id=owner.id, content=content, visibility=visibility, pinned=pinned
@@ -60,6 +66,24 @@ async def create_memo(
     memo.tags = await _get_or_create_tags(db, parse_tags(content))
     db.add(memo)
     await db.flush()
+    if attachment_uids:
+        # Link only the caller's OWN attachments — a uid belonging to another user is
+        # silently ignored so a memo can't claim someone else's media.
+        owned = (
+            (
+                await db.execute(
+                    select(Attachment).where(
+                        Attachment.uid.in_(attachment_uids),
+                        Attachment.owner_id == owner.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for att in owned:
+            att.memo_id = memo.id
+        await db.flush()
     await db.refresh(memo)
     return memo
 

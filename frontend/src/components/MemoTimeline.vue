@@ -2,9 +2,13 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
+import { useMediaEvents } from '@/composables/useMediaEvents'
 import { useTimeline } from '@/composables/useTimeline'
 
 const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError } = useTimeline()
+
+// Live media status: SSE patches the timeline cache so cards advance without a reload.
+useMediaEvents()
 
 const memos = computed(() => data.value?.pages.flatMap((page) => page.items) ?? [])
 

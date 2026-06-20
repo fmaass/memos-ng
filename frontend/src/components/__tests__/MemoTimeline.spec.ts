@@ -15,9 +15,12 @@ function memoStub(uid: string, content: string) {
     updated_at: '2026-06-20T00:00:00Z',
     archived_at: null,
     tags: [],
+    attachments: [],
     total_size: 0,
   }
 }
+
+vi.mock('@/composables/useMediaEvents', () => ({ useMediaEvents: () => {} }))
 
 const fetchNextPage = vi.fn()
 vi.mock('@/composables/useTimeline', () => ({

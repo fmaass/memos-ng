@@ -195,6 +195,101 @@
         "title": "AttachmentOut",
         "type": "object"
       },
+      "AttachmentRef": {
+        "properties": {
+          "blurhash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blurhash"
+          },
+          "downloadUrl": {
+            "title": "Downloadurl",
+            "type": "string"
+          },
+          "duration": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "posterUrl": {
+            "title": "Posterurl",
+            "type": "string"
+          },
+          "previewUrl": {
+            "title": "Previewurl",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "thumbnailUrl": {
+            "title": "Thumbnailurl",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "webUrl": {
+            "title": "Weburl",
+            "type": "string"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          }
+        },
+        "required": [
+          "uid",
+          "mime",
+          "status",
+          "blurhash",
+          "width",
+          "height",
+          "duration",
+          "thumbnailUrl",
+          "previewUrl",
+          "webUrl",
+          "posterUrl",
+          "downloadUrl"
+        ],
+        "title": "AttachmentRef",
+        "type": "object"
+      },
       "AttachmentStatus": {
         "enum": [
           "uploading",
@@ -250,6 +345,14 @@
       },
       "MemoCreate": {
         "properties": {
+          "attachment_uids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Attachment Uids",
+            "type": "array"
+          },
           "content": {
             "title": "Content",
             "type": "string"
@@ -316,6 +419,14 @@
               }
             ],
             "title": "Archived At"
+          },
+          "attachments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AttachmentRef"
+            },
+            "title": "Attachments",
+            "type": "array"
           },
           "content": {
             "title": "Content",

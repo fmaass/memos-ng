@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
+import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
 import { renderMemoMarkdown } from '@/lib/markdown'
 
@@ -20,6 +21,13 @@ const html = computed(() => renderMemoMarkdown(props.memo.content))
   >
     <!-- eslint-disable-next-line vue/no-v-html -- content sanitized by renderMemoMarkdown -->
     <div class="memo-content break-words" data-test="memo-content" v-html="html" />
+    <div
+      v-if="memo.attachments?.length"
+      class="grid grid-cols-2 sm:grid-cols-3 gap-2"
+      data-test="media-grid"
+    >
+      <MediaTile v-for="a in memo.attachments" :key="a.uid" :att="a" />
+    </div>
     <div v-if="memo.tags.length" class="flex flex-wrap gap-1">
       <span
         v-for="t in memo.tags"

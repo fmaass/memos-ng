@@ -72,14 +72,18 @@ async function save() {
   if (!content.value.trim()) return
   saving.value = true
   try {
+    // Link any uploads that have already finished; a memo posts without waiting on the rest.
+    const attachment_uids = uploads
+      .filter((u) => u.status === 'done' && u.attachmentUid)
+      .map((u) => u.attachmentUid!)
     const { data, error } = await api.POST('/api/memos', {
-      body: { content: content.value, visibility: visibility.value, pinned: false },
+      body: { content: content.value, visibility: visibility.value, pinned: false, attachment_uids },
     })
     if (error) throw error
     emit('saved', data)
     content.value = ''
     tagModel.value = []
-    // In-flight uploads intentionally keep going — a memo posts without waiting on media.
+    uploads.length = 0
   } finally {
     saving.value = false
   }

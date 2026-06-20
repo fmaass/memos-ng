@@ -14,6 +14,7 @@ function memo(content: string, tags: string[] = []) {
     updated_at: '2026-06-20T00:00:00Z',
     archived_at: null,
     tags,
+    attachments: [],
     total_size: 0,
   }
 }

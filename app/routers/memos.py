@@ -7,10 +7,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.database import get_session
-from app.models import Memo, User, Visibility
+from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
 from app.services import memos as svc
 
 router = APIRouter(prefix="/api", tags=["memos"])
+
+
+class AttachmentRef(BaseModel):
+    uid: str
+    mime: str
+    status: AttachmentStatus
+    blurhash: str | None
+    width: int | None
+    height: int | None
+    duration: float | None
+    thumbnailUrl: str
+    previewUrl: str
+    webUrl: str
+    posterUrl: str
+    downloadUrl: str
 
 
 class MemoOut(BaseModel):
@@ -23,6 +38,7 @@ class MemoOut(BaseModel):
     updated_at: datetime
     archived_at: datetime | None
     tags: list[str]
+    attachments: list[AttachmentRef] = []
     total_size: int = 0
 
 
@@ -30,6 +46,7 @@ class MemoCreate(BaseModel):
     content: str
     visibility: Visibility = Visibility.PRIVATE
     pinned: bool = False
+    attachment_uids: list[str] = []
 
 
 class MemoPatch(BaseModel):
@@ -50,6 +67,24 @@ class TagCount(BaseModel):
     count: int
 
 
+def _att_ref(att: Attachment) -> AttachmentRef:
+    base = f"/api/attachments/{att.uid}"
+    return AttachmentRef(
+        uid=att.uid,
+        mime=att.mime,
+        status=att.status,
+        blurhash=att.blurhash,
+        width=att.width,
+        height=att.height,
+        duration=att.duration,
+        thumbnailUrl=f"{base}/thumb",
+        previewUrl=f"{base}/mobile",
+        webUrl=f"{base}/web",
+        posterUrl=f"{base}/poster",
+        downloadUrl=f"{base}/original",
+    )
+
+
 def _out(memo: Memo) -> MemoOut:
     return MemoOut(
         uid=memo.uid,
@@ -61,6 +96,7 @@ def _out(memo: Memo) -> MemoOut:
         updated_at=memo.updated_at,
         archived_at=memo.archived_at,
         tags=sorted(t.name for t in memo.tags),
+        attachments=[_att_ref(a) for a in memo.attachments],
     )
 
 
@@ -103,7 +139,12 @@ async def create_memo(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
     memo = await svc.create_memo(
-        db, user, content=body.content, visibility=body.visibility, pinned=body.pinned
+        db,
+        user,
+        content=body.content,
+        visibility=body.visibility,
+        pinned=body.pinned,
+        attachment_uids=body.attachment_uids,
     )
     await db.commit()
     return _out(memo)

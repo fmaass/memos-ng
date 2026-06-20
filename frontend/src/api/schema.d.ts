@@ -407,6 +407,32 @@ export interface components {
             /** Width */
             width: number | null;
         };
+        /** AttachmentRef */
+        AttachmentRef: {
+            /** Blurhash */
+            blurhash: string | null;
+            /** Downloadurl */
+            downloadUrl: string;
+            /** Duration */
+            duration: number | null;
+            /** Height */
+            height: number | null;
+            /** Mime */
+            mime: string;
+            /** Posterurl */
+            posterUrl: string;
+            /** Previewurl */
+            previewUrl: string;
+            status: components["schemas"]["AttachmentStatus"];
+            /** Thumbnailurl */
+            thumbnailUrl: string;
+            /** Uid */
+            uid: string;
+            /** Weburl */
+            webUrl: string;
+            /** Width */
+            width: number | null;
+        };
         /**
          * AttachmentStatus
          * @enum {string}
@@ -428,6 +454,11 @@ export interface components {
         };
         /** MemoCreate */
         MemoCreate: {
+            /**
+             * Attachment Uids
+             * @default []
+             */
+            attachment_uids: string[];
             /** Content */
             content: string;
             /**
@@ -451,6 +482,11 @@ export interface components {
         MemoOut: {
             /** Archived At */
             archived_at: string | null;
+            /**
+             * Attachments
+             * @default []
+             */
+            attachments: components["schemas"]["AttachmentRef"][];
             /** Content */
             content: string;
             /**

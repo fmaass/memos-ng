@@ -91,6 +91,9 @@ class Memo(Base):
         secondary=memo_tags, back_populates="memos", lazy="selectin"
     )
     owner: Mapped["User"] = relationship(lazy="selectin")
+    attachments: Mapped[list["Attachment"]] = relationship(
+        "Attachment", lazy="selectin", order_by="Attachment.id"
+    )
 
 
 class Tag(Base):
