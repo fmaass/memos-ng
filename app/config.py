@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     THERMAL_MAX_C: int = 70
     MEDIA_MAX_ATTEMPTS: int = 3
 
+    # Web push (VAPID) — T2.5. Empty keys = push disabled (every send is a no-op), so the
+    # pipeline runs unchanged without VAPID configured. Generate a keypair with `vapid --gen`
+    # (py-vapid) and set both halves via the stack .env in prod.
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = "mailto:admin@discomarder.live"
+
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
     OIDC_CLIENT_ID: str = "memos-ng"

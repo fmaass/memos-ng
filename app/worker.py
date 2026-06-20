@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session
 from app.models import Attachment, AttachmentStatus, JobState, MediaJob
-from app.services import media
+from app.services import media, push
 from app.services.uploads import reap_expired
 from app.version import __version__
 
@@ -63,6 +63,28 @@ async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
         att.status = AttachmentStatus.failed  # terminal + UI-visible, never a silent drop
 
 
+async def _notify_terminal(db: AsyncSession, attachment_id: int) -> None:
+    """Web-push the owner when an attachment reaches a terminal state (ready/failed).
+
+    Gates on the *attachment's* status, not the job's: an image fast-lane job finishes at
+    'ready', but a video fast-lane job finishes at 'processing' (the slow-lane job fires
+    this later when it reaches 'ready'). Best-effort — a push failure never breaks the job.
+    """
+    att = (
+        await db.execute(select(Attachment).where(Attachment.id == attachment_id))
+    ).scalar_one_or_none()
+    if att is None or att.status not in (AttachmentStatus.ready, AttachmentStatus.failed):
+        return
+    try:
+        await push.send_to_user(
+            db,
+            att.owner_id,
+            {"uid": att.uid, "status": att.status.value, "title": att.filename},
+        )
+    except Exception as exc:  # push is best-effort; it must not fail the media job
+        logger.warning("push_notify_failed", attachment_id=attachment_id, error=str(exc))
+
+
 async def run_once(db: AsyncSession) -> str:
     """Claim+process one job in one transaction (row locked until commit).
     Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off)."""
@@ -74,6 +96,7 @@ async def run_once(db: AsyncSession) -> str:
         await media.process_job(db, job)
         job.state = JobState.done
         job.progress_pct = 100
+        await _notify_terminal(db, job.attachment_id)
         await db.commit()
         return "processed"
     except media.ThermalDefer:
@@ -87,6 +110,7 @@ async def run_once(db: AsyncSession) -> str:
         if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
             job.state = JobState.failed
             await _fail_attachment(db, job)
+            await _notify_terminal(db, job.attachment_id)
             logger.warning("media_job_failed_terminal", job_id=job.id, error=str(exc))
             await db.commit()
             return "processed"
