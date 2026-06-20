@@ -69,3 +69,8 @@ def test_pat_http_create_list_delete(logged_in_client):
 
     assert client.delete(f"/api/pats/{body['id']}").status_code == 204
     assert client.get("/api/pats").json() == []
+
+
+def test_pat_create_rejects_empty_name(logged_in_client):
+    client, _ = logged_in_client
+    assert client.post("/api/pats", json={"name": ""}).status_code == 422  # name min_length=1

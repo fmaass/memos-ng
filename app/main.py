@@ -94,7 +94,7 @@ async def health(response: Response) -> HealthResponse:
     except Exception:
         response.status_code = 503
         return HealthResponse(status="degraded", version=__version__, db="unreachable")
-    return HealthResponse(status="ok", version=__version__)
+    return HealthResponse(status="ok", version=__version__, db="ok")
 
 
 @app.api_route(

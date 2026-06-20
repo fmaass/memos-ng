@@ -8,7 +8,7 @@ def test_health_ok_when_db_reachable(client, monkeypatch):
     body = r.json()
     assert body["status"] == "ok"
     assert body["version"]  # version string is present
-    assert body.get("db") is None
+    assert body["db"] == "ok"  # DB probe succeeded
 
 
 def test_health_degraded_when_db_unreachable(client, monkeypatch):

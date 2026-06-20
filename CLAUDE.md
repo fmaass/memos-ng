@@ -65,7 +65,13 @@ Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
   `/volume1/docker/.sudo_pass` on Saturn.
 - Stack git repo: `/volume1/docker-compose/stacks/`; app data: `/volume1/docker/`.
 - Deploy with `up -d` (never `restart` — reuses the old image). Verify the running image
-  digest + a live request before calling it deployed.
+  digest + a live request before calling it deployed. After `up -d --force-recreate`,
+  Traefik takes ~20–40s to re-sync the new container — a brief external 404 right after
+  deploy is normal; wait and retry before assuming a routing break.
+- **Containers writing a bind-mounted `/volume1/docker/...` share must run as the share
+  owner** (`user: "1027:100"` in compose) — the Synology share ACL masks the unix mode, so a
+  0777 dir still denies a non-owner container UID. Verify with a real file write (heartbeat /
+  derived asset), not just `mkdir -p` (which no-ops on existing dirs and hides the denial).
 
 ## G1 compat fixtures — `fixtures/live-0.29.1/`
 
@@ -113,6 +119,13 @@ met until its tests exist and pass.
 ## Conventions
 
 - Branch discipline: each task on `feature/<task-slug>`; never commit to main.
+- **Off-loop blocking I/O uses `from anyio import to_thread` then `to_thread.run_sync(...)`** —
+  never `import anyio` + `anyio.to_thread.run_sync`, which pyright misresolves to
+  `BrokenWorkerInterpreter` and fails the gate.
+- **Frontend: extract security/logic-critical behaviour into a pure function or middleware**
+  (e.g. `renderMemoMarkdown`, `applyMediaEvent`, `toggleTask`, `tileKind`,
+  `authMiddleware.onResponse`) and unit-test that directly — don't rely on driving it through a
+  component in happy-dom, which lacks EventSource/canvas/clipboard/PushManager/localStorage.
 - Every live Authelia/Traefik change is mirrored into the sanitized in-repo template the
   same session.
 - Session review at the end of every implementation session (see `~/CLAUDE.md`).

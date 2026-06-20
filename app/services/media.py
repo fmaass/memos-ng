@@ -197,15 +197,23 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     assert proc.stdout is not None
     tail: deque[str] = deque(maxlen=12)
     last = 0.0
-    async for raw in proc.stdout:
-        line = raw.decode(errors="ignore")
-        tail.append(line.rstrip())
-        pct = parse_progress(line, duration)
-        if pct is not None and (asyncio.get_event_loop().time() - last) > 2:
-            job.progress_pct = pct
-            await db.flush()
-            last = asyncio.get_event_loop().time()
-    await proc.wait()
+    try:
+        async for raw in proc.stdout:
+            line = raw.decode(errors="ignore")
+            tail.append(line.rstrip())
+            pct = parse_progress(line, duration)
+            if pct is not None and (asyncio.get_event_loop().time() - last) > 2:
+                job.progress_pct = pct
+                await db.flush()
+                last = asyncio.get_event_loop().time()
+        await proc.wait()
+    finally:
+        # On cancellation (worker shutdown) or any error, don't leak the ffmpeg process or a
+        # half-written tmp file — kill it and clean up.
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+            tmp.unlink(missing_ok=True)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
