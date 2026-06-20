@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery } from '@tanstack/vue-query'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import SelectButton from 'primevue/selectbutton'
 import { computed, ref } from 'vue'
 
@@ -9,6 +9,7 @@ import { useApi } from '@/composables/useApi'
 import type { MemoQuery } from '@/composables/useTimeline'
 
 const api = useApi()
+const queryClient = useQueryClient()
 const filter = ref<'all' | 'image' | 'video'>('all')
 const options = [
   { label: 'All', value: 'all' },
@@ -29,6 +30,14 @@ const { data, isPending } = useQuery({
 
 const items = computed(() => data.value ?? [])
 const lightboxIndex = ref<number | null>(null)
+
+async function onDelete(uid: string) {
+  if (!window.confirm('Delete this media permanently? This cannot be undone.')) return
+  const { error } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
+  if (error) return
+  lightboxIndex.value = null
+  await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+}
 </script>
 
 <template>
@@ -47,6 +56,6 @@ const lightboxIndex = ref<number | null>(null)
       No attachments yet.
     </p>
     <JustifiedGallery v-else :items="items" :target-height="200" @open="lightboxIndex = $event" />
-    <MediaLightbox v-model="lightboxIndex" :items="items" />
+    <MediaLightbox v-model="lightboxIndex" :items="items" @delete="onDelete" />
   </section>
 </template>

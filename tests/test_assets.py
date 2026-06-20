@@ -206,6 +206,35 @@ def test_list_attachments_includes_shared_excludes_private(logged_in_client):
         _rm("libsharer", pub_m, priv_m)
 
 
+def test_delete_own_attachment_removes_row_and_file(logged_in_client, monkeypatch, tmp_path):
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid = _seed_attachment("del-me", subject)
+    try:
+        thumb = tmp_path / "assets" / "thumbs" / "del-me.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(thumb, "JPEG")
+        assert client.delete("/api/attachments/del-me").status_code == 204
+        assert client.get("/api/attachments/del-me").status_code == 404  # gone from DB
+        assert not thumb.exists()  # tier file removed
+    finally:
+        _cleanup(aid)  # no-op if already deleted
+
+
+def test_cannot_delete_another_users_shared_attachment(logged_in_client, monkeypatch, tmp_path):
+    # delete is OWNER-only — even a shared (PUBLIC-memo) attachment you can VIEW is not deletable.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _mk_user("delsharer")
+    mid, aid = _seed_memo_with_attachment("delm", "del-shared", "delsharer", "PUBLIC")
+    try:
+        assert client.delete("/api/attachments/del-shared").status_code == 404  # not owner
+        assert client.get("/api/attachments/del-shared").status_code == 200  # still viewable
+    finally:
+        _cleanup(aid)
+        _rm("delsharer", mid)
+
+
 def test_list_attachments_requires_auth(client):
     assert client.get("/api/attachments").status_code == 401
 

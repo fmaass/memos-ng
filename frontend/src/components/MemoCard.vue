@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import Galleria from 'primevue/galleria'
 import { computed, ref } from 'vue'
 
+import MediaLightbox from '@/components/MediaLightbox.vue'
 import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
 import { renderMemoMarkdown } from '@/lib/markdown'
-import { tileKind } from '@/lib/media'
 import { toggleTask } from '@/lib/tasks'
 
 type Memo = components['schemas']['MemoOut']
@@ -15,6 +14,7 @@ const emit = defineEmits<{
   restore: [uid: string]
   'task-toggle': [payload: { uid: string; content: string }]
   'toggle-reaction': [payload: { uid: string; emoji: string; add: boolean }]
+  'delete-attachment': [uid: string]
 }>()
 
 const REACTION_CHOICES = ['👍', '❤️', '😄', '🎉']
@@ -31,18 +31,16 @@ function addReaction(emoji: string) {
 // of its output is safe — raw HTML/script in memo content is escaped to inert text.
 const html = computed(() => renderMemoMarkdown(props.memo.content))
 
-// Lightbox over the memo's ready images (Galleria, full-screen mask).
-const images = computed(() =>
-  (props.memo.attachments ?? []).filter((a) => tileKind(a.status, a.mime) === 'image'),
-)
-const lightboxOpen = ref(false)
-const lightboxIndex = ref(0)
+// Lightbox over ALL of the memo's media (images + videos) — arrow left/right through them.
+const lightboxIndex = ref<number | null>(null)
 function openLightbox(uid: string) {
-  const i = images.value.findIndex((a) => a.uid === uid)
-  if (i >= 0) {
-    lightboxIndex.value = i
-    lightboxOpen.value = true
-  }
+  const i = (props.memo.attachments ?? []).findIndex((a) => a.uid === uid)
+  if (i >= 0) lightboxIndex.value = i
+}
+function onDeleteAttachment(uid: string) {
+  if (!window.confirm('Delete this media permanently? This cannot be undone.')) return
+  lightboxIndex.value = null
+  emit('delete-attachment', uid)
 }
 
 // Clicking a rendered task checkbox flips it in the source markdown and asks the parent to
@@ -76,20 +74,11 @@ function onContentClick(event: MouseEvent) {
       <MediaTile v-for="a in memo.attachments" :key="a.uid" :att="a" @open="openLightbox" />
     </div>
 
-    <Galleria
-      v-if="images.length"
-      v-model:active-index="lightboxIndex"
-      v-model:visible="lightboxOpen"
-      :value="images"
-      :full-screen="true"
-      :circular="true"
-      :show-thumbnails="false"
-      data-test="lightbox"
-    >
-      <template #item="{ item }">
-        <img :src="item.previewUrl" :alt="item.uid" class="max-h-screen max-w-full object-contain" />
-      </template>
-    </Galleria>
+    <MediaLightbox
+      v-model="lightboxIndex"
+      :items="memo.attachments ?? []"
+      @delete="onDeleteAttachment"
+    />
 
     <div v-if="memo.tags.length" class="flex flex-wrap gap-1">
       <span

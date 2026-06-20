@@ -33,6 +33,10 @@
             "title": "Mime",
             "type": "string"
           },
+          "mine": {
+            "title": "Mine",
+            "type": "boolean"
+          },
           "orphan": {
             "title": "Orphan",
             "type": "boolean"
@@ -79,6 +83,7 @@
           "blurhash",
           "width",
           "height",
+          "mine",
           "orphan",
           "thumbnailUrl",
           "previewUrl",
@@ -144,6 +149,10 @@
             "title": "Mime",
             "type": "string"
           },
+          "mine": {
+            "title": "Mine",
+            "type": "boolean"
+          },
           "posterUrl": {
             "title": "Posterurl",
             "type": "string"
@@ -193,6 +202,7 @@
           "duration",
           "blurhash",
           "captured_at",
+          "mine",
           "downloadUrl",
           "thumbnailUrl",
           "previewUrl",
@@ -326,6 +336,10 @@
             "title": "Mime",
             "type": "string"
           },
+          "mine": {
+            "title": "Mine",
+            "type": "boolean"
+          },
           "posterUrl": {
             "title": "Posterurl",
             "type": "string"
@@ -369,6 +383,7 @@
           "width",
           "height",
           "duration",
+          "mine",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
@@ -1154,6 +1169,40 @@
       }
     },
     "/api/attachments/{uid}": {
+      "delete": {
+        "description": "Delete an attachment \u2014 OWNER-only (a mutation, unlike viewing). Removes its media jobs,\nDB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the\nmemo keeps its text; only the media is removed.",
+        "operationId": "delete_attachment_api_attachments__uid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Attachment",
+        "tags": [
+          "assets"
+        ]
+      },
       "get": {
         "operationId": "attachment_meta_api_attachments__uid__get",
         "parameters": [

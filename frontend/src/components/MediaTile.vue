@@ -61,14 +61,19 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
       @click="emit('open', att.uid)"
     />
 
-    <video
+    <button
       v-else-if="kind === 'video'"
-      :poster="att.posterUrl"
-      :src="att.webUrl"
-      controls
-      class="w-full h-full object-cover"
+      type="button"
+      class="relative h-full w-full"
       data-test="tile-video"
-    />
+      aria-label="Play video"
+      @click="emit('open', att.uid)"
+    >
+      <img :src="att.posterUrl" alt="" loading="lazy" class="h-full w-full object-cover" />
+      <span class="absolute inset-0 flex items-center justify-center">
+        <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
+      </span>
+    </button>
 
     <!-- failed: warning + retry -->
     <div

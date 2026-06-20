@@ -21,6 +21,7 @@ class AttachmentRef(BaseModel):
     width: int | None
     height: int | None
     duration: float | None
+    mine: bool  # the requesting user owns it (→ may delete); shared media is view-only
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -80,7 +81,7 @@ class TagCount(BaseModel):
     count: int
 
 
-def _att_ref(att: Attachment) -> AttachmentRef:
+def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
     base = f"/api/attachments/{att.uid}"
     return AttachmentRef(
         uid=att.uid,
@@ -90,6 +91,7 @@ def _att_ref(att: Attachment) -> AttachmentRef:
         width=att.width,
         height=att.height,
         duration=att.duration,
+        mine=att.owner_id == user_id,
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",
         webUrl=f"{base}/web",
@@ -121,7 +123,7 @@ def _out(memo: Memo, user_id: int) -> MemoOut:
         updated_at=memo.updated_at,
         archived_at=memo.archived_at,
         tags=sorted(t.name for t in memo.tags),
-        attachments=[_att_ref(a) for a in memo.attachments],
+        attachments=[_att_ref(a, user_id) for a in memo.attachments],
         reactions=_reactions(memo, user_id),
     )
 

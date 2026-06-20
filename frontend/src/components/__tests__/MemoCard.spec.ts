@@ -13,6 +13,7 @@ function imageAtt(uid: string) {
     width: null,
     height: null,
     duration: null,
+    mine: true,
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
     webUrl: `/api/attachments/${uid}/web`,
@@ -75,11 +76,12 @@ describe('MemoCard', () => {
     expect(wrapper.emitted('task-toggle')?.[0]).toEqual([{ uid: 'm1', content: '- [x] todo' }])
   })
 
-  it('opens the lightbox when a ready image tile is clicked', async () => {
+  it('opens the lightbox at the clicked image (MediaLightbox modelValue)', async () => {
     const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
-    expect(wrapper.findComponent({ name: 'Galleria' }).props('visible')).toBe(false)
+    const lb = wrapper.findComponent({ name: 'MediaLightbox' })
+    expect(lb.props('modelValue')).toBe(null) // closed
     await wrapper.find('[data-test="tile-image"]').trigger('click')
-    expect(wrapper.findComponent({ name: 'Galleria' }).props('visible')).toBe(true)
+    expect(lb.props('modelValue')).toBe(0) // opened at the memo's first attachment
   })
 
   it('adds a reaction from the picker', async () => {

@@ -11,7 +11,7 @@ interface GalleryAttachment {
   blurhash: string | null
   width: number | null
   height: number | null
-  previewUrl: string
+  thumbnailUrl: string
   posterUrl: string
 }
 
@@ -48,7 +48,8 @@ const rows = computed(() => {
 })
 
 function srcFor(att: GalleryAttachment): string {
-  return att.mime.startsWith('video/') ? att.posterUrl : att.previewUrl
+  // Small thumb tier in the grid (the lightbox loads the larger preview).
+  return att.mime.startsWith('video/') ? att.posterUrl : att.thumbnailUrl
 }
 function bg(att: GalleryAttachment): string | undefined {
   const url = blurhashToDataUrl(att.blurhash)

@@ -5,8 +5,9 @@ import { describe, expect, it, vi } from 'vitest'
 
 import ResourcesView from '@/views/ResourcesView.vue'
 
-vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn() }) }))
+vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn(), DELETE: vi.fn() }) }))
 vi.mock('@tanstack/vue-query', () => ({
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
   useQuery: () => ({
     data: ref([
       {

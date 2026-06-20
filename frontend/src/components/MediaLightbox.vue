@@ -7,6 +7,7 @@ import { keyToIntent, stepIndex } from '@/lib/lightbox'
 interface LightboxItem {
   uid: string
   mime: string
+  mine?: boolean // owner → may delete
   previewUrl: string
   webUrl: string
   posterUrl: string
@@ -14,7 +15,7 @@ interface LightboxItem {
 }
 
 const props = defineProps<{ items: LightboxItem[]; modelValue: number | null }>()
-const emit = defineEmits<{ 'update:modelValue': [v: number | null] }>()
+const emit = defineEmits<{ 'update:modelValue': [v: number | null]; delete: [uid: string] }>()
 
 const open = computed(() => props.modelValue !== null && props.modelValue < props.items.length)
 const idx = computed(() => props.modelValue ?? 0)
@@ -87,6 +88,15 @@ onBeforeUnmount(() => {
       >
         <i class="pi pi-download text-xl" aria-hidden="true" />
       </a>
+      <button
+        v-if="current.mine"
+        class="absolute top-3 right-24 p-2 text-white/80 hover:text-red-400"
+        aria-label="Delete"
+        data-test="lightbox-delete"
+        @click.stop="emit('delete', current.uid)"
+      >
+        <i class="pi pi-trash text-xl" aria-hidden="true" />
+      </button>
 
       <button
         v-if="idx > 0"

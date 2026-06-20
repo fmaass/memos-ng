@@ -38,7 +38,13 @@ export interface paths {
         get: operations["attachment_meta_api_attachments__uid__get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete Attachment
+         * @description Delete an attachment — OWNER-only (a mutation, unlike viewing). Removes its media jobs,
+         *     DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
+         *     memo keeps its text; only the media is removed.
+         */
+        delete: operations["delete_attachment_api_attachments__uid__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -497,6 +503,8 @@ export interface components {
             height: number | null;
             /** Mime */
             mime: string;
+            /** Mine */
+            mine: boolean;
             /** Orphan */
             orphan: boolean;
             /** Posterurl */
@@ -527,6 +535,8 @@ export interface components {
             height: number | null;
             /** Mime */
             mime: string;
+            /** Mine */
+            mine: boolean;
             /** Posterurl */
             posterUrl: string;
             /** Previewurl */
@@ -575,6 +585,8 @@ export interface components {
             height: number | null;
             /** Mime */
             mime: string;
+            /** Mine */
+            mine: boolean;
             /** Posterurl */
             posterUrl: string;
             /** Previewurl */
@@ -889,6 +901,35 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AttachmentMeta"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_attachment_api_attachments__uid__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

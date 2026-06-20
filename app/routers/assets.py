@@ -5,9 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,6 +68,7 @@ class AttachmentMeta(BaseModel):
     duration: float | None
     blurhash: str | None
     captured_at: datetime | None
+    mine: bool
     downloadUrl: str
     thumbnailUrl: str
     previewUrl: str
@@ -80,6 +83,7 @@ class AttachmentListItem(BaseModel):
     blurhash: str | None
     width: int | None  # for justified/aspect-ratio gallery layout (no CLS)
     height: int | None
+    mine: bool  # the requesting user owns it (→ may delete)
     orphan: bool  # not linked to a memo
     thumbnailUrl: str
     previewUrl: str
@@ -88,7 +92,7 @@ class AttachmentListItem(BaseModel):
     downloadUrl: str
 
 
-def _list_item(att: Attachment) -> AttachmentListItem:
+def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
     base = f"/api/attachments/{att.uid}"
     return AttachmentListItem(
         uid=att.uid,
@@ -97,6 +101,7 @@ def _list_item(att: Attachment) -> AttachmentListItem:
         blurhash=att.blurhash,
         width=att.width,
         height=att.height,
+        mine=att.owner_id == user_id,
         orphan=att.memo_id is None,
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",
@@ -129,7 +134,7 @@ async def list_attachments(
         stmt = stmt.where(Attachment.mime.like("video/%"))
     stmt = stmt.order_by(Attachment.id.desc()).limit(max(1, min(limit, 500)))
     rows = (await db.execute(stmt)).scalars().all()
-    return [_list_item(a) for a in rows]
+    return [_list_item(a, user.id) for a in rows]
 
 
 @router.get("/attachments/{uid}", response_model=AttachmentMeta)
@@ -150,6 +155,7 @@ async def attachment_meta(
         duration=att.duration,
         blurhash=att.blurhash,
         captured_at=att.captured_at,
+        mine=att.owner_id == user.id,
         downloadUrl=f"{base}/original",
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",
@@ -192,6 +198,47 @@ async def serve_asset(
         media_type=media_type,
         headers={"Cache-Control": f"public, max-age={settings.ASSET_CACHE_SECONDS}, immutable"},
     )
+
+
+def _all_asset_paths(att: Attachment) -> list[Path]:
+    """Every on-disk file for an attachment: the original + each derived tier (+ webp variant)."""
+    paths: list[Path] = []
+    if att.storage_path:
+        paths.append(Path(att.storage_path))
+    for tier in ("thumb", "mobile", "web", "poster"):
+        resolved = _tier_path(att, tier)
+        if resolved is not None:
+            p = resolved[0]
+            paths.append(p)
+            paths.append(p.with_suffix(".webp"))  # format-negotiated variant (may not exist)
+    return paths
+
+
+def _unlink_all(paths: list[Path]) -> None:
+    for p in paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass  # best-effort; the DB row is already gone
+
+
+@router.delete("/attachments/{uid}", status_code=204)
+async def delete_attachment(
+    uid: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Delete an attachment — OWNER-only (a mutation, unlike viewing). Removes its media jobs,
+    DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
+    memo keeps its text; only the media is removed."""
+    att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
+    if att is None or att.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    paths = _all_asset_paths(att)
+    await db.execute(sa_delete(MediaJob).where(MediaJob.attachment_id == att.id))
+    await db.delete(att)
+    await db.commit()
+    await to_thread.run_sync(_unlink_all, paths)
 
 
 # --- SSE media status channel (poll-based; LISTEN/NOTIFY is a future enhancement) ---
