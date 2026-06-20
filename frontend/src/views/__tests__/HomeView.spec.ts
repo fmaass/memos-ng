@@ -1,24 +1,18 @@
-import { VueQueryPlugin } from '@tanstack/vue-query'
-import { flushPromises, mount } from '@vue/test-utils'
+import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import { describe, expect, it, vi } from 'vitest'
 
 import HomeView from '@/views/HomeView.vue'
 
-// Mock the API dependency (not the component under test). The mocked /health
-// response must flow through useQuery into the rendered Tag for this to pass.
+// CaptureEditor (rendered by Home) depends on the API; mock it (not the view under test).
 vi.mock('@/composables/useApi', () => ({
-  useApi: () => ({
-    GET: vi.fn().mockResolvedValue({ data: { status: 'ok', version: 'test' }, error: undefined }),
-  }),
+  useApi: () => ({ GET: vi.fn(), POST: vi.fn() }),
 }))
 
 describe('HomeView', () => {
-  it('renders backend health status reported by the API', async () => {
-    const wrapper = mount(HomeView, {
-      global: { plugins: [VueQueryPlugin, PrimeVue] },
-    })
-    await flushPromises()
-    expect(wrapper.find('[data-test="health"]').text()).toContain('ok')
+  it('renders the capture editor atop the home timeline', () => {
+    const wrapper = mount(HomeView, { global: { plugins: [PrimeVue] } })
+    expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="timeline-placeholder"]').exists()).toBe(true)
   })
 })
