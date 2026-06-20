@@ -71,18 +71,27 @@ async def api_fallback(path: str):
     return JSONResponse({"detail": f"/api/{path} not found"}, status_code=404)
 
 
+def resolve_spa_file(path: str) -> Path:
+    """Map a SPA request to a real file under dist, else index.html.
+
+    Uses Path.is_relative_to (NOT a lexical startswith, which would let a
+    sibling like dist-secret/ escape the served directory) so the result can
+    never point outside FRONTEND_DIR.
+    """
+    dist = FRONTEND_DIR.resolve()
+    candidate = (FRONTEND_DIR / path).resolve()
+    if candidate.is_relative_to(dist) and candidate.is_file():
+        return candidate
+    return FRONTEND_DIR / "index.html"
+
+
 # SPA static serving (frontend/dist is produced by the Vite build stage in Docker).
 if FRONTEND_DIR.is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
-        file_path = (FRONTEND_DIR / path).resolve()
-        if not str(file_path).startswith(str(FRONTEND_DIR.resolve())):
-            return FileResponse(FRONTEND_DIR / "index.html")
-        if file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(FRONTEND_DIR / "index.html")
+        return FileResponse(resolve_spa_file(path))
 else:
     logger.warning("frontend_not_built", path=str(FRONTEND_DIR))
 
