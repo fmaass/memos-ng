@@ -1043,7 +1043,7 @@
   "paths": {
     "/api/attachments": {
       "get": {
-        "description": "The current user's attachment library, newest first. ?type=image|video filters by\nmime prefix; `orphan` flags media not attached to any memo.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE\nor orphan media is excluded \u2014 mirrors `_viewable` / memo visibility.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -1067,7 +1067,7 @@
             "name": "limit",
             "required": false,
             "schema": {
-              "default": 60,
+              "default": 200,
               "title": "Limit",
               "type": "integer"
             }

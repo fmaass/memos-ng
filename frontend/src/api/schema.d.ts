@@ -13,8 +13,10 @@ export interface paths {
         };
         /**
          * List Attachments
-         * @description The current user's attachment library, newest first. ?type=image|video filters by
-         *     mime prefix; `orphan` flags media not attached to any memo.
+         * @description The household media library the user can see, newest first: their own attachments
+         *     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
+         *     filters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE
+         *     or orphan media is excluded — mirrors `_viewable` / memo visibility.
          */
         get: operations["list_attachments_api_attachments_get"];
         put?: never;

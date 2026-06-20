@@ -14,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.config import settings
 from app.database import async_session, get_session
-from app.models import Attachment, AttachmentStatus, MediaJob, User
+from app.models import Attachment, AttachmentStatus, MediaJob, Memo, User
+from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
 
@@ -37,11 +38,22 @@ def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
     return None
 
 
-async def _owned(db: AsyncSession, user: User, uid: str) -> Attachment:
+async def _viewable(db: AsyncSession, user: User, uid: str) -> Attachment:
+    """An attachment is viewable if the user owns it OR it is attached to a memo the user can
+    see (mirrors memo visibility: non-PRIVATE, or theirs). This is a shared household instance —
+    if you can see a memo, you can see its media. Another user's PRIVATE/orphan media stays 404."""
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
-    if att is None or att.owner_id != user.id:
+    if att is None:
         raise HTTPException(status_code=404, detail="Attachment not found")
-    return att
+    if att.owner_id == user.id:
+        return att
+    if att.memo_id is not None:
+        memo = (
+            await db.execute(select(Memo.id).where(Memo.id == att.memo_id, visible_clause(user)))
+        ).scalar_one_or_none()
+        if memo is not None:
+            return att
+    raise HTTPException(status_code=404, detail="Attachment not found")
 
 
 class AttachmentMeta(BaseModel):
@@ -95,16 +107,23 @@ async def list_attachments(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
     type: str | None = None,
-    limit: int = 60,
+    limit: int = 200,
 ) -> list[AttachmentListItem]:
-    """The current user's attachment library, newest first. ?type=image|video filters by
-    mime prefix; `orphan` flags media not attached to any memo."""
-    stmt = select(Attachment).where(Attachment.owner_id == user.id)
+    """The household media library the user can see, newest first: their own attachments
+    (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
+    filters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE
+    or orphan media is excluded — mirrors `_viewable` / memo visibility."""
+    stmt = (
+        select(Attachment)
+        .outerjoin(Memo, Memo.id == Attachment.memo_id)
+        # own (incl. orphans, where Memo is NULL) OR on a memo the user can see (non-PRIVATE)
+        .where((Attachment.owner_id == user.id) | visible_clause(user))
+    )
     if type == "image":
         stmt = stmt.where(Attachment.mime.like("image/%"))
     elif type == "video":
         stmt = stmt.where(Attachment.mime.like("video/%"))
-    stmt = stmt.order_by(Attachment.id.desc()).limit(max(1, min(limit, 200)))
+    stmt = stmt.order_by(Attachment.id.desc()).limit(max(1, min(limit, 500)))
     rows = (await db.execute(stmt)).scalars().all()
     return [_list_item(a) for a in rows]
 
@@ -115,7 +134,7 @@ async def attachment_meta(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentMeta:
-    att = await _owned(db, user, uid)
+    att = await _viewable(db, user, uid)
     base = f"/api/attachments/{uid}"
     return AttachmentMeta(
         uid=att.uid,
@@ -146,7 +165,7 @@ async def serve_asset(
 ) -> FileResponse:
     if tier not in TIERS:
         raise HTTPException(status_code=404, detail="Unknown tier")
-    att = await _owned(db, user, uid)
+    att = await _viewable(db, user, uid)
     resolved = _tier_path(att, tier)
     if resolved is None:
         raise HTTPException(status_code=404, detail="Unknown tier")

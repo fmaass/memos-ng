@@ -108,6 +108,104 @@ async def test_sse_stream_emits_progress_then_ready():
     assert any('"status": "ready"' in e for e in events)  # synthetic ready on completion
 
 
+def _seed_memo_with_attachment(memo_uid, att_uid, owner_subject, visibility, mime="image/jpeg"):
+    """A memo (owner, visibility) + an attachment linked to it (same owner), thumb file separate."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        oid = c.execute(
+            text("SELECT id FROM users WHERE subject=:s"), {"s": owner_subject}
+        ).scalar_one()
+        mid = c.execute(
+            text(
+                "INSERT INTO memos (uid, owner_id, content, visibility, pinned, created_at, "
+                "updated_at) VALUES (:u,:o,'m',CAST(:v AS visibility),false,now(),now()) "
+                "RETURNING id"
+            ),
+            {"u": memo_uid, "o": oid, "v": visibility},
+        ).scalar_one()
+        aid = c.execute(
+            text(
+                "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status, "
+                "storage_path, blurhash) VALUES (:u,:o,:m,'x.jpg',:mime,1,"
+                "CAST('ready' AS attachment_status),'/x','LKO2') RETURNING id"
+            ),
+            {"u": att_uid, "o": oid, "m": mid, "mime": mime},
+        ).scalar_one()
+    eng.dispose()
+    return mid, aid
+
+
+def _mk_user(subject):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": subject})
+        c.execute(text("INSERT INTO users (subject, role) VALUES (:s,'user')"), {"s": subject})
+    eng.dispose()
+
+
+def _rm(subject, *mids):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        for mid in mids:
+            c.execute(text("DELETE FROM memos WHERE id=:m"), {"m": mid})
+        c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": subject})
+    eng.dispose()
+
+
+def test_shared_memo_media_viewable_by_other_user(logged_in_client, monkeypatch, tmp_path):
+    # Household-sharing fix: a memo you can SEE (non-PRIVATE) → you can fetch its media even
+    # though ANOTHER user owns the attachment. Regression for "shared images don't load".
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _mk_user("sharer")
+    mid, aid = _seed_memo_with_attachment("shm-pub", "sha-pub", "sharer", "PUBLIC")
+    try:
+        thumb = tmp_path / "assets" / "thumbs" / "sha-pub.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(thumb, "JPEG")  # file present → 404 is the check
+        assert client.get("/api/attachments/sha-pub/thumb").status_code == 200  # was 404 pre-fix
+        assert client.get("/api/attachments/sha-pub").status_code == 200  # meta too
+    finally:
+        _cleanup(aid)
+        _rm("sharer", mid)
+
+
+def test_private_memo_media_stays_404_for_other_user(logged_in_client, monkeypatch, tmp_path):
+    # The fix must NOT over-grant: another user's PRIVATE-memo media stays hidden even with the
+    # tier file present (so the 404 is the visibility check, not a missing file).
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _mk_user("sharer2")
+    mid, aid = _seed_memo_with_attachment("shm-priv", "sha-priv", "sharer2", "PRIVATE")
+    try:
+        thumb = tmp_path / "assets" / "thumbs" / "sha-priv.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(thumb, "JPEG")
+        assert client.get("/api/attachments/sha-priv/thumb").status_code == 404  # PRIVATE+not owner
+        assert client.get("/api/attachments/sha-priv").status_code == 404
+    finally:
+        _cleanup(aid)
+        _rm("sharer2", mid)
+
+
+def test_list_attachments_includes_shared_excludes_private(logged_in_client):
+    # The library shows the household-viewable set: own + media on non-PRIVATE memos; another
+    # user's PRIVATE-memo media and orphans stay out.
+    client, _ = logged_in_client
+    _mk_user("libsharer")
+    pub_m, pub_a = _seed_memo_with_attachment("lib-pubm", "lib-pub", "libsharer", "PUBLIC")
+    priv_m, priv_a = _seed_memo_with_attachment("lib-privm", "lib-priv", "libsharer", "PRIVATE")
+    orphan = _seed_attachment("lib-orph", "libsharer")  # another user's orphan
+    try:
+        uids = {i["uid"] for i in client.get("/api/attachments").json()}
+        assert "lib-pub" in uids  # shared (PUBLIC memo) media now in the library
+        assert "lib-priv" not in uids  # another user's PRIVATE media excluded
+        assert "lib-orph" not in uids  # another user's orphan excluded
+    finally:
+        _cleanup(pub_a, priv_a, orphan)
+        _rm("libsharer", pub_m, priv_m)
+
+
 def test_list_attachments_requires_auth(client):
     assert client.get("/api/attachments").status_code == 401
 
