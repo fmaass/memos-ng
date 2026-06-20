@@ -8,7 +8,7 @@ from app.database import async_session
 from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
 from app.services import media
 from PIL import Image
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 
 from tests.conftest import SYNC_URL
 
@@ -71,6 +71,40 @@ async def test_fast_lane_image_produces_tiers(adb, monkeypatch, tmp_path):
     assert (tmp_path / "assets" / "mobile" / "img1.jpg").exists()
     assert att.width == 1200 and att.height == 900
     assert att.blurhash and att.status is AttachmentStatus.ready  # image done after fast lane
+
+
+async def test_video_fast_lane_enqueues_slow_after_poster(adb, monkeypatch, tmp_path):
+    # The fast lane must enqueue the slow (transcode) job ONLY after it finishes, so the
+    # two never race a status overwrite under concurrent workers. ffmpeg is stubbed out.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        media,
+        "process_video_poster",
+        lambda att: {"width": 1920, "height": 1080, "duration": 4.0, "blurhash": "LKO2"},
+    )
+    att = Attachment(
+        uid="vid1",
+        filename="v.mov",
+        mime="video/quicktime",
+        size=1,
+        status=AttachmentStatus.pending,
+        storage_path=str(tmp_path / "v.mov"),
+    )
+    adb.add(att)
+    await adb.flush()
+    fast = MediaJob(attachment_id=att.id, lane=JobLane.fast, state=JobState.queued)
+    adb.add(fast)
+    await adb.flush()
+
+    await media.process_job(adb, fast)
+
+    assert att.status is AttachmentStatus.processing  # video not done after fast lane
+    lanes = (
+        (await adb.execute(select(MediaJob.lane).where(MediaJob.attachment_id == att.id)))
+        .scalars()
+        .all()
+    )
+    assert JobLane.slow in lanes  # slow transcode now queued, by the fast lane
 
 
 def test_missing_original_retries_then_fails(monkeypatch, tmp_path):

@@ -200,3 +200,13 @@ async def test_worker_skips_notify_while_processing(adb, monkeypatch):
     monkeypatch.setattr(worker.push, "send_to_user", _fake_send)
     await worker._notify_terminal(adb, att.id)
     assert calls == []  # video still transcoding (processing) → no premature notify
+
+
+async def test_notify_terminal_safe_swallows_errors(monkeypatch):
+    # The job is already committed before push runs; a push/session error must be swallowed,
+    # never propagated back into the worker's job loop.
+    async def _boom(db, attachment_id):
+        raise RuntimeError("push backend down")
+
+    monkeypatch.setattr(worker, "_notify_terminal", _boom)
+    await worker._notify_terminal_safe(999999)  # must not raise

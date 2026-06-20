@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Attachment, AttachmentStatus, JobLane, MediaJob
+from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
 from app.services import blurhash_pure
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
@@ -237,4 +237,8 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     attachment.blurhash = meta.get("blurhash")
     # Image is complete after the fast lane; video still needs the slow-lane transcode.
     attachment.status = AttachmentStatus.processing if is_video else AttachmentStatus.ready
+    if is_video:
+        # Enqueue the transcode only now that the fast lane (poster, dims, duration) is done,
+        # which guarantees fast→slow ordering regardless of how many workers run.
+        db.add(MediaJob(attachment_id=attachment.id, lane=JobLane.slow, state=JobState.queued))
     await db.flush()

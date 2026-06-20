@@ -72,7 +72,9 @@ def test_resumable_upload_resumes_and_finalizes(logged_in_client, monkeypatch, t
             ).scalar_one()
         eng.dispose()
         assert sha == hashlib.sha256(content).hexdigest()  # reassembled bytes intact
-        assert set(_lanes_for(att["uid"])) == {"fast", "slow"}  # video enqueues both lanes
+        # Video enqueues ONLY the fast lane at finalize; the fast lane enqueues the slow
+        # (transcode) job when it completes, so fast→slow can't race a status overwrite.
+        assert _lanes_for(att["uid"]) == ["fast"]
     finally:
         _cleanup()
 

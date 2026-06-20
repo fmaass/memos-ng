@@ -121,9 +121,11 @@ async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachmen
     db.add(attachment)
     await db.flush()
 
+    # Only the fast lane is enqueued up front. For video, the fast lane enqueues the slow
+    # (transcode) job once it has produced the poster/dims — so the two can never race a
+    # status overwrite under concurrent workers (a slow job setting 'ready' before the fast
+    # job sets 'processing' would strand finished media permanently non-ready).
     db.add(MediaJob(attachment_id=attachment.id, lane=JobLane.fast, state=JobState.queued))
-    if is_video:
-        db.add(MediaJob(attachment_id=attachment.id, lane=JobLane.slow, state=JobState.queued))
     await db.delete(upload)
     await db.flush()
     return attachment

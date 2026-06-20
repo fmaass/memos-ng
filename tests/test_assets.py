@@ -70,6 +70,12 @@ def test_other_users_attachment_is_404(logged_in_client, monkeypatch, tmp_path):
     eng.dispose()
     aid = _seed_attachment("att-other", "other_owner")
     try:
+        # Seed the actual tier file so the 404 can ONLY come from the owner check, not from a
+        # missing file — without this the test would pass even if owner-scoping were removed
+        # (a removed check returns 200 and serves another user's file).
+        thumb = tmp_path / "assets" / "thumbs" / "att-other.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(thumb, "JPEG")
         assert client.get("/api/attachments/att-other/thumb").status_code == 404  # not owner
     finally:
         _cleanup(aid)

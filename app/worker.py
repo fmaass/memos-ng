@@ -64,24 +64,38 @@ async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
 
 
 async def _notify_terminal(db: AsyncSession, attachment_id: int) -> None:
-    """Web-push the owner when an attachment reaches a terminal state (ready/failed).
+    """Web-push the owner when an attachment is in a terminal state (ready/failed).
 
     Gates on the *attachment's* status, not the job's: an image fast-lane job finishes at
     'ready', but a video fast-lane job finishes at 'processing' (the slow-lane job fires
-    this later when it reaches 'ready'). Best-effort — a push failure never breaks the job.
+    this later when it reaches 'ready'). Errors propagate here; `_notify_terminal_safe`
+    isolates them — this function itself never runs inside the media job's transaction.
     """
     att = (
         await db.execute(select(Attachment).where(Attachment.id == attachment_id))
     ).scalar_one_or_none()
     if att is None or att.status not in (AttachmentStatus.ready, AttachmentStatus.failed):
         return
+    await push.send_to_user(
+        db,
+        att.owner_id,
+        {"uid": att.uid, "status": att.status.value, "title": att.filename},
+    )
+
+
+async def _notify_terminal_safe(attachment_id: int) -> None:
+    """Best-effort push in its OWN session, AFTER the media job has committed.
+
+    Decoupled deliberately: running push (and its 404/410 prune flush) inside the job's
+    transaction means a push/flush error would poison that session and fail the *already
+    finished* media job. Here the job is durable before we ever touch push, and any error
+    — including a poisoned session — is swallowed.
+    """
     try:
-        await push.send_to_user(
-            db,
-            att.owner_id,
-            {"uid": att.uid, "status": att.status.value, "title": att.filename},
-        )
-    except Exception as exc:  # push is best-effort; it must not fail the media job
+        async with async_session() as db:
+            await _notify_terminal(db, attachment_id)
+            await db.commit()
+    except Exception as exc:  # push is best-effort; the job is already committed
         logger.warning("push_notify_failed", attachment_id=attachment_id, error=str(exc))
 
 
@@ -92,12 +106,13 @@ async def run_once(db: AsyncSession) -> str:
     if job is None:
         await db.commit()
         return "idle"
+    attachment_id = job.attachment_id  # captured before commit expires the job instance
     try:
         await media.process_job(db, job)
         job.state = JobState.done
         job.progress_pct = 100
-        await _notify_terminal(db, job.attachment_id)
         await db.commit()
+        await _notify_terminal_safe(attachment_id)  # separate session, after the job is durable
         return "processed"
     except media.ThermalDefer:
         job.state = JobState.queued  # too hot — try again later, not a failure
@@ -110,9 +125,9 @@ async def run_once(db: AsyncSession) -> str:
         if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
             job.state = JobState.failed
             await _fail_attachment(db, job)
-            await _notify_terminal(db, job.attachment_id)
             logger.warning("media_job_failed_terminal", job_id=job.id, error=str(exc))
             await db.commit()
+            await _notify_terminal_safe(attachment_id)  # separate session, after commit
             return "processed"
         job.state = JobState.queued  # retry with backoff
         job.claimed_by = None
