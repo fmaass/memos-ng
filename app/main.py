@@ -75,7 +75,7 @@ async def api_fallback(path: str):
 if FRONTEND_DIR.is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
 
-    @app.get("/{path:path}")
+    @app.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
         file_path = (FRONTEND_DIR / path).resolve()
         if not str(file_path).startswith(str(FRONTEND_DIR.resolve())):
@@ -86,7 +86,7 @@ if FRONTEND_DIR.is_dir():
 else:
     logger.warning("frontend_not_built", path=str(FRONTEND_DIR))
 
-    @app.get("/{path:path}")
+    @app.get("/{path:path}", include_in_schema=False)
     async def serve_spa_fallback(path: str):
         return JSONResponse(
             {"error": "Frontend not built. Run 'npm run build' in frontend/."},
