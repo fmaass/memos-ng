@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     FFMPEG_THREADS: int = 1
     WORKER_CONCURRENCY: int = 1
 
+    # Resumable upload (T2.1).
+    UPLOAD_CHUNK_SIZE: int = 5 * 1024 * 1024  # 5 MiB
+    UPLOAD_EXPIRY_HOURS: int = 24
+
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
     OIDC_CLIENT_ID: str = "memos-ng"

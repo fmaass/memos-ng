@@ -117,6 +117,7 @@ class Attachment(Base):
     height: Mapped[int | None] = mapped_column(Integer)
     duration: Mapped[float | None]
     blurhash: Mapped[str | None] = mapped_column(String(255))
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True)  # content dedup
     # Original capture time (EXIF/QuickTime → File.lastModified → upload time).
     captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[AttachmentStatus] = mapped_column(
@@ -137,6 +138,9 @@ class Upload(Base):
     declared_size: Mapped[int] = mapped_column(BigInteger)
     bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
     sha256: Mapped[str | None] = mapped_column(String(64))
+    client_mtime: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )  # File.lastModified
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

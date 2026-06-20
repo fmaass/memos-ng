@@ -195,6 +195,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start Upload */
+        post: operations["start_upload_api_uploads_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/uploads/{upload_uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        /** Upload Offset */
+        head: operations["upload_offset_api_uploads__upload_uid__head"];
+        /** Append Chunk */
+        patch: operations["append_chunk_api_uploads__upload_uid__patch"];
+        trace?: never;
+    };
+    "/api/uploads/{upload_uid}/finalize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Finalize Upload */
+        post: operations["finalize_upload_api_uploads__upload_uid__finalize_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -216,6 +268,31 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AttachmentOut */
+        AttachmentOut: {
+            /** Captured At */
+            captured_at: string | null;
+            /** Duration */
+            duration: number | null;
+            /** Filename */
+            filename: string;
+            /** Height */
+            height: number | null;
+            /** Mime */
+            mime: string;
+            /** Size */
+            size: number;
+            status: components["schemas"]["AttachmentStatus"];
+            /** Uid */
+            uid: string;
+            /** Width */
+            width: number | null;
+        };
+        /**
+         * AttachmentStatus
+         * @enum {string}
+         */
+        AttachmentStatus: "uploading" | "pending" | "processing" | "ready" | "failed";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -333,6 +410,26 @@ export interface components {
             count: number;
             /** Name */
             name: string;
+        };
+        /** UploadCreate */
+        UploadCreate: {
+            /** Filename */
+            filename: string;
+            /** Last Modified */
+            last_modified?: number | null;
+            /** Mime */
+            mime: string;
+            /** Size */
+            size: number;
+        };
+        /** UploadOut */
+        UploadOut: {
+            /** Bytes Received */
+            bytes_received: number;
+            /** Chunk Size */
+            chunk_size: number;
+            /** Upload Uid */
+            upload_uid: string;
         };
         /** UserOut */
         UserOut: {
@@ -798,6 +895,134 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TagCount"][];
+                };
+            };
+        };
+    };
+    start_upload_api_uploads_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UploadCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upload_offset_api_uploads__upload_uid__head: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    append_chunk_api_uploads__upload_uid__patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Upload-Offset"?: number;
+            };
+            path: {
+                upload_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    finalize_upload_api_uploads__upload_uid__finalize_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

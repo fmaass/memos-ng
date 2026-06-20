@@ -1,6 +1,98 @@
 {
   "components": {
     "schemas": {
+      "AttachmentOut": {
+        "properties": {
+          "captured_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Captured At"
+          },
+          "duration": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          }
+        },
+        "required": [
+          "uid",
+          "filename",
+          "mime",
+          "size",
+          "status",
+          "captured_at",
+          "width",
+          "height",
+          "duration"
+        ],
+        "title": "AttachmentOut",
+        "type": "object"
+      },
+      "AttachmentStatus": {
+        "enum": [
+          "uploading",
+          "pending",
+          "processing",
+          "ready",
+          "failed"
+        ],
+        "title": "AttachmentStatus",
+        "type": "string"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -325,6 +417,63 @@
           "count"
         ],
         "title": "TagCount",
+        "type": "object"
+      },
+      "UploadCreate": {
+        "properties": {
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "last_modified": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Modified"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filename",
+          "mime",
+          "size"
+        ],
+        "title": "UploadCreate",
+        "type": "object"
+      },
+      "UploadOut": {
+        "properties": {
+          "bytes_received": {
+            "title": "Bytes Received",
+            "type": "integer"
+          },
+          "chunk_size": {
+            "title": "Chunk Size",
+            "type": "integer"
+          },
+          "upload_uid": {
+            "title": "Upload Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_uid",
+          "chunk_size",
+          "bytes_received"
+        ],
+        "title": "UploadOut",
         "type": "object"
       },
       "UserOut": {
@@ -1174,6 +1323,179 @@
         "summary": "List Tags",
         "tags": [
           "memos"
+        ]
+      }
+    },
+    "/api/uploads": {
+      "post": {
+        "operationId": "start_upload_api_uploads_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Upload",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/api/uploads/{upload_uid}": {
+      "head": {
+        "operationId": "upload_offset_api_uploads__upload_uid__head",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Offset",
+        "tags": [
+          "uploads"
+        ]
+      },
+      "patch": {
+        "operationId": "append_chunk_api_uploads__upload_uid__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Upload-Offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Upload-Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Chunk",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/api/uploads/{upload_uid}/finalize": {
+      "post": {
+        "operationId": "finalize_upload_api_uploads__upload_uid__finalize_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finalize Upload",
+        "tags": [
+          "uploads"
         ]
       }
     },
