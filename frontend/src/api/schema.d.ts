@@ -109,6 +109,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/pats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Pats */
+        get: operations["list_pats_api_pats_get"];
+        put?: never;
+        /** Create Pat */
+        post: operations["create_pat_api_pats_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/pats/{pat_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke Pat */
+        delete: operations["revoke_pat_api_pats__pat_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/stats/heatmap": {
         parameters: {
             query?: never;
@@ -239,6 +274,41 @@ export interface components {
             /** Pinned */
             pinned?: boolean | null;
             visibility?: components["schemas"]["Visibility"] | null;
+        };
+        /** PatCreate */
+        PatCreate: {
+            /** Name */
+            name: string;
+        };
+        /** PatCreated */
+        PatCreated: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Last Used */
+            last_used: string | null;
+            /** Name */
+            name: string;
+            /** Token */
+            token: string;
+        };
+        /** PatOut */
+        PatOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Last Used */
+            last_used: string | null;
+            /** Name */
+            name: string;
         };
         /** TagCount */
         TagCount: {
@@ -543,6 +613,88 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MemoOut"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_pats_api_pats_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PatOut"][];
+                };
+            };
+        };
+    };
+    create_pat_api_pats_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PatCreated"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revoke_pat_api_pats__pat_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pat_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

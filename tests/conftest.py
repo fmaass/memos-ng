@@ -70,6 +70,41 @@ def client() -> TestClient:
     return TestClient(app, raise_server_exceptions=False)
 
 
+@pytest.fixture
+def logged_in_client(client, db_engine, monkeypatch):
+    """A TestClient carrying a real BFF session cookie (OIDC network calls mocked).
+
+    Eager-added routes bake their handler at construction time, so app.dependency_overrides
+    does not apply — authenticate through the real flow instead.
+    """
+    from unittest.mock import AsyncMock
+
+    from app import auth
+    from app.config import settings
+
+    subject = "test_session_user"
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    monkeypatch.setattr(auth, "exchange_code", AsyncMock(return_value={"id_token": "x"}))
+    monkeypatch.setattr(
+        auth,
+        "validate_id_token",
+        lambda t: {"preferred_username": subject, "name": "T", "email": "t@x", "groups": []},
+    )
+    login = client.get("/api/auth/login", follow_redirects=False)
+    tx = login.cookies[auth.TX_COOKIE]
+    state = auth.decrypt(tx)["state"]
+    client.cookies.set(auth.TX_COOKIE, tx)
+    cb = client.get(f"/api/auth/callback?code=abc&state={state}", follow_redirects=False)
+    client.cookies.set(auth.SID_COOKIE, cb.cookies[auth.SID_COOKIE])
+    try:
+        yield client, subject
+    finally:
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
+        eng.dispose()
+
+
 class _CtxSession:
     """Async context manager standing in for app.database.async_session().
 

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_session
-from app.models import User, WebSession
+from app.models import Pat, User, WebSession
 
 TX_COOKIE = "memosng_oidc_tx"
 SID_COOKIE = "memosng_sid"
@@ -148,8 +148,33 @@ async def require_user(request: Request, db: AsyncSession = Depends(get_session)
     return user
 
 
+PAT_PREFIX = "memos_pat_"
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
+    """Return the owning user for a valid PAT (stamping last_used), else None. No commit."""
+    pat = (
+        await db.execute(select(Pat).where(Pat.hashed_token == hash_token(token)))
+    ).scalar_one_or_none()
+    if pat is None:
+        return None
+    pat.last_used = datetime.now(UTC)
+    await db.flush()
+    return (await db.execute(select(User).where(User.id == pat.user_id))).scalar_one_or_none()
+
+
 async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
-    # The PAT branch lands in T1.4; until then this is session-only.
+    authz = request.headers.get("Authorization", "")
+    if authz.startswith("Bearer ") and authz[7:].startswith(PAT_PREFIX):
+        user = await authenticate_pat(db, authz[7:])
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid or revoked token")
+        await db.commit()
+        return user
     return await require_user(request, db)
 
 

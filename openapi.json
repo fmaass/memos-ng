@@ -217,6 +217,98 @@
         "title": "MemoPatch",
         "type": "object"
       },
+      "PatCreate": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PatCreate",
+        "type": "object"
+      },
+      "PatCreated": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "last_used": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "last_used",
+          "created_at",
+          "token"
+        ],
+        "title": "PatCreated",
+        "type": "object"
+      },
+      "PatOut": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "last_used": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "last_used",
+          "created_at"
+        ],
+        "title": "PatOut",
+        "type": "object"
+      },
       "TagCount": {
         "properties": {
           "count": {
@@ -801,6 +893,105 @@
         "summary": "Unpin Memo",
         "tags": [
           "memos"
+        ]
+      }
+    },
+    "/api/pats": {
+      "get": {
+        "operationId": "list_pats_api_pats_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PatOut"
+                  },
+                  "title": "Response List Pats Api Pats Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Pats",
+        "tags": [
+          "pats"
+        ]
+      },
+      "post": {
+        "operationId": "create_pat_api_pats_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatCreated"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Pat",
+        "tags": [
+          "pats"
+        ]
+      }
+    },
+    "/api/pats/{pat_id}": {
+      "delete": {
+        "operationId": "revoke_pat_api_pats__pat_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pat_id",
+            "required": true,
+            "schema": {
+              "title": "Pat Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Pat",
+        "tags": [
+          "pats"
         ]
       }
     },
