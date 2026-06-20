@@ -1,8 +1,11 @@
-<script setup lang="ts"></script>
+<script setup lang="ts">
+import MemoFeed from '@/components/MemoFeed.vue'
+</script>
 
 <template>
-  <section class="p-6" data-test="view-explore">
+  <section class="max-w-2xl mx-auto p-4 flex flex-col gap-3" data-test="view-explore">
     <h1 class="text-2xl font-semibold">Explore</h1>
-    <p class="text-muted-color mt-2">Public memos across the household — coming in T3.4.</p>
+    <p class="text-muted-color text-sm">Public memos shared across the household.</p>
+    <MemoFeed :query="{ visibility: 'PUBLIC' }" />
   </section>
 </template>

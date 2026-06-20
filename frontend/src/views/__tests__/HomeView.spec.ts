@@ -8,15 +8,17 @@ import HomeView from '@/views/HomeView.vue'
 vi.mock('@/composables/useApi', () => ({
   useApi: () => ({ GET: vi.fn(), POST: vi.fn() }),
 }))
+// useMediaEvents opens an SSE channel + uses the query client; stub it out here.
+vi.mock('@/composables/useMediaEvents', () => ({ useMediaEvents: () => {} }))
 
-const TimelineStub = { template: '<div data-test="timeline-stub" />' }
+const FeedStub = { template: '<div data-test="feed-stub" />' }
 
 describe('HomeView', () => {
-  it('composes the capture editor above the timeline', () => {
+  it('composes the capture editor above the memo feed', () => {
     const wrapper = mount(HomeView, {
-      global: { plugins: [PrimeVue], stubs: { MemoTimeline: TimelineStub } },
+      global: { plugins: [PrimeVue], stubs: { MemoFeed: FeedStub } },
     })
     expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="timeline-stub"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="feed-stub"]').exists()).toBe(true)
   })
 })

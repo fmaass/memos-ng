@@ -4,6 +4,7 @@ import ArchivedView from './views/ArchivedView.vue'
 import ExploreView from './views/ExploreView.vue'
 import HomeView from './views/HomeView.vue'
 import ResourcesView from './views/ResourcesView.vue'
+import SearchView from './views/SearchView.vue'
 import SettingsView from './views/SettingsView.vue'
 
 // All routes render inside AppShell (App.vue). Auth is enforced at the API layer: any
@@ -16,6 +17,7 @@ export default createRouter({
     { path: '/explore', name: 'explore', component: ExploreView },
     { path: '/archived', name: 'archived', component: ArchivedView },
     { path: '/resources', name: 'resources', component: ResourcesView },
+    { path: '/search', name: 'search', component: SearchView },
     { path: '/settings', name: 'settings', component: SettingsView },
   ],
 })

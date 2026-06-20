@@ -85,6 +85,9 @@ async function logout(): Promise<void> {
           @click="mobileOpen = true"
         />
         <div class="flex-1" />
+        <RouterLink to="/search" aria-label="Search" data-test="nav-search">
+          <Button text rounded icon="pi pi-search" aria-label="Search" />
+        </RouterLink>
         <Button
           text
           rounded
