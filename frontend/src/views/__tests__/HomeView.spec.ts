@@ -9,10 +9,14 @@ vi.mock('@/composables/useApi', () => ({
   useApi: () => ({ GET: vi.fn(), POST: vi.fn() }),
 }))
 
+const TimelineStub = { template: '<div data-test="timeline-stub" />' }
+
 describe('HomeView', () => {
-  it('renders the capture editor atop the home timeline', () => {
-    const wrapper = mount(HomeView, { global: { plugins: [PrimeVue] } })
+  it('composes the capture editor above the timeline', () => {
+    const wrapper = mount(HomeView, {
+      global: { plugins: [PrimeVue], stubs: { MemoTimeline: TimelineStub } },
+    })
     expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="timeline-placeholder"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="timeline-stub"]').exists()).toBe(true)
   })
 })
