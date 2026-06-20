@@ -20,6 +20,23 @@ class Settings(BaseSettings):
     FFMPEG_THREADS: int = 1
     WORKER_CONCURRENCY: int = 1
 
+    # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
+    # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
+    OIDC_CLIENT_ID: str = "memos-ng"
+    OIDC_CLIENT_SECRET: str = ""  # set via stack .env in prod
+    OIDC_ISSUER: str = "https://auth.discomarder.live"
+    OIDC_AUTHORIZE_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/authorization"
+    OIDC_TOKEN_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/token"
+    OIDC_JWKS_URI: str = "https://auth.discomarder.live/jwks.json"
+    OIDC_REDIRECT_URI: str = "https://memos-ng.discomarder.live/api/auth/callback"
+
+    # BFF session. SESSION_SECRET is a Fernet key encrypting tokens at rest; the
+    # default is DEV-ONLY and must be overridden in prod via the stack .env.
+    SESSION_SECRET: str = "TzWJWb-LwdXWdsb92xjiY7yqMaW1lWZJPDNZSg-qqd8="
+    COOKIE_SECURE: bool = True
+    SESSION_ABSOLUTE_DAYS: int = 90
+    SESSION_ROLLING: bool = True
+
     @property
     def is_production(self) -> bool:
         return self.ENV != "development"

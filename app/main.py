@@ -36,7 +36,34 @@ app = FastAPI(
     redoc_url=None if settings.is_production else "/redoc",
 )
 
+from app.routers import auth as auth_router  # noqa: E402
+
+# Add eagerly rather than include_router(): FastAPI 0.138's include_router defers to a
+# lazy _IncludedRouter wrapper that the Prometheus instrumentator's route resolver can't
+# read (AttributeError on .path → 500). The router's routes already carry their full
+# /api/auth/* paths and dependencies, so extending is equivalent here.
+app.router.routes.extend(auth_router.router.routes)
+
+# Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+CSP = (
+    "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+    "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+)
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = CSP
+    if settings.is_production:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 
 class HealthResponse(BaseModel):
