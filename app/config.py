@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     UPLOAD_CHUNK_SIZE: int = 5 * 1024 * 1024  # 5 MiB
     UPLOAD_EXPIRY_HOURS: int = 24
 
+    # Slow-lane transcode + thermal guard (T2.3). Saturn is thermally bound: defer the
+    # H.264 transcode while the SoC is above THERMAL_MAX_C. Missing zone path → no-op.
+    THERMAL_ZONE: str = "/sys/class/thermal/thermal_zone0/temp"
+    THERMAL_MAX_C: int = 70
+    MEDIA_MAX_ATTEMPTS: int = 3
+
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
     OIDC_CLIENT_ID: str = "memos-ng"

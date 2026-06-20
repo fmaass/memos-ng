@@ -1,6 +1,8 @@
+import asyncio
 import json
 import os
 import subprocess
+from collections import deque
 from pathlib import Path
 
 import pillow_heif
@@ -100,7 +102,8 @@ def process_video_poster(attachment: Attachment) -> dict:
     meta = _ffprobe(src)
     poster_path = _assets("web") / f"{attachment.uid}.poster.jpg"
     poster_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = poster_path.with_suffix(".jpg.tmp")
+    # keep the real extension so ffmpeg can infer the muxer (a .jpg.tmp suffix fails)
+    tmp = poster_path.with_name(f"{poster_path.stem}.tmp{poster_path.suffix}")
     subprocess.run(
         [
             "ffmpeg",
@@ -126,14 +129,104 @@ def process_video_poster(attachment: Attachment) -> dict:
     return meta
 
 
+class ThermalDefer(Exception):
+    """Raised to re-queue a slow job when the host is too hot (not a failure)."""
+
+
+def read_temp_millideg() -> int | None:
+    try:
+        return int(Path(settings.THERMAL_ZONE).read_text().strip())
+    except (OSError, ValueError):
+        return None  # no thermal zone (local/CI) → guard is a no-op
+
+
+def too_hot() -> bool:
+    temp = read_temp_millideg()
+    return temp is not None and temp > settings.THERMAL_MAX_C * 1000
+
+
+def parse_progress(line: str, duration: float | None) -> int | None:
+    """Map an ffmpeg `-progress` line to a 0-100 percent (needs the clip duration)."""
+    if not duration or duration <= 0:
+        return None
+    key, _, value = line.strip().partition("=")
+    if key == "out_time_us" and value.isdigit():
+        return max(0, min(100, int(int(value) / 1_000_000 / duration * 100)))
+    return None
+
+
+async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
+    """H.264/AAC transcode (the slow lane). Defers while the host is too hot (ADR thermal)."""
+    if too_hot():
+        raise ThermalDefer
+    src = attachment.storage_path
+    assert src is not None
+    duration = attachment.duration or _ffprobe(src).get("duration")
+
+    dest = _assets("web") / f"{attachment.uid}.mp4"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # keep the real extension so ffmpeg infers the mp4 muxer (a .mp4.tmp suffix fails)
+    tmp = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        src,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-threads",
+        str(settings.FFMPEG_THREADS),
+        "-vf",
+        "scale=-2:min(1080\\,ih)",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        str(tmp),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    assert proc.stdout is not None
+    tail: deque[str] = deque(maxlen=12)
+    last = 0.0
+    async for raw in proc.stdout:
+        line = raw.decode(errors="ignore")
+        tail.append(line.rstrip())
+        pct = parse_progress(line, duration)
+        if pct is not None and (asyncio.get_event_loop().time() - last) > 2:
+            job.progress_pct = pct
+            await db.flush()
+            last = asyncio.get_event_loop().time()
+    await proc.wait()
+    if proc.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
+
+    os.replace(tmp, dest)  # atomic; poster was written by the fast lane first
+    _stamp_mtime(dest, attachment)
+    job.progress_pct = 100
+    attachment.status = AttachmentStatus.ready
+    await db.flush()
+
+
 async def process_job(db: AsyncSession, job: MediaJob) -> None:
-    """Run a fast-lane job: derive tiers, fill metadata, advance status.
-    Raises on failure (caller marks the job failed)."""
+    """Dispatch a media job to its lane. Raises on failure (caller marks it failed);
+    raises ThermalDefer to re-queue without counting a failure."""
     attachment = (
         await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
     ).scalar_one()
-    if job.lane is not JobLane.fast:
-        raise RuntimeError("slow lane handled in T2.3")
+
+    if job.lane is JobLane.slow:
+        await process_slow(db, job, attachment)
+        return
 
     is_video = attachment.mime.startswith("video/")
     meta = process_video_poster(attachment) if is_video else process_image(attachment)
@@ -142,6 +235,6 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     attachment.height = meta.get("height")
     attachment.duration = meta.get("duration")
     attachment.blurhash = meta.get("blurhash")
-    # Image is complete after the fast lane; video still needs the slow-lane transcode (T2.3).
+    # Image is complete after the fast lane; video still needs the slow-lane transcode.
     attachment.status = AttachmentStatus.processing if is_video else AttachmentStatus.ready
     await db.flush()

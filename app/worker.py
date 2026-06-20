@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session
-from app.models import JobLane, JobState, MediaJob
+from app.models import Attachment, AttachmentStatus, JobState, MediaJob
 from app.services import media
 from app.services.uploads import reap_expired
 from app.version import __version__
@@ -39,10 +39,10 @@ def beat() -> None:
 
 
 async def claim_one(db: AsyncSession) -> MediaJob | None:
-    """Atomically claim the next queued fast-lane job; concurrent workers skip a locked row."""
+    """Atomically claim the next queued job (fast or slow); concurrent workers skip a locked row."""
     stmt = (
         select(MediaJob)
-        .where(MediaJob.state == JobState.queued, MediaJob.lane == JobLane.fast)
+        .where(MediaJob.state == JobState.queued)
         .order_by(MediaJob.id)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -55,22 +55,46 @@ async def claim_one(db: AsyncSession) -> MediaJob | None:
     return job
 
 
-async def run_once(db: AsyncSession) -> bool:
-    """Claim+process one job in a single transaction (the row stays locked until commit)."""
+async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
+    att = (
+        await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
+    ).scalar_one_or_none()
+    if att is not None:
+        att.status = AttachmentStatus.failed  # terminal + UI-visible, never a silent drop
+
+
+async def run_once(db: AsyncSession) -> str:
+    """Claim+process one job in one transaction (row locked until commit).
+    Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off)."""
     job = await claim_one(db)
     if job is None:
         await db.commit()
-        return False
+        return "idle"
     try:
         await media.process_job(db, job)
         job.state = JobState.done
+        job.progress_pct = 100
+        await db.commit()
+        return "processed"
+    except media.ThermalDefer:
+        job.state = JobState.queued  # too hot — try again later, not a failure
+        job.claimed_by = None
+        await db.commit()
+        return "deferred"
     except Exception as exc:  # a bad input must not kill the worker
-        job.state = JobState.failed
         job.attempts += 1
         job.error = str(exc)[:500]
-        logger.warning("media_job_failed", job_id=job.id, error=str(exc))
-    await db.commit()
-    return True
+        if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
+            job.state = JobState.failed
+            await _fail_attachment(db, job)
+            logger.warning("media_job_failed_terminal", job_id=job.id, error=str(exc))
+            await db.commit()
+            return "processed"
+        job.state = JobState.queued  # retry with backoff
+        job.claimed_by = None
+        logger.warning("media_job_retry", job_id=job.id, attempts=job.attempts, error=str(exc))
+        await db.commit()
+        return "deferred"
 
 
 async def run() -> None:
@@ -79,7 +103,7 @@ async def run() -> None:
     last_reap = 0.0
     while True:
         async with async_session() as db:
-            processed = await run_once(db)
+            status = await run_once(db)
         beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             async with async_session() as db:
@@ -87,7 +111,7 @@ async def run() -> None:
             if reaped:
                 logger.info("uploads_reaped", count=reaped)
             last_reap = time.time()
-        if not processed:
+        if status != "processed":  # idle or deferred (thermal/retry backoff)
             await asyncio.sleep(POLL_SECONDS)
 
 

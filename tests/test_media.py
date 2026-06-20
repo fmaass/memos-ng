@@ -73,7 +73,7 @@ async def test_fast_lane_image_produces_tiers(adb, monkeypatch, tmp_path):
     assert att.blurhash and att.status is AttachmentStatus.ready  # image done after fast lane
 
 
-def test_missing_original_marks_job_failed(monkeypatch, tmp_path):
+def test_missing_original_retries_then_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     aid, jid = _seed("image/png", str(tmp_path / "does-not-exist.png"))
     try:
@@ -82,14 +82,16 @@ def test_missing_original_marks_job_failed(monkeypatch, tmp_path):
             async with async_session() as db:
                 return await worker.run_once(db)
 
-        assert asyncio.run(_go()) is True  # a job was claimed (and failed), not a crash
+        # Fails on each attempt; retries (deferred) until MEDIA_MAX_ATTEMPTS → terminal failed.
+        for _ in range(settings.MEDIA_MAX_ATTEMPTS):
+            asyncio.run(_go())
         eng = create_engine(SYNC_URL)
         with eng.connect() as c:
             state, attempts = c.execute(
                 text("SELECT state, attempts FROM media_jobs WHERE id=:j"), {"j": jid}
             ).one()
         eng.dispose()
-        assert state == "failed" and attempts == 1
+        assert state == "failed" and attempts == settings.MEDIA_MAX_ATTEMPTS  # worker survived
     finally:
         _cleanup(aid)
 
