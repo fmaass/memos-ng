@@ -65,7 +65,7 @@ def test_import_maps_users_memos_attachments_reactions(db_session):
 
     att = db_session.execute(select(Attachment).where(Attachment.uid == "mig-att")).scalar_one()
     assert att.memo_id == pub.id and att.owner_id == fabian.id and att.mime == "image/jpeg"
-    assert att.storage_path.endswith("originals/2024/a.jpg")
+    assert att.storage_path.endswith("originals/a.jpg")  # flat basename of the reference
 
     orphan = db_session.execute(
         select(Attachment).where(Attachment.uid == "mig-orphan")

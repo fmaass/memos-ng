@@ -139,7 +139,9 @@ def import_attachment(
     uid = old["uid"]
     mime = old.get("type") or "application/octet-stream"
     is_video = mime.startswith(VIDEO_PREFIX)
-    storage_path = str(Path(settings.DATA_ROOT) / "originals" / old["reference"])
+    # old `reference` is an absolute container path (/var/opt/memos/assets/<basename>); the
+    # file is copied flat into originals/ keyed by that unique basename.
+    storage_path = str(Path(settings.DATA_ROOT) / "originals" / Path(old["reference"]).name)
 
     image_ready = not is_video and _has_derived(uid, "thumbs", "jpg")
     video_ready = is_video and _has_derived(uid, "web", "mp4")
@@ -258,6 +260,18 @@ def read_old(source_dsn: str) -> dict[str, Any]:  # pragma: no cover - exercised
             )
             acols = ("id", "uid", "creator_id", "filename", "type", "size", "memo_id", "reference")
             out["attachments"] = [dict(zip(acols, r, strict=False)) for r in cur.fetchall()]
+            # reaction.content_id is "memos/{uid}"; reaction_type is the emoji.
+            cur.execute("SELECT content_id, creator_id, reaction_type FROM reaction")
+            for content_id, creator_id, rtype in cur.fetchall():
+                subject = users_by_id.get(creator_id, {}).get("username")
+                if subject:
+                    out["reactions"].append(
+                        {
+                            "memo_uid": str(content_id).split("memos/")[-1],
+                            "subject": subject,
+                            "emoji": rtype,
+                        }
+                    )
     finally:
         conn.close()
     return out
