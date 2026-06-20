@@ -1,5 +1,12 @@
+/* Canonical cascade-layer order — MUST match main.ts cssLayer.order. Without this
+   declaration, Tailwind v4 preflight (base) and PrimeVue's theme layer order is
+   undefined and preflight zeroes PrimeVue component padding → cramped/unstyled UI. */
+@layer theme, base, primevue, utilities;
+
 @import 'tailwindcss';
 @import 'tailwindcss-primeui';
 
-/* PrimeVue 4 cssLayer order is set in main.ts (theme, base, primevue).
-   Full theming (Aura definePreset, dark-mode toggle) lands in T3.1. */
+/* Tailwind's dark: variant must key off the same .app-dark class PrimeVue's
+   darkModeSelector toggles (main.ts / useDarkMode) — the v4 default is the OS
+   prefers-color-scheme, which disagrees with PrimeVue's class-based dark tokens. */
+@custom-variant dark (&:where(.app-dark, .app-dark *));
