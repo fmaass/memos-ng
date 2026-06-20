@@ -18,6 +18,10 @@
             "title": "Downloadurl",
             "type": "string"
           },
+          "hasPrint": {
+            "title": "Hasprint",
+            "type": "boolean"
+          },
           "height": {
             "anyOf": [
               {
@@ -47,6 +51,10 @@
           },
           "previewUrl": {
             "title": "Previewurl",
+            "type": "string"
+          },
+          "printUrl": {
+            "title": "Printurl",
             "type": "string"
           },
           "status": {
@@ -84,12 +92,14 @@
           "width",
           "height",
           "mine",
+          "hasPrint",
           "orphan",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
           "posterUrl",
-          "downloadUrl"
+          "downloadUrl",
+          "printUrl"
         ],
         "title": "AttachmentListItem",
         "type": "object"
@@ -134,6 +144,10 @@
             ],
             "title": "Duration"
           },
+          "hasPrint": {
+            "title": "Hasprint",
+            "type": "boolean"
+          },
           "height": {
             "anyOf": [
               {
@@ -159,6 +173,10 @@
           },
           "previewUrl": {
             "title": "Previewurl",
+            "type": "string"
+          },
+          "printUrl": {
+            "title": "Printurl",
             "type": "string"
           },
           "size": {
@@ -203,7 +221,9 @@
           "blurhash",
           "captured_at",
           "mine",
+          "hasPrint",
           "downloadUrl",
+          "printUrl",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
@@ -321,6 +341,10 @@
             ],
             "title": "Duration"
           },
+          "hasPrint": {
+            "title": "Hasprint",
+            "type": "boolean"
+          },
           "height": {
             "anyOf": [
               {
@@ -346,6 +370,10 @@
           },
           "previewUrl": {
             "title": "Previewurl",
+            "type": "string"
+          },
+          "printUrl": {
+            "title": "Printurl",
             "type": "string"
           },
           "status": {
@@ -384,11 +412,13 @@
           "height",
           "duration",
           "mine",
+          "hasPrint",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
           "posterUrl",
-          "downloadUrl"
+          "downloadUrl",
+          "printUrl"
         ],
         "title": "AttachmentRef",
         "type": "object"
@@ -403,6 +433,20 @@
         ],
         "title": "AttachmentStatus",
         "type": "string"
+      },
+      "Body_upload_print_api_attachments__uid__print_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_print_api_attachments__uid__print_post",
+        "type": "object"
       },
       "HTTPValidationError": {
         "properties": {
@@ -1244,6 +1288,59 @@
           }
         },
         "summary": "Attachment Meta",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/api/attachments/{uid}/print": {
+      "post": {
+        "description": "Attach a print-quality master to an OWNED image attachment (a separate Lightroom print\nexport \u2014 see ADR web/print renditions). The web rendition keeps displaying; this file is\nhidden from the feed and download-only via the `print` tier.",
+        "operationId": "upload_print_api_attachments__uid__print_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_print_api_attachments__uid__print_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentMeta"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Print",
         "tags": [
           "assets"
         ]

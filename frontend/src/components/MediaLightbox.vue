@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 import { keyToIntent, stepIndex } from '@/lib/lightbox'
 
@@ -7,15 +7,29 @@ import { keyToIntent, stepIndex } from '@/lib/lightbox'
 interface LightboxItem {
   uid: string
   mime: string
-  mine?: boolean // owner → may delete
+  mine?: boolean // owner → may delete / attach a print master
+  hasPrint?: boolean
   previewUrl: string
   webUrl: string
   posterUrl: string
   downloadUrl: string
+  printUrl?: string
 }
 
 const props = defineProps<{ items: LightboxItem[]; modelValue: number | null }>()
-const emit = defineEmits<{ 'update:modelValue': [v: number | null]; delete: [uid: string] }>()
+const emit = defineEmits<{
+  'update:modelValue': [v: number | null]
+  delete: [uid: string]
+  'add-print': [payload: { uid: string; file: File }]
+}>()
+
+const printInput = ref<HTMLInputElement | null>(null)
+const isImage = computed(() => current.value?.mime.startsWith('image/') ?? false)
+function onPickPrint(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (file && current.value) emit('add-print', { uid: current.value.uid, file })
+  if (printInput.value) printInput.value.value = ''
+}
 
 const open = computed(() => props.modelValue !== null && props.modelValue < props.items.length)
 const idx = computed(() => props.modelValue ?? 0)
@@ -97,6 +111,37 @@ onBeforeUnmount(() => {
       >
         <i class="pi pi-trash text-xl" aria-hidden="true" />
       </button>
+      <!-- print master: download if present; owners can attach one to an image -->
+      <a
+        v-if="current.hasPrint && current.printUrl"
+        :href="current.printUrl"
+        class="absolute top-3 right-36 p-2 text-amber-300 hover:text-amber-200"
+        aria-label="Download print version"
+        title="Download print version"
+        download
+        data-test="lightbox-print-download"
+        @click.stop
+      >
+        <i class="pi pi-print text-xl" aria-hidden="true" />
+      </a>
+      <button
+        v-else-if="current.mine && isImage"
+        class="absolute top-3 right-36 p-2 text-white/70 hover:text-amber-200"
+        aria-label="Add print version"
+        title="Attach a print-quality master"
+        data-test="lightbox-add-print"
+        @click.stop="printInput?.click()"
+      >
+        <i class="pi pi-print text-xl opacity-60" aria-hidden="true" />
+      </button>
+      <input
+        ref="printInput"
+        type="file"
+        accept="image/*,.tif,.tiff"
+        class="hidden"
+        data-test="print-input"
+        @change="onPickPrint"
+      />
 
       <button
         v-if="idx > 0"

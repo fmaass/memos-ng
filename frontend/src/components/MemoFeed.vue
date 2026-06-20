@@ -62,6 +62,21 @@ const editMemo = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// Attach a print-quality master to one of your image attachments and refresh.
+const addPrint = useMutation({
+  mutationFn: async ({ uid, file }: { uid: string; file: File }) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(`/api/attachments/${uid}/print`, {
+      method: 'POST',
+      body: fd,
+      credentials: 'include',
+    })
+    if (!res.ok) throw new Error('print upload failed')
+  },
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+})
+
 // Delete one of a memo's attachments (owner-only on the server) and refresh the feed.
 const deleteAttachment = useMutation({
   mutationFn: async (uid: string) => {
@@ -110,6 +125,7 @@ onUnmounted(() => observer?.disconnect())
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"
         @delete-attachment="deleteAttachment.mutate($event)"
+        @add-print="addPrint.mutate($event)"
         @edit="editMemo.mutate($event)"
       />
     </template>

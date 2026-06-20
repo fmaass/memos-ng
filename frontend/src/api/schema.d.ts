@@ -50,6 +50,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/attachments/{uid}/print": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload Print
+         * @description Attach a print-quality master to an OWNED image attachment (a separate Lightroom print
+         *     export — see ADR web/print renditions). The web rendition keeps displaying; this file is
+         *     hidden from the feed and download-only via the `print` tier.
+         */
+        post: operations["upload_print_api_attachments__uid__print_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/attachments/{uid}/{tier}": {
         parameters: {
             query?: never;
@@ -499,6 +521,8 @@ export interface components {
             blurhash: string | null;
             /** Downloadurl */
             downloadUrl: string;
+            /** Hasprint */
+            hasPrint: boolean;
             /** Height */
             height: number | null;
             /** Mime */
@@ -511,6 +535,8 @@ export interface components {
             posterUrl: string;
             /** Previewurl */
             previewUrl: string;
+            /** Printurl */
+            printUrl: string;
             status: components["schemas"]["AttachmentStatus"];
             /** Thumbnailurl */
             thumbnailUrl: string;
@@ -531,6 +557,8 @@ export interface components {
             downloadUrl: string;
             /** Duration */
             duration: number | null;
+            /** Hasprint */
+            hasPrint: boolean;
             /** Height */
             height: number | null;
             /** Mime */
@@ -541,6 +569,8 @@ export interface components {
             posterUrl: string;
             /** Previewurl */
             previewUrl: string;
+            /** Printurl */
+            printUrl: string;
             /** Size */
             size: number;
             status: components["schemas"]["AttachmentStatus"];
@@ -581,6 +611,8 @@ export interface components {
             downloadUrl: string;
             /** Duration */
             duration: number | null;
+            /** Hasprint */
+            hasPrint: boolean;
             /** Height */
             height: number | null;
             /** Mime */
@@ -591,6 +623,8 @@ export interface components {
             posterUrl: string;
             /** Previewurl */
             previewUrl: string;
+            /** Printurl */
+            printUrl: string;
             status: components["schemas"]["AttachmentStatus"];
             /** Thumbnailurl */
             thumbnailUrl: string;
@@ -606,6 +640,11 @@ export interface components {
          * @enum {string}
          */
         AttachmentStatus: "uploading" | "pending" | "processing" | "ready" | "failed";
+        /** Body_upload_print_api_attachments__uid__print_post */
+        Body_upload_print_api_attachments__uid__print_post: {
+            /** File */
+            file: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -932,6 +971,41 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upload_print_api_attachments__uid__print_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_print_api_attachments__uid__print_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentMeta"];
+                };
             };
             /** @description Validation Error */
             422: {

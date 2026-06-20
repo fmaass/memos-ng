@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated
 
 from anyio import to_thread
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete as sa_delete
@@ -21,7 +21,7 @@ from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
 
-TIERS = ("original", "thumb", "mobile", "web", "poster")
+TIERS = ("original", "thumb", "mobile", "web", "poster", "print")
 
 
 def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
@@ -29,6 +29,12 @@ def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
     uid = attachment.uid
     if tier == "original":
         return (Path(attachment.storage_path), attachment.mime) if attachment.storage_path else None
+    if tier == "print":  # separately-uploaded print master (download-only); None if absent
+        return (
+            (Path(attachment.print_path), attachment.print_mime or "application/octet-stream")
+            if attachment.print_path
+            else None
+        )
     if tier == "thumb":
         return assets / "thumbs" / f"{uid}.jpg", "image/jpeg"
     if tier == "mobile":
@@ -69,7 +75,9 @@ class AttachmentMeta(BaseModel):
     blurhash: str | None
     captured_at: datetime | None
     mine: bool
+    hasPrint: bool  # a print-quality master has been uploaded
     downloadUrl: str
+    printUrl: str
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -84,12 +92,14 @@ class AttachmentListItem(BaseModel):
     width: int | None  # for justified/aspect-ratio gallery layout (no CLS)
     height: int | None
     mine: bool  # the requesting user owns it (→ may delete)
+    hasPrint: bool  # a print-quality master has been uploaded
     orphan: bool  # not linked to a memo
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
     posterUrl: str
     downloadUrl: str
+    printUrl: str
 
 
 def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
@@ -102,12 +112,14 @@ def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
         width=att.width,
         height=att.height,
         mine=att.owner_id == user_id,
+        hasPrint=att.print_path is not None,
         orphan=att.memo_id is None,
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",
         webUrl=f"{base}/web",
         posterUrl=f"{base}/poster",
         downloadUrl=f"{base}/original",
+        printUrl=f"{base}/print",
     )
 
 
@@ -156,7 +168,9 @@ async def attachment_meta(
         blurhash=att.blurhash,
         captured_at=att.captured_at,
         mine=att.owner_id == user.id,
+        hasPrint=att.print_path is not None,
         downloadUrl=f"{base}/original",
+        printUrl=f"{base}/print",
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",
         webUrl=f"{base}/web",
@@ -205,6 +219,8 @@ def _all_asset_paths(att: Attachment) -> list[Path]:
     paths: list[Path] = []
     if att.storage_path:
         paths.append(Path(att.storage_path))
+    if att.print_path:
+        paths.append(Path(att.print_path))
     for tier in ("thumb", "mobile", "web", "poster"):
         resolved = _tier_path(att, tier)
         if resolved is not None:
@@ -239,6 +255,42 @@ async def delete_attachment(
     await db.delete(att)
     await db.commit()
     await to_thread.run_sync(_unlink_all, paths)
+
+
+def _save_print_sync(part_dir: Path, uid: str, data: bytes, suffix: str) -> str:
+    part_dir.mkdir(parents=True, exist_ok=True)
+    dest = part_dir / f"{uid}{suffix}"
+    dest.write_bytes(data)
+    return str(dest)
+
+
+@router.post("/attachments/{uid}/print", response_model=AttachmentMeta)
+async def upload_print(
+    uid: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+    file: UploadFile,
+) -> AttachmentMeta:
+    """Attach a print-quality master to an OWNED image attachment (a separate Lightroom print
+    export — see ADR web/print renditions). The web rendition keeps displaying; this file is
+    hidden from the feed and download-only via the `print` tier."""
+    att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
+    if att is None or att.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if not att.mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Print masters are for images only")
+    data = await file.read()
+    if len(data) > settings.MAX_UPLOAD_MIB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"Exceeds {settings.MAX_UPLOAD_MIB} MiB")
+    suffix = Path(file.filename or "").suffix or ".bin"
+    path = await to_thread.run_sync(
+        _save_print_sync, Path(settings.DATA_ROOT) / "print", uid, data, suffix
+    )
+    att.print_path = path
+    att.print_mime = file.content_type or "application/octet-stream"
+    att.print_size = len(data)
+    await db.commit()
+    return await attachment_meta(uid, user, db)
 
 
 # --- SSE media status channel (poll-based; LISTEN/NOTIFY is a future enhancement) ---

@@ -14,11 +14,13 @@ function imageAtt(uid: string) {
     height: null,
     duration: null,
     mine: true,
+    hasPrint: false,
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
     webUrl: `/api/attachments/${uid}/web`,
     posterUrl: `/api/attachments/${uid}/poster`,
     downloadUrl: `/api/attachments/${uid}/original`,
+    printUrl: `/api/attachments/${uid}/print`,
   }
 }
 

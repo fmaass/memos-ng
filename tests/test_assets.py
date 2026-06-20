@@ -235,6 +235,39 @@ def test_cannot_delete_another_users_shared_attachment(logged_in_client, monkeyp
         _rm("delsharer", mid)
 
 
+def test_upload_print_master_then_serve_and_flag(logged_in_client, monkeypatch, tmp_path):
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid = _seed_attachment("pr-img", subject, mime="image/jpeg")
+    try:
+        assert client.get("/api/attachments/pr-img").json()["hasPrint"] is False
+        r = client.post(
+            "/api/attachments/pr-img/print",
+            files={"file": ("p.tif", b"PRINTMASTERBYTES", "image/tiff")},
+        )
+        assert r.status_code == 200 and r.json()["hasPrint"] is True
+        served = client.get("/api/attachments/pr-img/print")
+        assert served.status_code == 200 and served.content == b"PRINTMASTERBYTES"
+    finally:
+        _cleanup(aid)
+
+
+def test_upload_print_is_owner_only(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _mk_user("prsharer")
+    mid, aid = _seed_memo_with_attachment("prm", "pr-shared", "prsharer", "PUBLIC")
+    try:
+        r = client.post(
+            "/api/attachments/pr-shared/print",
+            files={"file": ("p.tif", b"X", "image/tiff")},
+        )
+        assert r.status_code == 404  # can view the shared image, cannot attach a print master
+    finally:
+        _cleanup(aid)
+        _rm("prsharer", mid)
+
+
 def test_list_attachments_requires_auth(client):
     assert client.get("/api/attachments").status_code == 401
 

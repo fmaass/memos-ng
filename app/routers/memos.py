@@ -22,11 +22,13 @@ class AttachmentRef(BaseModel):
     height: int | None
     duration: float | None
     mine: bool  # the requesting user owns it (→ may delete); shared media is view-only
+    hasPrint: bool  # a print-quality master has been uploaded
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
     posterUrl: str
     downloadUrl: str
+    printUrl: str
 
 
 class ReactionSummary(BaseModel):
@@ -93,11 +95,13 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         height=att.height,
         duration=att.duration,
         mine=att.owner_id == user_id,
+        hasPrint=att.print_path is not None,
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",
         webUrl=f"{base}/web",
         posterUrl=f"{base}/poster",
         downloadUrl=f"{base}/original",
+        printUrl=f"{base}/print",
     )
 
 

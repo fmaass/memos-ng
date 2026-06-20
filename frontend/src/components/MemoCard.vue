@@ -19,6 +19,7 @@ const emit = defineEmits<{
   'task-toggle': [payload: { uid: string; content: string }]
   'toggle-reaction': [payload: { uid: string; emoji: string; add: boolean }]
   'delete-attachment': [uid: string]
+  'add-print': [payload: { uid: string; file: File }]
   edit: [payload: { uid: string; content: string; visibility: Visibility; created_at: string }]
 }>()
 
@@ -161,6 +162,7 @@ function onContentClick(event: MouseEvent) {
       v-model="lightboxIndex"
       :items="memo.attachments ?? []"
       @delete="onDeleteAttachment"
+      @add-print="emit('add-print', $event)"
     />
 
     <div v-if="memo.tags.length" class="flex flex-wrap gap-1">

@@ -38,6 +38,17 @@ async function onDelete(uid: string) {
   lightboxIndex.value = null
   await queryClient.invalidateQueries({ queryKey: ['attachments'] })
 }
+
+async function onAddPrint({ uid, file }: { uid: string; file: File }) {
+  const fd = new FormData()
+  fd.append('file', file)
+  const res = await fetch(`/api/attachments/${uid}/print`, {
+    method: 'POST',
+    body: fd,
+    credentials: 'include',
+  })
+  if (res.ok) await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+}
 </script>
 
 <template>
@@ -56,6 +67,11 @@ async function onDelete(uid: string) {
       No attachments yet.
     </p>
     <JustifiedGallery v-else :items="items" :target-height="200" @open="lightboxIndex = $event" />
-    <MediaLightbox v-model="lightboxIndex" :items="items" @delete="onDelete" />
+    <MediaLightbox
+      v-model="lightboxIndex"
+      :items="items"
+      @delete="onDelete"
+      @add-print="onAddPrint"
+    />
   </section>
 </template>

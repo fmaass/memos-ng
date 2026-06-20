@@ -143,6 +143,12 @@ class Attachment(Base):
         index=True,
     )
     storage_path: Mapped[str | None] = mapped_column(String(1024))
+    # Optional print-quality rendition (a separately-uploaded Lightroom print export): same
+    # logical photo, hidden from display, download-only. NOT derivable from the web master —
+    # output sharpening + color profile differ per medium (ADR: web/print renditions).
+    print_path: Mapped[str | None] = mapped_column(String(1024))
+    print_mime: Mapped[str | None] = mapped_column(String(255))
+    print_size: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
