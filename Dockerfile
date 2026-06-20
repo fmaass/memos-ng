@@ -20,8 +20,10 @@ WORKDIR /app
 
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 COPY pyproject.toml uv.lock* ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+# No BuildKit cache mount: Saturn's Docker 24 defaults to the classic builder, and
+# the passwordless-sudo exclusion only covers `docker` (not `env`/buildkit). Plain
+# RUN keeps one Dockerfile that builds on both classic and BuildKit (CI).
+RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 COPY --from=frontend /build/dist /app/frontend/dist
