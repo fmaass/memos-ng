@@ -38,6 +38,7 @@ class ReactionSummary(BaseModel):
 class MemoOut(BaseModel):
     uid: str
     owner: str
+    mine: bool  # the requesting user owns it (→ may edit/delete)
     content: str
     visibility: Visibility
     pinned: bool
@@ -116,6 +117,7 @@ def _out(memo: Memo, user_id: int) -> MemoOut:
     return MemoOut(
         uid=memo.uid,
         owner=memo.owner.subject,
+        mine=memo.owner_id == user_id,
         content=memo.content,
         visibility=memo.visibility,
         pinned=memo.pinned,

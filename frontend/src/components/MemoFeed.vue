@@ -50,6 +50,18 @@ const toggleReaction = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// Edit a memo's content / visibility / display date (owner-only on the server) and refresh.
+const editMemo = useMutation({
+  mutationFn: async (p: { uid: string; content: string; visibility: string; created_at: string }) => {
+    const { error } = await api.PATCH('/api/memos/{uid}', {
+      params: { path: { uid: p.uid } },
+      body: { content: p.content, visibility: p.visibility as never, created_at: p.created_at },
+    })
+    if (error) throw error
+  },
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+})
+
 // Delete one of a memo's attachments (owner-only on the server) and refresh the feed.
 const deleteAttachment = useMutation({
   mutationFn: async (uid: string) => {
@@ -98,6 +110,7 @@ onUnmounted(() => observer?.disconnect())
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"
         @delete-attachment="deleteAttachment.mutate($event)"
+        @edit="editMemo.mutate($event)"
       />
     </template>
     <div ref="sentinel" class="h-4" data-test="sentinel" />

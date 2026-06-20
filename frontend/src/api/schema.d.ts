@@ -663,6 +663,8 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Mine */
+            mine: boolean;
             /** Owner */
             owner: string;
             /** Pinned */

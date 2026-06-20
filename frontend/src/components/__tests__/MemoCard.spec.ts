@@ -26,6 +26,7 @@ function memo(content: string, tags: string[] = [], attachments: ReturnType<type
   return {
     uid: 'm1',
     owner: 'alice',
+    mine: true,
     content,
     visibility: 'PRIVATE' as const,
     pinned: false,
@@ -82,6 +83,22 @@ describe('MemoCard', () => {
     expect(lb.props('modelValue')).toBe(null) // closed
     await wrapper.find('[data-test="tile-image"]').trigger('click')
     expect(lb.props('modelValue')).toBe(0) // opened at the memo's first attachment
+  })
+
+  it('edits content + visibility + date and emits edit on save', async () => {
+    const wrapper = mountCard({ memo: memo('original') })
+    await wrapper.find('[data-test="memo-edit"]').trigger('click')
+    expect(wrapper.find('[data-test="memo-editor"]').exists()).toBe(true)
+    await wrapper.find('[data-test="edit-content"]').setValue('edited text')
+    await wrapper.find('[data-test="edit-save"]').trigger('click')
+    const payload = wrapper.emitted('edit')?.[0]?.[0] as { uid: string; content: string }
+    expect(payload.uid).toBe('m1')
+    expect(payload.content).toBe('edited text')
+  })
+
+  it('hides the edit affordance on memos the user does not own', () => {
+    const wrapper = mountCard({ memo: { ...memo('x'), mine: false } })
+    expect(wrapper.find('[data-test="memo-edit"]').exists()).toBe(false)
   })
 
   it('adds a reaction from the picker', async () => {

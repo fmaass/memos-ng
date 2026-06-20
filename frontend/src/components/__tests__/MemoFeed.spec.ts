@@ -9,6 +9,7 @@ function memoStub(uid: string, content: string, created_at = '2026-06-20T10:00:0
   return {
     uid,
     owner: 'alice',
+    mine: true,
     content,
     visibility: 'PRIVATE' as const,
     pinned: false,

@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import Button from 'primevue/button'
+import DatePicker from 'primevue/datepicker'
+import Select from 'primevue/select'
 import { computed, ref } from 'vue'
 
 import MediaLightbox from '@/components/MediaLightbox.vue'
@@ -8,6 +11,7 @@ import { renderMemoMarkdown } from '@/lib/markdown'
 import { toggleTask } from '@/lib/tasks'
 
 type Memo = components['schemas']['MemoOut']
+type Visibility = Memo['visibility']
 
 const props = defineProps<{ memo: Memo; restorable?: boolean }>()
 const emit = defineEmits<{
@@ -15,7 +19,33 @@ const emit = defineEmits<{
   'task-toggle': [payload: { uid: string; content: string }]
   'toggle-reaction': [payload: { uid: string; emoji: string; add: boolean }]
   'delete-attachment': [uid: string]
+  edit: [payload: { uid: string; content: string; visibility: Visibility; created_at: string }]
 }>()
+
+const visibilityOptions = [
+  { label: 'Private', value: 'PRIVATE', icon: 'pi pi-lock' },
+  { label: 'Protected', value: 'PROTECTED', icon: 'pi pi-users' },
+  { label: 'Public', value: 'PUBLIC', icon: 'pi pi-globe' },
+]
+const editing = ref(false)
+const editContent = ref('')
+const editVisibility = ref<Visibility>('PRIVATE')
+const editDate = ref<Date | null>(null)
+function startEdit() {
+  editContent.value = props.memo.content
+  editVisibility.value = props.memo.visibility
+  editDate.value = new Date(props.memo.created_at)
+  editing.value = true
+}
+function saveEdit() {
+  emit('edit', {
+    uid: props.memo.uid,
+    content: editContent.value,
+    visibility: editVisibility.value,
+    created_at: (editDate.value ?? new Date(props.memo.created_at)).toISOString(),
+  })
+  editing.value = false
+}
 
 const REACTION_CHOICES = ['👍', '❤️', '😄', '🎉']
 const pickerOpen = ref(false)
@@ -60,11 +90,64 @@ function onContentClick(event: MouseEvent) {
 
 <template>
   <article
-    class="rounded-xl border border-surface-200 dark:border-surface-700 p-4 flex flex-col gap-2"
+    class="group relative flex flex-col gap-2 rounded-xl border border-surface-200 p-4 dark:border-surface-700"
     data-test="memo-card"
   >
+    <button
+      v-if="memo.mine && !editing && !restorable"
+      type="button"
+      class="absolute right-2 top-2 p-1.5 text-muted-color opacity-0 transition hover:text-color group-hover:opacity-100"
+      aria-label="Edit memo"
+      data-test="memo-edit"
+      @click="startEdit"
+    >
+      <i class="pi pi-pencil text-sm" aria-hidden="true" />
+    </button>
+
+    <!-- edit mode: content + visibility + display date -->
+    <div v-if="editing" class="flex flex-col gap-2" data-test="memo-editor">
+      <textarea
+        v-model="editContent"
+        rows="3"
+        class="w-full resize-y rounded-md border border-surface-200 bg-transparent p-2 outline-none dark:border-surface-700"
+        data-test="edit-content"
+      />
+      <div class="flex flex-wrap items-center gap-2">
+        <DatePicker
+          v-model="editDate"
+          show-time
+          hour-format="24"
+          show-icon
+          icon-display="input"
+          size="small"
+          date-format="M d, yy"
+          class="w-48"
+          data-test="edit-date"
+        />
+        <Select
+          v-model="editVisibility"
+          :options="visibilityOptions"
+          option-label="label"
+          option-value="value"
+          size="small"
+          class="text-muted-color"
+          data-test="edit-visibility"
+        />
+        <div class="ml-auto flex gap-1">
+          <Button text size="small" label="Cancel" data-test="edit-cancel" @click="editing = false" />
+          <Button size="small" label="Save" icon="pi pi-check" data-test="edit-save" @click="saveEdit" />
+        </div>
+      </div>
+    </div>
+
     <!-- eslint-disable-next-line vue/no-v-html -- content sanitized by renderMemoMarkdown -->
-    <div class="memo-content break-words" data-test="memo-content" v-html="html" @click="onContentClick" />
+    <div
+      v-else
+      class="memo-content break-words"
+      data-test="memo-content"
+      v-html="html"
+      @click="onContentClick"
+    />
 
     <div
       v-if="memo.attachments?.length"

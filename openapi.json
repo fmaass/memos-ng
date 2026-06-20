@@ -558,6 +558,10 @@
             "title": "Created At",
             "type": "string"
           },
+          "mine": {
+            "title": "Mine",
+            "type": "boolean"
+          },
           "owner": {
             "title": "Owner",
             "type": "string"
@@ -602,6 +606,7 @@
         "required": [
           "uid",
           "owner",
+          "mine",
           "content",
           "visibility",
           "pinned",
