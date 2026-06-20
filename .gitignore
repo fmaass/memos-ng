@@ -31,3 +31,6 @@ fixtures/live-0.29.1/
 
 # claude code harness runtime
 .claude/
+
+# session reviews (local only)
+docs/session-reviews/

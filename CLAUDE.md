@@ -109,5 +109,6 @@ met until its tests exist and pass.
   same session.
 - Session review at the end of every implementation session (see `~/CLAUDE.md`).
 - ARCHIMEDES: documented under the `memos-ng` BookStack shelf (to be created, plan T6.1);
-  roadmap of record is BookStack page 1646 / local plan above. Read accepted ADRs before
+  roadmap of record is BookStack page 1649 (book 1648 "memos-ng — Features"; page 1646 is the
+  superseded portainer-stacks draft) / local plan above. Read accepted ADRs before
   re-litigating settled decisions.

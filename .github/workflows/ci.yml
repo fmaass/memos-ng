@@ -33,6 +33,8 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check app/ tests/ scripts/
       - run: uv run pyright app/
+      - name: Migrations apply cleanly from an empty database
+        run: uv run alembic upgrade head
       - run: uv run pytest -q
 
   frontend:
@@ -96,25 +98,30 @@ jobs:
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
       - id: build
+        # Build into the local daemon (load), do NOT publish yet — Trivy must gate
+        # the push so an image with HIGH/CRITICAL CVEs never becomes public.
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           build-args: APP_VERSION=${{ github.sha }}
           provenance: false
-      - name: Trivy scan (fail on HIGH/CRITICAL) — digest-pinned (ADR-0003)
+      - name: Trivy scan the local image BEFORE publishing (fail on HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: ghcr.io/fmaass/memos-ng@${{ steps.build.outputs.digest }}
+          image-ref: ghcr.io/fmaass/memos-ng:latest
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true
+      - name: Publish only after the scan passes
+        run: docker push --all-tags ghcr.io/fmaass/memos-ng
       - name: SBOM (syft)
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/fmaass/memos-ng@${{ steps.build.outputs.digest }}
+          image: ghcr.io/fmaass/memos-ng:latest
           format: spdx-json
           output-file: sbom.spdx.json
       - uses: actions/upload-artifact@v4
