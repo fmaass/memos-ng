@@ -78,6 +78,8 @@ class AttachmentListItem(BaseModel):
     mime: str
     status: AttachmentStatus
     blurhash: str | None
+    width: int | None  # for justified/aspect-ratio gallery layout (no CLS)
+    height: int | None
     orphan: bool  # not linked to a memo
     thumbnailUrl: str
     previewUrl: str
@@ -93,6 +95,8 @@ def _list_item(att: Attachment) -> AttachmentListItem:
         mime=att.mime,
         status=att.status,
         blurhash=att.blurhash,
+        width=att.width,
+        height=att.height,
         orphan=att.memo_id is None,
         thumbnailUrl=f"{base}/thumb",
         previewUrl=f"{base}/mobile",

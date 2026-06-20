@@ -18,6 +18,17 @@
             "title": "Downloadurl",
             "type": "string"
           },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
           "mime": {
             "title": "Mime",
             "type": "string"
@@ -48,6 +59,17 @@
           "webUrl": {
             "title": "Weburl",
             "type": "string"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
           }
         },
         "required": [
@@ -55,6 +77,8 @@
           "mime",
           "status",
           "blurhash",
+          "width",
+          "height",
           "orphan",
           "thumbnailUrl",
           "previewUrl",

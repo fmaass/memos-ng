@@ -3,7 +3,8 @@ import { useQuery } from '@tanstack/vue-query'
 import SelectButton from 'primevue/selectbutton'
 import { computed, ref } from 'vue'
 
-import MediaTile from '@/components/MediaTile.vue'
+import JustifiedGallery from '@/components/JustifiedGallery.vue'
+import MediaLightbox from '@/components/MediaLightbox.vue'
 import { useApi } from '@/composables/useApi'
 import type { MemoQuery } from '@/composables/useTimeline'
 
@@ -25,10 +26,13 @@ const { data, isPending } = useQuery({
     return data
   },
 })
+
+const items = computed(() => data.value ?? [])
+const lightboxIndex = ref<number | null>(null)
 </script>
 
 <template>
-  <section class="max-w-3xl mx-auto p-4 flex flex-col gap-3" data-test="view-resources">
+  <section class="mx-auto flex max-w-6xl flex-col gap-4 p-4" data-test="view-resources">
     <h1 class="text-2xl font-semibold">Resources</h1>
     <SelectButton
       v-model="filter"
@@ -38,20 +42,11 @@ const { data, isPending } = useQuery({
       :allow-empty="false"
       data-test="type-filter"
     />
-    <p v-if="isPending" class="text-muted-color text-sm">Loading…</p>
-    <p v-else-if="!data?.length" class="text-muted-color text-sm" data-test="resources-empty">
+    <p v-if="isPending" class="text-sm text-muted-color">Loading…</p>
+    <p v-else-if="!items.length" class="text-sm text-muted-color" data-test="resources-empty">
       No attachments yet.
     </p>
-    <div v-else class="grid grid-cols-3 sm:grid-cols-4 gap-2" data-test="resource-grid">
-      <div v-for="a in data" :key="a.uid" class="relative">
-        <MediaTile :att="a" />
-        <span
-          v-if="a.orphan"
-          class="absolute top-1 right-1 text-xs bg-amber-500/80 text-white px-1 rounded"
-          data-test="orphan-badge"
-          >orphan</span
-        >
-      </div>
-    </div>
+    <JustifiedGallery v-else :items="items" :target-height="200" @open="lightboxIndex = $event" />
+    <MediaLightbox v-model="lightboxIndex" :items="items" />
   </section>
 </template>

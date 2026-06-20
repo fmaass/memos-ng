@@ -493,6 +493,8 @@ export interface components {
             blurhash: string | null;
             /** Downloadurl */
             downloadUrl: string;
+            /** Height */
+            height: number | null;
             /** Mime */
             mime: string;
             /** Orphan */
@@ -508,6 +510,8 @@ export interface components {
             uid: string;
             /** Weburl */
             webUrl: string;
+            /** Width */
+            width: number | null;
         };
         /** AttachmentMeta */
         AttachmentMeta: {

@@ -14,6 +14,8 @@ vi.mock('@tanstack/vue-query', () => ({
         mime: 'image/jpeg',
         status: 'ready',
         blurhash: null,
+        width: 800,
+        height: 600,
         orphan: true,
         thumbnailUrl: '/api/attachments/a1/thumb',
         previewUrl: '/api/attachments/a1/mobile',
@@ -27,10 +29,12 @@ vi.mock('@tanstack/vue-query', () => ({
 }))
 
 describe('ResourcesView', () => {
-  it('renders a media tile per attachment and flags orphans', () => {
+  it('renders the justified gallery + type filter (not the old square grid)', () => {
+    // Layout/image sizing needs real DOM width (covered by lib/justified.spec); here we assert the
+    // gallery container + filter are wired and the legacy grid/tile markup is gone.
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue] } })
-    expect(wrapper.findAll('[data-test="media-tile"]')).toHaveLength(1)
-    expect(wrapper.find('[data-test="orphan-badge"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="justified-gallery"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="type-filter"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="resource-grid"]').exists()).toBe(false)
   })
 })
