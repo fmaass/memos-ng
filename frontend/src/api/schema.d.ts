@@ -21,42 +21,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/{path}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Api Fallback
-         * @description Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML.
-         */
-        get: operations["api_fallback_api__path__post"];
-        /**
-         * Api Fallback
-         * @description Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML.
-         */
-        put: operations["api_fallback_api__path__post"];
-        /**
-         * Api Fallback
-         * @description Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML.
-         */
-        post: operations["api_fallback_api__path__post"];
-        /**
-         * Api Fallback
-         * @description Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML.
-         */
-        delete: operations["api_fallback_api__path__post"];
-        options?: never;
-        head?: never;
-        /**
-         * Api Fallback
-         * @description Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML.
-         */
-        patch: operations["api_fallback_api__path__post"];
-        trace?: never;
-    };
     "/{path}": {
         parameters: {
             query?: never;
@@ -64,8 +28,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Serve Spa Fallback */
-        get: operations["serve_spa_fallback__path__get"];
+        /** Serve Spa */
+        get: operations["serve_spa__path__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -85,25 +49,25 @@ export interface components {
         };
         /** HealthResponse */
         HealthResponse: {
+            /** Db */
+            db?: string | null;
             /** Status */
             status: string;
             /** Version */
             version: string;
-            /** Db */
-            db?: string | null;
         };
         /** ValidationError */
         ValidationError: {
+            /** Context */
+            ctx?: Record<string, never>;
+            /** Input */
+            input?: unknown;
             /** Location */
             loc: (string | number)[];
             /** Message */
             msg: string;
             /** Error Type */
             type: string;
-            /** Input */
-            input?: unknown;
-            /** Context */
-            ctx?: Record<string, never>;
         };
     };
     responses: never;
@@ -134,162 +98,7 @@ export interface operations {
             };
         };
     };
-    api_fallback_api__path__post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                path: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_fallback_api__path__post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                path: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_fallback_api__path__post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                path: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_fallback_api__path__post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                path: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_fallback_api__path__post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                path: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    serve_spa_fallback__path__get: {
+    serve_spa__path__get: {
         parameters: {
             query?: never;
             header?: never;

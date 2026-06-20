@@ -56,9 +56,18 @@ async def health(response: Response) -> HealthResponse:
     return HealthResponse(status="ok", version=__version__)
 
 
-@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route(
+    "/api/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    include_in_schema=False,
+)
 async def api_fallback(path: str):
-    """Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML."""
+    """Catch-all for unmatched /api/* routes — JSON 404 instead of SPA HTML.
+
+    Excluded from the OpenAPI schema: it is an internal 404 helper, not a real
+    endpoint, and a single multi-method route makes FastAPI emit non-deterministic
+    operationIds (which would flake the CI drift gate).
+    """
     return JSONResponse({"detail": f"/api/{path} not found"}, status_code=404)
 
 

@@ -10,5 +10,8 @@ from pathlib import Path
 from app.main import app
 
 out = Path(__file__).resolve().parent.parent / "openapi.json"
-out.write_text(json.dumps(app.openapi(), indent=2) + "\n")
+# sort_keys=True makes the snapshot deterministic — FastAPI emits set-valued route
+# methods (e.g. the /api/{path} catch-all) in arbitrary order, which would otherwise
+# make the CI drift gate flaky.
+out.write_text(json.dumps(app.openapi(), indent=2, sort_keys=True) + "\n")
 print(f"wrote {out} ({out.stat().st_size} bytes)")

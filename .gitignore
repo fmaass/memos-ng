@@ -28,3 +28,6 @@ data/
 # os
 .DS_Store
 fixtures/live-0.29.1/
+
+# claude code harness runtime
+.claude/
