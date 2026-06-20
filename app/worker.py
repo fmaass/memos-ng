@@ -102,6 +102,12 @@ async def _notify_terminal_safe(attachment_id: int) -> None:
 async def run_once(db: AsyncSession) -> str:
     """Claim+process one job in one transaction (row locked until commit).
     Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off)."""
+    # Whole-worker thermal gate: when the host is too hot, claim/process NOTHING (the fast
+    # lane's image work has no inner thermal check, so a bulk import could otherwise drive a
+    # transcode/thumbnail storm). Back off until it cools — protects the thermally-coupled host.
+    if media.too_hot():
+        await db.commit()
+        return "deferred"
     job = await claim_one(db)
     if job is None:
         await db.commit()

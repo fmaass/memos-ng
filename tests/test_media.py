@@ -153,3 +153,27 @@ def test_heartbeat_written(monkeypatch, tmp_path):
     worker.beat()
     p = worker.heartbeat_path()
     assert p.exists() and time.time() - float(p.read_text()) < 5
+
+
+def test_worker_defers_everything_when_too_hot(monkeypatch, tmp_path):
+    # Whole-worker thermal gate: when too hot, even a fast-lane image job is NOT processed.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _make_png(tmp_path / "hot.png")
+    aid, jid = _seed("image/png", str(tmp_path / "hot.png"))
+    monkeypatch.setattr(media, "too_hot", lambda: True)
+    try:
+
+        async def _go():
+            async with async_session() as db:
+                return await worker.run_once(db)
+
+        assert asyncio.run(_go()) == "deferred"
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            state = c.execute(
+                text("SELECT state FROM media_jobs WHERE id=:j"), {"j": jid}
+            ).scalar_one()
+        eng.dispose()
+        assert state == "queued"  # nothing claimed/processed while hot
+    finally:
+        _cleanup(aid)
