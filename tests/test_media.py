@@ -177,3 +177,22 @@ def test_worker_defers_everything_when_too_hot(monkeypatch, tmp_path):
         assert state == "queued"  # nothing claimed/processed while hot
     finally:
         _cleanup(aid)
+
+
+def test_poster_seek_skips_intro_and_clamps():
+    from app.services.media import poster_seek_seconds
+
+    assert poster_seek_seconds(None) == 0.0  # unknown duration → from start
+    assert poster_seek_seconds(1.0) == 0.0  # very short clip → from start
+    assert poster_seek_seconds(100.0) == 12.0  # ~12% in
+    # short clips clamp up to the 0.5s floor (3s → 0.12*3 = 0.36, raised to 0.5)
+    assert poster_seek_seconds(3.0) == 0.5
+
+
+def test_poster_cmd_uses_thumbnail_filter():
+    from app.services.media import poster_ffmpeg_cmd
+
+    cmd = poster_ffmpeg_cmd("/in.mov", "/out.jpg", 100.0)
+    assert "thumbnail=100" in cmd  # representative-frame heuristic, not the first frame
+    assert "-ss" in cmd and "12.00" in cmd  # seeks past the intro
+    assert cmd[-1] == "/out.jpg" and "/in.mov" in cmd

@@ -94,6 +94,35 @@ def _ffprobe(path: str) -> dict:
     }
 
 
+def poster_seek_seconds(duration: float | None) -> float:
+    """Seek past a video's intro before picking the poster — skips black/establishing frames.
+    ~12% in, but always leave a window before the end and never seek a very short clip."""
+    if not duration or duration <= 2:
+        return 0.0
+    return max(0.5, min(duration * 0.12, duration - 1.0))
+
+
+def poster_ffmpeg_cmd(src: str, dest: str, duration: float | None) -> list[str]:
+    """Pick a representative 'hero' frame: seek past the intro, then ffmpeg's `thumbnail`
+    filter selects the frame most different from its neighbours' average over a 100-frame
+    window — the industry-standard cheap heuristic, instead of the odd first frame."""
+    return [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{poster_seek_seconds(duration):.2f}",
+        "-i",
+        src,
+        "-vf",
+        "thumbnail=100",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+        dest,
+    ]
+
+
 def process_video_poster(attachment: Attachment) -> dict:
     """Fast lane for video: probe dims/duration + extract a poster frame + blurhash.
     The H.264 transcode (slow lane) lands in T2.3."""
@@ -105,19 +134,7 @@ def process_video_poster(attachment: Attachment) -> dict:
     # keep the real extension so ffmpeg can infer the muxer (a .jpg.tmp suffix fails)
     tmp = poster_path.with_name(f"{poster_path.stem}.tmp{poster_path.suffix}")
     subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            "0.5",
-            "-i",
-            src,
-            "-frames:v",
-            "1",
-            "-q:v",
-            "3",
-            str(tmp),
-        ],
+        poster_ffmpeg_cmd(src, str(tmp), meta.get("duration")),
         capture_output=True,
         timeout=60,
         check=True,
