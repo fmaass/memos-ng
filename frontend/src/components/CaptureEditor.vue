@@ -71,15 +71,16 @@ async function save() {
   if (!content.value.trim()) return
   saving.value = true
   try {
-    // Link any uploads that have already finished; a memo posts without waiting on the rest.
-    const attachment_uids = uploads
-      .filter((u) => u.status === 'done' && u.attachmentUid)
-      .map((u) => u.attachmentUid!)
+    // Finalize-on-post: send the finished uploads' upload_uids; the server turns them into
+    // attachments now. Uploads still in flight are not posted (and simply expire) — no orphans.
+    const upload_uids = uploads
+      .filter((u) => u.status === 'done' && u.uploadUid)
+      .map((u) => u.uploadUid!)
     const body: Record<string, unknown> = {
       content: content.value,
       visibility: visibility.value,
       pinned: false,
-      attachment_uids,
+      upload_uids,
     }
     if (memoDate.value) body.created_at = memoDate.value.toISOString() // only when backdated
     const { data, error } = await api.POST('/api/memos', { body: body as never })

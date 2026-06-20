@@ -139,6 +139,57 @@ async def test_dedup_is_per_owner(adb, monkeypatch, tmp_path):
     assert att_a2.uid == att_a.uid  # same owner, same bytes → still dedups to A's row
 
 
+async def test_finalize_pending_skips_incomplete_and_missing(adb, monkeypatch, tmp_path):
+    # finalize-on-post: only fully-received uploads become attachments; incomplete/missing skip.
+    from app.models import User
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    u = User(subject="fp_user", role="user")
+    adb.add(u)
+    await adb.flush()
+    data = b"complete-bytes" * 100
+    done = await svc.create_upload(adb, filename="a.png", mime="image/png", size=len(data))
+    await svc.append_chunk(adb, done, 0, data)
+    incomplete = await svc.create_upload(adb, filename="b.png", mime="image/png", size=999999)
+    uids = await svc.finalize_pending(
+        adb, [done.upload_uid, incomplete.upload_uid, "nonexistent"], owner_id=u.id
+    )
+    assert len(uids) == 1  # only the complete upload finalized into an attachment
+
+
+def test_create_memo_finalizes_pending_uploads(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"M" * 4000
+        uid = _start(client, "p.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        memo = client.post(
+            "/api/memos",
+            json={"content": "with a pic", "visibility": "PUBLIC", "upload_uids": [uid]},
+        ).json()
+        assert len(memo["attachments"]) == 1  # finalized + linked at post time
+        assert client.head(f"/api/uploads/{uid}").status_code == 404  # upload consumed
+    finally:
+        _cleanup()
+
+
+def test_abandoned_upload_leaves_no_attachment(logged_in_client, monkeypatch, tmp_path):
+    # The whole point of finalize-on-post: an un-posted upload never becomes an orphan attachment.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"O" * 4000
+        uid = _start(client, "orphan.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        # post a memo WITHOUT referencing the upload (the user abandoned that media)
+        client.post("/api/memos", json={"content": "no pics", "visibility": "PUBLIC"})
+        assert not client.get("/api/attachments").json()  # no attachment was created
+        assert client.head(f"/api/uploads/{uid}").status_code == 200  # upload remains
+    finally:
+        _cleanup()
+
+
 def test_uploads_require_auth(client):
     assert (
         client.post("/api/uploads", json={"filename": "x", "mime": "x", "size": 1}).status_code

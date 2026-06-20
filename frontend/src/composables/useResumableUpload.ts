@@ -14,14 +14,6 @@ interface UploadCreated {
   bytes_received: number
 }
 
-export interface AttachmentResult {
-  uid: string
-  filename: string
-  mime: string
-  size: number
-  status: string
-}
-
 const MAX_RETRIES_PER_OFFSET = 5
 
 async function postJson<T>(url: string): Promise<T>
@@ -46,10 +38,10 @@ async function serverOffset(uid: string): Promise<number> {
   return Number(res.headers.get('Upload-Offset') ?? 0)
 }
 
-export async function uploadFile(
-  file: File,
-  onProgress?: (pct: number) => void,
-): Promise<AttachmentResult> {
+// Upload the file's bytes and return its upload_uid. Finalize-on-post: the memo-create call
+// turns the upload into an attachment, so an abandoned compose leaves only a (self-expiring)
+// Upload and never an orphan attachment.
+export async function uploadFile(file: File, onProgress?: (pct: number) => void): Promise<string> {
   const created = await postJson<UploadCreated>('/api/uploads', {
     filename: file.name,
     mime: file.type || 'application/octet-stream',
@@ -85,7 +77,7 @@ export async function uploadFile(
     }
   }
 
-  return postJson<AttachmentResult>(`/api/uploads/${uid}/finalize`)
+  return uid // NOT finalized here — the memo create finalizes it (finalize-on-post)
 }
 
 export type UploadItemStatus = 'queued' | 'uploading' | 'done' | 'error'
@@ -95,7 +87,7 @@ export interface UploadItem {
   name: string
   progress: number
   status: UploadItemStatus
-  attachmentUid?: string
+  uploadUid?: string // the pending upload; finalized into an attachment when the memo posts
   error?: string
   preview?: string // local object URL for an instant image thumbnail while uploading
   isVideo?: boolean
@@ -116,10 +108,10 @@ export function useUploadQueue(concurrency = 2) {
       active++
       item.status = 'uploading'
       uploadFile(file, (pct) => (item.progress = pct))
-        .then((res) => {
+        .then((uploadUid) => {
           item.status = 'done'
           item.progress = 100
-          item.attachmentUid = res.uid
+          item.uploadUid = uploadUid
         })
         .catch((err: unknown) => {
           item.status = 'error'

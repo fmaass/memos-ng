@@ -521,6 +521,14 @@
             "title": "Pinned",
             "type": "boolean"
           },
+          "upload_uids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Upload Uids",
+            "type": "array"
+          },
           "visibility": {
             "anyOf": [
               {

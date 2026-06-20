@@ -675,6 +675,11 @@ export interface components {
              * @default false
              */
             pinned: boolean;
+            /**
+             * Upload Uids
+             * @default []
+             */
+            upload_uids: string[];
             visibility?: components["schemas"]["Visibility"] | null;
         };
         /** MemoList */

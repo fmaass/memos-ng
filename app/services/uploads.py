@@ -80,6 +80,26 @@ async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: byte
     return upload
 
 
+async def finalize_pending(
+    db: AsyncSession, upload_uids: list[str], owner_id: int
+) -> list[str]:
+    """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
+    return their uids. A missing/expired or incomplete upload is skipped (it expires via
+    reap_expired) so an abandoned compose never creates an orphan attachment."""
+    out: list[str] = []
+    for up_uid in upload_uids:
+        upload = (
+            await db.execute(select(Upload).where(Upload.upload_uid == up_uid))
+        ).scalar_one_or_none()
+        if upload is None:
+            continue
+        part = part_path(up_uid)
+        if not part.exists() or part.stat().st_size != upload.declared_size:
+            continue  # incomplete — leave it to expire, don't half-finalize
+        out.append((await finalize(db, upload, owner_id=owner_id)).uid)
+    return out
+
+
 async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachment:
     part = part_path(upload.upload_uid)
     actual = part.stat().st_size

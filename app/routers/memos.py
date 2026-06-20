@@ -9,6 +9,7 @@ from app import auth
 from app.database import get_session
 from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
 from app.services import memos as svc
+from app.services import uploads as uploads_svc
 
 router = APIRouter(prefix="/api", tags=["memos"])
 
@@ -57,7 +58,10 @@ class MemoCreate(BaseModel):
     content: str
     visibility: Visibility | None = None  # None → the user's default_visibility setting
     pinned: bool = False
-    attachment_uids: list[str] = []
+    # Finalize-on-post: pending upload_uids become attachments only when the memo is created, so
+    # an abandoned compose leaves only Uploads (which expire) — never an orphan attachment.
+    upload_uids: list[str] = []
+    attachment_uids: list[str] = []  # already-finalized attachments (back-compat)
     created_at: datetime | None = None  # custom display date (None → server now), parity w/ memos
 
 
@@ -176,13 +180,20 @@ async def create_memo(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
+    # Finalize-on-post: pending uploads become attachments now, then link them alongside any
+    # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
+    finalized = (
+        await uploads_svc.finalize_pending(db, body.upload_uids, user.id)
+        if body.upload_uids
+        else []
+    )
     memo = await svc.create_memo(
         db,
         user,
         content=body.content,
         visibility=body.visibility or user.default_visibility,  # prod parity: per-user default
         pinned=body.pinned,
-        attachment_uids=body.attachment_uids,
+        attachment_uids=[*body.attachment_uids, *finalized],
         created_at=body.created_at,
     )
     await db.commit()
