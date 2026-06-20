@@ -515,6 +515,14 @@
             "title": "Pinned",
             "type": "boolean"
           },
+          "reactions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ReactionSummary"
+            },
+            "title": "Reactions",
+            "type": "array"
+          },
           "tags": {
             "items": {
               "type": "string"
@@ -713,6 +721,42 @@
           "auth"
         ],
         "title": "PushKeys",
+        "type": "object"
+      },
+      "ReactionIn": {
+        "properties": {
+          "emoji": {
+            "title": "Emoji",
+            "type": "string"
+          }
+        },
+        "required": [
+          "emoji"
+        ],
+        "title": "ReactionIn",
+        "type": "object"
+      },
+      "ReactionSummary": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "emoji": {
+            "title": "Emoji",
+            "type": "string"
+          },
+          "reacted": {
+            "title": "Reacted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "emoji",
+          "count",
+          "reacted"
+        ],
+        "title": "ReactionSummary",
         "type": "object"
       },
       "SettingsOut": {
@@ -1718,6 +1762,109 @@
           }
         },
         "summary": "Pin Memo",
+        "tags": [
+          "memos"
+        ]
+      }
+    },
+    "/api/memos/{uid}/reactions": {
+      "post": {
+        "operationId": "react_api_memos__uid__reactions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReactionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "React",
+        "tags": [
+          "memos"
+        ]
+      }
+    },
+    "/api/memos/{uid}/reactions/{emoji}": {
+      "delete": {
+        "operationId": "unreact_api_memos__uid__reactions__emoji__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "emoji",
+            "required": true,
+            "schema": {
+              "title": "Emoji",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unreact",
         "tags": [
           "memos"
         ]

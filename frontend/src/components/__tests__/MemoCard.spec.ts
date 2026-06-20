@@ -33,6 +33,7 @@ function memo(content: string, tags: string[] = [], attachments: ReturnType<type
     archived_at: null,
     tags,
     attachments,
+    reactions: [] as { emoji: string; count: number; reacted: boolean }[],
     total_size: 0,
   }
 }
@@ -79,5 +80,23 @@ describe('MemoCard', () => {
     expect(wrapper.findComponent({ name: 'Galleria' }).props('visible')).toBe(false)
     await wrapper.find('[data-test="tile-image"]').trigger('click')
     expect(wrapper.findComponent({ name: 'Galleria' }).props('visible')).toBe(true)
+  })
+
+  it('adds a reaction from the picker', async () => {
+    const wrapper = mountCard({ memo: memo('hi') })
+    await wrapper.find('[data-test="react-add"]').trigger('click')
+    await wrapper.find('[data-test="react-choice-👍"]').trigger('click')
+    expect(wrapper.emitted('toggle-reaction')?.[0]).toEqual([
+      { uid: 'm1', emoji: '👍', add: true },
+    ])
+  })
+
+  it('toggles off an existing reaction when its chip is clicked', async () => {
+    const m = { ...memo('hi'), reactions: [{ emoji: '❤️', count: 2, reacted: true }] }
+    const wrapper = mountCard({ memo: m })
+    await wrapper.find('[data-test="reaction-chip"]').trigger('click')
+    expect(wrapper.emitted('toggle-reaction')?.[0]).toEqual([
+      { uid: 'm1', emoji: '❤️', add: false },
+    ])
   })
 })

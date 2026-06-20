@@ -28,6 +28,12 @@ class AttachmentRef(BaseModel):
     downloadUrl: str
 
 
+class ReactionSummary(BaseModel):
+    emoji: str
+    count: int
+    reacted: bool  # did the requesting user react with this emoji
+
+
 class MemoOut(BaseModel):
     uid: str
     owner: str
@@ -39,6 +45,7 @@ class MemoOut(BaseModel):
     archived_at: datetime | None
     tags: list[str]
     attachments: list[AttachmentRef] = []
+    reactions: list[ReactionSummary] = []
     total_size: int = 0
 
 
@@ -54,6 +61,10 @@ class MemoPatch(BaseModel):
     visibility: Visibility | None = None
     pinned: bool | None = None
     archived: bool | None = None
+
+
+class ReactionIn(BaseModel):
+    emoji: str
 
 
 class MemoList(BaseModel):
@@ -85,7 +96,19 @@ def _att_ref(att: Attachment) -> AttachmentRef:
     )
 
 
-def _out(memo: Memo) -> MemoOut:
+def _reactions(memo: Memo, user_id: int) -> list[ReactionSummary]:
+    counts: dict[str, int] = {}
+    mine: set[str] = set()
+    for r in memo.reactions:
+        counts[r.emoji] = counts.get(r.emoji, 0) + 1
+        if r.user_id == user_id:
+            mine.add(r.emoji)
+    return [
+        ReactionSummary(emoji=e, count=c, reacted=e in mine) for e, c in sorted(counts.items())
+    ]
+
+
+def _out(memo: Memo, user_id: int) -> MemoOut:
     return MemoOut(
         uid=memo.uid,
         owner=memo.owner.subject,
@@ -97,6 +120,7 @@ def _out(memo: Memo) -> MemoOut:
         archived_at=memo.archived_at,
         tags=sorted(t.name for t in memo.tags),
         attachments=[_att_ref(a) for a in memo.attachments],
+        reactions=_reactions(memo, user_id),
     )
 
 
@@ -131,7 +155,9 @@ async def list_memos(
         cursor=cursor,
         limit=limit,
     )
-    return MemoList(items=[_out(m) for m in items], nextCursor=next_cursor, totalCount=total)
+    return MemoList(
+        items=[_out(m, user.id) for m in items], nextCursor=next_cursor, totalCount=total
+    )
 
 
 @router.post("/memos", response_model=MemoOut, status_code=201)
@@ -149,7 +175,7 @@ async def create_memo(
         attachment_uids=body.attachment_uids,
     )
     await db.commit()
-    return _out(memo)
+    return _out(memo, user.id)
 
 
 async def _require_owned(db: AsyncSession, user: User, uid: str) -> Memo:
@@ -165,7 +191,7 @@ async def get_memo(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
-    return _out(await _require_owned(db, user, uid))
+    return _out(await _require_owned(db, user, uid), user.id)
 
 
 @router.patch("/memos/{uid}", response_model=MemoOut)
@@ -180,7 +206,7 @@ async def patch_memo(
         raise HTTPException(status_code=403, detail="Not your memo")
     memo = await svc.update_memo(db, memo, **body.model_dump(exclude_unset=True))
     await db.commit()
-    return _out(memo)
+    return _out(memo, user.id)
 
 
 @router.delete("/memos/{uid}", status_code=204)
@@ -205,7 +231,7 @@ async def pin_memo(
     memo = await _require_owned(db, user, uid)
     memo = await svc.update_memo(db, memo, pinned=True)
     await db.commit()
-    return _out(memo)
+    return _out(memo, user.id)
 
 
 @router.post("/memos/{uid}/unpin", response_model=MemoOut)
@@ -217,7 +243,35 @@ async def unpin_memo(
     memo = await _require_owned(db, user, uid)
     memo = await svc.update_memo(db, memo, pinned=False)
     await db.commit()
-    return _out(memo)
+    return _out(memo, user.id)
+
+
+@router.post("/memos/{uid}/reactions", response_model=MemoOut)
+async def react(
+    uid: str,
+    body: ReactionIn,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> MemoOut:
+    memo = await _require_owned(db, user, uid)  # any memo visible to the user
+    await svc.add_reaction(db, memo, user, body.emoji)
+    await db.commit()
+    await db.refresh(memo, attribute_names=["reactions"])  # expire_on_commit=False → reload
+    return _out(memo, user.id)
+
+
+@router.delete("/memos/{uid}/reactions/{emoji}", response_model=MemoOut)
+async def unreact(
+    uid: str,
+    emoji: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> MemoOut:
+    memo = await _require_owned(db, user, uid)
+    await svc.remove_reaction(db, memo, user, emoji)
+    await db.commit()
+    await db.refresh(memo, attribute_names=["reactions"])
+    return _out(memo, user.id)
 
 
 @router.get("/tags", response_model=list[TagCount])

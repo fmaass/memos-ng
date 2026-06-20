@@ -17,6 +17,7 @@ function memoStub(uid: string, content: string, created_at = '2026-06-20T10:00:0
     archived_at: null,
     tags: [],
     attachments: [],
+    reactions: [],
     total_size: 0,
   }
 }

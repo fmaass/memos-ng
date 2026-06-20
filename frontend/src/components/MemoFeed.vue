@@ -37,6 +37,19 @@ const toggleTask = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// Add/remove an emoji reaction and refresh.
+const toggleReaction = useMutation({
+  mutationFn: async ({ uid, emoji, add }: { uid: string; emoji: string; add: boolean }) => {
+    const { error } = add
+      ? await api.POST('/api/memos/{uid}/reactions', { params: { path: { uid } }, body: { emoji } })
+      : await api.DELETE('/api/memos/{uid}/reactions/{emoji}', {
+          params: { path: { uid, emoji } },
+        })
+    if (error) throw error
+  },
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+})
+
 // Infinite scroll: load the next page when a sentinel below the list scrolls into view.
 const sentinel = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
@@ -74,6 +87,7 @@ onUnmounted(() => observer?.disconnect())
         :restorable="restorable"
         @restore="emit('restore', $event)"
         @task-toggle="toggleTask.mutate($event)"
+        @toggle-reaction="toggleReaction.mutate($event)"
       />
     </template>
     <div ref="sentinel" class="h-4" data-test="sentinel" />

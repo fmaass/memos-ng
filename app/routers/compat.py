@@ -82,7 +82,9 @@ def _compat_memo(memo: Memo) -> dict[str, Any]:
         "pinned": memo.pinned,
         "attachments": [_compat_attachment(a, name) for a in memo.attachments],
         "relations": [],
-        "reactions": [],
+        "reactions": [
+            {"emoji": r.emoji, "creator": f"users/{r.user_id}"} for r in memo.reactions
+        ],
         "property": _property(memo.content),
         "snippet": memo.content[:200],
     }

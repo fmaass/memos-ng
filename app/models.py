@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -100,6 +101,9 @@ class Memo(Base):
     owner: Mapped["User"] = relationship(lazy="selectin")
     attachments: Mapped[list["Attachment"]] = relationship(
         "Attachment", lazy="selectin", order_by="Attachment.id"
+    )
+    reactions: Mapped[list["Reaction"]] = relationship(
+        lazy="selectin", cascade="all, delete-orphan"
     )
 
 
@@ -200,6 +204,17 @@ class Pat(Base):
     name: Mapped[str] = mapped_column(String(255))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     last_used: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Reaction(Base):
+    __tablename__ = "reactions"
+    __table_args__ = (UniqueConstraint("memo_id", "user_id", "emoji", name="uq_reaction"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    memo_id: Mapped[int] = mapped_column(ForeignKey("memos.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    emoji: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

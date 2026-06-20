@@ -194,7 +194,7 @@ async def test_memo_out_serializes_attachment_tier_urls(adb):
     )
     # Re-select so the selectin attachments/owner/tags relationships are eagerly loaded.
     m2 = (await adb.execute(select(Memo).where(Memo.uid == memo.uid))).scalar_one()
-    out = _out(m2)
+    out = _out(m2, alice.id)
     assert len(out.attachments) == 1
     a = out.attachments[0]
     assert a.uid == "att1" and a.status is AttachmentStatus.processing and a.blurhash == "LKO2"
@@ -214,3 +214,27 @@ async def test_archived_only_filter(adb):
     assert total == 1 and items[0].uid == arch.uid  # only the archived memo
     _, _, default = await svc.list_memos(adb, u)
     assert default == 1  # default still excludes archived
+
+
+def test_reactions_toggle_count_and_reacted(logged_in_client):
+    client, _ = logged_in_client
+    uid = client.post("/api/memos", json={"content": "react", "visibility": "PUBLIC"}).json()["uid"]
+
+    r = client.post(f"/api/memos/{uid}/reactions", json={"emoji": "👍"}).json()
+    assert r["reactions"] == [{"emoji": "👍", "count": 1, "reacted": True}]
+
+    # idempotent — same user, same emoji
+    r2 = client.post(f"/api/memos/{uid}/reactions", json={"emoji": "👍"}).json()
+    assert r2["reactions"][0]["count"] == 1
+
+    # a second emoji
+    r3 = client.post(f"/api/memos/{uid}/reactions", json={"emoji": "❤️"}).json()
+    assert {x["emoji"] for x in r3["reactions"]} == {"👍", "❤️"}
+
+    # remove the first
+    r4 = client.delete(f"/api/memos/{uid}/reactions/👍").json()
+    assert r4["reactions"] == [{"emoji": "❤️", "count": 1, "reacted": True}]
+
+    # the memo list also carries reactions
+    listed = next(m for m in client.get("/api/memos").json()["items"] if m["uid"] == uid)
+    assert listed["reactions"][0]["emoji"] == "❤️"

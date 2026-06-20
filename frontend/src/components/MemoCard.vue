@@ -14,7 +14,18 @@ const props = defineProps<{ memo: Memo; restorable?: boolean }>()
 const emit = defineEmits<{
   restore: [uid: string]
   'task-toggle': [payload: { uid: string; content: string }]
+  'toggle-reaction': [payload: { uid: string; emoji: string; add: boolean }]
 }>()
+
+const REACTION_CHOICES = ['👍', '❤️', '😄', '🎉']
+const pickerOpen = ref(false)
+function toggleReaction(emoji: string, reacted: boolean) {
+  emit('toggle-reaction', { uid: props.memo.uid, emoji, add: !reacted })
+}
+function addReaction(emoji: string) {
+  pickerOpen.value = false
+  emit('toggle-reaction', { uid: props.memo.uid, emoji, add: true })
+}
 
 // renderMemoMarkdown sanitizes (markdown-it html:false + DOMPurify allowlist), so v-html
 // of its output is safe — raw HTML/script in memo content is escaped to inert text.
@@ -88,6 +99,51 @@ function onContentClick(event: MouseEvent) {
         data-test="tag-chip"
         >#{{ t }}</span
       >
+    </div>
+
+    <div class="flex flex-wrap items-center gap-1" data-test="reactions">
+      <button
+        v-for="r in memo.reactions"
+        :key="r.emoji"
+        type="button"
+        class="text-xs px-2 py-0.5 rounded-full border"
+        :class="
+          r.reacted
+            ? 'border-primary bg-primary-50 dark:bg-primary-400/10'
+            : 'border-surface-200 dark:border-surface-700'
+        "
+        data-test="reaction-chip"
+        @click="toggleReaction(r.emoji, r.reacted)"
+      >
+        {{ r.emoji }} {{ r.count }}
+      </button>
+      <span class="relative">
+        <button
+          type="button"
+          class="text-xs px-1.5 py-0.5 text-muted-color hover:text-color"
+          aria-label="Add reaction"
+          data-test="react-add"
+          @click="pickerOpen = !pickerOpen"
+        >
+          <i class="pi pi-face-smile" />
+        </button>
+        <span
+          v-if="pickerOpen"
+          class="absolute z-10 left-0 mt-1 flex gap-1 rounded border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-1"
+          data-test="react-picker"
+        >
+          <button
+            v-for="e in REACTION_CHOICES"
+            :key="e"
+            type="button"
+            class="text-sm px-1"
+            :data-test="`react-choice-${e}`"
+            @click="addReaction(e)"
+          >
+            {{ e }}
+          </button>
+        </span>
+      </span>
     </div>
     <div v-if="restorable" class="flex justify-end">
       <button

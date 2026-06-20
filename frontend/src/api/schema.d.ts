@@ -181,6 +181,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/memos/{uid}/reactions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** React */
+        post: operations["react_api_memos__uid__reactions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memos/{uid}/reactions/{emoji}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unreact */
+        delete: operations["unreact_api_memos__uid__reactions__emoji__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/memos/{uid}/unpin": {
         parameters: {
             query?: never;
@@ -613,6 +647,11 @@ export interface components {
             owner: string;
             /** Pinned */
             pinned: boolean;
+            /**
+             * Reactions
+             * @default []
+             */
+            reactions: components["schemas"]["ReactionSummary"][];
             /** Tags */
             tags: string[];
             /**
@@ -680,6 +719,20 @@ export interface components {
             auth: string;
             /** P256Dh */
             p256dh: string;
+        };
+        /** ReactionIn */
+        ReactionIn: {
+            /** Emoji */
+            emoji: string;
+        };
+        /** ReactionSummary */
+        ReactionSummary: {
+            /** Count */
+            count: number;
+            /** Emoji */
+            emoji: string;
+            /** Reacted */
+            reacted: boolean;
         };
         /** SettingsOut */
         SettingsOut: {
@@ -1137,6 +1190,73 @@ export interface operations {
             header?: never;
             path: {
                 uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    react_api_memos__uid__reactions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReactionIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unreact_api_memos__uid__reactions__emoji__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                emoji: string;
             };
             cookie?: never;
         };

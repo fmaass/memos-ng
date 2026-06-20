@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy import String, and_, cast, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Attachment, Memo, Tag, User, Visibility, memo_tags
+from app.models import Attachment, Memo, Reaction, Tag, User, Visibility, memo_tags
 
 TAG_RE = re.compile(r"#(\w+)")
 
@@ -205,3 +205,34 @@ async def heatmap(db: AsyncSession, user: User) -> dict[str, int]:
         .group_by(day)
     )
     return {d: c for d, c in (await db.execute(stmt)).all()}
+
+
+async def add_reaction(db: AsyncSession, memo: Memo, user: User, emoji: str) -> None:
+    """Idempotent: a user reacting twice with the same emoji is a no-op (unique constraint)."""
+    existing = (
+        await db.execute(
+            select(Reaction).where(
+                Reaction.memo_id == memo.id,
+                Reaction.user_id == user.id,
+                Reaction.emoji == emoji,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        db.add(Reaction(memo_id=memo.id, user_id=user.id, emoji=emoji))
+        await db.flush()
+
+
+async def remove_reaction(db: AsyncSession, memo: Memo, user: User, emoji: str) -> None:
+    reaction = (
+        await db.execute(
+            select(Reaction).where(
+                Reaction.memo_id == memo.id,
+                Reaction.user_id == user.id,
+                Reaction.emoji == emoji,
+            )
+        )
+    ).scalar_one_or_none()
+    if reaction is not None:
+        await db.delete(reaction)
+        await db.flush()
