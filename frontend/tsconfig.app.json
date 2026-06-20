@@ -7,5 +7,6 @@
     "paths": { "@/*": ["./src/*"] },
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue", "src/**/*.d.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue", "src/**/*.d.ts"],
+  "exclude": ["src/sw.ts"]
 }
