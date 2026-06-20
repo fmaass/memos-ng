@@ -1,0 +1,119 @@
+import asyncio
+import secrets
+import time
+
+from app import worker
+from app.config import settings
+from app.database import async_session
+from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
+from app.services import media
+from PIL import Image
+from sqlalchemy import create_engine, text
+
+from tests.conftest import SYNC_URL
+
+
+def _make_png(path, size=(1200, 900)):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, (120, 80, 200)).save(path, "PNG")
+
+
+def _seed(mime, storage_path, status="processing", lane="fast"):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        aid = c.execute(
+            text(
+                "INSERT INTO attachments (uid, filename, mime, size, status, storage_path) "
+                "VALUES (:u,'x',:m,1,CAST(:s AS attachment_status),:sp) RETURNING id"
+            ),
+            {"u": secrets.token_urlsafe(8), "m": mime, "s": status, "sp": storage_path},
+        ).scalar_one()
+        jid = c.execute(
+            text(
+                "INSERT INTO media_jobs (attachment_id, lane, state, attempts, progress_pct) "
+                "VALUES (:a, CAST(:l AS job_lane), CAST('queued' AS job_state), 0, 0) RETURNING id"
+            ),
+            {"a": aid, "l": lane},
+        ).scalar_one()
+    eng.dispose()
+    return aid, jid
+
+
+def _cleanup(*aids):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        for aid in aids:
+            c.execute(text("DELETE FROM attachments WHERE id=:a"), {"a": aid})  # cascades jobs
+    eng.dispose()
+
+
+async def test_fast_lane_image_produces_tiers(adb, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    orig = tmp_path / "originals" / "2024" / "01" / "x.png"
+    _make_png(orig)
+    att = Attachment(
+        uid="img1",
+        filename="x.png",
+        mime="image/png",
+        size=orig.stat().st_size,
+        status=AttachmentStatus.processing,
+        storage_path=str(orig),
+    )
+    adb.add(att)
+    await adb.flush()
+    job = MediaJob(attachment_id=att.id, lane=JobLane.fast, state=JobState.queued)
+    adb.add(job)
+    await adb.flush()
+
+    await media.process_job(adb, job)
+
+    assert (tmp_path / "assets" / "thumbs" / "img1.jpg").exists()
+    assert (tmp_path / "assets" / "mobile" / "img1.jpg").exists()
+    assert att.width == 1200 and att.height == 900
+    assert att.blurhash and att.status is AttachmentStatus.ready  # image done after fast lane
+
+
+def test_missing_original_marks_job_failed(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid, jid = _seed("image/png", str(tmp_path / "does-not-exist.png"))
+    try:
+
+        async def _go():
+            async with async_session() as db:
+                return await worker.run_once(db)
+
+        assert asyncio.run(_go()) is True  # a job was claimed (and failed), not a crash
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            state, attempts = c.execute(
+                text("SELECT state, attempts FROM media_jobs WHERE id=:j"), {"j": jid}
+            ).one()
+        eng.dispose()
+        assert state == "failed" and attempts == 1
+    finally:
+        _cleanup(aid)
+
+
+def test_skip_locked_no_double_claim(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    a1, j1 = _seed("image/png", "p1")
+    a2, j2 = _seed("image/png", "p2")
+    try:
+
+        async def _go():
+            async with async_session() as db_a, async_session() as db_b:
+                job_a = await worker.claim_one(db_a)  # locks the lower id
+                job_b = await worker.claim_one(db_b)  # must SKIP the locked row
+                return job_a.id, job_b.id
+
+        ida, idb = asyncio.run(_go())
+        assert ida != idb and {ida, idb} == {j1, j2}  # no double-claim
+    finally:
+        _cleanup(a1, a2)
+
+
+def test_heartbeat_written(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    worker.beat()
+    p = worker.heartbeat_path()
+    assert p.exists() and time.time() - float(p.read_text()) < 5

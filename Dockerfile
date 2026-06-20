@@ -13,7 +13,9 @@ RUN npm run build
 # --- Backend runtime (uv-managed, Python 3.13) ---
 FROM python:3.13-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# ffmpeg/ffprobe for the video fast lane (poster) + slow lane (H.264). pillow-heif's
+# wheel bundles libheif, so no system libvips/libheif is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /bin/false appuser
 WORKDIR /app
