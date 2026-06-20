@@ -1,8 +1,11 @@
 <script setup lang="ts">
+import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
+import { useApi } from '@/composables/useApi'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
+import { groupByDay } from '@/lib/timeline'
 
 // Generic cursor-paginated memo feed. Home passes no query; Explore/Search pass filters;
 // Archived passes restorable to surface a per-card Restore action.
@@ -12,11 +15,27 @@ const props = withDefaults(defineProps<{ query?: MemoQuery; restorable?: boolean
 })
 const emit = defineEmits<{ restore: [uid: string] }>()
 
+const api = useApi()
+const queryClient = useQueryClient()
+
 const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError } = useTimeline(
   () => props.query,
 )
 
 const memos = computed(() => data.value?.pages.flatMap((page) => page.items) ?? [])
+const days = computed(() => groupByDay(memos.value))
+
+// Persist a task-checkbox toggle (PATCH the memo content) and refresh the feed.
+const toggleTask = useMutation({
+  mutationFn: async ({ uid, content }: { uid: string; content: string }) => {
+    const { error } = await api.PATCH('/api/memos/{uid}', {
+      params: { path: { uid } },
+      body: { content },
+    })
+    if (error) throw error
+  },
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+})
 
 // Infinite scroll: load the next page when a sentinel below the list scrolls into view.
 const sentinel = ref<HTMLElement | null>(null)
@@ -41,13 +60,22 @@ onUnmounted(() => observer?.disconnect())
     <p v-else-if="!memos.length" class="text-muted-color text-sm" data-test="feed-empty">
       No memos here yet.
     </p>
-    <MemoCard
-      v-for="m in memos"
-      :key="m.uid"
-      :memo="m"
-      :restorable="restorable"
-      @restore="emit('restore', $event)"
-    />
+    <template v-for="group in days" :key="group.key">
+      <h3
+        class="text-xs font-medium uppercase tracking-wide text-muted-color pt-2"
+        data-test="day-header"
+      >
+        {{ group.label }}
+      </h3>
+      <MemoCard
+        v-for="m in group.items"
+        :key="m.uid"
+        :memo="m"
+        :restorable="restorable"
+        @restore="emit('restore', $event)"
+        @task-toggle="toggleTask.mutate($event)"
+      />
+    </template>
     <div ref="sentinel" class="h-4" data-test="sentinel" />
     <p v-if="isFetchingNextPage" class="text-muted-color text-sm">Loading more…</p>
   </div>

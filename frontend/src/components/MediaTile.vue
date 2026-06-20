@@ -16,7 +16,7 @@ interface MediaAttachment {
 }
 
 const props = defineProps<{ att: MediaAttachment; progress?: number }>()
-const emit = defineEmits<{ retry: [uid: string] }>()
+const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
 const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
@@ -54,8 +54,9 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
       v-else-if="kind === 'image'"
       :src="att.previewUrl"
       :alt="att.uid"
-      class="w-full h-full object-cover"
+      class="w-full h-full object-cover cursor-pointer"
       data-test="tile-image"
+      @click="emit('open', att.uid)"
     />
 
     <video

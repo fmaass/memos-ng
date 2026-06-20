@@ -16,6 +16,13 @@ describe('renderMemoMarkdown', () => {
     expect(html).toContain('href="https://example.com"')
   })
 
+  it('renders task lines as checkboxes (checked state preserved)', () => {
+    const html = renderMemoMarkdown('- [ ] todo\n- [x] done')
+    expect(html).toContain('type="checkbox"')
+    expect((html.match(/type="checkbox"/g) ?? []).length).toBe(2)
+    expect(html).toContain('checked') // the [x] item
+  })
+
   // --- the load-bearing security cases: dangerous source must be inert (escaped), never live ---
 
   it('renders an inline <script> inert (escaped, not a live tag)', () => {

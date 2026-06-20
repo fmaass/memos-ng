@@ -1,24 +1,42 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
+import PrimeVue from 'primevue/config'
 import { ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import MemoFeed from '@/components/MemoFeed.vue'
 
-function memoStub(uid: string, content: string) {
+function memoStub(uid: string, content: string, created_at = '2026-06-20T10:00:00Z') {
   return {
     uid,
     owner: 'alice',
     content,
     visibility: 'PRIVATE' as const,
     pinned: false,
-    created_at: '2026-06-20T00:00:00Z',
-    updated_at: '2026-06-20T00:00:00Z',
+    created_at,
+    updated_at: created_at,
     archived_at: null,
     tags: [],
     attachments: [],
     total_size: 0,
   }
 }
+
+const patch = vi.fn().mockResolvedValue({ error: undefined })
+vi.mock('@/composables/useApi', () => ({ useApi: () => ({ PATCH: patch }) }))
+
+const invalidateQueries = vi.fn()
+vi.mock('@tanstack/vue-query', () => ({
+  useQueryClient: () => ({ invalidateQueries }),
+  useMutation: (opts: {
+    mutationFn: (v: unknown) => Promise<unknown>
+    onSuccess?: () => void
+  }) => ({
+    mutate: async (v: unknown) => {
+      await opts.mutationFn(v)
+      opts.onSuccess?.()
+    },
+  }),
+}))
 
 const fetchNextPage = vi.fn()
 const useTimelineMock = vi.fn()
@@ -35,6 +53,10 @@ function feedResult(items: ReturnType<typeof memoStub>[]) {
   }
 }
 
+function mountFeed(props = {}) {
+  return mount(MemoFeed, { props, global: { plugins: [PrimeVue] } })
+}
+
 describe('MemoFeed', () => {
   beforeEach(() => {
     vi.stubGlobal(
@@ -49,25 +71,46 @@ describe('MemoFeed', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     useTimelineMock.mockReset()
+    patch.mockClear()
+    invalidateQueries.mockClear()
   })
 
-  it('renders a card per memo', () => {
-    useTimelineMock.mockReturnValue(feedResult([memoStub('1', '**first**'), memoStub('2', 'second')]))
-    const wrapper = mount(MemoFeed)
+  it('renders a card per memo under day-grouped headers', () => {
+    useTimelineMock.mockReturnValue(
+      feedResult([
+        memoStub('1', '**first**', '2026-06-20T10:00:00Z'),
+        memoStub('2', 'older', '2026-01-01T10:00:00Z'),
+      ]),
+    )
+    const wrapper = mountFeed()
     expect(wrapper.findAll('[data-test="memo-card"]')).toHaveLength(2)
-    expect(wrapper.find('[data-test="memo-content"]').html()).toContain('<strong>first</strong>')
+    expect(wrapper.findAll('[data-test="day-header"]').length).toBe(2) // two distinct days
   })
 
   it('shows an empty state when there are no memos', () => {
     useTimelineMock.mockReturnValue(feedResult([]))
-    const wrapper = mount(MemoFeed)
-    expect(wrapper.find('[data-test="feed-empty"]').exists()).toBe(true)
+    expect(mountFeed().find('[data-test="feed-empty"]').exists()).toBe(true)
   })
 
   it('passes its query through to useTimeline', () => {
     useTimelineMock.mockReturnValue(feedResult([]))
-    mount(MemoFeed, { props: { query: { visibility: 'PUBLIC' } } })
+    mountFeed({ query: { visibility: 'PUBLIC' } })
     const arg = useTimelineMock.mock.calls[0][0]
     expect(typeof arg === 'function' ? arg() : arg).toEqual({ visibility: 'PUBLIC' })
+  })
+
+  it('persists a task toggle bubbled from a card via PATCH', async () => {
+    useTimelineMock.mockReturnValue(feedResult([memoStub('1', '- [ ] todo')]))
+    const wrapper = mountFeed()
+    wrapper.findComponent({ name: 'MemoCard' }).vm.$emit('task-toggle', {
+      uid: '1',
+      content: '- [x] todo',
+    })
+    await flushPromises()
+    expect(patch).toHaveBeenCalledWith('/api/memos/{uid}', {
+      params: { path: { uid: '1' } },
+      body: { content: '- [x] todo' },
+    })
+    expect(invalidateQueries).toHaveBeenCalled()
   })
 })
