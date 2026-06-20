@@ -106,3 +106,38 @@ async def test_sse_stream_emits_progress_then_ready():
     events = [e async for e in media_event_stream(snap, interval=0)]
     assert any('"progress_pct": 40' in e for e in events)
     assert any('"status": "ready"' in e for e in events)  # synthetic ready on completion
+
+
+def test_list_attachments_requires_auth(client):
+    assert client.get("/api/attachments").status_code == 401
+
+
+def test_list_attachments_owner_scoped_and_type_filter(logged_in_client):
+    client, subject = logged_in_client
+    img = _seed_attachment("la-img", subject, mime="image/jpeg")
+    vid = _seed_attachment("la-vid", subject, mime="video/mp4")
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject='other_la'"))
+        c.execute(text("INSERT INTO users (subject, role) VALUES ('other_la','user')"))
+    eng.dispose()
+    other = _seed_attachment("la-other", "other_la", mime="image/png")
+    try:
+        items = client.get("/api/attachments").json()
+        uids = {i["uid"] for i in items}
+        assert {"la-img", "la-vid"} <= uids
+        assert "la-other" not in uids  # owner-scoped: another user's media is excluded
+
+        imgs = {i["uid"] for i in client.get("/api/attachments?type=image").json()}
+        assert imgs == {"la-img"}  # type filter (owner's image only)
+        vids = {i["uid"] for i in client.get("/api/attachments?type=video").json()}
+        assert vids == {"la-vid"}
+
+        # unlinked media is flagged orphan
+        assert all(i["orphan"] for i in items if i["uid"] in ("la-img", "la-vid"))
+    finally:
+        _cleanup(img, vid, other)
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM users WHERE subject='other_la'"))
+        eng.dispose()

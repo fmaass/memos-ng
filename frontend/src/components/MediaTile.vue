@@ -1,12 +1,21 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
-import type { components } from '@/api/schema'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
 
-type Att = components['schemas']['AttachmentRef']
+// Only the fields a tile renders — so both MemoOut.attachments (AttachmentRef) and the
+// Resources list (AttachmentListItem) satisfy it without a width/height/duration shape clash.
+interface MediaAttachment {
+  uid: string
+  mime: string
+  status: string
+  blurhash: string | null
+  previewUrl: string
+  posterUrl: string
+  webUrl: string
+}
 
-const props = defineProps<{ att: Att; progress?: number }>()
+const props = defineProps<{ att: MediaAttachment; progress?: number }>()
 const emit = defineEmits<{ retry: [uid: string] }>()
 
 const kind = computed(() => tileKind(props.att.status, props.att.mime))

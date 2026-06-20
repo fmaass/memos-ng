@@ -108,12 +108,15 @@ async def list_memos(
     owner: str | None = None,
     q: str | None = None,
     include_archived: bool = False,
+    archived_only: bool = False,
     sort: str = "-created_at",
     cursor: str | None = None,
     limit: int = 20,
 ) -> tuple[list[Memo], str | None, int]:
     conds = [visible_clause(user)]
-    if not include_archived:
+    if archived_only:
+        conds.append(Memo.archived_at.is_not(None))
+    elif not include_archived:
         conds.append(Memo.archived_at.is_(None))
     if created_before:
         conds.append(Memo.created_at < created_before)

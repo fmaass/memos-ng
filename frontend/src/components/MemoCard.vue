@@ -7,7 +7,8 @@ import { renderMemoMarkdown } from '@/lib/markdown'
 
 type Memo = components['schemas']['MemoOut']
 
-const props = defineProps<{ memo: Memo }>()
+const props = defineProps<{ memo: Memo; restorable?: boolean }>()
+const emit = defineEmits<{ restore: [uid: string] }>()
 
 // renderMemoMarkdown sanitizes (markdown-it html:false + DOMPurify allowlist), so v-html
 // of its output is safe — raw HTML/script in memo content is escaped to inert text.
@@ -36,6 +37,15 @@ const html = computed(() => renderMemoMarkdown(props.memo.content))
         data-test="tag-chip"
         >#{{ t }}</span
       >
+    </div>
+    <div v-if="restorable" class="flex justify-end">
+      <button
+        class="text-sm text-primary hover:underline"
+        data-test="restore"
+        @click="emit('restore', memo.uid)"
+      >
+        Restore
+      </button>
     </div>
   </article>
 </template>

@@ -4,6 +4,27 @@
  */
 
 export interface paths {
+    "/api/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Attachments
+         * @description The current user's attachment library, newest first. ?type=image|video filters by
+         *     mime prefix; `orphan` flags media not attached to any memo.
+         */
+        get: operations["list_attachments_api_attachments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/attachments/{uid}": {
         parameters: {
             query?: never;
@@ -357,6 +378,28 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AttachmentListItem */
+        AttachmentListItem: {
+            /** Blurhash */
+            blurhash: string | null;
+            /** Downloadurl */
+            downloadUrl: string;
+            /** Mime */
+            mime: string;
+            /** Orphan */
+            orphan: boolean;
+            /** Posterurl */
+            posterUrl: string;
+            /** Previewurl */
+            previewUrl: string;
+            status: components["schemas"]["AttachmentStatus"];
+            /** Thumbnailurl */
+            thumbnailUrl: string;
+            /** Uid */
+            uid: string;
+            /** Weburl */
+            webUrl: string;
+        };
         /** AttachmentMeta */
         AttachmentMeta: {
             /** Blurhash */
@@ -642,6 +685,38 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_attachments_api_attachments_get: {
+        parameters: {
+            query?: {
+                type?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentListItem"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     attachment_meta_api_attachments__uid__get: {
         parameters: {
             query?: never;
@@ -813,6 +888,7 @@ export interface operations {
                 owner?: string | null;
                 q?: string | null;
                 include_archived?: boolean;
+                archived_only?: boolean;
                 sort?: string;
                 cursor?: string | null;
                 limit?: number;

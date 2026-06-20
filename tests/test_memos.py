@@ -202,3 +202,15 @@ async def test_memo_out_serializes_attachment_tier_urls(adb):
     assert a.webUrl == "/api/attachments/att1/web"
     assert a.posterUrl == "/api/attachments/att1/poster"
     assert a.downloadUrl == "/api/attachments/att1/original"
+
+
+async def test_archived_only_filter(adb):
+    u = await _user(adb, "alice")
+    await svc.create_memo(adb, u, content="active", visibility=Visibility.PUBLIC)
+    arch = await svc.create_memo(adb, u, content="arch", visibility=Visibility.PUBLIC)
+    await svc.update_memo(adb, arch, archived=True)
+
+    items, _, total = await svc.list_memos(adb, u, archived_only=True)
+    assert total == 1 and items[0].uid == arch.uid  # only the archived memo
+    _, _, default = await svc.list_memos(adb, u)
+    assert default == 1  # default still excludes archived

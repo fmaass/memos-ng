@@ -32,4 +32,15 @@ describe('MemoCard', () => {
     expect(content.element.querySelector('script')).toBeNull()
     expect(content.html()).toContain('&lt;script&gt;')
   })
+
+  it('has no restore action unless restorable', () => {
+    const wrapper = mount(MemoCard, { props: { memo: memo('x') } })
+    expect(wrapper.find('[data-test="restore"]').exists()).toBe(false)
+  })
+
+  it('emits restore with the uid when restorable', async () => {
+    const wrapper = mount(MemoCard, { props: { memo: memo('x'), restorable: true } })
+    await wrapper.find('[data-test="restore"]').trigger('click')
+    expect(wrapper.emitted('restore')?.[0]).toEqual(['m1'])
+  })
 })

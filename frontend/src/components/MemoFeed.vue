@@ -4,8 +4,13 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import MemoCard from '@/components/MemoCard.vue'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
 
-// Generic cursor-paginated memo feed. Home passes no query; Explore/Search pass filters.
-const props = withDefaults(defineProps<{ query?: MemoQuery }>(), { query: () => ({}) })
+// Generic cursor-paginated memo feed. Home passes no query; Explore/Search pass filters;
+// Archived passes restorable to surface a per-card Restore action.
+const props = withDefaults(defineProps<{ query?: MemoQuery; restorable?: boolean }>(), {
+  query: () => ({}),
+  restorable: false,
+})
+const emit = defineEmits<{ restore: [uid: string] }>()
 
 const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError } = useTimeline(
   () => props.query,
@@ -36,7 +41,13 @@ onUnmounted(() => observer?.disconnect())
     <p v-else-if="!memos.length" class="text-muted-color text-sm" data-test="feed-empty">
       No memos here yet.
     </p>
-    <MemoCard v-for="m in memos" :key="m.uid" :memo="m" />
+    <MemoCard
+      v-for="m in memos"
+      :key="m.uid"
+      :memo="m"
+      :restorable="restorable"
+      @restore="emit('restore', $event)"
+    />
     <div ref="sentinel" class="h-4" data-test="sentinel" />
     <p v-if="isFetchingNextPage" class="text-muted-color text-sm">Loading more…</p>
   </div>

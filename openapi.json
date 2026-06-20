@@ -1,6 +1,70 @@
 {
   "components": {
     "schemas": {
+      "AttachmentListItem": {
+        "properties": {
+          "blurhash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blurhash"
+          },
+          "downloadUrl": {
+            "title": "Downloadurl",
+            "type": "string"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "orphan": {
+            "title": "Orphan",
+            "type": "boolean"
+          },
+          "posterUrl": {
+            "title": "Posterurl",
+            "type": "string"
+          },
+          "previewUrl": {
+            "title": "Previewurl",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "thumbnailUrl": {
+            "title": "Thumbnailurl",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "webUrl": {
+            "title": "Weburl",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "mime",
+          "status",
+          "blurhash",
+          "orphan",
+          "thumbnailUrl",
+          "previewUrl",
+          "webUrl",
+          "posterUrl",
+          "downloadUrl"
+        ],
+        "title": "AttachmentListItem",
+        "type": "object"
+      },
       "AttachmentMeta": {
         "properties": {
           "blurhash": {
@@ -847,6 +911,70 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/attachments": {
+      "get": {
+        "description": "The current user's attachment library, newest first. ?type=image|video filters by\nmime prefix; `orphan` flags media not attached to any memo.",
+        "operationId": "list_attachments_api_attachments_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 60,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AttachmentListItem"
+                  },
+                  "title": "Response List Attachments Api Attachments Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Attachments",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
     "/api/attachments/{uid}": {
       "get": {
         "operationId": "attachment_meta_api_attachments__uid__get",
@@ -1257,6 +1385,16 @@
             "schema": {
               "default": false,
               "title": "Include Archived",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Archived Only",
               "type": "boolean"
             }
           },

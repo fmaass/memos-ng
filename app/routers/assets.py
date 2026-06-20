@@ -61,6 +61,54 @@ class AttachmentMeta(BaseModel):
     posterUrl: str
 
 
+class AttachmentListItem(BaseModel):
+    uid: str
+    mime: str
+    status: AttachmentStatus
+    blurhash: str | None
+    orphan: bool  # not linked to a memo
+    thumbnailUrl: str
+    previewUrl: str
+    webUrl: str
+    posterUrl: str
+    downloadUrl: str
+
+
+def _list_item(att: Attachment) -> AttachmentListItem:
+    base = f"/api/attachments/{att.uid}"
+    return AttachmentListItem(
+        uid=att.uid,
+        mime=att.mime,
+        status=att.status,
+        blurhash=att.blurhash,
+        orphan=att.memo_id is None,
+        thumbnailUrl=f"{base}/thumb",
+        previewUrl=f"{base}/mobile",
+        webUrl=f"{base}/web",
+        posterUrl=f"{base}/poster",
+        downloadUrl=f"{base}/original",
+    )
+
+
+@router.get("/attachments", response_model=list[AttachmentListItem])
+async def list_attachments(
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+    type: str | None = None,
+    limit: int = 60,
+) -> list[AttachmentListItem]:
+    """The current user's attachment library, newest first. ?type=image|video filters by
+    mime prefix; `orphan` flags media not attached to any memo."""
+    stmt = select(Attachment).where(Attachment.owner_id == user.id)
+    if type == "image":
+        stmt = stmt.where(Attachment.mime.like("image/%"))
+    elif type == "video":
+        stmt = stmt.where(Attachment.mime.like("video/%"))
+    stmt = stmt.order_by(Attachment.id.desc()).limit(max(1, min(limit, 200)))
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_list_item(a) for a in rows]
+
+
 @router.get("/attachments/{uid}", response_model=AttachmentMeta)
 async def attachment_meta(
     uid: str,
