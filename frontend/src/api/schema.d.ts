@@ -617,6 +617,8 @@ export interface components {
             attachment_uids: string[];
             /** Content */
             content: string;
+            /** Created At */
+            created_at?: string | null;
             /**
              * Pinned
              * @default false
@@ -680,6 +682,8 @@ export interface components {
             archived?: boolean | null;
             /** Content */
             content?: string | null;
+            /** Created At */
+            created_at?: string | null;
             /** Pinned */
             pinned?: boolean | null;
             visibility?: components["schemas"]["Visibility"] | null;

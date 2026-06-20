@@ -206,6 +206,19 @@ async def test_memo_out_serializes_attachment_tier_urls(adb):
     assert a.downloadUrl == "/api/attachments/att1/original"
 
 
+async def test_create_and_edit_custom_display_date(adb):
+    # Parity with old memos: a memo can be backdated on create and its date edited later.
+    u = await _user(adb, "dater")
+    custom = datetime(2020, 5, 1, 12, 0, tzinfo=UTC)
+    m = await svc.create_memo(
+        adb, u, content="backdated", visibility=Visibility.PUBLIC, created_at=custom
+    )
+    assert m.created_at == custom
+    new = datetime(2019, 1, 2, 9, 30, tzinfo=UTC)
+    await svc.update_memo(adb, m, created_at=new)
+    assert m.created_at == new
+
+
 async def test_archived_only_filter(adb):
     u = await _user(adb, "alice")
     await svc.create_memo(adb, u, content="active", visibility=Visibility.PUBLIC)

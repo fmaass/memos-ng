@@ -59,10 +59,13 @@ async def create_memo(
     visibility: Visibility,
     pinned: bool = False,
     attachment_uids: Sequence[str] | None = None,
+    created_at: datetime | None = None,
 ) -> Memo:
     memo = Memo(
         uid=gen_uid(), owner_id=owner.id, content=content, visibility=visibility, pinned=pinned
     )
+    if created_at is not None:
+        memo.created_at = created_at  # custom display date (parity with old memos)
     memo.tags = await _get_or_create_tags(db, parse_tags(content))
     db.add(memo)
     await db.flush()
@@ -167,7 +170,7 @@ async def update_memo(db: AsyncSession, memo: Memo, **fields) -> Memo:
     if "content" in fields and fields["content"] is not None:
         memo.content = fields["content"]
         memo.tags = await _get_or_create_tags(db, parse_tags(memo.content))
-    for key in ("visibility", "pinned"):
+    for key in ("visibility", "pinned", "created_at"):
         if fields.get(key) is not None:
             setattr(memo, key, fields[key])
     if fields.get("archived") is True and memo.archived_at is None:

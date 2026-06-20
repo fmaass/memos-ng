@@ -445,6 +445,18 @@
             "title": "Content",
             "type": "string"
           },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
           "pinned": {
             "default": false,
             "title": "Pinned",
@@ -609,6 +621,18 @@
               }
             ],
             "title": "Content"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
           },
           "pinned": {
             "anyOf": [

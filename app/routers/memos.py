@@ -54,6 +54,7 @@ class MemoCreate(BaseModel):
     visibility: Visibility | None = None  # None → the user's default_visibility setting
     pinned: bool = False
     attachment_uids: list[str] = []
+    created_at: datetime | None = None  # custom display date (None → server now), parity w/ memos
 
 
 class MemoPatch(BaseModel):
@@ -61,6 +62,7 @@ class MemoPatch(BaseModel):
     visibility: Visibility | None = None
     pinned: bool | None = None
     archived: bool | None = None
+    created_at: datetime | None = None  # edit a memo's display date
 
 
 class ReactionIn(BaseModel):
@@ -173,6 +175,7 @@ async def create_memo(
         visibility=body.visibility or user.default_visibility,  # prod parity: per-user default
         pinned=body.pinned,
         attachment_uids=body.attachment_uids,
+        created_at=body.created_at,
     )
     await db.commit()
     return _out(memo, user.id)
