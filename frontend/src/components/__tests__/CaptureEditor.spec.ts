@@ -68,6 +68,6 @@ describe('CaptureEditor', () => {
     await input.trigger('change')
     await nextTick()
     expect(wrapper.find('[data-test="uploads"]').exists()).toBe(true)
-    expect(wrapper.text()).toContain('pic.png')
+    expect(wrapper.find('[data-test="uploads"] [title="pic.png"]').exists()).toBe(true)
   })
 })

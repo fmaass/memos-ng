@@ -97,6 +97,8 @@ export interface UploadItem {
   status: UploadItemStatus
   attachmentUid?: string
   error?: string
+  preview?: string // local object URL for an instant image thumbnail while uploading
+  isVideo?: boolean
 }
 
 // Reactive multi-file queue with bounded concurrency. Each file uploads independently so a
@@ -134,7 +136,17 @@ export function useUploadQueue(concurrency = 2) {
 
   function add(toAdd: File[]): UploadItem[] {
     const created = toAdd.map((file) => {
-      const item: UploadItem = { id: nextId++, name: file.name, progress: 0, status: 'queued' }
+      const isImage = file.type.startsWith('image/')
+      const item: UploadItem = {
+        id: nextId++,
+        name: file.name,
+        progress: 0,
+        status: 'queued',
+        preview: isImage && typeof URL.createObjectURL === 'function'
+          ? URL.createObjectURL(file)
+          : undefined,
+        isVideo: file.type.startsWith('video/'),
+      }
       files.set(item.id, file)
       items.push(item)
       pending.push(item)

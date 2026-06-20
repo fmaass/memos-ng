@@ -17,10 +17,12 @@ const { settings } = useSettings()
 
 const content = ref('')
 const visibility = ref<'PRIVATE' | 'PROTECTED' | 'PUBLIC'>('PRIVATE')
-// Default the picker to the user's setting once it loads (prod parity).
+// Default the picker to the user's setting. immediate so it applies even when settings are
+// ALREADY cached at mount (AppShell loads them first) — otherwise the watch never fires and the
+// picker is stuck on the initial PRIVATE despite a PUBLIC default.
 watch(settings, (s) => {
   if (s) visibility.value = s.default_visibility
-})
+}, { immediate: true })
 const visibilityOptions = [
   { label: 'Private', value: 'PRIVATE', icon: 'pi pi-lock' },
   { label: 'Protected', value: 'PROTECTED', icon: 'pi pi-users' },
@@ -109,15 +111,39 @@ async function save() {
       data-test="content"
     />
 
-    <div v-if="uploads.length" class="flex flex-col gap-1" data-test="uploads">
-      <div v-for="u in uploads" :key="u.id" class="flex items-center gap-2 text-sm">
-        <span class="truncate">{{ u.name }}</span>
-        <span class="text-muted-color">{{ u.status }} {{ u.progress }}%</span>
+    <div v-if="uploads.length" class="flex flex-wrap gap-2" data-test="uploads">
+      <div
+        v-for="u in uploads"
+        :key="u.id"
+        class="relative h-20 w-20 overflow-hidden rounded-lg bg-surface-100 dark:bg-surface-800"
+        :title="u.name"
+      >
+        <img v-if="u.preview" :src="u.preview" alt="" class="h-full w-full object-cover" />
+        <span v-else class="flex h-full w-full items-center justify-center text-muted-color">
+          <i :class="u.isVideo ? 'pi pi-video' : 'pi pi-file'" class="text-xl" aria-hidden="true" />
+        </span>
+        <!-- uploading: dim + percent; done: check; error: red -->
+        <div
+          v-if="u.status !== 'done'"
+          class="absolute inset-0 flex items-center justify-center bg-black/45 text-xs font-medium text-white"
+        >
+          <span v-if="u.status === 'error'"><i class="pi pi-exclamation-triangle text-red-400" /></span>
+          <span v-else>{{ u.progress }}%</span>
+        </div>
+        <span
+          v-else
+          class="absolute bottom-1 right-1 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[10px] text-white"
+        >
+          <i class="pi pi-check" style="font-size: 9px" aria-hidden="true" />
+        </span>
       </div>
     </div>
 
-    <!-- one slim action bar: formatting + media on the left, date / visibility / post on the right -->
-    <div class="flex items-center gap-1 border-t border-surface-100 pt-2 dark:border-surface-800">
+    <!-- one slim action bar: formatting + media on the left, date / visibility / post on the right.
+         flex-wrap so on a phone the right cluster drops to its own line instead of overflowing. -->
+    <div
+      class="flex flex-wrap items-center gap-1 gap-y-2 border-t border-surface-100 pt-2 dark:border-surface-800"
+    >
       <Button
         v-for="t in TOOLBAR"
         :key="t.action"
