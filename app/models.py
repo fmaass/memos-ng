@@ -107,6 +107,9 @@ class Attachment(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    owner_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     memo_id: Mapped[int | None] = mapped_column(
         ForeignKey("memos.id", ondelete="SET NULL"), index=True
     )

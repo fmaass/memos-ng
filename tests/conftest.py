@@ -63,6 +63,17 @@ async def adb(db_engine):
             await trans.rollback()
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limit():
+    # The login rate-limiter keeps per-IP state in a module dict; all tests share the one
+    # TestClient IP, so reset it between tests or repeated logins eventually 429.
+    from app import auth
+
+    auth._RL.clear()
+    yield
+    auth._RL.clear()
+
+
 @pytest.fixture
 def client() -> TestClient:
     # raise_server_exceptions=False so the degraded path's 503 is observable rather

@@ -80,7 +80,7 @@ async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: byte
     return upload
 
 
-async def finalize(db: AsyncSession, upload: Upload) -> Attachment:
+async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachment:
     part = part_path(upload.upload_uid)
     actual = part.stat().st_size
     if actual != upload.declared_size:
@@ -108,6 +108,7 @@ async def finalize(db: AsyncSession, upload: Upload) -> Attachment:
     is_video = mime.startswith("video/")
     attachment = Attachment(
         uid=secrets.token_urlsafe(16),
+        owner_id=owner_id,
         filename=upload.filename,
         mime=mime,
         size=actual,

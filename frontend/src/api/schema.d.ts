@@ -4,6 +4,40 @@
  */
 
 export interface paths {
+    "/api/attachments/{uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Attachment Meta */
+        get: operations["attachment_meta_api_attachments__uid__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/{uid}/{tier}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Serve Asset */
+        get: operations["serve_asset_api_attachments__uid___tier__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/logout": {
         parameters: {
             query?: never;
@@ -30,6 +64,23 @@ export interface paths {
         };
         /** Whoami */
         get: operations["whoami_api_auth_user_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Events */
+        get: operations["events_api_events_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -268,6 +319,36 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AttachmentMeta */
+        AttachmentMeta: {
+            /** Blurhash */
+            blurhash: string | null;
+            /** Captured At */
+            captured_at: string | null;
+            /** Downloadurl */
+            downloadUrl: string;
+            /** Duration */
+            duration: number | null;
+            /** Height */
+            height: number | null;
+            /** Mime */
+            mime: string;
+            /** Posterurl */
+            posterUrl: string;
+            /** Previewurl */
+            previewUrl: string;
+            /** Size */
+            size: number;
+            status: components["schemas"]["AttachmentStatus"];
+            /** Thumbnailurl */
+            thumbnailUrl: string;
+            /** Uid */
+            uid: string;
+            /** Weburl */
+            webUrl: string;
+            /** Width */
+            width: number | null;
+        };
         /** AttachmentOut */
         AttachmentOut: {
             /** Captured At */
@@ -469,6 +550,71 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    attachment_meta_api_attachments__uid__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentMeta"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    serve_asset_api_attachments__uid___tier__get: {
+        parameters: {
+            query?: {
+                format?: string | null;
+            };
+            header?: never;
+            path: {
+                uid: string;
+                tier: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     logout_api_auth_logout_post: {
         parameters: {
             query?: never;
@@ -505,6 +651,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UserOut"];
+                };
+            };
+        };
+    };
+    events_api_events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };

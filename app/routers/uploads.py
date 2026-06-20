@@ -106,7 +106,7 @@ async def finalize_upload(
 ) -> AttachmentOut:
     upload = await _get_upload(db, upload_uid)
     try:
-        attachment = await svc.finalize(db, upload)
+        attachment = await svc.finalize(db, upload, owner_id=user.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     await db.commit()
