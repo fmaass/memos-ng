@@ -190,6 +190,33 @@ def test_abandoned_upload_leaves_no_attachment(logged_in_client, monkeypatch, tm
         _cleanup()
 
 
+def test_failed_post_cleans_up_moved_original(logged_in_client, monkeypatch, tmp_path):
+    # finalize moves the file to disk before the shared commit; if the post then fails, the
+    # compensating cleanup must unlink it (else it leaks with no DB row — the review's MED finding).
+    from app.services import memos as memo_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("post failed after finalize")
+
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"L" * 4000
+        uid = _start(client, "leak.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        monkeypatch.setattr(memo_svc, "create_memo", boom)  # fail AFTER finalize_pending moved it
+        # raise_server_exceptions=False → the failure surfaces as a 500 (the finally still runs).
+        assert client.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
+        ).status_code == 500
+        originals = tmp_path / "originals"
+        leaked = [p for p in originals.rglob("*") if p.is_file()] if originals.exists() else []
+        assert leaked == []  # moved original was unlinked on the failed post
+    finally:
+        _cleanup()
+
+
 def test_uploads_require_auth(client):
     assert (
         client.post("/api/uploads", json={"filename": "x", "mime": "x", "size": 1}).status_code

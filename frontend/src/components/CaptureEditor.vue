@@ -2,7 +2,7 @@
 import Button from 'primevue/button'
 import DatePicker from 'primevue/datepicker'
 import Select from 'primevue/select'
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { useUploadQueue } from '@/composables/useResumableUpload'
@@ -31,6 +31,9 @@ const visibilityOptions = [
 // Custom display date — null means "now" (server default); set it to backdate a memo (parity).
 const memoDate = ref<Date | null>(null)
 const saving = ref(false)
+// Block Post while media is still uploading — only finished uploads attach, so posting early
+// would silently drop the in-flight ones (the thumbnails show their progress).
+const uploading = computed(() => uploads.some((u) => u.status === 'queued' || u.status === 'uploading'))
 
 const textarea = ref<HTMLTextAreaElement | null>(null)
 const TOOLBAR: { icon: string; action: MarkdownAction; label: string }[] = [
@@ -206,11 +209,11 @@ async function save() {
           </template>
         </Select>
         <Button
-          label="Post"
+          :label="uploading ? 'Uploading…' : 'Post'"
           icon="pi pi-send"
           size="small"
           :loading="saving"
-          :disabled="!content.trim()"
+          :disabled="!content.trim() || uploading"
           data-test="save"
           @click="save"
         />

@@ -1,6 +1,9 @@
+import contextlib
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +15,13 @@ from app.services import memos as svc
 from app.services import uploads as uploads_svc
 
 router = APIRouter(prefix="/api", tags=["memos"])
+
+
+def _unlink_paths(paths: list[str]) -> None:
+    """Best-effort remove files finalize moved to disk when a post rolls back (off-loop)."""
+    for path in paths:
+        with contextlib.suppress(OSError):
+            Path(path).unlink(missing_ok=True)
 
 
 class AttachmentRef(BaseModel):
@@ -182,21 +192,30 @@ async def create_memo(
 ) -> MemoOut:
     # Finalize-on-post: pending uploads become attachments now, then link them alongside any
     # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
-    finalized = (
-        await uploads_svc.finalize_pending(db, body.upload_uids, user.id)
-        if body.upload_uids
-        else []
-    )
-    memo = await svc.create_memo(
-        db,
-        user,
-        content=body.content,
-        visibility=body.visibility or user.default_visibility,  # prod parity: per-user default
-        pinned=body.pinned,
-        attachment_uids=[*body.attachment_uids, *finalized],
-        created_at=body.created_at,
-    )
-    await db.commit()
+    # finalize moves files to disk before the shared commit — if the post then rolls back, unlink
+    # those moved originals so they don't leak (the DB row is reverted but the file would remain).
+    moved: list[str] = []
+    committed = False
+    try:
+        finalized = (
+            await uploads_svc.finalize_pending(db, body.upload_uids, user.id, moved_out=moved)
+            if body.upload_uids
+            else []
+        )
+        memo = await svc.create_memo(
+            db,
+            user,
+            content=body.content,
+            visibility=body.visibility or user.default_visibility,  # prod parity: per-user default
+            pinned=body.pinned,
+            attachment_uids=[*body.attachment_uids, *finalized],
+            created_at=body.created_at,
+        )
+        await db.commit()
+        committed = True
+    finally:
+        if not committed and moved:
+            await to_thread.run_sync(_unlink_paths, moved)
     return _out(memo, user.id)
 
 
