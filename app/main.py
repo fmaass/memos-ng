@@ -37,6 +37,7 @@ app = FastAPI(
 )
 
 from app.routers import auth as auth_router  # noqa: E402
+from app.routers import export as export_router  # noqa: E402
 from app.routers import memos as memos_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
 
@@ -49,6 +50,7 @@ from app.routers import pats as pats_router  # noqa: E402
 app.router.routes.extend(auth_router.router.routes)
 app.router.routes.extend(memos_router.router.routes)
 app.router.routes.extend(pats_router.router.routes)
+app.router.routes.extend(export_router.router.routes)
 
 # Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
