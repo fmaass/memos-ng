@@ -136,3 +136,16 @@ async def test_reaper_deletes_expired_upload_and_part(adb, monkeypatch, tmp_path
     await adb.flush()
     n = await svc.reap_expired(adb)
     assert n == 1 and not part.exists()
+
+
+def test_upload_rejects_oversize(logged_in_client, monkeypatch):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 1)  # 1 MiB cap for the test
+    over = client.post(
+        "/api/uploads", json={"filename": "big.mov", "mime": "video/mp4", "size": 2 * 1024 * 1024}
+    )
+    assert over.status_code == 413  # exceeds the cap
+    ok = client.post(
+        "/api/uploads", json={"filename": "ok.jpg", "mime": "image/jpeg", "size": 500 * 1024}
+    )
+    assert ok.status_code == 201  # within the cap

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Resumable upload (T2.1).
     UPLOAD_CHUNK_SIZE: int = 5 * 1024 * 1024  # 5 MiB
     UPLOAD_EXPIRY_HOURS: int = 24
+    MAX_UPLOAD_MIB: int = 1024  # prod parity (system_setting MAX_UPLOAD_SIZE_MIB)
 
     # Slow-lane transcode + thermal guard (T2.3). Saturn is thermally bound: defer the
     # H.264 transcode while the SoC is above THERMAL_MAX_C. Missing zone path → no-op.

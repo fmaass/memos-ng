@@ -55,6 +55,10 @@ async def start_upload(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> UploadOut:
+    if body.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
+        )
     upload = await svc.create_upload(
         db, filename=body.filename, mime=body.mime, size=body.size, last_modified=body.last_modified
     )
