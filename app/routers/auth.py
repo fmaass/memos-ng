@@ -14,6 +14,15 @@ from app.models import User
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
+def _safe_next(target: str | None) -> str:
+    """Only allow a same-site local path as the post-login redirect — never an absolute
+    or protocol-relative URL ('//evil.com', 'https://evil.com', '/\\evil') — so the `next`
+    param can't be used as an open redirect."""
+    if not target or not target.startswith("/") or target.startswith(("//", "/\\")):
+        return "/"
+    return target
+
+
 class UserOut(BaseModel):
     subject: str
     display_name: str | None
@@ -39,7 +48,7 @@ async def login(request: Request, next: str = "/", _: None = Depends(auth.rate_l
     )
     resp.set_cookie(
         auth.TX_COOKIE,
-        auth.encrypt({"state": state, "verifier": verifier, "next": next}),
+        auth.encrypt({"state": state, "verifier": verifier, "next": _safe_next(next)}),
         max_age=600,
         httponly=True,
         secure=settings.COOKIE_SECURE,
@@ -65,7 +74,7 @@ async def callback(
     user = await auth.upsert_user(db, claims)
     sid = await auth.create_session(db, user, tokens)
     await db.commit()
-    resp = RedirectResponse(tx.get("next") or "/", status_code=302)
+    resp = RedirectResponse(_safe_next(tx.get("next")), status_code=302)  # defence in depth
     resp.delete_cookie(auth.TX_COOKIE)
     resp.set_cookie(
         auth.SID_COOKIE,

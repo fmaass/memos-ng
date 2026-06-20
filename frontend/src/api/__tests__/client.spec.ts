@@ -20,6 +20,19 @@ describe('redirectToLogin', () => {
       `/api/auth/login?next=${encodeURIComponent('/archived?q=x')}`,
     )
   })
+
+  it('does not forward a protocol-relative path as next (open-redirect guard)', () => {
+    const assign = vi.fn()
+    const original = window.location
+    // happy-dom blocks cross-origin pushState, so inject a '//evil' pathname directly.
+    Object.defineProperty(window, 'location', {
+      value: { pathname: '//evil.com', search: '', assign },
+      configurable: true,
+    })
+    redirectToLogin()
+    expect(assign).toHaveBeenCalledWith(`/api/auth/login?next=${encodeURIComponent('/')}`)
+    Object.defineProperty(window, 'location', { value: original, configurable: true })
+  })
 })
 
 describe('authMiddleware', () => {

@@ -171,3 +171,15 @@ def test_logout_returns_rp_initiated_url(logged_in_client):
     assert body["logout_url"].startswith(settings.OIDC_END_SESSION_ENDPOINT)
     assert "post_logout_redirect_uri=" in body["logout_url"]
     assert "id_token_hint=" in body["logout_url"]
+
+
+def test_login_next_rejects_open_redirect(client):
+    # A protocol-relative or absolute next must not survive — only same-site local paths.
+    from app.routers.auth import _safe_next
+
+    assert _safe_next("/memos/abc") == "/memos/abc"
+    assert _safe_next("//evil.com") == "/"
+    assert _safe_next("https://evil.com") == "/"
+    assert _safe_next("/\\evil.com") == "/"
+    assert _safe_next(None) == "/"
+    assert _safe_next("") == "/"

@@ -7,8 +7,11 @@ import type { paths } from './schema'
 // user was so the backend's `next` param lands them back after auth. Exported for tests.
 export function redirectToLogin(): void {
   if (typeof window === 'undefined') return
-  const next = encodeURIComponent(window.location.pathname + window.location.search)
-  window.location.assign(`/api/auth/login?next=${next}`)
+  const path = window.location.pathname + window.location.search
+  // Only forward a same-site local path; never a protocol-relative '//evil' (which the
+  // browser would treat as absolute). The backend re-validates, but harden here too.
+  const safe = path.startsWith('/') && !path.startsWith('//') ? path : '/'
+  window.location.assign(`/api/auth/login?next=${encodeURIComponent(safe)}`)
 }
 
 // Exported for direct unit testing — openapi-fetch binds `fetch` at client creation,
