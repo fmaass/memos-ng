@@ -34,21 +34,26 @@ async def export_memos(
     # NOTE (Phase 2 / T2.4): a `tier` param (original|web|thumbnail) and per-file mtimes
     # from attachment.captured_at get wired once attachments exist. For now we export the
     # memo text; each zip entry's mtime is the memo's created_at (the captured_at analogue).
-    filters = dict(
-        created_before=created_before,
-        created_after=created_after,
-        tags=tag,
-        visibility=visibility,
-        owner=owner,
-        q=q,
-    )
-    _, _, total = await svc.list_memos(db, user, limit=1, **filters)
+    async def query(limit: int):
+        return await svc.list_memos(
+            db,
+            user,
+            created_before=created_before,
+            created_after=created_after,
+            tags=tag,
+            visibility=visibility,
+            owner=owner,
+            q=q,
+            limit=limit,
+        )
+
+    _, _, total = await query(1)
     if total > EXPORT_MAX:
         raise HTTPException(
             status_code=413,
             detail=f"Export too large ({total} memos > {EXPORT_MAX}). Narrow it with filters.",
         )
-    items, _, _ = await svc.list_memos(db, user, limit=EXPORT_MAX, **filters)
+    items, _, _ = await query(EXPORT_MAX)
 
     async with _sem:
         buf = io.BytesIO()
