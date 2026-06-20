@@ -1,6 +1,4 @@
 import hashlib
-import json
-from pathlib import Path
 
 from app.config import settings
 from PIL import Image
@@ -8,7 +6,17 @@ from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
 
-FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "live-0.29.1"
+# The memos 0.29.1 contract field sets, from fixtures/live-0.29.1/NOTES.md (the captured live
+# ground truth). Hardcoded here so the contract test is self-contained and CI-safe — the real
+# fixtures are gitignored because they contain private family memo content.
+MEMO_KEYS = {
+    "name", "state", "creator", "createTime", "updateTime", "content", "visibility",
+    "tags", "pinned", "attachments", "relations", "reactions", "property", "snippet",
+}
+ATTACHMENT_KEYS = {
+    "name", "createTime", "filename", "content", "externalLink", "type", "size",
+    "memo", "motionMedia",
+}
 
 
 def _seed_user(c, subject):
@@ -75,25 +83,21 @@ def _seed_world():
     return token
 
 
-def test_compat_envelope_and_fields_match_fixture(client):
-    token = _seed_world()
+def test_compat_envelope_and_fields_match_contract(client):
+    _seed_world()
     try:
-        fx = json.loads((FIXTURES / "01_memos_list.json").read_text())
-        fx_memo, fx_att = fx["memos"][0], fx["memos"][0]["attachments"][0]
-
         body = client.get("/api/v1/memos").json()
         assert set(body.keys()) == {"memos", "nextPageToken"}  # 0.29.1 envelope
         memo = next(m for m in body["memos"] if m["name"] == "memos/cmp-pub")
-        assert set(memo.keys()) == set(fx_memo.keys())  # exact 0.29.1 memo field set
+        assert set(memo.keys()) == MEMO_KEYS  # exact 0.29.1 memo field set
         assert memo["content"] == "Public #curated memo" and memo["visibility"] == "PUBLIC"
         att = memo["attachments"][0]
-        assert set(att.keys()) == set(fx_att.keys())  # exact attachment field set
+        assert set(att.keys()) == ATTACHMENT_KEYS  # exact attachment field set
         assert att["name"] == "attachments/cmp-att"
         assert att["size"] == "5797027" and isinstance(att["size"], str)  # size is a STRING
         assert att["content"] == "" and att["motionMedia"] is None
     finally:
         _cleanup("compat_owner")
-        del token
 
 
 def test_f1_no_auth_returns_200_public_only(client):
