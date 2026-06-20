@@ -9,6 +9,10 @@ const { postMemo, getTags } = vi.hoisted(() => ({ postMemo: vi.fn(), getTags: vi
 vi.mock('@/composables/useApi', () => ({
   useApi: () => ({ POST: postMemo, GET: getTags }),
 }))
+vi.mock('@/composables/useSettings', async () => {
+  const { ref } = await import('vue')
+  return { useSettings: () => ({ settings: ref(undefined), update: { mutate: () => {} } }) }
+})
 
 function mountEditor() {
   return mount(CaptureEditor, { global: { plugins: [PrimeVue] } })

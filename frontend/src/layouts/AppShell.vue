@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import Drawer from 'primevue/drawer'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 
 import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
 import TagList from '@/components/TagList.vue'
 import { useApi } from '@/composables/useApi'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
+import { useSettings } from '@/composables/useSettings'
 
 // The five primary destinations, mirroring the original memos sidebar.
 interface NavItem {
@@ -23,9 +24,15 @@ const NAV: NavItem[] = [
   { label: 'Settings', icon: 'pi pi-cog', to: '/settings' },
 ]
 
-const { isDark, toggle } = useDarkMode()
+const { isDark, toggle, setDark } = useDarkMode()
 const { data: user } = useSession()
+const { settings } = useSettings()
 const api = useApi()
+
+// Apply the server-persisted theme once it loads (source of truth across devices).
+watch(settings, (s) => {
+  if (s) setDark(s.theme === 'dark')
+})
 
 const mobileOpen = ref(false)
 

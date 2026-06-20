@@ -63,6 +63,13 @@ class User(Base):
     display_name: Mapped[str | None] = mapped_column(String(255))
     email: Mapped[str | None] = mapped_column(String(320))
     role: Mapped[str] = mapped_column(String(32), default="user")
+    avatar: Mapped[str | None] = mapped_column(Text)  # data: URL or path (migrated from prod)
+    # Per-user settings (prod parity). default_visibility seeds new memos; theme is
+    # server-persisted so it follows the account across devices.
+    default_visibility: Mapped[Visibility] = mapped_column(
+        Enum(Visibility, name="visibility"), default=Visibility.PUBLIC
+    )
+    theme: Mapped[str] = mapped_column(String(32), default="dark")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

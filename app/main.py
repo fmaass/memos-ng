@@ -43,6 +43,7 @@ from app.routers import export as export_router  # noqa: E402
 from app.routers import memos as memos_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
 from app.routers import push as push_router  # noqa: E402
+from app.routers import settings as settings_router  # noqa: E402
 from app.routers import uploads as uploads_router  # noqa: E402
 
 # Add eagerly rather than include_router(): FastAPI 0.138's include_router defers to a
@@ -58,6 +59,7 @@ app.router.routes.extend(export_router.router.routes)
 app.router.routes.extend(uploads_router.router.routes)
 app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
+app.router.routes.extend(settings_router.router.routes)
 # Compat (/api/v1/*, /file/*) must precede the /api/* fallback and the SPA catch-all.
 app.router.routes.extend(compat_router.router.routes)
 

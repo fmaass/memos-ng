@@ -12,6 +12,11 @@ vi.mock('@/composables/useApi', () => ({
 vi.mock('@/composables/useMediaEvents', () => ({ useMediaEvents: () => {} }))
 // HomeView reads the route's ?tag; provide a stub route.
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }) }))
+// CaptureEditor (child) uses settings via vue-query; stub it out.
+vi.mock('@/composables/useSettings', async () => {
+  const { ref } = await import('vue')
+  return { useSettings: () => ({ settings: ref(undefined), update: { mutate: () => {} } }) }
+})
 
 const FeedStub = { template: '<div data-test="feed-stub" />' }
 

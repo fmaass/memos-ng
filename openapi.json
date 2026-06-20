@@ -427,8 +427,14 @@
             "type": "boolean"
           },
           "visibility": {
-            "$ref": "#/components/schemas/Visibility",
-            "default": "PRIVATE"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Visibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -707,6 +713,50 @@
           "auth"
         ],
         "title": "PushKeys",
+        "type": "object"
+      },
+      "SettingsOut": {
+        "properties": {
+          "default_visibility": {
+            "$ref": "#/components/schemas/Visibility"
+          },
+          "theme": {
+            "title": "Theme",
+            "type": "string"
+          }
+        },
+        "required": [
+          "default_visibility",
+          "theme"
+        ],
+        "title": "SettingsOut",
+        "type": "object"
+      },
+      "SettingsPatch": {
+        "properties": {
+          "default_visibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Visibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "theme": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Theme"
+          }
+        },
+        "title": "SettingsPatch",
         "type": "object"
       },
       "SubscriptionIn": {
@@ -1899,6 +1949,66 @@
         "summary": "Vapid Public Key",
         "tags": [
           "push"
+        ]
+      }
+    },
+    "/api/settings": {
+      "get": {
+        "operationId": "get_settings_api_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Settings",
+        "tags": [
+          "settings"
+        ]
+      },
+      "patch": {
+        "operationId": "update_settings_api_settings_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Settings",
+        "tags": [
+          "settings"
         ]
       }
     },

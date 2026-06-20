@@ -38,5 +38,9 @@ export function useDarkMode() {
     toggle: () => {
       isDark.value = !isDark.value
     },
+    // Apply an explicit theme (e.g. from the server-persisted user setting).
+    setDark: (dark: boolean) => {
+      isDark.value = dark
+    },
   }
 }

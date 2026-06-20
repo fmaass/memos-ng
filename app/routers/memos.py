@@ -44,7 +44,7 @@ class MemoOut(BaseModel):
 
 class MemoCreate(BaseModel):
     content: str
-    visibility: Visibility = Visibility.PRIVATE
+    visibility: Visibility | None = None  # None → the user's default_visibility setting
     pinned: bool = False
     attachment_uids: list[str] = []
 
@@ -144,7 +144,7 @@ async def create_memo(
         db,
         user,
         content=body.content,
-        visibility=body.visibility,
+        visibility=body.visibility or user.default_visibility,  # prod parity: per-user default
         pinned=body.pinned,
         attachment_uids=body.attachment_uids,
     )

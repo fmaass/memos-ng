@@ -2,19 +2,25 @@
 import AutoComplete, { type AutoCompleteCompleteEvent } from 'primevue/autocomplete'
 import Button from 'primevue/button'
 import SelectButton from 'primevue/selectbutton'
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { useUploadQueue } from '@/composables/useResumableUpload'
+import { useSettings } from '@/composables/useSettings'
 import { applyMarkdown, type MarkdownAction } from '@/lib/markdownToolbar'
 
 const emit = defineEmits<{ saved: [memo: unknown] }>()
 
 const api = useApi()
 const { items: uploads, add: addUploads } = useUploadQueue()
+const { settings } = useSettings()
 
 const content = ref('')
 const visibility = ref<'PRIVATE' | 'PROTECTED' | 'PUBLIC'>('PRIVATE')
+// Default the picker to the user's setting once it loads (prod parity).
+watch(settings, (s) => {
+  if (s) visibility.value = s.default_visibility
+})
 const visibilityOptions = [
   { label: 'Private', value: 'PRIVATE' },
   { label: 'Protected', value: 'PROTECTED' },

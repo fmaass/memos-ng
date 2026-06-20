@@ -1,13 +1,37 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
+import SelectButton from 'primevue/selectbutton'
 
 import PatManager from '@/components/PatManager.vue'
+import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
 import { useSession } from '@/composables/useSession'
+import { type SettingsPatch, useSettings } from '@/composables/useSettings'
 
 const version = __APP_VERSION__
 const { data: user } = useSession()
 const { supported, enabled, busy, enable } = usePushSubscription()
+const { settings, update } = useSettings()
+const { setDark } = useDarkMode()
+
+const visibilityOptions = [
+  { label: 'Private', value: 'PRIVATE' },
+  { label: 'Protected', value: 'PROTECTED' },
+  { label: 'Public', value: 'PUBLIC' },
+]
+const themeOptions = [
+  { label: 'Dark', value: 'dark' },
+  { label: 'Light', value: 'light' },
+]
+
+function setVisibility(value: SettingsPatch['default_visibility']) {
+  if (value) update.mutate({ default_visibility: value })
+}
+function setTheme(value: string) {
+  if (!value) return
+  update.mutate({ theme: value })
+  setDark(value === 'dark') // apply immediately
+}
 </script>
 
 <template>
@@ -21,6 +45,34 @@ const { supported, enabled, busy, enable } = usePushSubscription()
       <p class="text-sm mt-1" data-test="profile-name">{{ user?.display_name ?? user?.subject }}</p>
       <p class="text-sm text-muted-color">{{ user?.email }}</p>
       <p class="text-xs text-muted-color mt-1">Identity is managed by single sign-on.</p>
+    </div>
+
+    <div v-if="settings" data-test="preferences" class="flex flex-col gap-4">
+      <div>
+        <h2 class="text-lg font-medium">Default visibility</h2>
+        <p class="text-sm text-muted-color mb-2">New memos use this unless you change it.</p>
+        <SelectButton
+          :model-value="settings.default_visibility"
+          :options="visibilityOptions"
+          option-label="label"
+          option-value="value"
+          :allow-empty="false"
+          data-test="default-visibility"
+          @update:model-value="setVisibility"
+        />
+      </div>
+      <div>
+        <h2 class="text-lg font-medium">Theme</h2>
+        <SelectButton
+          :model-value="settings.theme"
+          :options="themeOptions"
+          option-label="label"
+          option-value="value"
+          :allow-empty="false"
+          data-test="theme"
+          @update:model-value="setTheme"
+        />
+      </div>
     </div>
 
     <PatManager />
