@@ -10,6 +10,7 @@ interface MediaAttachment {
   mime: string
   status: string
   blurhash: string | null
+  thumbnailUrl: string
   previewUrl: string
   posterUrl: string
   webUrl: string
@@ -52,8 +53,9 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
 
     <img
       v-else-if="kind === 'image'"
-      :src="att.previewUrl"
+      :src="att.thumbnailUrl"
       :alt="att.uid"
+      loading="lazy"
       class="w-full h-full object-cover cursor-pointer"
       data-test="tile-image"
       @click="emit('open', att.uid)"

@@ -34,9 +34,11 @@ describe('MediaTile', () => {
     expect(w.text()).toContain('42%')
   })
 
-  it('renders an image when a ready image', () => {
+  it('renders a lazy-loaded thumb (not the heavy mobile tier) for a ready image', () => {
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
-    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/mobile')
+    const img = w.find('[data-test="tile-image"]')
+    expect(img.attributes('src')).toBe('/api/attachments/a1/thumb') // small tier in the grid
+    expect(img.attributes('loading')).toBe('lazy')
   })
 
   it('renders a video element when a ready video', () => {

@@ -184,8 +184,14 @@ async def serve_asset(
     if not path.exists():
         raise HTTPException(status_code=404, detail="Asset not generated yet")
     # FileResponse adds ETag + Last-Modified (mtime == captured_at for derived tiers) +
-    # Accept-Ranges, and answers Range requests with 206 automatically.
-    return FileResponse(path, media_type=media_type)
+    # Accept-Ranges, and answers Range requests with 206 automatically. Tiers are uid-keyed and
+    # immutable, so cache hard — repeat feed/gallery renders then hit the browser cache, not the
+    # server (cuts request fan-out + DB connection pressure).
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": f"public, max-age={settings.ASSET_CACHE_SECONDS}, immutable"},
+    )
 
 
 # --- SSE media status channel (poll-based; LISTEN/NOTIFY is a future enhancement) ---

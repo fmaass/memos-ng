@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     # Storage — bind-mounted at /app/data in the container (layout identical to old memos).
     DATA_ROOT: str = "./data"
 
+    # DB connection pool (prod only — dev/test use NullPool so per-test event loops are safe).
+    # memos-ng SHARES Postgres17 with prod; cap total connections (pool_size + max_overflow) so a
+    # request burst can't exhaust the shared slots (TooManyConnectionsError starves prod too).
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 5
+    DB_POOL_RECYCLE: int = 1800
+
+    # Derived media tiers are immutable (uid-keyed) — let browsers cache them hard so re-renders
+    # of the feed/gallery don't re-request every image (1 year, immutable).
+    ASSET_CACHE_SECONDS: int = 31536000
+
     # Media worker thermal/concurrency guards (Saturn is thermally bound — see plan §3).
     FFMPEG_THREADS: int = 1
     WORKER_CONCURRENCY: int = 1
