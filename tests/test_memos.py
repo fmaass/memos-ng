@@ -3,7 +3,9 @@ from datetime import UTC, datetime, timedelta
 from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
 from app.routers.memos import MemoOut, _out
 from app.services import memos as svc
-from sqlalchemy import select
+from sqlalchemy import create_engine, select, text
+
+from tests.conftest import SYNC_URL
 
 
 async def _user(adb, subject):
@@ -214,6 +216,40 @@ async def test_archived_only_filter(adb):
     assert total == 1 and items[0].uid == arch.uid  # only the archived memo
     _, _, default = await svc.list_memos(adb, u)
     assert default == 1  # default still excludes archived
+
+
+def test_pin_unpin_rejects_non_owner(logged_in_client):
+    # A user can SEE another user's PUBLIC memo, but pinning is a mutation — owner-only.
+    # Regression: pin/unpin shared _require_owned (visibility check) without an ownership
+    # guard, so any user could pin another's PUBLIC memo.
+    client, _ = logged_in_client
+    eng = create_engine(SYNC_URL)
+    try:
+        with eng.begin() as c:
+            oid = c.execute(
+                text(
+                    "INSERT INTO users (subject, role, default_visibility, theme) "
+                    "VALUES ('other_owner','user','PUBLIC','dark') RETURNING id"
+                )
+            ).scalar_one()
+            c.execute(
+                text(
+                    "INSERT INTO memos (uid, owner_id, content, visibility, pinned, "
+                    "created_at, updated_at) VALUES ('othermemo', :oid, 'x', 'PUBLIC', false, "
+                    "now(), now())"
+                ),
+                {"oid": oid},
+            )
+        assert client.post("/api/memos/othermemo/pin").status_code == 403
+        assert client.post("/api/memos/othermemo/unpin").status_code == 403
+        with eng.connect() as c:
+            still = c.execute(text("SELECT pinned FROM memos WHERE uid='othermemo'")).scalar_one()
+        assert still is False  # untouched
+    finally:
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM memos WHERE uid='othermemo'"))
+            c.execute(text("DELETE FROM users WHERE subject='other_owner'"))
+        eng.dispose()
 
 
 def test_reactions_toggle_count_and_reacted(logged_in_client):

@@ -106,6 +106,12 @@ async def run_once(db: AsyncSession) -> str:
     # lane's image work has no inner thermal check, so a bulk import could otherwise drive a
     # transcode/thumbnail storm). Back off until it cools — protects the thermally-coupled host.
     if media.too_hot():
+        temp_mc = media.read_temp_millideg()
+        logger.info(
+            "worker_thermal_defer",  # the safety guard firing — observable, not just inferable
+            temp_c=round(temp_mc / 1000, 1) if temp_mc is not None else None,
+            max_c=settings.THERMAL_MAX_C,
+        )
         await db.commit()
         return "deferred"
     job = await claim_one(db)

@@ -229,6 +229,8 @@ async def pin_memo(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
     memo = await _require_owned(db, user, uid)
+    if memo.owner_id != user.id:  # pinning is a mutation — owner-only, not visible-to-user
+        raise HTTPException(status_code=403, detail="Not your memo")
     memo = await svc.update_memo(db, memo, pinned=True)
     await db.commit()
     return _out(memo, user.id)
@@ -241,6 +243,8 @@ async def unpin_memo(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
     memo = await _require_owned(db, user, uid)
+    if memo.owner_id != user.id:  # unpinning is a mutation — owner-only, not visible-to-user
+        raise HTTPException(status_code=403, detail="Not your memo")
     memo = await svc.update_memo(db, memo, pinned=False)
     await db.commit()
     return _out(memo, user.id)

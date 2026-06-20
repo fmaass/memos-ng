@@ -26,8 +26,11 @@ class Settings(BaseSettings):
     MAX_UPLOAD_MIB: int = 1024  # prod parity (system_setting MAX_UPLOAD_SIZE_MIB)
 
     # Slow-lane transcode + thermal guard (T2.3). Saturn is thermally bound: defer the
-    # H.264 transcode while the SoC is above THERMAL_MAX_C. Missing zone path → no-op.
-    THERMAL_ZONE: str = "/sys/class/thermal/thermal_zone0/temp"
+    # H.264 transcode while the SoC is above THERMAL_MAX_C. The default is Saturn's real CPU
+    # sensor (k10temp) — `/sys/class/thermal/thermal_zone*` does NOT exist on this Synology, so
+    # the old default silently read nothing and the guard failed OPEN (the 80 °C near-miss).
+    # On dev/CI this path is absent → read returns None → guard is a no-op (correct for dev).
+    THERMAL_ZONE: str = "/sys/class/hwmon/hwmon0/temp1_input"
     THERMAL_MAX_C: int = 70
     MEDIA_MAX_ATTEMPTS: int = 3
 

@@ -1,6 +1,35 @@
 from app.models import Attachment, Memo, Reaction, User, Visibility
-from app.scripts.migrate_from_memos import epoch_to_dt, import_all
+from app.scripts.migrate_from_memos import epoch_to_dt, import_all, resolve_subjects
 from sqlalchemy import select
+
+
+def test_resolve_subjects_prefers_extern_uid_over_opaque_username():
+    # laura's old user.username was the opaque OIDC sub UUID; the human handle is the
+    # Authelia preferred_username in user_identity.extern_uid. Keying on username would
+    # mis-own all her memos (the real prod bug this fix prevents).
+    users = [
+        {"id": 1, "username": "fabian"},
+        {"id": 3, "username": "2f91f885-a8af-4f49-892a-61c16441ff95"},
+    ]
+    resolved = resolve_subjects(users, {1: "fabian", 3: "laura"})
+    assert {u["id"]: u["username"] for u in resolved} == {1: "fabian", 3: "laura"}
+
+
+def test_resolve_subjects_falls_back_when_no_identity_row():
+    # A user with no OIDC identity (or a NULL extern_uid) keeps its existing username.
+    users = [{"id": 5, "username": "legacy"}, {"id": 6, "username": "keepme"}]
+    resolved = resolve_subjects(users, {5: None})  # 6 absent entirely, 5 NULL
+    assert {u["id"]: u["username"] for u in resolved} == {5: "legacy", 6: "keepme"}
+
+
+def test_resolve_subjects_raises_on_subject_collision():
+    # Two old users resolving to the same subject would silently merge accounts on the
+    # subject-keyed upsert and mis-own one user's PRIVATE memos — must fail loudly, not import.
+    import pytest
+
+    users = [{"id": 1, "username": "u1"}, {"id": 2, "username": "u2"}]
+    with pytest.raises(ValueError, match="collision"):
+        resolve_subjects(users, {1: "shared", 2: "shared"})
 
 
 def _dataset():

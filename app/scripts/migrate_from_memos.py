@@ -66,6 +66,34 @@ def _get_or_create_tags(session: Session, names: Iterable[str]) -> list[Tag]:
     return out
 
 
+def resolve_subjects(
+    users: list[dict[str, Any]], identities: dict[int, str | None]
+) -> list[dict[str, Any]]:
+    """Overwrite each user's `username` with its authoritative Authelia identity.
+
+    The migration subject MUST be `user_identity.extern_uid` (the Authelia preferred_username),
+    NOT `user.username` — old memos backfilled some usernames with the opaque OIDC sub UUID
+    (laura's was `2f91f885-…`), so keying on username mis-owns that user's memos. Falls back to
+    the existing username only when a user has no OIDC identity row. Pure (no DB) so the exact
+    laura-bug fix is unit-testable without a real old DB.
+
+    Raises on a subject COLLISION (two old users resolving to the same subject): the upsert is
+    keyed on subject, so a collision would silently merge two accounts and assign one user's
+    PRIVATE memos to the other. Fail loudly rather than corrupt ownership.
+    """
+    for u in users:
+        u["username"] = identities.get(u["id"]) or u["username"]
+    seen: dict[str, int] = {}
+    for u in users:
+        if u["username"] in seen:
+            raise ValueError(
+                f"subject collision: old users {seen[u['username']]} and {u['id']} both resolve "
+                f"to subject {u['username']!r} — would merge accounts and mis-own memos"
+            )
+        seen[u["username"]] = u["id"]
+    return users
+
+
 def import_user(session: Session, old: dict[str, Any]) -> User:
     """Upsert by subject (= old username = Authelia preferred_username)."""
     subject = old["username"]
@@ -230,15 +258,17 @@ def read_old(source_dsn: str) -> dict[str, Any]:  # pragma: no cover - exercised
                 "WHERE row_status = 'NORMAL'"
             )
             user_cols = ("id", "username", "role", "email", "nickname", "avatar_url")
-            users = [dict(zip(user_cols, r, strict=False)) for r in cur.fetchall()]
+            users: list[dict[str, Any]] = [
+                dict(zip(user_cols, r, strict=False)) for r in cur.fetchall()
+            ]
             # The OIDC identity (user_identity.extern_uid) is the Authelia preferred_username
             # and is the authoritative subject — user.username can be the opaque OIDC sub UUID
             # (it is for laura). Prefer extern_uid; fall back to username.
             cur.execute("SELECT user_id, extern_uid FROM user_identity")
             ident = dict(cur.fetchall())
+            users = resolve_subjects(users, ident)
             users_by_id = {}
             for u in users:
-                u["username"] = ident.get(u["id"]) or u["username"]
                 users_by_id[u["id"]] = u
                 out["users"].append(u)
             for uid, u in users_by_id.items():

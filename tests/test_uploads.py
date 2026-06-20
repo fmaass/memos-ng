@@ -111,6 +111,34 @@ def test_dedup_same_content_returns_existing(logged_in_client, monkeypatch, tmp_
         _cleanup()
 
 
+async def test_dedup_is_per_owner(adb, monkeypatch, tmp_path):
+    # sha256 dedup must be scoped per-owner: owner B finalizing bytes identical to owner A's
+    # must get a DISTINCT attachment, never a reference to A's row (cross-user linkage).
+    from app.models import User
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    a = User(subject="dedup_a", role="user")
+    b = User(subject="dedup_b", role="user")
+    adb.add_all([a, b])
+    await adb.flush()
+    data = b"shared-bytes" * 500
+
+    async def _finalize(owner_id, name):
+        up = await svc.create_upload(
+            adb, filename=name, mime="application/octet-stream", size=len(data)
+        )
+        await svc.append_chunk(adb, up, 0, data)
+        return await svc.finalize(adb, up, owner_id=owner_id)
+
+    att_a = await _finalize(a.id, "a.bin")
+    att_b = await _finalize(b.id, "b.bin")
+    assert att_b.uid != att_a.uid  # B does NOT receive A's attachment
+    assert att_a.owner_id == a.id and att_b.owner_id == b.id
+
+    att_a2 = await _finalize(a.id, "a2.bin")
+    assert att_a2.uid == att_a.uid  # same owner, same bytes → still dedups to A's row
+
+
 def test_uploads_require_auth(client):
     assert (
         client.post("/api/uploads", json={"filename": "x", "mime": "x", "size": 1}).status_code

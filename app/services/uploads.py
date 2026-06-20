@@ -88,9 +88,15 @@ async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachmen
 
     digest = await to_thread.run_sync(_sha256_sync, part)
 
-    # sha256 dedup — identical bytes already stored → return the existing attachment.
+    # sha256 dedup — identical bytes already stored BY THIS OWNER → return the existing
+    # attachment. Scoped per-owner: a global dedup would hand one user a reference to another
+    # user's attachment row (cross-user linkage), so dedup only within the finalizing owner.
     existing = (
-        await db.execute(select(Attachment).where(Attachment.sha256 == digest))
+        await db.execute(
+            select(Attachment).where(
+                Attachment.sha256 == digest, Attachment.owner_id == owner_id
+            )
+        )
     ).scalar_one_or_none()
     if existing is not None:
         part.unlink(missing_ok=True)
