@@ -71,7 +71,10 @@ async def callback(
         raise HTTPException(status_code=400, detail="Invalid OIDC state")
     tokens = await auth.exchange_code(code, tx["verifier"])
     claims = auth.validate_id_token(tokens["id_token"])
-    user = await auth.upsert_user(db, claims)
+    # The id_token only carries `sub`; pull preferred_username/name/email/groups from userinfo
+    # so the user is keyed by their real username, not the opaque sub UUID.
+    userinfo = await auth.fetch_userinfo(tokens.get("access_token"))
+    user = await auth.upsert_user(db, {**claims, **userinfo})
     sid = await auth.create_session(db, user, tokens)
     await db.commit()
     resp = RedirectResponse(_safe_next(tx.get("next")), status_code=302)  # defence in depth

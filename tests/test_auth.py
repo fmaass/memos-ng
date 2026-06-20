@@ -92,12 +92,19 @@ def test_callback_creates_session_then_user_then_logout(client, db_engine, monke
     monkeypatch.setattr(
         auth,
         "validate_id_token",
-        lambda t: {
-            "preferred_username": "testuser_auth",
-            "name": "Test",
-            "email": "t@x",
-            "groups": [],
-        },
+        lambda t: {"sub": "uuid-testuser"},
+    )
+    monkeypatch.setattr(
+        auth,
+        "fetch_userinfo",
+        AsyncMock(
+            return_value={
+                "preferred_username": "testuser_auth",
+                "name": "Test",
+                "email": "t@x",
+                "groups": [],
+            }
+        ),
     )
     try:
         login = client.get("/api/auth/login?next=/home", follow_redirects=False)
@@ -183,3 +190,26 @@ def test_login_next_rejects_open_redirect(client):
     assert _safe_next("/\\evil.com") == "/"
     assert _safe_next(None) == "/"
     assert _safe_next("") == "/"
+
+
+async def test_userinfo_preferred_username_keys_user_not_sub(adb):
+    # id_token carries only the opaque sub UUID; userinfo supplies preferred_username.
+    # The user must be keyed by the real username, not the UUID (the live bug).
+    from app import auth
+
+    claims = {"sub": "b65154b9-0f1f-46a5-9dbf-6ef2aaf6334a"}
+    userinfo = {
+        "preferred_username": "fabian",
+        "name": "Fabian",
+        "email": "f@x",
+        "groups": ["admins"],
+    }
+    user = await auth.upsert_user(adb, {**claims, **userinfo})
+    assert user.subject == "fabian"  # NOT the sub UUID
+    assert user.display_name == "Fabian" and user.role == "admin"
+
+
+async def test_fetch_userinfo_no_access_token_returns_empty():
+    from app import auth
+
+    assert await auth.fetch_userinfo(None) == {}

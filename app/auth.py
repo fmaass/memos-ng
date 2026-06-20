@@ -86,6 +86,19 @@ def validate_id_token(id_token: str) -> dict:
 # --- user + session persistence ---
 
 
+async def fetch_userinfo(access_token: str | None) -> dict:
+    """Authelia returns preferred_username/name/email/groups from the userinfo endpoint, not
+    the (minimal, sub-only) id_token. Returns {} if there's no access token."""
+    if not access_token:
+        return {}
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            settings.OIDC_USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {access_token}"}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def upsert_user(db: AsyncSession, claims: dict) -> User:
     subject = claims.get("preferred_username") or claims.get("sub")
     if not subject:

@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     OIDC_AUTHORIZE_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/authorization"
     OIDC_TOKEN_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/token"
     OIDC_JWKS_URI: str = "https://auth.discomarder.live/jwks.json"
+    # Authelia's id_token is minimal (sub only); preferred_username/name/email/groups come
+    # from userinfo. Without this the app keyed users by the opaque sub UUID.
+    OIDC_USERINFO_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/userinfo"
     OIDC_END_SESSION_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/logout"
     OIDC_REDIRECT_URI: str = "https://memos-ng.discomarder.live/api/auth/callback"
     OIDC_POST_LOGOUT_REDIRECT_URI: str = "https://memos-ng.discomarder.live/"
