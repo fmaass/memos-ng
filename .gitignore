@@ -1,0 +1,30 @@
+# secrets & env
+.env
+.env.*
+!.env.example
+*.local
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# node / vite
+node_modules/
+frontend/dist/
+*.log
+# composite tsc build emits these next to the source
+frontend/vite.config.js
+frontend/vite.config.d.ts
+*.tsbuildinfo
+
+# data / media (never commit family media)
+data/
+/volume*/
+
+# os
+.DS_Store
+fixtures/live-0.29.1/

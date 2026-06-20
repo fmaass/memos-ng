@@ -1,0 +1,5 @@
+@import 'tailwindcss';
+@import 'tailwindcss-primeui';
+
+/* PrimeVue 4 cssLayer order is set in main.ts (theme, base, primevue).
+   Full theming (Aura definePreset, dark-mode toggle) lands in T3.1. */
