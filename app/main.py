@@ -38,6 +38,7 @@ app = FastAPI(
 
 from app.routers import assets as assets_router  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
+from app.routers import compat as compat_router  # noqa: E402
 from app.routers import export as export_router  # noqa: E402
 from app.routers import memos as memos_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
@@ -57,6 +58,8 @@ app.router.routes.extend(export_router.router.routes)
 app.router.routes.extend(uploads_router.router.routes)
 app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
+# Compat (/api/v1/*, /file/*) must precede the /api/* fallback and the SPA catch-all.
+app.router.routes.extend(compat_router.router.routes)
 
 # Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
