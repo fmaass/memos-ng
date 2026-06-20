@@ -37,12 +37,14 @@ app = FastAPI(
 )
 
 from app.routers import auth as auth_router  # noqa: E402
+from app.routers import memos as memos_router  # noqa: E402
 
 # Add eagerly rather than include_router(): FastAPI 0.138's include_router defers to a
 # lazy _IncludedRouter wrapper that the Prometheus instrumentator's route resolver can't
-# read (AttributeError on .path → 500). The router's routes already carry their full
-# /api/auth/* paths and dependencies, so extending is equivalent here.
+# read (AttributeError on .path → 500). The routers' routes already carry their full
+# paths and dependencies, so extending is equivalent here.
 app.router.routes.extend(auth_router.router.routes)
+app.router.routes.extend(memos_router.router.routes)
 
 # Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)

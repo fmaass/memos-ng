@@ -86,7 +86,11 @@ class Memo(Base):
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    tags: Mapped[list["Tag"]] = relationship(secondary=memo_tags, back_populates="memos")
+    # selectin so async serialization can read tags/owner without a lazy-load error
+    tags: Mapped[list["Tag"]] = relationship(
+        secondary=memo_tags, back_populates="memos", lazy="selectin"
+    )
+    owner: Mapped["User"] = relationship(lazy="selectin")
 
 
 class Tag(Base):

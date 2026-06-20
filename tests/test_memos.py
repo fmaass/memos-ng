@@ -1,0 +1,133 @@
+from datetime import UTC, datetime, timedelta
+
+from app.models import User, Visibility
+from app.routers.memos import MemoOut
+from app.services import memos as svc
+
+
+async def _user(adb, subject):
+    u = User(subject=subject, role="user")
+    adb.add(u)
+    await adb.flush()
+    return u
+
+
+async def test_create_parses_tags_and_generates_uid(adb):
+    u = await _user(adb, "alice")
+    m = await svc.create_memo(adb, u, content="hi #foo #bar #foo", visibility=Visibility.PRIVATE)
+    assert m.uid and len(m.uid) >= 12
+    assert sorted(t.name for t in m.tags) == ["bar", "foo"]
+
+
+async def test_visibility_matrix(adb):
+    alice, bob = await _user(adb, "alice"), await _user(adb, "bob")
+    priv = await svc.create_memo(adb, alice, content="secret", visibility=Visibility.PRIVATE)
+    prot = await svc.create_memo(adb, alice, content="prot", visibility=Visibility.PROTECTED)
+    pub = await svc.create_memo(adb, alice, content="pub", visibility=Visibility.PUBLIC)
+
+    _, _, total_a = await svc.list_memos(adb, alice)
+    assert total_a == 3  # owner sees own PRIVATE
+
+    items_b, _, total_b = await svc.list_memos(adb, bob)
+    uids_b = {m.uid for m in items_b}
+    # This assertion FAILS if the PRIVATE visibility filter is dropped (bob would see priv).
+    assert priv.uid not in uids_b
+    assert prot.uid in uids_b and pub.uid in uids_b and total_b == 2
+
+    assert await svc.get_memo(adb, bob, priv.uid) is None
+    assert (await svc.get_memo(adb, alice, priv.uid)).uid == priv.uid
+
+
+async def test_filters_date_tag_visibility_owner_combo(adb):
+    alice, bob = await _user(adb, "alice"), await _user(adb, "bob")
+    old = await svc.create_memo(adb, alice, content="old #x", visibility=Visibility.PUBLIC)
+    old.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    new = await svc.create_memo(adb, alice, content="new #y", visibility=Visibility.PROTECTED)
+    new.created_at = datetime(2024, 1, 1, tzinfo=UTC)
+    await svc.create_memo(adb, bob, content="bobs #x", visibility=Visibility.PUBLIC)
+    await adb.flush()
+
+    _, _, before = await svc.list_memos(adb, alice, created_before=datetime(2022, 1, 1, tzinfo=UTC))
+    assert before == 1  # only the 2020 memo
+    items, _, _ = await svc.list_memos(adb, alice, tags=["x"])
+    assert {m.uid for m in items} == {old.uid} or all(
+        "x" in [t.name for t in m.tags] for m in items
+    )
+    _, _, vis = await svc.list_memos(adb, alice, visibility=Visibility.PROTECTED)
+    assert vis == 1
+    _, _, owned = await svc.list_memos(adb, alice, owner="bob")
+    assert owned == 1
+    # composed: alice's PUBLIC tagged x
+    _, _, combo = await svc.list_memos(
+        adb, alice, owner="alice", tags=["x"], visibility=Visibility.PUBLIC
+    )
+    assert combo == 1
+
+
+async def test_cursor_pagination_stable_totalcount(adb):
+    u = await _user(adb, "alice")
+    for i in range(5):
+        m = await svc.create_memo(adb, u, content=f"m{i}", visibility=Visibility.PUBLIC)
+        m.created_at = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(minutes=i)
+    await adb.flush()
+
+    seen, cursor = [], None
+    for _ in range(3):
+        items, cursor, total = await svc.list_memos(adb, u, limit=2, cursor=cursor)
+        assert total == 5
+        seen.extend(m.uid for m in items)
+        if cursor is None:
+            break
+    assert len(seen) == 5 and len(set(seen)) == 5  # no dupes, no gaps
+
+
+async def test_sort_asc_desc(adb):
+    u = await _user(adb, "alice")
+    a = await svc.create_memo(adb, u, content="a", visibility=Visibility.PUBLIC)
+    a.created_at = datetime(2024, 1, 1, tzinfo=UTC)
+    b = await svc.create_memo(adb, u, content="b", visibility=Visibility.PUBLIC)
+    b.created_at = datetime(2024, 6, 1, tzinfo=UTC)
+    await adb.flush()
+    desc, _, _ = await svc.list_memos(adb, u, sort="-created_at")
+    asc, _, _ = await svc.list_memos(adb, u, sort="created_at")
+    assert desc[0].uid == b.uid and asc[0].uid == a.uid
+
+
+async def test_fulltext_search(adb):
+    u = await _user(adb, "alice")
+    await svc.create_memo(adb, u, content="apples and oranges", visibility=Visibility.PUBLIC)
+    await svc.create_memo(adb, u, content="bananas only", visibility=Visibility.PUBLIC)
+    items, _, total = await svc.list_memos(adb, u, q="apples")
+    assert total == 1 and "apples" in items[0].content
+
+
+async def test_archive_hides_from_default_list(adb):
+    u = await _user(adb, "alice")
+    m = await svc.create_memo(adb, u, content="x", visibility=Visibility.PUBLIC)
+    await svc.update_memo(adb, m, archived=True)
+    _, _, default = await svc.list_memos(adb, u)
+    _, _, witharch = await svc.list_memos(adb, u, include_archived=True)
+    assert default == 0 and witharch == 1
+
+
+async def test_tag_counts(adb):
+    u = await _user(adb, "alice")
+    await svc.create_memo(adb, u, content="#travel a", visibility=Visibility.PUBLIC)
+    await svc.create_memo(adb, u, content="#travel b", visibility=Visibility.PUBLIC)
+    await svc.create_memo(adb, u, content="#food c", visibility=Visibility.PUBLIC)
+    counts = dict(await svc.list_tags(adb, u))
+    assert counts == {"travel": 2, "food": 1}
+
+
+# --- HTTP-level: auth-by-default + schema hygiene ---
+
+
+def test_memos_requires_auth(client):
+    assert client.get("/api/memos").status_code == 401
+
+
+def test_memoout_has_no_dead_fields():
+    fields = set(MemoOut.model_fields)
+    for dead in ("externalLink", "motionMedia", "snippet", "property"):
+        assert dead not in fields
+    assert {"uid", "content", "visibility", "tags", "owner"} <= fields

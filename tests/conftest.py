@@ -2,11 +2,14 @@ import os
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from alembic import command
 from alembic.config import Config
+from app.database import engine as async_engine
 from app.main import app
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 SYNC_URL = os.environ.get(
@@ -45,6 +48,19 @@ def db_session(db_engine):
         if txn.is_active:  # a failed flush (IntegrityError test) already rolled back
             txn.rollback()
         conn.close()
+
+
+@pytest_asyncio.fixture
+async def adb(db_engine):
+    """Async session bound to a transaction rolled back after each test (service tests)."""
+    async with async_engine.connect() as conn:
+        trans = await conn.begin()
+        sess = AsyncSession(bind=conn, expire_on_commit=False)
+        try:
+            yield sess
+        finally:
+            await sess.close()
+            await trans.rollback()
 
 
 @pytest.fixture
