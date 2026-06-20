@@ -101,6 +101,14 @@ met until its tests exist and pass.
   category, not just the happy path.
 - **Manual verification supplements, never replaces.** Live `curl`/browser checks are evidence
   on top of tests, not instead of them.
+- **CI green is the per-task gate.** A task/phase is not done until the CI run on its commit is
+  green across ALL jobs (backend, frontend, api-drift, release). Never advance past a red or
+  pending CI. Never commit while a local gate is RED — run
+  `uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q && uv run alembic check`
+  and observe all green first.
+- **Local gates can't see the slim image.** When a change touches `pyproject.toml` deps or the
+  `Dockerfile`, run a local/Saturn `docker build` BEFORE pushing — `python:3.13-slim` has no
+  compiler, so C-extension wheels (e.g. blurhash-python) fail there but not on your dev machine.
 
 ## Conventions
 
