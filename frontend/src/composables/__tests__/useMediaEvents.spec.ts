@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { applyMediaEvent, useMediaEvents } from '@/composables/useMediaEvents'
 
-const setQueryData = vi.fn()
-vi.mock('@tanstack/vue-query', () => ({ useQueryClient: () => ({ setQueryData }) }))
+const setQueriesData = vi.fn()
+vi.mock('@tanstack/vue-query', () => ({ useQueryClient: () => ({ setQueriesData }) }))
 
 describe('applyMediaEvent', () => {
   it('updates only the matching attachment status across pages', () => {
@@ -27,7 +27,7 @@ describe('useMediaEvents', () => {
     null
   afterEach(() => {
     vi.unstubAllGlobals()
-    setQueryData.mockClear()
+    setQueriesData.mockClear()
   })
 
   it('opens the SSE channel and patches the timeline cache on a message', () => {
@@ -53,6 +53,6 @@ describe('useMediaEvents', () => {
     expect(instance!.url).toBe('/api/events')
 
     instance!.onmessage!({ data: JSON.stringify({ uid: 'x', status: 'ready' }) })
-    expect(setQueryData).toHaveBeenCalledWith(['memos', 'timeline'], expect.any(Function))
+    expect(setQueriesData).toHaveBeenCalledWith({ queryKey: ['memos'] }, expect.any(Function))
   })
 })

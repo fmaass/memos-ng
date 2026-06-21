@@ -49,8 +49,10 @@ export function useMediaEvents() {
     } catch {
       return // ignore malformed events
     }
-    queryClient.setQueryData(['memos', 'timeline'], (old: TimelineData | undefined) =>
-      old ? applyMediaEvent(old, parsed) : old,
+    // Patch EVERY memos feed cache (home, explore, search, archived) — they key off the filter
+    // (['memos', {…}] / ['memos','timeline']), so a single exact key would miss all but home.
+    queryClient.setQueriesData({ queryKey: ['memos'] }, (old: TimelineData | undefined) =>
+      old?.pages ? applyMediaEvent(old, parsed) : old,
     )
   }
 

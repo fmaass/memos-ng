@@ -10,8 +10,8 @@ import HomeView from '@/views/HomeView.vue'
 vi.mock('@/composables/useApi', () => ({
   useApi: () => ({ GET: vi.fn(), POST: vi.fn() }),
 }))
-// useMediaEvents opens an SSE channel + uses the query client; stub it out here.
-vi.mock('@/composables/useMediaEvents', () => ({ useMediaEvents: () => {} }))
+// HomeView invalidates the feed on @saved via the query client; stub it.
+vi.mock('@tanstack/vue-query', () => ({ useQueryClient: () => ({ invalidateQueries: vi.fn() }) }))
 // HomeView reads the route's ?tag; provide a stub route.
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }) }))
 // CaptureEditor (child) uses settings via vue-query; stub it out.
