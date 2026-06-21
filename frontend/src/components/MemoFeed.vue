@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
+import MemoCardSkeleton from '@/components/MemoCardSkeleton.vue'
 import { useApi } from '@/composables/useApi'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
 import { groupByDay } from '@/lib/timeline'
@@ -125,7 +126,9 @@ onUnmounted(() => observer?.disconnect())
 
 <template>
   <div class="flex flex-col gap-3" data-test="memo-feed">
-    <p v-if="isPending" class="text-muted-color text-sm">Loading…</p>
+    <template v-if="isPending">
+      <MemoCardSkeleton v-for="n in 4" :key="n" />
+    </template>
     <p v-else-if="isError" class="text-muted-color text-sm">Couldn't load memos.</p>
     <p v-else-if="!memos.length" class="text-muted-color text-sm" data-test="feed-empty">
       No memos here yet.

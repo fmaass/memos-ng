@@ -96,6 +96,13 @@ describe('MemoFeed', () => {
     expect(mountFeed().find('[data-test="feed-empty"]').exists()).toBe(true)
   })
 
+  it('shows shimmer skeletons while the timeline is pending (not a blank screen)', () => {
+    useTimelineMock.mockReturnValue({ ...feedResult([]), isPending: ref(true) })
+    const wrapper = mountFeed()
+    expect(wrapper.findAll('[data-test="memo-skeleton"]').length).toBeGreaterThan(0)
+    expect(wrapper.find('[data-test="feed-empty"]').exists()).toBe(false) // skeletons, not empty
+  })
+
   it('passes its query through to useTimeline', () => {
     useTimelineMock.mockReturnValue(feedResult([]))
     mountFeed({ query: { visibility: 'PUBLIC' } })

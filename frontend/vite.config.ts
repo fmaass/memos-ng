@@ -47,6 +47,23 @@ export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(process.env.VITE_APP_VERSION || 'dev'),
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Split heavy vendors into their own chunks so they download in parallel and cache
+        // independently of app code (they change rarely). With lazy routes, this keeps the
+        // cold-open critical path small.
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return
+          if (/primevue|@primeuix|primeicons/.test(id)) return 'primevue'
+          if (/markdown-it|dompurify|entities|linkifyjs|mdurl|uc\.micro|punycode/.test(id))
+            return 'markdown'
+          if (/[\\/]vue[\\/]|vue-router|@vue[\\/]|@tanstack/.test(id)) return 'vue'
+          return 'vendor'
+        },
+      },
+    },
+  },
   resolve: {
     alias: { '@': new URL('./src', import.meta.url).pathname },
   },
