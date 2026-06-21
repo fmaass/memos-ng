@@ -46,6 +46,10 @@ def test_serve_thumb_with_range_etag_lastmodified(logged_in_client, monkeypatch,
         assert r.headers["content-type"] == "image/jpeg"
         assert "last-modified" in r.headers and "etag" in r.headers
         assert r.headers.get("accept-ranges") == "bytes"
+        # auth path (no sig): Cache-Control is private (never public), and switching off `public`
+        # did NOT break ETag/Last-Modified/Range above.
+        auth_cc = r.headers["cache-control"]
+        assert auth_cc.startswith("private,") and "public" not in auth_cc
 
         ranged = client.get("/api/attachments/att-thumb/thumb", headers={"Range": "bytes=0-9"})
         assert ranged.status_code == 206  # partial content
@@ -330,6 +334,13 @@ def test_signed_thumb_serves_without_auth_or_db(client, monkeypatch, tmp_path):
     r = client.get(url)  # `client` is unauthenticated (no session cookie)
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
+    # Scoped media must be `private` (never `public`) and bounded to the signature's remaining
+    # life, so a shared cache can't replay it and a revoked tier can't outlive exp in cache.
+    cc = r.headers["cache-control"]
+    assert cc.startswith("private,")
+    assert "immutable" in cc and "public" not in cc
+    max_age = int(cc.split("max-age=")[1].split(",")[0])
+    assert 0 < max_age <= settings.ASSET_URL_TTL
 
 
 def test_signed_serve_rejects_tampered_and_expired(client, monkeypatch, tmp_path):

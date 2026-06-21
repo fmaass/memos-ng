@@ -58,3 +58,37 @@ def test_rotation_ring(monkeypatch):
     q = _q(asset_urls.sign_asset_url("uidA", "thumb", 42, now=1000))
     _fixed(monkeypatch, secret="new-key", prev="old-key")
     assert asset_urls.verify_asset_sig("uidA", "thumb", q["exp"], q["scope"], q["sig"], now=1000)
+
+
+def test_signed_tier_urls_map_to_correct_tiers(monkeypatch):
+    # Each derived field must point at its OWN tier — a mis-mapping (e.g. previewUrl→thumb) would
+    # serve the wrong rendition yet still verify, so assert the path-to-tier binding directly.
+    _fixed(monkeypatch)
+    urls = asset_urls.signed_tier_urls("uidA", 7, now=1000)
+    expected = {
+        "thumbnailUrl": "thumb",
+        "previewUrl": "mobile",
+        "webUrl": "web",
+        "posterUrl": "poster",
+    }
+    for field, tier in expected.items():
+        assert urls[field].split("?")[0] == f"/api/attachments/uidA/{tier}"
+
+
+def test_non_numeric_exp_and_none_scope_fail(monkeypatch):
+    # Defensive, fail-closed branches in verify_asset_sig: a non-numeric exp must not raise, and a
+    # missing scope must reject (these arrive from raw query params, so they can be malformed).
+    _fixed(monkeypatch)
+    q = _q(asset_urls.sign_asset_url("uidA", "thumb", 42, now=1000))
+    v = asset_urls.verify_asset_sig
+    assert not v("uidA", "thumb", "not-a-number", q["scope"], q["sig"], now=1000)  # ValueError path
+    assert not v("uidA", "thumb", q["exp"], None, q["sig"], now=1000)  # scope is None
+
+
+def test_scope_none_guard_rejects_even_a_crafted_matching_sig(monkeypatch):
+    # Isolates the `scope is None` early-return: f"{None}" == f"{'None'}", so a sig crafted for the
+    # string "None" WOULD verify if the guard were removed. The guard must reject the missing scope.
+    _fixed(monkeypatch)
+    exp = asset_urls.bucketed_exp(1000)
+    crafted = asset_urls._sig("uidA", "thumb", exp, "None", asset_urls._secret())
+    assert not asset_urls.verify_asset_sig("uidA", "thumb", exp, None, crafted, now=1000)

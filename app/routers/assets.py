@@ -52,7 +52,9 @@ def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
     return _derived_tier_path(attachment.uid, tier)
 
 
-def _serve_file(path: Path, media_type: str, request: Request, format: str | None) -> FileResponse:
+def _serve_file(
+    path: Path, media_type: str, request: Request, format: str | None, cache_control: str
+) -> FileResponse:
     # Prefer a pre-generated webp variant for image tiers when asked (falls back to JPEG if absent).
     if media_type == "image/jpeg" and (
         format == "webp" or "image/webp" in request.headers.get("accept", "")
@@ -62,11 +64,9 @@ def _serve_file(path: Path, media_type: str, request: Request, format: str | Non
             path, media_type = webp, "image/webp"
     if not path.exists():
         raise HTTPException(status_code=404, detail="Asset not generated yet")
-    return FileResponse(
-        path,
-        media_type=media_type,
-        headers={"Cache-Control": f"public, max-age={settings.ASSET_CACHE_SECONDS}, immutable"},
-    )
+    # Cache-Control is `private` (never `public`): these responses are either signature-scoped or
+    # auth-gated to one viewer, so a shared/intermediary cache must not store and replay them.
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": cache_control})
 
 
 async def _viewable(db: AsyncSession, user: User, uid: str) -> Attachment:
@@ -216,16 +216,27 @@ async def serve_asset(
         resolved = _derived_tier_path(uid, tier)
         if resolved is None:
             raise HTTPException(status_code=404, detail="Unknown tier")
-        return _serve_file(resolved[0], resolved[1], request, format)
-    # UNSIGNED / AUTH PATH (original/print, /file/* compat, satellites): DB work in a short-lived
-    # session released BEFORE streaming, so the download holds no pool connection either.
+        # Cap the browser cache to the signature's remaining life so a now-revoked (e.g.
+        # memo-gone-PRIVATE) tier can't be replayed from cache far past exp — bounds the mint-time-
+        # auth staleness window (ADR-0009). `exp` already passed verify_asset_sig (numeric, future),
+        # so remaining is > 0 and at most ASSET_URL_TTL. (`exp is not None` here for the type
+        # checker; verify_asset_sig already rejected a None/non-numeric exp.)
+        remaining = (int(exp) - int(time.time())) if exp is not None else settings.ASSET_URL_TTL
+        cache = f"private, max-age={max(1, remaining)}, immutable"
+        return _serve_file(resolved[0], resolved[1], request, format, cache)
+    # UNSIGNED / AUTH PATH (original/print on THIS route): DB work in a short-lived session released
+    # BEFORE streaming, so the download holds no pool connection either. (The /file/* compat route
+    # is separate — app/routers/compat.py — and serves derived tiers unauthenticated by design,
+    # ADR-0004 / fixtures F2; it does not pass through here.)
     async with async_session() as db:
         user = await auth.require_user(request, db)
         att = await _viewable(db, user, uid)
         resolved = _tier_path(att, tier)
     if resolved is None:
         raise HTTPException(status_code=404, detail="Unknown tier")
-    return _serve_file(resolved[0], resolved[1], request, format)
+    # immutable uid-keyed bytes, but private (one authed viewer) — never cached by a shared proxy.
+    cache = f"private, max-age={settings.ASSET_CACHE_SECONDS}, immutable"
+    return _serve_file(resolved[0], resolved[1], request, format, cache)
 
 
 def _all_asset_paths(att: Attachment) -> list[Path]:

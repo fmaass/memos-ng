@@ -2,6 +2,13 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# DEV-ONLY default for SESSION_SECRET. It is the Fernet key encrypting BFF tokens at rest AND the
+# fallback HMAC key for signed media URLs — so running production on this published value would make
+# session tokens decryptable and media signatures forgeable. `validate_runtime_secrets()` refuses to
+# start in production with this value. Keep the field default referencing this constant so the guard
+# compares against the exact same string.
+_DEV_SESSION_SECRET = "TzWJWb-LwdXWdsb92xjiY7yqMaW1lWZJPDNZSg-qqd8="
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -86,7 +93,7 @@ class Settings(BaseSettings):
 
     # BFF session. SESSION_SECRET is a Fernet key encrypting tokens at rest; the
     # default is DEV-ONLY and must be overridden in prod via the stack .env.
-    SESSION_SECRET: str = "TzWJWb-LwdXWdsb92xjiY7yqMaW1lWZJPDNZSg-qqd8="
+    SESSION_SECRET: str = _DEV_SESSION_SECRET
     COOKIE_SECURE: bool = True
     SESSION_ABSOLUTE_DAYS: int = 90
     SESSION_ROLLING: bool = True
@@ -94,6 +101,18 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.ENV != "development"
+
+    def validate_runtime_secrets(self) -> None:
+        """Refuse to start production on the published dev-default secret (forgeable media
+        signatures + decryptable BFF tokens). Called from the app lifespan at startup — NOT at
+        import — so pure imports and tests stay side-effect-free. A dedicated ASSET_URL_SECRET does
+        not exempt this: SESSION_SECRET still encrypts session tokens."""
+        if self.is_production and self.SESSION_SECRET == _DEV_SESSION_SECRET:
+            raise RuntimeError(
+                "SESSION_SECRET is the built-in dev default in production — set a unique value "
+                "(and optionally ASSET_URL_SECRET) via the stack .env. The default key makes BFF "
+                "session tokens decryptable and media URL signatures forgeable."
+            )
 
 
 @lru_cache

@@ -21,6 +21,7 @@ FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.validate_runtime_secrets()  # fail fast if prod is on the dev-default key
     data_root = Path(settings.DATA_ROOT)
     for sub in ("originals", "assets/thumbs", "assets/mobile", "assets/web"):
         (data_root / sub).mkdir(parents=True, exist_ok=True)
