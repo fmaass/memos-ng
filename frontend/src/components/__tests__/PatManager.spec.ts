@@ -1,5 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -33,7 +35,7 @@ vi.mock('@tanstack/vue-query', () => ({
 }))
 
 function mountPats() {
-  return mount(PatManager, { global: { plugins: [PrimeVue] } })
+  return mount(PatManager, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
 }
 
 describe('PatManager', () => {

@@ -1,5 +1,7 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -36,7 +38,7 @@ describe('ResourcesView', () => {
   it('renders the justified gallery + type filter (not the old square grid)', () => {
     // Layout/image sizing needs real DOM width (covered by lib/justified.spec); here we assert the
     // gallery container + filter are wired and the legacy grid/tile markup is gone.
-    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue] } })
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
     expect(wrapper.find('[data-test="justified-gallery"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="type-filter"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="resource-grid"]').exists()).toBe(false)

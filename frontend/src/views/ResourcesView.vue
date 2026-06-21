@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
+import { useConfirm } from 'primevue/useconfirm'
+import { useToast } from 'primevue/usetoast'
 import SelectButton from 'primevue/selectbutton'
 import { computed, ref } from 'vue'
 
@@ -10,6 +12,8 @@ import type { MemoQuery } from '@/composables/useTimeline'
 
 const api = useApi()
 const queryClient = useQueryClient()
+const confirm = useConfirm()
+const toast = useToast()
 const filter = ref<'all' | 'image' | 'video'>('all')
 const options = [
   { label: 'All', value: 'all' },
@@ -31,12 +35,23 @@ const { data, isPending } = useQuery({
 const items = computed(() => data.value ?? [])
 const lightboxIndex = ref<number | null>(null)
 
-async function onDelete(uid: string) {
-  if (!window.confirm('Delete this media permanently? This cannot be undone.')) return
-  const { error } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
-  if (error) return
-  lightboxIndex.value = null
-  await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+function onDelete(uid: string) {
+  confirm.require({
+    header: 'Delete media',
+    message: 'Delete this media permanently? This cannot be undone.',
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Delete', severity: 'danger' },
+    accept: async () => {
+      const { error } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
+      if (error) {
+        toast.add({ severity: 'error', summary: 'Delete failed', life: 4000 })
+        return
+      }
+      lightboxIndex.value = null
+      await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+    },
+  })
 }
 
 async function onAddPrint({ uid, file }: { uid: string; file: File }) {
@@ -47,7 +62,12 @@ async function onAddPrint({ uid, file }: { uid: string; file: File }) {
     body: fd,
     credentials: 'include',
   })
-  if (res.ok) await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+  if (res.ok) {
+    toast.add({ severity: 'success', summary: 'Print version attached', life: 2500 })
+    await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+  } else {
+    toast.add({ severity: 'error', summary: 'Print upload failed', life: 4000 })
+  }
 }
 </script>
 
@@ -60,6 +80,7 @@ async function onAddPrint({ uid, file }: { uid: string; file: File }) {
       option-label="label"
       option-value="value"
       :allow-empty="false"
+      aria-label="Filter media type"
       data-test="type-filter"
     />
     <p v-if="isPending" class="text-sm text-muted-color">Loading…</p>

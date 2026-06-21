@@ -174,7 +174,7 @@ onBeforeUnmount(() => {
         v-else
         :key="current.uid"
         :src="current.previewUrl"
-        :alt="current.uid"
+        alt="Image"
         class="max-h-[92vh] max-w-[94vw] rounded object-contain shadow-2xl"
         data-test="lightbox-image"
       />

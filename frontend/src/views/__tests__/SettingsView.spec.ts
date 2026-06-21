@@ -1,5 +1,7 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import SelectButton from 'primevue/selectbutton'
 import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
@@ -30,7 +32,7 @@ vi.mock('@/composables/useDarkMode', () => ({
 
 function mountSettings() {
   return mount(SettingsView, {
-    global: { plugins: [PrimeVue], stubs: { PatManager: { template: '<div />' } } },
+    global: { plugins: [PrimeVue, ConfirmationService, ToastService], stubs: { PatManager: { template: '<div />' } } },
   })
 }
 

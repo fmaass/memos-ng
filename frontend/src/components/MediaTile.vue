@@ -54,7 +54,7 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
     <img
       v-else-if="kind === 'image'"
       :src="att.thumbnailUrl"
-      :alt="att.uid"
+      alt=""
       loading="lazy"
       class="w-full h-full object-cover cursor-pointer"
       data-test="tile-image"

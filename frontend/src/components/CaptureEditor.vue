@@ -195,6 +195,7 @@ async function save() {
       size="small"
       placeholder="Pick date & time"
       class="w-full sm:w-64"
+      aria-label="Memo date"
       data-test="memo-date"
     />
 
@@ -241,20 +242,24 @@ async function save() {
           severity="secondary"
           icon="pi pi-plus"
           aria-label="Insert"
+          aria-haspopup="true"
+          aria-controls="composer-insert-menu"
           data-test="insert-menu"
           @click="insertMenu?.toggle($event)"
         />
-        <Menu ref="insertMenu" :model="insertItems" popup />
+        <Menu id="composer-insert-menu" ref="insertMenu" :model="insertItems" popup />
         <Button
           text
           rounded
           severity="secondary"
           icon="pi pi-ellipsis-h"
           aria-label="More options"
+          aria-haspopup="true"
+          aria-controls="composer-more-menu"
           data-test="more-menu"
           @click="moreMenu?.toggle($event)"
         />
-        <Menu ref="moreMenu" :model="moreItems" popup />
+        <Menu id="composer-more-menu" ref="moreMenu" :model="moreItems" popup />
         <input
           ref="fileInput"
           type="file"
@@ -272,6 +277,7 @@ async function save() {
           option-label="label"
           option-value="value"
           size="small"
+          aria-label="Visibility"
           class="!border-none bg-transparent text-muted-color"
           data-test="visibility"
         >

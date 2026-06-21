@@ -2,6 +2,7 @@
 import Button from 'primevue/button'
 import DatePicker from 'primevue/datepicker'
 import Select from 'primevue/select'
+import { useConfirm } from 'primevue/useconfirm'
 import { computed, ref } from 'vue'
 
 import MediaLightbox from '@/components/MediaLightbox.vue'
@@ -68,10 +69,19 @@ function openLightbox(uid: string) {
   const i = (props.memo.attachments ?? []).findIndex((a) => a.uid === uid)
   if (i >= 0) lightboxIndex.value = i
 }
+const confirm = useConfirm()
 function onDeleteAttachment(uid: string) {
-  if (!window.confirm('Delete this media permanently? This cannot be undone.')) return
-  lightboxIndex.value = null
-  emit('delete-attachment', uid)
+  confirm.require({
+    header: 'Delete media',
+    message: 'Delete this media permanently? This cannot be undone.',
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Delete', severity: 'danger' },
+    accept: () => {
+      lightboxIndex.value = null
+      emit('delete-attachment', uid)
+    },
+  })
 }
 
 // Clicking a rendered task checkbox flips it in the source markdown and asks the parent to
@@ -123,6 +133,7 @@ function onContentClick(event: MouseEvent) {
           size="small"
           date-format="M d, yy"
           class="w-48"
+          aria-label="Memo date"
           data-test="edit-date"
         />
         <Select
@@ -131,6 +142,7 @@ function onContentClick(event: MouseEvent) {
           option-label="label"
           option-value="value"
           size="small"
+          aria-label="Visibility"
           class="text-muted-color"
           data-test="edit-visibility"
         />
@@ -196,10 +208,12 @@ function onContentClick(event: MouseEvent) {
           type="button"
           class="text-xs px-1.5 py-0.5 text-muted-color hover:text-color"
           aria-label="Add reaction"
+          aria-haspopup="true"
+          :aria-expanded="pickerOpen"
           data-test="react-add"
           @click="pickerOpen = !pickerOpen"
         >
-          <i class="pi pi-face-smile" />
+          <i class="pi pi-face-smile" aria-hidden="true" />
         </button>
         <span
           v-if="pickerOpen"

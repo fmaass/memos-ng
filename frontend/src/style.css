@@ -10,3 +10,16 @@
    darkModeSelector toggles (main.ts / useDarkMode) — the v4 default is the OS
    prefers-color-scheme, which disagrees with PrimeVue's class-based dark tokens. */
 @custom-variant dark (&:where(.app-dark, .app-dark *));
+
+/* Page canvas — without this the body falls through to browser-default white and doesn't
+   adapt to the theme (incl. over-scroll). Surface tokens are palette (not auto-flipping), so
+   set light here and override under .app-dark; text-color is semantic and adapts on its own. */
+@layer base {
+  body {
+    background-color: var(--p-surface-50);
+    color: var(--p-text-color);
+  }
+  .app-dark body {
+    background-color: var(--p-surface-950);
+  }
+}

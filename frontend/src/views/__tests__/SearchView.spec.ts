@@ -1,5 +1,7 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import SearchView from '@/views/SearchView.vue'
@@ -10,7 +12,7 @@ const FeedStub = {
 }
 
 function mountSearch() {
-  return mount(SearchView, { global: { plugins: [PrimeVue], stubs: { MemoFeed: FeedStub } } })
+  return mount(SearchView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService], stubs: { MemoFeed: FeedStub } } })
 }
 
 describe('SearchView', () => {

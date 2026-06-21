@@ -1,5 +1,7 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { describe, expect, it } from 'vitest'
 
 import MemoCard from '@/components/MemoCard.vue'
@@ -43,7 +45,7 @@ function memo(content: string, tags: string[] = [], attachments: ReturnType<type
 }
 
 function mountCard(props: { memo: ReturnType<typeof memo>; restorable?: boolean }) {
-  return mount(MemoCard, { props, global: { plugins: [PrimeVue] } })
+  return mount(MemoCard, { props, global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
 }
 
 describe('MemoCard', () => {

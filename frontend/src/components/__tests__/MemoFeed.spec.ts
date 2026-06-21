@@ -1,5 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -56,7 +58,7 @@ function feedResult(items: ReturnType<typeof memoStub>[]) {
 }
 
 function mountFeed(props = {}) {
-  return mount(MemoFeed, { props, global: { plugins: [PrimeVue] } })
+  return mount(MemoFeed, { props, global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
 }
 
 describe('MemoFeed', () => {

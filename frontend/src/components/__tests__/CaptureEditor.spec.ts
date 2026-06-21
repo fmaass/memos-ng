@@ -1,5 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { nextTick } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -15,7 +17,7 @@ vi.mock('@/composables/useSettings', async () => {
 })
 
 function mountEditor() {
-  return mount(CaptureEditor, { global: { plugins: [PrimeVue] } })
+  return mount(CaptureEditor, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
 }
 
 describe('CaptureEditor', () => {

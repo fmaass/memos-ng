@@ -1,5 +1,7 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import ToastService from 'primevue/toastservice'
 import { describe, expect, it, vi } from 'vitest'
 
 import HomeView from '@/views/HomeView.vue'
@@ -23,7 +25,7 @@ const FeedStub = { template: '<div data-test="feed-stub" />' }
 describe('HomeView', () => {
   it('composes the capture editor above the memo feed', () => {
     const wrapper = mount(HomeView, {
-      global: { plugins: [PrimeVue], stubs: { MemoFeed: FeedStub } },
+      global: { plugins: [PrimeVue, ConfirmationService, ToastService], stubs: { MemoFeed: FeedStub } },
     })
     expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="feed-stub"]').exists()).toBe(true)
