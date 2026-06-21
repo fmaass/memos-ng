@@ -282,6 +282,27 @@ async def test_heic_finalize_routes_to_slow_lane(adb, monkeypatch, tmp_path):
     assert job.lane is JobLane.slow  # heavy decode offloaded to Merkur
 
 
+def test_edit_memo_attaches_new_upload(logged_in_client, monkeypatch, tmp_path):
+    # Editing a memo can add a new image: upload it, then PATCH the memo with its upload_uid.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = client.post(
+            "/api/memos", json={"content": "no pics yet", "visibility": "PUBLIC"}
+        ).json()
+        assert len(memo["attachments"]) == 0
+        data = b"\x89PNG\r\n\x1a\n" + b"E" * 4000
+        uid = _start(client, "added.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        edited = client.patch(
+            f"/api/memos/{memo['uid']}", json={"upload_uids": [uid]}
+        ).json()
+        assert len(edited["attachments"]) == 1  # new image attached on edit
+        assert client.head(f"/api/uploads/{uid}").status_code == 404  # upload consumed
+    finally:
+        _cleanup()
+
+
 def test_uploads_require_auth(client):
     assert (
         client.post("/api/uploads", json={"filename": "x", "mime": "x", "size": 1}).status_code

@@ -50,12 +50,24 @@ const toggleReaction = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
-// Edit a memo's content / visibility / display date (owner-only on the server) and refresh.
+// Edit a memo's content / visibility / display date + attach any new images (owner-only on the
+// server) and refresh.
 const editMemo = useMutation({
-  mutationFn: async (p: { uid: string; content: string; visibility: string; created_at: string }) => {
+  mutationFn: async (p: {
+    uid: string
+    content: string
+    visibility: string
+    created_at: string
+    upload_uids: string[]
+  }) => {
     const { error } = await api.PATCH('/api/memos/{uid}', {
       params: { path: { uid: p.uid } },
-      body: { content: p.content, visibility: p.visibility as never, created_at: p.created_at },
+      body: {
+        content: p.content,
+        visibility: p.visibility as never,
+        created_at: p.created_at,
+        upload_uids: p.upload_uids,
+      },
     })
     if (error) throw error
   },

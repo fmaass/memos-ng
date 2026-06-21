@@ -744,6 +744,8 @@ export interface components {
             created_at?: string | null;
             /** Pinned */
             pinned?: boolean | null;
+            /** Upload Uids */
+            upload_uids?: string[] | null;
             visibility?: components["schemas"]["Visibility"] | null;
         };
         /** PatCreate */

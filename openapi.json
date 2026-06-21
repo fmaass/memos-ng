@@ -717,6 +717,20 @@
             ],
             "title": "Pinned"
           },
+          "upload_uids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upload Uids"
+          },
           "visibility": {
             "anyOf": [
               {

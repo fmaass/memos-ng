@@ -110,11 +110,26 @@ describe('MemoCard', () => {
     editItem.click()
     await nextTick()
     expect(wrapper.find('[data-test="memo-editor"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="edit-add-image"]').exists()).toBe(true) // can attach new images
     await wrapper.find('[data-test="edit-content"]').setValue('edited text')
     await wrapper.find('[data-test="edit-save"]').trigger('click')
-    const payload = wrapper.emitted('edit')?.[0]?.[0] as { uid: string; content: string }
+    const payload = wrapper.emitted('edit')?.[0]?.[0] as {
+      uid: string
+      content: string
+      upload_uids: string[]
+    }
     expect(payload.uid).toBe('m1')
     expect(payload.content).toBe('edited text')
+    expect(payload.upload_uids).toEqual([]) // no new uploads staged this edit
+    wrapper.unmount()
+  })
+
+  it('edit mode shows a remove button for each existing image', async () => {
+    const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
+    const editItem = await openAction(wrapper, 'memo-action-edit')
+    editItem.click()
+    await nextTick()
+    expect(wrapper.find('[data-test="edit-remove-attachment"]').exists()).toBe(true)
     wrapper.unmount()
   })
 

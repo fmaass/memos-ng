@@ -10,6 +10,7 @@ import { computed, ref } from 'vue'
 import MediaLightbox from '@/components/MediaLightbox.vue'
 import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
+import { useUploadQueue } from '@/composables/useResumableUpload'
 import { renderMemoMarkdown } from '@/lib/markdown'
 import { toggleTask } from '@/lib/tasks'
 
@@ -24,7 +25,15 @@ const emit = defineEmits<{
   'delete-attachment': [uid: string]
   'delete-memo': [uid: string]
   'add-print': [payload: { uid: string; file: File }]
-  edit: [payload: { uid: string; content: string; visibility: Visibility; created_at: string }]
+  edit: [
+    payload: {
+      uid: string
+      content: string
+      visibility: Visibility
+      created_at: string
+      upload_uids: string[] // new images added while editing
+    },
+  ]
 }>()
 
 const visibilityOptions = [
@@ -36,10 +45,21 @@ const editing = ref(false)
 const editContent = ref('')
 const editVisibility = ref<Visibility>('PRIVATE')
 const editDate = ref<Date | null>(null)
+// New images added while editing — uploaded in the background, attached on Save (finalize-on-patch).
+// Removing an existing image is a delete (onDeleteAttachment), so it's immediate, not staged.
+const { items: editUploads, add: addEditUploads, remove: removeEditUpload } = useUploadQueue()
+const editFileInput = ref<HTMLInputElement | null>(null)
+const editUploading = computed(() =>
+  editUploads.some((u) => u.status === 'queued' || u.status === 'uploading'),
+)
+function onEditFiles(files: FileList | null) {
+  if (files?.length) addEditUploads(Array.from(files))
+}
 function startEdit() {
   editContent.value = props.memo.content
   editVisibility.value = props.memo.visibility
   editDate.value = new Date(props.memo.created_at)
+  editUploads.length = 0
   editing.value = true
 }
 function saveEdit() {
@@ -48,7 +68,11 @@ function saveEdit() {
     content: editContent.value,
     visibility: editVisibility.value,
     created_at: (editDate.value ?? new Date(props.memo.created_at)).toISOString(),
+    upload_uids: editUploads
+      .filter((u) => u.status === 'done' && u.uploadUid)
+      .map((u) => u.uploadUid as string),
   })
+  editUploads.length = 0
   editing.value = false
 }
 
@@ -154,6 +178,74 @@ function onContentClick(event: MouseEvent) {
         class="w-full resize-y rounded-md border border-surface-200 bg-transparent p-2 outline-none dark:border-surface-700"
         data-test="edit-content"
       />
+
+      <!-- attachments: remove an existing image (immediate delete) or add new ones (attached on Save) -->
+      <div
+        v-if="memo.attachments?.length || editUploads.length"
+        class="flex flex-wrap gap-2"
+        data-test="edit-attachments"
+      >
+        <div
+          v-for="a in memo.attachments"
+          :key="a.uid"
+          class="relative h-16 w-16 overflow-hidden rounded-md bg-surface-100 dark:bg-surface-800"
+        >
+          <img :src="a.thumbnailUrl" :alt="a.uid" class="h-full w-full object-cover" />
+          <button
+            type="button"
+            class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white"
+            aria-label="Remove image"
+            data-test="edit-remove-attachment"
+            @click="onDeleteAttachment(a.uid)"
+          >
+            <i class="pi pi-times text-[10px]" aria-hidden="true" />
+          </button>
+        </div>
+        <div
+          v-for="u in editUploads"
+          :key="u.id"
+          class="relative h-16 w-16 overflow-hidden rounded-md bg-surface-100 dark:bg-surface-800"
+        >
+          <img v-if="u.preview" :src="u.preview" :alt="u.name" class="h-full w-full object-cover" />
+          <span v-else class="flex h-full w-full items-center justify-center text-muted-color">
+            <i :class="u.isVideo ? 'pi pi-video' : 'pi pi-file'" aria-hidden="true" />
+          </span>
+          <div
+            v-if="u.status !== 'done'"
+            class="absolute inset-0 flex items-center justify-center bg-black/45 text-xs font-medium text-white"
+          >
+            {{ u.progress }}%
+          </div>
+          <button
+            type="button"
+            class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white"
+            aria-label="Remove"
+            @click="removeEditUpload(u.id)"
+          >
+            <i class="pi pi-times text-[10px]" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      <div>
+        <Button
+          text
+          size="small"
+          icon="pi pi-image"
+          label="Add image"
+          data-test="edit-add-image"
+          @click="editFileInput?.click()"
+        />
+        <input
+          ref="editFileInput"
+          type="file"
+          multiple
+          accept="image/*,video/*"
+          class="hidden"
+          data-test="edit-file-input"
+          @change="onEditFiles(($event.target as HTMLInputElement).files)"
+        />
+      </div>
+
       <div class="flex flex-wrap items-center gap-2">
         <DatePicker
           v-model="editDate"
@@ -179,7 +271,14 @@ function onContentClick(event: MouseEvent) {
         />
         <div class="ml-auto flex gap-1">
           <Button text size="small" label="Cancel" data-test="edit-cancel" @click="editing = false" />
-          <Button size="small" label="Save" icon="pi pi-check" data-test="edit-save" @click="saveEdit" />
+          <Button
+            size="small"
+            :label="editUploading ? 'Uploading…' : 'Save'"
+            icon="pi pi-check"
+            :disabled="editUploading"
+            data-test="edit-save"
+            @click="saveEdit"
+          />
         </div>
       </div>
     </div>

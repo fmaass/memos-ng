@@ -81,6 +81,10 @@ class MemoPatch(BaseModel):
     pinned: bool | None = None
     archived: bool | None = None
     created_at: datetime | None = None  # edit a memo's display date
+    # New images attached while editing — pending uploads finalized + linked, same as create.
+    # Optional/nullable (not []) so PATCH stays a true partial update: callers that only change
+    # content/archived/etc. omit it. (Removing an attachment is DELETE /api/attachments/{uid}.)
+    upload_uids: list[str] | None = None
 
 
 class ReactionIn(BaseModel):
@@ -245,8 +249,24 @@ async def patch_memo(
     memo = await _require_owned(db, user, uid)
     if memo.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your memo")
-    memo = await svc.update_memo(db, memo, **body.model_dump(exclude_unset=True))
-    await db.commit()
+    # Same finalize-on-post pattern as create: new uploads become attachments and link to this memo;
+    # if the patch rolls back, unlink the moved originals so they don't leak.
+    moved: list[str] = []
+    committed = False
+    try:
+        fields = body.model_dump(exclude_unset=True, exclude={"upload_uids"})
+        memo = await svc.update_memo(db, memo, **fields)
+        if body.upload_uids:
+            finalized = await uploads_svc.finalize_pending(
+                db, body.upload_uids, user.id, moved_out=moved
+            )
+            await svc.link_attachments(db, user.id, memo, finalized)
+        await db.commit()
+        committed = True
+    finally:
+        if not committed and moved:
+            await to_thread.run_sync(_unlink_paths, moved)
+    await db.refresh(memo)
     return _out(memo, user.id)
 
 

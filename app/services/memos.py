@@ -69,26 +69,32 @@ async def create_memo(
     memo.tags = await _get_or_create_tags(db, parse_tags(content))
     db.add(memo)
     await db.flush()
-    if attachment_uids:
-        # Link only the caller's OWN attachments — a uid belonging to another user is
-        # silently ignored so a memo can't claim someone else's media.
-        owned = (
-            (
-                await db.execute(
-                    select(Attachment).where(
-                        Attachment.uid.in_(attachment_uids),
-                        Attachment.owner_id == owner.id,
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for att in owned:
-            att.memo_id = memo.id
-        await db.flush()
+    await link_attachments(db, owner.id, memo, attachment_uids or [])
     await db.refresh(memo)
     return memo
+
+
+async def link_attachments(
+    db: AsyncSession, owner_id: int, memo: Memo, uids: Sequence[str]
+) -> None:
+    """Link the caller's OWN attachments to a memo. A uid belonging to another user is silently
+    ignored so a memo can never claim someone else's media. Used on create and on edit."""
+    if not uids:
+        return
+    owned = (
+        (
+            await db.execute(
+                select(Attachment).where(
+                    Attachment.uid.in_(uids), Attachment.owner_id == owner_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for att in owned:
+        att.memo_id = memo.id
+    await db.flush()
 
 
 async def get_memo(db: AsyncSession, user: User, uid: str) -> Memo | None:
