@@ -72,6 +72,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/attachments/{uid}/rendition/{variant_key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Serve Rendition
+         * @description Download a single print rendition — download-only, household-visible, on the short-session
+         *     auth path (never the signed/public fast path; prints are low fan-out, not public-by-uid).
+         */
+        get: operations["serve_rendition_api_attachments__uid__rendition__variant_key__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/{uid}/renditions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Renditions
+         * @description A photo's hidden print renditions (household-visible, like the legacy print tier). Registered
+         *     BEFORE the generic /{uid}/{tier} route so the literal `renditions` segment isn't a tier.
+         */
+        get: operations["list_renditions_api_attachments__uid__renditions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/attachments/{uid}/{tier}": {
         parameters: {
             query?: never;
@@ -521,6 +563,8 @@ export interface components {
             blurhash: string | null;
             /** Downloadurl */
             downloadUrl: string;
+            /** Haslegacyprint */
+            hasLegacyPrint: boolean;
             /** Hasprint */
             hasPrint: boolean;
             /** Height */
@@ -537,6 +581,8 @@ export interface components {
             previewUrl: string;
             /** Printurl */
             printUrl: string;
+            /** Renditions */
+            renditions: components["schemas"]["RenditionItem"][];
             status: components["schemas"]["AttachmentStatus"];
             /** Thumbnailurl */
             thumbnailUrl: string;
@@ -557,6 +603,8 @@ export interface components {
             downloadUrl: string;
             /** Duration */
             duration: number | null;
+            /** Haslegacyprint */
+            hasLegacyPrint: boolean;
             /** Hasprint */
             hasPrint: boolean;
             /** Height */
@@ -571,6 +619,8 @@ export interface components {
             previewUrl: string;
             /** Printurl */
             printUrl: string;
+            /** Renditions */
+            renditions: components["schemas"]["RenditionItem"][];
             /** Size */
             size: number;
             status: components["schemas"]["AttachmentStatus"];
@@ -611,6 +661,8 @@ export interface components {
             downloadUrl: string;
             /** Duration */
             duration: number | null;
+            /** Haslegacyprint */
+            hasLegacyPrint: boolean;
             /** Hasprint */
             hasPrint: boolean;
             /** Height */
@@ -625,6 +677,8 @@ export interface components {
             previewUrl: string;
             /** Printurl */
             printUrl: string;
+            /** Renditions */
+            renditions: components["schemas"]["RenditionItem"][];
             status: components["schemas"]["AttachmentStatus"];
             /** Thumbnailurl */
             thumbnailUrl: string;
@@ -803,6 +857,19 @@ export interface components {
             emoji: string;
             /** Reacted */
             reacted: boolean;
+        };
+        /** RenditionItem */
+        RenditionItem: {
+            /** Downloadurl */
+            downloadUrl: string;
+            /** Label */
+            label: string | null;
+            /** Mime */
+            mime: string;
+            /** Size */
+            size: number;
+            /** Variant Key */
+            variant_key: string;
         };
         /** SettingsOut */
         SettingsOut: {
@@ -1012,6 +1079,69 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AttachmentMeta"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    serve_rendition_api_attachments__uid__rendition__variant_key__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                variant_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_renditions_api_attachments__uid__renditions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RenditionItem"][];
                 };
             };
             /** @description Validation Error */

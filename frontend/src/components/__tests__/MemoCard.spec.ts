@@ -32,6 +32,8 @@ function imageAtt(uid: string) {
     duration: null,
     mine: true,
     hasPrint: false,
+    hasLegacyPrint: false,
+    renditions: [],
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
     webUrl: `/api/attachments/${uid}/web`,

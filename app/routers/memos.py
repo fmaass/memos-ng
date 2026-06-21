@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.database import get_session
 from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
+from app.routers.assets import RenditionItem, has_print, rendition_items
 from app.services import memos as svc
 from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
@@ -35,7 +36,9 @@ class AttachmentRef(BaseModel):
     height: int | None
     duration: float | None
     mine: bool  # the requesting user owns it (→ may delete); shared media is view-only
-    hasPrint: bool  # a print-quality master has been uploaded
+    hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
+    hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
+    renditions: list[RenditionItem]
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -118,7 +121,9 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         height=att.height,
         duration=att.duration,
         mine=att.owner_id == user_id,
-        hasPrint=att.print_path is not None,
+        hasPrint=has_print(att),
+        hasLegacyPrint=att.print_path is not None,
+        renditions=rendition_items(att),
         **signed_tier_urls(att.uid, user_id, now=now),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",

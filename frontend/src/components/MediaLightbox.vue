@@ -5,11 +5,18 @@ import { keyToIntent, stepIndex } from '@/lib/lightbox'
 import { type GestureState, initState, onDown, onMove, onUp } from '@/lib/lightboxGesture'
 
 // Reuses the attachment shape from both the Resources list and a memo's attachments.
+interface RenditionRef {
+  variant_key: string
+  label: string | null
+  downloadUrl: string
+}
 interface LightboxItem {
   uid: string
   mime: string
   mine?: boolean // owner → may delete / attach a print master
-  hasPrint?: boolean
+  hasPrint?: boolean // has a print master of any kind (legacy print_path OR a rendition)
+  hasLegacyPrint?: boolean // has the legacy single print_path → the /print download applies
+  renditions?: RenditionRef[] // named print masters (glossy/matte/…), download-only
   previewUrl: string
   webUrl: string
   posterUrl: string
@@ -149,9 +156,10 @@ onBeforeUnmount(() => {
       >
         <i class="pi pi-trash text-xl" aria-hidden="true" />
       </button>
-      <!-- print master: download if present; owners can attach one to an image -->
+      <!-- legacy single print master: download if present; gated on hasLegacyPrint (NOT hasPrint) so
+           a photo with only named renditions doesn't show a button pointing at an absent print_path -->
       <a
-        v-if="current.hasPrint && current.printUrl"
+        v-if="current.hasLegacyPrint && current.printUrl"
         :href="current.printUrl"
         class="absolute top-3 right-36 p-2 text-amber-300 hover:text-amber-200"
         aria-label="Download print version"
@@ -162,8 +170,27 @@ onBeforeUnmount(() => {
       >
         <i class="pi pi-print text-xl" aria-hidden="true" />
       </a>
+      <!-- named print renditions (glossy/matte/…): download-only masters, hidden from the feed -->
+      <div
+        v-if="current.renditions && current.renditions.length"
+        class="absolute top-14 right-3 flex flex-col items-end gap-1"
+        data-test="lightbox-renditions"
+      >
+        <a
+          v-for="r in current.renditions"
+          :key="r.variant_key"
+          :href="r.downloadUrl"
+          class="rounded bg-black/40 px-2 py-1 text-xs text-amber-200 hover:text-amber-100"
+          :aria-label="`Download ${r.label ?? 'print'} print`"
+          :data-test="`lightbox-rendition-${r.variant_key}`"
+          download
+          @click.stop
+        >
+          <i class="pi pi-print mr-1" aria-hidden="true" />{{ r.label ?? 'print' }}
+        </a>
+      </div>
       <button
-        v-else-if="current.mine && isImage"
+        v-if="current.mine && isImage && !current.hasLegacyPrint"
         class="absolute top-3 right-36 p-2 text-white/70 hover:text-amber-200"
         aria-label="Add print version"
         title="Attach a print-quality master"

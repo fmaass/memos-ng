@@ -87,6 +87,34 @@ async def _viewable(db: AsyncSession, user: User, uid: str) -> Attachment:
     raise HTTPException(status_code=404, detail="Attachment not found")
 
 
+class RenditionItem(BaseModel):
+    variant_key: str  # "print" or "print:<slug>"
+    label: str | None
+    mime: str
+    size: int
+    downloadUrl: str
+
+
+def rendition_items(att: Attachment) -> list[RenditionItem]:
+    """The photo's hidden print renditions as download refs (selectin-loaded; no extra query)."""
+    base = f"/api/attachments/{att.uid}/rendition"
+    return [
+        RenditionItem(
+            variant_key=r.variant_key,
+            label=r.label,
+            mime=r.mime,
+            size=r.size,
+            downloadUrl=f"{base}/{r.variant_key}",
+        )
+        for r in att.renditions
+    ]
+
+
+def has_print(att: Attachment) -> bool:
+    """True if the photo has any print master — the legacy single print_path OR ≥1 rendition."""
+    return att.print_path is not None or bool(att.renditions)
+
+
 class AttachmentMeta(BaseModel):
     uid: str
     mime: str
@@ -98,7 +126,9 @@ class AttachmentMeta(BaseModel):
     blurhash: str | None
     captured_at: datetime | None
     mine: bool
-    hasPrint: bool  # a print-quality master has been uploaded
+    hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
+    hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
+    renditions: list[RenditionItem]
     downloadUrl: str
     printUrl: str
     thumbnailUrl: str
@@ -115,7 +145,9 @@ class AttachmentListItem(BaseModel):
     width: int | None  # for justified/aspect-ratio gallery layout (no CLS)
     height: int | None
     mine: bool  # the requesting user owns it (→ may delete)
-    hasPrint: bool  # a print-quality master has been uploaded
+    hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
+    hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
+    renditions: list[RenditionItem]
     orphan: bool  # not linked to a memo
     thumbnailUrl: str
     previewUrl: str
@@ -135,7 +167,9 @@ def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
         width=att.width,
         height=att.height,
         mine=att.owner_id == user_id,
-        hasPrint=att.print_path is not None,
+        hasPrint=has_print(att),
+        hasLegacyPrint=att.print_path is not None,
+        renditions=rendition_items(att),
         orphan=att.memo_id is None,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         downloadUrl=f"{base}/original",
@@ -188,11 +222,40 @@ async def attachment_meta(
         blurhash=att.blurhash,
         captured_at=att.captured_at,
         mine=att.owner_id == user.id,
-        hasPrint=att.print_path is not None,
+        hasPrint=has_print(att),
+        hasLegacyPrint=att.print_path is not None,
+        renditions=rendition_items(att),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
         **asset_urls.signed_tier_urls(att.uid, user.id, now=time.time()),
     )
+
+
+@router.get("/attachments/{uid}/renditions", response_model=list[RenditionItem])
+async def list_renditions(
+    uid: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> list[RenditionItem]:
+    """A photo's hidden print renditions (household-visible, like the legacy print tier). Registered
+    BEFORE the generic /{uid}/{tier} route so the literal `renditions` segment isn't a tier."""
+    att = await _viewable(db, user, uid)
+    return rendition_items(att)
+
+
+@router.get("/attachments/{uid}/rendition/{variant_key}")
+async def serve_rendition(uid: str, variant_key: str, request: Request) -> FileResponse:
+    """Download a single print rendition — download-only, household-visible, on the short-session
+    auth path (never the signed/public fast path; prints are low fan-out, not public-by-uid)."""
+    async with async_session() as db:
+        user = await auth.require_user(request, db)
+        att = await _viewable(db, user, uid)
+        match = next((r for r in att.renditions if r.variant_key == variant_key), None)
+        resolved = (match.storage_path, match.mime) if match is not None else None
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Rendition not found")
+    cache = f"private, max-age={settings.ASSET_CACHE_SECONDS}, immutable"  # immutable master
+    return _serve_file(Path(resolved[0]), resolved[1], request, None, cache)
 
 
 @router.get("/attachments/{uid}/{tier}")
