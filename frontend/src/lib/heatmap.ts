@@ -1,5 +1,8 @@
-// Build a GitHub-style activity grid: the last `weeks` weeks of days, each with its memo
-// count and a 0–4 intensity level. Pure so the bucketing/levels are unit-tested; `today`
+// Build a GitHub-style activity grid, each day with its memo count and a 0–4 intensity level.
+// The window spans from the FIRST day with activity up to today, capped at `weeks` weeks — so a
+// young household isn't shown weeks of empty cells before its first memo (the grid grows over time
+// and pins to `weeks` once history is long enough). With no activity at all, the full `weeks`
+// window is shown (the cold-start grid). Pure so the bucketing/window are unit-tested; `today`
 // is injectable. Cells are ordered oldest→newest (column-major weeks).
 export interface HeatCell {
   date: string // YYYY-MM-DD
@@ -24,12 +27,19 @@ export function buildHeatmap(
   today: Date = new Date(),
   weeks = 12,
 ): HeatCell[] {
+  const DAY = 86_400_000
+  const endMs = Date.parse(dayKey(today) + 'T00:00:00Z') // today at UTC midnight
+  // The furthest back we ever reach: `weeks` weeks ago. Then clamp the start FORWARD to the first
+  // day that has activity, so leading empty weeks (before the household's first memo) aren't shown.
+  let startMs = endMs - (weeks * 7 - 1) * DAY
+  const keys = Object.keys(counts)
+  if (keys.length > 0) {
+    const firstMs = Date.parse(keys.reduce((a, b) => (a < b ? a : b)) + 'T00:00:00Z')
+    if (firstMs > startMs) startMs = firstMs
+  }
   const cells: HeatCell[] = []
-  const totalDays = weeks * 7
-  const start = new Date(today.getTime() - (totalDays - 1) * 86_400_000)
-  for (let i = 0; i < totalDays; i++) {
-    const d = new Date(start.getTime() + i * 86_400_000)
-    const key = dayKey(d)
+  for (let ms = startMs; ms <= endMs; ms += DAY) {
+    const key = dayKey(new Date(ms))
     const count = counts[key] ?? 0
     cells.push({ date: key, count, level: levelFor(count) })
   }

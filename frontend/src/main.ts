@@ -40,6 +40,8 @@ createApp(App)
   .use(router)
   .use(VueQueryPlugin)
   .use(PrimeVue, {
+    // Weeks start on Monday (deep-merged into the default locale, so day/month names are kept).
+    locale: { firstDayOfWeek: 1 },
     theme: {
       preset: MemosPreset,
       options: {
