@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
+from starlette.datastructures import MutableHeaders
 
 from app.config import settings
 from app.database import async_session
@@ -73,16 +74,36 @@ CSP = (
 )
 
 
-@app.middleware("http")
-async def security_headers(request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Content-Security-Policy"] = CSP
-    if settings.is_production:
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    return response
+class SecurityHeadersMiddleware:
+    """Pure-ASGI response-header middleware. Deliberately NOT BaseHTTPMiddleware
+    (@app.middleware('http')): that wrapper buffers the request and breaks endpoints reading the
+    raw body — it hung the chunked upload PATCH (await request.body()) with a CancelledError and
+    stalled upload progress at 0%. This only wraps `send` to inject headers; `receive` (the request
+    body stream) passes through untouched."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["X-Frame-Options"] = "DENY"
+                headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+                headers["Content-Security-Policy"] = CSP
+                if settings.is_production:
+                    headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 class HealthResponse(BaseModel):
