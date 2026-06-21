@@ -137,6 +137,14 @@ describe('MemoCard', () => {
     expect(wrapper.find('[data-test="memo-edit"]').exists()).toBe(false)
   })
 
+  it('isolates the card and elevates the actions button above content', () => {
+    const wrapper = mountCard({ memo: memo('x') })
+    // `isolate` makes the article its own stacking context so z-index resolves within the card;
+    // z-20 lifts the ⋯ button above the media grid / markdown (else it is occluded / "you don't see").
+    expect(wrapper.find('[data-test="memo-card"]').classes()).toContain('isolate')
+    expect(wrapper.find('[data-test="memo-edit"]').classes()).toContain('z-20')
+  })
+
   it('adds a reaction from the picker (PrimeVue Popover, teleported)', async () => {
     const wrapper = mountCard({ memo: memo('hi') })
     await wrapper.find('[data-test="react-add"]').trigger('click')

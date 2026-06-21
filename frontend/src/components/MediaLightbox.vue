@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 import { keyToIntent, stepIndex } from '@/lib/lightbox'
+import { type GestureState, initState, onDown, onMove, onUp } from '@/lib/lightboxGesture'
 
 // Reuses the attachment shape from both the Resources list and a memo's attachments.
 interface LightboxItem {
@@ -51,16 +52,55 @@ function onKey(e: KeyboardEvent) {
   else go(intent === 'next' ? 1 : -1)
 }
 
-let startX: number | null = null
-function onTouchStart(e: TouchEvent) {
-  startX = e.changedTouches[0].clientX
+// Pinch-zoom + pan + swipe (arbitration is the pure reducer in lib/lightboxGesture). At scale 1 a
+// horizontal drag navigates; once zoomed a drag pans and never navigates — replacing the old crude
+// "any 50px drag flips the image" that made pinch-zoom impossible.
+const imgEl = ref<HTMLImageElement | null>(null)
+const gesture = ref<GestureState>(initState())
+const smooth = ref(false) // ease on settle/double-tap; instant while dragging
+const imgTransform = computed(
+  () => `translate(${gesture.value.offsetX}px, ${gesture.value.offsetY}px) scale(${gesture.value.scale})`,
+)
+const pointers = new Map<number, { x: number; y: number }>()
+function geom() {
+  const el = imgEl.value
+  return {
+    viewW: window.innerWidth,
+    viewH: window.innerHeight,
+    imgW: el?.clientWidth ?? window.innerWidth,
+    imgH: el?.clientHeight ?? window.innerHeight,
+  }
 }
-function onTouchEnd(e: TouchEvent) {
-  if (startX === null) return
-  const dx = e.changedTouches[0].clientX - startX
-  if (Math.abs(dx) > 50) go(dx < 0 ? 1 : -1)
-  startX = null
+function resetZoom() {
+  gesture.value = initState()
+  smooth.value = false
+  pointers.clear()
 }
+function onPointerDown(e: PointerEvent) {
+  imgEl.value?.setPointerCapture?.(e.pointerId)
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+  smooth.value = false
+  gesture.value = onDown(gesture.value, [...pointers.values()], e.timeStamp).state
+}
+function onPointerMove(e: PointerEvent) {
+  if (!pointers.has(e.pointerId)) return
+  if (e.pointerType === 'mouse' && e.buttons === 0) return onPointerUp(e) // recover a missed up
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+  e.preventDefault()
+  smooth.value = false
+  gesture.value = onMove(gesture.value, [...pointers.values()], e.timeStamp, geom()).state
+}
+function onPointerUp(e: PointerEvent) {
+  pointers.delete(e.pointerId)
+  imgEl.value?.releasePointerCapture?.(e.pointerId)
+  const r = onUp(gesture.value, [...pointers.values()], e.timeStamp, geom())
+  gesture.value = r.state
+  smooth.value = r.action.type === 'snapback' || r.action.type === 'transform'
+  if (r.action.type === 'navigate') go(r.action.dir)
+}
+
+// Reset zoom/pan whenever the shown item changes or the lightbox closes.
+watch([() => current.value?.uid, open], () => resetZoom())
 
 watch(
   open,
@@ -83,8 +123,6 @@ onBeforeUnmount(() => {
       class="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm"
       data-test="lightbox"
       @click.self="close"
-      @touchstart="onTouchStart"
-      @touchend="onTouchEnd"
     >
       <button
         class="absolute top-3 right-3 p-2 text-white/80 hover:text-white"
@@ -172,11 +210,24 @@ onBeforeUnmount(() => {
       />
       <img
         v-else
+        ref="imgEl"
         :key="current.uid"
         :src="current.previewUrl"
         alt="Image"
-        class="max-h-[92vh] max-w-[94vw] rounded object-contain shadow-2xl"
+        class="max-h-[92vh] max-w-[94vw] touch-none select-none rounded object-contain shadow-2xl"
+        :style="{
+          transform: imgTransform,
+          transformOrigin: 'center center',
+          transition: smooth ? 'transform 0.2s ease-out' : 'none',
+          willChange: 'transform',
+        }"
         data-test="lightbox-image"
+        @pointerdown="onPointerDown"
+        @pointermove="onPointerMove"
+        @pointerup="onPointerUp"
+        @pointercancel="onPointerUp"
+        @click.stop
+        @dblclick.prevent
       />
 
       <span class="absolute bottom-3 left-1/2 -translate-x-1/2 text-sm text-white/60">

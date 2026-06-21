@@ -121,13 +121,13 @@ function onContentClick(event: MouseEvent) {
 
 <template>
   <article
-    class="group relative flex flex-col gap-2 rounded-xl border border-surface-200 p-4 dark:border-surface-700"
+    class="group relative isolate flex flex-col gap-2 rounded-xl border border-surface-200 p-4 dark:border-surface-700"
     data-test="memo-card"
   >
     <template v-if="memo.mine && !editing && !restorable">
       <button
         type="button"
-        class="absolute right-2 top-2 p-1.5 text-muted-color transition hover:text-color"
+        class="absolute right-2 top-2 z-20 rounded-full bg-surface-0/70 p-1.5 text-muted-color backdrop-blur-sm transition hover:text-color dark:bg-surface-900/60"
         aria-label="Memo actions"
         aria-haspopup="true"
         aria-controls="memo-actions"
