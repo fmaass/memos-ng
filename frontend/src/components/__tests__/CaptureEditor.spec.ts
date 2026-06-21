@@ -50,13 +50,21 @@ describe('CaptureEditor', () => {
     expect(postMemo).not.toHaveBeenCalled()
   })
 
-  it('applies a toolbar action to the content', async () => {
+  it('applies a markdown action via the ⌘B shortcut', async () => {
     const wrapper = mountEditor()
-    await wrapper.find('[data-test="content"]').setValue('hi')
-    await wrapper.find('[data-test="md-bold"]').trigger('click')
-    expect((wrapper.find('[data-test="content"]').element as HTMLTextAreaElement).value).toContain(
-      '**',
-    )
+    const ta = wrapper.find('[data-test="content"]')
+    await ta.setValue('hi')
+    await ta.trigger('keydown', { key: 'b', metaKey: true })
+    expect((ta.element as HTMLTextAreaElement).value).toContain('**')
+  })
+
+  it('posts on ⌘+Enter', async () => {
+    const wrapper = mountEditor()
+    const ta = wrapper.find('[data-test="content"]')
+    await ta.setValue('quick note')
+    await ta.trigger('keydown', { key: 'Enter', metaKey: true })
+    await flushPromises()
+    expect(postMemo).toHaveBeenCalled()
   })
 
   it('enqueues dropped/selected files for upload', async () => {

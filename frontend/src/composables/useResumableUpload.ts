@@ -148,5 +148,16 @@ export function useUploadQueue(concurrency = 2) {
     return created
   }
 
-  return { items, add }
+  // Drop a tile from the queue. A still-uploading file keeps uploading server-side but, since it's
+  // no longer in the queue, its upload_uid won't be posted → it expires (finalize-on-post). Frees
+  // the object-URL preview.
+  function remove(id: number): void {
+    const i = items.findIndex((it) => it.id === id)
+    if (i < 0) return
+    const [it] = items.splice(i, 1)
+    if (it.preview && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(it.preview)
+    files.delete(id)
+  }
+
+  return { items, add, remove }
 }

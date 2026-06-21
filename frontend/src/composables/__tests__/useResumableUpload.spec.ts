@@ -95,4 +95,13 @@ describe('useUploadQueue', () => {
     expect(items[0].uploadUid).toBe('uq')
     expect(items[0].progress).toBe(100)
   })
+
+  it('remove() drops a tile from the queue', () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonRes({ upload_uid: 'x', chunk_size: 100, bytes_received: 0 })))
+    const { items, add, remove } = useUploadQueue()
+    const [a, b] = add([fileOf(3, 'a.png', 'image/png'), fileOf(3, 'b.png', 'image/png')])
+    expect(items).toHaveLength(2)
+    remove(a.id)
+    expect(items.map((i) => i.id)).toEqual([b.id]) // only the removed one is gone
+  })
 })

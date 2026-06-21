@@ -26,13 +26,20 @@ const NAV: NavItem[] = [
 
 const { isDark, toggle, setDark } = useDarkMode()
 const { data: user } = useSession()
-const { settings } = useSettings()
+const { settings, update } = useSettings()
 const api = useApi()
 
 // Apply the server-persisted theme once it loads (source of truth across devices).
 watch(settings, (s) => {
   if (s) setDark(s.theme === 'dark')
 })
+
+// Toggle AND persist to the server, else the watch above re-applies the old server theme on the
+// next load and the choice appears not to stick.
+function onToggleTheme() {
+  toggle()
+  update.mutate({ theme: isDark.value ? 'dark' : 'light' })
+}
 
 const mobileOpen = ref(false)
 
@@ -107,7 +114,7 @@ async function logout(): Promise<void> {
           :icon="isDark ? 'pi pi-sun' : 'pi pi-moon'"
           :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
           data-test="dark-toggle"
-          @click="toggle"
+          @click="onToggleTheme"
         />
         <img
           v-if="user?.avatar"

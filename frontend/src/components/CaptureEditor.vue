@@ -1,41 +1,73 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import DatePicker from 'primevue/datepicker'
+import Menu from 'primevue/menu'
 import Select from 'primevue/select'
 import { computed, nextTick, ref, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { useUploadQueue } from '@/composables/useResumableUpload'
 import { useSettings } from '@/composables/useSettings'
+import { composerKeyAction, formatMemoDate } from '@/lib/composer'
 import { applyMarkdown, type MarkdownAction } from '@/lib/markdownToolbar'
 
 const emit = defineEmits<{ saved: [memo: unknown] }>()
 
 const api = useApi()
-const { items: uploads, add: addUploads } = useUploadQueue()
+const { items: uploads, add: addUploads, remove: removeUpload } = useUploadQueue()
 const { settings } = useSettings()
 
 const content = ref('')
 const visibility = ref<'PRIVATE' | 'PROTECTED' | 'PUBLIC'>('PRIVATE')
-// Default the picker to the user's setting. immediate so it applies even when settings are
-// ALREADY cached at mount (AppShell loads them first) — otherwise the watch never fires and the
-// picker is stuck on the initial PRIVATE despite a PUBLIC default.
-watch(settings, (s) => {
-  if (s) visibility.value = s.default_visibility
-}, { immediate: true })
+// Default from the user's setting. immediate so it applies even when settings are already cached
+// at mount (else the picker stays on the initial PRIVATE despite a PUBLIC default).
+watch(
+  settings,
+  (s) => {
+    if (s) visibility.value = s.default_visibility
+  },
+  { immediate: true },
+)
 const visibilityOptions = [
   { label: 'Private', value: 'PRIVATE', icon: 'pi pi-lock' },
   { label: 'Protected', value: 'PROTECTED', icon: 'pi pi-users' },
   { label: 'Public', value: 'PUBLIC', icon: 'pi pi-globe' },
 ]
-// Custom display date — null means "now" (server default); set it to backdate a memo (parity).
+function visMeta(v: string) {
+  return visibilityOptions.find((o) => o.value === v)
+}
+
+// Custom display date — null = server now; the ⋯ menu reveals a picker, then it shows as a chip.
 const memoDate = ref<Date | null>(null)
+const showDate = ref(false)
+function clearDate() {
+  memoDate.value = null
+  showDate.value = false
+}
 const saving = ref(false)
-// Block Post while media is still uploading — only finished uploads attach, so posting early
-// would silently drop the in-flight ones (the thumbnails show their progress).
-const uploading = computed(() => uploads.some((u) => u.status === 'queued' || u.status === 'uploading'))
+const uploading = computed(() =>
+  uploads.some((u) => u.status === 'queued' || u.status === 'uploading'),
+)
 
 const textarea = ref<HTMLTextAreaElement | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
+// Track the selection so a menu action (which steals focus) still formats the right range.
+let selStart = 0
+let selEnd = 0
+function trackSelection() {
+  const el = textarea.value
+  if (!el) return
+  selStart = el.selectionStart
+  selEnd = el.selectionEnd
+}
+function autosize() {
+  const el = textarea.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
+watch(content, () => nextTick(autosize))
+
 const TOOLBAR: { icon: string; action: MarkdownAction; label: string }[] = [
   { icon: 'pi pi-bold', action: 'bold', label: 'Bold' },
   { icon: 'pi pi-italic', action: 'italic', label: 'Italic' },
@@ -43,17 +75,41 @@ const TOOLBAR: { icon: string; action: MarkdownAction; label: string }[] = [
   { icon: 'pi pi-check-square', action: 'checkbox', label: 'Checkbox' },
   { icon: 'pi pi-link', action: 'link', label: 'Link' },
 ]
-
 function runToolbar(action: MarkdownAction) {
-  const el = textarea.value
-  const start = el?.selectionStart ?? content.value.length
-  const end = el?.selectionEnd ?? content.value.length
-  const r = applyMarkdown(content.value, start, end, action)
+  const r = applyMarkdown(content.value, selStart, selEnd, action)
   content.value = r.text
   nextTick(() => {
+    const el = textarea.value
     el?.focus()
     el?.setSelectionRange(r.selectionStart, r.selectionEnd)
+    selStart = r.selectionStart
+    selEnd = r.selectionEnd
   })
+}
+
+const insertMenu = ref<InstanceType<typeof Menu> | null>(null)
+const moreMenu = ref<InstanceType<typeof Menu> | null>(null)
+const insertItems = computed(() => [
+  { label: 'Attach media', icon: 'pi pi-image', command: () => fileInput.value?.click() },
+  { separator: true },
+  ...TOOLBAR.map((t) => ({ label: t.label, icon: t.icon, command: () => runToolbar(t.action) })),
+])
+const moreItems = computed(() => [
+  {
+    label: 'Set custom date…',
+    icon: 'pi pi-clock',
+    command: () => {
+      showDate.value = true
+    },
+  },
+])
+
+function onKeydown(e: KeyboardEvent) {
+  const action = composerKeyAction(e)
+  if (!action) return
+  e.preventDefault()
+  if (action === 'save') void save()
+  else runToolbar(action)
 }
 
 function onFiles(files: FileList | File[] | null) {
@@ -61,7 +117,6 @@ function onFiles(files: FileList | File[] | null) {
   const list = Array.from(files)
   if (list.length) addUploads(list)
 }
-
 function onPaste(event: ClipboardEvent) {
   const files = Array.from(event.clipboardData?.files ?? [])
   if (files.length) {
@@ -74,8 +129,7 @@ async function save() {
   if (!content.value.trim()) return
   saving.value = true
   try {
-    // Finalize-on-post: send the finished uploads' upload_uids; the server turns them into
-    // attachments now. Uploads still in flight are not posted (and simply expire) — no orphans.
+    // Finalize-on-post: send finished uploads' upload_uids; the server turns them into attachments.
     const upload_uids = uploads
       .filter((u) => u.status === 'done' && u.uploadUid)
       .map((u) => u.uploadUid!)
@@ -91,7 +145,9 @@ async function save() {
     emit('saved', data)
     content.value = ''
     memoDate.value = null
+    showDate.value = false
     uploads.length = 0
+    nextTick(autosize)
   } finally {
     saving.value = false
   }
@@ -109,24 +165,50 @@ async function save() {
     <textarea
       ref="textarea"
       v-model="content"
-      rows="3"
-      placeholder="Write a memo…  #tags, drop or paste images & video"
-      class="w-full resize-y bg-transparent p-2 text-base outline-none"
+      rows="1"
+      placeholder="Any thoughts…"
+      class="max-h-[50vh] w-full resize-none overflow-y-auto whitespace-pre-wrap rounded-lg bg-transparent p-2 text-base outline-none transition focus:ring-2 focus:ring-primary/40"
       data-test="content"
+      @input="autosize"
+      @keydown="onKeydown"
+      @select="trackSelection"
+      @keyup="trackSelection"
+      @mouseup="trackSelection"
+      @blur="trackSelection"
+    />
+
+    <!-- backdate: a removable chip once set, or a picker the moment you choose "Set custom date…" -->
+    <div
+      v-if="memoDate"
+      class="flex items-center gap-2 self-start rounded-full bg-surface-100 px-3 py-1 text-sm text-muted-color dark:bg-surface-800"
+      data-test="date-chip"
+    >
+      <i class="pi pi-clock text-xs" aria-hidden="true" />
+      <span>{{ formatMemoDate(memoDate) }}</span>
+      <button class="pi pi-times text-xs hover:text-color" aria-label="Clear date" @click="clearDate" />
+    </div>
+    <DatePicker
+      v-else-if="showDate"
+      v-model="memoDate"
+      show-time
+      hour-format="24"
+      size="small"
+      placeholder="Pick date & time"
+      class="w-full sm:w-64"
+      data-test="memo-date"
     />
 
     <div v-if="uploads.length" class="flex flex-wrap gap-2" data-test="uploads">
       <div
         v-for="u in uploads"
         :key="u.id"
-        class="relative h-20 w-20 overflow-hidden rounded-lg bg-surface-100 dark:bg-surface-800"
+        class="group relative h-20 w-20 overflow-hidden rounded-lg bg-surface-100 dark:bg-surface-800"
         :title="u.name"
       >
-        <img v-if="u.preview" :src="u.preview" alt="" class="h-full w-full object-cover" />
+        <img v-if="u.preview" :src="u.preview" :alt="u.name" class="h-full w-full object-cover" />
         <span v-else class="flex h-full w-full items-center justify-center text-muted-color">
           <i :class="u.isVideo ? 'pi pi-video' : 'pi pi-file'" class="text-xl" aria-hidden="true" />
         </span>
-        <!-- uploading: dim + percent; done: check; error: red -->
         <div
           v-if="u.status !== 'done'"
           class="absolute inset-0 flex items-center justify-center bg-black/45 text-xs font-medium text-white"
@@ -134,34 +216,47 @@ async function save() {
           <span v-if="u.status === 'error'"><i class="pi pi-exclamation-triangle text-red-400" /></span>
           <span v-else>{{ u.progress }}%</span>
         </div>
-        <span
-          v-else
-          class="absolute bottom-1 right-1 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[10px] text-white"
+        <button
+          class="absolute right-1 top-1 hidden h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white group-hover:flex"
+          aria-label="Remove"
+          data-test="upload-remove"
+          @click="removeUpload(u.id)"
         >
-          <i class="pi pi-check" style="font-size: 9px" aria-hidden="true" />
+          <i class="pi pi-times text-[10px]" aria-hidden="true" />
+        </button>
+        <span class="absolute inset-x-0 bottom-0 truncate bg-black/40 px-1 py-0.5 text-[10px] text-white">
+          {{ u.name }}
         </span>
       </div>
     </div>
 
-    <!-- one slim action bar: formatting + media on the left, date / visibility / post on the right.
-         flex-wrap so on a phone the right cluster drops to its own line instead of overflowing. -->
+    <!-- one clean bottom bar: insert + overflow on the left, visibility + Post on the right -->
     <div
-      class="flex flex-wrap items-center gap-1 gap-y-2 border-t border-surface-100 pt-2 dark:border-surface-800"
+      class="flex items-center justify-between gap-2 border-t border-surface-100 pt-2 dark:border-surface-800"
     >
-      <Button
-        v-for="t in TOOLBAR"
-        :key="t.action"
-        text
-        rounded
-        size="small"
-        severity="secondary"
-        :icon="t.icon"
-        :aria-label="t.label"
-        :data-test="`md-${t.action}`"
-        @click="runToolbar(t.action)"
-      />
-      <label class="cursor-pointer rounded-full p-2 text-muted-color hover:text-color" title="Attach media">
+      <div class="flex items-center gap-1">
+        <Button
+          text
+          rounded
+          severity="secondary"
+          icon="pi pi-plus"
+          aria-label="Insert"
+          data-test="insert-menu"
+          @click="insertMenu?.toggle($event)"
+        />
+        <Menu ref="insertMenu" :model="insertItems" popup />
+        <Button
+          text
+          rounded
+          severity="secondary"
+          icon="pi pi-ellipsis-h"
+          aria-label="More options"
+          data-test="more-menu"
+          @click="moreMenu?.toggle($event)"
+        />
+        <Menu ref="moreMenu" :model="moreItems" popup />
         <input
+          ref="fileInput"
           type="file"
           multiple
           accept="image/*,video/*"
@@ -169,23 +264,8 @@ async function save() {
           data-test="file-input"
           @change="onFiles(($event.target as HTMLInputElement).files)"
         />
-        <i class="pi pi-image" aria-hidden="true" />
-      </label>
-
-      <div class="ml-auto flex items-center gap-2">
-        <DatePicker
-          v-model="memoDate"
-          show-time
-          hour-format="24"
-          show-icon
-          icon-display="input"
-          size="small"
-          placeholder="Now"
-          date-format="M d,"
-          class="w-40"
-          input-class="text-sm text-muted-color"
-          data-test="memo-date"
-        />
+      </div>
+      <div class="flex items-center gap-2">
         <Select
           v-model="visibility"
           :options="visibilityOptions"
@@ -197,8 +277,8 @@ async function save() {
         >
           <template #value="{ value }">
             <span class="flex items-center gap-1.5 text-sm">
-              <i :class="visibilityOptions.find((o) => o.value === value)?.icon" aria-hidden="true" />
-              {{ visibilityOptions.find((o) => o.value === value)?.label }}
+              <i :class="visMeta(value)?.icon" aria-hidden="true" />
+              <span class="hidden sm:inline">{{ visMeta(value)?.label }}</span>
             </span>
           </template>
           <template #option="{ option }">
@@ -210,7 +290,6 @@ async function save() {
         </Select>
         <Button
           :label="uploading ? 'Uploading…' : 'Post'"
-          icon="pi pi-send"
           size="small"
           :loading="saving"
           :disabled="!content.trim() || uploading"
