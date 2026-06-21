@@ -182,15 +182,20 @@ async def attachment_meta(
 async def serve_asset(
     uid: str,
     tier: str,
-    user: Annotated[User, Depends(auth.require_user)],
-    db: Annotated[AsyncSession, Depends(get_session)],
     request: Request,
     format: str | None = None,
 ) -> FileResponse:
     if tier not in TIERS:
         raise HTTPException(status_code=404, detail="Unknown tier")
-    att = await _viewable(db, user, uid)
-    resolved = _tier_path(att, tier)
+    # Do ALL DB work (auth + viewability) in a short-lived session and release it BEFORE streaming.
+    # A FastAPI `Depends(get_session)` would hold the connection until the whole file finished
+    # downloading — and the feed fans out to many image requests at once, so holding a connection
+    # per stream exhausts the bounded pool (QueuePool timeout → missing thumbnails). Resolving the
+    # path here means the FileResponse streams with no DB connection held.
+    async with async_session() as db:
+        user = await auth.require_user(request, db)
+        att = await _viewable(db, user, uid)
+        resolved = _tier_path(att, tier)
     if resolved is None:
         raise HTTPException(status_code=404, detail="Unknown tier")
     path, media_type = resolved
@@ -347,8 +352,15 @@ async def _user_snapshot(user_id: int) -> list[dict]:
 
 
 @router.get("/events")
-async def events(user: Annotated[User, Depends(auth.require_user)]) -> StreamingResponse:
+async def events(request: Request) -> StreamingResponse:
+    # Authenticate in a short-lived session and release it before the stream opens — otherwise the
+    # SSE connection would pin a pool connection for its whole lifetime. Each poll inside
+    # media_event_stream opens its own short session (_user_snapshot), so the stream holds none.
+    async with async_session() as db:
+        user = await auth.require_user(request, db)
+    user_id = user.id
+
     async def snap() -> list[dict]:
-        return await _user_snapshot(user.id)
+        return await _user_snapshot(user_id)
 
     return StreamingResponse(media_event_stream(snap), media_type="text/event-stream")
