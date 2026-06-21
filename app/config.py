@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     FFMPEG_THREADS: int = 1
     WORKER_CONCURRENCY: int = 1
 
+    # Which media lanes a worker drains. Default = both (single-worker dev/CI + the original
+    # in-stack Saturn worker). The Merkur offload runs a second worker with WORKER_LANES=slow
+    # (CPU-heavy H.264 transcode) while Saturn runs WORKER_LANES=fast (light thumbs/poster/dims),
+    # so transcode load leaves the thermally-bound NAS entirely. See ADR-0006 (revisit).
+    WORKER_LANES: str = "fast,slow"
+
     # Resumable upload (T2.1).
     UPLOAD_CHUNK_SIZE: int = 5 * 1024 * 1024  # 5 MiB
     UPLOAD_EXPIRY_HOURS: int = 24

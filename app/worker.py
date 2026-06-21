@@ -1,7 +1,9 @@
-"""memos-ng media worker: claims media_jobs (FOR UPDATE SKIP LOCKED) and runs the fast lane.
+"""memos-ng media worker: claims media_jobs (FOR UPDATE SKIP LOCKED) and runs them.
 
-Same image as the app, started with `command: worker`. The slow-lane H.264 transcode
-lands in T2.3; this worker handles the fast lane (thumbs/mobile/poster/blurhash/dims).
+Same image as the app, started with `command: worker`. Each worker drains the lanes in
+WORKER_LANES: the fast lane (thumbs/mobile/poster/blurhash/dims) and/or the slow lane (the
+CPU-heavy H.264 transcode). The Saturn in-stack worker runs `fast` and a Merkur worker runs
+`slow`, moving transcode off the thermally-bound NAS (ADR-0006 revisit). Default = both lanes.
 """
 
 import asyncio
@@ -16,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session
-from app.models import Attachment, AttachmentStatus, JobState, MediaJob
+from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
 from app.services import media, push
 from app.services.uploads import reap_expired
 from app.version import __version__
@@ -26,6 +28,26 @@ logger = structlog.get_logger(__name__)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
+
+
+def parse_worker_lanes(raw: str) -> list[JobLane]:
+    """Parse WORKER_LANES (e.g. 'slow' or 'fast,slow') into the lanes this worker drains.
+
+    Empty/unset → both lanes (preserves the single-worker default). An unknown token is a
+    misconfiguration and raises — fail loud rather than silently draining the wrong lane.
+    """
+    tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return [JobLane.fast, JobLane.slow]
+    lanes: list[JobLane] = []
+    for t in tokens:
+        try:
+            lane = JobLane(t)
+        except ValueError as exc:
+            raise ValueError(f"Invalid WORKER_LANES token {t!r} (expected fast/slow)") from exc
+        if lane not in lanes:
+            lanes.append(lane)
+    return lanes
 
 
 def heartbeat_path() -> Path:
@@ -38,11 +60,15 @@ def beat() -> None:
     path.write_text(str(time.time()))
 
 
-async def claim_one(db: AsyncSession) -> MediaJob | None:
-    """Atomically claim the next queued job (fast or slow); concurrent workers skip a locked row."""
+async def claim_one(db: AsyncSession, lanes: list[JobLane] | None = None) -> MediaJob | None:
+    """Atomically claim the next queued job in this worker's lanes; concurrent workers skip a
+    locked row. `lanes` defaults to the configured WORKER_LANES — the Saturn worker drains
+    `fast`, the Merkur worker drains `slow`, so a job is claimed by exactly one of them."""
+    if lanes is None:
+        lanes = parse_worker_lanes(settings.WORKER_LANES)
     stmt = (
         select(MediaJob)
-        .where(MediaJob.state == JobState.queued)
+        .where(MediaJob.state == JobState.queued, MediaJob.lane.in_(lanes))
         .order_by(MediaJob.id)
         .limit(1)
         .with_for_update(skip_locked=True)
