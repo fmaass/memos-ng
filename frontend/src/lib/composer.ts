@@ -9,6 +9,15 @@ export function formatMemoDate(d: Date): string {
   return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
 }
 
+/**
+ * Whether the composer has something postable: non-empty text OR at least one finished upload.
+ * A photo-only memo (no text) is valid, like old memos. Queued/uploading/errored files don't count
+ * — only `done` uploads finalize into attachments on post.
+ */
+export function canPost(content: string, uploads: { status: string }[]): boolean {
+  return content.trim().length > 0 || uploads.some((u) => u.status === 'done')
+}
+
 /** Map a composer keydown to an intent: ⌘/Ctrl+Enter = post; ⌘/Ctrl+B/I/K = a markdown action. */
 export function composerKeyAction(
   e: { key: string; metaKey: boolean; ctrlKey: boolean },

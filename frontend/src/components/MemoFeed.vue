@@ -86,6 +86,15 @@ const deleteAttachment = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// Delete a whole memo (owner-only on the server) and refresh the feed.
+const deleteMemo = useMutation({
+  mutationFn: async (uid: string) => {
+    const { error } = await api.DELETE('/api/memos/{uid}', { params: { path: { uid } } })
+    if (error) throw error
+  },
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+})
+
 // Infinite scroll: load the next page when a sentinel below the list scrolls into view.
 const sentinel = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
@@ -125,6 +134,7 @@ onUnmounted(() => observer?.disconnect())
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"
         @delete-attachment="deleteAttachment.mutate($event)"
+        @delete-memo="deleteMemo.mutate($event)"
         @add-print="addPrint.mutate($event)"
         @edit="editMemo.mutate($event)"
       />

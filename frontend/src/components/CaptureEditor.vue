@@ -8,7 +8,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { useApi } from '@/composables/useApi'
 import { useUploadQueue } from '@/composables/useResumableUpload'
 import { useSettings } from '@/composables/useSettings'
-import { composerKeyAction, formatMemoDate } from '@/lib/composer'
+import { canPost, composerKeyAction, formatMemoDate } from '@/lib/composer'
 import { applyMarkdown, type MarkdownAction } from '@/lib/markdownToolbar'
 
 const emit = defineEmits<{ saved: [memo: unknown] }>()
@@ -48,6 +48,8 @@ const saving = ref(false)
 const uploading = computed(() =>
   uploads.some((u) => u.status === 'queued' || u.status === 'uploading'),
 )
+// Postable with text OR finished media (a photo-only memo is valid, like old memos).
+const hasContent = computed(() => canPost(content.value, uploads))
 
 const textarea = ref<HTMLTextAreaElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -126,7 +128,7 @@ function onPaste(event: ClipboardEvent) {
 }
 
 async function save() {
-  if (!content.value.trim()) return
+  if (!hasContent.value) return
   saving.value = true
   try {
     // Finalize-on-post: send finished uploads' upload_uids; the server turns them into attachments.
@@ -300,7 +302,7 @@ async function save() {
           :label="uploading ? 'Uploading…' : 'Post'"
           size="small"
           :loading="saving"
-          :disabled="!content.trim() || uploading"
+          :disabled="!hasContent || uploading"
           data-test="save"
           @click="save"
         />

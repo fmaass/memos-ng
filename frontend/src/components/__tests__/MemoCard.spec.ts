@@ -2,10 +2,24 @@ import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
+
+// The Delete action routes through PrimeVue's confirm dialog (a service with no ConfirmDialog
+// mounted in these unit specs). Mock useConfirm so we can capture the options and invoke accept().
+const { requireSpy } = vi.hoisted(() => ({ requireSpy: vi.fn() }))
+vi.mock('primevue/useconfirm', () => ({ useConfirm: () => ({ require: requireSpy }) }))
+
+// The owner actions (⋯) menu is a PrimeVue popup teleported to body — open it, then return the
+// freshest matching item (last appended, so stale nodes from prior mounts don't shadow it).
+async function openAction(wrapper: ReturnType<typeof mountCard>, testId: string) {
+  await wrapper.find('[data-test="memo-edit"]').trigger('click')
+  await nextTick()
+  const items = document.body.querySelectorAll<HTMLElement>(`[data-test="${testId}"]`)
+  return items[items.length - 1]
+}
 
 function imageAtt(uid: string) {
   return {
@@ -92,16 +106,33 @@ describe('MemoCard', () => {
 
   it('edits content + visibility + date and emits edit on save', async () => {
     const wrapper = mountCard({ memo: memo('original') })
-    await wrapper.find('[data-test="memo-edit"]').trigger('click')
+    const editItem = await openAction(wrapper, 'memo-action-edit')
+    editItem.click()
+    await nextTick()
     expect(wrapper.find('[data-test="memo-editor"]').exists()).toBe(true)
     await wrapper.find('[data-test="edit-content"]').setValue('edited text')
     await wrapper.find('[data-test="edit-save"]').trigger('click')
     const payload = wrapper.emitted('edit')?.[0]?.[0] as { uid: string; content: string }
     expect(payload.uid).toBe('m1')
     expect(payload.content).toBe('edited text')
+    wrapper.unmount()
   })
 
-  it('hides the edit affordance on memos the user does not own', () => {
+  it('emits delete-memo when the Delete action is confirmed', async () => {
+    requireSpy.mockClear()
+    const wrapper = mountCard({ memo: memo('to delete') })
+    const delItem = await openAction(wrapper, 'memo-action-delete')
+    delItem.click()
+    expect(requireSpy).toHaveBeenCalledTimes(1)
+    // No emit until the user actually confirms.
+    expect(wrapper.emitted('delete-memo')).toBeUndefined()
+    const opts = requireSpy.mock.calls[0][0] as { accept: () => void }
+    opts.accept()
+    expect(wrapper.emitted('delete-memo')?.[0]).toEqual(['m1'])
+    wrapper.unmount()
+  })
+
+  it('hides the owner actions on memos the user does not own', () => {
     const wrapper = mountCard({ memo: { ...memo('x'), mine: false } })
     expect(wrapper.find('[data-test="memo-edit"]').exists()).toBe(false)
   })

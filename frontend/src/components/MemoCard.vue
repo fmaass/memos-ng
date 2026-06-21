@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import DatePicker from 'primevue/datepicker'
+import Menu from 'primevue/menu'
 import Popover from 'primevue/popover'
 import Select from 'primevue/select'
 import { useConfirm } from 'primevue/useconfirm'
@@ -21,6 +22,7 @@ const emit = defineEmits<{
   'task-toggle': [payload: { uid: string; content: string }]
   'toggle-reaction': [payload: { uid: string; emoji: string; add: boolean }]
   'delete-attachment': [uid: string]
+  'delete-memo': [uid: string]
   'add-print': [payload: { uid: string; file: File }]
   edit: [payload: { uid: string; content: string; visibility: Visibility; created_at: string }]
 }>()
@@ -48,6 +50,23 @@ function saveEdit() {
     created_at: (editDate.value ?? new Date(props.memo.created_at)).toISOString(),
   })
   editing.value = false
+}
+
+// Owner actions menu (⋯) — always visible (the old hover-only pencil was invisible on touch).
+const actionsMenu = ref<InstanceType<typeof Menu> | null>(null)
+const memoActions = computed(() => [
+  { label: 'Edit', icon: 'pi pi-pencil', testId: 'memo-action-edit', command: startEdit },
+  { label: 'Delete', icon: 'pi pi-trash', testId: 'memo-action-delete', command: confirmDeleteMemo },
+])
+function confirmDeleteMemo() {
+  confirm.require({
+    header: 'Delete memo',
+    message: 'Delete this memo? This cannot be undone.',
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Delete', severity: 'danger' },
+    accept: () => emit('delete-memo', props.memo.uid),
+  })
 }
 
 const REACTION_CHOICES = ['👍', '❤️', '😄', '🎉']
@@ -105,16 +124,27 @@ function onContentClick(event: MouseEvent) {
     class="group relative flex flex-col gap-2 rounded-xl border border-surface-200 p-4 dark:border-surface-700"
     data-test="memo-card"
   >
-    <button
-      v-if="memo.mine && !editing && !restorable"
-      type="button"
-      class="absolute right-2 top-2 p-1.5 text-muted-color opacity-0 transition hover:text-color group-hover:opacity-100"
-      aria-label="Edit memo"
-      data-test="memo-edit"
-      @click="startEdit"
-    >
-      <i class="pi pi-pencil text-sm" aria-hidden="true" />
-    </button>
+    <template v-if="memo.mine && !editing && !restorable">
+      <button
+        type="button"
+        class="absolute right-2 top-2 p-1.5 text-muted-color transition hover:text-color"
+        aria-label="Memo actions"
+        aria-haspopup="true"
+        aria-controls="memo-actions"
+        data-test="memo-edit"
+        @click="actionsMenu?.toggle($event)"
+      >
+        <i class="pi pi-ellipsis-h text-sm" aria-hidden="true" />
+      </button>
+      <Menu id="memo-actions" ref="actionsMenu" :model="memoActions" popup>
+        <template #item="{ item, props }">
+          <a class="flex items-center gap-2 px-3 py-2" :data-test="item.testId" v-bind="props.action">
+            <i :class="item.icon" aria-hidden="true" />
+            <span>{{ item.label }}</span>
+          </a>
+        </template>
+      </Menu>
+    </template>
 
     <!-- edit mode: content + visibility + display date -->
     <div v-if="editing" class="flex flex-col gap-2" data-test="memo-editor">
