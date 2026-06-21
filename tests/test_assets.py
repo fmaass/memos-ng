@@ -53,8 +53,9 @@ def test_serve_thumb_with_range_etag_lastmodified(logged_in_client, monkeypatch,
         assert client.get("/api/attachments/att-thumb/web").status_code == 404  # tier file absent
 
         meta = client.get("/api/attachments/att-thumb").json()
-        assert meta["thumbnailUrl"].endswith("/thumb")
-        assert meta["webUrl"].endswith("/web") and meta["blurhash"] == "LKO2"
+        assert meta["thumbnailUrl"].split("?")[0].endswith("/thumb")
+        assert "sig=" in meta["thumbnailUrl"]
+        assert meta["webUrl"].split("?")[0].endswith("/web") and meta["blurhash"] == "LKO2"
     finally:
         _cleanup(aid)
 
@@ -301,3 +302,51 @@ def test_list_attachments_owner_scoped_and_type_filter(logged_in_client):
         with eng.begin() as c:
             c.execute(text("DELETE FROM users WHERE subject='other_la'"))
         eng.dispose()
+
+
+# --- HMAC-signed asset URLs: the DB-free serve fast path ---
+import time as _time  # noqa: E402
+
+from app.services.asset_urls import sign_asset_url  # noqa: E402
+
+
+def test_signed_thumb_serves_without_auth_or_db(client, monkeypatch, tmp_path):
+    # The load-bearing guard: a signed derived-tier URL serves with NO auth and NO DB session.
+    # If the byte path ever takes a DB session again (the missing-thumbnails bug), this goes red.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "ASSET_URL_SECRET", "test-secret")
+    thumb = tmp_path / "assets" / "thumbs" / "sig1.jpg"
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (10, 10), (1, 2, 3)).save(thumb, "JPEG")
+
+    from app.routers import assets as assets_mod
+
+    def _boom(*a, **k):
+        raise AssertionError("signed serve must not open a DB session")
+
+    monkeypatch.setattr(assets_mod, "async_session", _boom)
+
+    url = sign_asset_url("sig1", "thumb", 7, now=_time.time())
+    r = client.get(url)  # `client` is unauthenticated (no session cookie)
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+
+
+def test_signed_serve_rejects_tampered_and_expired(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "ASSET_URL_SECRET", "test-secret")
+    thumb = tmp_path / "assets" / "thumbs" / "sig2.jpg"
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (10, 10), (1, 2, 3)).save(thumb, "JPEG")
+
+    good = sign_asset_url("sig2", "thumb", 7, now=_time.time())
+    tampered = good[:-1] + ("0" if good[-1] != "0" else "1")
+    assert client.get(tampered).status_code == 403  # bad signature
+    expired = sign_asset_url("sig2", "thumb", 7, now=1000)  # exp long in the past
+    assert client.get(expired).status_code == 403
+
+
+def test_unsigned_original_still_requires_auth(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    # original is unsigned (low fan-out, needs the DB row) → the auth path; no session → 401.
+    assert client.get("/api/attachments/whatever/original").status_code == 401

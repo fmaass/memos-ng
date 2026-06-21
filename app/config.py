@@ -22,10 +22,21 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 5
     DB_POOL_RECYCLE: int = 1800
+    # Explicit, short pool checkout timeout: fail loud at 10s, not the 30s default that lets a burst
+    # queue silently and hang the feed. Exhaustion is a hold-time bug to fix, not a wait to tune.
+    DB_POOL_TIMEOUT: int = 10
 
     # Derived media tiers are immutable (uid-keyed) — let browsers cache them hard so re-renders
     # of the feed/gallery don't re-request every image (1 year, immutable).
     ASSET_CACHE_SECONDS: int = 31536000
+
+    # HMAC-signed media URLs (the DB-free byte path). The feed mints short-lived signed derived-tier
+    # URLs; the serve route verifies the signature with no DB/auth dependency, then streams. The
+    # signing key defaults off SESSION_SECRET so prod needs no new env; PREV is the rotation slot.
+    ASSET_URL_SECRET: str = ""  # empty → derived from SESSION_SECRET (see services/asset_urls)
+    ASSET_URL_SECRET_PREV: str = ""
+    ASSET_URL_TTL: int = 7200  # seconds a signed URL stays valid
+    ASSET_URL_BUCKET: int = 3600  # mint bucket → URLs stable within the window (browser cache hits)
 
     # Media worker thermal/concurrency guards (Saturn is thermally bound — see plan §3).
     FFMPEG_THREADS: int = 1

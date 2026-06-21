@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from app import auth
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import Attachment, AttachmentStatus, MediaJob, Memo, User
+from app.services import asset_urls
 from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
@@ -24,17 +26,9 @@ router = APIRouter(prefix="/api", tags=["assets"])
 TIERS = ("original", "thumb", "mobile", "web", "poster", "print")
 
 
-def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
+def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
+    """Derived tiers resolve from the uid alone (no DB row) — used by the signed fast path."""
     assets = Path(settings.DATA_ROOT) / "assets"
-    uid = attachment.uid
-    if tier == "original":
-        return (Path(attachment.storage_path), attachment.mime) if attachment.storage_path else None
-    if tier == "print":  # separately-uploaded print master (download-only); None if absent
-        return (
-            (Path(attachment.print_path), attachment.print_mime or "application/octet-stream")
-            if attachment.print_path
-            else None
-        )
     if tier == "thumb":
         return assets / "thumbs" / f"{uid}.jpg", "image/jpeg"
     if tier == "mobile":
@@ -44,6 +38,35 @@ def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
     if tier == "poster":
         return assets / "web" / f"{uid}.poster.jpg", "image/jpeg"
     return None
+
+
+def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
+    if tier == "original":
+        return (Path(attachment.storage_path), attachment.mime) if attachment.storage_path else None
+    if tier == "print":  # separately-uploaded print master (download-only); None if absent
+        return (
+            (Path(attachment.print_path), attachment.print_mime or "application/octet-stream")
+            if attachment.print_path
+            else None
+        )
+    return _derived_tier_path(attachment.uid, tier)
+
+
+def _serve_file(path: Path, media_type: str, request: Request, format: str | None) -> FileResponse:
+    # Prefer a pre-generated webp variant for image tiers when asked (falls back to JPEG if absent).
+    if media_type == "image/jpeg" and (
+        format == "webp" or "image/webp" in request.headers.get("accept", "")
+    ):
+        webp = path.with_suffix(".webp")
+        if webp.exists():
+            path, media_type = webp, "image/webp"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Asset not generated yet")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": f"public, max-age={settings.ASSET_CACHE_SECONDS}, immutable"},
+    )
 
 
 async def _viewable(db: AsyncSession, user: User, uid: str) -> Attachment:
@@ -114,10 +137,7 @@ def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
         mine=att.owner_id == user_id,
         hasPrint=att.print_path is not None,
         orphan=att.memo_id is None,
-        thumbnailUrl=f"{base}/thumb",
-        previewUrl=f"{base}/mobile",
-        webUrl=f"{base}/web",
-        posterUrl=f"{base}/poster",
+        **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
     )
@@ -171,10 +191,7 @@ async def attachment_meta(
         hasPrint=att.print_path is not None,
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
-        thumbnailUrl=f"{base}/thumb",
-        previewUrl=f"{base}/mobile",
-        webUrl=f"{base}/web",
-        posterUrl=f"{base}/poster",
+        **asset_urls.signed_tier_urls(att.uid, user.id, now=time.time()),
     )
 
 
@@ -183,40 +200,32 @@ async def serve_asset(
     uid: str,
     tier: str,
     request: Request,
+    exp: str | None = None,
+    scope: str | None = None,
+    sig: str | None = None,
     format: str | None = None,
 ) -> FileResponse:
     if tier not in TIERS:
         raise HTTPException(status_code=404, detail="Unknown tier")
-    # Do ALL DB work (auth + viewability) in a short-lived session and release it BEFORE streaming.
-    # A FastAPI `Depends(get_session)` would hold the connection until the whole file finished
-    # downloading — and the feed fans out to many image requests at once, so holding a connection
-    # per stream exhausts the bounded pool (QueuePool timeout → missing thumbnails). Resolving the
-    # path here means the FileResponse streams with no DB connection held.
+    # SIGNED FAST PATH: a derived tier with a valid HMAC signature is served with NO DB and NO auth
+    # dependency — the feed already authorized at mint time. This keeps the high-fan-out media path
+    # entirely off the DB pool (the QueuePool-exhaustion / missing-thumbnails class of bug).
+    if sig is not None and tier in asset_urls.DERIVED_TIERS:
+        if not asset_urls.verify_asset_sig(uid, tier, exp, scope, sig, now=time.time()):
+            raise HTTPException(status_code=403, detail="Bad or expired signature")
+        resolved = _derived_tier_path(uid, tier)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="Unknown tier")
+        return _serve_file(resolved[0], resolved[1], request, format)
+    # UNSIGNED / AUTH PATH (original/print, /file/* compat, satellites): DB work in a short-lived
+    # session released BEFORE streaming, so the download holds no pool connection either.
     async with async_session() as db:
         user = await auth.require_user(request, db)
         att = await _viewable(db, user, uid)
         resolved = _tier_path(att, tier)
     if resolved is None:
         raise HTTPException(status_code=404, detail="Unknown tier")
-    path, media_type = resolved
-    # Format negotiation: prefer a pre-generated webp variant for image tiers when asked.
-    if media_type == "image/jpeg" and (
-        format == "webp" or "image/webp" in request.headers.get("accept", "")
-    ):
-        webp = path.with_suffix(".webp")
-        if webp.exists():
-            path, media_type = webp, "image/webp"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Asset not generated yet")
-    # FileResponse adds ETag + Last-Modified (mtime == captured_at for derived tiers) +
-    # Accept-Ranges, and answers Range requests with 206 automatically. Tiers are uid-keyed and
-    # immutable, so cache hard — repeat feed/gallery renders then hit the browser cache, not the
-    # server (cuts request fan-out + DB connection pressure).
-    return FileResponse(
-        path,
-        media_type=media_type,
-        headers={"Cache-Control": f"public, max-age={settings.ASSET_CACHE_SECONDS}, immutable"},
-    )
+    return _serve_file(resolved[0], resolved[1], request, format)
 
 
 def _all_asset_paths(att: Attachment) -> list[Path]:

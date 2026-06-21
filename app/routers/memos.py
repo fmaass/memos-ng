@@ -1,4 +1,5 @@
 import contextlib
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -13,6 +14,7 @@ from app.database import get_session
 from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
 from app.services import memos as svc
 from app.services import uploads as uploads_svc
+from app.services.asset_urls import signed_tier_urls
 
 router = APIRouter(prefix="/api", tags=["memos"])
 
@@ -104,6 +106,9 @@ class TagCount(BaseModel):
 
 def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
     base = f"/api/attachments/{att.uid}"
+    now = time.time()
+    # Derived tiers get HMAC-signed URLs → served DB-free (no pool pressure on the feed fan-out).
+    # original/print stay unsigned (low fan-out, need the DB row; served via the auth path).
     return AttachmentRef(
         uid=att.uid,
         mime=att.mime,
@@ -114,10 +119,7 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         duration=att.duration,
         mine=att.owner_id == user_id,
         hasPrint=att.print_path is not None,
-        thumbnailUrl=f"{base}/thumb",
-        previewUrl=f"{base}/mobile",
-        webUrl=f"{base}/web",
-        posterUrl=f"{base}/poster",
+        **signed_tier_urls(att.uid, user_id, now=now),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
     )

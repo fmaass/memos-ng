@@ -1028,6 +1028,9 @@ export interface operations {
     serve_asset_api_attachments__uid___tier__get: {
         parameters: {
             query?: {
+                exp?: string | null;
+                scope?: string | null;
+                sig?: string | null;
                 format?: string | null;
             };
             header?: never;

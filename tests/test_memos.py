@@ -200,9 +200,11 @@ async def test_memo_out_serializes_attachment_tier_urls(adb):
     assert len(out.attachments) == 1
     a = out.attachments[0]
     assert a.uid == "att1" and a.status is AttachmentStatus.processing and a.blurhash == "LKO2"
-    assert a.thumbnailUrl == "/api/attachments/att1/thumb"
-    assert a.webUrl == "/api/attachments/att1/web"
-    assert a.posterUrl == "/api/attachments/att1/poster"
+    # Derived tiers are HMAC-signed (DB-free serve); original stays unsigned (auth path).
+    assert a.thumbnailUrl.split("?")[0] == "/api/attachments/att1/thumb"
+    assert "sig=" in a.thumbnailUrl
+    assert a.webUrl.split("?")[0] == "/api/attachments/att1/web"
+    assert a.posterUrl.split("?")[0] == "/api/attachments/att1/poster"
     assert a.downloadUrl == "/api/attachments/att1/original"
 
 
