@@ -1,7 +1,13 @@
 import { mount } from '@vue/test-utils'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import MediaTile from '@/components/MediaTile.vue'
+
+// blurhashToDataUrl decodes via canvas, which happy-dom lacks — mock it (keep tileKind real).
+vi.mock('@/lib/media', async (orig) => {
+  const actual = await orig<typeof import('@/lib/media')>()
+  return { ...actual, blurhashToDataUrl: (h: string | null) => (h ? 'data:image/png;base64,blur' : null) }
+})
 
 type Status = 'uploading' | 'pending' | 'processing' | 'ready' | 'failed'
 function att(status: Status, mime = 'image/jpeg', extra: Record<string, unknown> = {}) {
@@ -39,6 +45,12 @@ describe('MediaTile', () => {
     const img = w.find('[data-test="tile-image"]')
     expect(img.attributes('src')).toBe('/api/attachments/a1/thumb') // small tier in the grid
     expect(img.attributes('loading')).toBe('lazy')
+  })
+
+  it('shows the blurhash instantly behind a ready image (no blank box while it loads)', () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png', { blurhash: 'LEHV6nWB' }) } })
+    expect(w.find('[data-test="tile-blur"]').exists()).toBe(true) // instant blurred preview
+    expect(w.find('[data-test="tile-image"]').exists()).toBe(true) // real thumb loads on top
   })
 
   it('renders a video element when a ready video', () => {

@@ -51,15 +51,26 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
       </div>
     </template>
 
-    <img
-      v-else-if="kind === 'image'"
-      :src="att.thumbnailUrl"
-      alt=""
-      loading="lazy"
-      class="w-full h-full object-cover cursor-pointer"
-      data-test="tile-image"
-      @click="emit('open', att.uid)"
-    />
+    <!-- ready image: the blurhash shows instantly (tiny client-decoded preview) behind the real
+         thumb, so the feed never renders as empty gray boxes while thumbnails download. -->
+    <template v-else-if="kind === 'image'">
+      <img
+        v-if="blur"
+        :src="blur"
+        alt=""
+        aria-hidden="true"
+        class="absolute inset-0 w-full h-full object-cover"
+        data-test="tile-blur"
+      />
+      <img
+        :src="att.thumbnailUrl"
+        alt=""
+        loading="lazy"
+        class="relative w-full h-full object-cover cursor-pointer"
+        data-test="tile-image"
+        @click="emit('open', att.uid)"
+      />
+    </template>
 
     <button
       v-else-if="kind === 'video'"
@@ -69,7 +80,14 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
       aria-label="Play video"
       @click="emit('open', att.uid)"
     >
-      <img :src="att.posterUrl" alt="" loading="lazy" class="h-full w-full object-cover" />
+      <img
+        v-if="blur"
+        :src="blur"
+        alt=""
+        aria-hidden="true"
+        class="absolute inset-0 h-full w-full object-cover"
+      />
+      <img :src="att.posterUrl" alt="" loading="lazy" class="relative h-full w-full object-cover" />
       <span class="absolute inset-0 flex items-center justify-center">
         <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
       </span>
