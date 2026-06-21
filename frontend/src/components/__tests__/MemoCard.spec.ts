@@ -3,6 +3,7 @@ import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
 import { describe, expect, it } from 'vitest'
+import { nextTick } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
 
@@ -105,10 +106,14 @@ describe('MemoCard', () => {
     expect(wrapper.find('[data-test="memo-edit"]').exists()).toBe(false)
   })
 
-  it('adds a reaction from the picker', async () => {
+  it('adds a reaction from the picker (PrimeVue Popover, teleported)', async () => {
     const wrapper = mountCard({ memo: memo('hi') })
     await wrapper.find('[data-test="react-add"]').trigger('click')
-    await wrapper.find('[data-test="react-choice-👍"]').trigger('click')
+    await nextTick()
+    // Popover content teleports to body — query there, not the wrapper.
+    const choice = document.body.querySelector('[data-test="react-choice-👍"]') as HTMLElement
+    expect(choice).toBeTruthy()
+    choice.click()
     expect(wrapper.emitted('toggle-reaction')?.[0]).toEqual([
       { uid: 'm1', emoji: '👍', add: true },
     ])

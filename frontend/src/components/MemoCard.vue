@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import DatePicker from 'primevue/datepicker'
+import Popover from 'primevue/popover'
 import Select from 'primevue/select'
 import { useConfirm } from 'primevue/useconfirm'
 import { computed, ref } from 'vue'
@@ -50,12 +51,12 @@ function saveEdit() {
 }
 
 const REACTION_CHOICES = ['👍', '❤️', '😄', '🎉']
-const pickerOpen = ref(false)
+const reactPicker = ref<InstanceType<typeof Popover> | null>(null)
 function toggleReaction(emoji: string, reacted: boolean) {
   emit('toggle-reaction', { uid: props.memo.uid, emoji, add: !reacted })
 }
 function addReaction(emoji: string) {
-  pickerOpen.value = false
+  reactPicker.value?.hide()
   emit('toggle-reaction', { uid: props.memo.uid, emoji, add: true })
 }
 
@@ -203,35 +204,32 @@ function onContentClick(event: MouseEvent) {
       >
         {{ r.emoji }} {{ r.count }}
       </button>
-      <span class="relative">
-        <button
-          type="button"
-          class="text-xs px-1.5 py-0.5 text-muted-color hover:text-color"
-          aria-label="Add reaction"
-          aria-haspopup="true"
-          :aria-expanded="pickerOpen"
-          data-test="react-add"
-          @click="pickerOpen = !pickerOpen"
-        >
-          <i class="pi pi-face-smile" aria-hidden="true" />
-        </button>
-        <span
-          v-if="pickerOpen"
-          class="absolute z-10 left-0 mt-1 flex gap-1 rounded border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-1"
-          data-test="react-picker"
-        >
+      <button
+        type="button"
+        class="text-xs px-1.5 py-0.5 text-muted-color hover:text-color"
+        aria-label="Add reaction"
+        aria-haspopup="true"
+        aria-controls="react-picker"
+        data-test="react-add"
+        @click="reactPicker?.toggle($event)"
+      >
+        <i class="pi pi-face-smile" aria-hidden="true" />
+      </button>
+      <Popover id="react-picker" ref="reactPicker" data-test="react-picker">
+        <div class="flex gap-1">
           <button
             v-for="e in REACTION_CHOICES"
             :key="e"
             type="button"
-            class="text-sm px-1"
+            class="rounded px-1 text-lg transition hover:scale-125"
+            :aria-label="`React ${e}`"
             :data-test="`react-choice-${e}`"
             @click="addReaction(e)"
           >
             {{ e }}
           </button>
-        </span>
-      </span>
+        </div>
+      </Popover>
     </div>
     <div v-if="restorable" class="flex justify-end">
       <button
