@@ -113,6 +113,39 @@ async def test_slow_transcode_produces_h264(adb, monkeypatch, tmp_path):
     assert att.status is AttachmentStatus.ready and job.progress_pct == 100
 
 
+async def test_slow_lane_decodes_heic_image(adb, monkeypatch, tmp_path):
+    # A HEIC image job on the slow lane is decoded into tiers (on Merkur), not transcoded.
+    pillow_heif = pytest.importorskip("pillow_heif")
+    from PIL import Image
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    pillow_heif.register_heif_opener()
+    src = tmp_path / "originals" / "p.heic"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (120, 90), (40, 160, 90)).save(str(src), format="HEIF")
+
+    att = Attachment(
+        uid="heic1",
+        filename="p.heic",
+        mime="image/heic",
+        size=src.stat().st_size,
+        status=AttachmentStatus.processing,
+        storage_path=str(src),
+    )
+    adb.add(att)
+    await adb.flush()
+    job = MediaJob(attachment_id=att.id, lane=JobLane.slow, state=JobState.queued)
+    adb.add(job)
+    await adb.flush()
+
+    await media.process_job(adb, job)
+
+    assert (tmp_path / "assets" / "thumbs" / "heic1.jpg").exists()
+    assert (tmp_path / "assets" / "mobile" / "heic1.jpg").exists()
+    assert att.status is AttachmentStatus.ready
+    assert att.width == 120 and att.height == 90 and att.blurhash
+
+
 def test_progress_parser():
     assert media.parse_progress("out_time_us=500000\n", 1.0) == 50
     assert media.parse_progress("out_time_us=1000000", 1.0) == 100

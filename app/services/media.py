@@ -250,7 +250,17 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     ).scalar_one()
 
     if job.lane is JobLane.slow:
-        await process_slow(db, job, attachment)
+        if attachment.mime.startswith("video/"):
+            await process_slow(db, job, attachment)
+        else:
+            # Heavy image (HEIC/AVIF): the CPU-costly libheif decode + derivative generation runs
+            # on the slow (Merkur) worker. process_image never touches the original (ADR-0008).
+            meta = process_image(attachment)
+            attachment.width = meta.get("width")
+            attachment.height = meta.get("height")
+            attachment.blurhash = meta.get("blurhash")
+            attachment.status = AttachmentStatus.ready
+            await db.flush()
         return
 
     is_video = attachment.mime.startswith("video/")

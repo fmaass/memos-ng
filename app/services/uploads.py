@@ -37,8 +37,44 @@ def part_path(upload_uid: str) -> Path:
     return _data_root() / "uploads" / f"{upload_uid}.part"
 
 
+# HEIF-family ISOBMFF brands. HEIC (Apple's iPhone codec) shares the ISOBMFF container with MP4,
+# so content sniffers (puremagic) mislabel it `video/mp4` — `detect_heif_mime` corrects that from
+# the ftyp brand so Apple-codec photos route as images (and to the Merkur slow lane), not video.
+_HEIF_HEVC_BRANDS = frozenset(
+    {b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"}
+)
+_AVIF_BRANDS = frozenset({b"avif", b"avis"})
+# Heavy image codecs whose decode is offloaded to the Merkur slow worker (kept as archive masters).
+HEAVY_IMAGE_MIMES = frozenset({"image/heic", "image/avif"})
+
+
+def detect_heif_mime(header: bytes) -> str | None:
+    """Classify an ISOBMFF header as a HEIF/HEIC or AVIF still image, else None.
+
+    Reads the `ftyp` box brands. Returns 'image/heic' for the HEVC-HEIF family (iPhone .heic),
+    'image/avif' for AVIF, or None for MP4/MOV video and non-ISOBMFF files. This is the
+    discriminator content sniffers get wrong (they only see the shared MP4 container)."""
+    if len(header) < 12 or header[4:8] != b"ftyp":
+        return None
+    brands = {header[8:12]}  # major_brand
+    size = int.from_bytes(header[0:4], "big")
+    end = min(size if size >= 16 else len(header), len(header))
+    for off in range(16, end - 3, 4):  # compatible_brands follow the 4-byte minor_version
+        brands.add(header[off : off + 4])
+    if brands & _AVIF_BRANDS:
+        return "image/avif"
+    if brands & _HEIF_HEVC_BRANDS:
+        return "image/heic"
+    return None
+
+
 def _sniff_mime(path: Path, declared: str) -> str:
     try:
+        with open(path, "rb") as f:
+            header = f.read(64)
+        heif = detect_heif_mime(header)  # before puremagic — it mislabels HEIC as video/mp4
+        if heif is not None:
+            return heif
         guessed = puremagic.from_file(str(path), mime=True)
         return guessed or declared
     except (puremagic.PureError, ValueError, OSError):
@@ -154,11 +190,13 @@ async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachmen
     db.add(attachment)
     await db.flush()
 
-    # Only the fast lane is enqueued up front. For video, the fast lane enqueues the slow
-    # (transcode) job once it has produced the poster/dims — so the two can never race a
-    # status overwrite under concurrent workers (a slow job setting 'ready' before the fast
-    # job sets 'processing' would strand finished media permanently non-ready).
-    db.add(MediaJob(attachment_id=attachment.id, lane=JobLane.fast, state=JobState.queued))
+    # Lane routing: video → fast (poster/dims), and the fast lane then enqueues the slow
+    # (transcode) job — so the two never race a status overwrite under concurrent workers (a slow
+    # job setting 'ready' before the fast job sets 'processing' would strand finished media). A
+    # heavy image (HEIC/AVIF — Apple's CPU-costly codec) goes straight to the slow lane so its
+    # decode runs on the Merkur worker, off the thermally-bound NAS; ordinary images stay fast.
+    initial_lane = JobLane.slow if mime in HEAVY_IMAGE_MIMES else JobLane.fast
+    db.add(MediaJob(attachment_id=attachment.id, lane=initial_lane, state=JobState.queued))
     await db.delete(upload)
     await db.flush()
     return attachment

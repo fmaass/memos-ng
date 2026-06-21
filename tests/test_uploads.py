@@ -217,6 +217,71 @@ def test_failed_post_cleans_up_moved_original(logged_in_client, monkeypatch, tmp
         _cleanup()
 
 
+def _make_heic(path):
+    import pillow_heif
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    Image.new("RGB", (96, 72), (200, 120, 40)).save(str(path), format="HEIF")
+
+
+def test_detect_heif_mime_per_category():
+    # The classification heuristic that fixes the HEIC-as-MP4 trap — one case per input category.
+    from app.services.uploads import detect_heif_mime
+
+    def ftyp(major, *compat):
+        body = b"ftyp" + major + b"\x00\x00\x00\x00" + b"".join(compat)
+        return (4 + len(body)).to_bytes(4, "big") + body
+
+    assert detect_heif_mime(ftyp(b"heic", b"mif1")) == "image/heic"  # iPhone .heic
+    assert detect_heif_mime(ftyp(b"heix")) == "image/heic"
+    assert detect_heif_mime(ftyp(b"mif1")) == "image/heic"  # generic HEIF
+    assert detect_heif_mime(ftyp(b"avif", b"mif1")) == "image/avif"  # AVIF
+    assert detect_heif_mime(ftyp(b"isom", b"mp41")) is None  # MP4 video
+    assert detect_heif_mime(ftyp(b"qt  ")) is None  # MOV video
+    assert detect_heif_mime(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x00\x00") is None  # JPEG
+    assert detect_heif_mime(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0d") is None  # PNG
+    assert detect_heif_mime(b"\x00\x00\x00\x0cfty") is None  # truncated / not ftyp
+    assert detect_heif_mime(b"ab") is None  # too short
+
+
+def test_sniff_mime_corrects_heic_misdetected_as_video(tmp_path):
+    import puremagic
+    from app.services.uploads import _sniff_mime
+
+    p = tmp_path / "photo.heic"
+    _make_heic(p)
+    # baseline: the content sniffer alone mislabels HEIC as video (the bug we're guarding against)
+    assert puremagic.from_file(str(p), mime=True).startswith("video/")
+    # _sniff_mime corrects it via the ISOBMFF brand → an image, even if the client declared wrong
+    assert _sniff_mime(p, "video/mp4") == "image/heic"
+
+
+async def test_heic_finalize_routes_to_slow_lane(adb, monkeypatch, tmp_path):
+    # A HEIC upload must be classified as an image (not video) and routed to the slow lane so its
+    # heavy decode runs on the Merkur worker.
+    from app.models import AttachmentStatus, JobLane, MediaJob, User
+    from sqlalchemy import select
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    u = User(subject="heic_user", role="user")
+    adb.add(u)
+    await adb.flush()
+    src = tmp_path / "src.heic"
+    _make_heic(src)
+    data = src.read_bytes()
+    up = await svc.create_upload(adb, filename="photo.heic", mime="image/heic", size=len(data))
+    await svc.append_chunk(adb, up, 0, data)
+    att = await svc.finalize(adb, up, owner_id=u.id)
+
+    assert att.mime == "image/heic"  # classified as image, not video/mp4
+    assert att.status is AttachmentStatus.processing  # 'pending' is only for video
+    job = (
+        await adb.execute(select(MediaJob).where(MediaJob.attachment_id == att.id))
+    ).scalar_one()
+    assert job.lane is JobLane.slow  # heavy decode offloaded to Merkur
+
+
 def test_uploads_require_auth(client):
     assert (
         client.post("/api/uploads", json={"filename": "x", "mime": "x", "size": 1}).status_code
