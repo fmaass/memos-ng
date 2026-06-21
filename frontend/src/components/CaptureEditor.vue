@@ -214,7 +214,9 @@ async function save() {
           v-if="u.status !== 'done'"
           class="absolute inset-0 flex items-center justify-center bg-black/45 text-xs font-medium text-white"
         >
-          <span v-if="u.status === 'error'"><i class="pi pi-exclamation-triangle text-red-400" /></span>
+          <span v-if="u.status === 'error'"
+            ><i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true"
+          /></span>
           <span v-else>{{ u.progress }}%</span>
         </div>
         <button

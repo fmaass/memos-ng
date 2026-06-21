@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { nextTick, watchEffect } from 'vue'
 
 import { uploadFile, useUploadQueue } from '@/composables/useResumableUpload'
 
@@ -94,6 +95,29 @@ describe('useUploadQueue', () => {
     await vi.waitFor(() => expect(items[0].status).toBe('done'))
     expect(items[0].uploadUid).toBe('uq')
     expect(items[0].progress).toBe(100)
+  })
+
+  it('progress mutations are REACTIVE (re-trigger effects, not just update the raw value)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const method = init.method ?? 'GET'
+        if (url === '/api/uploads' && method === 'POST')
+          return jsonRes({ upload_uid: 'rx', chunk_size: 100, bytes_received: 0 })
+        if (url === '/api/uploads/rx' && method === 'PATCH') return jsonRes({ bytes_received: 5 })
+        throw new Error(`unexpected ${method} ${url}`)
+      }),
+    )
+    const { items, add } = useUploadQueue()
+    add([fileOf(5, 'r.png', 'image/png')])
+    const seen: number[] = []
+    const stop = watchEffect(() => seen.push(items[0]?.progress ?? -1)) // tracks the proxy
+    await vi.waitFor(() => expect(items[0].status).toBe('done'))
+    await nextTick()
+    stop()
+    // The effect must have re-run when progress hit 100 — if pump() mutated the raw object instead
+    // of the reactive proxy, the effect would never re-fire and the UI would sit at 0%.
+    expect(seen).toContain(100)
   })
 
   it('remove() drops a tile from the queue', () => {

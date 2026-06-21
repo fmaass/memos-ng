@@ -127,23 +127,29 @@ export function useUploadQueue(concurrency = 2) {
   const files = new Map<number, File>()
 
   function add(toAdd: File[]): UploadItem[] {
-    const created = toAdd.map((file) => {
+    const created: UploadItem[] = []
+    for (const file of toAdd) {
       const isImage = file.type.startsWith('image/')
-      const item: UploadItem = {
+      const raw: UploadItem = {
         id: nextId++,
         name: file.name,
         progress: 0,
         status: 'queued',
-        preview: isImage && typeof URL.createObjectURL === 'function'
-          ? URL.createObjectURL(file)
-          : undefined,
+        preview:
+          isImage && typeof URL.createObjectURL === 'function'
+            ? URL.createObjectURL(file)
+            : undefined,
         isVideo: file.type.startsWith('video/'),
       }
-      files.set(item.id, file)
-      items.push(item)
+      files.set(raw.id, file)
+      items.push(raw)
+      // CRITICAL: queue + return the REACTIVE element (items[i]), not the raw object. pump()/
+      // onProgress mutate this — mutating the raw bypasses Vue's proxy so progress/status updates
+      // never re-render (the upload finishes but the UI sits at 0% until another change repaints).
+      const item = items[items.length - 1]
       pending.push(item)
-      return item
-    })
+      created.push(item)
+    }
     pump()
     return created
   }

@@ -81,7 +81,7 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
       class="w-full h-full flex flex-col items-center justify-center gap-1 text-sm"
       data-test="tile-failed"
     >
-      <i class="pi pi-exclamation-triangle text-red-500" />
+      <i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true" />
       <button class="text-primary underline" data-test="tile-retry" @click="emit('retry', att.uid)">
         Retry
       </button>
