@@ -41,6 +41,11 @@ src = ["app", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
+[tool.ruff.lint.per-file-ignores]
+# Async service tests legitimately make blocking filesystem assertions (the event loop is the
+# test's own); ASYNC230/240 target production hot paths, not test code.
+"tests/**" = ["ASYNC230", "ASYNC240"]
+
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI dependency-injection markers are call-in-default by design.
 extend-immutable-calls = [

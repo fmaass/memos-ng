@@ -22,9 +22,12 @@ LABEL_MAXLEN = 48  # bounds the slug so variant_key (String(96)) always fits
 # Suffix grammar, anchored at the END of the extension-stripped stem (so ` - print` must sit
 # immediately before the extension — `Trip - print shop.png` is a screen, not a print). `\Z` (not
 # `$`) so a stem ending in a stray newline isn't matched as a print (`$` matches before a final \n).
-_PRINT_LABELED = re.compile(r"^(?P<base>.+) - print \((?P<label>[^()]+)\)\Z")
-_PRINT_BARE = re.compile(r"^(?P<base>.+) - print\Z")
-_SCREEN_EXPLICIT = re.compile(r"^(?P<base>.+) - screen\Z")
+# IGNORECASE on the `print`/`screen` keyword so a title-case ` - Print (Glossy)` from a Lightroom
+# preset is still hidden — a case slip must NOT silently expose a print as a visible photo. The
+# label is matched verbatim then slugged (so its case/spacing is normalized separately).
+_PRINT_LABELED = re.compile(r"^(?P<base>.+) - print \((?P<label>[^()]+)\)\Z", re.IGNORECASE)
+_PRINT_BARE = re.compile(r"^(?P<base>.+) - print\Z", re.IGNORECASE)
+_SCREEN_EXPLICIT = re.compile(r"^(?P<base>.+) - screen\Z", re.IGNORECASE)
 
 
 @dataclass(frozen=True)

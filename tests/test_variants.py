@@ -77,6 +77,43 @@ def test_base_dots_and_basename_are_handled():
     assert parse_variant("noext - print (x)").base == "noext"  # no extension at all
 
 
+def test_role_keyword_is_case_insensitive():
+    # a title-case / upper-case keyword (e.g. a Lightroom preset emitting ' - Print (Glossy)') must
+    # still be hidden — a case slip must never silently expose a print as a visible photo
+    for name in (
+        "_AR1 - Print (Glossy).png",
+        "_AR1 - PRINT (glossy).png",
+        "_AR1 - print (GLOSSY).png",
+    ):
+        p = parse_variant(name)
+        assert p.is_print and p.variant_key == "print:glossy", name
+    assert parse_variant("X - PRINT.png").is_print
+    assert parse_variant("X - Print.png").variant_key == "print"
+    assert not parse_variant("X - Screen.png").is_print  # explicit screen, any case → visible
+
+
+def test_extension_is_case_and_format_agnostic():
+    # only the final extension is stripped, regardless of case/format (TIFF/DNG/JPEG raws etc.)
+    for ext in (".png", ".PNG", ".tiff", ".TIFF", ".dng", ".jpeg"):
+        p = parse_variant(f"_AR1 - print (glossy){ext}")
+        assert p.is_print and p.base == "_AR1" and p.variant_key == "print:glossy", ext
+
+
+def test_strict_structure_missing_space_stays_a_visible_screen():
+    # the convention requires ' - print (label)' with the spaces; a near-miss is treated as a
+    # visible screen (the SAFE failure — never hide on an ambiguous name), not a print
+    for name in ("X - print(glossy).png", "X-print (glossy).png", "X -print (glossy).png"):
+        assert not parse_variant(name).is_print, name
+
+
+def test_base_may_contain_its_own_separator():
+    # the base is greedy, so a name whose base legitimately contains ' - ' still groups correctly
+    p = parse_variant("Mom - birthday - print (glossy).png")
+    assert p.is_print and p.base == "Mom - birthday" and p.variant_key == "print:glossy"
+    # and the screen of the same logical photo shares that base
+    assert parse_variant("Mom - birthday.png").base == p.base
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

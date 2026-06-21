@@ -8,10 +8,20 @@ from pathlib import Path
 import puremagic
 from anyio import to_thread
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, Upload
+from app.models import (
+    Attachment,
+    AttachmentRendition,
+    AttachmentStatus,
+    JobLane,
+    JobState,
+    MediaJob,
+    Upload,
+)
+from app.services.variants import ParsedName, parse_variant
 
 
 def _data_root() -> Path:
@@ -123,10 +133,16 @@ async def finalize_pending(
     return their uids. A missing/expired or incomplete upload is skipped (it expires via
     reap_expired) so an abandoned compose never creates an orphan attachment.
 
-    finalize() moves the part file to its final originals/ path BEFORE the (now shared) memo
-    transaction commits — a non-transactional side effect. Each moved path is appended to
-    `moved_out` so the caller can unlink them if the post later rolls back (else they leak)."""
-    out: list[str] = []
+    finalize()/finalize_rendition() move the part file to its final path BEFORE the (now shared)
+    memo transaction commits — a non-transactional side effect. Each genuinely-moved path is
+    appended to `moved_out` (inside those functions, new-file branch only) so the caller can
+    unlink it if the post rolls back. A dedup return moves nothing and appends nothing.
+
+    Screen/print grouping is IN-BATCH ONLY: screens (non-print files) become Attachments first, then
+    each print attaches to the same-base screen as a hidden rendition. A print with no screen
+    in this batch — or an in-batch (screen, variant_key) collision — is PROMOTED to a normal picture
+    (decision: a print is never silently dropped, never silently hidden without a screen)."""
+    pending: list[tuple[Upload, ParsedName]] = []
     for up_uid in upload_uids:
         upload = (
             await db.execute(select(Upload).where(Upload.upload_uid == up_uid))
@@ -136,14 +152,35 @@ async def finalize_pending(
         part = part_path(up_uid)
         if not part.exists() or part.stat().st_size != upload.declared_size:
             continue  # incomplete — leave it to expire, don't half-finalize
-        att = await finalize(db, upload, owner_id=owner_id)
+        pending.append((upload, parse_variant(upload.filename)))
+
+    out: list[str] = []
+    base_to_attachment: dict[str, Attachment] = {}
+    for upload, parsed in pending:  # PASS 1 — screens become Attachments (first-wins per base)
+        if parsed.is_print:
+            continue
+        att = await finalize(db, upload, owner_id, moved_out)
+        base_to_attachment.setdefault(parsed.base, att)
         out.append(att.uid)
-        if moved_out is not None and att.storage_path:
-            moved_out.append(att.storage_path)
+
+    seen: set[tuple[int, str]] = set()
+    for upload, parsed in pending:  # PASS 2 — prints attach to their batch screen, else promote
+        if not parsed.is_print:
+            continue
+        screen = base_to_attachment.get(parsed.base)
+        vk = parsed.variant_key
+        if screen is not None and vk is not None and (screen.id, vk) not in seen:
+            await finalize_rendition(db, upload, screen, parsed, moved_out)
+            seen.add((screen.id, vk))
+        else:  # no matching screen, or an in-batch variant_key collision → promote to a photo
+            att = await finalize(db, upload, owner_id, moved_out)
+            out.append(att.uid)
     return out
 
 
-async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachment:
+async def finalize(
+    db: AsyncSession, upload: Upload, owner_id: int, moved_out: list[str] | None = None
+) -> Attachment:
     part = part_path(upload.upload_uid)
     actual = part.stat().st_size
     if actual != upload.declared_size:
@@ -173,6 +210,8 @@ async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachmen
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
     await to_thread.run_sync(os.replace, part, dest)
+    if moved_out is not None:  # only a genuinely-moved file; the dedup return above appends nothing
+        moved_out.append(str(dest))
 
     is_video = mime.startswith("video/")
     attachment = Attachment(
@@ -200,6 +239,75 @@ async def finalize(db: AsyncSession, upload: Upload, owner_id: int) -> Attachmen
     await db.delete(upload)
     await db.flush()
     return attachment
+
+
+async def finalize_rendition(
+    db: AsyncSession,
+    upload: Upload,
+    attachment: Attachment,
+    parsed: ParsedName,
+    moved_out: list[str] | None = None,
+) -> AttachmentRendition | None:
+    """Attach a hidden, download-only rendition (print master) to its screen `attachment`. Writes a
+    UNIQUE uuid-named file (never a shared/deterministic path → safe to delete, never overwrites a
+    committed file) and NEVER enqueues a MediaJob — a rendition is an archive master, not a tier,
+    so it must not touch the thermally-bound worker. Write-once per (attachment, variant_key): a
+    re-dump of an existing key is an idempotent no-op. Any mime is accepted (PNG/TIFF/RAW/…)."""
+    assert parsed.variant_key is not None  # callers pass only prints (is_print ⇒ variant_key set)
+    part = part_path(upload.upload_uid)
+    actual = part.stat().st_size
+    if actual != upload.declared_size:
+        raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
+
+    existing = (
+        await db.execute(
+            select(AttachmentRendition).where(
+                AttachmentRendition.attachment_id == attachment.id,
+                AttachmentRendition.variant_key == parsed.variant_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:  # write-once — a re-dump of the same key changes nothing
+        part.unlink(missing_ok=True)
+        await db.delete(upload)
+        await db.flush()
+        return None
+
+    mime = _sniff_mime(part, upload.mime)
+    digest = await to_thread.run_sync(_sha256_sync, part)
+    dest_dir = _data_root() / "print"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{uuid.uuid4().hex}{Path(upload.filename).suffix or '.bin'}"
+    rendition = AttachmentRendition(
+        attachment_id=attachment.id,
+        variant_key=parsed.variant_key,
+        label=parsed.label,
+        filename=upload.filename,
+        mime=mime,
+        size=actual,
+        sha256=digest,
+        storage_path=str(dest),
+    )
+    # Insert inside a savepoint BEFORE moving the file. The existence pre-check above is racy: a
+    # CONCURRENT same-key finalize could pass it twice, so the UNIQUE constraint makes the loser
+    # raise — the savepoint turns that into a graceful no-op. Moving the file only after the insert
+    # wins means the loser leaves no orphan file behind.
+    try:
+        async with db.begin_nested():
+            db.add(rendition)
+            await db.flush()
+    except IntegrityError:  # lost a concurrent race for this (attachment, variant_key) → no-op
+        part.unlink(missing_ok=True)
+        await db.delete(upload)
+        await db.flush()
+        return None
+
+    await to_thread.run_sync(os.replace, part, dest)
+    if moved_out is not None:
+        moved_out.append(str(dest))
+    await db.delete(upload)
+    await db.flush()
+    return rendition
 
 
 async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:

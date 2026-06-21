@@ -246,6 +246,8 @@ def _all_asset_paths(att: Attachment) -> list[Path]:
         paths.append(Path(att.storage_path))
     if att.print_path:
         paths.append(Path(att.print_path))
+    for rendition in att.renditions:  # hidden print masters (unique, unshared files)
+        paths.append(Path(rendition.storage_path))
     for tier in ("thumb", "mobile", "web", "poster"):
         resolved = _tier_path(att, tier)
         if resolved is not None:
