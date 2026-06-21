@@ -150,6 +150,37 @@ class Attachment(Base):
     print_mime: Mapped[str | None] = mapped_column(String(255))
     print_size: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Hidden, download-only extra files for this logical photo (e.g. print masters). NOT Attachment
+    # rows, so they never surface in any feed/library/compat query — see AttachmentRendition.
+    renditions: Mapped[list["AttachmentRendition"]] = relationship(
+        lazy="selectin", cascade="all, delete-orphan"
+    )
+
+
+class AttachmentRendition(Base):
+    """A hidden, download-only physical file for a logical photo — generalizes the single legacy
+    print_path into many named variants (e.g. print:glossy, print:matte). The SCREEN file stays the
+    Attachment (it owns its renditions); a rendition is deliberately NOT an Attachment row, so the
+    web feed/library/compat/SSE/export — which only ever traverse Attachment rows — cannot surface
+    it. Renditions carry no derived tiers and get no MediaJob (download-only archive masters)."""
+
+    __tablename__ = "attachment_renditions"
+    __table_args__ = (
+        UniqueConstraint("attachment_id", "variant_key", name="uq_attachment_rendition"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attachment_id: Mapped[int] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), index=True
+    )
+    variant_key: Mapped[str] = mapped_column(String(96))  # "print" or "print:<slug>"
+    label: Mapped[str | None] = mapped_column(String(48))  # slugified sub-name (glossy/matte)
+    filename: Mapped[str] = mapped_column(String(512))  # original dumped name (round-trip fidelity)
+    mime: Mapped[str] = mapped_column(String(255))
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    sha256: Mapped[str | None] = mapped_column(String(64))  # informational only (never file-shared)
+    storage_path: Mapped[str] = mapped_column(String(1024))  # a unique uuid-named file under print/
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Upload(Base):
