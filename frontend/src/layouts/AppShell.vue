@@ -53,7 +53,7 @@ async function logout(): Promise<void> {
   <div class="min-h-screen flex flex-col md:flex-row">
     <!-- Persistent sidebar on md+ -->
     <aside
-      class="hidden md:flex md:flex-col w-60 shrink-0 border-r border-surface-200 dark:border-surface-700 p-4 gap-1"
+      class="hidden md:flex md:flex-col w-60 shrink-0 border-r border-surface-200 dark:border-surface-700 p-4 gap-1 pt-[calc(1rem+env(safe-area-inset-top))] pl-[calc(1rem+env(safe-area-inset-left))]"
       data-test="sidebar"
     >
       <div class="text-xl font-semibold px-2 pb-4">memos-ng</div>
@@ -75,7 +75,12 @@ async function logout(): Promise<void> {
     </aside>
 
     <!-- Mobile drawer -->
-    <Drawer v-model:visible="mobileOpen" header="memos-ng" data-test="mobile-drawer">
+    <Drawer
+      v-model:visible="mobileOpen"
+      header="memos-ng"
+      data-test="mobile-drawer"
+      :pt="{ header: { class: 'pt-[calc(1.25rem+env(safe-area-inset-top))]' } }"
+    >
       <nav class="flex flex-col gap-1">
         <RouterLink
           v-for="item in NAV"
@@ -92,8 +97,11 @@ async function logout(): Promise<void> {
     </Drawer>
 
     <div class="flex-1 flex flex-col min-w-0">
+      <!-- iOS standalone draws under the status bar/Dynamic Island (viewport-fit=cover +
+           black-translucent), so pad the chrome with the safe-area insets — 0 in normal browsers,
+           non-zero only in that context, so it needs no display-mode gating. -->
       <header
-        class="flex items-center gap-2 px-4 h-14 border-b border-surface-200 dark:border-surface-700"
+        class="flex items-center gap-2 min-h-14 border-b border-surface-200 dark:border-surface-700 pt-[env(safe-area-inset-top)] pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))] sticky top-0 z-30 bg-surface-50/90 backdrop-blur-sm dark:bg-surface-950/90"
       >
         <Button
           class="md:hidden"
@@ -136,7 +144,7 @@ async function logout(): Promise<void> {
         />
       </header>
 
-      <main class="flex-1 min-w-0">
+      <main class="flex-1 min-w-0 pb-[env(safe-area-inset-bottom)]">
         <slot />
       </main>
     </div>

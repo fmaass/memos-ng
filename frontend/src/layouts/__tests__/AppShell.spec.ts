@@ -52,4 +52,11 @@ describe('AppShell', () => {
     expect(wrapper.find('[data-test="user-name"]').text()).toBe('Alice')
     expect(wrapper.find('[data-test="dark-toggle"]').exists()).toBe(true)
   })
+
+  it('pads the header with the iOS safe-area inset so the burger clears the status bar', async () => {
+    const wrapper = await mountShell()
+    // env(safe-area-inset-top) is 0 in normal browsers, non-zero only in iOS standalone — applied
+    // unconditionally. Without it the header draws under the notch (the reported bug).
+    expect(wrapper.find('header').classes()).toContain('pt-[env(safe-area-inset-top)]')
+  })
 })
