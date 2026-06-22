@@ -24,6 +24,7 @@ const emit = defineEmits<{
   'task-toggle': [payload: { uid: string; content: string }]
   'toggle-reaction': [payload: { uid: string; emoji: string; add: boolean }]
   'delete-attachment': [uid: string]
+  'delete-attachments': [uids: string[]] // bulk remove — deleted SEQUENTIALLY by the parent
   'delete-memo': [uid: string]
   'add-print': [payload: { uid: string; file: File }]
   edit: [
@@ -142,7 +143,9 @@ function onRemoveAllAttachments() {
     acceptProps: { label: 'Remove all', severity: 'danger' },
     accept: () => {
       lightboxIndex.value = null
-      for (const uid of uids) emit('delete-attachment', uid)
+      // ONE event with all uids — the parent deletes them sequentially. Emitting N single deletes
+      // would fan out N concurrent requests and exhaust the bounded shared Postgres pool (5/5).
+      emit('delete-attachments', uids)
     },
   })
 }

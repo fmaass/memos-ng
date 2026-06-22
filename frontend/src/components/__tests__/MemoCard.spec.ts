@@ -149,7 +149,7 @@ describe('MemoCard', () => {
     wrapper.unmount()
   })
 
-  it('Remove all deletes every photo on confirm (one delete-attachment per uid)', async () => {
+  it('Remove all emits ONE delete-attachments with every uid on confirm (parent deletes serially)', async () => {
     requireSpy.mockClear()
     const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1'), imageAtt('img2')]) })
     const editItem = await openAction(wrapper, 'memo-action-edit')
@@ -157,10 +157,12 @@ describe('MemoCard', () => {
     await nextTick()
     await wrapper.find('[data-test="edit-remove-all"]').trigger('click')
     expect(requireSpy).toHaveBeenCalledTimes(1)
-    expect(wrapper.emitted('delete-attachment')).toBeUndefined() // nothing until confirmed
+    expect(wrapper.emitted('delete-attachments')).toBeUndefined() // nothing until confirmed
     const opts = requireSpy.mock.calls[0][0] as { accept: () => void }
     opts.accept()
-    expect(wrapper.emitted('delete-attachment')).toEqual([['img1'], ['img2']])
+    // a SINGLE bulk event (not N single deletes — those would fan out N concurrent DB connections)
+    expect(wrapper.emitted('delete-attachments')).toEqual([[['img1', 'img2']]])
+    expect(wrapper.emitted('delete-attachment')).toBeUndefined()
     wrapper.unmount()
   })
 

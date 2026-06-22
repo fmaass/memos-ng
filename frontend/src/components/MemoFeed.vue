@@ -99,6 +99,20 @@ const deleteAttachment = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// "Remove all" — delete the memo's attachments ONE AT A TIME. A parallel fan-out (one request per
+// uid) would check out a pooled DB connection each and exhaust the bounded shared Postgres pool
+// (5/5 — CARDINAL), 500-ing deletes and starving concurrent uploads. Sequential = ≤1 connection at a
+// time. Refresh the feed once, at the end.
+const deleteAttachments = useMutation({
+  mutationFn: async (uids: string[]) => {
+    for (const uid of uids) {
+      const { error } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
+      if (error) throw error
+    }
+  },
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+})
+
 // Delete a whole memo (owner-only on the server) and refresh the feed.
 const deleteMemo = useMutation({
   mutationFn: async (uid: string) => {
@@ -149,6 +163,7 @@ onUnmounted(() => observer?.disconnect())
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"
         @delete-attachment="deleteAttachment.mutate($event)"
+        @delete-attachments="deleteAttachments.mutate($event)"
         @delete-memo="deleteMemo.mutate($event)"
         @add-print="addPrint.mutate($event)"
         @edit="editMemo.mutate($event)"
