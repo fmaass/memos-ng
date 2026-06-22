@@ -149,6 +149,11 @@ async def link_attachments(
     data_root = Path(settings.DATA_ROOT)
     dest_dir = storage.memo_dir(data_root, memo.created_at, memo.uid)
     for att in owned:
+        # Never STEAL an attachment already linked to a different memo — that would strand the
+        # original memo (the defence for the back-compat `attachment_uids` path; the dedup path is
+        # also guarded at the source in uploads.finalize). Re-linking to the same memo is a no-op.
+        if att.memo_id is not None and att.memo_id != memo.id:
+            continue
         att.memo_id = memo.id
         await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)
     await db.flush()

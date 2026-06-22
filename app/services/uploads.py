@@ -192,13 +192,25 @@ async def finalize(
     # sha256 dedup — identical bytes already stored BY THIS OWNER → return the existing
     # attachment. Scoped per-owner: a global dedup would hand one user a reference to another
     # user's attachment row (cross-user linkage), so dedup only within the finalizing owner.
+    # ONLY dedup against an UNLINKED attachment (memo_id IS NULL): an attachment already linked to a
+    # memo is that memo's — reusing it would let link_attachments re-point memo_id and STRAND the
+    # original memo (the same photo in a second memo must get its own row + file, like renditions).
+    # limit(1) since several memos may legitimately share identical bytes now.
     existing = (
-        await db.execute(
-            select(Attachment).where(
-                Attachment.sha256 == digest, Attachment.owner_id == owner_id
+        (
+            await db.execute(
+                select(Attachment)
+                .where(
+                    Attachment.sha256 == digest,
+                    Attachment.owner_id == owner_id,
+                    Attachment.memo_id.is_(None),
+                )
+                .limit(1)
             )
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
     if existing is not None:
         part.unlink(missing_ok=True)
         await db.delete(upload)

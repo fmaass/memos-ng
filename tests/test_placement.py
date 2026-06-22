@@ -2,6 +2,7 @@
 `originals/_unfiled/` and is atomically moved into the memo folder when the memo is saved; an
 existing (committed) master is NEVER moved, so no memo↔file association can break."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import settings
@@ -204,6 +205,111 @@ async def test_worker_sees_the_final_memo_folder_path(adb, monkeypatch, tmp_path
     assert Path(att.storage_path).parent == storage.memo_dir(
         Path(settings.DATA_ROOT), memo.created_at, memo.uid
     )
+
+
+async def test_same_photo_in_two_memos_does_not_strand_the_first(adb, monkeypatch, tmp_path):
+    """Association-safety regression (Codex HIGH): re-uploading identical bytes into a second memo
+    must NOT dedup-and-steal the first memo's attachment. Dedup only reuses UNLINKED attachments, so
+    the second memo gets its own row + file and BOTH memos keep their photo."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "pl_steal")
+    same = PNG + b"identical-photo-bytes" * 400
+
+    upA = await _upload(adb, "P.png", same)
+    finA = await up_svc.finalize_pending(adb, [upA.upload_uid], o.id)
+    memoA = await memo_svc.create_memo(
+        adb, o, content="A", visibility=Visibility.PUBLIC, attachment_uids=finA
+    )
+    attA = await _att(adb, finA[0])
+
+    upB = await _upload(adb, "P.png", same)  # byte-identical, second memo
+    finB = await up_svc.finalize_pending(adb, [upB.upload_uid], o.id)
+    assert finB[0] != finA[0]  # NOT deduped to A's (linked) attachment → a fresh row
+    memoB = await memo_svc.create_memo(
+        adb, o, content="B", visibility=Visibility.PUBLIC, attachment_uids=finB
+    )
+
+    await adb.refresh(attA)
+    assert attA.memo_id == memoA.id  # A's attachment was NOT stolen
+    a_atts = (
+        (await adb.execute(select(Attachment).where(Attachment.memo_id == memoA.id)))
+        .scalars()
+        .all()
+    )
+    b_atts = (
+        (await adb.execute(select(Attachment).where(Attachment.memo_id == memoB.id)))
+        .scalars()
+        .all()
+    )
+    assert len(a_atts) == 1 and len(b_atts) == 1  # both memos keep a photo
+    assert a_atts[0].storage_path != b_atts[0].storage_path  # distinct files (no sharing)
+    assert Path(a_atts[0].storage_path).exists() and Path(b_atts[0].storage_path).exists()
+
+
+async def test_in_post_duplicate_still_dedups(adb, monkeypatch, tmp_path):
+    """The dedup guard must NOT break in-post dedup: two identical files in ONE memo collapse to one
+    attachment (both are still UNLINKED when the second finalizes)."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "pl_indedup")
+    same = PNG + b"dup" * 700
+    u1 = await _upload(adb, "a.png", same)
+    u2 = await _upload(adb, "b.png", same)
+    fin = await up_svc.finalize_pending(adb, [u1.upload_uid, u2.upload_uid], o.id)
+    assert len(set(fin)) == 1  # collapsed to a single attachment within the post
+
+
+async def test_relink_via_attachment_uids_does_not_steal(adb, monkeypatch, tmp_path):
+    """Defence for the back-compat attachment_uids path: passing an already-linked attachment's uid
+    to a new memo must NOT move it (link_attachments skips a foreign-memo attachment)."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "pl_relink")
+    up = await _upload(adb, "x.png", PNG + b"x" * 2000)
+    fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
+    memoA = await memo_svc.create_memo(
+        adb, o, content="A", visibility=Visibility.PUBLIC, attachment_uids=fin
+    )
+    att = await _att(adb, fin[0])
+    placed = att.storage_path
+    await memo_svc.create_memo(
+        adb, o, content="B", visibility=Visibility.PUBLIC, attachment_uids=[att.uid]
+    )
+    await adb.refresh(att)
+    assert att.memo_id == memoA.id  # not stolen
+    assert att.storage_path == placed  # not moved
+
+
+async def test_custom_created_at_drives_the_folder(adb, monkeypatch, tmp_path):
+    """A caller-supplied display date names the folder (the refresh must not clobber it)."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "pl_date")
+    custom = datetime(2021, 3, 7, 9, 5, tzinfo=UTC)
+    up = await _upload(adb, "d.png", PNG + b"d" * 2000)
+    fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
+    memo = await memo_svc.create_memo(
+        adb, o, content="x", visibility=Visibility.PUBLIC, attachment_uids=fin, created_at=custom
+    )
+    assert memo.created_at == custom  # refresh reloaded the persisted custom value, not now()
+    att = await _att(adb, fin[0])
+    assert Path(att.storage_path).parent == storage.memo_dir(
+        Path(settings.DATA_ROOT), custom, memo.uid
+    )
+    assert "2021/03/2021-03-07_0905_" in att.storage_path
+
+
+async def test_patch_memo_adds_photo_and_places_it(adb, monkeypatch, tmp_path):
+    """Adding a photo to an existing memo via the edit path places it in that memo's folder."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "pl_patch")
+    memo = await memo_svc.create_memo(adb, o, content="m", visibility=Visibility.PUBLIC)
+    up = await _upload(adb, "added.png", PNG + b"p" * 2000)
+    moved: list[str] = []
+    fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id, moved_out=moved)
+    await memo_svc.link_attachments(adb, o.id, memo, fin, moved_out=moved)
+    att = await _att(adb, fin[0])
+    folder = storage.memo_dir(Path(settings.DATA_ROOT), memo.created_at, memo.uid)
+    assert Path(att.storage_path).parent == folder
+    assert Path(att.storage_path).name == "added.png" and Path(att.storage_path).exists()
+    assert att.storage_path in moved
 
 
 def test_api_upload_post_places_masters_and_serves_them(logged_in_client, monkeypatch, tmp_path):

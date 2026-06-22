@@ -52,6 +52,15 @@ def test_sanitize_name_caps_length():
     assert len(out) <= storage.MAX_NAME_LEN
 
 
+def test_sanitize_name_caps_by_bytes_not_codepoints():
+    # a multibyte name must be capped by ENCODED bytes (filesystem component limit is byte-based),
+    # never splitting a char, and the extension is preserved
+    out = storage.sanitize_name("é" * 300 + ".jpg")  # 'é' = 2 bytes → 600+ bytes raw
+    assert len(out.encode()) <= storage.MAX_NAME_LEN
+    assert out.endswith(".jpg")
+    out.encode()  # round-trips → no broken trailing multibyte sequence
+
+
 def test_place_master_moves_under_real_name(tmp_path):
     src = tmp_path / "uuid_src.part"
     src.write_bytes(b"payload")

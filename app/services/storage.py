@@ -17,14 +17,31 @@ from anyio import to_thread
 MAX_NAME_LEN = 200
 
 
+def _truncate_bytes(name: str, limit: int) -> str:
+    """Cap `name` to `limit` ENCODED bytes (filesystem component limits are byte-based, ~255),
+    never splitting a multibyte char. Keeps the extension when possible so the name stays usable."""
+    if len(name.encode()) <= limit:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    ext_b = (dot + ext).encode()
+    keep = limit - len(ext_b) if dot and len(ext_b) < limit else limit
+    body = (stem if dot else name).encode()[:keep]
+    # back off a partial trailing multibyte sequence
+    while body and (body[-1] & 0xC0) == 0x80:
+        body = body[:-1]
+    out = body.decode(errors="ignore") + (dot + ext if dot and keep != limit else "")
+    return out or name.encode()[:limit].decode(errors="ignore")
+
+
 def sanitize_name(filename: str) -> str:
     """Reduce a client-supplied filename to a safe in-folder name: directory components dropped,
     path separators + non-printable/control chars removed, leading/trailing dots and spaces trimmed
-    (no hidden/Windows-trailing-dot files), length-capped. Empty result falls back to 'file'."""
+    (no hidden/Windows trailing-dot files), byte-capped. Empty result falls back to 'file'."""
     name = Path(filename).name  # drop posix dir components
     cleaned = "".join(c for c in name if c.isprintable() and c not in ("/", "\\"))
     cleaned = cleaned.strip().strip(".").strip()
-    return cleaned[:MAX_NAME_LEN] or "file"
+    # cap by encoded bytes (not code points) with headroom for a ` (NN)` collision suffix
+    return _truncate_bytes(cleaned, MAX_NAME_LEN) if cleaned else "file"
 
 
 def memo_folder_name(created_at: datetime, uid: str) -> str:
@@ -74,7 +91,13 @@ def _reserve(dest_dir: Path, name: str) -> Path:
 def _place_master_sync(src: Path, dest_dir: Path, name: str) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     reserved = _reserve(dest_dir, sanitize_name(name))
-    os.replace(src, reserved)  # atomic move onto the reserved (empty) name
+    try:
+        os.replace(src, reserved)  # atomic move onto the reserved (empty) name
+    except OSError:
+        # don't leak the empty reservation — a stale 0-byte file would make the next placement of
+        # the same name mis-number to ` (2)` and clutter the folder
+        reserved.unlink(missing_ok=True)
+        raise
     return reserved
 
 
