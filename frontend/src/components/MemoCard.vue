@@ -109,6 +109,9 @@ function addReaction(emoji: string) {
 // of its output is safe — raw HTML/script in memo content is escaped to inert text.
 const html = computed(() => renderMemoMarkdown(props.memo.content))
 
+// A subtle badge on memos that carry print masters (any attachment with a hidden print/rendition).
+const hasPrints = computed(() => (props.memo.attachments ?? []).some((a) => a.hasPrint))
+
 // Lightbox over ALL of the memo's media (images + videos) — arrow left/right through them.
 const lightboxIndex = ref<number | null>(null)
 function openLightbox(uid: string) {
@@ -339,13 +342,21 @@ function onContentClick(event: MouseEvent) {
       @add-print="emit('add-print', $event)"
     />
 
-    <div v-if="memo.tags.length" class="flex flex-wrap gap-1">
+    <div v-if="memo.tags.length || hasPrints" class="flex flex-wrap items-center gap-1">
       <span
         v-for="t in memo.tags"
         :key="t"
         class="text-xs px-2 py-0.5 rounded-full bg-primary-50 dark:bg-primary-400/10 text-primary"
         data-test="tag-chip"
         >#{{ t }}</span
+      >
+      <span
+        v-if="hasPrints"
+        class="text-xs px-2 py-0.5 rounded-full bg-surface-200 dark:bg-surface-700 text-muted-color"
+        data-test="print-badge"
+        title="This memo has print versions"
+        aria-label="Has print versions"
+        >🖨</span
       >
     </div>
 

@@ -72,6 +72,21 @@ describe('MemoCard', () => {
     expect(wrapper.findAll('[data-test="tag-chip"]').map((c) => c.text())).toEqual(['#work', '#idea'])
   })
 
+  it('shows a tag only as a chip, not as a title in the body', () => {
+    const wrapper = mountCard({ memo: memo('#curated', ['curated']) })
+    expect(wrapper.find('[data-test="memo-content"]').text()).not.toContain('#curated')
+    expect(wrapper.findAll('[data-test="tag-chip"]').map((c) => c.text())).toEqual(['#curated'])
+  })
+
+  it('shows the 🖨 print badge iff a memo has print versions', () => {
+    const withPrint = mountCard({
+      memo: memo('trip', [], [{ ...imageAtt('p1'), hasPrint: true }]),
+    })
+    expect(withPrint.find('[data-test="print-badge"]').exists()).toBe(true)
+    const without = mountCard({ memo: memo('trip', [], [imageAtt('p2')]) })
+    expect(without.find('[data-test="print-badge"]').exists()).toBe(false)
+  })
+
   it('renders a <script> in memo content inert (no live script tag)', () => {
     const wrapper = mountCard({ memo: memo('evil <script>alert(1)</script>') })
     const content = wrapper.find('[data-test="memo-content"]')

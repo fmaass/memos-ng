@@ -21,8 +21,22 @@ const ALLOWED_TAGS = [
 // event-handler attribute, so this only enables task toggles, not an XSS surface.
 const ALLOWED_ATTR = ['href', 'title', 'class', 'type', 'checked', 'disabled']
 
+// A line that is ONLY hashtags (e.g. `#curated`, `#curated #trip`) — these already show as tag chips
+// below the memo, so rendering them in the body too is redundant ("#curated" reads as a title).
+// `#word` requires no space after `#`, so a real markdown heading (`# Heading`, `## Sub`) is preserved,
+// and an inline tag in prose ("see #curated") is not a tag-only line and stays.
+const TAG_ONLY_LINE = /^[ \t]*#\w+(?:[ \t]+#\w+)*[ \t]*$/
+
+/** Drop whole lines that consist solely of hashtags — the tags still appear as chips below. */
+export function stripTagOnlyLines(source: string): string {
+  return (source ?? '')
+    .split('\n')
+    .filter((line) => !TAG_ONLY_LINE.test(line))
+    .join('\n')
+}
+
 export function renderMemoMarkdown(source: string): string {
-  const rendered = md.render(source ?? '')
+  const rendered = md.render(stripTagOnlyLines(source ?? ''))
   return DOMPurify.sanitize(rendered, {
     ALLOWED_TAGS,
     ALLOWED_ATTR,
