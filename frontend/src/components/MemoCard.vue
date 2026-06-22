@@ -5,11 +5,11 @@ import Menu from 'primevue/menu'
 import Popover from 'primevue/popover'
 import Select from 'primevue/select'
 import { useConfirm } from 'primevue/useconfirm'
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 
-import MediaLightbox from '@/components/MediaLightbox.vue'
 import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
+import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import { useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
 import { renderMemoMarkdown } from '@/lib/markdown'
@@ -112,12 +112,18 @@ const html = computed(() => renderMemoMarkdown(props.memo.content))
 // A subtle badge on memos that carry print masters (any attachment with a hidden print/rendition).
 const hasPrints = computed(() => (props.memo.attachments ?? []).some((a) => a.hasPrint))
 
-// Lightbox over ALL of the memo's media (images + videos) — arrow left/right through them.
-const lightboxIndex = ref<number | null>(null)
+// Full-screen viewer (PhotoSwipe) over ALL of the memo's media — swipe/zoom images, play videos.
+const lightbox = useMediaLightbox()
 function openLightbox(uid: string) {
-  const i = (props.memo.attachments ?? []).findIndex((a) => a.uid === uid)
-  if (i >= 0) lightboxIndex.value = i
+  const atts = props.memo.attachments ?? []
+  const i = atts.findIndex((a) => a.uid === uid)
+  if (i >= 0)
+    lightbox.open(atts, i, {
+      onDelete: onDeleteAttachment,
+      onAddPrint: (uid, file) => emit('add-print', { uid, file }),
+    })
 }
+onUnmounted(() => lightbox.destroy())
 const confirm = useConfirm()
 function onDeleteAttachment(uid: string) {
   confirm.require({
@@ -126,10 +132,7 @@ function onDeleteAttachment(uid: string) {
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Delete', severity: 'danger' },
-    accept: () => {
-      lightboxIndex.value = null
-      emit('delete-attachment', uid)
-    },
+    accept: () => emit('delete-attachment', uid),
   })
 }
 
@@ -145,7 +148,6 @@ function onRemoveAllAttachments() {
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Remove all', severity: 'danger' },
     accept: () => {
-      lightboxIndex.value = null
       // ONE event with all uids — the parent deletes them sequentially. Emitting N single deletes
       // would fan out N concurrent requests and exhaust the bounded shared Postgres pool (5/5).
       emit('delete-attachments', uids)
@@ -334,13 +336,6 @@ function onContentClick(event: MouseEvent) {
     >
       <MediaTile v-for="a in memo.attachments" :key="a.uid" :att="a" @open="openLightbox" />
     </div>
-
-    <MediaLightbox
-      v-model="lightboxIndex"
-      :items="memo.attachments ?? []"
-      @delete="onDeleteAttachment"
-      @add-print="emit('add-print', $event)"
-    />
 
     <div v-if="memo.tags.length || hasPrints" class="flex flex-wrap items-center gap-1">
       <span

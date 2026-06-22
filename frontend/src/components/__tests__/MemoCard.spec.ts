@@ -12,6 +12,13 @@ import MemoCard from '@/components/MemoCard.vue'
 const { requireSpy } = vi.hoisted(() => ({ requireSpy: vi.fn() }))
 vi.mock('primevue/useconfirm', () => ({ useConfirm: () => ({ require: requireSpy }) }))
 
+// The viewer is PhotoSwipe (imperative, needs a real DOM) — mock the composable so we can assert the
+// open() wiring without booting PhotoSwipe in jsdom.
+const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
+vi.mock('@/composables/useMediaLightbox', () => ({
+  useMediaLightbox: () => ({ open: lightboxOpen, destroy: vi.fn() }),
+}))
+
 // The owner actions (⋯) menu is a PrimeVue popup teleported to body — open it, then return the
 // freshest matching item (last appended, so stale nodes from prior mounts don't shadow it).
 async function openAction(wrapper: ReturnType<typeof mountCard>, testId: string) {
@@ -113,12 +120,14 @@ describe('MemoCard', () => {
     expect(wrapper.emitted('task-toggle')?.[0]).toEqual([{ uid: 'm1', content: '- [x] todo' }])
   })
 
-  it('opens the lightbox at the clicked image (MediaLightbox modelValue)', async () => {
-    const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
-    const lb = wrapper.findComponent({ name: 'MediaLightbox' })
-    expect(lb.props('modelValue')).toBe(null) // closed
+  it('opens the lightbox at the clicked image (composable open with the right index)', async () => {
+    lightboxOpen.mockClear()
+    const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1'), imageAtt('img2')]) })
     await wrapper.find('[data-test="tile-image"]').trigger('click')
-    expect(lb.props('modelValue')).toBe(0) // opened at the memo's first attachment
+    expect(lightboxOpen).toHaveBeenCalledTimes(1)
+    const [atts, index] = lightboxOpen.mock.calls[0]
+    expect(atts).toHaveLength(2)
+    expect(index).toBe(0) // the first attachment was clicked
   })
 
   it('edits content + visibility + date and emits edit on save', async () => {

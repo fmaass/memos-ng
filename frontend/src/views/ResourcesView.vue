@@ -3,11 +3,11 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import SelectButton from 'primevue/selectbutton'
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
-import MediaLightbox from '@/components/MediaLightbox.vue'
 import { useApi } from '@/composables/useApi'
+import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import type { MemoQuery } from '@/composables/useTimeline'
 
 const api = useApi()
@@ -33,7 +33,15 @@ const { data, isPending } = useQuery({
 })
 
 const items = computed(() => data.value ?? [])
-const lightboxIndex = ref<number | null>(null)
+
+const lightbox = useMediaLightbox()
+function openAt(index: number) {
+  lightbox.open(items.value, index, {
+    onDelete,
+    onAddPrint: (uid, file) => onAddPrint({ uid, file }),
+  })
+}
+onUnmounted(() => lightbox.destroy())
 
 function onDelete(uid: string) {
   confirm.require({
@@ -48,7 +56,6 @@ function onDelete(uid: string) {
         toast.add({ severity: 'error', summary: 'Delete failed', life: 4000 })
         return
       }
-      lightboxIndex.value = null
       await queryClient.invalidateQueries({ queryKey: ['attachments'] })
     },
   })
@@ -87,12 +94,6 @@ async function onAddPrint({ uid, file }: { uid: string; file: File }) {
     <p v-else-if="!items.length" class="text-sm text-muted-color" data-test="resources-empty">
       No attachments yet.
     </p>
-    <JustifiedGallery v-else :items="items" :target-height="200" @open="lightboxIndex = $event" />
-    <MediaLightbox
-      v-model="lightboxIndex"
-      :items="items"
-      @delete="onDelete"
-      @add-print="onAddPrint"
-    />
+    <JustifiedGallery v-else :items="items" :target-height="200" @open="openAt" />
   </section>
 </template>

@@ -8,6 +8,10 @@ import { describe, expect, it, vi } from 'vitest'
 import ResourcesView from '@/views/ResourcesView.vue'
 
 vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn(), DELETE: vi.fn() }) }))
+// The viewer is PhotoSwipe (needs a real DOM) — mock the composable so jsdom doesn't boot it.
+vi.mock('@/composables/useMediaLightbox', () => ({
+  useMediaLightbox: () => ({ open: vi.fn(), destroy: vi.fn() }),
+}))
 vi.mock('@tanstack/vue-query', () => ({
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
   useQuery: () => ({
