@@ -38,7 +38,7 @@ describe('MediaLightbox', () => {
     w.unmount()
   })
 
-  it('a renditions-only photo shows rendition links but NO (broken) legacy print button', () => {
+  it('renders NO print-download chrome — prints are API-only, never offered in the GUI', () => {
     const item = {
       uid: 'p1', mime: 'image/jpeg', mine: true, previewUrl: '/p1/m', webUrl: '/p1/w',
       posterUrl: '/p1/p', downloadUrl: '/p1/o', hasPrint: true, hasLegacyPrint: false,
@@ -47,27 +47,21 @@ describe('MediaLightbox', () => {
       ],
     }
     const w = mount(MediaLightbox, { props: { items: [item], modelValue: 0 }, attachTo: document.body })
-    // the legacy /print button must NOT render (it would 404 — there is no print_path)
     expect(document.body.querySelector('[data-test="lightbox-print-download"]')).toBeFalsy()
-    const link = document.body.querySelector(
-      '[data-test="lightbox-rendition-print:glossy"]',
-    ) as HTMLAnchorElement
-    expect(link?.getAttribute('href')).toBe('/api/attachments/p1/rendition/print:glossy')
-    // an owner can still attach a legacy print (the add-print button is now an independent v-if)
+    expect(document.body.querySelector('[data-test="lightbox-renditions"]')).toBeFalsy()
+    expect(document.body.querySelector('[data-test="lightbox-rendition-print:glossy"]')).toBeFalsy()
+    // an owner can still ATTACH a print (upload — distinct from downloading)
     expect(document.body.querySelector('[data-test="lightbox-add-print"]')).toBeTruthy()
     w.unmount()
   })
 
-  it('shows the legacy print download when hasLegacyPrint is set', () => {
+  it('renders no legacy print download even when hasLegacyPrint is set', () => {
     const item = {
       uid: 'l1', mime: 'image/jpeg', previewUrl: '/l1/m', webUrl: '/l1/w', posterUrl: '/l1/p',
       downloadUrl: '/l1/o', hasPrint: true, hasLegacyPrint: true, printUrl: '/api/attachments/l1/print',
     }
     const w = mount(MediaLightbox, { props: { items: [item], modelValue: 0 }, attachTo: document.body })
-    const a = document.body.querySelector(
-      '[data-test="lightbox-print-download"]',
-    ) as HTMLAnchorElement
-    expect(a?.getAttribute('href')).toBe('/api/attachments/l1/print')
+    expect(document.body.querySelector('[data-test="lightbox-print-download"]')).toBeFalsy()
     w.unmount()
   })
 })
