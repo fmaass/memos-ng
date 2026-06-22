@@ -110,8 +110,12 @@ async def place_master(src: Path, dest_dir: Path, name: str) -> Path:
 def _place_bytes_sync(data: bytes, dest_dir: Path, name: str) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     reserved = _reserve(dest_dir, sanitize_name(name))  # O_EXCL → never overwrites another file
-    with open(reserved, "wb") as f:
-        f.write(data)
+    try:
+        with open(reserved, "wb") as f:
+            f.write(data)
+    except OSError:  # don't leave a partial/empty reservation behind on a write failure
+        reserved.unlink(missing_ok=True)
+        raise
     return reserved
 
 

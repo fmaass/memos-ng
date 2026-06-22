@@ -384,15 +384,19 @@ async def upload_print(
     if memo is not None:
         dest = storage.memo_dir(data_root, memo.created_at, memo.uid)
         path = str(await storage.place_bytes(data, dest, file.filename or f"{uid}-print{suffix}"))
-    else:
+    else:  # legacy: deterministic print/{uid}{suffix} — may overwrite this attachment's prior print
         path = await to_thread.run_sync(_save_print_sync, data_root / "print", uid, data, suffix)
+    att.print_path = path
+    att.print_mime = file.content_type or "application/octet-stream"
+    att.print_size = len(data)
     try:
-        att.print_path = path
-        att.print_mime = file.content_type or "application/octet-stream"
-        att.print_size = len(data)
         await db.commit()
-    except Exception:  # don't leak the just-written print file if the commit fails
-        await to_thread.run_sync(lambda: Path(path).unlink(missing_ok=True))
+    except Exception:
+        # Only the memo-folder file is a brand-new UNIQUE (O_EXCL) name this request created, so
+        # it's safe to unlink on rollback. The legacy print/{uid}{suffix} path is deterministic and
+        # may be a file another (committed) request owns — never unlink it (would break it).
+        if memo is not None:
+            await to_thread.run_sync(lambda: Path(path).unlink(missing_ok=True))
         raise
     return await attachment_meta(uid, user, db)
 

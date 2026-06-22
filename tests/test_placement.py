@@ -437,3 +437,33 @@ def test_upload_print_to_unlinked_attachment_keeps_print_dir(
         assert Path(pp).exists()
     finally:
         _cleanup()
+
+
+def test_reupload_print_to_unlinked_attachment_keeps_legacy_file(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The legacy print/{uid} path is deterministic and may be shared/committed — a re-upload must
+    leave a valid file at print_path (commit-failure cleanup must never touch the legacy path)."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"u" * 3000
+        su = _start(client, "loose.png", "image/png", len(screen))
+        client.patch(f"/api/uploads/{su}", content=screen, headers={"Upload-Offset": "0"})
+        att = client.post(f"/api/uploads/{su}/finalize").json()
+
+        first = PNG + b"first-print" * 100
+        second = PNG + b"second-print" * 100
+        client.post(
+            f"/api/attachments/{att['uid']}/print",
+            files={"file": ("a.tif", first, "image/tiff")},
+        )
+        r2 = client.post(
+            f"/api/attachments/{att['uid']}/print",
+            files={"file": ("a.tif", second, "image/tiff")},
+        )
+        assert r2.status_code == 200
+        got = client.get(f"/api/attachments/{att['uid']}/print")
+        assert got.status_code == 200 and got.content == second  # latest content, file intact
+    finally:
+        _cleanup()
