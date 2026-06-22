@@ -365,3 +365,75 @@ def test_api_upload_post_places_masters_and_serves_them(logged_in_client, monkey
         assert pr.status_code == 200 and pr.content == printb
     finally:
         _cleanup()
+
+
+def test_upload_print_to_linked_attachment_lands_in_memo_folder(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """P2: a /print upload to an attachment already in a memo lands in that memo's folder under its
+    real filename (beside the screen) and serves via the print tier."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"S" * 3000
+        su = _start(client, "beach.png", "image/png", len(screen))
+        client.patch(f"/api/uploads/{su}", content=screen, headers={"Upload-Offset": "0"})
+        memo = client.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [su]}
+        ).json()
+        att_uid = memo["attachments"][0]["uid"]
+
+        printb = PNG + b"P" * 4000
+        r = client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("beach - print (matte).tif", printb, "image/tiff")},
+        )
+        assert r.status_code == 200, r.text
+
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            pp = c.execute(
+                text("SELECT print_path FROM attachments WHERE uid=:u"), {"u": att_uid}
+            ).scalar_one()
+            ca, mu = c.execute(text("SELECT created_at, uid FROM memos")).first()
+        eng.dispose()
+
+        folder = storage.memo_dir(Path(str(tmp_path)), ca, mu)
+        assert Path(pp).parent == folder
+        assert Path(pp).name == "beach - print (matte).tif"
+        assert Path(pp).exists() and Path(pp).read_bytes() == printb
+        got = client.get(f"/api/attachments/{att_uid}/print")  # serves from the memo folder
+        assert got.status_code == 200 and got.content == printb
+    finally:
+        _cleanup()
+
+
+def test_upload_print_to_unlinked_attachment_keeps_print_dir(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """P2: a /print upload to an attachment NOT linked to a memo keeps the legacy print/ path."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"u" * 3000
+        su = _start(client, "loose.png", "image/png", len(screen))
+        client.patch(f"/api/uploads/{su}", content=screen, headers={"Upload-Offset": "0"})
+        att = client.post(f"/api/uploads/{su}/finalize").json()  # attachment, NOT in a memo
+
+        printb = PNG + b"q" * 2000
+        r = client.post(
+            f"/api/attachments/{att['uid']}/print",
+            files={"file": ("loose - print.tif", printb, "image/tiff")},
+        )
+        assert r.status_code == 200
+
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            pp = c.execute(
+                text("SELECT print_path FROM attachments WHERE uid=:u"), {"u": att["uid"]}
+            ).scalar_one()
+        eng.dispose()
+        assert Path(pp).parent == Path(str(tmp_path)) / "print"  # legacy location, unchanged
+        assert Path(pp).exists()
+    finally:
+        _cleanup()

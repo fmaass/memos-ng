@@ -18,7 +18,7 @@ from app import auth
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import Attachment, AttachmentStatus, MediaJob, Memo, User
-from app.services import asset_urls
+from app.services import asset_urls, storage
 from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
@@ -372,14 +372,28 @@ async def upload_print(
     data = await file.read()
     if len(data) > settings.MAX_UPLOAD_MIB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Exceeds {settings.MAX_UPLOAD_MIB} MiB")
+    data_root = Path(settings.DATA_ROOT)
     suffix = Path(file.filename or "").suffix or ".bin"
-    path = await to_thread.run_sync(
-        _save_print_sync, Path(settings.DATA_ROOT) / "print", uid, data, suffix
+    # A print uploaded to an attachment already in a memo lands in that memo's folder under its real
+    # filename (sits beside the screen); an unlinked attachment keeps the legacy print/{uid} path.
+    memo = (
+        (await db.execute(select(Memo).where(Memo.id == att.memo_id))).scalar_one_or_none()
+        if att.memo_id is not None
+        else None
     )
-    att.print_path = path
-    att.print_mime = file.content_type or "application/octet-stream"
-    att.print_size = len(data)
-    await db.commit()
+    if memo is not None:
+        dest = storage.memo_dir(data_root, memo.created_at, memo.uid)
+        path = str(await storage.place_bytes(data, dest, file.filename or f"{uid}-print{suffix}"))
+    else:
+        path = await to_thread.run_sync(_save_print_sync, data_root / "print", uid, data, suffix)
+    try:
+        att.print_path = path
+        att.print_mime = file.content_type or "application/octet-stream"
+        att.print_size = len(data)
+        await db.commit()
+    except Exception:  # don't leak the just-written print file if the commit fails
+        await to_thread.run_sync(lambda: Path(path).unlink(missing_ok=True))
+        raise
     return await attachment_meta(uid, user, db)
 
 
