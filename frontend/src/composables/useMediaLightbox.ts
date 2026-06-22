@@ -103,9 +103,7 @@ export function useMediaLightbox() {
           onInit: (el) => {
             el.setAttribute('aria-label', 'Delete')
             const sync = () => {
-              el.style.display = (buildSlides([items[pswp.currIndex]])[0]?.mine ?? false)
-                ? 'block'
-                : 'none'
+              el.style.display = (items[pswp.currIndex]?.mine ?? false) ? 'block' : 'none'
             }
             pswp.on('change', sync)
             sync()
