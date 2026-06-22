@@ -206,6 +206,10 @@ async def finalize(
                     Attachment.memo_id.is_(None),
                 )
                 .limit(1)
+                # FOR UPDATE so two concurrent posts can't both reuse the same unlinked row: the
+                # loser blocks, then Postgres re-evaluates `memo_id IS NULL` against the now-linked
+                # row, excludes it, and the loser creates its own attachment instead of stealing.
+                .with_for_update()
             )
         )
         .scalars()

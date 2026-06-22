@@ -138,9 +138,13 @@ async def link_attachments(
     owned = (
         (
             await db.execute(
-                select(Attachment).where(
-                    Attachment.uid.in_(uids), Attachment.owner_id == owner_id
-                )
+                # FOR UPDATE (ordered by id for a stable lock order) so the memo_id steal-guard
+                # below re-checks under a row lock: a concurrent post racing for the same unlinked
+                # attachment blocks, then sees it already linked and skips it.
+                select(Attachment)
+                .where(Attachment.uid.in_(uids), Attachment.owner_id == owner_id)
+                .order_by(Attachment.id)
+                .with_for_update()
             )
         )
         .scalars()
