@@ -1,6 +1,7 @@
 import PhotoSwipeLightbox from 'photoswipe/lightbox'
 import PhotoSwipe from 'photoswipe'
 import 'photoswipe/style.css'
+import './mediaLightbox.css'
 
 import { buildSlides, type LightboxItem, type Slide } from '@/lib/lightboxSlides'
 
@@ -48,26 +49,32 @@ export function useMediaLightbox() {
       }),
     })
 
-    // --- videos: render a <video> for slides marked type:'video' (images use PhotoSwipe's default) ---
+    // --- videos: a clean native <video controls> (Safari/iOS render their own liquid-glass controls) ---
     lightbox.on('contentLoad', (e) => {
       const data = e.content.data as unknown as Slide
       if (data.type !== 'video') return
       e.preventDefault()
       const wrap = document.createElement('div')
-      wrap.className = 'pswp__video-wrap flex h-full w-full items-center justify-center'
+      wrap.className = 'pswp-video-wrap' // full-slide flex-center (mediaLightbox.css)
       const video = document.createElement('video')
       video.src = data.src
       if (data.poster) video.poster = data.poster
       video.controls = true
       video.playsInline = true
       video.preload = 'metadata'
-      video.className = 'max-h-full max-w-full'
+      video.className = 'pswp-video'
       wrap.appendChild(video)
       e.content.element = wrap
     })
-    // custom content isn't pinch-zoomable; let the swipe still work around the video
-    lightbox.addFilter('isContentZoomable', (zoomable, content) => {
-      return (content.data as unknown as Slide).type === 'video' ? false : zoomable
+    // a video isn't pinch-zoomable (swipe still navigates around it) and autoplays on its slide
+    lightbox.addFilter('isContentZoomable', (zoomable, content) =>
+      (content.data as unknown as Slide).type === 'video' ? false : zoomable,
+    )
+    lightbox.on('contentActivate', ({ content }) => {
+      content.element?.querySelector('video')?.play().catch(() => {})
+    })
+    lightbox.on('contentDeactivate', ({ content }) => {
+      content.element?.querySelector('video')?.pause()
     })
 
     // --- owner buttons (delete, add-print) + download; visibility tracks the current slide ---
@@ -77,8 +84,9 @@ export function useMediaLightbox() {
 
       pswp.ui?.registerElement({
         name: 'download',
-        order: 8,
+        order: 15, // between zoom (10) and close (20), in the top bar
         isButton: true,
+        appendTo: 'bar',
         tagName: 'a',
         html: '<i class="pi pi-download" aria-hidden="true"></i>',
         onInit: (el) => {
@@ -97,8 +105,9 @@ export function useMediaLightbox() {
       if (handlers.onDelete) {
         pswp.ui?.registerElement({
           name: 'delete',
-          order: 9,
+          order: 16,
           isButton: true,
+          appendTo: 'bar',
           html: '<i class="pi pi-trash" aria-hidden="true"></i>',
           onInit: (el) => {
             el.setAttribute('aria-label', 'Delete')
@@ -121,8 +130,9 @@ export function useMediaLightbox() {
       if (handlers.onAddPrint) {
         pswp.ui?.registerElement({
           name: 'add-print',
-          order: 10,
+          order: 17,
           isButton: true,
+          appendTo: 'bar',
           html: '<i class="pi pi-print" aria-hidden="true"></i>',
           onInit: (el) => {
             el.setAttribute('aria-label', 'Attach a print-quality master')

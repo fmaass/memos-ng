@@ -1,0 +1,23 @@
+/* Overrides for the PhotoSwipe-based media lightbox (useMediaLightbox.ts). */
+
+/* A video slide: native <video controls> filling the slide, letterboxed on black. The browser's own
+   controls (Safari/iOS "liquid glass") render on top — we don't draw our own. */
+.pswp-video-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+.pswp-video {
+  max-width: 100vw;
+  max-height: 100vh;
+  object-fit: contain;
+  background: #000;
+}
+
+/* Show the prev/next arrows on touch devices too (PhotoSwipe hides them there by default; the owner
+   asked for them). They sit at the screen edges and don't fight the swipe gesture. */
+.pswp__button--arrow {
+  visibility: visible !important;
+}
