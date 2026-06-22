@@ -221,6 +221,7 @@ async def create_memo(
             pinned=body.pinned,
             attachment_uids=[*body.attachment_uids, *finalized],
             created_at=body.created_at,
+            moved_out=moved,  # placement into the memo folder appends here → unlinked on rollback
         )
         await db.commit()
         committed = True
@@ -267,7 +268,7 @@ async def patch_memo(
             finalized = await uploads_svc.finalize_pending(
                 db, body.upload_uids, user.id, moved_out=moved
             )
-            await svc.link_attachments(db, user.id, memo, finalized)
+            await svc.link_attachments(db, user.id, memo, finalized, moved_out=moved)
         await db.commit()
         committed = True
     finally:

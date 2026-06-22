@@ -3,11 +3,23 @@ import re
 import secrets
 from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import String, and_, cast, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Attachment, Memo, Reaction, Tag, User, Visibility, memo_tags
+from app.config import settings
+from app.models import (
+    Attachment,
+    AttachmentRendition,
+    Memo,
+    Reaction,
+    Tag,
+    User,
+    Visibility,
+    memo_tags,
+)
+from app.services import storage
 
 TAG_RE = re.compile(r"#(\w+)")
 
@@ -60,6 +72,7 @@ async def create_memo(
     pinned: bool = False,
     attachment_uids: Sequence[str] | None = None,
     created_at: datetime | None = None,
+    moved_out: list[str] | None = None,
 ) -> Memo:
     memo = Memo(
         uid=gen_uid(), owner_id=owner.id, content=content, visibility=visibility, pinned=pinned
@@ -69,16 +82,57 @@ async def create_memo(
     memo.tags = await _get_or_create_tags(db, parse_tags(content))
     db.add(memo)
     await db.flush()
-    await link_attachments(db, owner.id, memo, attachment_uids or [])
+    # created_at is server_default=now() with no Python default → unloaded after flush; placement
+    # in link_attachments reads it to build the per-memo folder, so populate it first (an async lazy
+    # access on an expired column would raise). A caller-supplied created_at is already loaded; the
+    # refresh just reloads the identical persisted value.
+    await db.refresh(memo, ["created_at"])
+    await link_attachments(db, owner.id, memo, attachment_uids or [], moved_out=moved_out)
     await db.refresh(memo)
     return memo
 
 
+async def _place_attachment_masters(
+    db: AsyncSession, att: Attachment, dest_dir: Path, data_root: Path, moved_out: list[str] | None
+) -> None:
+    """Move this attachment's still-staged masters (the screen original + each hidden rendition)
+    into the memo folder under their real names. ONLY a master in _unfiled/ is moved — an existing
+    (committed) master is left in place (new-writes-only). Each moved path is tracked in `moved_out`
+    so a rolled-back post unlinks it."""
+    if att.storage_path and storage.is_unfiled(att.storage_path, data_root):
+        new = await storage.place_master(Path(att.storage_path), dest_dir, att.filename)
+        att.storage_path = str(new)
+        if moved_out is not None:
+            moved_out.append(str(new))
+    # Query renditions explicitly rather than via the lazy relationship — async lazy access on a
+    # just-added child is fragile, and they were inserted in this same transaction.
+    rends = (
+        (
+            await db.execute(
+                select(AttachmentRendition).where(AttachmentRendition.attachment_id == att.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for r in rends:
+        if storage.is_unfiled(r.storage_path, data_root):
+            new = await storage.place_master(Path(r.storage_path), dest_dir, r.filename)
+            r.storage_path = str(new)
+            if moved_out is not None:
+                moved_out.append(str(new))
+
+
 async def link_attachments(
-    db: AsyncSession, owner_id: int, memo: Memo, uids: Sequence[str]
+    db: AsyncSession,
+    owner_id: int,
+    memo: Memo,
+    uids: Sequence[str],
+    moved_out: list[str] | None = None,
 ) -> None:
     """Link the caller's OWN attachments to a memo. A uid belonging to another user is silently
-    ignored so a memo can never claim someone else's media. Used on create and on edit."""
+    ignored so a memo can never claim someone else's media. Used on create and on edit. As each
+    attachment is linked, its still-staged masters are placed into the memo's per-memo folder."""
     if not uids:
         return
     owned = (
@@ -92,8 +146,11 @@ async def link_attachments(
         .scalars()
         .all()
     )
+    data_root = Path(settings.DATA_ROOT)
+    dest_dir = storage.memo_dir(data_root, memo.created_at, memo.uid)
     for att in owned:
         att.memo_id = memo.id
+        await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)
     await db.flush()
 
 

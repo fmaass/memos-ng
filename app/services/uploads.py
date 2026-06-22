@@ -21,6 +21,7 @@ from app.models import (
     MediaJob,
     Upload,
 )
+from app.services import storage
 from app.services.variants import ParsedName, parse_variant
 
 
@@ -206,7 +207,9 @@ async def finalize(
 
     mime = _sniff_mime(part, upload.mime)
     now = datetime.now(UTC)
-    dest_dir = _data_root() / "originals" / f"{now:%Y}" / f"{now:%m}"
+    # Stage in originals/_unfiled/ — the memo (and so the per-memo folder) doesn't exist yet; the
+    # master is atomically moved into originals/YYYY/MM/<memo-folder>/ on link_attachments.
+    dest_dir = storage.unfiled_dir(_data_root())
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
     await to_thread.run_sync(os.replace, part, dest)
@@ -275,7 +278,8 @@ async def finalize_rendition(
 
     mime = _sniff_mime(part, upload.mime)
     digest = await to_thread.run_sync(_sha256_sync, part)
-    dest_dir = _data_root() / "print"
+    # Stage beside the screen master in _unfiled/; link_attachments moves it into the memo folder.
+    dest_dir = storage.unfiled_dir(_data_root())
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{uuid.uuid4().hex}{Path(upload.filename).suffix or '.bin'}"
     rendition = AttachmentRendition(

@@ -57,7 +57,9 @@ async def test_in_batch_screen_and_print_groups(adb, monkeypatch, tmp_path):
     r = rends[0]
     assert r.variant_key == "print:glossy" and r.label == "glossy"
     assert Path(r.storage_path).exists()
-    assert Path(r.storage_path).parent == Path(settings.DATA_ROOT) / "print"
+    # finalize_pending alone (no memo link) stages the print in _unfiled; link_attachments later
+    # moves it into the memo folder (covered by tests/test_placement.py).
+    assert Path(r.storage_path).parent == Path(settings.DATA_ROOT) / "originals" / "_unfiled"
 
 
 async def test_identical_print_bytes_on_two_photos_are_not_file_shared(adb, monkeypatch, tmp_path):
