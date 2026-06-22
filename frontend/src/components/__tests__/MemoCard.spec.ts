@@ -149,6 +149,30 @@ describe('MemoCard', () => {
     wrapper.unmount()
   })
 
+  it('Remove all deletes every photo on confirm (one delete-attachment per uid)', async () => {
+    requireSpy.mockClear()
+    const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1'), imageAtt('img2')]) })
+    const editItem = await openAction(wrapper, 'memo-action-edit')
+    editItem.click()
+    await nextTick()
+    await wrapper.find('[data-test="edit-remove-all"]').trigger('click')
+    expect(requireSpy).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('delete-attachment')).toBeUndefined() // nothing until confirmed
+    const opts = requireSpy.mock.calls[0][0] as { accept: () => void }
+    opts.accept()
+    expect(wrapper.emitted('delete-attachment')).toEqual([['img1'], ['img2']])
+    wrapper.unmount()
+  })
+
+  it('hides Remove all in the editor when the memo has no photos', async () => {
+    const wrapper = mountCard({ memo: memo('no pics') })
+    const editItem = await openAction(wrapper, 'memo-action-edit')
+    editItem.click()
+    await nextTick()
+    expect(wrapper.find('[data-test="edit-remove-all"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('hides the owner actions on memos the user does not own', () => {
     const wrapper = mountCard({ memo: { ...memo('x'), mine: false } })
     expect(wrapper.find('[data-test="memo-edit"]').exists()).toBe(false)

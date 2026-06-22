@@ -11,6 +11,7 @@ import MediaLightbox from '@/components/MediaLightbox.vue'
 import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
 import { useUploadQueue } from '@/composables/useResumableUpload'
+import { attachmentUidsToClear } from '@/lib/attachments'
 import { renderMemoMarkdown } from '@/lib/markdown'
 import { toggleTask } from '@/lib/tasks'
 
@@ -128,6 +129,24 @@ function onDeleteAttachment(uid: string) {
   })
 }
 
+// "Remove all" — one confirm, then delete every existing photo (reuses the per-uid delete path). Lets
+// the owner wipe a memo and re-upload screen+print pairs, which file into the per-memo folder.
+function onRemoveAllAttachments() {
+  const uids = attachmentUidsToClear(props.memo)
+  if (!uids.length) return
+  confirm.require({
+    header: 'Remove all photos',
+    message: `Remove all ${uids.length} photos from this memo? This cannot be undone.`,
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Remove all', severity: 'danger' },
+    accept: () => {
+      lightboxIndex.value = null
+      for (const uid of uids) emit('delete-attachment', uid)
+    },
+  })
+}
+
 // Clicking a rendered task checkbox flips it in the source markdown and asks the parent to
 // persist (PATCH). preventDefault so the box reflects server truth on re-render, not the click.
 function onContentClick(event: MouseEvent) {
@@ -226,7 +245,7 @@ function onContentClick(event: MouseEvent) {
           </button>
         </div>
       </div>
-      <div>
+      <div class="flex items-center gap-1">
         <Button
           text
           size="small"
@@ -234,6 +253,16 @@ function onContentClick(event: MouseEvent) {
           label="Add image"
           data-test="edit-add-image"
           @click="editFileInput?.click()"
+        />
+        <Button
+          v-if="memo.attachments?.length"
+          text
+          size="small"
+          severity="danger"
+          icon="pi pi-trash"
+          label="Remove all"
+          data-test="edit-remove-all"
+          @click="onRemoveAllAttachments"
         />
         <input
           ref="editFileInput"
