@@ -10,7 +10,14 @@ import AppShell from '@/layouts/AppShell.vue'
 // Mock the session dependency (not the shell under test). data is a ref so the template
 // unwraps it the same way Vue Query's would.
 vi.mock('@/composables/useSession', () => ({
-  useSession: () => ({ data: ref({ subject: 'alice', display_name: 'Alice', role: 'user' }) }),
+  useSession: () => ({
+    data: ref({
+      subject: 'alice',
+      display_name: 'Alice',
+      role: 'user',
+      avatar: 'https://example.test/avatar.png',
+    }),
+  }),
 }))
 
 const stub = { template: '<div />' }
@@ -47,10 +54,17 @@ describe('AppShell', () => {
     }
   })
 
-  it('shows the authenticated user and a dark-mode toggle', async () => {
+  it('shows the avatar (not the username text) and a dark-mode toggle', async () => {
     const wrapper = await mountShell()
-    expect(wrapper.find('[data-test="user-name"]').text()).toBe('Alice')
+    // The avatar alone identifies the signed-in user; the username text was removed as redundant.
+    expect(wrapper.find('[data-test="header-avatar"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="user-name"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="dark-toggle"]').exists()).toBe(true)
+  })
+
+  it('has no in-app logout button (login is Authelia/OIDC SSO)', async () => {
+    const wrapper = await mountShell()
+    expect(wrapper.find('[data-test="logout"]').exists()).toBe(false)
   })
 
   it('pads the header with the iOS safe-area inset so the burger clears the status bar', async () => {
