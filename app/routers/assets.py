@@ -291,8 +291,10 @@ async def serve_asset(
     # BEFORE streaming, so the download holds no pool connection either. (The /file/* compat route
     # is separate — app/routers/compat.py — and serves derived tiers unauthenticated by design,
     # ADR-0004 / fixtures F2; it does not pass through here.)
+    # PAT-or-session so headless API clients (e.g. the memos-slideshow generator) can fetch the
+    # original tier with a Personal Access Token, matching the /api/v1/* compat surface.
     async with async_session() as db:
-        user = await auth.require_user(request, db)
+        user = await auth.require_pat_or_user(request, db)
         att = await _viewable(db, user, uid)
         resolved = _tier_path(att, tier)
     if resolved is None:

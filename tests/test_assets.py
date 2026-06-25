@@ -1,5 +1,7 @@
 from app.config import settings
+from app.main import app
 from app.routers.assets import media_event_stream
+from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine, text
 
@@ -361,3 +363,29 @@ def test_unsigned_original_still_requires_auth(client, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     # original is unsigned (low fan-out, needs the DB row) → the auth path; no session → 401.
     assert client.get("/api/attachments/whatever/original").status_code == 401
+
+
+def test_pat_can_download_original(logged_in_client, monkeypatch, tmp_path):
+    # A headless API client (e.g. the slideshow generator) with a PAT can fetch the original
+    # tier — the auth path now accepts PAT-or-session (require_pat_or_user).
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    pat = client.post("/api/pats", json={"name": "slideshow"}).json()["token"]
+    aid = _seed_attachment("att-pat-orig", subject)
+    try:
+        orig = tmp_path / "orig.jpg"
+        Image.new("RGB", (40, 40), (9, 9, 9)).save(orig, "JPEG")
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("UPDATE attachments SET storage_path=:p WHERE uid='att-pat-orig'"),
+                      {"p": str(orig)})
+        eng.dispose()
+
+        anon = TestClient(app, raise_server_exceptions=False)  # no session cookie, PAT only
+        r = anon.get("/api/attachments/att-pat-orig/original",
+                     headers={"Authorization": f"Bearer {pat}"})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("image/")
+        assert anon.get("/api/attachments/att-pat-orig/original").status_code == 401  # no auth
+    finally:
+        _cleanup(aid)
