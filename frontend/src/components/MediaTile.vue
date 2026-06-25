@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 
+import { nextRetrySrc } from '@/lib/imageRetry'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
 
 // Only the fields a tile renders — so both MemoOut.attachments (AttachmentRef) and the
@@ -21,6 +22,43 @@ const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
 const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
+
+// The grid tier this tile loads (video tiles show the poster). Used as the retry base: a re-mint
+// refetch delivers a new URL here, which resets the tile via the watch below.
+const baseUrl = computed(() => (kind.value === 'video' ? props.att.posterUrl : props.att.thumbnailUrl))
+const imgSrc = ref(baseUrl.value)
+const attempt = ref(0)
+const loadFailed = ref(false)
+const showFailed = computed(() => kind.value === 'failed' || loadFailed.value)
+
+// A fresh URL (e.g. after a parent re-mint refetch) clears the failed state and retries from scratch.
+watch(baseUrl, (url) => {
+  imgSrc.value = url
+  attempt.value = 0
+  loadFailed.value = false
+})
+
+// A thumbnail failed to load: cache-bust and retry a couple times (transient blip). Once exhausted
+// the signed URL is likely expired — its signature can't be cache-busted back to life — so show the
+// failed state and ask the parent to re-mint fresh URLs by refetching the feed.
+function onImgError() {
+  const next = nextRetrySrc(baseUrl.value, attempt.value)
+  if (next) {
+    attempt.value += 1
+    imgSrc.value = next
+  } else {
+    loadFailed.value = true
+    emit('retry', props.att.uid)
+  }
+}
+
+// Manual Retry: force a fresh request even if the URL is unchanged, and ask the parent to re-mint.
+function manualRetry() {
+  attempt.value = 0
+  loadFailed.value = false
+  imgSrc.value = nextRetrySrc(baseUrl.value, 0) ?? baseUrl.value
+  emit('retry', props.att.uid)
+}
 </script>
 
 <template>
@@ -51,6 +89,19 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
       </div>
     </template>
 
+    <!-- failed (backend status OR the thumbnail/poster failed to load after retries): warning + retry.
+         Checked before image/video so a load failure surfaces the recovery affordance. -->
+    <div
+      v-else-if="showFailed"
+      class="w-full h-full flex flex-col items-center justify-center gap-1 text-sm"
+      data-test="tile-failed"
+    >
+      <i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true" />
+      <button class="text-primary underline" data-test="tile-retry" @click="manualRetry">
+        Retry
+      </button>
+    </div>
+
     <!-- ready image: the blurhash shows instantly (tiny client-decoded preview) behind the real
          thumb, so the feed never renders as empty gray boxes while thumbnails download. -->
     <template v-else-if="kind === 'image'">
@@ -63,12 +114,13 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
         data-test="tile-blur"
       />
       <img
-        :src="att.thumbnailUrl"
+        :src="imgSrc"
         alt=""
         loading="lazy"
         class="relative w-full h-full object-cover cursor-pointer"
         data-test="tile-image"
         @click="emit('open', att.uid)"
+        @error="onImgError"
       />
     </template>
 
@@ -87,22 +139,16 @@ const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
         aria-hidden="true"
         class="absolute inset-0 h-full w-full object-cover"
       />
-      <img :src="att.posterUrl" alt="" loading="lazy" class="relative h-full w-full object-cover" />
+      <img
+        :src="imgSrc"
+        alt=""
+        loading="lazy"
+        class="relative h-full w-full object-cover"
+        @error="onImgError"
+      />
       <span class="absolute inset-0 flex items-center justify-center">
         <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
       </span>
     </button>
-
-    <!-- failed: warning + retry -->
-    <div
-      v-else
-      class="w-full h-full flex flex-col items-center justify-center gap-1 text-sm"
-      data-test="tile-failed"
-    >
-      <i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true" />
-      <button class="text-primary underline" data-test="tile-retry" @click="emit('retry', att.uid)">
-        Retry
-      </button>
-    </div>
   </div>
 </template>

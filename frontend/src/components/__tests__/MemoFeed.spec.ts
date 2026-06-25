@@ -43,6 +43,7 @@ vi.mock('@tanstack/vue-query', () => ({
 }))
 
 const fetchNextPage = vi.fn()
+const refetch = vi.fn()
 const useTimelineMock = vi.fn()
 vi.mock('@/composables/useTimeline', () => ({ useTimeline: (q: unknown) => useTimelineMock(q) }))
 
@@ -50,8 +51,10 @@ function feedResult(items: ReturnType<typeof memoStub>[]) {
   return {
     data: ref({ pages: [{ items, nextCursor: null, totalCount: items.length }] }),
     fetchNextPage,
+    refetch,
     hasNextPage: ref(false),
     isFetchingNextPage: ref(false),
+    isFetching: ref(false),
     isPending: ref(false),
     isError: ref(false),
   }
@@ -77,6 +80,7 @@ describe('MemoFeed', () => {
     useTimelineMock.mockReset()
     patch.mockClear()
     invalidateQueries.mockClear()
+    refetch.mockClear()
   })
 
   it('renders a card per memo under day-grouped headers', () => {
@@ -123,5 +127,17 @@ describe('MemoFeed', () => {
       body: { content: '- [x] todo' },
     })
     expect(invalidateQueries).toHaveBeenCalled()
+  })
+
+  it('re-mints the feed when a card bubbles retry, throttled to one refetch per cooldown', async () => {
+    useTimelineMock.mockReturnValue(feedResult([memoStub('1', 'pic')]))
+    const wrapper = mountFeed()
+    const card = wrapper.findComponent({ name: 'MemoCard' })
+    card.vm.$emit('retry', 'a1') // a tile exhausted its in-place retries (expired signed URL)
+    await flushPromises()
+    expect(refetch).toHaveBeenCalledTimes(1) // refetch re-mints freshly-signed URLs
+    card.vm.$emit('retry', 'a1') // another tile fails immediately after
+    await flushPromises()
+    expect(refetch).toHaveBeenCalledTimes(1) // cooldown blocks a refetch loop
   })
 })

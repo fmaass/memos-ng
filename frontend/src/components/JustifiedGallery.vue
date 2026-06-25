@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
+import { nextRetrySrc } from '@/lib/imageRetry'
 import { justifyRows } from '@/lib/justified'
 import { blurhashToDataUrl } from '@/lib/media'
 
@@ -47,9 +48,24 @@ const rows = computed(() => {
   }))
 })
 
-function srcFor(att: GalleryAttachment): string {
+function baseSrc(att: GalleryAttachment): string {
   // Small thumb tier in the grid (the lightbox loads the larger preview).
   return att.mime.startsWith('video/') ? att.posterUrl : att.thumbnailUrl
+}
+
+// Transient thumbnail-load resilience (network blips). The Resources grid has no per-tile failed UI
+// and its own query, so this is cache-bust-only — no feed-level re-mint (that lives in MemoFeed).
+const attempts = ref<Record<string, number>>({})
+const retrySrc = ref<Record<string, string>>({})
+function srcFor(att: GalleryAttachment): string {
+  return retrySrc.value[att.uid] ?? baseSrc(att)
+}
+function onImgError(att: GalleryAttachment): void {
+  const n = attempts.value[att.uid] ?? 0
+  const next = nextRetrySrc(baseSrc(att), n)
+  if (!next) return // exhausted — leave the broken tile (no re-mint affordance in Resources)
+  attempts.value[att.uid] = n + 1
+  retrySrc.value = { ...retrySrc.value, [att.uid]: next }
 }
 function bg(att: GalleryAttachment): string | undefined {
   const url = blurhashToDataUrl(att.blurhash)
@@ -80,6 +96,7 @@ function bg(att: GalleryAttachment): string | undefined {
           loading="lazy"
           class="h-full w-full object-cover transition duration-200 group-hover:scale-[1.04]"
           data-test="gallery-img"
+          @error="onImgError(li.item)"
         />
         <span
           v-if="li.item.mime.startsWith('video/')"
