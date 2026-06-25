@@ -83,7 +83,13 @@ function manualRetry() {
 
     <!-- processing: poster + percent overlay (% arrives via SSE) -->
     <template v-else-if="kind === 'processing'">
-      <img :src="att.posterUrl" alt="" class="w-full h-full object-cover" data-test="tile-processing" />
+      <img
+        :src="att.posterUrl"
+        alt=""
+        decoding="async"
+        class="w-full h-full object-cover"
+        data-test="tile-processing"
+      />
       <div class="absolute inset-0 flex items-center justify-center">
         <span class="text-xs px-1.5 py-0.5 rounded bg-black/60 text-white">{{ progress ?? 0 }}%</span>
       </div>
@@ -117,6 +123,7 @@ function manualRetry() {
         :src="imgSrc"
         alt=""
         loading="lazy"
+        decoding="async"
         class="relative w-full h-full object-cover cursor-pointer"
         data-test="tile-image"
         @click="emit('open', att.uid)"
@@ -143,6 +150,7 @@ function manualRetry() {
         :src="imgSrc"
         alt=""
         loading="lazy"
+        decoding="async"
         class="relative h-full w-full object-cover"
         @error="onImgError"
       />

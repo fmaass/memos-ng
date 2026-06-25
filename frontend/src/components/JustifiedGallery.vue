@@ -94,6 +94,7 @@ function bg(att: GalleryAttachment): string | undefined {
           :src="srcFor(li.item)"
           alt=""
           loading="lazy"
+          decoding="async"
           class="h-full w-full object-cover transition duration-200 group-hover:scale-[1.04]"
           data-test="gallery-img"
           @error="onImgError(li.item)"
