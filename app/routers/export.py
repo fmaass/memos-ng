@@ -45,12 +45,14 @@ async def export_memos(
             owner=owner,
             q=q,
             limit=limit,
+            with_total=True,  # export gates on the count, so it must be computed
         )
 
     # Acquire the concurrency cap BEFORE the (potentially large) query + materialize + zip,
     # so concurrent exports can't each pull EXPORT_MAX rows into memory at once.
     async with _sem:
         _, _, total = await query(1)
+        assert total is not None  # with_total=True above guarantees a count
         if total > EXPORT_MAX:
             raise HTTPException(
                 status_code=413,

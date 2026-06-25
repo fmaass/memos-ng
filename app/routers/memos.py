@@ -99,7 +99,8 @@ class ReactionIn(BaseModel):
 class MemoList(BaseModel):
     items: list[MemoOut]
     nextCursor: str | None
-    totalCount: int
+    # null unless the caller asks (?with_total=true); the COUNT is expensive and the feed omits it
+    totalCount: int | None
 
 
 class TagCount(BaseModel):
@@ -174,6 +175,7 @@ async def list_memos(
     sort: str = "-created_at",
     cursor: str | None = None,
     limit: int = Query(20, ge=1, le=100),
+    with_total: bool = False,
 ) -> MemoList:
     items, next_cursor, total = await svc.list_memos(
         db,
@@ -189,6 +191,7 @@ async def list_memos(
         sort=sort,
         cursor=cursor,
         limit=limit,
+        with_total=with_total,
     )
     return MemoList(
         items=[_out(m, user.id) for m in items], nextCursor=next_cursor, totalCount=total
