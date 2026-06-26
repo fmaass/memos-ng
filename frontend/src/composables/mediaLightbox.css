@@ -21,3 +21,13 @@
 .pswp__button--arrow {
   visibility: visible !important;
 }
+
+/* PhotoSwipe's paddingFn pads only the slide/zoom canvas, not the chrome: the top bar is
+   hardcoded `top: 0` in photoswipe.css, so in the iOS standalone PWA (viewport-fit=cover) its
+   icons sit under the Dynamic Island / notch. Shift the whole bar below the top inset and keep its
+   buttons clear of the left/right insets in landscape. env() is 0 off-PWA → desktop unchanged. */
+.pswp__top-bar {
+  top: env(safe-area-inset-top);
+  padding-right: env(safe-area-inset-right);
+  padding-left: env(safe-area-inset-left);
+}
