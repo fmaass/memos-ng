@@ -5,7 +5,6 @@ import { ref, watch } from 'vue'
 
 import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
 import TagList from '@/components/TagList.vue'
-import { useApi } from '@/composables/useApi'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
 import { useSettings } from '@/composables/useSettings'
@@ -27,7 +26,6 @@ const NAV: NavItem[] = [
 const { isDark, toggle, setDark } = useDarkMode()
 const { data: user } = useSession()
 const { settings, update } = useSettings()
-const api = useApi()
 
 // Apply the server-persisted theme once it loads (source of truth across devices).
 watch(settings, (s) => {
@@ -42,11 +40,6 @@ function onToggleTheme() {
 }
 
 const mobileOpen = ref(false)
-
-async function logout(): Promise<void> {
-  await api.POST('/api/auth/logout')
-  window.location.assign('/')
-}
 </script>
 
 <template>
@@ -130,17 +123,6 @@ async function logout(): Promise<void> {
           class="w-7 h-7 rounded-full object-cover"
           alt="avatar"
           data-test="header-avatar"
-        />
-        <span v-if="user" class="text-sm text-muted-color px-2" data-test="user-name">
-          {{ user.display_name ?? user.subject }}
-        </span>
-        <Button
-          text
-          rounded
-          icon="pi pi-sign-out"
-          aria-label="Log out"
-          data-test="logout"
-          @click="logout"
         />
       </header>
 
