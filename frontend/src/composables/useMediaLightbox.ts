@@ -88,7 +88,14 @@ export function useMediaLightbox() {
         isButton: true,
         appendTo: 'bar',
         tagName: 'a',
-        html: '<i class="pi pi-download" aria-hidden="true"></i>',
+        // Native PhotoSwipe icon (isCustomSVG → .pswp__icn) so it centers/sizes/shadows exactly
+        // like the built-in close/zoom buttons — not a foreign PrimeIcons glyph that floats.
+        html: {
+          isCustomSVG: true,
+          size: 24,
+          inner: '<path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" id="pswp__icn-download"/>',
+          outlineID: 'pswp__icn-download',
+        },
         onInit: (el) => {
           const a = el as HTMLAnchorElement
           a.setAttribute('aria-label', 'Download original')
@@ -108,7 +115,13 @@ export function useMediaLightbox() {
           order: 16,
           isButton: true,
           appendTo: 'bar',
-          html: '<i class="pi pi-trash" aria-hidden="true"></i>',
+          html: {
+            isCustomSVG: true,
+            size: 24,
+            inner:
+              '<path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" id="pswp__icn-delete"/>',
+            outlineID: 'pswp__icn-delete',
+          },
           onInit: (el) => {
             el.setAttribute('aria-label', 'Delete')
             const sync = () => {
@@ -133,7 +146,13 @@ export function useMediaLightbox() {
           order: 17,
           isButton: true,
           appendTo: 'bar',
-          html: '<i class="pi pi-print" aria-hidden="true"></i>',
+          html: {
+            isCustomSVG: true,
+            size: 24,
+            inner:
+              '<path d="M19 8H5c-1.66 0-3 1.34-3 3v6h4v4h12v-4h4v-6c0-1.66-1.34-3-3-3zm-3 11H8v-5h8v5zm3-7c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-9H6v4h12V3z" id="pswp__icn-print"/>',
+            outlineID: 'pswp__icn-print',
+          },
           onInit: (el) => {
             el.setAttribute('aria-label', 'Attach a print-quality master')
             const sync = () => {
