@@ -1,10 +1,12 @@
 import base64
 import re
 import secrets
+import time
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
+import structlog
 from sqlalchemy import String, and_, cast, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +22,8 @@ from app.models import (
     memo_tags,
 )
 from app.services import storage
+
+logger = structlog.get_logger(__name__)
 
 TAG_RE = re.compile(r"#(\w+)")
 
@@ -187,7 +191,8 @@ async def list_memos(
     sort: str = "-created_at",
     cursor: str | None = None,
     limit: int = 20,
-) -> tuple[list[Memo], str | None, int]:
+    with_total: bool = True,
+) -> tuple[list[Memo], str | None, int | None]:
     conds = [visible_clause(user)]
     if archived_only:
         conds.append(Memo.archived_at.is_not(None))
@@ -217,7 +222,13 @@ async def list_memos(
         )
 
     where = and_(*conds)
-    total = (await db.execute(select(func.count()).select_from(Memo).where(where))).scalar_one()
+    # The COUNT scans every visible memo, so it's the single most expensive part of a feed page —
+    # and the feed UI never shows a total. Skip it unless a caller explicitly asks (with_total).
+    t_count0 = time.perf_counter()
+    total: int | None = None
+    if with_total:
+        total = (await db.execute(select(func.count()).select_from(Memo).where(where))).scalar_one()
+    count_ms = round((time.perf_counter() - t_count0) * 1000, 1)
 
     descending = not sort.lstrip("-") == sort  # "-created_at" → desc
     if cursor:
@@ -233,7 +244,19 @@ async def list_memos(
         else (Memo.created_at.asc(), Memo.id.asc())
     )
     stmt = select(Memo).where(and_(*conds)).order_by(*order).limit(limit + 1)
+    # This execute also fires the lazy="selectin" relationship loads (tags/owner/attachments/
+    # reactions), so select_ms captures the per-page query fan-out, not just the main SELECT.
+    t_select0 = time.perf_counter()
     rows = list((await db.execute(stmt)).scalars().all())
+    select_ms = round((time.perf_counter() - t_select0) * 1000, 1)
+
+    logger.debug(
+        "list_memos.timing",
+        count_ms=count_ms,
+        select_ms=select_ms,
+        rows=len(rows),
+        with_total=with_total,
+    )
     next_cursor = encode_cursor(rows[limit - 1]) if len(rows) > limit else None
     return rows[:limit], next_cursor, total
 

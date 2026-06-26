@@ -743,7 +743,7 @@ export interface components {
             /** Nextcursor */
             nextCursor: string | null;
             /** Totalcount */
-            totalCount: number;
+            totalCount: number | null;
         };
         /** MemoOut */
         MemoOut: {
@@ -1302,6 +1302,7 @@ export interface operations {
                 sort?: string;
                 cursor?: string | null;
                 limit?: number;
+                with_total?: boolean;
             };
             header?: never;
             path?: never;

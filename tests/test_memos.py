@@ -289,3 +289,27 @@ def test_reactions_toggle_count_and_reacted(logged_in_client):
     # the memo list also carries reactions
     listed = next(m for m in client.get("/api/memos").json()["items"] if m["uid"] == uid)
     assert listed["reactions"][0]["emoji"] == "❤️"
+
+
+async def test_list_memos_total_is_opt_in(adb):
+    u = await _user(adb, "alice")
+    await svc.create_memo(adb, u, content="a", visibility=Visibility.PUBLIC)
+    await svc.create_memo(adb, u, content="b", visibility=Visibility.PUBLIC)
+
+    # The COUNT scans every visible memo and the feed never shows a total — so it's skippable.
+    _, _, skipped = await svc.list_memos(adb, u, with_total=False)
+    assert skipped is None
+    # Opt-in still returns an accurate count for callers that need it.
+    _, _, counted = await svc.list_memos(adb, u, with_total=True)
+    assert counted == 2
+
+
+def test_list_memos_endpoint_omits_total_by_default(logged_in_client):
+    client, _ = logged_in_client
+    client.post("/api/memos", json={"content": "one", "visibility": "PUBLIC"})
+    client.post("/api/memos", json={"content": "two", "visibility": "PUBLIC"})
+
+    # Default feed response carries no total (the COUNT is skipped on the hot path).
+    assert client.get("/api/memos").json()["totalCount"] is None
+    # Explicit opt-in computes it.
+    assert client.get("/api/memos?with_total=true").json()["totalCount"] == 2

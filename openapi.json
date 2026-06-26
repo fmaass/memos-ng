@@ -606,8 +606,15 @@
             "title": "Nextcursor"
           },
           "totalCount": {
-            "title": "Totalcount",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totalcount"
           }
         },
         "required": [
@@ -2009,6 +2016,16 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "With Total",
+              "type": "boolean"
             }
           }
         ],

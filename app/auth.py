@@ -9,7 +9,7 @@ import httpx
 import jwt
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -145,6 +145,21 @@ async def load_session(db: AsyncSession, sid: str) -> WebSession | None:
     return ws
 
 
+# In-process record of when each session's last_seen was last claimed for a refresh (monotonic
+# seconds). Set synchronously BEFORE the DB write so a concurrent same-session burst sees it and
+# skips — only one coroutine per window even attempts the write, so the first load after idle can't
+# lock-convoy on the hot session row either. Per-process + non-durable is fine: the DB conditional
+# UPDATE is the durable safety net, and a restart just costs one extra write per session.
+_last_seen_claimed: dict[str, float] = {}
+
+
+def rolling_refresh_due(last_seen: datetime, now: datetime) -> bool:
+    """True iff the session's informational last_seen is older than the rolling-throttle window and
+    should be refreshed. Throttling avoids a per-request UPDATE+COMMIT to the one hot session row,
+    which lock-convoys the front page's concurrent fan-out (measured 60-90x). Pure + unit-tested."""
+    return last_seen < now - timedelta(seconds=settings.SESSION_ROLLING_THROTTLE_S)
+
+
 async def require_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
     sid = request.cookies.get(SID_COOKIE)
     if not sid:
@@ -152,9 +167,22 @@ async def require_user(request: Request, db: AsyncSession = Depends(get_session)
     ws = await load_session(db, sid)
     if ws is None:
         raise HTTPException(status_code=401, detail="Session invalid or expired")
-    if settings.SESSION_ROLLING:
-        ws.last_seen = datetime.now(UTC)
-        await db.commit()  # expire_on_commit=False keeps objects usable
+    if settings.SESSION_ROLLING and rolling_refresh_due(ws.last_seen, ws_now := datetime.now(UTC)):
+        mono = time.monotonic()
+        # Claim the write window IN MEMORY before any await: a concurrent same-session burst sees
+        # the fresh marker and skips, so at most one coroutine per window hits the DB (no convoy —
+        # even on first load after idle). The conditional UPDATE is the durable cross-restart gate.
+        if mono - _last_seen_claimed.get(sid, 0.0) >= settings.SESSION_ROLLING_THROTTLE_S:
+            _last_seen_claimed[sid] = mono
+            if len(_last_seen_claimed) > 4096:  # bound the map (correctness lives in the DB WHERE)
+                _last_seen_claimed.clear()
+            stale_before = ws_now - timedelta(seconds=settings.SESSION_ROLLING_THROTTLE_S)
+            await db.execute(
+                update(WebSession)
+                .where(WebSession.sid == sid, WebSession.last_seen < stale_before)
+                .values(last_seen=ws_now)
+            )
+            await db.commit()  # expire_on_commit=False keeps objects usable
     user = (await db.execute(select(User).where(User.id == ws.user_id))).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")

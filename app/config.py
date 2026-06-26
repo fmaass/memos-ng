@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = True
     SESSION_ABSOLUTE_DAYS: int = 90
     SESSION_ROLLING: bool = True
+    # last_seen is informational only (expiry is absolute), so don't rewrite it on every request:
+    # the front page's concurrent fan-out all hits ONE session row and the per-request UPDATE+COMMIT
+    # lock-convoys (measured 60-90x slowdown). Refresh it at most once per this window per session.
+    SESSION_ROLLING_THROTTLE_S: int = 600
 
     @property
     def is_production(self) -> bool:
