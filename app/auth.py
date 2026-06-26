@@ -9,7 +9,7 @@ import httpx
 import jwt
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -145,6 +145,13 @@ async def load_session(db: AsyncSession, sid: str) -> WebSession | None:
     return ws
 
 
+def rolling_refresh_due(last_seen: datetime, now: datetime) -> bool:
+    """True iff the session's informational last_seen is older than the rolling-throttle window and
+    should be refreshed. Throttling avoids a per-request UPDATE+COMMIT to the one hot session row,
+    which lock-convoys the front page's concurrent fan-out (measured 60-90x). Pure + unit-tested."""
+    return last_seen < now - timedelta(seconds=settings.SESSION_ROLLING_THROTTLE_S)
+
+
 async def require_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
     sid = request.cookies.get(SID_COOKIE)
     if not sid:
@@ -153,8 +160,18 @@ async def require_user(request: Request, db: AsyncSession = Depends(get_session)
     if ws is None:
         raise HTTPException(status_code=401, detail="Session invalid or expired")
     if settings.SESSION_ROLLING:
-        ws.last_seen = datetime.now(UTC)
-        await db.commit()  # expire_on_commit=False keeps objects usable
+        now = datetime.now(UTC)
+        stale_before = now - timedelta(seconds=settings.SESSION_ROLLING_THROTTLE_S)
+        # Refresh last_seen at most once per throttle window. The Python gate skips the write (and
+        # its COMMIT) on the hot path; the WHERE re-checks staleness under the row lock so a
+        # concurrent burst on the same session does ONE write, not N — no per-request lock-convoy.
+        if rolling_refresh_due(ws.last_seen, now):
+            await db.execute(
+                update(WebSession)
+                .where(WebSession.sid == sid, WebSession.last_seen < stale_before)
+                .values(last_seen=now)
+            )
+            await db.commit()  # expire_on_commit=False keeps objects usable
     user = (await db.execute(select(User).where(User.id == ws.user_id))).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")

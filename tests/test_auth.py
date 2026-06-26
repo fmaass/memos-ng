@@ -213,3 +213,17 @@ async def test_fetch_userinfo_no_access_token_returns_empty():
     from app import auth
 
     assert await auth.fetch_userinfo(None) == {}
+
+
+def test_rolling_refresh_due_throttle_boundary():
+    # last_seen is refreshed at most once per throttle window — so the front page's concurrent
+    # authenticated fan-out doesn't UPDATE+COMMIT the one hot session row on every request.
+    from datetime import UTC, datetime, timedelta
+
+    from app.auth import rolling_refresh_due
+
+    now = datetime(2026, 6, 26, 12, 0, 0, tzinfo=UTC)
+    w = settings.SESSION_ROLLING_THROTTLE_S
+    assert rolling_refresh_due(now - timedelta(seconds=w + 1), now) is True  # past window → refresh
+    assert rolling_refresh_due(now - timedelta(seconds=w - 1), now) is False  # within → skip
+    assert rolling_refresh_due(now, now) is False  # just written → skip
