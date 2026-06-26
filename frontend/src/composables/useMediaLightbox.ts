@@ -92,8 +92,10 @@ export function useMediaLightbox() {
         // like the built-in close/zoom buttons — not a foreign PrimeIcons glyph that floats.
         html: {
           isCustomSVG: true,
-          size: 24,
-          inner: '<path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" id="pswp__icn-download"/>',
+          // 24-unit Material path centered (translate +4) in PhotoSwipe's native 32 viewBox, so it
+          // renders at the SAME size as the built-in close/zoom icons (size:24 made them ~1.3x big).
+          inner:
+            '<path transform="translate(4 4)" d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" id="pswp__icn-download"/>',
           outlineID: 'pswp__icn-download',
         },
         onInit: (el) => {
@@ -117,9 +119,8 @@ export function useMediaLightbox() {
           appendTo: 'bar',
           html: {
             isCustomSVG: true,
-            size: 24,
             inner:
-              '<path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" id="pswp__icn-delete"/>',
+              '<path transform="translate(4 4)" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" id="pswp__icn-delete"/>',
             outlineID: 'pswp__icn-delete',
           },
           onInit: (el) => {
@@ -148,9 +149,8 @@ export function useMediaLightbox() {
           appendTo: 'bar',
           html: {
             isCustomSVG: true,
-            size: 24,
             inner:
-              '<path d="M19 8H5c-1.66 0-3 1.34-3 3v6h4v4h12v-4h4v-6c0-1.66-1.34-3-3-3zm-3 11H8v-5h8v5zm3-7c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-9H6v4h12V3z" id="pswp__icn-print"/>',
+              '<path transform="translate(4 4)" d="M19 8H5c-1.66 0-3 1.34-3 3v6h4v4h12v-4h4v-6c0-1.66-1.34-3-3-3zm-3 11H8v-5h8v5zm3-7c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-9H6v4h12V3z" id="pswp__icn-print"/>',
             outlineID: 'pswp__icn-print',
           },
           onInit: (el) => {
