@@ -131,12 +131,32 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | `DATABASE_URL` / `DATABASE_URL_SYNC` | local dev DSN | async (app) + sync (Alembic) Postgres DSNs |
 | `DATA_ROOT` | `./data` | media storage root (bind-mounted at `/app/data` in prod) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `5` | connection cap — Postgres is **shared** with prod; never exhaust it |
+| `SESSION_ROLLING_THROTTLE_S` | `600` | min interval between session `last_seen` refreshes (avoids a hot-row write convoy on the feed fan-out) |
 | `ASSET_URL_SECRET` | derived from `SESSION_SECRET` | HMAC key for signed media URLs (`_PREV` = rotation slot) |
 | `WORKER_LANES` | `fast,slow` | which media lanes a worker drains (`fast` = thumbs/posters, `slow` = transcode) |
 | `THERMAL_ZONE` / `THERMAL_MAX_C` | k10temp sensor / `70` | defer transcode while the (heat-bound) host is hot |
 | `MAX_UPLOAD_MIB` | `1024` | upload size cap |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | empty (push disabled) | Web Push (VAPID) keypair |
 | Authelia OIDC | — | confidential BFF client; public `https://auth…` endpoints only |
+
+## Changelog
+
+### v1.1.0
+
+- **Performance — front-page load convoy fixed.** `require_user` wrote `sessions.last_seen` +
+  committed on every authenticated request, so the feed's concurrent fan-out lock-convoyed one
+  hot session row (measured 3.7 s for a 6-request burst). The refresh is now throttled
+  (`SESSION_ROLLING_THROTTLE_S`, in-process gate + conditional UPDATE) — warm `/api/memos` ~30 ms,
+  burst ~0.2 s. The unused per-page `COUNT` is opt-in (`?with_total`); `totalCount` is now nullable.
+- **UI.** Removed the redundant header username text + in-app logout button (login is Authelia SSO).
+  iOS PWA lightbox: top toolbar clears the Dynamic Island, and the download/delete/print buttons use
+  PhotoSwipe's native icon pipeline (correctly aligned + sized). Thumbnails recover from load
+  failures (bounded retry + feed re-mint) and decode off the main thread.
+- **API.** The asset download route accepts a PAT (original/print tier).
+
+### v1.0.0
+
+First production release.
 
 ## License
 
