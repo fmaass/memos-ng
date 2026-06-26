@@ -26,6 +26,7 @@ const emit = defineEmits<{
   'delete-attachment': [uid: string]
   'delete-attachments': [uids: string[]] // bulk remove — deleted SEQUENTIALLY by the parent
   'delete-memo': [uid: string]
+  retry: [uid: string] // a tile exhausted its in-place retries — ask the feed to re-mint URLs
   'add-print': [payload: { uid: string; file: File }]
   edit: [
     payload: {
@@ -334,7 +335,13 @@ function onContentClick(event: MouseEvent) {
       class="grid grid-cols-2 sm:grid-cols-3 gap-2"
       data-test="media-grid"
     >
-      <MediaTile v-for="a in memo.attachments" :key="a.uid" :att="a" @open="openLightbox" />
+      <MediaTile
+        v-for="a in memo.attachments"
+        :key="a.uid"
+        :att="a"
+        @open="openLightbox"
+        @retry="emit('retry', $event)"
+      />
     </div>
 
     <div v-if="memo.tags.length || hasPrints" class="flex flex-wrap items-center gap-1">

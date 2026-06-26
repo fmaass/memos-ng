@@ -63,4 +63,34 @@ describe('MediaTile', () => {
     await w.find('[data-test="tile-retry"]').trigger('click')
     expect(w.emitted('retry')?.[0]).toEqual(['a1'])
   })
+
+  it('cache-busts the thumbnail in place on a transient load error (no re-mint yet)', async () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb')
+    await w.find('[data-test="tile-image"]').trigger('error')
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?_r=1')
+    expect(w.emitted('retry')).toBeUndefined() // still retrying in place — the feed is not re-minted
+  })
+
+  it('shows the failed state and asks the parent to re-mint once retries are exhausted', async () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    // MAX_THUMB_RETRIES in-place retries, then the next error exhausts → expired-signature signal.
+    await w.find('[data-test="tile-image"]').trigger('error') // _r=1
+    await w.find('[data-test="tile-image"]').trigger('error') // _r=2
+    await w.find('[data-test="tile-image"]').trigger('error') // exhausted
+    expect(w.find('[data-test="tile-image"]').exists()).toBe(false)
+    expect(w.find('[data-test="tile-failed"]').exists()).toBe(true)
+    expect(w.emitted('retry')?.[0]).toEqual(['a1'])
+  })
+
+  it('resets and retries from scratch when a fresh (re-minted) URL arrives', async () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await w.find('[data-test="tile-image"]').trigger('error') // failed
+    expect(w.find('[data-test="tile-failed"]').exists()).toBe(true)
+    await w.setProps({ att: att('ready', 'image/png', { thumbnailUrl: '/api/attachments/a1/thumb?exp=2' }) })
+    expect(w.find('[data-test="tile-failed"]').exists()).toBe(false)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?exp=2')
+  })
 })

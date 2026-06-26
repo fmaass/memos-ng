@@ -6,6 +6,7 @@ import MemoCard from '@/components/MemoCard.vue'
 import MemoCardSkeleton from '@/components/MemoCardSkeleton.vue'
 import { useApi } from '@/composables/useApi'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
+import { shouldRemint } from '@/lib/imageRetry'
 import { groupByDay } from '@/lib/timeline'
 
 // Generic cursor-paginated memo feed. Home passes no query; Explore/Search pass filters;
@@ -19,12 +20,22 @@ const emit = defineEmits<{ restore: [uid: string] }>()
 const api = useApi()
 const queryClient = useQueryClient()
 
-const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError } = useTimeline(
-  () => props.query,
-)
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching, isPending, isError, refetch } =
+  useTimeline(() => props.query)
 
 const memos = computed(() => data.value?.pages.flatMap((page) => page.items) ?? [])
 const days = computed(() => groupByDay(memos.value))
+
+// A tile bubbled `retry` after exhausting its in-place cache-bust retries — its signed URL has
+// likely expired (the bucket rolled while the feed sat open). Cache-busting can't refresh a
+// signature, so re-mint by refetching the timeline, which returns freshly-signed URLs. Gated so a
+// burst (or steady stream) of failing tiles triggers one refetch per cooldown window, not a loop.
+let lastRemint = 0
+function onTileRetry() {
+  if (!shouldRemint(Date.now(), lastRemint, isFetching.value)) return
+  lastRemint = Date.now()
+  void refetch()
+}
 
 // Persist a task-checkbox toggle (PATCH the memo content) and refresh the feed.
 const toggleTask = useMutation({
@@ -167,6 +178,7 @@ onUnmounted(() => observer?.disconnect())
         @delete-memo="deleteMemo.mutate($event)"
         @add-print="addPrint.mutate($event)"
         @edit="editMemo.mutate($event)"
+        @retry="onTileRetry"
       />
     </template>
     <div ref="sentinel" class="h-4" data-test="sentinel" />
