@@ -8,6 +8,7 @@ drains the queue, renders each photo, and emails it to the frame.
 
 import io
 import re
+import tempfile
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -40,18 +41,22 @@ def is_valid_email(value: str) -> bool:
     return bool(_EMAIL_RE.match(value or ""))
 
 
-def build_test_image() -> bytes:
-    """A small, self-contained JPEG for the settings 'Send test photo' button — no bundled binary.
-    q95 like the real render, with a DateTimeOriginal so Aura places it chronologically."""
-    img = Image.new("RGB", (1200, 800), (38, 70, 110))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle((60, 60, 1140, 740), outline=(255, 255, 255), width=8)
-    draw.text((110, 110), "memos-ng frame test", fill=(255, 255, 255))
-    exif = img.getexif()
-    exif.get_ifd(_EXIF_OFFSET)[_EXIF_DATETIME_ORIGINAL] = datetime.now(UTC).strftime(_EXIF_DT_FMT)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=FRAME_JPEG_QUALITY, subsampling=0, exif=exif)
-    return buf.getvalue()
+def render_test_image() -> bytes:
+    """Produce the settings 'Send test photo' JPEG by running a generated source through the REAL
+    render_for_frame — so the test-send exercises the actual render path (open, exif_transpose,
+    q95 encode, captured_at→DateTimeOriginal backfill), not just SMTP. The source is a PNG with no
+    EXIF, mirroring the curated screen-PNGs, so the captured_at backfill is genuinely exercised."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        path = tmp.name
+    try:
+        img = Image.new("RGB", (1200, 800), (38, 70, 110))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((60, 60, 1140, 740), outline=(255, 255, 255), width=8)
+        draw.text((110, 110), "memos-ng frame test", fill=(255, 255, 255))
+        img.save(path, "PNG")  # PNG source = no EXIF, like the stored curated renditions
+        return render_for_frame(path, datetime.now(UTC))
+    finally:
+        Path(path).unlink(missing_ok=True)
 
 # Render/send tuning. Full-resolution q95 4:4:4 (user-decided 2026-07-03) — Aura resizes to its
 # panel server-side, so no client-side downscale; q95 4:4:4 is visually lossless yet safely under

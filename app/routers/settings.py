@@ -94,7 +94,7 @@ async def frame_test(user: Annotated[User, Depends(auth.require_user)]) -> Frame
         raise HTTPException(status_code=400, detail="Frame sharing is not configured on the server")
     if not (user.frame_send_to and user.frame_send_from):
         raise HTTPException(status_code=400, detail="Set a send-to and send-from address first.")
-    jpeg = await to_thread.run_sync(frame_share.build_test_image)
+    jpeg = await to_thread.run_sync(frame_share.render_test_image)
     try:
         await frame_share.send_frame_share(
             from_addr=user.frame_send_from,

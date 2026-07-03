@@ -75,6 +75,14 @@ def test_render_heic_source_to_jpeg(tmp_path):
     assert Image.open(io.BytesIO(fs.render_for_frame(str(p)))).format == "JPEG"
 
 
+def test_render_test_image_uses_the_real_render_path():
+    # DateTimeOriginal is injected only by render_for_frame's captured_at backfill — its presence
+    # proves render_test_image goes through the real renderer, not a shortcut JPEG.
+    im = Image.open(io.BytesIO(fs.render_test_image()))
+    assert im.format == "JPEG"
+    assert im.getexif().get_ifd(0x8769).get(0x9003) is not None
+
+
 # --- send_frame_share ---
 
 
