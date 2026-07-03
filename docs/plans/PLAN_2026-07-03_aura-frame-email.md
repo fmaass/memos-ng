@@ -12,7 +12,7 @@ todos:
     status: done
   - id: "p1-backend-enqueue"
     content: "Phase 1 — config, migration (user cols + frame_share_jobs), enqueue on #curated"
-    status: pending
+    status: done
   - id: "p2-worker-send"
     content: "Phase 2 — worker render+send path, aiosmtplib, retries, EXIF preservation"
     status: pending
