@@ -22,6 +22,7 @@ dependencies = [
     "pillow>=11",
     "pillow-heif>=0.18",
     "pywebpush>=2.0",
+    "aiosmtplib>=3.0",
 ]
 
 [dependency-groups]
