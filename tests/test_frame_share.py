@@ -2,7 +2,7 @@ import pytest
 from app.config import settings
 from app.models import Attachment, AttachmentStatus, FrameShareJob, User, Visibility
 from app.services import memos as svc
-from app.services.frame_share import is_frame_image, maybe_enqueue_frame_shares
+from app.services.frame_share import is_frame_image, is_valid_email, maybe_enqueue_frame_shares
 from sqlalchemy import func, select
 
 
@@ -48,6 +48,18 @@ async def _job_count(adb, memo) -> int:
 )
 def test_is_frame_image(mime, expected):
     assert is_frame_image(mime) is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("a@b.com", True), ("first.last@send.auraframes.com", True), ("x@y.co.uk", True),
+        ("", False), ("no-at-sign", False), ("no@domain", False), ("@nolocal.com", False),
+        ("two@@at.com", False), ("has space@x.com", False), ("trailing@x.com ", False),
+    ],
+)
+def test_is_valid_email(value, expected):
+    assert is_valid_email(value) is expected
 
 
 # --- enqueue guard: one test per input category (plan Phase 1 verification) ---

@@ -7,6 +7,7 @@ drains the queue, renders each photo, and emails it to the frame.
 """
 
 import io
+import re
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -15,7 +16,7 @@ import aiosmtplib
 import pillow_heif
 import structlog
 from anyio import to_thread
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,28 @@ pillow_heif.register_heif_opener()  # decode HEIC/HEIF originals (also registere
 
 # The tag that opts a memo's photos into frame sharing.
 CURATED_TAG = "curated"
+
+# Pragmatic email shape check (not full RFC 5322): one @, non-empty local + domain, a dotted TLD,
+# no whitespace. Enough to reject typos in the settings form; the real proof is Phase 0/the frame.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email(value: str) -> bool:
+    return bool(_EMAIL_RE.match(value or ""))
+
+
+def build_test_image() -> bytes:
+    """A small, self-contained JPEG for the settings 'Send test photo' button — no bundled binary.
+    q95 like the real render, with a DateTimeOriginal so Aura places it chronologically."""
+    img = Image.new("RGB", (1200, 800), (38, 70, 110))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((60, 60, 1140, 740), outline=(255, 255, 255), width=8)
+    draw.text((110, 110), "memos-ng frame test", fill=(255, 255, 255))
+    exif = img.getexif()
+    exif.get_ifd(_EXIF_OFFSET)[_EXIF_DATETIME_ORIGINAL] = datetime.now(UTC).strftime(_EXIF_DT_FMT)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=FRAME_JPEG_QUALITY, subsampling=0, exif=exif)
+    return buf.getvalue()
 
 # Render/send tuning. Full-resolution q95 4:4:4 (user-decided 2026-07-03) — Aura resizes to its
 # panel server-side, so no client-side downscale; q95 4:4:4 is visually lossless yet safely under

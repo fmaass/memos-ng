@@ -487,6 +487,24 @@
         "title": "Body_upload_print_api_attachments__uid__print_post",
         "type": "object"
       },
+      "FrameTestResult": {
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "detail"
+        ],
+        "title": "FrameTestResult",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -995,6 +1013,28 @@
           "default_visibility": {
             "$ref": "#/components/schemas/Visibility"
           },
+          "frame_send_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frame Send From"
+          },
+          "frame_send_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frame Send To"
+          },
           "theme": {
             "title": "Theme",
             "type": "string"
@@ -1003,7 +1043,9 @@
         "required": [
           "default_visibility",
           "theme",
-          "avatar"
+          "avatar",
+          "frame_send_to",
+          "frame_send_from"
         ],
         "title": "SettingsOut",
         "type": "object"
@@ -1030,6 +1072,28 @@
                 "type": "null"
               }
             ]
+          },
+          "frame_send_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frame Send From"
+          },
+          "frame_send_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frame Send To"
           },
           "theme": {
             "anyOf": [
@@ -2650,6 +2714,28 @@
           }
         },
         "summary": "Update Settings",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/settings/frame-test": {
+      "post": {
+        "description": "Send a bundled test photo through the real render+SMTP path, synchronously. Reports whether\nthe MAIL SERVER accepted it \u2014 NOT whether it reached the frame (acceptance != delivery).",
+        "operationId": "frame_test_api_settings_frame_test_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FrameTestResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Frame Test",
         "tags": [
           "settings"
         ]
