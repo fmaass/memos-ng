@@ -18,7 +18,7 @@ todos:
     status: done
   - id: "p3-settings-ui"
     content: "Phase 3 — settings API extension, OpenAPI regen, SettingsView section, test-send"
-    status: pending
+    status: done
   - id: "p4-deploy-acceptance"
     content: "Phase 4 — /safe-deploy + acceptance: photo visibly lands on the frame"
     status: pending
