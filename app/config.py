@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     VAPID_PRIVATE_KEY: str = ""
     VAPID_SUBJECT: str = "mailto:admin@discomarder.live"
 
+    # Aura frame email share. Empty username/password = feature disabled globally: no jobs are
+    # enqueued and every send is a no-op (same empty-default-disables pattern as VAPID above).
+    # These are secrets — set via the stack .env in prod and never log them. Default host/port
+    # target iCloud SMTP (smtp.mail.me.com:587 STARTTLS), the proven Phase-0 send path.
+    SMTP_HOST: str = "smtp.mail.me.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
     OIDC_CLIENT_ID: str = "memos-ng"
