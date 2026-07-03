@@ -15,7 +15,7 @@ todos:
     status: done
   - id: "p2-worker-send"
     content: "Phase 2 — worker render+send path, aiosmtplib, retries, EXIF preservation"
-    status: pending
+    status: done
   - id: "p3-settings-ui"
     content: "Phase 3 — settings API extension, OpenAPI regen, SettingsView section, test-send"
     status: pending
@@ -507,4 +507,44 @@ plan. **Must go through the Phase 2 pre-execution Codex gate before implementati
 **Deferred:** rotate the app-specific password — it was briefly exposed in this session
 (SMTP debug transcript printed the AUTH PLAIN handshake; the leaked tool-result file was
 deleted). Revoke + regenerate at account.apple.com, update `~/.config/memos-ng/frame.env`.
-Env file is now owned by `fabian` (mode 600).
+Env file is now owned by `fabian` (mode 600). **DONE 2026-07-03:** the user rotated the ASP
+and updated `frame.env` with the new value.
+
+## Phase 2 design decisions (pre-exec gate round, 2026-07-03) — resolves 2 REVISE blockers
+
+The Phase 2 pre-execution Codex gate returned REVISE on two design points. Resolutions,
+now authoritative for Phase 2 implementation:
+
+**D1 — Delivery semantics = AT-MOST-ONCE (no duplicate on the frame).** A duplicate photo on
+the frame is worse UX than a rare miss (which the user can re-trigger by re-adding). Mechanism:
+the worker commits `state=claimed` (queued → claimed) BEFORE rendering/sending. The claim query
+selects only `state=queued`, so a worker crash between "SMTP accepted DATA" and the `sent` commit
+leaves the job stranded in `claimed` — it is NEVER re-claimed, so it cannot resend (the `claimed`
+state is the in-flight tombstone). No stale-`claimed` reaper (a reaper would reintroduce the
+duplicate risk). SMTP error classification (Codex note): permanent failures
+(`SMTPAuthenticationError`, `SMTPSenderRefused`, `SMTPRecipientsRefused`, 5xx policy) →
+terminal `failed` immediately with the error recorded (do NOT churn 5 attempts). Definitely-
+no-send transient failures (`SMTPConnectError`, `SMTPServerDisconnected`, timeout — raised
+before DATA acceptance) → `queued` with exponential `next_attempt_at` backoff, terminal
+`failed` at 5 attempts. Residual accepted risk: the narrow "server accepted DATA then the
+connection dropped so `aiosmtplib.send` raised" window could, in principle, retry-and-duplicate;
+we treat a generic post-connection `SMTPException` as transient-retryable only if no crash
+occurred, and accept the rare duplicate (deletable from the Aura app) rather than silently drop.
+
+**D2 — Send-time revalidation is a BEST-EFFORT filter, NOT a lock-held guarantee.** We do NOT
+hold a DB row lock on the attachment/`memo_tags` across the SMTP round-trip — that would block
+memo edits for the seconds a send takes and pin a DB connection. Instead the worker re-reads
+(memo exists, still tagged `curated`, attachment still linked with `memo_id == job.memo_id`,
+owner settings still set, original file present) immediately before render/send inside the claim
+transaction; any miss → terminal `state=skipped`, no email. This catches every realistic case
+(memo deleted / un-tagged / attachment unlinked before the worker polls — and Aura ingestion is
+minutes-latent, so edits almost always precede the send). Explicitly out of guarantee: a memo
+un-curated in the final milliseconds AFTER revalidation but BEFORE the SMTP send completes may
+still deliver one photo; consequence is minor (delete it from the Aura app). This is the
+documented weakening the gate asked for, chosen over cross-send row locks.
+
+**D3 — render_for_frame signature change (from F1):** `render_for_frame(original_path,
+captured_at=None) -> bytes`. Inject `captured_at` as EXIF `DateTimeOriginal` in EXIF timestamp
+format (`"%Y:%m:%d %H:%M:%S"`) only when the source lacks it; write EXIF with `Orientation`
+reset to 1 AFTER `ImageOps.exif_transpose` normalizes pixels (no double-rotation). Log the
+output byte size; still send if > ~9 MB (product choice, not correctness).
