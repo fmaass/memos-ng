@@ -94,9 +94,12 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     number of NEW rows inserted (0 when any guard fails or every attachment is already queued).
 
     Guards (all required): server SMTP configured, owner has both Aura settings, memo is #curated.
-    Idempotent per attachment via ON CONFLICT (attachment_id) DO NOTHING — so re-editing a curated
-    memo never resends existing photos, while a newly added image on an already-curated memo is
-    enqueued. Runs inside the caller's transaction (atomic with the memo write)."""
+    Idempotent per attachment via ON CONFLICT (attachment_id): a re-edit resurrects ONLY rows that
+    went terminal `skipped`/`failed` (reset to queued so a transiently-missed photo gets another
+    chance), while `sent` stays terminal (never resend), `claimed` is never touched (at-most-once
+    tombstone), and a live `queued` retry keeps its backoff. A newly added image on an
+    already-curated memo is enqueued fresh. Runs inside the caller's transaction (atomic with the
+    memo write)."""
     if not server_smtp_configured():
         return 0
     if not (user.frame_send_to and user.frame_send_from):
@@ -119,20 +122,35 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     for att in attachments:
         if not is_frame_image(att.mime):
             continue
+        # Core insert (needed for ON CONFLICT) does NOT apply the ORM column defaults, so set the
+        # NOT-NULL state/attempts explicitly. created_at uses the DB server_default.
+        ins = pg_insert(FrameShareJob).values(
+            attachment_id=att.id,
+            memo_id=memo.id,
+            user_id=user.id,
+            state=FrameShareState.queued,
+            attempts=0,
+        )
         result = await db.execute(
-            # Core insert (needed for ON CONFLICT) does NOT apply the ORM column defaults, so set
-            # the NOT-NULL state/attempts explicitly. created_at uses the DB server_default.
-            # RETURNING id yields a row on insert and nothing on conflict → a typed insert counter.
-            pg_insert(FrameShareJob)
-            .values(
-                attachment_id=att.id,
-                memo_id=memo.id,
-                user_id=user.id,
-                state=FrameShareState.queued,
-                attempts=0,
-            )
-            .on_conflict_do_nothing(index_elements=["attachment_id"])
-            .returning(FrameShareJob.id)
+            # On conflict, resurrect only terminal rows (skipped/failed) back to queued and clear
+            # their retry/claim bookkeeping; the WHERE keeps `sent`/`claimed`/live `queued` rows
+            # untouched. RETURNING id yields a row on a fresh insert OR a matched resurrection and
+            # nothing when the WHERE excludes the row → a typed "enqueued" counter.
+            ins.on_conflict_do_update(
+                index_elements=["attachment_id"],
+                set_={
+                    "state": FrameShareState.queued,
+                    "attempts": 0,
+                    "error": None,
+                    "next_attempt_at": None,
+                    "claimed_by": None,
+                    "memo_id": ins.excluded.memo_id,
+                    "user_id": ins.excluded.user_id,
+                },
+                where=FrameShareJob.state.in_(
+                    [FrameShareState.skipped, FrameShareState.failed]
+                ),
+            ).returning(FrameShareJob.id)
         )
         if result.first() is not None:
             inserted += 1
