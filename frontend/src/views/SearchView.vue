@@ -8,6 +8,7 @@ import {
   filterFromSearchParams,
   filterToQuery,
   filterToRouteQuery,
+  filterToSearchParams,
   isEmptyFilter,
   type MemoFilter,
 } from '@/lib/memoFilter'
@@ -18,13 +19,34 @@ const router = useRouter()
 // Seed from the URL so a linked/reloaded filtered search restores exactly.
 const filter = ref<MemoFilter>(filterFromSearchParams(route.query))
 
-// Reflect the active filter into the URL (linkable + reload-stable), same serialization A6 stores.
+// Canonical string form of a filter — the loop guard for the two-way URL sync (equal filters
+// serialize identically; a no-op change never triggers a router.replace or a re-seed).
+function canon(f: MemoFilter): string {
+  return filterToSearchParams(f).toString()
+}
+
+// filter -> URL: reflect the active filter into the address bar (linkable, reload-stable; the same
+// serialization A6 stores). Guarded so an already-represented filter doesn't churn replace().
 watch(
   filter,
   (f) => {
-    void router.replace({ query: filterToRouteQuery(f) })
+    if (canon(f) !== canon(filterFromSearchParams(route.query))) {
+      void router.replace({ query: filterToRouteQuery(f) })
+    }
   },
   { deep: true },
+)
+
+// URL -> filter: Vue Router reuses this component across query-only navigations (e.g. a sidebar
+// tag link, back/forward, or the header search link while already on Search), so re-seed the
+// filter whenever the URL diverges from it. Same guard prevents a feedback loop with the watcher
+// above.
+watch(
+  () => route.query,
+  () => {
+    const fromUrl = filterFromSearchParams(route.query)
+    if (canon(fromUrl) !== canon(filter.value)) filter.value = fromUrl
+  },
 )
 
 const active = computed(() => !isEmptyFilter(filter.value))

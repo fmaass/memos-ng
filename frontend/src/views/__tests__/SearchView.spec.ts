@@ -5,20 +5,28 @@ import ToastService from 'primevue/toastservice'
 import { describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
 
-// The view seeds its filter from the route and syncs back via the router; drive it through the
-// URL (the real wiring) rather than PrimeVue widgets in happy-dom. FilterBar's tag list uses
-// useTags — stub it (a dependency, not the unit under test).
-const replace = vi.fn()
-const routeQuery: { value: Record<string, string | string[]> } = { value: {} }
-vi.mock('vue-router', () => ({
-  useRoute: () => ({
-    get query() {
-      return routeQuery.value
-    },
-  }),
-  useRouter: () => ({ replace }),
-}))
+// The view seeds its filter from the route AND re-seeds on query-only navigation, syncing back via
+// the router; drive it through the URL (the real wiring) rather than PrimeVue widgets in happy-dom.
+// A reactive ref backs route.query so a query change actually fires the view's route watcher.
+const { replace, routeQuery } = vi.hoisted(() => {
+  return { replace: vi.fn(), routeQuery: { current: null as unknown as ReturnType<typeof ref> } }
+})
+vi.mock('vue-router', async () => {
+  const { ref } = await import('vue')
+  routeQuery.current = ref<Record<string, string | string[]>>({})
+  return {
+    useRoute: () => ({
+      get query() {
+        return routeQuery.current.value
+      },
+    }),
+    useRouter: () => ({ replace }),
+  }
+})
 vi.mock('@/composables/useTags', () => ({ useTags: () => ({ data: ref([]) }) }))
+function setQuery(q: Record<string, string | string[]>) {
+  routeQuery.current.value = q
+}
 
 import SearchView from '@/views/SearchView.vue'
 
@@ -38,18 +46,30 @@ function mountSearch() {
 
 describe('SearchView', () => {
   it('shows a hint and no feed when the URL carries no filter', () => {
-    routeQuery.value = {}
+    setQuery({})
     const wrapper = mountSearch()
     expect(wrapper.find('[data-test="search-hint"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="feed-stub"]').exists()).toBe(false)
   })
 
   it('renders the feed with the filter parsed from the URL query', () => {
-    routeQuery.value = { q: 'beach', tag: ['work'] }
+    setQuery({ q: 'beach', tag: ['work'] })
     const wrapper = mountSearch()
     const feed = wrapper.find('[data-test="feed-stub"]')
     expect(feed.exists()).toBe(true)
     expect(feed.text()).toContain('"q":"beach"')
     expect(feed.text()).toContain('"tag":["work"]')
+  })
+
+  it('re-seeds the feed on query-only navigation (no full remount)', async () => {
+    setQuery({ q: 'beach' })
+    const wrapper = mountSearch()
+    expect(wrapper.find('[data-test="feed-stub"]').text()).toContain('"q":"beach"')
+    // simulate a sidebar tag link / back-forward that only changes the query while mounted
+    setQuery({ tag: ['work'] })
+    await wrapper.vm.$nextTick()
+    const feed = wrapper.find('[data-test="feed-stub"]')
+    expect(feed.text()).toContain('"tag":["work"]')
+    expect(feed.text()).not.toContain('beach')
   })
 })
