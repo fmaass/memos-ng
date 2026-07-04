@@ -145,16 +145,17 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
 # --- send side (Phase 2): render + email, driven by the worker ---
 
 
-def render_for_frame(original_path: str, captured_at: datetime | None = None) -> bytes:
+def render_for_frame(original_path: str, photo_date: datetime | None = None) -> bytes:
     """Render an attachment original into a frame-ready JPEG (returns bytes; never persisted).
 
     Downscaled to a 2048px longest edge (never upscaled — Aura resizes to its <=2048x1536 panel
     anyway, so this is visually lossless on the frame and keeps the JPEG under iCloud's 20MB and
     Aura's ~9.5MB caps), JPEG quality 95 with 4:4:4 chroma, EXIF preserved with Orientation
     normalized to 1 after ImageOps.exif_transpose bakes rotation into the pixels. DateTimeOriginal
-    is backfilled from captured_at ONLY when the source lacks it (stored curated screen-PNGs have no
-    EXIF, and Aura sorts chronologically by that tag). HEIC decodes via pillow-heif. Synchronous CPU
-    work — call under to_thread.run_sync."""
+    is backfilled from photo_date ONLY when the source lacks it (stored curated screen-PNGs have no
+    EXIF, and Aura sorts chronologically by that tag — callers pass the memo's date, the intended
+    frame position). HEIC decodes via pillow-heif. Synchronous CPU work — call under
+    to_thread.run_sync."""
     with Image.open(original_path) as raw:
         img = ImageOps.exif_transpose(raw).convert("RGB")
         if max(img.size) > FRAME_MAX_EDGE:
@@ -162,8 +163,8 @@ def render_for_frame(original_path: str, captured_at: datetime | None = None) ->
         exif = img.getexif()
         exif[_EXIF_ORIENTATION] = 1  # pixels already normalized; keep the tag consistent
         exif_ifd = exif.get_ifd(_EXIF_OFFSET)
-        if not exif_ifd.get(_EXIF_DATETIME_ORIGINAL) and captured_at is not None:
-            exif_ifd[_EXIF_DATETIME_ORIGINAL] = captured_at.strftime(_EXIF_DT_FMT)
+        if not exif_ifd.get(_EXIF_DATETIME_ORIGINAL) and photo_date is not None:
+            exif_ifd[_EXIF_DATETIME_ORIGINAL] = photo_date.strftime(_EXIF_DT_FMT)
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=FRAME_JPEG_QUALITY, subsampling=0, exif=exif)
     return buf.getvalue()
@@ -207,9 +208,11 @@ def _is_permanent_smtp_error(exc: Exception) -> bool:
     return isinstance(code, int) and 500 <= code < 600
 
 
-async def _revalidate(db: AsyncSession, job: FrameShareJob) -> tuple[Attachment, User] | None:
+async def _revalidate(
+    db: AsyncSession, job: FrameShareJob
+) -> tuple[Attachment, Memo, User] | None:
     """Best-effort send-time revalidation (see plan D2 — NOT lock-held across the SMTP round-trip).
-    Returns (attachment, owner) if the job is still eligible, else None → the worker marks it
+    Returns (attachment, memo, owner) if the job is still eligible, else None → the worker marks it
     `skipped`. Catches every realistic case: memo deleted / un-#curated / attachment unlinked /
     settings cleared / original missing / feature disabled."""
     if not server_smtp_configured():
@@ -234,7 +237,7 @@ async def _revalidate(db: AsyncSession, job: FrameShareJob) -> tuple[Attachment,
         return None
     if not att.storage_path or not await to_thread.run_sync(_file_exists, att.storage_path):
         return None
-    return att, user
+    return att, memo, user
 
 
 async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
@@ -247,12 +250,15 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         await db.flush()
         logger.info("frame_share.skipped", job_id=job.id)
         return "skipped"
-    att, user = reval
+    att, memo, user = reval
     assert att.storage_path is not None  # _revalidate guarantees a present file
     assert user.frame_send_from is not None and user.frame_send_to is not None
     filename = Path(att.filename).stem + ".jpg"
+    # Stamp DateTimeOriginal from the MEMO's date, not attachment.captured_at: for curated exports
+    # captured_at is unreliable (mostly NULL, else upload time); the memo's created_at is the user's
+    # curated/back-dated event date — the intended chronological position on the frame.
     try:
-        jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, att.captured_at)
+        jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
         if len(jpeg) > FRAME_SIZE_WARN_BYTES:
             logger.warning("frame_share.render_large", job_id=job.id, bytes=len(jpeg))
         await send_frame_share(
