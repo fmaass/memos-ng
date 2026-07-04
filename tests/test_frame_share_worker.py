@@ -117,6 +117,9 @@ async def test_send_builds_one_jpeg_attachment_over_starttls(monkeypatch):
     assert len(atts) == 1 and atts[0].get_content_type() == "image/jpeg"
     assert msg["From"] == "a@me.com" and msg["To"] == "f@send.auraframes.com"
     assert captured["kw"]["start_tls"] is True and captured["kw"]["hostname"] == "smtp.example"
+    # Explicit send timeout (not aiosmtplib's 60s default) so a hung SMTP server can't stall the
+    # worker drain long enough to flap the healthcheck.
+    assert captured["kw"]["timeout"] == 30
 
 
 # --- process_claimed_job state machine (adb; the worker owns commits, so no commit here) ---

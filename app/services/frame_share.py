@@ -69,6 +69,9 @@ FRAME_MAX_EDGE = 2048  # downscale to this longest edge (never upscale); = Aura'
 FRAME_SIZE_WARN_BYTES = 9 * 1024 * 1024
 FRAME_MAX_ATTEMPTS = 5
 FRAME_BACKOFF_BASE_S = 60  # exponential: BASE * 2**(attempts-1)
+# Explicit SMTP timeout (aiosmtplib defaults to 60s). A hung server must not stall the worker
+# drain long enough to flap the healthcheck — 30s is generous for a single small JPEG.
+SMTP_TIMEOUT_S = 30
 
 _EXIF_ORIENTATION = 0x0112
 _EXIF_OFFSET = 0x8769  # pointer to the Exif sub-IFD (where DateTimeOriginal lives)
@@ -205,6 +208,7 @@ async def send_frame_share(
         start_tls=True,
         username=settings.SMTP_USERNAME,
         password=settings.SMTP_PASSWORD,
+        timeout=SMTP_TIMEOUT_S,
     )
 
 
