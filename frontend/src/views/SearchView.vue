@@ -1,39 +1,65 @@
 <script setup lang="ts">
-import InputText from 'primevue/inputtext'
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
+import FilterBar from '@/components/FilterBar.vue'
 import MemoFeed from '@/components/MemoFeed.vue'
-import type { MemoQuery } from '@/composables/useTimeline'
+import {
+  filterFromSearchParams,
+  filterToQuery,
+  filterToRouteQuery,
+  filterToSearchParams,
+  isEmptyFilter,
+  type MemoFilter,
+} from '@/lib/memoFilter'
 
-const term = ref('')
-const debounced = ref('')
-let timer: ReturnType<typeof setTimeout> | undefined
+const route = useRoute()
+const router = useRouter()
 
-function onInput() {
-  clearTimeout(timer)
-  timer = setTimeout(() => {
-    debounced.value = term.value.trim()
-  }, 300)
+// Seed from the URL so a linked/reloaded filtered search restores exactly.
+const filter = ref<MemoFilter>(filterFromSearchParams(route.query))
+
+// Canonical string form of a filter — the loop guard for the two-way URL sync (equal filters
+// serialize identically; a no-op change never triggers a router.replace or a re-seed).
+function canon(f: MemoFilter): string {
+  return filterToSearchParams(f).toString()
 }
-onUnmounted(() => clearTimeout(timer))
 
-const query = computed<MemoQuery>(() => {
-  const q: MemoQuery = {}
-  if (debounced.value) q.q = debounced.value
-  return q
-})
+// filter -> URL: reflect the active filter into the address bar (linkable, reload-stable; the same
+// serialization A6 stores). Guarded so an already-represented filter doesn't churn replace().
+watch(
+  filter,
+  (f) => {
+    if (canon(f) !== canon(filterFromSearchParams(route.query))) {
+      void router.replace({ query: filterToRouteQuery(f) })
+    }
+  },
+  { deep: true },
+)
+
+// URL -> filter: Vue Router reuses this component across query-only navigations (e.g. a sidebar
+// tag link, back/forward, or the header search link while already on Search), so re-seed the
+// filter whenever the URL diverges from it. Same guard prevents a feedback loop with the watcher
+// above.
+watch(
+  () => route.query,
+  () => {
+    const fromUrl = filterFromSearchParams(route.query)
+    if (canon(fromUrl) !== canon(filter.value)) filter.value = fromUrl
+  },
+)
+
+const active = computed(() => !isEmptyFilter(filter.value))
+const query = computed(() => filterToQuery(filter.value))
 </script>
 
 <template>
   <section class="max-w-2xl mx-auto p-4 flex flex-col gap-3" data-test="view-search">
     <h1 class="text-2xl font-semibold">Search</h1>
-    <InputText
-      v-model="term"
-      placeholder="Search memos…"
-      data-test="search-input"
-      @input="onInput"
-    />
-    <MemoFeed v-if="debounced" :query="query" />
-    <p v-else class="text-muted-color text-sm" data-test="search-hint">Type to search your memos.</p>
+    <FilterBar v-model="filter" />
+    <MemoFeed v-if="active" :query="query" />
+    <p v-else class="text-muted-color text-sm" data-test="search-hint">
+      Type or pick a filter to search your memos.
+    </p>
   </section>
 </template>

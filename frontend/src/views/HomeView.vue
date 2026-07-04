@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router'
 
 import CaptureEditor from '@/components/CaptureEditor.vue'
 import MemoFeed from '@/components/MemoFeed.vue'
-import type { MemoQuery } from '@/composables/useTimeline'
+import { filterFromSearchParams, filterToQuery } from '@/lib/memoFilter'
 
 // Refetch the feed when a memo is posted so it appears immediately. (Live media status is handled
 // app-wide by useMediaEvents in App.vue.)
@@ -14,14 +14,10 @@ function onSaved() {
   void queryClient.invalidateQueries({ queryKey: ['memos'] })
 }
 
-// A ?tag= from the sidebar tag list filters the feed to that tag.
+// The feed honours any filter present in the URL (e.g. a ?tag= from the sidebar tag list), parsed
+// through the shared memoFilter module so Home and Search agree on one serialization.
 const route = useRoute()
-const query = computed<MemoQuery>(() => {
-  const q: MemoQuery = {}
-  const tag = route.query.tag
-  if (typeof tag === 'string' && tag) q.tag = [tag]
-  return q
-})
+const query = computed(() => filterToQuery(filterFromSearchParams(route.query)))
 </script>
 
 <template>
