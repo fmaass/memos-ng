@@ -178,6 +178,47 @@ async def test_process_success_marks_sent(adb, monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
+async def test_process_stamps_memo_date_not_captured_at(adb, monkeypatch, tmp_path):
+    # Frame ordering key is the MEMO's date, not attachment.captured_at (unreliable for exports).
+    captured = {}
+
+    async def fake_send(msg, **kw):
+        captured["msg"] = msg
+        return ({}, "250 ok")
+
+    monkeypatch.setattr(fs.aiosmtplib, "send", fake_send)
+    monkeypatch.setattr(settings, "SMTP_USERNAME", "s@me.com")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "pw")
+    u = User(
+        subject=f"u-{secrets.token_hex(4)}", role="user",
+        frame_send_to="f@send.auraframes.com", frame_send_from="s@me.com",
+    )
+    adb.add(u)
+    await adb.flush()
+    src = tmp_path / "src.png"
+    Image.new("RGB", (50, 40), (1, 2, 3)).save(src, "PNG")  # PNG source → no EXIF
+    att = Attachment(
+        uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/png",
+        size=1, status=AttachmentStatus.ready, storage_path=str(src),
+        captured_at=datetime(2020, 1, 1, tzinfo=UTC),  # deliberately WRONG/old
+    )
+    adb.add(att)
+    await adb.flush()
+    memo = await memos_svc.create_memo(
+        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid],
+        created_at=datetime(2026, 5, 12, 9, 30, 0, tzinfo=UTC),  # the intended frame date
+    )
+    job = FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
+                        state=FrameShareState.claimed, attempts=0)
+    adb.add(job)
+    await adb.flush()
+    assert await fs.process_claimed_job(adb, job) == "sent"
+    part = next(captured["msg"].iter_attachments())
+    im = Image.open(io.BytesIO(part.get_payload(decode=True)))
+    dto = im.getexif().get_ifd(0x8769).get(0x9003)
+    assert dto == "2026:05:12 09:30:00"  # memo date, NOT captured_at's 2020
+
+
 async def test_process_transient_smtp_retries_with_backoff(adb, monkeypatch, tmp_path):
     _record_send(monkeypatch, [], exc=fs.aiosmtplib.SMTPServerDisconnected("conn lost"))
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
