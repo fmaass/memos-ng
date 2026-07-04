@@ -21,7 +21,7 @@ todos:
     status: done
   - id: "p4-deploy-acceptance"
     content: "Phase 4 — /safe-deploy + acceptance: photo visibly lands on the frame"
-    status: pending
+    status: done
 isProject: false
 ---
 
@@ -495,6 +495,26 @@ the 4047×2698 curated source, full-resolution, no chroma subsampling (4:4:4):
 - q100 → **12.78 MB** — exceeds Aura's ~9.5 MB web-uploader proxy cap; likely rejected.
 - q95 → **4.16 MB** — safe under the cap, visually indistinguishable from q100.
 - (plan's 2400 px q88 → 654 KB — delivered fine but user-rejected as too low quality.)
+**SUPERSEDED 2026-07-04 — full-res is UNDELIVERABLE, capped at 2048px.** The production backfill
+proved the full-res decision below was wrong: real curated exports average ~8600px / 82MB source
+(max 138MB), and full-res q95 rendered to 20-46MB JPEGs which iCloud rejects (`552 5.3.4 Message
+size exceeds fixed limit`, 20MB cap) and blow Aura's ~9.5MB proxy cap. First 11 backfill sends all
+failed. Fix (commit c53699d): `render_for_frame` downscales to a **2048px longest edge** (never
+upscales) — = Aura's largest-ever panel, which it resizes to on ingestion anyway, so visually
+lossless on the frame; renders drop to ~0.7-2MB. Verified live: the 138MB source renders to
+2048×1365 / 2.25MB. The full-res paragraph below is retained only as the record of the reversed
+decision.
+
+**Phase 4 deploy (2026-07-04):** merged PR #21 (feature) + #22 (2048px cap fix) to main via CI
+(all jobs green, Trivy-scanned images). Deployed to Saturn by digest pin
+(`@sha256:d4faeb1b…`) + `up -d --force-recreate`; migration `f156a444d37e` applied on start.
+SMTP creds in the Saturn stack `.env` (worker only — the Merkur slow-lane worker runs an old
+0.1.0 image without frame code + no SMTP, so it never claims frame jobs; the `server_smtp_configured`
+guard is belt-and-suspenders). Acceptance: a test image and the paced backfill photos land on the
+physical frame (user-confirmed). **Backfill:** 166 pre-existing #curated screen images (print
+renditions correctly excluded) enqueued and drained at ~45s spacing (user choice — keeps the
+thermally-bound NAS cool; 0 thermal defers observed) over ~2h.
+
 **DECIDED Phase 2 render spec (user-confirmed 2026-07-03; both a 2400 px q88 and a
 full-res q95 4:4:4 render were frame-confirmed this session):** full resolution from
 `storage_path` (no downscale; Aura resizes to its ≤2048×1536 panel server-side anyway),
