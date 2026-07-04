@@ -33,12 +33,24 @@ def _write_jpeg(path, size=(120, 80), color=(30, 60, 90), orientation=None, dto=
     img.save(path, "JPEG", exif=exif)
 
 
-def test_render_full_res_no_upscale_or_downscale(tmp_path):
+def test_render_small_image_not_upscaled(tmp_path):
     p = tmp_path / "o.jpg"
     _write_jpeg(p, (140, 90))
     im = Image.open(io.BytesIO(fs.render_for_frame(str(p))))
     assert im.format == "JPEG"
-    assert im.size == (140, 90)  # neither upscaled nor downscaled
+    assert im.size == (140, 90)  # below the cap → unchanged, never upscaled
+
+
+def test_render_large_image_downscaled_to_2048_longest_edge(tmp_path):
+    # Real curated exports are ~8600px; render must cap the longest edge so the JPEG stays under
+    # iCloud's 20MB / Aura's 9.5MB limits (regression: full-res rendered 20-46MB and iCloud 552'd).
+    p = tmp_path / "big.jpg"
+    _write_jpeg(p, (6000, 4000))
+    out = fs.render_for_frame(str(p))
+    im = Image.open(io.BytesIO(out))
+    assert max(im.size) == fs.FRAME_MAX_EDGE == 2048  # longest edge capped
+    assert im.size == (2048, 1365)  # aspect ratio preserved
+    assert len(out) < 9 * 1024 * 1024  # safely under Aura's proxy cap
 
 
 def test_render_backfills_datetimeoriginal_from_captured_at(tmp_path):
