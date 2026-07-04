@@ -115,6 +115,42 @@ def test_frame_test_success_reports_acceptance_not_delivery(logged_in_client, mo
     assert len(sent) == 1
 
 
+def test_frame_test_rejects_persisted_non_aura_send_to(logged_in_client, monkeypatch):
+    # Defense in depth: the Aura-domain validator only runs on PATCH, so a legacy row persisted
+    # BEFORE that validator existed can hold an arbitrary address. The send path must re-check at
+    # read time — otherwise frame-test stays an SMTP primitive to any persisted recipient.
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "SMTP_USERNAME", "u@me.com")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "pw")
+    # Seed the legacy state directly in the DB, bypassing the PATCH validator.
+    from sqlalchemy import create_engine, text
+
+    from tests.conftest import SYNC_URL
+
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text(
+                "UPDATE users SET frame_send_to = 'victim@example.com', "
+                "frame_send_from = 'me@me.com' WHERE subject = :s"
+            ),
+            {"s": subject},
+        )
+    eng.dispose()
+
+    sent = []
+
+    async def fake_send(msg, **kw):
+        sent.append(msg)
+        return ({}, "250 ok")
+
+    monkeypatch.setattr(frame_share.aiosmtplib, "send", fake_send)
+    r = client.post("/api/settings/frame-test")
+    assert r.status_code == 400
+    assert "send.auraframes.com" in r.json()["detail"]
+    assert sent == []  # never reached SMTP
+
+
 def test_frame_test_cooldown_returns_429_on_rapid_reuse(logged_in_client, monkeypatch):
     # frame-test is an authenticated send primitive through the server SMTP account. A per-user
     # cooldown stops it being hammered: the first call sends, an immediate second is 429.

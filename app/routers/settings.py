@@ -110,6 +110,12 @@ async def frame_test(user: Annotated[User, Depends(auth.require_user)]) -> Frame
         raise HTTPException(status_code=400, detail="Frame sharing is not configured on the server")
     if not (user.frame_send_to and user.frame_send_from):
         raise HTTPException(status_code=400, detail="Set a send-to and send-from address first.")
+    if not frame_share.frame_settings_valid(user):
+        # Read-time re-check (shared predicate): a legacy row persisted before the PATCH-time Aura
+        # validator must not make frame-test an SMTP primitive to an arbitrary recipient.
+        raise HTTPException(
+            status_code=400, detail="send-to must be an @send.auraframes.com address"
+        )
     now = time.monotonic()
     last = _frame_test_cooldown.get(user.id)
     if last is not None and now - last < FRAME_TEST_COOLDOWN_S:

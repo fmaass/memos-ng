@@ -55,6 +55,20 @@ def is_aura_send_to(value: str) -> bool:
     return is_valid_email(v) and v.endswith("@" + AURA_SEND_DOMAIN)
 
 
+def frame_settings_valid(user: User) -> bool:
+    """The single read-time predicate for 'this user's persisted Aura settings are usable': both
+    addresses set AND send_to is an Aura ingestion address. Defense in depth — the PATCH validator
+    enforces the domain on write, but a legacy row persisted before that validator (or written
+    around the API) would otherwise turn every send path into an arbitrary-recipient SMTP
+    primitive. Shared by frame-test, enqueue, and send-time revalidation so the three sites can't
+    drift."""
+    return bool(
+        user.frame_send_to
+        and user.frame_send_from
+        and is_aura_send_to(user.frame_send_to)
+    )
+
+
 def render_test_image() -> bytes:
     """Produce the settings 'Send test photo' JPEG by running a generated source through the REAL
     render_for_frame — so the test-send exercises the actual render path (open, exif_transpose,
@@ -119,7 +133,7 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     memo write)."""
     if not server_smtp_configured():
         return 0
-    if not (user.frame_send_to and user.frame_send_from):
+    if not frame_settings_valid(user):  # includes the Aura-domain check on legacy rows
         return 0
 
     has_curated = (
@@ -259,8 +273,11 @@ async def _revalidate(
     memo = await db.get(Memo, job.memo_id)
     if memo is None:
         return None
+    # frame_settings_valid re-checks the Aura domain at send time: a legacy non-Aura send_to skips
+    # the job rather than emailing an arbitrary recipient. Once the user fixes the address, the
+    # resurrection path (skipped → queued on the next enqueue) gives the photo another chance.
     user = await db.get(User, job.user_id)
-    if user is None or not (user.frame_send_to and user.frame_send_from):
+    if user is None or not frame_settings_valid(user):
         return None
     still_curated = (
         await db.execute(

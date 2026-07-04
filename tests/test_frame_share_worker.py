@@ -302,6 +302,19 @@ async def test_process_server_smtp_unset_skips(adb, monkeypatch, tmp_path):
     assert job.state is FrameShareState.skipped and calls == []
 
 
+async def test_process_non_aura_send_to_skips(adb, monkeypatch, tmp_path):
+    # Defense in depth against legacy rows: a persisted non-Aura send_to (predating the PATCH-time
+    # validator) must fail send-time revalidation — the job goes skipped, nothing reaches SMTP.
+    # Once the user fixes the address, the resurrection path re-queues it on the next memo edit.
+    calls = []
+    _record_send(monkeypatch, calls)
+    job, _att, _memo, u = await _make_claimed(adb, monkeypatch, tmp_path)
+    u.frame_send_to = "victim@example.com"  # bypasses the PATCH validator, like a legacy DB row
+    await adb.flush()
+    assert await fs.process_claimed_job(adb, job) == "skipped"
+    assert job.state is FrameShareState.skipped and calls == []
+
+
 # --- run_frame_share_drain isolates errors from the worker loop (media stays alive) ---
 
 

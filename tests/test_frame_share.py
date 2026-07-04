@@ -265,6 +265,26 @@ async def test_queued_retry_job_untouched(adb, monkeypatch):
     assert job.next_attempt_at is not None  # backoff preserved
 
 
+async def test_non_aura_send_to_no_jobs(adb, monkeypatch):
+    # Defense in depth against legacy rows: a persisted send_to predating the PATCH-time Aura
+    # validator must read as not-configured at enqueue time — no jobs to an arbitrary address.
+    monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-specific-pw")
+    u = User(
+        subject="legacy", role="user",
+        frame_send_to="victim@example.com", frame_send_from="sender@me.com",
+    )
+    adb.add(u)
+    await adb.flush()
+    adb.add(_img(u.id, "i1"))
+    await adb.flush()
+    memo = await svc.create_memo(
+        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=["i1"]
+    )
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
+    assert await _job_count(adb, memo) == 0
+
+
 async def test_owner_missing_settings_no_jobs(adb, monkeypatch):
     monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
     monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-specific-pw")
