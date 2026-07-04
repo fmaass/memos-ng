@@ -313,3 +313,46 @@ def test_list_memos_endpoint_omits_total_by_default(logged_in_client):
     assert client.get("/api/memos").json()["totalCount"] is None
     # Explicit opt-in computes it.
     assert client.get("/api/memos?with_total=true").json()["totalCount"] == 2
+
+
+def test_memo_create_survives_frame_enqueue_error(logged_in_client, monkeypatch):
+    """The optional frame-share enqueue is savepoint-isolated: an unexpected error inside it (even
+    after a partial DB write) must NOT abort the core memo save, and its partial work is rolled
+    back. Without the SAVEPOINT the raise would 500 the endpoint and lose the memo."""
+    client, _ = logged_in_client
+    from app.routers import memos as memos_router
+
+    async def insert_probe_then_boom(db, memo, user):
+        from app.models import Tag
+
+        db.add(Tag(name="frame-savepoint-probe"))
+        await db.flush()  # a real write inside the enqueue's savepoint
+        raise RuntimeError("enqueue exploded after a partial write")
+
+    monkeypatch.setattr(
+        memos_router.frame_share_svc, "maybe_enqueue_frame_shares", insert_probe_then_boom
+    )
+    r = client.post("/api/memos", json={"content": "core write must survive"})
+    assert r.status_code in (200, 201)  # NOT a 500 — the memo save is not hostage to the feature
+    uid = r.json()["uid"]
+    assert client.get(f"/api/memos/{uid}").status_code == 200  # memo persisted
+
+    eng = create_engine(SYNC_URL)
+    try:
+        with eng.connect() as c:
+            probe = c.execute(
+                text("SELECT count(*) FROM tags WHERE name = 'frame-savepoint-probe'")
+            ).scalar()
+            jobs = c.execute(
+                text(
+                    "SELECT count(*) FROM frame_share_jobs j JOIN memos m ON j.memo_id = m.id "
+                    "WHERE m.uid = :uid"
+                ),
+                {"uid": uid},
+            ).scalar()
+        assert probe == 0  # savepoint rolled the partial write back
+        assert jobs == 0  # no frame-share job leaked
+    finally:
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM tags WHERE name = 'frame-savepoint-probe'"))
+        eng.dispose()

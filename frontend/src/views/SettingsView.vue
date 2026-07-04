@@ -9,7 +9,13 @@ import PatManager from '@/components/PatManager.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
 import { useSession } from '@/composables/useSession'
-import { type SettingsPatch, frameTestMessage, useSettings } from '@/composables/useSettings'
+import {
+  type SettingsPatch,
+  frameErrorText,
+  frameIsDirty,
+  frameTestMessage,
+  useSettings,
+} from '@/composables/useSettings'
 
 const version = __APP_VERSION__
 const { data: user } = useSession()
@@ -43,9 +49,28 @@ watch(
 )
 const frameResult = ref<{ severity: 'success' | 'error'; text: string } | null>(null)
 
-function saveFrame() {
+// The test endpoint uses the PERSISTED settings, so a "test" of unsaved edits would report on the
+// stale address. Disable the test button until edits are saved (buffers match persisted).
+const frameDirty = computed(() =>
+  frameIsDirty(
+    { to: frameSendTo.value, from: frameSendFrom.value },
+    { to: settings.value?.frame_send_to, from: settings.value?.frame_send_from },
+  ),
+)
+
+async function saveFrame() {
   frameResult.value = null
-  update.mutate({ frame_send_to: frameSendTo.value, frame_send_from: frameSendFrom.value })
+  try {
+    await update.mutateAsync({
+      frame_send_to: frameSendTo.value,
+      frame_send_from: frameSendFrom.value,
+    })
+    frameResult.value = { severity: 'success', text: 'Saved.' }
+  } catch (e) {
+    // Surface a backend rejection (e.g. 422 for a non-Aura address) instead of silently swallowing
+    // it — otherwise the user believes an invalid address was saved.
+    frameResult.value = { severity: 'error', text: frameErrorText(e) }
+  }
 }
 async function sendFrameTest() {
   frameResult.value = null
@@ -180,7 +205,7 @@ function setTheme(value: string) {
           severity="secondary"
           icon="pi pi-image"
           :loading="frameTest.isPending.value"
-          :disabled="!frameSendTo || !frameSendFrom"
+          :disabled="!frameSendTo || !frameSendFrom || frameDirty"
           data-test="frame-test"
           @click="sendFrameTest"
         />

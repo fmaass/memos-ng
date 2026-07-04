@@ -41,6 +41,34 @@ def is_valid_email(value: str) -> bool:
     return bool(_EMAIL_RE.match(value or ""))
 
 
+# The frame send-to must be an Aura ingestion address. The leading "@" anchor blocks both
+# subdomain spoofing ("@evilsend.auraframes.com") and suffix-append spoofing
+# ("...auraframes.com.evil.com"). frame_send_from stays shape-only — Aura membership enforces it.
+AURA_SEND_DOMAIN = "send.auraframes.com"
+
+
+def is_aura_send_to(value: str) -> bool:
+    """True only for a shaped email whose domain is exactly Aura's ingestion domain (case-
+    insensitive). Used by the settings validator so the server SMTP account can't be pointed at an
+    arbitrary recipient."""
+    v = (value or "").lower()
+    return is_valid_email(v) and v.endswith("@" + AURA_SEND_DOMAIN)
+
+
+def frame_settings_valid(user: User) -> bool:
+    """The single read-time predicate for 'this user's persisted Aura settings are usable': both
+    addresses set AND send_to is an Aura ingestion address. Defense in depth — the PATCH validator
+    enforces the domain on write, but a legacy row persisted before that validator (or written
+    around the API) would otherwise turn every send path into an arbitrary-recipient SMTP
+    primitive. Shared by frame-test, enqueue, and send-time revalidation so the three sites can't
+    drift."""
+    return bool(
+        user.frame_send_to
+        and user.frame_send_from
+        and is_aura_send_to(user.frame_send_to)
+    )
+
+
 def render_test_image() -> bytes:
     """Produce the settings 'Send test photo' JPEG by running a generated source through the REAL
     render_for_frame — so the test-send exercises the actual render path (open, exif_transpose,
@@ -69,6 +97,9 @@ FRAME_MAX_EDGE = 2048  # downscale to this longest edge (never upscale); = Aura'
 FRAME_SIZE_WARN_BYTES = 9 * 1024 * 1024
 FRAME_MAX_ATTEMPTS = 5
 FRAME_BACKOFF_BASE_S = 60  # exponential: BASE * 2**(attempts-1)
+# Explicit SMTP timeout (aiosmtplib defaults to 60s). A hung server must not stall the worker
+# drain long enough to flap the healthcheck — 30s is generous for a single small JPEG.
+SMTP_TIMEOUT_S = 30
 
 _EXIF_ORIENTATION = 0x0112
 _EXIF_OFFSET = 0x8769  # pointer to the Exif sub-IFD (where DateTimeOriginal lives)
@@ -94,12 +125,15 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     number of NEW rows inserted (0 when any guard fails or every attachment is already queued).
 
     Guards (all required): server SMTP configured, owner has both Aura settings, memo is #curated.
-    Idempotent per attachment via ON CONFLICT (attachment_id) DO NOTHING — so re-editing a curated
-    memo never resends existing photos, while a newly added image on an already-curated memo is
-    enqueued. Runs inside the caller's transaction (atomic with the memo write)."""
+    Idempotent per attachment via ON CONFLICT (attachment_id): a re-edit resurrects ONLY rows that
+    went terminal `skipped`/`failed` (reset to queued so a transiently-missed photo gets another
+    chance), while `sent` stays terminal (never resend), `claimed` is never touched (at-most-once
+    tombstone), and a live `queued` retry keeps its backoff. A newly added image on an
+    already-curated memo is enqueued fresh. Runs inside the caller's transaction (atomic with the
+    memo write)."""
     if not server_smtp_configured():
         return 0
-    if not (user.frame_send_to and user.frame_send_from):
+    if not frame_settings_valid(user):  # includes the Aura-domain check on legacy rows
         return 0
 
     has_curated = (
@@ -119,20 +153,35 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     for att in attachments:
         if not is_frame_image(att.mime):
             continue
+        # Core insert (needed for ON CONFLICT) does NOT apply the ORM column defaults, so set the
+        # NOT-NULL state/attempts explicitly. created_at uses the DB server_default.
+        ins = pg_insert(FrameShareJob).values(
+            attachment_id=att.id,
+            memo_id=memo.id,
+            user_id=user.id,
+            state=FrameShareState.queued,
+            attempts=0,
+        )
         result = await db.execute(
-            # Core insert (needed for ON CONFLICT) does NOT apply the ORM column defaults, so set
-            # the NOT-NULL state/attempts explicitly. created_at uses the DB server_default.
-            # RETURNING id yields a row on insert and nothing on conflict → a typed insert counter.
-            pg_insert(FrameShareJob)
-            .values(
-                attachment_id=att.id,
-                memo_id=memo.id,
-                user_id=user.id,
-                state=FrameShareState.queued,
-                attempts=0,
-            )
-            .on_conflict_do_nothing(index_elements=["attachment_id"])
-            .returning(FrameShareJob.id)
+            # On conflict, resurrect only terminal rows (skipped/failed) back to queued and clear
+            # their retry/claim bookkeeping; the WHERE keeps `sent`/`claimed`/live `queued` rows
+            # untouched. RETURNING id yields a row on a fresh insert OR a matched resurrection and
+            # nothing when the WHERE excludes the row → a typed "enqueued" counter.
+            ins.on_conflict_do_update(
+                index_elements=["attachment_id"],
+                set_={
+                    "state": FrameShareState.queued,
+                    "attempts": 0,
+                    "error": None,
+                    "next_attempt_at": None,
+                    "claimed_by": None,
+                    "memo_id": ins.excluded.memo_id,
+                    "user_id": ins.excluded.user_id,
+                },
+                where=FrameShareJob.state.in_(
+                    [FrameShareState.skipped, FrameShareState.failed]
+                ),
+            ).returning(FrameShareJob.id)
         )
         if result.first() is not None:
             inserted += 1
@@ -187,6 +236,7 @@ async def send_frame_share(
         start_tls=True,
         username=settings.SMTP_USERNAME,
         password=settings.SMTP_PASSWORD,
+        timeout=SMTP_TIMEOUT_S,
     )
 
 
@@ -223,8 +273,11 @@ async def _revalidate(
     memo = await db.get(Memo, job.memo_id)
     if memo is None:
         return None
+    # frame_settings_valid re-checks the Aura domain at send time: a legacy non-Aura send_to skips
+    # the job rather than emailing an arbitrary recipient. Once the user fixes the address, the
+    # resurrection path (skipped → queued on the next enqueue) gives the photo another chance.
     user = await db.get(User, job.user_id)
-    if user is None or not (user.frame_send_to and user.frame_send_from):
+    if user is None or not frame_settings_valid(user):
         return None
     still_curated = (
         await db.execute(
@@ -257,10 +310,24 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
     # Stamp DateTimeOriginal from the MEMO's date, not attachment.captured_at: for curated exports
     # captured_at is unreliable (mostly NULL, else upload time); the memo's created_at is the user's
     # curated/back-dated event date — the intended chronological position on the frame.
+    # Render step: a decode/render failure is a permanent data problem (corrupt original), not a
+    # transient send error. Fail terminally on the first attempt instead of retrying with backoff
+    # through all five (~15 min of churn) — and never reach SMTP.
     try:
         jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
-        if len(jpeg) > FRAME_SIZE_WARN_BYTES:
-            logger.warning("frame_share.render_large", job_id=job.id, bytes=len(jpeg))
+    except Exception as exc:
+        job.attempts += 1
+        job.state = FrameShareState.failed
+        job.error = str(exc)[:500]
+        await db.flush()
+        logger.warning(
+            "frame_share.render_failed", job_id=job.id, attempts=job.attempts, error=str(exc)[:200]
+        )
+        return "failed"
+    if len(jpeg) > FRAME_SIZE_WARN_BYTES:
+        logger.warning("frame_share.render_large", job_id=job.id, bytes=len(jpeg))
+    # Send step: SMTP errors keep the transient/permanent split (retry with backoff vs terminal).
+    try:
         await send_frame_share(
             from_addr=user.frame_send_from,
             to_addr=user.frame_send_to,

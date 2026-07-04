@@ -8,9 +8,13 @@ import { describe, expect, it, vi } from 'vitest'
 
 import SettingsView from '@/views/SettingsView.vue'
 
-const { mutate, frameTestMutateAsync } = vi.hoisted(() => ({
+const { mutate, mutateAsync, frameTestMutateAsync, persistedFrame } = vi.hoisted(() => ({
   mutate: vi.fn(),
+  mutateAsync: vi.fn().mockResolvedValue({}),
   frameTestMutateAsync: vi.fn().mockResolvedValue({ ok: true, detail: 'Accepted — check your frame.' }),
+  // Persisted frame settings the mocked useSettings reports; the component seeds its edit buffers
+  // from these, so buffers match persisted on mount (clean → test button enabled).
+  persistedFrame: { to: 'f@send.auraframes.com' as string | null, from: 'me@me.com' as string | null },
 }))
 vi.mock('@/composables/useSession', () => ({
   useSession: () => ({ data: ref({ subject: 'fabian', display_name: 'Fabian', email: 'f@x' }) }),
@@ -32,9 +36,9 @@ vi.mock('@/composables/useSettings', async () => {
     useSettings: () => ({
       settings: ref({
         default_visibility: 'PUBLIC', theme: 'dark', avatar: null,
-        frame_send_to: null, frame_send_from: null,
+        frame_send_to: persistedFrame.to, frame_send_from: persistedFrame.from,
       }),
-      update: { mutate },
+      update: { mutate, mutateAsync },
       frameTest: { mutateAsync: frameTestMutateAsync, isPending: ref(false) },
     }),
   }
@@ -74,21 +78,48 @@ describe('SettingsView', () => {
     expect(mutate).toHaveBeenCalledWith({ default_visibility: 'PRIVATE' })
   })
 
-  it('saves the Aura frame addresses and shows the test-send result', async () => {
+  it('saves the Aura frame addresses via mutateAsync and confirms with a banner', async () => {
+    mutateAsync.mockResolvedValueOnce({})
     const wrapper = mountSettings()
     expect(wrapper.find('[data-test="aura-frame"]').exists()).toBe(true)
-    // PrimeVue InputText forwards data-test to its <input>; setValue drives the v-model buffer.
-    await wrapper.find('[data-test="frame-send-to"]').setValue('f@send.auraframes.com')
-    await wrapper.find('[data-test="frame-send-from"]').setValue('me@me.com')
     await wrapper.find('[data-test="frame-save"]').trigger('click')
-    expect(mutate).toHaveBeenCalledWith({
+    await flushPromises()
+    expect(mutateAsync).toHaveBeenCalledWith({
       frame_send_to: 'f@send.auraframes.com',
       frame_send_from: 'me@me.com',
     })
+    expect(wrapper.find('[data-test="frame-test-result"]').text()).toContain('Saved')
+  })
 
-    await wrapper.find('[data-test="frame-test"]').trigger('click')
+  it('surfaces a backend save error instead of silently swallowing it', async () => {
+    // A 422 (e.g. a non-Aura address) must reach the user, not be lost to a fire-and-forget mutate.
+    mutateAsync.mockRejectedValueOnce({
+      detail: [{ msg: 'must be an @send.auraframes.com address' }],
+    })
+    const wrapper = mountSettings()
+    await wrapper.find('[data-test="frame-send-to"]').setValue('me@icloud.com')
+    await wrapper.find('[data-test="frame-save"]').trigger('click')
+    await flushPromises()
+    const banner = wrapper.find('[data-test="frame-test-result"]')
+    expect(banner.text()).toContain('@send.auraframes.com')
+    expect(banner.classes()).toContain('text-red-500')
+  })
+
+  it('sends a test photo when edits are saved (buffers match persisted)', async () => {
+    const wrapper = mountSettings()
+    const testBtn = wrapper.find('[data-test="frame-test"]')
+    expect(testBtn.attributes('disabled')).toBeUndefined() // clean → enabled
+    await testBtn.trigger('click')
     await flushPromises()
     expect(frameTestMutateAsync).toHaveBeenCalled()
     expect(wrapper.find('[data-test="frame-test-result"]').text()).toContain('check your frame')
+  })
+
+  it('disables Send test photo while edits differ from the saved address (dirty)', async () => {
+    const wrapper = mountSettings()
+    // Change the buffer away from the persisted value — testing now would report on the STALE
+    // saved address, so the button must be disabled until the edit is saved.
+    await wrapper.find('[data-test="frame-send-to"]').setValue('other@send.auraframes.com')
+    expect(wrapper.find('[data-test="frame-test"]').attributes('disabled')).toBeDefined()
   })
 })

@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
+import structlog
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -19,6 +20,20 @@ from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
 
 router = APIRouter(prefix="/api", tags=["memos"])
+
+logger = structlog.get_logger(__name__)
+
+
+async def _enqueue_frame_shares_safe(db: AsyncSession, memo: Memo, user: User) -> None:
+    """Enqueue frame shares inside a SAVEPOINT so an unexpected error in this optional feature
+    (tag join, pg_insert) can't abort the core memo write. On error the savepoint rolls back its
+    partial work — leaving the outer transaction usable — and the memo save proceeds. The core
+    write path must never be hostage to frame sharing."""
+    try:
+        async with db.begin_nested():
+            await frame_share_svc.maybe_enqueue_frame_shares(db, memo, user)
+    except Exception as exc:
+        logger.warning("frame_share.enqueue_error", memo_id=memo.id, error=str(exc)[:200])
 
 
 def _unlink_paths(paths: list[str]) -> None:
@@ -228,8 +243,8 @@ async def create_memo(
             moved_out=moved,  # placement into the memo folder appends here → unlinked on rollback
         )
         # After all attachments are linked, enqueue frame shares for #curated photos (no-op unless
-        # the feature is configured). Atomic with the memo write — same commit.
-        await frame_share_svc.maybe_enqueue_frame_shares(db, memo, user)
+        # the feature is configured). Savepoint-isolated so a feature error can't fail the save.
+        await _enqueue_frame_shares_safe(db, memo, user)
         await db.commit()
         committed = True
     finally:
@@ -278,7 +293,8 @@ async def patch_memo(
             await svc.link_attachments(db, user.id, memo, finalized, moved_out=moved)
         # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed tags,
         # so both "added #curated on edit" and "added a new photo to a curated memo" are caught.
-        await frame_share_svc.maybe_enqueue_frame_shares(db, memo, user)
+        # Savepoint-isolated so a feature error can't fail the memo save.
+        await _enqueue_frame_shares_safe(db, memo, user)
         await db.commit()
         committed = True
     finally:

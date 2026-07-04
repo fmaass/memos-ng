@@ -117,6 +117,9 @@ async def test_send_builds_one_jpeg_attachment_over_starttls(monkeypatch):
     assert len(atts) == 1 and atts[0].get_content_type() == "image/jpeg"
     assert msg["From"] == "a@me.com" and msg["To"] == "f@send.auraframes.com"
     assert captured["kw"]["start_tls"] is True and captured["kw"]["hostname"] == "smtp.example"
+    # Explicit send timeout (not aiosmtplib's 60s default) so a hung SMTP server can't stall the
+    # worker drain long enough to flap the healthcheck.
+    assert captured["kw"]["timeout"] == 30
 
 
 # --- process_claimed_job state machine (adb; the worker owns commits, so no commit here) ---
@@ -244,6 +247,25 @@ async def test_process_permanent_smtp_fails_immediately(adb, monkeypatch, tmp_pa
     assert job.state is FrameShareState.failed and job.attempts == 1
 
 
+async def test_process_render_failure_fails_immediately(adb, monkeypatch, tmp_path):
+    # A corrupt/undecodable original makes render_for_frame raise. That is a permanent data problem,
+    # NOT a transient send error — it must go terminal `failed` on the FIRST attempt, never churn
+    # through all five with backoff, and never reach SMTP.
+    calls = []
+    _record_send(monkeypatch, calls)
+    job, att, *_ = await _make_claimed(adb, monkeypatch, tmp_path, write_file=False)
+    bad = tmp_path / "corrupt.jpg"
+    bad.write_bytes(b"this is not a decodable image")
+    att.storage_path = str(bad)
+    await adb.flush()
+    assert await fs.process_claimed_job(adb, job) == "failed"
+    assert job.state is FrameShareState.failed
+    assert job.attempts == 1  # terminal on first attempt, no 5-attempt churn
+    assert job.next_attempt_at is None  # no retry scheduled
+    assert calls == []  # never reached the send step
+    assert job.error  # the decode error is recorded
+
+
 async def test_process_uncurated_skips_without_sending(adb, monkeypatch, tmp_path):
     calls = []
     _record_send(monkeypatch, calls)
@@ -278,6 +300,33 @@ async def test_process_server_smtp_unset_skips(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "SMTP_PASSWORD", "")
     assert await fs.process_claimed_job(adb, job) == "skipped"
     assert job.state is FrameShareState.skipped and calls == []
+
+
+async def test_process_non_aura_send_to_skips(adb, monkeypatch, tmp_path):
+    # Defense in depth against legacy rows: a persisted non-Aura send_to (predating the PATCH-time
+    # validator) must fail send-time revalidation — the job goes skipped, nothing reaches SMTP.
+    # Once the user fixes the address, the resurrection path re-queues it on the next memo edit.
+    calls = []
+    _record_send(monkeypatch, calls)
+    job, _att, _memo, u = await _make_claimed(adb, monkeypatch, tmp_path)
+    u.frame_send_to = "victim@example.com"  # bypasses the PATCH validator, like a legacy DB row
+    await adb.flush()
+    assert await fs.process_claimed_job(adb, job) == "skipped"
+    assert job.state is FrameShareState.skipped and calls == []
+
+
+# --- run_frame_share_drain isolates errors from the worker loop (media stays alive) ---
+
+
+async def test_frame_share_drain_swallows_errors(monkeypatch, db_engine):
+    # A raise out of run_frame_share_once (a DB error in claim/revalidate/commit) MUST NOT escape
+    # the drain — if it did, run()'s loop would crash and media processing would halt. The drain
+    # converts it to a non-processed 'error' status and continues.
+    async def boom(db):
+        raise RuntimeError("db exploded mid-claim")
+
+    monkeypatch.setattr(worker, "run_frame_share_once", boom)
+    assert await worker.run_frame_share_drain() == "error"
 
 
 # --- claim honors state + next_attempt_at ---

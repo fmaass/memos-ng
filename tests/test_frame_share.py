@@ -1,8 +1,22 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from app.config import settings
-from app.models import Attachment, AttachmentStatus, FrameShareJob, User, Visibility
+from app.models import (
+    Attachment,
+    AttachmentStatus,
+    FrameShareJob,
+    FrameShareState,
+    User,
+    Visibility,
+)
 from app.services import memos as svc
-from app.services.frame_share import is_frame_image, is_valid_email, maybe_enqueue_frame_shares
+from app.services.frame_share import (
+    is_aura_send_to,
+    is_frame_image,
+    is_valid_email,
+    maybe_enqueue_frame_shares,
+)
 from sqlalchemy import func, select
 
 
@@ -34,6 +48,24 @@ async def _job_count(adb, memo) -> int:
     ).scalar_one()
 
 
+async def _single_job(adb, memo) -> FrameShareJob:
+    return (
+        await adb.execute(select(FrameShareJob).where(FrameShareJob.memo_id == memo.id))
+    ).scalar_one()
+
+
+async def _curated_memo_with_job(adb, monkeypatch, subject="alice"):
+    """A configured user + a #curated memo with one image → exactly one enqueued (queued) job."""
+    u = await _configured_user(adb, monkeypatch, subject=subject)
+    adb.add(_img(u.id, "i1"))
+    await adb.flush()
+    memo = await svc.create_memo(
+        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=["i1"]
+    )
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 1
+    return u, memo, await _single_job(adb, memo)
+
+
 # --- pure predicate: one case per input category (Testing Integrity: routing heuristic) ---
 
 
@@ -60,6 +92,24 @@ def test_is_frame_image(mime, expected):
 )
 def test_is_valid_email(value, expected):
     assert is_valid_email(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("frame@send.auraframes.com", True),  # canonical Aura ingestion address
+        ("first.last@send.auraframes.com", True),
+        ("Frame@SEND.AURAFRAMES.COM", True),  # domain match is case-insensitive
+        ("me@icloud.com", False),  # shaped email but not the Aura domain
+        ("me@auraframes.com", False),  # missing the send. subdomain
+        ("me@evilsend.auraframes.com", False),  # the @ anchor blocks subdomain spoofing
+        ("frame@send.auraframes.com.evil.com", False),  # suffix-append spoof
+        ("not-an-email", False),
+        ("", False),
+    ],
+)
+def test_is_aura_send_to(value, expected):
+    assert is_aura_send_to(value) is expected
 
 
 # --- enqueue guard: one test per input category (plan Phase 1 verification) ---
@@ -143,6 +193,96 @@ async def test_new_attachment_on_curated_enqueues_only_new(adb, monkeypatch):
     await svc.link_attachments(adb, u.id, memo, ["i2"])
     assert await maybe_enqueue_frame_shares(adb, memo, u) == 1
     assert await _job_count(adb, memo) == 2
+
+
+# --- re-enqueue resurrection: one test per existing-row state category (P1-2) ---
+
+
+async def test_skipped_job_is_resurrected(adb, monkeypatch):
+    # A job that went terminal `skipped` (memo briefly un-#curated / original missing at send time)
+    # must be re-enqueable: re-editing the curated memo resets it to queued so the photo retries.
+    u, memo, job = await _curated_memo_with_job(adb, monkeypatch)
+    job.state = FrameShareState.skipped
+    job.attempts = 3
+    job.error = "was missing"
+    job.next_attempt_at = datetime.now(UTC) + timedelta(minutes=5)
+    job.claimed_by = "worker-x"
+    await adb.flush()
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 1  # resurrection counts as enqueued
+    await adb.refresh(job)
+    assert job.state is FrameShareState.queued
+    assert job.attempts == 0 and job.error is None
+    assert job.next_attempt_at is None and job.claimed_by is None
+    assert await _job_count(adb, memo) == 1  # resurrected in place, not duplicated
+
+
+async def test_failed_job_is_resurrected(adb, monkeypatch):
+    # A job that failed on bad addresses (later corrected) must get another chance on re-edit.
+    u, memo, job = await _curated_memo_with_job(adb, monkeypatch)
+    job.state = FrameShareState.failed
+    job.attempts = 5
+    job.error = "recipient refused"
+    await adb.flush()
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 1
+    await adb.refresh(job)
+    assert job.state is FrameShareState.queued and job.attempts == 0 and job.error is None
+    assert await _job_count(adb, memo) == 1
+
+
+async def test_sent_job_never_resurrected(adb, monkeypatch):
+    # `sent` is terminal — a re-edit must NEVER resend a photo already on the frame.
+    u, memo, job = await _curated_memo_with_job(adb, monkeypatch)
+    job.state = FrameShareState.sent
+    job.sent_at = datetime.now(UTC)
+    await adb.flush()
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
+    await adb.refresh(job)
+    assert job.state is FrameShareState.sent  # untouched
+
+
+async def test_claimed_job_never_touched(adb, monkeypatch):
+    # `claimed` is the at-most-once tombstone: an in-flight send must never be reset under it.
+    u, memo, job = await _curated_memo_with_job(adb, monkeypatch)
+    job.state = FrameShareState.claimed
+    job.claimed_by = "worker-1"
+    await adb.flush()
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
+    await adb.refresh(job)
+    assert job.state is FrameShareState.claimed and job.claimed_by == "worker-1"
+
+
+async def test_queued_retry_job_untouched(adb, monkeypatch):
+    # A queued job mid-backoff must keep its attempts/next_attempt_at — resurrection is only for
+    # terminal rows, never a live retry (that would erase the backoff schedule).
+    u, memo, job = await _curated_memo_with_job(adb, monkeypatch)
+    job.attempts = 2
+    future = datetime.now(UTC) + timedelta(minutes=10)
+    job.next_attempt_at = future
+    await adb.flush()
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
+    await adb.refresh(job)
+    assert job.state is FrameShareState.queued and job.attempts == 2
+    assert job.next_attempt_at is not None  # backoff preserved
+
+
+async def test_non_aura_send_to_no_jobs(adb, monkeypatch):
+    # Defense in depth against legacy rows: a persisted send_to predating the PATCH-time Aura
+    # validator must read as not-configured at enqueue time — no jobs to an arbitrary address.
+    monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-specific-pw")
+    u = User(
+        subject="legacy", role="user",
+        frame_send_to="victim@example.com", frame_send_from="sender@me.com",
+    )
+    adb.add(u)
+    await adb.flush()
+    adb.add(_img(u.id, "i1"))
+    await adb.flush()
+    memo = await svc.create_memo(
+        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=["i1"]
+    )
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
+    assert await _job_count(adb, memo) == 0
 
 
 async def test_owner_missing_settings_no_jobs(adb, monkeypatch):

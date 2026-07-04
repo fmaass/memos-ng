@@ -22,6 +22,31 @@ export function frameTestMessage(r: FrameTestResult): { severity: 'success' | 'e
   return { severity: r.ok ? 'success' : 'error', text: r.detail }
 }
 
+// Pure: are the local edit buffers different from the persisted values? Drives disabling
+// "Send test photo" — the test endpoint uses PERSISTED settings, so testing an unsaved address
+// would report a green result for the stale one. Extracted for happy-dom-free unit testing.
+export function frameIsDirty(
+  local: { to: string; from: string },
+  persisted: { to?: string | null; from?: string | null },
+): boolean {
+  return local.to !== (persisted.to ?? '') || local.from !== (persisted.from ?? '')
+}
+
+// Pure: turn a failed save (openapi-fetch error body, 422 validation array, or Error) into a
+// human banner so a backend rejection is surfaced instead of silently swallowed.
+export function frameErrorText(e: unknown): string {
+  if (e && typeof e === 'object' && 'detail' in e) {
+    const d = (e as { detail: unknown }).detail
+    if (typeof d === 'string') return d
+    if (Array.isArray(d) && d.length > 0) {
+      const first = d[0] as { msg?: unknown }
+      if (typeof first?.msg === 'string') return first.msg
+    }
+  }
+  if (e instanceof Error) return e.message
+  return 'Could not save the frame settings.'
+}
+
 // The current user's server-persisted settings (default memo visibility + theme).
 export function useSettings() {
   const api = useApi()
