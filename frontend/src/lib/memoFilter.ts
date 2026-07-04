@@ -30,6 +30,48 @@ export function isEmptyFilter(f: MemoFilter): boolean {
   )
 }
 
+// Active-filter pills: one descriptor per active field (one per tag), each with a stable `key`
+// that removeFilterKey understands. 'exclude' archived is the default and shows no pill.
+export interface FilterPill {
+  key: string
+  label: string
+}
+
+const VISIBILITY_LABEL: Record<Visibility, string> = {
+  PRIVATE: 'Private',
+  PROTECTED: 'Protected',
+  PUBLIC: 'Public',
+}
+
+export function pillsFor(f: MemoFilter): FilterPill[] {
+  const pills: FilterPill[] = []
+  if (f.text) pills.push({ key: 'text', label: `"${f.text}"` })
+  for (const t of f.tags ?? []) pills.push({ key: `tag:${t}`, label: `#${t}` })
+  if (f.visibility) pills.push({ key: 'visibility', label: VISIBILITY_LABEL[f.visibility] })
+  if (f.dateFrom) pills.push({ key: 'dateFrom', label: `From ${f.dateFrom}` })
+  if (f.dateTo) pills.push({ key: 'dateTo', label: `To ${f.dateTo}` })
+  if (f.archived === 'include') pills.push({ key: 'archived', label: 'Incl. archived' })
+  else if (f.archived === 'only') pills.push({ key: 'archived', label: 'Archived only' })
+  return pills
+}
+
+// Return a new filter (never mutating the input) with the piece named by `key` cleared. A
+// 'tag:<name>' key removes only that one tag; 'archived' resets to the default 'exclude'.
+export function removeFilterKey(f: MemoFilter, key: string): MemoFilter {
+  const next: MemoFilter = { ...f, tags: [...(f.tags ?? [])] }
+  if (key.startsWith('tag:')) {
+    const name = key.slice(4)
+    next.tags = next.tags.filter((t) => t !== name)
+  } else if (key === 'text') next.text = undefined
+  else if (key === 'visibility') next.visibility = undefined
+  else if (key === 'dateFrom') next.dateFrom = undefined
+  else if (key === 'dateTo') next.dateTo = undefined
+  // undefined is the canonical "default" (≡ 'exclude'); keeps a cleared filter deep-equal to
+  // emptyFilter() and round-trip-stable. The FilterBar maps undefined→'exclude' for display.
+  else if (key === 'archived') next.archived = undefined
+  return next
+}
+
 // A local 'YYYY-MM-DD' at 00:00:00.000 local time, offset by `addDays` (JS normalizes overflow,
 // so month/year rollover and DST are handled). Returns null for a malformed date string.
 function localMidnight(dateStr: string, addDays = 0): Date | null {
@@ -90,6 +132,19 @@ function toParams(input: URLSearchParams | LocationQueryLike): URLSearchParams {
     }
   }
   return sp
+}
+
+// The Vue Router LocationQuery form (for router.push/replace): repeated keys become arrays,
+// single keys stay strings — the array-based sibling of filterToSearchParams, round-tripping via
+// filterFromSearchParams (which accepts LocationQuery). Use this to sync the filter into the URL.
+export function filterToRouteQuery(f: MemoFilter): Record<string, string | string[]> {
+  const sp = filterToSearchParams(f)
+  const out: Record<string, string | string[]> = {}
+  for (const key of new Set(sp.keys())) {
+    const all = sp.getAll(key)
+    out[key] = all.length > 1 ? all : all[0]
+  }
+  return out
 }
 
 export function filterFromSearchParams(input: URLSearchParams | LocationQueryLike): MemoFilter {

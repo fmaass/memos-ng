@@ -1,39 +1,43 @@
 <script setup lang="ts">
-import InputText from 'primevue/inputtext'
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
+import FilterBar from '@/components/FilterBar.vue'
 import MemoFeed from '@/components/MemoFeed.vue'
-import type { MemoQuery } from '@/composables/useTimeline'
+import {
+  filterFromSearchParams,
+  filterToQuery,
+  filterToRouteQuery,
+  isEmptyFilter,
+  type MemoFilter,
+} from '@/lib/memoFilter'
 
-const term = ref('')
-const debounced = ref('')
-let timer: ReturnType<typeof setTimeout> | undefined
+const route = useRoute()
+const router = useRouter()
 
-function onInput() {
-  clearTimeout(timer)
-  timer = setTimeout(() => {
-    debounced.value = term.value.trim()
-  }, 300)
-}
-onUnmounted(() => clearTimeout(timer))
+// Seed from the URL so a linked/reloaded filtered search restores exactly.
+const filter = ref<MemoFilter>(filterFromSearchParams(route.query))
 
-const query = computed<MemoQuery>(() => {
-  const q: MemoQuery = {}
-  if (debounced.value) q.q = debounced.value
-  return q
-})
+// Reflect the active filter into the URL (linkable + reload-stable), same serialization A6 stores.
+watch(
+  filter,
+  (f) => {
+    void router.replace({ query: filterToRouteQuery(f) })
+  },
+  { deep: true },
+)
+
+const active = computed(() => !isEmptyFilter(filter.value))
+const query = computed(() => filterToQuery(filter.value))
 </script>
 
 <template>
   <section class="max-w-2xl mx-auto p-4 flex flex-col gap-3" data-test="view-search">
     <h1 class="text-2xl font-semibold">Search</h1>
-    <InputText
-      v-model="term"
-      placeholder="Search memos…"
-      data-test="search-input"
-      @input="onInput"
-    />
-    <MemoFeed v-if="debounced" :query="query" />
-    <p v-else class="text-muted-color text-sm" data-test="search-hint">Type to search your memos.</p>
+    <FilterBar v-model="filter" />
+    <MemoFeed v-if="active" :query="query" />
+    <p v-else class="text-muted-color text-sm" data-test="search-hint">
+      Type or pick a filter to search your memos.
+    </p>
   </section>
 </template>

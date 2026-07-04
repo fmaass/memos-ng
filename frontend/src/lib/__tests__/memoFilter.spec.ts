@@ -5,8 +5,11 @@ import {
   filterFromSearchParams,
   filterToQuery,
   filterToSearchParams,
+  filterToRouteQuery,
   isEmptyFilter,
   type MemoFilter,
+  pillsFor,
+  removeFilterKey,
 } from '@/lib/memoFilter'
 
 // The day-granularity date convention (documented in the A1 plan): the backend compares
@@ -127,6 +130,49 @@ describe('date boundary convention (strict-comparison faithful)', () => {
   })
 })
 
+describe('pillsFor / removeFilterKey (active-filter pills)', () => {
+  const full: MemoFilter = {
+    text: 'hi',
+    tags: ['work', 'home'],
+    visibility: 'PUBLIC',
+    dateFrom: '2026-07-01',
+    dateTo: '2026-07-04',
+    archived: 'only',
+  }
+
+  it('empty filter has no pills', () => {
+    expect(pillsFor(emptyFilter())).toEqual([])
+  })
+
+  it('one pill per active field, one per tag; exclude archived shows no pill', () => {
+    const keys = pillsFor(full).map((p) => p.key)
+    expect(keys).toEqual([
+      'text',
+      'tag:work',
+      'tag:home',
+      'visibility',
+      'dateFrom',
+      'dateTo',
+      'archived',
+    ])
+    expect(pillsFor({ ...emptyFilter(), archived: 'exclude' })).toEqual([])
+  })
+
+  it('every pill has a human label', () => {
+    for (const p of pillsFor(full)) expect(p.label.length).toBeGreaterThan(0)
+  })
+
+  it('removeFilterKey clears exactly that piece and only a single tag', () => {
+    expect(removeFilterKey(full, 'tag:work').tags).toEqual(['home'])
+    expect(removeFilterKey(full, 'text').text).toBeUndefined()
+    expect(removeFilterKey(full, 'visibility').visibility).toBeUndefined()
+    expect(removeFilterKey(full, 'dateFrom').dateFrom).toBeUndefined()
+    expect(removeFilterKey(full, 'archived').archived).toBeUndefined()
+    // does not mutate the input
+    expect(full.tags).toEqual(['work', 'home'])
+  })
+})
+
 describe('URL round-trip (the A6 serialization contract)', () => {
   it('tags serialize as REPEATED tag keys, not comma-joined', () => {
     const sp = filterToSearchParams({ ...emptyFilter(), tags: ['work', 'home'] })
@@ -161,6 +207,24 @@ describe('URL round-trip (the A6 serialization contract)', () => {
     }
     expect(filterFromSearchParams(locationQuery)).toEqual(filterFromSearchParams(sp))
     expect(filterFromSearchParams(locationQuery)).toEqual(f)
+  })
+
+  it('filterToRouteQuery yields a router LocationQuery (arrays for repeated tags) that round-trips', () => {
+    const f: MemoFilter = {
+      text: 'hi',
+      tags: ['work', 'home'],
+      visibility: 'PUBLIC',
+      dateFrom: '2026-07-01',
+      archived: 'only',
+    }
+    const rq = filterToRouteQuery(f)
+    expect(rq.tag).toEqual(['work', 'home']) // repeated key -> array (not comma-joined)
+    expect(rq.q).toBe('hi') // single value -> string
+    expect(filterFromSearchParams(rq)).toEqual(f) // route-query round-trips via the LocationQuery path
+  })
+
+  it('filterToRouteQuery of an empty filter is an empty object', () => {
+    expect(filterToRouteQuery(emptyFilter())).toEqual({})
   })
 
   it('ignores empty/malformed params and never emits empty-string values', () => {
