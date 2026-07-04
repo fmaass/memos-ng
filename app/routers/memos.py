@@ -13,6 +13,7 @@ from app import auth
 from app.database import get_session
 from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
+from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
 from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
@@ -226,6 +227,9 @@ async def create_memo(
             created_at=body.created_at,
             moved_out=moved,  # placement into the memo folder appends here → unlinked on rollback
         )
+        # After all attachments are linked, enqueue frame shares for #curated photos (no-op unless
+        # the feature is configured). Atomic with the memo write — same commit.
+        await frame_share_svc.maybe_enqueue_frame_shares(db, memo, user)
         await db.commit()
         committed = True
     finally:
@@ -272,6 +276,9 @@ async def patch_memo(
                 db, body.upload_uids, user.id, moved_out=moved
             )
             await svc.link_attachments(db, user.id, memo, finalized, moved_out=moved)
+        # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed tags,
+        # so both "added #curated on edit" and "added a new photo to a curated memo" are caught.
+        await frame_share_svc.maybe_enqueue_frame_shares(db, memo, user)
         await db.commit()
         committed = True
     finally:

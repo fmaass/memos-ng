@@ -395,6 +395,27 @@ export interface paths {
         patch: operations["update_settings_api_settings_patch"];
         trace?: never;
     };
+    "/api/settings/frame-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Frame Test
+         * @description Send a bundled test photo through the real render+SMTP path, synchronously. Reports whether
+         *     the MAIL SERVER accepted it — NOT whether it reached the frame (acceptance != delivery).
+         */
+        post: operations["frame_test_api_settings_frame_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/stats/heatmap": {
         parameters: {
             query?: never;
@@ -699,6 +720,13 @@ export interface components {
             /** File */
             file: string;
         };
+        /** FrameTestResult */
+        FrameTestResult: {
+            /** Detail */
+            detail: string;
+            /** Ok */
+            ok: boolean;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -876,6 +904,10 @@ export interface components {
             /** Avatar */
             avatar: string | null;
             default_visibility: components["schemas"]["Visibility"];
+            /** Frame Send From */
+            frame_send_from: string | null;
+            /** Frame Send To */
+            frame_send_to: string | null;
             /** Theme */
             theme: string;
         };
@@ -884,6 +916,10 @@ export interface components {
             /** Avatar */
             avatar?: string | null;
             default_visibility?: components["schemas"]["Visibility"] | null;
+            /** Frame Send From */
+            frame_send_from?: string | null;
+            /** Frame Send To */
+            frame_send_to?: string | null;
             /** Theme */
             theme?: string | null;
         };
@@ -1800,6 +1836,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    frame_test_api_settings_frame_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FrameTestResult"];
                 };
             };
         };

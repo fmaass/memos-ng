@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # DEV-ONLY default for SESSION_SECRET. It is the Fernet key encrypting BFF tokens at rest AND the
@@ -75,6 +76,18 @@ class Settings(BaseSettings):
     VAPID_PUBLIC_KEY: str = ""
     VAPID_PRIVATE_KEY: str = ""
     VAPID_SUBJECT: str = "mailto:admin@discomarder.live"
+
+    # Aura frame email share. Empty username/password = feature disabled globally: no jobs are
+    # enqueued and every send is a no-op (same empty-default-disables pattern as VAPID above).
+    # These are secrets — set via the stack .env in prod and never log them. Default host/port
+    # target iCloud SMTP (smtp.mail.me.com:587 STARTTLS), the proven Phase-0 send path.
+    SMTP_HOST: str = "smtp.mail.me.com"
+    SMTP_PORT: int = 587
+    # repr=False keeps these credentials out of any repr(settings)/structlog dump. They stay plain
+    # str (not SecretStr) so the empty-default truthiness test that disables the feature still works
+    # (a SecretStr is always truthy, which would defeat the on/off switch).
+    SMTP_USERNAME: str = Field(default="", repr=False)
+    SMTP_PASSWORD: str = Field(default="", repr=False)
 
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).

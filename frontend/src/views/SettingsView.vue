@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
+import InputText from 'primevue/inputtext'
 import SelectButton from 'primevue/selectbutton'
 
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import PatManager from '@/components/PatManager.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
 import { useSession } from '@/composables/useSession'
-import { type SettingsPatch, useSettings } from '@/composables/useSettings'
+import { type SettingsPatch, frameTestMessage, useSettings } from '@/composables/useSettings'
 
 const version = __APP_VERSION__
 const { data: user } = useSession()
@@ -24,8 +25,36 @@ function onAvatarFile(event: Event) {
   reader.readAsDataURL(file)
 }
 const { supported, enabled, busy, enable } = usePushSubscription()
-const { settings, update } = useSettings()
+const { settings, update, frameTest } = useSettings()
 const { setDark } = useDarkMode()
+
+// Aura frame — local edit buffers seeded from the persisted settings.
+const frameSendTo = ref('')
+const frameSendFrom = ref('')
+watch(
+  settings,
+  (s) => {
+    if (s) {
+      frameSendTo.value = s.frame_send_to ?? ''
+      frameSendFrom.value = s.frame_send_from ?? ''
+    }
+  },
+  { immediate: true },
+)
+const frameResult = ref<{ severity: 'success' | 'error'; text: string } | null>(null)
+
+function saveFrame() {
+  frameResult.value = null
+  update.mutate({ frame_send_to: frameSendTo.value, frame_send_from: frameSendFrom.value })
+}
+async function sendFrameTest() {
+  frameResult.value = null
+  try {
+    frameResult.value = frameTestMessage(await frameTest.mutateAsync())
+  } catch (e) {
+    frameResult.value = { severity: 'error', text: e instanceof Error ? e.message : 'Test failed' }
+  }
+}
 
 const visibilityOptions = [
   { label: 'Private', value: 'PRIVATE' },
@@ -122,6 +151,48 @@ function setTheme(value: string) {
           @update:model-value="setTheme"
         />
       </div>
+    </div>
+
+    <div v-if="settings" data-test="aura-frame" class="flex flex-col gap-3">
+      <div>
+        <h2 class="text-lg font-medium">Aura frame</h2>
+        <p class="text-sm text-muted-color">
+          Photos in a memo tagged <code>#curated</code> are emailed to your Aura frame.
+        </p>
+      </div>
+      <label class="flex flex-col gap-1 text-sm">
+        Send to (frame address)
+        <InputText
+          v-model="frameSendTo"
+          placeholder="…@send.auraframes.com"
+          data-test="frame-send-to"
+        />
+      </label>
+      <label class="flex flex-col gap-1 text-sm">
+        Send from (your Aura member address)
+        <InputText v-model="frameSendFrom" placeholder="you@icloud.com" data-test="frame-send-from" />
+      </label>
+      <div class="flex items-center gap-2">
+        <Button label="Save" size="small" data-test="frame-save" @click="saveFrame" />
+        <Button
+          label="Send test photo"
+          size="small"
+          severity="secondary"
+          icon="pi pi-image"
+          :loading="frameTest.isPending.value"
+          :disabled="!frameSendTo || !frameSendFrom"
+          data-test="frame-test"
+          @click="sendFrameTest"
+        />
+      </div>
+      <p
+        v-if="frameResult"
+        class="text-sm"
+        :class="frameResult.severity === 'success' ? 'text-green-500' : 'text-red-500'"
+        data-test="frame-test-result"
+      >
+        {{ frameResult.text }}
+      </p>
     </div>
 
     <PatManager />

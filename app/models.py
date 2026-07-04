@@ -71,6 +71,11 @@ class User(Base):
         Enum(Visibility, name="visibility"), default=Visibility.PUBLIC
     )
     theme: Mapped[str] = mapped_column(String(32), default="dark")
+    # Aura frame share (per-user). Both must be set for #curated photos to be emailed to the
+    # frame. frame_send_to = the …@send.auraframes.com address; frame_send_from = the sender
+    # identity (an address the SMTP account owns AND a registered member of the frame).
+    frame_send_to: Mapped[str | None] = mapped_column(String(320))
+    frame_send_from: Mapped[str | None] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -218,6 +223,41 @@ class MediaJob(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class FrameShareState(enum.StrEnum):
+    queued = "queued"
+    claimed = "claimed"
+    sent = "sent"
+    failed = "failed"
+    skipped = "skipped"
+
+
+class FrameShareJob(Base):
+    """One durable job per image attachment to email to the user's Aura frame. UNIQUE on
+    attachment_id is the at-most-once idempotency guard: re-editing a #curated memo cannot resend.
+    FKs CASCADE so a deleted attachment/memo/user removes the job — but attachments.memo_id is
+    ON DELETE SET NULL, so a job can outlive its memo link; the worker revalidates at send time."""
+
+    __tablename__ = "frame_share_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attachment_id: Mapped[int] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    memo_id: Mapped[int] = mapped_column(ForeignKey("memos.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    state: Mapped[FrameShareState] = mapped_column(
+        Enum(FrameShareState, name="frame_share_state"),
+        default=FrameShareState.queued,
+        index=True,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    claimed_by: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class WebSession(Base):

@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
@@ -8,7 +8,10 @@ import { describe, expect, it, vi } from 'vitest'
 
 import SettingsView from '@/views/SettingsView.vue'
 
-const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }))
+const { mutate, frameTestMutateAsync } = vi.hoisted(() => ({
+  mutate: vi.fn(),
+  frameTestMutateAsync: vi.fn().mockResolvedValue({ ok: true, detail: 'Accepted — check your frame.' }),
+}))
 vi.mock('@/composables/useSession', () => ({
   useSession: () => ({ data: ref({ subject: 'fabian', display_name: 'Fabian', email: 'f@x' }) }),
 }))
@@ -20,12 +23,22 @@ vi.mock('@/composables/usePushSubscription', () => ({
     enable: vi.fn(),
   }),
 }))
-vi.mock('@/composables/useSettings', () => ({
-  useSettings: () => ({
-    settings: ref({ default_visibility: 'PUBLIC', theme: 'dark', avatar: null }),
-    update: { mutate },
-  }),
-}))
+vi.mock('@/composables/useSettings', async () => {
+  const actual = await vi.importActual<typeof import('@/composables/useSettings')>(
+    '@/composables/useSettings',
+  )
+  return {
+    ...actual, // keep the real pure frameTestMessage
+    useSettings: () => ({
+      settings: ref({
+        default_visibility: 'PUBLIC', theme: 'dark', avatar: null,
+        frame_send_to: null, frame_send_from: null,
+      }),
+      update: { mutate },
+      frameTest: { mutateAsync: frameTestMutateAsync, isPending: ref(false) },
+    }),
+  }
+})
 vi.mock('@/composables/useDarkMode', () => ({
   useDarkMode: () => ({ isDark: ref(true), toggle: vi.fn(), setDark: vi.fn() }),
 }))
@@ -59,5 +72,23 @@ describe('SettingsView', () => {
     visButton.vm.$emit('update:modelValue', 'PRIVATE')
     await wrapper.vm.$nextTick()
     expect(mutate).toHaveBeenCalledWith({ default_visibility: 'PRIVATE' })
+  })
+
+  it('saves the Aura frame addresses and shows the test-send result', async () => {
+    const wrapper = mountSettings()
+    expect(wrapper.find('[data-test="aura-frame"]').exists()).toBe(true)
+    // PrimeVue InputText forwards data-test to its <input>; setValue drives the v-model buffer.
+    await wrapper.find('[data-test="frame-send-to"]').setValue('f@send.auraframes.com')
+    await wrapper.find('[data-test="frame-send-from"]').setValue('me@me.com')
+    await wrapper.find('[data-test="frame-save"]').trigger('click')
+    expect(mutate).toHaveBeenCalledWith({
+      frame_send_to: 'f@send.auraframes.com',
+      frame_send_from: 'me@me.com',
+    })
+
+    await wrapper.find('[data-test="frame-test"]').trigger('click')
+    await flushPromises()
+    expect(frameTestMutateAsync).toHaveBeenCalled()
+    expect(wrapper.find('[data-test="frame-test-result"]').text()).toContain('check your frame')
   })
 })

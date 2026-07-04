@@ -27,3 +27,14 @@ def test_validate_runtime_secrets_ok_when_overridden_in_production():
 def test_validate_runtime_secrets_noop_in_development():
     # Dev keeps the default and must not raise (the guard is production-only).
     Settings(ENV="development", SESSION_SECRET=_DEV_SESSION_SECRET).validate_runtime_secrets()
+
+
+def test_smtp_credentials_excluded_from_repr():
+    # SMTP creds must never surface in a repr()/structlog dump of the settings object.
+    s = Settings(SMTP_USERNAME="sender@me.com", SMTP_PASSWORD="super-secret-app-pw")
+    text = repr(s)
+    assert "super-secret-app-pw" not in text
+    assert "sender@me.com" not in text
+    # ...but the values are still readable for use and drive the disable switch.
+    assert s.SMTP_PASSWORD == "super-secret-app-pw"
+    assert bool(s.SMTP_USERNAME and s.SMTP_PASSWORD) is True

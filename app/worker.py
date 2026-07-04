@@ -13,13 +13,21 @@ import time
 from pathlib import Path
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session
-from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
-from app.services import media, push
+from app.models import (
+    Attachment,
+    AttachmentStatus,
+    FrameShareJob,
+    FrameShareState,
+    JobLane,
+    JobState,
+    MediaJob,
+)
+from app.services import frame_share, media, push
 from app.services.uploads import reap_expired
 from app.version import __version__
 
@@ -174,6 +182,56 @@ async def run_once(db: AsyncSession) -> str:
         return "deferred"
 
 
+async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
+    """Atomically claim the next due frame-share job (queued AND next_attempt_at reached), skipping
+    rows another worker holds. Sets state=claimed so a crash mid-send never re-runs it (at-most-once
+    — plan D1). Honors next_attempt_at for exponential retry backoff."""
+    stmt = (
+        select(FrameShareJob)
+        .where(
+            FrameShareJob.state == FrameShareState.queued,
+            or_(
+                FrameShareJob.next_attempt_at.is_(None),
+                FrameShareJob.next_attempt_at <= func.now(),
+            ),
+        )
+        .order_by(FrameShareJob.id)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    job = (await db.execute(stmt)).scalar_one_or_none()
+    if job is not None:
+        job.state = FrameShareState.claimed
+        job.claimed_by = WORKER_ID
+        await db.flush()
+    return job
+
+
+async def run_frame_share_once(db: AsyncSession) -> str:
+    """Claim + process one frame-share job. Returns 'processed' | 'idle' | 'deferred'.
+
+    The `claimed` state is COMMITTED before any render/send, so a crash between SMTP acceptance and
+    the result commit strands the job in `claimed` (never re-claimed) rather than resending it."""
+    if not frame_share.server_smtp_configured():
+        # Only a worker that can actually send may CLAIM these jobs. The Merkur slow-lane worker
+        # runs the same image with no SMTP creds — without this guard it would win the claim race
+        # for some jobs and, unable to send, mark them terminally `skipped`. Leaving them queued
+        # lets the SMTP-configured (Saturn) worker drain them.
+        await db.commit()
+        return "idle"
+    if media.too_hot():  # a photo render is light, but honor the same host thermal guard
+        await db.commit()
+        return "deferred"
+    job = await claim_frame_share_one(db)
+    if job is None:
+        await db.commit()
+        return "idle"
+    await db.commit()  # commit the `claimed` tombstone BEFORE the external send (plan D1)
+    await frame_share.process_claimed_job(db, job)
+    await db.commit()
+    return "processed"
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     beat()
@@ -181,6 +239,10 @@ async def run() -> None:
     while True:
         async with async_session() as db:
             status = await run_once(db)
+        # Drain a frame-share job opportunistically in its own session (like reap): email sending is
+        # decoupled from the media job's transaction so an SMTP error can't poison media work.
+        async with async_session() as db:
+            frame_status = await run_frame_share_once(db)
         beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             async with async_session() as db:
@@ -188,7 +250,7 @@ async def run() -> None:
             if reaped:
                 logger.info("uploads_reaped", count=reaped)
             last_reap = time.time()
-        if status != "processed":  # idle or deferred (thermal/retry backoff)
+        if status != "processed" and frame_status != "processed":  # idle/deferred → back off
             await asyncio.sleep(POLL_SECONDS)
 
 
