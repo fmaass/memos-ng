@@ -280,6 +280,20 @@ async def test_process_server_smtp_unset_skips(adb, monkeypatch, tmp_path):
     assert job.state is FrameShareState.skipped and calls == []
 
 
+# --- run_frame_share_drain isolates errors from the worker loop (media stays alive) ---
+
+
+async def test_frame_share_drain_swallows_errors(monkeypatch, db_engine):
+    # A raise out of run_frame_share_once (a DB error in claim/revalidate/commit) MUST NOT escape
+    # the drain — if it did, run()'s loop would crash and media processing would halt. The drain
+    # converts it to a non-processed 'error' status and continues.
+    async def boom(db):
+        raise RuntimeError("db exploded mid-claim")
+
+    monkeypatch.setattr(worker, "run_frame_share_once", boom)
+    assert await worker.run_frame_share_drain() == "error"
+
+
 # --- claim honors state + next_attempt_at ---
 
 

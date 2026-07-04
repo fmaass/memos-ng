@@ -232,6 +232,20 @@ async def run_frame_share_once(db: AsyncSession) -> str:
     return "processed"
 
 
+async def run_frame_share_drain() -> str:
+    """Drain one frame-share job in its own session, isolating ALL errors so a DB failure inside the
+    claim/revalidate/commit path can never propagate into run()'s loop and halt media processing.
+    Returns run_frame_share_once's status, or 'error' when the drain raised (treated as
+    non-processed so the loop backs off but keeps running). This is the boundary guard for
+    "media processing is immune to the optional frame-share feature"."""
+    try:
+        async with async_session() as db:
+            return await run_frame_share_once(db)
+    except Exception:
+        logger.exception("frame_share.drain_error")
+        return "error"
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     beat()
@@ -239,10 +253,10 @@ async def run() -> None:
     while True:
         async with async_session() as db:
             status = await run_once(db)
+        beat()  # heartbeat before the (possibly slow SMTP) frame drain — keep liveness honest
         # Drain a frame-share job opportunistically in its own session (like reap): email sending is
         # decoupled from the media job's transaction so an SMTP error can't poison media work.
-        async with async_session() as db:
-            frame_status = await run_frame_share_once(db)
+        frame_status = await run_frame_share_drain()
         beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             async with async_session() as db:
