@@ -58,10 +58,13 @@ def render_test_image() -> bytes:
     finally:
         Path(path).unlink(missing_ok=True)
 
-# Render/send tuning. Full-resolution q95 4:4:4 (user-decided 2026-07-03) — Aura resizes to its
-# panel server-side, so no client-side downscale; q95 4:4:4 is visually lossless yet safely under
-# Aura's ~9.5 MB proxy cap for typical photos.
+# Render/send tuning. q95 4:4:4 downscaled to a 2048px longest edge (user-decided 2026-07-04,
+# reversing the original full-res choice). Real curated exports average ~8600px / 82MB source;
+# full-res q95 rendered to 20-46MB JPEGs which iCloud rejects (552 message-size) and exceed Aura's
+# ~9.5MB proxy cap. Aura's largest-ever panel is 2048x1536 and it resizes on ingestion, so a 2048px
+# cap is visually lossless on the frame while keeping renders ~1-2MB, well under both limits.
 FRAME_JPEG_QUALITY = 95
+FRAME_MAX_EDGE = 2048  # downscale to this longest edge (never upscale); = Aura's largest panel
 # Log (but still send) when a render exceeds Aura's ~9.5 MB web-uploader proxy cap.
 FRAME_SIZE_WARN_BYTES = 9 * 1024 * 1024
 FRAME_MAX_ATTEMPTS = 5
@@ -145,14 +148,17 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
 def render_for_frame(original_path: str, captured_at: datetime | None = None) -> bytes:
     """Render an attachment original into a frame-ready JPEG (returns bytes; never persisted).
 
-    Full resolution (Aura resizes to its <=2048x1536 panel server-side, so no client downscale),
-    JPEG quality 95 with 4:4:4 chroma, EXIF preserved with Orientation normalized to 1 after
-    ImageOps.exif_transpose bakes rotation into the pixels (avoids double-rotation).
-    DateTimeOriginal is backfilled from captured_at ONLY when the source lacks it — stored curated
-    screen-PNGs without EXIF, and Aura sorts chronologically by that tag. HEIC decodes via
-    pillow-heif. Synchronous CPU work — call under to_thread.run_sync."""
+    Downscaled to a 2048px longest edge (never upscaled — Aura resizes to its <=2048x1536 panel
+    anyway, so this is visually lossless on the frame and keeps the JPEG under iCloud's 20MB and
+    Aura's ~9.5MB caps), JPEG quality 95 with 4:4:4 chroma, EXIF preserved with Orientation
+    normalized to 1 after ImageOps.exif_transpose bakes rotation into the pixels. DateTimeOriginal
+    is backfilled from captured_at ONLY when the source lacks it (stored curated screen-PNGs have no
+    EXIF, and Aura sorts chronologically by that tag). HEIC decodes via pillow-heif. Synchronous CPU
+    work — call under to_thread.run_sync."""
     with Image.open(original_path) as raw:
         img = ImageOps.exif_transpose(raw).convert("RGB")
+        if max(img.size) > FRAME_MAX_EDGE:
+            img.thumbnail((FRAME_MAX_EDGE, FRAME_MAX_EDGE))  # downscale large; never upscales
         exif = img.getexif()
         exif[_EXIF_ORIENTATION] = 1  # pixels already normalized; keep the tag consistent
         exif_ifd = exif.get_ifd(_EXIF_OFFSET)
