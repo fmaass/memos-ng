@@ -244,6 +244,25 @@ async def test_process_permanent_smtp_fails_immediately(adb, monkeypatch, tmp_pa
     assert job.state is FrameShareState.failed and job.attempts == 1
 
 
+async def test_process_render_failure_fails_immediately(adb, monkeypatch, tmp_path):
+    # A corrupt/undecodable original makes render_for_frame raise. That is a permanent data problem,
+    # NOT a transient send error — it must go terminal `failed` on the FIRST attempt, never churn
+    # through all five with backoff, and never reach SMTP.
+    calls = []
+    _record_send(monkeypatch, calls)
+    job, att, *_ = await _make_claimed(adb, monkeypatch, tmp_path, write_file=False)
+    bad = tmp_path / "corrupt.jpg"
+    bad.write_bytes(b"this is not a decodable image")
+    att.storage_path = str(bad)
+    await adb.flush()
+    assert await fs.process_claimed_job(adb, job) == "failed"
+    assert job.state is FrameShareState.failed
+    assert job.attempts == 1  # terminal on first attempt, no 5-attempt churn
+    assert job.next_attempt_at is None  # no retry scheduled
+    assert calls == []  # never reached the send step
+    assert job.error  # the decode error is recorded
+
+
 async def test_process_uncurated_skips_without_sending(adb, monkeypatch, tmp_path):
     calls = []
     _record_send(monkeypatch, calls)

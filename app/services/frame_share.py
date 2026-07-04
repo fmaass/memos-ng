@@ -275,10 +275,24 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
     # Stamp DateTimeOriginal from the MEMO's date, not attachment.captured_at: for curated exports
     # captured_at is unreliable (mostly NULL, else upload time); the memo's created_at is the user's
     # curated/back-dated event date — the intended chronological position on the frame.
+    # Render step: a decode/render failure is a permanent data problem (corrupt original), not a
+    # transient send error. Fail terminally on the first attempt instead of retrying with backoff
+    # through all five (~15 min of churn) — and never reach SMTP.
     try:
         jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
-        if len(jpeg) > FRAME_SIZE_WARN_BYTES:
-            logger.warning("frame_share.render_large", job_id=job.id, bytes=len(jpeg))
+    except Exception as exc:
+        job.attempts += 1
+        job.state = FrameShareState.failed
+        job.error = str(exc)[:500]
+        await db.flush()
+        logger.warning(
+            "frame_share.render_failed", job_id=job.id, attempts=job.attempts, error=str(exc)[:200]
+        )
+        return "failed"
+    if len(jpeg) > FRAME_SIZE_WARN_BYTES:
+        logger.warning("frame_share.render_large", job_id=job.id, bytes=len(jpeg))
+    # Send step: SMTP errors keep the transient/permanent split (retry with backoff vs terminal).
+    try:
         await send_frame_share(
             from_addr=user.frame_send_from,
             to_addr=user.frame_send_to,
