@@ -66,12 +66,16 @@ async def adb(db_engine):
 @pytest.fixture(autouse=True)
 def _reset_rate_limit():
     # The login rate-limiter keeps per-IP state in a module dict; all tests share the one
-    # TestClient IP, so reset it between tests or repeated logins eventually 429.
+    # TestClient IP, so reset it between tests or repeated logins eventually 429. The frame-test
+    # cooldown keeps per-user state in the same way — clear it so cooldown state can't leak.
     from app import auth
+    from app.routers import settings as settings_router
 
     auth._RL.clear()
+    settings_router._frame_test_cooldown.clear()
     yield
     auth._RL.clear()
+    settings_router._frame_test_cooldown.clear()
 
 
 @pytest.fixture

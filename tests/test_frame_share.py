@@ -12,6 +12,7 @@ from app.models import (
 )
 from app.services import memos as svc
 from app.services.frame_share import (
+    is_aura_send_to,
     is_frame_image,
     is_valid_email,
     maybe_enqueue_frame_shares,
@@ -91,6 +92,24 @@ def test_is_frame_image(mime, expected):
 )
 def test_is_valid_email(value, expected):
     assert is_valid_email(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("frame@send.auraframes.com", True),  # canonical Aura ingestion address
+        ("first.last@send.auraframes.com", True),
+        ("Frame@SEND.AURAFRAMES.COM", True),  # domain match is case-insensitive
+        ("me@icloud.com", False),  # shaped email but not the Aura domain
+        ("me@auraframes.com", False),  # missing the send. subdomain
+        ("me@evilsend.auraframes.com", False),  # the @ anchor blocks subdomain spoofing
+        ("frame@send.auraframes.com.evil.com", False),  # suffix-append spoof
+        ("not-an-email", False),
+        ("", False),
+    ],
+)
+def test_is_aura_send_to(value, expected):
+    assert is_aura_send_to(value) is expected
 
 
 # --- enqueue guard: one test per input category (plan Phase 1 verification) ---

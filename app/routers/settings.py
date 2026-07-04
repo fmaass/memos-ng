@@ -1,3 +1,4 @@
+import time
 from typing import Annotated
 
 from anyio import to_thread
@@ -15,6 +16,12 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 MAX_AVATAR_BYTES = 256 * 1024
 
+# Per-user cooldown for the frame-test send primitive: user_id -> last-send monotonic timestamp.
+# In-process (single app instance) and best-effort — enough to stop an authed user hammering the
+# shared server SMTP account from the settings screen.
+FRAME_TEST_COOLDOWN_S = 30
+_frame_test_cooldown: dict[int, float] = {}
+
 
 class SettingsOut(BaseModel):
     default_visibility: Visibility
@@ -31,13 +38,22 @@ class SettingsPatch(BaseModel):
     frame_send_to: str | None = None  # …@send.auraframes.com; "" clears it
     frame_send_from: str | None = None  # the Aura member sender identity; "" clears it
 
-    @field_validator("frame_send_to", "frame_send_from")
+    @field_validator("frame_send_from")
     @classmethod
     def _valid_email_or_blank(cls, v: str | None) -> str | None:
         # None = unchanged, "" = clear; any other value must look like an email (422 otherwise).
         if v is None or v == "" or frame_share.is_valid_email(v):
             return v
         raise ValueError("must be a valid email address")
+
+    @field_validator("frame_send_to")
+    @classmethod
+    def _valid_aura_addr_or_blank(cls, v: str | None) -> str | None:
+        # The frame recipient must be an Aura ingestion address — the server SMTP account may only
+        # send to the frame, not an arbitrary recipient. None = unchanged, "" = clear.
+        if v is None or v == "" or frame_share.is_aura_send_to(v):
+            return v
+        raise ValueError("must be an @send.auraframes.com address")
 
 
 class FrameTestResult(BaseModel):
@@ -94,6 +110,13 @@ async def frame_test(user: Annotated[User, Depends(auth.require_user)]) -> Frame
         raise HTTPException(status_code=400, detail="Frame sharing is not configured on the server")
     if not (user.frame_send_to and user.frame_send_from):
         raise HTTPException(status_code=400, detail="Set a send-to and send-from address first.")
+    now = time.monotonic()
+    last = _frame_test_cooldown.get(user.id)
+    if last is not None and now - last < FRAME_TEST_COOLDOWN_S:
+        raise HTTPException(
+            status_code=429, detail="Please wait a moment before sending another test photo."
+        )
+    _frame_test_cooldown[user.id] = now  # record before sending → the primitive can't be hammered
     jpeg = await to_thread.run_sync(frame_share.render_test_image)
     try:
         await frame_share.send_frame_share(

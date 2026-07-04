@@ -68,6 +68,16 @@ def test_frame_settings_roundtrip_and_validation(logged_in_client):
     assert client.patch("/api/settings", json={"frame_send_to": ""}).json()["frame_send_to"] is None
 
 
+def test_frame_send_to_must_be_aura_address(logged_in_client):
+    client, _ = logged_in_client
+    # A shaped but non-Aura recipient is rejected — the server SMTP account may only send to the
+    # frame's ingestion domain, not an arbitrary address.
+    assert client.patch("/api/settings", json={"frame_send_to": "me@icloud.com"}).status_code == 422
+    # frame_send_from stays shape-only (Aura membership enforces it in practice).
+    r = client.patch("/api/settings", json={"frame_send_from": "me@icloud.com"})
+    assert r.status_code == 200
+
+
 def test_frame_test_requires_server_config(logged_in_client, monkeypatch):
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "SMTP_USERNAME", "")
@@ -103,6 +113,30 @@ def test_frame_test_success_reports_acceptance_not_delivery(logged_in_client, mo
     assert r["ok"] is True and "mail server" in r["detail"] and "frame" in r["detail"]
     assert "delivered" not in r["detail"].lower()  # must not claim frame delivery
     assert len(sent) == 1
+
+
+def test_frame_test_cooldown_returns_429_on_rapid_reuse(logged_in_client, monkeypatch):
+    # frame-test is an authenticated send primitive through the server SMTP account. A per-user
+    # cooldown stops it being hammered: the first call sends, an immediate second is 429.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "SMTP_USERNAME", "u@me.com")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "pw")
+    client.patch(
+        "/api/settings",
+        json={"frame_send_to": "f@send.auraframes.com", "frame_send_from": "me@me.com"},
+    )
+    sent = []
+
+    async def fake_send(msg, **kw):
+        sent.append(msg)
+        return ({}, "250 ok")
+
+    monkeypatch.setattr(frame_share.aiosmtplib, "send", fake_send)
+    first = client.post("/api/settings/frame-test")
+    assert first.status_code == 200 and first.json()["ok"] is True
+    second = client.post("/api/settings/frame-test")
+    assert second.status_code == 429
+    assert len(sent) == 1  # the throttled call never reached SMTP
 
 
 def test_frame_test_smtp_error_is_reported_not_500(logged_in_client, monkeypatch):

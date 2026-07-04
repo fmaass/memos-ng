@@ -41,6 +41,20 @@ def is_valid_email(value: str) -> bool:
     return bool(_EMAIL_RE.match(value or ""))
 
 
+# The frame send-to must be an Aura ingestion address. The leading "@" anchor blocks both
+# subdomain spoofing ("@evilsend.auraframes.com") and suffix-append spoofing
+# ("...auraframes.com.evil.com"). frame_send_from stays shape-only — Aura membership enforces it.
+AURA_SEND_DOMAIN = "send.auraframes.com"
+
+
+def is_aura_send_to(value: str) -> bool:
+    """True only for a shaped email whose domain is exactly Aura's ingestion domain (case-
+    insensitive). Used by the settings validator so the server SMTP account can't be pointed at an
+    arbitrary recipient."""
+    v = (value or "").lower()
+    return is_valid_email(v) and v.endswith("@" + AURA_SEND_DOMAIN)
+
+
 def render_test_image() -> bytes:
     """Produce the settings 'Send test photo' JPEG by running a generated source through the REAL
     render_for_frame — so the test-send exercises the actual render path (open, exif_transpose,
