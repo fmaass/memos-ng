@@ -81,7 +81,7 @@ def is_frame_image(mime: str) -> bool:
     return m.startswith("image/") and m != "image/svg+xml"
 
 
-def _server_smtp_configured() -> bool:
+def server_smtp_configured() -> bool:
     """Global on/off switch: empty username or password disables the feature entirely."""
     return bool(settings.SMTP_USERNAME and settings.SMTP_PASSWORD)
 
@@ -94,7 +94,7 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     Idempotent per attachment via ON CONFLICT (attachment_id) DO NOTHING — so re-editing a curated
     memo never resends existing photos, while a newly added image on an already-curated memo is
     enqueued. Runs inside the caller's transaction (atomic with the memo write)."""
-    if not _server_smtp_configured():
+    if not server_smtp_configured():
         return 0
     if not (user.frame_send_to and user.frame_send_from):
         return 0
@@ -206,7 +206,7 @@ async def _revalidate(db: AsyncSession, job: FrameShareJob) -> tuple[Attachment,
     Returns (attachment, owner) if the job is still eligible, else None → the worker marks it
     `skipped`. Catches every realistic case: memo deleted / un-#curated / attachment unlinked /
     settings cleared / original missing / feature disabled."""
-    if not _server_smtp_configured():
+    if not server_smtp_configured():
         return None
     att = await db.get(Attachment, job.attachment_id)
     if att is None or att.memo_id != job.memo_id or not is_frame_image(att.mime):

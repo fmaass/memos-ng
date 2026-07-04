@@ -297,3 +297,50 @@ async def test_run_frame_share_once_end_to_end_marks_sent(monkeypatch, tmp_path,
                 await db.execute(delete(User).where(User.id == user_id))
             await db.execute(delete(Tag).where(Tag.name == "curated"))
             await db.commit()
+
+
+async def test_unconfigured_worker_leaves_frame_jobs_queued(monkeypatch, tmp_path, db_engine):
+    # The Merkur slow-lane worker runs the same image with no SMTP creds. It must NOT claim
+    # frame-share jobs (which it couldn't send) — it leaves them queued for the Saturn worker.
+    monkeypatch.setattr(settings, "SMTP_USERNAME", "")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "")
+    f = tmp_path / "real.jpg"
+    _write_jpeg(f, (100, 70))
+    subject = f"guard-{secrets.token_hex(4)}"
+    user_id = None
+    try:
+        async with async_session() as db:
+            u = User(
+                subject=subject, role="user",
+                frame_send_to="frame@send.auraframes.com", frame_send_from="me@me.com",
+            )
+            db.add(u)
+            await db.flush()
+            user_id = u.id
+            att = Attachment(
+                uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
+                size=1, status=AttachmentStatus.ready, storage_path=str(f),
+            )
+            db.add(att)
+            await db.flush()
+            memo = await memos_svc.create_memo(
+                db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
+            )
+            db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
+                                 state=FrameShareState.queued, attempts=0))
+            await db.commit()
+
+        async with async_session() as db:
+            assert await worker.run_frame_share_once(db) == "idle"
+
+        async with async_session() as db:
+            job = (
+                await db.execute(select(FrameShareJob).where(FrameShareJob.user_id == user_id))
+            ).scalar_one()
+            assert job.state is FrameShareState.queued  # NOT claimed, NOT skipped
+    finally:
+        async with async_session() as db:
+            if user_id is not None:
+                await db.execute(delete(User).where(User.id == user_id))
+            await db.execute(delete(Tag).where(Tag.name == "curated"))
+            await db.commit()

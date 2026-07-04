@@ -212,6 +212,13 @@ async def run_frame_share_once(db: AsyncSession) -> str:
 
     The `claimed` state is COMMITTED before any render/send, so a crash between SMTP acceptance and
     the result commit strands the job in `claimed` (never re-claimed) rather than resending it."""
+    if not frame_share.server_smtp_configured():
+        # Only a worker that can actually send may CLAIM these jobs. The Merkur slow-lane worker
+        # runs the same image with no SMTP creds — without this guard it would win the claim race
+        # for some jobs and, unable to send, mark them terminally `skipped`. Leaving them queued
+        # lets the SMTP-configured (Saturn) worker drain them.
+        await db.commit()
+        return "idle"
     if media.too_hot():  # a photo render is light, but honor the same host thermal guard
         await db.commit()
         return "deferred"
