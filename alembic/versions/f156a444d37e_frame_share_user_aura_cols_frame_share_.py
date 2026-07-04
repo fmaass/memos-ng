@@ -55,3 +55,6 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_frame_share_jobs_attachment_id'), table_name='frame_share_jobs')
     op.drop_table('frame_share_jobs')
     # ### end Alembic commands ###
+    # Drop the auto-created ENUM type too — create_table did NOT (Alembic autogenerate omits it),
+    # so without this a downgrade→upgrade cycle fails with DuplicateObject on frame_share_state.
+    sa.Enum(name='frame_share_state').drop(op.get_bind(), checkfirst=True)
