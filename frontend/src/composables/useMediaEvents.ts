@@ -44,6 +44,11 @@ function anyMemoCacheInFlight(queryClient: QueryClient): boolean {
     .some((query) => hasInFlight(query.state.data as TimelineData | undefined))
 }
 
+// Delay before re-opening after a connection error — without it, a persistent failure
+// while work is in-flight (server mid-restart, expired session) re-creates EventSources
+// at network-RTT speed, a worse hammering than the native reconnect this module replaces.
+export const RECONNECT_DELAY_MS = 3000
+
 export function startMediaEvents(
   queryClient: QueryClient,
   createSource: MediaEventSourceFactory,
@@ -52,6 +57,7 @@ export function startMediaEvents(
   let connected = false
   let everConnected = false
   let disposed = false
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
 
   const closeSource = () => {
     source?.close()
@@ -92,7 +98,11 @@ export function startMediaEvents(
     }
     source.onerror = () => {
       closeSource()
-      evaluate()
+      if (retryTimer !== null) return
+      retryTimer = setTimeout(() => {
+        retryTimer = null
+        evaluate()
+      }, RECONNECT_DELAY_MS)
     }
   }
 
@@ -102,6 +112,7 @@ export function startMediaEvents(
   return () => {
     disposed = true
     closeSource()
+    if (retryTimer !== null) clearTimeout(retryTimer)
     unsubscribe()
   }
 }

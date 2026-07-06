@@ -4,7 +4,12 @@ import { defineComponent, h } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { components } from '@/api/schema'
-import { applyMediaEvent, startMediaEvents, useMediaEvents } from '@/composables/useMediaEvents'
+import {
+  applyMediaEvent,
+  RECONNECT_DELAY_MS,
+  startMediaEvents,
+  useMediaEvents,
+} from '@/composables/useMediaEvents'
 import type { TimelineData } from '@/lib/sseLifecycle'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
@@ -102,6 +107,7 @@ describe('startMediaEvents', () => {
   })
 
   it('fires one catch-up invalidation per reconnect, never per message', () => {
+    vi.useFakeTimers()
     const queryClient = client()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue()
     const sources: FakeSource[] = []
@@ -119,6 +125,11 @@ describe('startMediaEvents', () => {
     expect(invalidate).not.toHaveBeenCalled()
 
     sources[0].onerror?.(new Event('error'))
+    // Reopening is delayed — a persistent failure must not hammer the server.
+    vi.advanceTimersByTime(RECONNECT_DELAY_MS - 1)
+    expect(sources).toHaveLength(1)
+    vi.advanceTimersByTime(1)
+    expect(sources).toHaveLength(2)
     sources[1].onopen?.(new Event('open'))
     expect(invalidate).toHaveBeenCalledTimes(1)
     expect(invalidate).toHaveBeenLastCalledWith({ queryKey: ['memos'] })
@@ -129,8 +140,28 @@ describe('startMediaEvents', () => {
     expect(invalidate).toHaveBeenCalledTimes(1)
 
     sources[1].onerror?.(new Event('error'))
+    vi.advanceTimersByTime(RECONNECT_DELAY_MS)
     sources[2].onopen?.(new Event('open'))
     expect(invalidate).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
+  })
+
+  it('cancels a pending error-retry on teardown', () => {
+    vi.useFakeTimers()
+    const queryClient = client()
+    queryClient.setQueryData(['memos', 'timeline'], timeline('processing'))
+    const sources: FakeSource[] = []
+    const stop = startMediaEvents(queryClient, (url) => {
+      const source = new FakeSource(url)
+      sources.push(source)
+      return source
+    })
+
+    sources[0].onerror?.(new Event('error'))
+    stop()
+    vi.advanceTimersByTime(RECONNECT_DELAY_MS * 2)
+    expect(sources).toHaveLength(1)
+    vi.useRealTimers()
   })
 
   it('closes without reopening when an error arrives and nothing is in-flight', () => {
