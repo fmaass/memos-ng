@@ -78,6 +78,16 @@ function manualRetry() {
   imgSrc.value = nextRetrySrc(baseUrl.value, 0) ?? baseUrl.value
   emit('retry', props.att.uid)
 }
+
+// Signed URLs are bucket-quantized, so a re-mint inside the same bucket returns the
+// IDENTICAL url and the baseUrl watch never clears a failed tile — a tile that
+// exhausted its retries while offline stayed failed although the URL works again
+// (AC-A2 live probe, 2026-07-06). Connectivity returning is the signal to retry.
+function onOnline() {
+  if (loadFailed.value) manualRetry()
+}
+window.addEventListener('online', onOnline)
+onBeforeUnmount(() => window.removeEventListener('online', onOnline))
 </script>
 
 <template>

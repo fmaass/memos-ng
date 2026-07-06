@@ -108,6 +108,24 @@ describe('MediaTile', () => {
     expect(w.emitted('retry')?.[0]).toEqual(['a1'])
   })
 
+  it('recovers a failed tile when connectivity returns (online event)', async () => {
+    vi.useFakeTimers()
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(1_000)
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(4_000)
+    await w.find('[data-test="tile-image"]').trigger('error')
+    expect(w.find('[data-test="tile-failed"]').exists()).toBe(true)
+    // A re-mint inside the same signing bucket returns the identical URL, so only
+    // the online signal can clear the failed state without user action.
+    window.dispatchEvent(new Event('online'))
+    await w.vm.$nextTick()
+    expect(w.find('[data-test="tile-failed"]').exists()).toBe(false)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?_r=1')
+    vi.useRealTimers()
+  })
+
   it('resets and retries from scratch when a fresh (re-minted) URL arrives', async () => {
     vi.useFakeTimers()
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
