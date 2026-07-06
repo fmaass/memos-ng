@@ -11,6 +11,7 @@
 // to RE-MINT (refetch the feed for freshly-signed URLs), which shouldRemint gates at the feed level.
 
 export const MAX_THUMB_RETRIES = 2
+const THUMB_RETRY_DELAYS_MS = [1_000, 4_000] as const
 
 // `attempt` is how many retries have already been made (0 on the first failure). The cache-bust key
 // is `_r`; signed URLs already carry ?exp&scope&sig, and the serve route reads only those, so an
@@ -19,6 +20,11 @@ export function nextRetrySrc(url: string, attempt: number, max = MAX_THUMB_RETRI
   if (attempt >= max) return null
   const sep = url.includes('?') ? '&' : '?'
   return `${url}${sep}_r=${attempt + 1}`
+}
+
+export function retryDelayMs(attempt: number, max = MAX_THUMB_RETRIES): number | null {
+  if (attempt >= max) return null
+  return THUMB_RETRY_DELAYS_MS[attempt] ?? THUMB_RETRY_DELAYS_MS[THUMB_RETRY_DELAYS_MS.length - 1]
 }
 
 export const REMINT_COOLDOWN_MS = 30_000

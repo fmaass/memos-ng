@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { MAX_THUMB_RETRIES, nextRetrySrc, REMINT_COOLDOWN_MS, shouldRemint } from '@/lib/imageRetry'
+import {
+  MAX_THUMB_RETRIES,
+  nextRetrySrc,
+  REMINT_COOLDOWN_MS,
+  retryDelayMs,
+  shouldRemint,
+} from '@/lib/imageRetry'
 
 describe('nextRetrySrc', () => {
   it('appends a cache-bust param to a bare URL on the first failure', () => {
@@ -19,6 +25,18 @@ describe('nextRetrySrc', () => {
   it('returns null once attempts are exhausted (the signal to re-mint, not cache-bust)', () => {
     expect(nextRetrySrc('/u', MAX_THUMB_RETRIES)).toBeNull()
     expect(nextRetrySrc('/u', MAX_THUMB_RETRIES + 1)).toBeNull()
+  })
+})
+
+describe('retryDelayMs', () => {
+  it('backs off the first two thumbnail retries', () => {
+    expect(retryDelayMs(0)).toBe(1_000)
+    expect(retryDelayMs(1)).toBe(4_000)
+  })
+
+  it('returns null once thumbnail retries are exhausted', () => {
+    expect(retryDelayMs(MAX_THUMB_RETRIES)).toBeNull()
+    expect(retryDelayMs(MAX_THUMB_RETRIES + 1)).toBeNull()
   })
 })
 
