@@ -80,6 +80,16 @@ function retry(att: GalleryAttachment): void {
   failed.value = { ...failed.value, [att.uid]: false }
   emit('retry', att.uid)
 }
+// Same bucket-quantization gap as MediaTile: connectivity returning is the one
+// signal that a failed tile's unchanged URL is worth a fresh attempt.
+function onOnline(): void {
+  for (const att of props.items) {
+    if (failed.value[att.uid]) retry(att)
+  }
+}
+window.addEventListener('online', onOnline)
+onBeforeUnmount(() => window.removeEventListener('online', onOnline))
+
 function bg(att: GalleryAttachment): string | undefined {
   const url = blurhashToDataUrl(att.blurhash)
   return url ? `url(${url})` : undefined

@@ -50,6 +50,22 @@ describe('JustifiedGallery', () => {
     expect(wrapper.emitted('retry')?.[0]).toEqual(['a1'])
   })
 
+  it('recovers failed tiles when connectivity returns (online event)', async () => {
+    const wrapper = mount(JustifiedGallery, { props: { items: [item()], targetHeight: 200 } })
+    await flushPromises()
+    const img = wrapper.find('[data-test="gallery-img"]')
+    await img.trigger('error')
+    await img.trigger('error')
+    await img.trigger('error')
+    expect(wrapper.find('[data-test="gallery-failed"]').exists()).toBe(true)
+
+    window.dispatchEvent(new Event('online'))
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('[data-test="gallery-failed"]').exists()).toBe(false)
+    expect(wrapper.emitted('retry')).toEqual([['a1'], ['a1']])
+  })
+
   it('manual retry clears the failed overlay and requests a Resources re-mint', async () => {
     const wrapper = mount(JustifiedGallery, { props: { items: [item()], targetHeight: 200 } })
     await flushPromises()
