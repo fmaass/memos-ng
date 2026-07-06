@@ -1,5 +1,5 @@
 import { mount } from '@vue/test-utils'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import MediaTile from '@/components/MediaTile.vue'
 
@@ -29,6 +29,10 @@ function att(status: Status, mime = 'image/jpeg', extra: Record<string, unknown>
 }
 
 describe('MediaTile', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it('shows a placeholder while pending', () => {
     const w = mount(MediaTile, { props: { att: att('pending') } })
     expect(w.find('[data-test="tile-placeholder"]').exists()).toBe(true)
@@ -64,19 +68,40 @@ describe('MediaTile', () => {
     expect(w.emitted('retry')?.[0]).toEqual(['a1'])
   })
 
-  it('cache-busts the thumbnail in place on a transient load error (no re-mint yet)', async () => {
+  it('cache-busts the thumbnail after the first retry delay (no re-mint yet)', async () => {
+    vi.useFakeTimers()
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
     expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb')
     await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(999)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb')
+    await vi.advanceTimersByTimeAsync(1)
     expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?_r=1')
     expect(w.emitted('retry')).toBeUndefined() // still retrying in place — the feed is not re-minted
   })
 
+  it('uses the longer delay for the second in-place retry', async () => {
+    vi.useFakeTimers()
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?_r=1')
+
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(3_999)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?_r=1')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?_r=2')
+  })
+
   it('shows the failed state and asks the parent to re-mint once retries are exhausted', async () => {
+    vi.useFakeTimers()
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
     // MAX_THUMB_RETRIES in-place retries, then the next error exhausts → expired-signature signal.
     await w.find('[data-test="tile-image"]').trigger('error') // _r=1
+    await vi.advanceTimersByTimeAsync(1_000)
     await w.find('[data-test="tile-image"]').trigger('error') // _r=2
+    await vi.advanceTimersByTimeAsync(4_000)
     await w.find('[data-test="tile-image"]').trigger('error') // exhausted
     expect(w.find('[data-test="tile-image"]').exists()).toBe(false)
     expect(w.find('[data-test="tile-failed"]').exists()).toBe(true)
@@ -84,13 +109,35 @@ describe('MediaTile', () => {
   })
 
   it('resets and retries from scratch when a fresh (re-minted) URL arrives', async () => {
+    vi.useFakeTimers()
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
     await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(1_000)
     await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(4_000)
     await w.find('[data-test="tile-image"]').trigger('error') // failed
     expect(w.find('[data-test="tile-failed"]').exists()).toBe(true)
     await w.setProps({ att: att('ready', 'image/png', { thumbnailUrl: '/api/attachments/a1/thumb?exp=2' }) })
     expect(w.find('[data-test="tile-failed"]').exists()).toBe(false)
+    expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?exp=2')
+  })
+
+  it('cancels a pending retry when unmounted', async () => {
+    vi.useFakeTimers()
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    await w.find('[data-test="tile-image"]').trigger('error')
+    w.unmount()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(w.emitted('retry')).toBeUndefined()
+  })
+
+  it('cancels a pending retry when the base URL changes', async () => {
+    vi.useFakeTimers()
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(999)
+    await w.setProps({ att: att('ready', 'image/png', { thumbnailUrl: '/api/attachments/a1/thumb?exp=2' }) })
+    await vi.advanceTimersByTimeAsync(1)
     expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?exp=2')
   })
 })

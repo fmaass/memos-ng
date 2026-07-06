@@ -9,6 +9,7 @@ import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import { useApi } from '@/composables/useApi'
 import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import type { MemoQuery } from '@/composables/useTimeline'
+import { shouldRemint } from '@/lib/imageRetry'
 
 const api = useApi()
 const queryClient = useQueryClient()
@@ -21,7 +22,7 @@ const options = [
   { label: 'Videos', value: 'video' },
 ]
 
-const { data, isPending } = useQuery({
+const { data, isPending, isFetching, refetch } = useQuery({
   queryKey: computed(() => ['attachments', filter.value]),
   queryFn: async () => {
     const query: MemoQuery = {}
@@ -33,6 +34,13 @@ const { data, isPending } = useQuery({
 })
 
 const items = computed(() => data.value ?? [])
+
+let lastRemint = 0
+function onTileRetry() {
+  if (!shouldRemint(Date.now(), lastRemint, isFetching.value)) return
+  lastRemint = Date.now()
+  void refetch()
+}
 
 const lightbox = useMediaLightbox()
 function openAt(index: number) {
@@ -94,6 +102,6 @@ async function onAddPrint({ uid, file }: { uid: string; file: File }) {
     <p v-else-if="!items.length" class="text-sm text-muted-color" data-test="resources-empty">
       No attachments yet.
     </p>
-    <JustifiedGallery v-else :items="items" :target-height="200" @open="openAt" />
+    <JustifiedGallery v-else :items="items" :target-height="200" @open="openAt" @retry="onTileRetry" />
   </section>
 </template>

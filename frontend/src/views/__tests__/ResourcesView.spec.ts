@@ -3,9 +3,11 @@ import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
 import { ref } from 'vue'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ResourcesView from '@/views/ResourcesView.vue'
+
+const refetch = vi.fn()
 
 vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn(), DELETE: vi.fn() }) }))
 // The viewer is PhotoSwipe (needs a real DOM) — mock the composable so jsdom doesn't boot it.
@@ -35,10 +37,17 @@ vi.mock('@tanstack/vue-query', () => ({
       },
     ]),
     isPending: ref(false),
+    isFetching: ref(false),
+    refetch,
   }),
 }))
 
 describe('ResourcesView', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    refetch.mockClear()
+  })
+
   it('renders the justified gallery + type filter (not the old square grid)', () => {
     // Layout/image sizing needs real DOM width (covered by lib/justified.spec); here we assert the
     // gallery container + filter are wired and the legacy grid/tile markup is gone.
@@ -46,5 +55,14 @@ describe('ResourcesView', () => {
     expect(wrapper.find('[data-test="justified-gallery"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="type-filter"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="resource-grid"]').exists()).toBe(false)
+  })
+
+  it('re-mints Resources when gallery retry bubbles, throttled to one refetch per cooldown', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(30_000)
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('retry', 'a1')
+    expect(refetch).toHaveBeenCalledTimes(1)
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('retry', 'a1')
+    expect(refetch).toHaveBeenCalledTimes(1)
   })
 })

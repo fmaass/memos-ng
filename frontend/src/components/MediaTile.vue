@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
-import { nextRetrySrc } from '@/lib/imageRetry'
+import type { components } from '@/api/schema'
+import { nextRetrySrc, retryDelayMs } from '@/lib/imageRetry'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
+
+type AttachmentStatus = components['schemas']['AttachmentStatus']
 
 // Only the fields a tile renders — so both MemoOut.attachments (AttachmentRef) and the
 // Resources list (AttachmentListItem) satisfy it without a width/height/duration shape clash.
 interface MediaAttachment {
   uid: string
   mime: string
-  status: string
+  status: AttachmentStatus
   blurhash: string | null
   thumbnailUrl: string
   previewUrl: string
@@ -30,22 +33,37 @@ const imgSrc = ref(baseUrl.value)
 const attempt = ref(0)
 const loadFailed = ref(false)
 const showFailed = computed(() => kind.value === 'failed' || loadFailed.value)
+let retryTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearRetryTimer() {
+  if (retryTimer === null) return
+  clearTimeout(retryTimer)
+  retryTimer = null
+}
 
 // A fresh URL (e.g. after a parent re-mint refetch) clears the failed state and retries from scratch.
 watch(baseUrl, (url) => {
+  clearRetryTimer()
   imgSrc.value = url
   attempt.value = 0
   loadFailed.value = false
 })
+onBeforeUnmount(clearRetryTimer)
 
 // A thumbnail failed to load: cache-bust and retry a couple times (transient blip). Once exhausted
 // the signed URL is likely expired — its signature can't be cache-busted back to life — so show the
 // failed state and ask the parent to re-mint fresh URLs by refetching the feed.
 function onImgError() {
-  const next = nextRetrySrc(baseUrl.value, attempt.value)
-  if (next) {
+  if (retryTimer !== null) return
+  const currentAttempt = attempt.value
+  const next = nextRetrySrc(baseUrl.value, currentAttempt)
+  const delay = retryDelayMs(currentAttempt)
+  if (next && delay !== null) {
     attempt.value += 1
-    imgSrc.value = next
+    retryTimer = setTimeout(() => {
+      imgSrc.value = next
+      retryTimer = null
+    }, delay)
   } else {
     loadFailed.value = true
     emit('retry', props.att.uid)
@@ -54,6 +72,7 @@ function onImgError() {
 
 // Manual Retry: force a fresh request even if the URL is unchanged, and ask the parent to re-mint.
 function manualRetry() {
+  clearRetryTimer()
   attempt.value = 0
   loadFailed.value = false
   imgSrc.value = nextRetrySrc(baseUrl.value, 0) ?? baseUrl.value
