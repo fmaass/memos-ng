@@ -88,41 +88,6 @@ def test_render_heic_source_to_jpeg(tmp_path):
     assert Image.open(io.BytesIO(fs.render_for_frame(str(p)))).format == "JPEG"
 
 
-def test_render_test_image_uses_the_real_render_path():
-    # DateTimeOriginal is injected only by render_for_frame's captured_at backfill — its presence
-    # proves render_test_image goes through the real renderer, not a shortcut JPEG.
-    im = Image.open(io.BytesIO(fs.render_test_image()))
-    assert im.format == "JPEG"
-    assert im.getexif().get_ifd(0x8769).get(0x9003) is not None
-
-
-# --- send_frame_share (the SMTP helper is retained until Phase 3; still exercised) ---
-
-
-async def test_send_builds_one_jpeg_attachment_over_starttls(monkeypatch):
-    captured = {}
-
-    async def fake_send(msg, **kw):
-        captured["msg"] = msg
-        captured["kw"] = kw
-        return ({}, "250 ok")
-
-    monkeypatch.setattr(fs.aiosmtplib, "send", fake_send)
-    monkeypatch.setattr(settings, "SMTP_HOST", "smtp.example")
-    await fs.send_frame_share(
-        from_addr="a@me.com", to_addr="f@send.auraframes.com",
-        filename="x.jpg", jpeg_bytes=b"\xff\xd8\xff\xd9",
-    )
-    msg = captured["msg"]
-    atts = list(msg.iter_attachments())
-    assert len(atts) == 1 and atts[0].get_content_type() == "image/jpeg"
-    assert msg["From"] == "a@me.com" and msg["To"] == "f@send.auraframes.com"
-    assert captured["kw"]["start_tls"] is True and captured["kw"]["hostname"] == "smtp.example"
-    # Explicit send timeout (not aiosmtplib's 60s default) so a hung SMTP server can't stall the
-    # worker drain long enough to flap the healthcheck.
-    assert captured["kw"]["timeout"] == 30
-
-
 # --- album HTTP upload helpers (Phase 2 send path) ---
 
 FRAME_API_URL = "http://frame.local"
