@@ -71,9 +71,9 @@ class User(Base):
         Enum(Visibility, name="visibility"), default=Visibility.PUBLIC
     )
     theme: Mapped[str] = mapped_column(String(32), default="dark")
-    # Aura frame share (per-user). Both must be set for #curated photos to be emailed to the
-    # frame. frame_send_to = the …@send.auraframes.com address; frame_send_from = the sender
-    # identity (an address the SMTP account owns AND a registered member of the frame).
+    # Retained (nullable, now UNUSED) after the SMTP frame-send path and per-user frame settings
+    # were removed — #curated delivery is now a system-level album HTTP upload. Kept for one
+    # rollback release; nothing reads or writes these columns.
     frame_send_to: Mapped[str | None] = mapped_column(String(320))
     frame_send_from: Mapped[str | None] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

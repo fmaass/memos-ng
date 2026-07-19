@@ -7,19 +7,15 @@ drains the queue, renders each photo, and uploads it to the frame's Aura album o
 """
 
 import io
-import re
-import tempfile
 from datetime import UTC, datetime, timedelta
-from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote
 
-import aiosmtplib
 import httpx
 import pillow_heif
 import structlog
 from anyio import to_thread
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,59 +30,6 @@ pillow_heif.register_heif_opener()  # decode HEIC/HEIF originals (also registere
 # The tag that opts a memo's photos into frame sharing.
 CURATED_TAG = "curated"
 
-# Pragmatic email shape check (not full RFC 5322): one @, non-empty local + domain, a dotted TLD,
-# no whitespace. Enough to reject typos in the settings form; the real proof is Phase 0/the frame.
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-def is_valid_email(value: str) -> bool:
-    return bool(_EMAIL_RE.match(value or ""))
-
-
-# The frame send-to must be an Aura ingestion address. The leading "@" anchor blocks both
-# subdomain spoofing ("@evilsend.auraframes.com") and suffix-append spoofing
-# ("...auraframes.com.evil.com"). frame_send_from stays shape-only — Aura membership enforces it.
-AURA_SEND_DOMAIN = "send.auraframes.com"
-
-
-def is_aura_send_to(value: str) -> bool:
-    """True only for a shaped email whose domain is exactly Aura's ingestion domain (case-
-    insensitive). Used by the settings validator so the server SMTP account can't be pointed at an
-    arbitrary recipient."""
-    v = (value or "").lower()
-    return is_valid_email(v) and v.endswith("@" + AURA_SEND_DOMAIN)
-
-
-def frame_settings_valid(user: User) -> bool:
-    """The single read-time predicate for 'this user's persisted Aura settings are usable': both
-    addresses set AND send_to is an Aura ingestion address. Defense in depth — the PATCH validator
-    enforces the domain on write, but a legacy row persisted before that validator (or written
-    around the API) would otherwise turn every send path into an arbitrary-recipient SMTP
-    primitive. Shared by frame-test, enqueue, and send-time revalidation so the three sites can't
-    drift."""
-    return bool(
-        user.frame_send_to
-        and user.frame_send_from
-        and is_aura_send_to(user.frame_send_to)
-    )
-
-
-def render_test_image() -> bytes:
-    """Produce the settings 'Send test photo' JPEG by running a generated source through the REAL
-    render_for_frame — so the test-send exercises the actual render path (open, exif_transpose,
-    q95 encode, captured_at→DateTimeOriginal backfill), not just SMTP. The source is a PNG with no
-    EXIF, mirroring the curated screen-PNGs, so the captured_at backfill is genuinely exercised."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        path = tmp.name
-    try:
-        img = Image.new("RGB", (1200, 800), (38, 70, 110))
-        draw = ImageDraw.Draw(img)
-        draw.rectangle((60, 60, 1140, 740), outline=(255, 255, 255), width=8)
-        draw.text((110, 110), "memos-ng frame test", fill=(255, 255, 255))
-        img.save(path, "PNG")  # PNG source = no EXIF, like the stored curated renditions
-        return render_for_frame(path, datetime.now(UTC))
-    finally:
-        Path(path).unlink(missing_ok=True)
 
 # Render/send tuning. q95 4:4:4 downscaled to a 2048px longest edge (user-decided 2026-07-04,
 # reversing the original full-res choice). Real curated exports average ~8600px / 82MB source;
@@ -99,9 +42,6 @@ FRAME_MAX_EDGE = 2048  # downscale to this longest edge (never upscale); = Aura'
 FRAME_SIZE_WARN_BYTES = 9 * 1024 * 1024
 FRAME_MAX_ATTEMPTS = 5
 FRAME_BACKOFF_BASE_S = 60  # exponential: BASE * 2**(attempts-1)
-# Explicit SMTP timeout (aiosmtplib defaults to 60s). A hung server must not stall the worker
-# drain long enough to flap the healthcheck — 30s is generous for a single small JPEG.
-SMTP_TIMEOUT_S = 30
 
 _EXIF_ORIENTATION = 0x0112
 _EXIF_OFFSET = 0x8769  # pointer to the Exif sub-IFD (where DateTimeOriginal lives)
@@ -115,11 +55,6 @@ def is_frame_image(mime: str) -> bool:
     excluded — it is not a raster photo and Pillow cannot decode it."""
     m = (mime or "").lower()
     return m.startswith("image/") and m != "image/svg+xml"
-
-
-def server_smtp_configured() -> bool:
-    """Global on/off switch: empty username or password disables the feature entirely."""
-    return bool(settings.SMTP_USERNAME and settings.SMTP_PASSWORD)
 
 
 def frame_api_configured() -> bool:
@@ -229,27 +164,6 @@ def render_for_frame(original_path: str, photo_date: datetime | None = None) -> 
     return buf.getvalue()
 
 
-async def send_frame_share(
-    *, from_addr: str, to_addr: str, filename: str, jpeg_bytes: bytes
-) -> None:
-    """Email ONE photo to the frame (Aura mandates one photo per email). Subject/body are empty —
-    Aura ignores them. Never log the credentials or the message body."""
-    msg = EmailMessage()
-    msg["From"] = from_addr
-    msg["To"] = to_addr
-    msg["Subject"] = ""
-    msg.add_attachment(jpeg_bytes, maintype="image", subtype="jpeg", filename=filename)
-    await aiosmtplib.send(
-        msg,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        start_tls=True,
-        username=settings.SMTP_USERNAME,
-        password=settings.SMTP_PASSWORD,
-        timeout=SMTP_TIMEOUT_S,
-    )
-
-
 def _safe_upload_error(exc: Exception) -> str:
     """Synthesize a token-free error string for the upload path from the exception TYPE and (only)
     the HTTP status code. A malformed-header failure (an illegal char anywhere in the token, even
@@ -297,20 +211,6 @@ async def upload_to_album(filename: str, jpeg_bytes: bytes) -> None:
 
 def _file_exists(path: str) -> bool:
     return Path(path).exists()
-
-
-def _is_permanent_smtp_error(exc: Exception) -> bool:
-    """Permanent SMTP failures (bad credentials, refused sender/recipient, 5xx policy) will never
-    succeed on retry — mark them terminal immediately instead of churning through all attempts."""
-    if isinstance(
-        exc,
-        aiosmtplib.SMTPAuthenticationError
-        | aiosmtplib.SMTPSenderRefused
-        | aiosmtplib.SMTPRecipientsRefused,
-    ):
-        return True
-    code = getattr(exc, "code", None)
-    return isinstance(code, int) and 500 <= code < 600
 
 
 def _is_transient_http_error(exc: Exception) -> bool:
