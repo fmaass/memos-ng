@@ -135,13 +135,19 @@ async def _upload_targets(
 
 
 async def run_backfill(
-    db: AsyncSession,
     *,
     execute: bool,
     render: RenderFn = render_for_frame,
     upload: UploadFn = upload_to_album,
 ) -> BackfillStats:
-    targets = await load_curated_targets(db)
+    # Read the whole target list up front, then RELEASE the DB session before the upload loop:
+    # rendering + uploading 200+ photos takes many minutes, and a connection left open but idle
+    # across that window is reaped server-side, so session teardown then raises (asyncpg
+    # "connection is closed") — a false non-zero exit AFTER the work already succeeded. The loop
+    # never touches the DB (targets carry their loaded columns), so closing first is safe and keeps
+    # the exit code + printed summary honest.
+    async with async_session() as db:
+        targets = await load_curated_targets(db)
     return await _upload_targets(targets, execute=execute, render=render, upload=upload)
 
 
@@ -151,8 +157,7 @@ async def _amain(*, execute: bool) -> BackfillStats:
             "frame API not configured (FRAME_API_URL / FRAME_ALBUM_ID / FRAME_API_TOKEN) — "
             "run inside the memos-ng-app container. Refusing to upload."
         )
-    async with async_session() as db:
-        return await run_backfill(db, execute=execute)
+    return await run_backfill(execute=execute)
 
 
 def main() -> None:  # pragma: no cover
