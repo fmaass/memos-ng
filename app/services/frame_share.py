@@ -3,7 +3,7 @@
 `maybe_enqueue_frame_shares` is the single choke point both memo router paths (create + edit)
 call after attachment linking and before commit. It inserts one `frame_share_jobs` row per linked
 image attachment when the feature is fully configured and the memo is #curated. The worker (Phase 2)
-drains the queue, renders each photo, and emails it to the frame.
+drains the queue, renders each photo, and uploads it to the frame's Aura album over the album API.
 """
 
 import io
@@ -12,8 +12,10 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import quote
 
 import aiosmtplib
+import httpx
 import pillow_heif
 import structlog
 from anyio import to_thread
@@ -120,20 +122,28 @@ def server_smtp_configured() -> bool:
     return bool(settings.SMTP_USERNAME and settings.SMTP_PASSWORD)
 
 
+def frame_api_configured() -> bool:
+    """Global on/off switch for the HTTP album upload: enabled only when the endpoint URL and the
+    bearer token are both set AND the album id is non-zero. Any missing piece disables the feature
+    entirely — no jobs are enqueued and the worker claims none (same empty-default-disables pattern
+    as SMTP/VAPID)."""
+    return bool(settings.FRAME_API_URL and settings.FRAME_API_TOKEN and settings.FRAME_ALBUM_ID)
+
+
 async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -> int:
     """Enqueue frame-share jobs for a memo's image attachments, if all guards pass. Returns the
     number of NEW rows inserted (0 when any guard fails or every attachment is already queued).
 
-    Guards (all required): server SMTP configured, owner has both Aura settings, memo is #curated.
+    Guards (all required): the frame album API is configured (system-level destination) and the
+    memo is #curated. There is no per-user guard any more — the send target is the shared album, not
+    a per-user address.
     Idempotent per attachment via ON CONFLICT (attachment_id): a re-edit resurrects ONLY rows that
     went terminal `skipped`/`failed` (reset to queued so a transiently-missed photo gets another
     chance), while `sent` stays terminal (never resend), `claimed` is never touched (at-most-once
     tombstone), and a live `queued` retry keeps its backoff. A newly added image on an
     already-curated memo is enqueued fresh. Runs inside the caller's transaction (atomic with the
     memo write)."""
-    if not server_smtp_configured():
-        return 0
-    if not frame_settings_valid(user):  # includes the Aura-domain check on legacy rows
+    if not frame_api_configured():
         return 0
 
     has_curated = (
@@ -191,7 +201,7 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
     return inserted
 
 
-# --- send side (Phase 2): render + email, driven by the worker ---
+# --- send side (Phase 2): render + upload to the Aura album API, driven by the worker ---
 
 
 def render_for_frame(original_path: str, photo_date: datetime | None = None) -> bytes:
@@ -240,6 +250,51 @@ async def send_frame_share(
     )
 
 
+def _safe_upload_error(exc: Exception) -> str:
+    """Synthesize a token-free error string for the upload path from the exception TYPE and (only)
+    the HTTP status code. A malformed-header failure (an illegal char anywhere in the token, even
+    an internal newline) raises httpx.LocalProtocolError whose message embeds the whole Bearer
+    header value in escaped forms that string redaction can't reliably catch. So we NEVER build
+    this from str(exc)/the exception message — the type name and status code can never contain the
+    token, which makes this leak-proof by construction rather than by pattern-matching."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"upload failed: HTTP {exc.response.status_code}"
+    return f"upload failed: {type(exc).__name__}"
+
+
+async def upload_to_album(filename: str, jpeg_bytes: bytes) -> None:
+    """POST ONE rendered JPEG to the aura-frames album API, which then owns delivery to the frame
+    (replacing the direct SMTP send). aura-frames returns 201 for a newly stored photo and 200 for a
+    SHA-duplicate — both mean the photo is safely in the album, so BOTH are success. Any other
+    status raises httpx.HTTPStatusError (carrying .response.status_code) so the caller can classify
+    transient vs permanent. The bearer token is a secret — never log it (it lives only in the
+    Authorization header, never in the URL or any raised exception message)."""
+    # rstrip("/") so a trailing slash in FRAME_API_URL doesn't yield `//api/albums/...` (redirects
+    # aren't followed, so a stray `//` could hard-fail the upload).
+    url = f"{settings.FRAME_API_URL.rstrip('/')}/api/albums/{settings.FRAME_ALBUM_ID}/photos"
+    headers = {
+        "Authorization": f"Bearer {settings.FRAME_API_TOKEN}",
+        "Content-Type": "image/jpeg",
+        # httpx 0.28 requires ASCII header values; a curated photo can have a non-ASCII filename
+        # (café.jpg), so percent-encode it. aura-frames uses X-Filename only as a display name
+        # (it stores by sha), so a percent-encoded name is fine — and it stays non-empty + .jpg.
+        "X-Filename": quote(filename),
+    }
+    # Explicit 30s timeout (httpx defaults to 5s connect / no overall cap here would let a hung
+    # server stall the worker drain long enough to flap the healthcheck — 30s is generous for one
+    # small JPEG, matching the old SMTP timeout).
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        resp = await client.post(url, content=jpeg_bytes, headers=headers)
+    if resp.status_code in (200, 201):
+        return
+    # 4xx/5xx → HTTPStatusError with .response.status_code for the caller's transient/permanent
+    # split; a stray non-2xx that raise_for_status ignores (e.g. an unfollowed 3xx) still errors.
+    resp.raise_for_status()
+    raise httpx.HTTPStatusError(
+        f"unexpected status {resp.status_code}", request=resp.request, response=resp
+    )
+
+
 def _file_exists(path: str) -> bool:
     return Path(path).exists()
 
@@ -258,14 +313,35 @@ def _is_permanent_smtp_error(exc: Exception) -> bool:
     return isinstance(code, int) and 500 <= code < 600
 
 
+def _is_transient_http_error(exc: Exception) -> bool:
+    """Transient album-upload failures worth retrying with backoff: any network/timeout/transport
+    error (httpx.TimeoutException and httpx.ConnectError are both httpx.TransportError subclasses),
+    and HTTP 408 (request timeout), 429 (rate limited), or any 5xx (server-side). Everything else —
+    any other 4xx (400/401/403/404/413/415/422) — is a permanent client error retrying can't fix, so
+    it returns False → the caller marks the job terminally `failed`."""
+    # A LocalProtocolError is a malformed OUTGOING request (e.g. an illegal char in the bearer
+    # token) — a config error retrying can't fix, so treat it as PERMANENT. It is a TransportError
+    # subclass, so this check MUST precede the broad TransportError branch below. (RemoteProtocol
+    # error — a malformed server response — stays transient via that branch.)
+    if isinstance(exc, httpx.LocalProtocolError):
+        return False
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code in (408, 429) or 500 <= code < 600
+    return False
+
+
 async def _revalidate(
     db: AsyncSession, job: FrameShareJob
 ) -> tuple[Attachment, Memo, User] | None:
-    """Best-effort send-time revalidation (see plan D2 — NOT lock-held across the SMTP round-trip).
+    """Best-effort send-time revalidation (see plan D2 — NOT lock-held across the upload call).
     Returns (attachment, memo, owner) if the job is still eligible, else None → the worker marks it
     `skipped`. Catches every realistic case: memo deleted / un-#curated / attachment unlinked /
-    settings cleared / original missing / feature disabled."""
-    if not server_smtp_configured():
+    original missing / feature disabled. The destination is now the system-level album, so there is
+    no per-user settings re-check here — only that the owner row still exists."""
+    if not frame_api_configured():
         return None
     att = await db.get(Attachment, job.attachment_id)
     if att is None or att.memo_id != job.memo_id or not is_frame_image(att.mime):
@@ -273,11 +349,8 @@ async def _revalidate(
     memo = await db.get(Memo, job.memo_id)
     if memo is None:
         return None
-    # frame_settings_valid re-checks the Aura domain at send time: a legacy non-Aura send_to skips
-    # the job rather than emailing an arbitrary recipient. Once the user fixes the address, the
-    # resurrection path (skipped → queued on the next enqueue) gives the photo another chance.
     user = await db.get(User, job.user_id)
-    if user is None or not frame_settings_valid(user):
+    if user is None:
         return None
     still_curated = (
         await db.execute(
@@ -296,23 +369,22 @@ async def _revalidate(
 async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
     """Render + send one job already committed as `claimed`. Mutates job state and FLUSHES only —
     the worker owns the commit, so a crash before that commit leaves the job `claimed` and it is
-    never re-claimed (at-most-once; no duplicate email — plan D1). Returns the outcome label."""
+    never re-claimed (at-most-once; no duplicate upload — plan D1). Returns the outcome label."""
     reval = await _revalidate(db, job)
     if reval is None:
         job.state = FrameShareState.skipped
         await db.flush()
         logger.info("frame_share.skipped", job_id=job.id)
         return "skipped"
-    att, memo, user = reval
+    att, memo, _user = reval
     assert att.storage_path is not None  # _revalidate guarantees a present file
-    assert user.frame_send_from is not None and user.frame_send_to is not None
     filename = Path(att.filename).stem + ".jpg"
     # Stamp DateTimeOriginal from the MEMO's date, not attachment.captured_at: for curated exports
     # captured_at is unreliable (mostly NULL, else upload time); the memo's created_at is the user's
     # curated/back-dated event date — the intended chronological position on the frame.
     # Render step: a decode/render failure is a permanent data problem (corrupt original), not a
     # transient send error. Fail terminally on the first attempt instead of retrying with backoff
-    # through all five (~15 min of churn) — and never reach SMTP.
+    # through all five (~15 min of churn) — and never reach the upload.
     try:
         jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
     except Exception as exc:
@@ -326,22 +398,24 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         return "failed"
     if len(jpeg) > FRAME_SIZE_WARN_BYTES:
         logger.warning("frame_share.render_large", job_id=job.id, bytes=len(jpeg))
-    # Send step: SMTP errors keep the transient/permanent split (retry with backoff vs terminal).
+    # Send step: upload the JPEG to the aura-frames album API (which then owns delivery). HTTP
+    # failures keep the transient/permanent split (retry with backoff vs terminal): transient =
+    # network/timeout + HTTP 408/429/5xx; permanent = any other 4xx. A 200 (SHA-duplicate) or 201
+    # (new photo) is success — upload_to_album returns without raising.
     try:
-        await send_frame_share(
-            from_addr=user.frame_send_from,
-            to_addr=user.frame_send_to,
-            filename=filename,
-            jpeg_bytes=jpeg,
-        )
+        await upload_to_album(filename, jpeg)
     except Exception as exc:
+        # A malformed-header failure (bad token) embeds the full `Bearer <token>` in str(exc), in
+        # escaped forms redaction can't catch — so build the stored/logged error from the exception
+        # TYPE + HTTP status ONLY (leak-proof by construction; never str(exc)).
+        safe = _safe_upload_error(exc)
         job.attempts += 1
-        job.error = str(exc)[:500]
-        if _is_permanent_smtp_error(exc) or job.attempts >= FRAME_MAX_ATTEMPTS:
+        job.error = safe
+        if not _is_transient_http_error(exc) or job.attempts >= FRAME_MAX_ATTEMPTS:
             job.state = FrameShareState.failed
             await db.flush()
             logger.warning(
-                "frame_share.failed", job_id=job.id, attempts=job.attempts, error=str(exc)[:200]
+                "frame_share.failed", job_id=job.id, attempts=job.attempts, error=safe
             )
             return "failed"
         job.state = FrameShareState.queued  # retry later
@@ -350,7 +424,7 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         )
         await db.flush()
         logger.warning(
-            "frame_share.retry", job_id=job.id, attempts=job.attempts, error=str(exc)[:200]
+            "frame_share.retry", job_id=job.id, attempts=job.attempts, error=safe
         )
         return "retry"
     job.state = FrameShareState.sent

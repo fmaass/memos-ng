@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     SMTP_USERNAME: str = Field(default="", repr=False)
     SMTP_PASSWORD: str = Field(default="", repr=False)
 
+    # Aura frame album HTTP upload. The SEND step POSTs the rendered JPEG to the aura-frames album
+    # API, which then owns delivery to the frame (replacing the direct SMTP send). Empty URL/token
+    # OR a zero album id disables the feature globally: no jobs are enqueued and every send is a
+    # no-op (same empty-default-disables pattern as SMTP/VAPID above). The token is a secret — set
+    # via the stack .env in prod and never log it (repr=False keeps it out of any settings dump).
+    FRAME_API_URL: str = ""
+    FRAME_ALBUM_ID: int = 0
+    FRAME_API_TOKEN: str = Field(default="", repr=False)
+
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
     OIDC_CLIENT_ID: str = "memos-ng"
