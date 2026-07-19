@@ -210,13 +210,14 @@ async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
 async def run_frame_share_once(db: AsyncSession) -> str:
     """Claim + process one frame-share job. Returns 'processed' | 'idle' | 'deferred'.
 
-    The `claimed` state is COMMITTED before any render/send, so a crash between SMTP acceptance and
-    the result commit strands the job in `claimed` (never re-claimed) rather than resending it."""
-    if not frame_share.server_smtp_configured():
-        # Only a worker that can actually send may CLAIM these jobs. The Merkur slow-lane worker
-        # runs the same image with no SMTP creds — without this guard it would win the claim race
-        # for some jobs and, unable to send, mark them terminally `skipped`. Leaving them queued
-        # lets the SMTP-configured (Saturn) worker drain them.
+    The `claimed` state is COMMITTED before any render/upload, so a crash between the album API
+    accepting the photo and the result commit strands the job in `claimed` (never re-claimed) rather
+    than re-uploading it."""
+    if not frame_share.frame_api_configured():
+        # Only a worker that can actually upload may CLAIM these jobs. The Merkur slow-lane worker
+        # runs the same image without the frame API configured — without this guard it would win the
+        # claim race for some jobs and, unable to upload, mark them terminally `skipped`. Leaving
+        # them queued lets the frame-API-configured (Saturn) worker drain them.
         await db.commit()
         return "idle"
     if media.too_hot():  # a photo render is light, but honor the same host thermal guard
@@ -253,9 +254,9 @@ async def run() -> None:
     while True:
         async with async_session() as db:
             status = await run_once(db)
-        beat()  # heartbeat before the (possibly slow SMTP) frame drain — keep liveness honest
-        # Drain a frame-share job opportunistically in its own session (like reap): email sending is
-        # decoupled from the media job's transaction so an SMTP error can't poison media work.
+        beat()  # heartbeat before the (possibly slow HTTP) frame drain — keep liveness honest
+        # Drain a frame-share job opportunistically in its own session (like reap): the album upload
+        # is decoupled from the media job's transaction so an upload error can't poison media work.
         frame_status = await run_frame_share_drain()
         beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:

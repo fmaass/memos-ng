@@ -12,12 +12,25 @@ from app.models import (
 )
 from app.services import memos as svc
 from app.services.frame_share import (
+    frame_api_configured,
     is_aura_send_to,
     is_frame_image,
     is_valid_email,
     maybe_enqueue_frame_shares,
 )
 from sqlalchemy import func, select
+
+# Test values for the album HTTP-upload feature. Enqueue now gates on frame_api_configured()
+# (system-level destination), NOT on any per-user address.
+FRAME_API_URL = "http://frame.local"
+FRAME_ALBUM_ID = 7
+FRAME_API_TOKEN = "album-token"
+
+
+def _set_frame_api(monkeypatch, *, url=FRAME_API_URL, album=FRAME_ALBUM_ID, token=FRAME_API_TOKEN):
+    monkeypatch.setattr(settings, "FRAME_API_URL", url)
+    monkeypatch.setattr(settings, "FRAME_ALBUM_ID", album)
+    monkeypatch.setattr(settings, "FRAME_API_TOKEN", token)
 
 
 def _img(owner_id: int, uid: str, mime: str = "image/jpeg") -> Attachment:
@@ -28,9 +41,8 @@ def _img(owner_id: int, uid: str, mime: str = "image/jpeg") -> Attachment:
 
 
 async def _configured_user(adb, monkeypatch, subject: str = "alice") -> User:
-    """A user + server config with the frame-share feature fully enabled."""
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-specific-pw")
+    """A user + server config with the frame-share feature fully enabled (album HTTP upload)."""
+    _set_frame_api(monkeypatch)
     u = User(
         subject=subject, role="user",
         frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
@@ -265,29 +277,10 @@ async def test_queued_retry_job_untouched(adb, monkeypatch):
     assert job.next_attempt_at is not None  # backoff preserved
 
 
-async def test_non_aura_send_to_no_jobs(adb, monkeypatch):
-    # Defense in depth against legacy rows: a persisted send_to predating the PATCH-time Aura
-    # validator must read as not-configured at enqueue time — no jobs to an arbitrary address.
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-specific-pw")
-    u = User(
-        subject="legacy", role="user",
-        frame_send_to="victim@example.com", frame_send_from="sender@me.com",
-    )
-    adb.add(u)
-    await adb.flush()
-    adb.add(_img(u.id, "i1"))
-    await adb.flush()
-    memo = await svc.create_memo(
-        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=["i1"]
-    )
-    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
-    assert await _job_count(adb, memo) == 0
-
-
-async def test_owner_missing_settings_no_jobs(adb, monkeypatch):
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-specific-pw")
+async def test_owner_without_per_user_settings_still_enqueues(adb, monkeypatch):
+    # The destination is the system-level album now, not a per-user address — the old per-user guard
+    # (frame_settings_valid) is gone, so a user with no frame_send_to/from must still enqueue.
+    _set_frame_api(monkeypatch)
     u = User(subject="alice", role="user")  # no frame_send_to / frame_send_from
     adb.add(u)
     await adb.flush()
@@ -296,13 +289,13 @@ async def test_owner_missing_settings_no_jobs(adb, monkeypatch):
     memo = await svc.create_memo(
         adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=["i1"]
     )
-    assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
-    assert await _job_count(adb, memo) == 0
+    assert await maybe_enqueue_frame_shares(adb, memo, u) == 1
+    assert await _job_count(adb, memo) == 1
 
 
-async def test_server_smtp_unset_no_jobs(adb, monkeypatch):
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "")
+async def test_frame_api_unset_no_jobs(adb, monkeypatch):
+    # Feature disabled (album API not configured) → no jobs enqueued even for a curated image.
+    _set_frame_api(monkeypatch, url="", album=0, token="")
     u = User(
         subject="alice", role="user",
         frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
@@ -316,3 +309,19 @@ async def test_server_smtp_unset_no_jobs(adb, monkeypatch):
     )
     assert await maybe_enqueue_frame_shares(adb, memo, u) == 0
     assert await _job_count(adb, memo) == 0
+
+
+@pytest.mark.parametrize(
+    "url,album,token,expected",
+    [
+        ("http://frame.local", 7, "tok", True),  # all three set → enabled
+        ("", 7, "tok", False),                    # URL unset → disabled
+        ("http://frame.local", 0, "tok", False),  # album id zero → disabled
+        ("http://frame.local", 7, "", False),     # token unset → disabled
+    ],
+)
+def test_frame_api_configured_requires_all_three(monkeypatch, url, album, token, expected):
+    monkeypatch.setattr(settings, "FRAME_API_URL", url)
+    monkeypatch.setattr(settings, "FRAME_ALBUM_ID", album)
+    monkeypatch.setattr(settings, "FRAME_API_TOKEN", token)
+    assert frame_api_configured() is expected

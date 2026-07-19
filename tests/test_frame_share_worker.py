@@ -2,6 +2,7 @@ import io
 import secrets
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 from app import worker
 from app.config import settings
@@ -95,7 +96,7 @@ def test_render_test_image_uses_the_real_render_path():
     assert im.getexif().get_ifd(0x8769).get(0x9003) is not None
 
 
-# --- send_frame_share ---
+# --- send_frame_share (the SMTP helper is retained until Phase 3; still exercised) ---
 
 
 async def test_send_builds_one_jpeg_attachment_over_starttls(monkeypatch):
@@ -122,16 +123,152 @@ async def test_send_builds_one_jpeg_attachment_over_starttls(monkeypatch):
     assert captured["kw"]["timeout"] == 30
 
 
+# --- album HTTP upload helpers (Phase 2 send path) ---
+
+FRAME_API_URL = "http://frame.local"
+FRAME_ALBUM_ID = 7
+FRAME_API_TOKEN = "album-token"
+
+
+def _frame_api_settings(
+    monkeypatch, *, url=FRAME_API_URL, album=FRAME_ALBUM_ID, token=FRAME_API_TOKEN
+):
+    monkeypatch.setattr(settings, "FRAME_API_URL", url)
+    monkeypatch.setattr(settings, "FRAME_ALBUM_ID", album)
+    monkeypatch.setattr(settings, "FRAME_API_TOKEN", token)
+
+
+def _mock_album(monkeypatch, *, status=201, exc=None, captured=None):
+    """Route upload_to_album's POST through an httpx.MockTransport that returns `status` (or whose
+    handler raises `exc` to simulate a network/timeout error). Each request is appended to
+    `captured` (a list) so callers can assert the URL/headers/body. Does NOT touch settings — the
+    caller decides whether the feature is configured."""
+
+    def handler(request):
+        if captured is not None:
+            captured.append(request)
+        if exc is not None:
+            raise exc
+        return httpx.Response(status)
+
+    transport = httpx.MockTransport(handler)
+    orig = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(fs.httpx, "AsyncClient", factory)
+
+
+@pytest.mark.parametrize("status", [200, 201])
+async def test_upload_to_album_2xx_succeeds(monkeypatch, status):
+    # 201 = new photo, 200 = SHA-duplicate — both mean the photo is safely in the album, so
+    # upload_to_album returns without raising for either.
+    _frame_api_settings(monkeypatch)
+    _mock_album(monkeypatch, status=status)
+    assert await fs.upload_to_album("x.jpg", b"\xff\xd8\xff\xd9") is None
+
+
+async def test_upload_to_album_error_raises_with_status_code(monkeypatch):
+    _frame_api_settings(monkeypatch)
+    _mock_album(monkeypatch, status=422)
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        await fs.upload_to_album("x.jpg", b"\xff\xd8\xff\xd9")
+    assert ei.value.response.status_code == 422  # status carried for the caller's classification
+
+
+async def test_upload_to_album_posts_bearer_and_filename(monkeypatch):
+    _frame_api_settings(monkeypatch)
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
+    await fs.upload_to_album("sunset.jpg", b"\xff\xd8body\xff\xd9")
+    req = captured[0]
+    assert str(req.url) == f"{FRAME_API_URL}/api/albums/{FRAME_ALBUM_ID}/photos"
+    assert req.headers["Authorization"] == f"Bearer {FRAME_API_TOKEN}"
+    assert req.headers["Content-Type"] == "image/jpeg"
+    assert req.headers["X-Filename"] == "sunset.jpg"
+    assert req.content == b"\xff\xd8body\xff\xd9"  # raw JPEG bytes are the body
+
+
+async def test_upload_to_album_uses_explicit_30s_timeout(monkeypatch):
+    # The explicit httpx.Timeout(30.0) keeps a hung server from stalling the worker drain. Capture
+    # the AsyncClient construction kwargs and pin it — this goes red if the explicit timeout is
+    # dropped (the arg would be absent → recorded None → not an httpx.Timeout).
+    _frame_api_settings(monkeypatch)
+    recorded = {}
+    orig = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda req: httpx.Response(201))
+
+    def factory(*args, **kwargs):
+        recorded["timeout"] = kwargs.get("timeout")
+        kwargs["transport"] = transport
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(fs.httpx, "AsyncClient", factory)
+    await fs.upload_to_album("x.jpg", b"\xff\xd8\xff\xd9")
+    t = recorded["timeout"]
+    assert isinstance(t, httpx.Timeout)
+    assert t.connect == t.read == t.write == t.pool == 30.0
+
+
+async def test_upload_to_album_ascii_encodes_non_ascii_filename(monkeypatch):
+    # httpx 0.28 rejects non-ASCII header values — a curated photo named café.jpg would raise
+    # UnicodeEncodeError. The header value must be percent-encoded (deterministic), ASCII, and keep
+    # the .jpg extension.
+    _frame_api_settings(monkeypatch)
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
+    await fs.upload_to_album("café.jpg", b"\xff\xd8\xff\xd9")  # must not raise
+    xf = captured[0].headers["X-Filename"]
+    assert xf == "caf%C3%A9.jpg" and xf.isascii() and xf.endswith(".jpg")
+
+
+def _status_err(code: int) -> httpx.HTTPStatusError:
+    req = httpx.Request("POST", f"{FRAME_API_URL}/api/albums/{FRAME_ALBUM_ID}/photos")
+    return httpx.HTTPStatusError(str(code), request=req, response=httpx.Response(code, request=req))
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        # transient → retry with backoff
+        (httpx.TimeoutException("t"), True),
+        (httpx.ConnectError("c"), True),
+        (httpx.ReadError("r"), True),
+        (httpx.RemoteProtocolError("malformed server response"), True),  # server-side → transient
+        (_status_err(408), True),
+        (_status_err(429), True),
+        (_status_err(500), True),
+        (_status_err(502), True),
+        (_status_err(503), True),
+        # permanent → terminal failure
+        # LocalProtocolError = a malformed OUTGOING request (bad token) — a TransportError subclass
+        # that MUST classify permanent (checked before the broad TransportError branch).
+        (httpx.LocalProtocolError("Illegal header value b'Bearer x'"), False),
+        (_status_err(400), False),
+        (_status_err(401), False),
+        (_status_err(403), False),
+        (_status_err(404), False),
+        (_status_err(413), False),
+        (_status_err(415), False),
+        (_status_err(422), False),
+        (ValueError("not an httpx error"), False),
+    ],
+)
+def test_is_transient_http_error(exc, expected):
+    assert fs._is_transient_http_error(exc) is expected
+
+
 # --- process_claimed_job state machine (adb; the worker owns commits, so no commit here) ---
 
 
 async def _make_claimed(
     adb, monkeypatch, tmp_path, *, content="pics #curated", mime="image/jpeg",
-    write_file=True, configured=True, subject=None,
+    write_file=True, configured=True, subject=None, filename="photo.jpg",
 ):
     if configured:
-        monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
-        monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-pw")
+        _frame_api_settings(monkeypatch)
     u = User(
         subject=subject or f"u-{secrets.token_hex(4)}", role="user",
         frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
@@ -144,7 +281,7 @@ async def _make_claimed(
         _write_jpeg(f, (64, 48))
         storage = str(f)
     att = Attachment(
-        uid=secrets.token_urlsafe(8), owner_id=u.id, filename="photo.jpg", mime=mime,
+        uid=secrets.token_urlsafe(8), owner_id=u.id, filename=filename, mime=mime,
         size=1, status=AttachmentStatus.ready, storage_path=storage,
         captured_at=datetime(2024, 5, 5, tzinfo=UTC),
     )
@@ -162,36 +299,29 @@ async def _make_claimed(
     return job, att, memo, u
 
 
-def _record_send(monkeypatch, calls, exc=None):
-    async def fake_send(msg, **kw):
-        calls.append(msg)
-        if exc is not None:
-            raise exc
-        return ({}, "250 ok")
-
-    monkeypatch.setattr(fs.aiosmtplib, "send", fake_send)
-
-
-async def test_process_success_marks_sent(adb, monkeypatch, tmp_path):
-    calls = []
-    _record_send(monkeypatch, calls)
+async def test_process_new_upload_201_marks_sent(adb, monkeypatch, tmp_path):
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
     assert await fs.process_claimed_job(adb, job) == "sent"
     assert job.state is FrameShareState.sent and job.sent_at is not None
-    assert len(calls) == 1
+    assert len(captured) == 1  # exactly one upload
+
+
+async def test_process_duplicate_200_marks_sent(adb, monkeypatch, tmp_path):
+    # A SHA-duplicate returns 200 — the photo is already in the album, so this is SUCCESS, not a
+    # failure. The job must end `sent` (idempotent), never `failed`.
+    _mock_album(monkeypatch, status=200)
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    assert await fs.process_claimed_job(adb, job) == "sent"
+    assert job.state is FrameShareState.sent and job.sent_at is not None
 
 
 async def test_process_stamps_memo_date_not_captured_at(adb, monkeypatch, tmp_path):
     # Frame ordering key is the MEMO's date, not attachment.captured_at (unreliable for exports).
-    captured = {}
-
-    async def fake_send(msg, **kw):
-        captured["msg"] = msg
-        return ({}, "250 ok")
-
-    monkeypatch.setattr(fs.aiosmtplib, "send", fake_send)
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "s@me.com")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "pw")
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
+    _frame_api_settings(monkeypatch)
     u = User(
         subject=f"u-{secrets.token_hex(4)}", role="user",
         frame_send_to="f@send.auraframes.com", frame_send_from="s@me.com",
@@ -216,22 +346,25 @@ async def test_process_stamps_memo_date_not_captured_at(adb, monkeypatch, tmp_pa
     adb.add(job)
     await adb.flush()
     assert await fs.process_claimed_job(adb, job) == "sent"
-    part = next(captured["msg"].iter_attachments())
-    im = Image.open(io.BytesIO(part.get_payload(decode=True)))
+    im = Image.open(io.BytesIO(captured[0].content))  # the uploaded JPEG bytes
     dto = im.getexif().get_ifd(0x8769).get(0x9003)
     assert dto == "2026:05:12 09:30:00"  # memo date, NOT captured_at's 2020
 
 
-async def test_process_transient_smtp_retries_with_backoff(adb, monkeypatch, tmp_path):
-    _record_send(monkeypatch, [], exc=fs.aiosmtplib.SMTPServerDisconnected("conn lost"))
+async def test_process_500_retries_with_backoff(adb, monkeypatch, tmp_path):
+    # A 5xx is a transient server-side error → retry with backoff (queued + future next_attempt_at).
+    _mock_album(monkeypatch, status=500)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    before = datetime.now(UTC)
     assert await fs.process_claimed_job(adb, job) == "retry"
     assert job.state is FrameShareState.queued
     assert job.attempts == 1 and job.next_attempt_at is not None
+    assert job.next_attempt_at > before  # backoff scheduled into the future
 
 
 async def test_process_transient_terminal_at_max_attempts(adb, monkeypatch, tmp_path):
-    _record_send(monkeypatch, [], exc=fs.aiosmtplib.SMTPServerDisconnected("conn lost"))
+    # Even a transient (5xx) failure goes terminal once attempts hit FRAME_MAX_ATTEMPTS.
+    _mock_album(monkeypatch, status=503)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
     job.attempts = 4  # next failure is the 5th
     await adb.flush()
@@ -239,20 +372,35 @@ async def test_process_transient_terminal_at_max_attempts(adb, monkeypatch, tmp_
     assert job.state is FrameShareState.failed and job.attempts == 5
 
 
-async def test_process_permanent_smtp_fails_immediately(adb, monkeypatch, tmp_path):
-    _record_send(monkeypatch, [], exc=fs.aiosmtplib.SMTPAuthenticationError(535, "bad creds"))
+async def test_process_422_fails_immediately(adb, monkeypatch, tmp_path):
+    # A 422 (and any non-408/429 4xx) is a permanent client error retrying can't fix → terminal
+    # `failed` on the FIRST attempt, no churn through all five, no backoff scheduled.
+    _mock_album(monkeypatch, status=422)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
     assert await fs.process_claimed_job(adb, job) == "failed"
-    # Terminal on the FIRST attempt — no churn through all five.
     assert job.state is FrameShareState.failed and job.attempts == 1
+    assert job.next_attempt_at is None  # no retry scheduled
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [httpx.TimeoutException("timed out"), httpx.ConnectError("connection refused")],
+)
+async def test_process_network_error_retries(adb, monkeypatch, tmp_path, exc):
+    # A timeout / connect error is transient → retry with backoff (queued, attempts incremented).
+    _mock_album(monkeypatch, exc=exc)
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    assert await fs.process_claimed_job(adb, job) == "retry"
+    assert job.state is FrameShareState.queued
+    assert job.attempts == 1 and job.next_attempt_at is not None
 
 
 async def test_process_render_failure_fails_immediately(adb, monkeypatch, tmp_path):
     # A corrupt/undecodable original makes render_for_frame raise. That is a permanent data problem,
     # NOT a transient send error — it must go terminal `failed` on the FIRST attempt, never churn
-    # through all five with backoff, and never reach SMTP.
-    calls = []
-    _record_send(monkeypatch, calls)
+    # through all five with backoff, and never reach the upload step.
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
     job, att, *_ = await _make_claimed(adb, monkeypatch, tmp_path, write_file=False)
     bad = tmp_path / "corrupt.jpg"
     bad.write_bytes(b"this is not a decodable image")
@@ -262,57 +410,116 @@ async def test_process_render_failure_fails_immediately(adb, monkeypatch, tmp_pa
     assert job.state is FrameShareState.failed
     assert job.attempts == 1  # terminal on first attempt, no 5-attempt churn
     assert job.next_attempt_at is None  # no retry scheduled
-    assert calls == []  # never reached the send step
+    assert captured == []  # never reached the upload step
     assert job.error  # the decode error is recorded
 
 
 async def test_process_uncurated_skips_without_sending(adb, monkeypatch, tmp_path):
-    calls = []
-    _record_send(monkeypatch, calls)
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path, content="no tag here")
     assert await fs.process_claimed_job(adb, job) == "skipped"
-    assert job.state is FrameShareState.skipped and calls == []
+    assert job.state is FrameShareState.skipped and captured == []
 
 
 async def test_process_unlinked_attachment_skips(adb, monkeypatch, tmp_path):
-    calls = []
-    _record_send(monkeypatch, calls)
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
     job, att, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
     att.memo_id = None  # attachment unlinked before the worker ran
     await adb.flush()
     assert await fs.process_claimed_job(adb, job) == "skipped"
-    assert job.state is FrameShareState.skipped and calls == []
+    assert job.state is FrameShareState.skipped and captured == []
 
 
 async def test_process_missing_original_file_skips(adb, monkeypatch, tmp_path):
-    calls = []
-    _record_send(monkeypatch, calls)
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path, write_file=False)
     assert await fs.process_claimed_job(adb, job) == "skipped"
-    assert job.state is FrameShareState.skipped and calls == []
+    assert job.state is FrameShareState.skipped and captured == []
 
 
-async def test_process_server_smtp_unset_skips(adb, monkeypatch, tmp_path):
-    calls = []
-    _record_send(monkeypatch, calls)
+async def test_process_frame_api_unset_skips(adb, monkeypatch, tmp_path):
+    # The album API is not configured → send-time revalidation returns None → the job is skipped
+    # and nothing is uploaded (mirrors the enqueue guard for a feature disabled mid-flight).
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
     job, *_ = await _make_claimed(adb, monkeypatch, tmp_path, configured=False)
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "")
+    _frame_api_settings(monkeypatch, url="", album=0, token="")
     assert await fs.process_claimed_job(adb, job) == "skipped"
-    assert job.state is FrameShareState.skipped and calls == []
+    assert job.state is FrameShareState.skipped and captured == []
 
 
-async def test_process_non_aura_send_to_skips(adb, monkeypatch, tmp_path):
-    # Defense in depth against legacy rows: a persisted non-Aura send_to (predating the PATCH-time
-    # validator) must fail send-time revalidation — the job goes skipped, nothing reaches SMTP.
-    # Once the user fixes the address, the resurrection path re-queues it on the next memo edit.
-    calls = []
-    _record_send(monkeypatch, calls)
-    job, _att, _memo, u = await _make_claimed(adb, monkeypatch, tmp_path)
-    u.frame_send_to = "victim@example.com"  # bypasses the PATCH validator, like a legacy DB row
+async def test_process_non_ascii_filename_uploads_ascii_header(adb, monkeypatch, tmp_path):
+    # A curated photo can have a non-ASCII name (café.jpg). httpx 0.28 rejects non-ASCII header
+    # values, so an un-encoded X-Filename would fail the upload permanently on attempt 1 — a
+    # regression vs the old email path. The header must be ASCII-safe and the job still `sent`.
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path, filename="café.jpg")
+    assert await fs.process_claimed_job(adb, job) == "sent"
+    xf = captured[0].headers["X-Filename"]
+    assert xf.isascii() and xf and xf.endswith(".jpg")  # ASCII-only, non-empty, keeps .jpg
+    assert xf == "caf%C3%A9.jpg"  # deterministic percent-encoding
+
+
+async def test_process_bad_token_fails_permanently_without_leaking(adb, monkeypatch, tmp_path):
+    # A token with an illegal header char makes httpx raise LocalProtocolError whose message embeds
+    # the full `Bearer <token>` value — and an INTERNAL control char (\n here) is escaped by h11's
+    # bytes-repr, so string redaction of the raw/stripped token would NOT catch it. Two invariants:
+    # (1) it is PERMANENT (a config error retrying can't fix) → `failed`, not retried; (2) the error
+    # is synthesized from the exception type only, so no fragment of the token can ever appear.
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)  # sets a valid url/album/token
+    secret = "SENTINEL\nTOKEN"  # internal control char — the case redaction cannot handle
+    monkeypatch.setattr(settings, "FRAME_API_TOKEN", secret)
+    # Faithful to h11: the message carries the header value via bytes-repr (escapes the \n).
+    header_repr = repr(f"Bearer {secret}".encode())
+    exc = httpx.LocalProtocolError(f"Illegal header value {header_repr}")
+    _mock_album(monkeypatch, exc=exc)
+    assert await fs.process_claimed_job(adb, job) == "failed"  # permanent, NOT retried
+    assert job.state is FrameShareState.failed and job.attempts == 1
+    assert job.next_attempt_at is None  # no backoff scheduled — never retried
+    assert job.error == "upload failed: LocalProtocolError"  # synthesized from type only
+    # Neither the raw token nor any non-trivial fragment of it may appear in the stored error.
+    assert "SENTINEL" not in (job.error or "") and "TOKEN" not in (job.error or "")
+
+
+# --- full flow: enqueue via the real guard → claim → upload → sent ---
+
+
+async def test_full_flow_enqueue_then_upload_marks_sent(adb, monkeypatch, tmp_path):
+    _frame_api_settings(monkeypatch)
+    captured = []
+    _mock_album(monkeypatch, status=201, captured=captured)
+    u = User(subject=f"u-{secrets.token_hex(4)}", role="user")  # no per-user frame settings needed
+    adb.add(u)
     await adb.flush()
-    assert await fs.process_claimed_job(adb, job) == "skipped"
-    assert job.state is FrameShareState.skipped and calls == []
+    src = tmp_path / "sunset.png"
+    Image.new("RGB", (120, 80), (10, 20, 30)).save(src, "PNG")
+    att = Attachment(
+        uid=secrets.token_urlsafe(8), owner_id=u.id, filename="sunset.png", mime="image/png",
+        size=1, status=AttachmentStatus.ready, storage_path=str(src),
+    )
+    adb.add(att)
+    await adb.flush()
+    memo = await memos_svc.create_memo(
+        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
+    )
+    # Enqueue through the real guard (frame_api_configured, no per-user settings).
+    assert await fs.maybe_enqueue_frame_shares(adb, memo, u) == 1
+    job = (
+        await adb.execute(select(FrameShareJob).where(FrameShareJob.memo_id == memo.id))
+    ).scalar_one()
+    job.state = FrameShareState.claimed  # the worker claims before processing
+    await adb.flush()
+
+    assert await fs.process_claimed_job(adb, job) == "sent"
+    assert job.state is FrameShareState.sent and job.sent_at is not None
+    req = captured[0]
+    assert str(req.url) == f"{FRAME_API_URL}/api/albums/{FRAME_ALBUM_ID}/photos"
+    assert req.headers["Authorization"] == f"Bearer {FRAME_API_TOKEN}"
+    assert req.headers["X-Filename"] == "sunset.jpg"  # attachment filename stem + .jpg
 
 
 # --- run_frame_share_drain isolates errors from the worker loop (media stays alive) ---
@@ -351,10 +558,9 @@ async def test_claim_frame_share_honors_state_and_next_attempt(adb, monkeypatch,
 
 
 async def test_run_frame_share_once_end_to_end_marks_sent(monkeypatch, tmp_path, db_engine):
-    calls = []
-    _record_send(monkeypatch, calls)
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "sender@me.com")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "app-pw")
+    captured = []
+    _frame_api_settings(monkeypatch)
+    _mock_album(monkeypatch, status=201, captured=captured)
     f = tmp_path / "real.jpg"
     _write_jpeg(f, (100, 70))
     subject = f"e2e-{secrets.token_hex(4)}"
@@ -389,7 +595,7 @@ async def test_run_frame_share_once_end_to_end_marks_sent(monkeypatch, tmp_path,
                 await db.execute(select(FrameShareJob).where(FrameShareJob.user_id == user_id))
             ).scalar_one()
             assert job.state is FrameShareState.sent and job.sent_at is not None
-        assert len(calls) == 1
+        assert len(captured) == 1
     finally:
         # This test COMMITS (unlike adb-rolled-back tests), so it must remove everything it wrote.
         # Deleting the user cascades to memo/attachment/job, but the shared `tags` row does not
@@ -402,10 +608,9 @@ async def test_run_frame_share_once_end_to_end_marks_sent(monkeypatch, tmp_path,
 
 
 async def test_unconfigured_worker_leaves_frame_jobs_queued(monkeypatch, tmp_path, db_engine):
-    # The Merkur slow-lane worker runs the same image with no SMTP creds. It must NOT claim
-    # frame-share jobs (which it couldn't send) — it leaves them queued for the Saturn worker.
-    monkeypatch.setattr(settings, "SMTP_USERNAME", "")
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "")
+    # The Merkur slow-lane worker runs the same image without the album API configured. It must NOT
+    # claim frame-share jobs (it couldn't upload) — it leaves them queued for the Saturn worker.
+    _frame_api_settings(monkeypatch, url="", album=0, token="")
     f = tmp_path / "real.jpg"
     _write_jpeg(f, (100, 70))
     subject = f"guard-{secrets.token_hex(4)}"
