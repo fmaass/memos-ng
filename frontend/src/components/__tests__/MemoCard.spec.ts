@@ -166,6 +166,19 @@ describe('MemoCard', () => {
     )
   })
 
+  it('sizes a lone portrait against its capped width, so it loads the thumb and not the mobile tier', () => {
+    const wrapper = mountCard({
+      memo: memo('portrait', [], [imageAtt('img1', { width: 3000, height: 4000 })]),
+    })
+    // The box is 420px wide (3:4 under the 35rem cap), not the 832px column — advertising the
+    // column would pull the 1536w candidate for a render the 600w thumb covers.
+    const img = wrapper.find('[data-test="tile-image"]')
+    expect(img.attributes('sizes')).toBe('(min-width: 484px) 420px, calc(100vw - 64px)')
+    expect(img.attributes('srcset')).toBe(
+      '/api/attachments/img1/thumb 600w, /api/attachments/img1/mobile 1536w',
+    )
+  })
+
   it('falls back to a 4:3 box for a lone photo whose dims are not known yet', () => {
     const wrapper = mountCard({ memo: memo('legacy photo', [], [imageAtt('img1')]) })
     expect(wrapper.find('[data-test="media-single"]').exists()).toBe(true)

@@ -51,6 +51,45 @@ describe('MediaTile', () => {
     expect(img.attributes('loading')).toBe('lazy')
   })
 
+  it('offers both image tiers with the pixel width each really serves', () => {
+    // 3000×4000 portrait: the tiers cap the HEIGHT, so the widths are 600 / 1536, not 800 / 2048.
+    const w = mount(MediaTile, {
+      props: { att: att('ready', 'image/jpeg', { width: 3000, height: 4000 }), sizes: '832px' },
+    })
+    const img = w.find('[data-test="tile-image"]')
+    expect(img.attributes('srcset')).toBe(
+      '/api/attachments/a1/thumb 600w, /api/attachments/a1/mobile 1536w',
+    )
+    expect(img.attributes('sizes')).toBe('832px')
+  })
+
+  it('ships no srcset while the dims are unknown — the plain thumb src stands alone', () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png'), sizes: '832px' } })
+    const img = w.find('[data-test="tile-image"]')
+    expect(img.attributes('srcset')).toBeUndefined()
+    expect(img.attributes('sizes')).toBeUndefined() // a sizes without a srcset means nothing
+    expect(img.attributes('src')).toBe('/api/attachments/a1/thumb')
+  })
+
+  it('cache-busts every srcset candidate on retry (a stale srcset outranks src)', async () => {
+    vi.useFakeTimers()
+    const w = mount(MediaTile, {
+      props: { att: att('ready', 'image/jpeg', { width: 4000, height: 3000 }) },
+    })
+    await w.find('[data-test="tile-image"]').trigger('error')
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(w.find('[data-test="tile-image"]').attributes('srcset')).toBe(
+      '/api/attachments/a1/thumb?_r=1 800w, /api/attachments/a1/mobile?_r=1 2048w',
+    )
+  })
+
+  it('leaves a video tile on its single poster (the image tiers are not its own)', () => {
+    const w = mount(MediaTile, {
+      props: { att: att('ready', 'video/mp4', { width: 1920, height: 1080, blurhash: 'LEHV6nWB' }) },
+    })
+    expect(w.findAll('img').every((i) => i.attributes('srcset') === undefined)).toBe(true)
+  })
+
   it('shows the blurhash instantly behind a ready image (no blank box while it loads)', () => {
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png', { blurhash: 'LEHV6nWB' }) } })
     expect(w.find('[data-test="tile-blur"]').exists()).toBe(true) // instant blurred preview
