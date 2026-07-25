@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query'
 
 import MemoFeed from '@/components/MemoFeed.vue'
 import { useApi } from '@/composables/useApi'
+import { CONTENT_COLUMN } from '@/lib/layout'
 import type { MemoQuery } from '@/composables/useTimeline'
 
 const api = useApi()
@@ -22,7 +23,7 @@ const restore = useMutation({
 </script>
 
 <template>
-  <section class="max-w-2xl mx-auto p-4 flex flex-col gap-3" data-test="view-archived">
+  <section class="mx-auto p-4 flex flex-col gap-3" :class="CONTENT_COLUMN" data-test="view-archived">
     <h1 class="text-2xl font-semibold">Archived</h1>
     <MemoFeed :query="archivedQuery" restorable @restore="restore.mutate($event)" />
   </section>

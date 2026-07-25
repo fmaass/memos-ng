@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { components } from '@/api/schema'
 import { nextRetrySrc, retryDelayMs } from '@/lib/imageRetry'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
+import { tileAspectRatio } from '@/lib/mediaLayout'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 
@@ -20,11 +21,19 @@ interface MediaAttachment {
   webUrl: string
 }
 
-const props = defineProps<{ att: MediaAttachment; progress?: number }>()
+// width/height give the tile box its shape (the caller passes the attachment's intrinsic dims, or the
+// uniform box of a multi-tile layout). Absent/unknown → the square box every tile used before.
+const props = defineProps<{
+  att: MediaAttachment
+  progress?: number
+  width?: number | null
+  height?: number | null
+}>()
 const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
 const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
+const ratio = computed(() => tileAspectRatio(props.width, props.height))
 
 // The grid tier this tile loads (video tiles show the poster). Used as the retry base: a re-mint
 // refetch delivers a new URL here, which resets the tile via the watch below.
@@ -92,16 +101,20 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
 
 <template>
   <div
-    class="relative aspect-square rounded-lg overflow-hidden bg-surface-100 dark:bg-surface-800"
+    class="relative rounded-lg overflow-hidden bg-surface-100 dark:bg-surface-800"
+    :class="{ 'aspect-square': ratio === null }"
+    :style="ratio === null ? undefined : { aspectRatio: String(ratio) }"
     data-test="media-tile"
   >
-    <!-- pending/uploading: blurhash placeholder (or shimmer) + Processing tag -->
+    <!-- pending/uploading: blurhash placeholder (or shimmer) + Processing tag.
+         The hash decodes square (32×32) but encodes the WHOLE frame, so it is stretched (object-fill)
+         to whatever ratio the tile box has — cropping it to cover would throw away part of the preview. -->
     <template v-if="kind === 'placeholder'">
       <img
         v-if="blur"
         :src="blur"
         alt=""
-        class="w-full h-full object-cover"
+        class="w-full h-full object-fill"
         data-test="tile-placeholder"
       />
       <div v-else class="w-full h-full animate-pulse" data-test="tile-placeholder" />
@@ -138,14 +151,23 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
     </div>
 
     <!-- ready image: the blurhash shows instantly (tiny client-decoded preview) behind the real
-         thumb, so the feed never renders as empty gray boxes while thumbnails download. -->
-    <template v-else-if="kind === 'image'">
+         thumb, so the feed never renders as empty gray boxes while thumbnails download.
+         A real <button> (same treatment as the video tile) so the viewer opens by keyboard too — a
+         click handler on the <img> alone was mouse/touch-only. -->
+    <button
+      v-else-if="kind === 'image'"
+      type="button"
+      class="relative h-full w-full cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+      data-test="tile-open"
+      aria-label="Open image"
+      @click="emit('open', att.uid)"
+    >
       <img
         v-if="blur"
         :src="blur"
         alt=""
         aria-hidden="true"
-        class="absolute inset-0 w-full h-full object-cover"
+        class="absolute inset-0 w-full h-full object-fill"
         data-test="tile-blur"
       />
       <img
@@ -153,17 +175,16 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
         alt=""
         loading="lazy"
         decoding="async"
-        class="relative w-full h-full object-cover cursor-pointer"
+        class="relative w-full h-full object-cover"
         data-test="tile-image"
-        @click="emit('open', att.uid)"
         @error="onImgError"
       />
-    </template>
+    </button>
 
     <button
       v-else-if="kind === 'video'"
       type="button"
-      class="relative h-full w-full"
+      class="relative h-full w-full cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
       data-test="tile-video"
       aria-label="Play video"
       @click="emit('open', att.uid)"
@@ -173,7 +194,7 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
         :src="blur"
         alt=""
         aria-hidden="true"
-        class="absolute inset-0 h-full w-full object-cover"
+        class="absolute inset-0 h-full w-full object-fill"
       />
       <img
         :src="imgSrc"

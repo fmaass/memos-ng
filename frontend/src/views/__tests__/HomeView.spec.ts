@@ -30,4 +30,13 @@ describe('HomeView', () => {
     expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="feed-stub"]').exists()).toBe(true)
   })
+
+  it('reads in the shared content column (wider on xl desktops)', () => {
+    const wrapper = mount(HomeView, {
+      global: { plugins: [PrimeVue, ConfirmationService, ToastService], stubs: { MemoFeed: FeedStub } },
+    })
+    const classes = wrapper.find('[data-test="view-home"]').classes()
+    expect(classes).toContain('max-w-2xl')
+    expect(classes).toContain('xl:max-w-4xl')
+  })
 })

@@ -5,6 +5,7 @@ import { useRoute } from 'vue-router'
 
 import CaptureEditor from '@/components/CaptureEditor.vue'
 import MemoFeed from '@/components/MemoFeed.vue'
+import { CONTENT_COLUMN } from '@/lib/layout'
 import { filterFromSearchParams, filterToQuery } from '@/lib/memoFilter'
 
 // Refetch the feed when a memo is posted so it appears immediately. (Live media status is handled
@@ -21,7 +22,7 @@ const query = computed(() => filterToQuery(filterFromSearchParams(route.query)))
 </script>
 
 <template>
-  <div class="max-w-2xl mx-auto p-4 flex flex-col gap-4" data-test="view-home">
+  <div class="mx-auto p-4 flex flex-col gap-4" :class="CONTENT_COLUMN" data-test="view-home">
     <CaptureEditor @saved="onSaved" />
     <MemoFeed :query="query" />
   </div>

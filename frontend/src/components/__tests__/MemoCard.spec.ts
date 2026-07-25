@@ -2,7 +2,7 @@ import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
@@ -28,14 +28,13 @@ async function openAction(wrapper: ReturnType<typeof mountCard>, testId: string)
   return items[items.length - 1]
 }
 
-function imageAtt(uid: string) {
+function imageAtt(uid: string, dims: { width: number | null; height: number | null } = { width: null, height: null }) {
   return {
     uid,
     mime: 'image/jpeg',
     status: 'ready' as const,
     blurhash: null,
-    width: null,
-    height: null,
+    ...dims,
     duration: null,
     mine: true,
     hasPrint: false,
@@ -72,7 +71,27 @@ function mountCard(props: { memo: ReturnType<typeof memo>; restorable?: boolean 
   return mount(MemoCard, { props, global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
 }
 
+// happy-dom measures every element as 0 wide; justified rows need a real container width, so drive
+// it through a ResizeObserver stub (the same path a browser takes).
+function stubResizeObserver(width: number) {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      constructor(private cb: ResizeObserverCallback) {}
+      observe() {
+        this.cb([{ contentRect: { width } } as ResizeObserverEntry], this as ResizeObserver)
+      }
+      disconnect() {}
+      unobserve() {}
+    },
+  )
+}
+
 describe('MemoCard', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
   it('renders markdown content and tag chips', () => {
     const wrapper = mountCard({ memo: memo('**bold** memo', ['work', 'idea']) })
     expect(wrapper.find('[data-test="memo-content"]').html()).toContain('<strong>bold</strong>')
@@ -118,6 +137,89 @@ describe('MemoCard', () => {
     expect(box.exists()).toBe(true)
     await box.trigger('click')
     expect(wrapper.emitted('task-toggle')?.[0]).toEqual([{ uid: 'm1', content: '- [x] todo' }])
+  })
+
+  it('renders a lone photo at its own ratio, content width, capped in height', () => {
+    const wrapper = mountCard({
+      memo: memo('one big photo', [], [imageAtt('img1', { width: 3000, height: 2000 })]),
+    })
+    const single = wrapper.find('[data-test="media-single"]')
+    expect(single.exists()).toBe(true)
+    expect(wrapper.find('[data-test="media-grid"]').exists()).toBe(false) // not the old square grid
+    // Full column width, but never wider than (cap × ratio) — so the cap narrows the box (35 × 1.5)
+    // instead of cropping the photo.
+    expect(single.attributes('style')).toContain('width: 100%')
+    expect(single.attributes('style')).toContain('max-width: 52.500rem')
+    expect(wrapper.find('[data-test="media-tile"]').attributes('style')).toContain('aspect-ratio: 1.5')
+  })
+
+  it('renders a lone portrait photo taller than wide (ratio follows the photo)', () => {
+    const wrapper = mountCard({
+      memo: memo('portrait', [], [imageAtt('img1', { width: 2000, height: 3000 })]),
+    })
+    // 2:3 at a 35rem height cap → at most 23.333rem wide (a portrait must not run the full column)
+    expect(wrapper.find('[data-test="media-single"]').attributes('style')).toContain(
+      'max-width: 23.333rem',
+    )
+    expect(wrapper.find('[data-test="media-tile"]').attributes('style')).toContain(
+      'aspect-ratio: 0.6666',
+    )
+  })
+
+  it('falls back to a 4:3 box for a lone photo whose dims are not known yet', () => {
+    const wrapper = mountCard({ memo: memo('legacy photo', [], [imageAtt('img1')]) })
+    expect(wrapper.find('[data-test="media-single"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="media-tile"]').attributes('style')).toContain(
+      'aspect-ratio: 1.333',
+    )
+  })
+
+  it('renders two photos as a uniform two-column grid, not at their own ratios', () => {
+    const wrapper = mountCard({
+      memo: memo(
+        'two',
+        [],
+        [
+          imageAtt('img1', { width: 3000, height: 2000 }),
+          imageAtt('img2', { width: 2000, height: 3000 }),
+        ],
+      ),
+    })
+    const grid = wrapper.find('[data-test="media-grid"]')
+    expect(grid.exists()).toBe(true)
+    expect(grid.classes()).toContain('grid-cols-2')
+    const tiles = wrapper.findAll('[data-test="media-tile"]')
+    expect(tiles).toHaveLength(2)
+    // Both boxes share one ratio (each photo crops into it) despite opposite orientations.
+    expect(tiles[0].attributes('style')).toBe(tiles[1].attributes('style'))
+    expect(tiles[0].attributes('style')).not.toContain('1.5')
+  })
+
+  it('packs three or more photos into justified rows scaled to the column width', async () => {
+    stubResizeObserver(400)
+    const wrapper = mountCard({
+      memo: memo(
+        'three',
+        [],
+        [
+          imageAtt('img1', { width: 400, height: 200 }), // 2:1
+          imageAtt('img2', { width: 200, height: 200 }), // 1:1
+          imageAtt('img3', { width: 200, height: 400 }), // 1:2
+        ],
+      ),
+    })
+    await nextTick()
+    expect(wrapper.find('[data-test="media-justified"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="media-grid"]').exists()).toBe(false)
+    const tiles = wrapper.findAll('[data-test="media-tile"]')
+    expect(tiles).toHaveLength(3)
+    const px = (tile: (typeof tiles)[number], prop: 'width' | 'height') =>
+      Number(new RegExp(`${prop}: ([\\d.]+)px`).exec(tile.attributes('style') ?? '')?.[1])
+    // Same row height, widths in proportion to each photo's ratio (2:1 widest, 1:2 narrowest).
+    expect(px(tiles[0], 'height')).toBeCloseTo(px(tiles[1], 'height'), 3)
+    expect(px(tiles[0], 'width')).toBeGreaterThan(px(tiles[1], 'width'))
+    expect(px(tiles[1], 'width')).toBeGreaterThan(px(tiles[2], 'width'))
+    wrapper.unmount()
   })
 
   it('opens the lightbox at the clicked image (composable open with the right index)', async () => {

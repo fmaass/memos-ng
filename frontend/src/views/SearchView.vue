@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 
 import FilterBar from '@/components/FilterBar.vue'
 import MemoFeed from '@/components/MemoFeed.vue'
+import { CONTENT_COLUMN } from '@/lib/layout'
 import {
   filterFromSearchParams,
   filterToQuery,
@@ -54,7 +55,7 @@ const query = computed(() => filterToQuery(filter.value))
 </script>
 
 <template>
-  <section class="max-w-2xl mx-auto p-4 flex flex-col gap-3" data-test="view-search">
+  <section class="mx-auto p-4 flex flex-col gap-3" :class="CONTENT_COLUMN" data-test="view-search">
     <h1 class="text-2xl font-semibold">Search</h1>
     <FilterBar v-model="filter" />
     <MemoFeed v-if="active" :query="query" />
