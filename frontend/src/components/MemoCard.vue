@@ -9,10 +9,13 @@ import { computed, onUnmounted, ref } from 'vue'
 
 import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
+import { useElementWidth } from '@/composables/useElementWidth'
 import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import { useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
+import { justifyRows } from '@/lib/justified'
 import { renderMemoMarkdown } from '@/lib/markdown'
+import { mediaLayout } from '@/lib/mediaLayout'
 import { toggleTask } from '@/lib/tasks'
 
 type Memo = components['schemas']['MemoOut']
@@ -112,6 +115,29 @@ const html = computed(() => renderMemoMarkdown(props.memo.content))
 
 // A subtle badge on memos that carry print masters (any attachment with a hidden print/rendition).
 const hasPrints = computed(() => (props.memo.attachments ?? []).some((a) => a.hasPrint))
+
+// The media area's shape follows the attachment count (see mediaLayout): a lone photo keeps its own
+// ratio at content width, two crop into a uniform two-up, three or more pack into justified rows.
+const attachments = computed(() => props.memo.attachments ?? [])
+const layout = computed(() => mediaLayout(attachments.value))
+
+// Capping the HEIGHT of a lone photo has to narrow its box, otherwise a full-width portrait would
+// have to crop to obey the cap. The box runs the column width up to (cap × ratio); its
+// aspect-ratio then keeps the height at or under the cap.
+const singleStyle = computed(() => {
+  const l = layout.value
+  if (l.mode !== 'single') return undefined
+  return { width: '100%', maxWidth: `${((l.width / l.height) * l.maxHeightRem).toFixed(3)}rem` }
+})
+
+// Justified rows are laid out in px, so they need the rendered width of the media column.
+const mediaRoot = ref<HTMLElement | null>(null)
+const mediaWidth = useElementWidth(mediaRoot)
+const justifiedRows = computed(() =>
+  layout.value.mode === 'justified'
+    ? justifyRows(attachments.value, mediaWidth.value, layout.value.targetHeight, layout.value.gap)
+    : [],
+)
 
 // Full-screen viewer (PhotoSwipe) over ALL of the memo's media — swipe/zoom images, play videos.
 const lightbox = useMediaLightbox()
@@ -330,18 +356,55 @@ function onContentClick(event: MouseEvent) {
       @click="onContentClick"
     />
 
-    <div
-      v-if="memo.attachments?.length"
-      class="grid grid-cols-2 sm:grid-cols-3 gap-2"
-      data-test="media-grid"
-    >
+    <!-- one photo: content width, its own ratio, height-capped (no crop) -->
+    <div v-if="layout.mode === 'single'" :style="singleStyle" data-test="media-single">
       <MediaTile
-        v-for="a in memo.attachments"
-        :key="a.uid"
-        :att="a"
+        :att="attachments[0]"
+        :width="layout.width"
+        :height="layout.height"
         @open="openLightbox"
         @retry="emit('retry', $event)"
       />
+    </div>
+
+    <!-- two photos: uniform boxes side by side, each cropping to the shared ratio -->
+    <div v-else-if="layout.mode === 'pair'" class="grid grid-cols-2 gap-2" data-test="media-grid">
+      <MediaTile
+        v-for="a in attachments"
+        :key="a.uid"
+        :att="a"
+        :width="layout.width"
+        :height="layout.height"
+        @open="openLightbox"
+        @retry="emit('retry', $event)"
+      />
+    </div>
+
+    <!-- three or more: justified rows, every photo at its own ratio (rows fill the column exactly) -->
+    <div
+      v-else-if="layout.mode === 'justified'"
+      ref="mediaRoot"
+      class="flex flex-col"
+      :style="{ gap: layout.gap + 'px' }"
+      data-test="media-justified"
+    >
+      <div
+        v-for="(row, ri) in justifiedRows"
+        :key="ri"
+        class="flex"
+        :style="{ gap: layout.gap + 'px', height: row.height + 'px' }"
+      >
+        <MediaTile
+          v-for="li in row.items"
+          :key="li.item.uid"
+          :att="li.item"
+          :width="li.item.width"
+          :height="li.item.height"
+          :style="{ width: li.width + 'px', height: li.height + 'px' }"
+          @open="openLightbox"
+          @retry="emit('retry', $event)"
+        />
+      </div>
     </div>
 
     <div v-if="memo.tags.length || hasPrints" class="flex flex-wrap items-center gap-1">

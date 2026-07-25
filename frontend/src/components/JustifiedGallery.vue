@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 
 import type { components } from '@/api/schema'
+import { useElementWidth } from '@/composables/useElementWidth'
 import { nextRetrySrc } from '@/lib/imageRetry'
 import { justifyRows } from '@/lib/justified'
 import { blurhashToDataUrl } from '@/lib/media'
@@ -26,20 +27,7 @@ const props = withDefaults(
 const emit = defineEmits<{ open: [index: number]; retry: [uid: string] }>()
 
 const root = ref<HTMLElement | null>(null)
-const containerWidth = ref(0)
-let ro: ResizeObserver | null = null
-
-onMounted(() => {
-  if (!root.value) return
-  containerWidth.value = root.value.clientWidth
-  if (typeof ResizeObserver !== 'undefined') {
-    ro = new ResizeObserver((entries) => {
-      containerWidth.value = entries[0].contentRect.width
-    })
-    ro.observe(root.value)
-  }
-})
-onBeforeUnmount(() => ro?.disconnect())
+const containerWidth = useElementWidth(root)
 
 // Flatten the running index across rows so `open` maps back to the original items array.
 const rows = computed(() => {

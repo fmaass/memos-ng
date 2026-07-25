@@ -57,6 +57,13 @@ describe('ResourcesView', () => {
     expect(wrapper.find('[data-test="resource-grid"]').exists()).toBe(false)
   })
 
+  it('keeps its own wide gallery column (not the feed reading column)', () => {
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+    const classes = wrapper.find('[data-test="view-resources"]').classes()
+    expect(classes).toContain('max-w-6xl')
+    expect(classes).not.toContain('xl:max-w-4xl')
+  })
+
   it('re-mints Resources when gallery retry bubbles, throttled to one refetch per cooldown', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(30_000)
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })

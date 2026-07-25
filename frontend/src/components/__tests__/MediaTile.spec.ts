@@ -57,6 +57,47 @@ describe('MediaTile', () => {
     expect(w.find('[data-test="tile-image"]').exists()).toBe(true) // real thumb loads on top
   })
 
+  it('takes the intrinsic aspect ratio when dims are known (no forced square crop)', () => {
+    const w = mount(MediaTile, {
+      props: { att: att('ready', 'image/jpeg'), width: 3000, height: 2000 },
+    })
+    const box = w.find('[data-test="media-tile"]')
+    expect(box.attributes('style')).toContain('aspect-ratio: 1.5')
+    expect(box.classes()).not.toContain('aspect-square')
+  })
+
+  it('keeps the square box while dims are unknown', () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/jpeg') } })
+    const box = w.find('[data-test="media-tile"]')
+    expect(box.classes()).toContain('aspect-square')
+    expect(box.attributes('style')).toBeUndefined()
+  })
+
+  it('makes a ready image a real button so the viewer opens by keyboard, not just by click', async () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    const opener = w.find('[data-test="tile-open"]')
+    expect(opener.element.tagName).toBe('BUTTON') // focusable + Enter/Space activate natively
+    expect(opener.attributes('type')).toBe('button')
+    expect(opener.attributes('aria-label')).toBe('Open image')
+    await opener.trigger('click')
+    expect(w.emitted('open')).toEqual([['a1']])
+  })
+
+  it('emits open exactly once when the image itself is clicked (unchanged contract)', async () => {
+    const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
+    await w.find('[data-test="tile-image"]').trigger('click')
+    expect(w.emitted('open')).toEqual([['a1']])
+  })
+
+  it('stretches the blurhash to the tile ratio instead of cropping it square', () => {
+    const w = mount(MediaTile, {
+      props: { att: att('ready', 'image/png', { blurhash: 'LEHV6nWB' }), width: 3000, height: 2000 },
+    })
+    const classes = w.find('[data-test="tile-blur"]').classes()
+    expect(classes).toContain('object-fill')
+    expect(classes).not.toContain('object-cover')
+  })
+
   it('renders a video element when a ready video', () => {
     const w = mount(MediaTile, { props: { att: att('ready', 'video/mp4') } })
     expect(w.find('[data-test="tile-video"]').exists()).toBe(true)

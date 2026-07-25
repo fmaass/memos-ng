@@ -72,4 +72,11 @@ describe('SearchView', () => {
     expect(feed.text()).toContain('"tag":["work"]')
     expect(feed.text()).not.toContain('beach')
   })
+
+  it('reads in the shared content column (wider on xl desktops)', () => {
+    setQuery({})
+    const classes = mountSearch().find('[data-test="view-search"]').classes()
+    expect(classes).toContain('max-w-2xl')
+    expect(classes).toContain('xl:max-w-4xl')
+  })
 })

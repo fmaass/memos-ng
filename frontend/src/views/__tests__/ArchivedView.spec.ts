@@ -38,4 +38,11 @@ describe('ArchivedView', () => {
     })
     expect(invalidateQueries).toHaveBeenCalled()
   })
+
+  it('reads in the shared content column (wider on xl desktops)', () => {
+    const wrapper = mount(ArchivedView, { global: { stubs: { MemoFeed: FeedStub } } })
+    const classes = wrapper.find('[data-test="view-archived"]').classes()
+    expect(classes).toContain('max-w-2xl')
+    expect(classes).toContain('xl:max-w-4xl')
+  })
 })
