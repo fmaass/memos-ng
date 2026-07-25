@@ -105,6 +105,21 @@ describe('MediaTile', () => {
     expect(box.classes()).not.toContain('aspect-square')
   })
 
+  it('keeps the fallback box for a video, whose stored dims ignore the rotation tag', () => {
+    // ffprobe records CODED dims, so a rotated portrait clip stores 1920x1080. Laying the box out
+    // from that would frame the (correctly rotated) poster at 16:9.
+    const w = mount(MediaTile, {
+      props: {
+        att: att('ready', 'video/mp4', { width: 1920, height: 1080 }),
+        width: 1920,
+        height: 1080,
+      },
+    })
+    const box = w.find('[data-test="media-tile"]')
+    expect(box.classes()).toContain('aspect-square')
+    expect(box.attributes('style')).toBeUndefined()
+  })
+
   it('keeps the square box while dims are unknown', () => {
     const w = mount(MediaTile, { props: { att: att('ready', 'image/jpeg') } })
     const box = w.find('[data-test="media-tile"]')

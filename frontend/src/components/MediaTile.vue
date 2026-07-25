@@ -27,7 +27,8 @@ interface MediaAttachment {
 }
 
 // width/height give the tile box its shape (the caller passes the attachment's intrinsic dims, or the
-// uniform box of a multi-tile layout). Absent/unknown → the square box every tile used before.
+// uniform box of a multi-tile layout). Absent/unknown → the square box every tile used before, which
+// is also where a video stays (see `ratio`).
 // sizes is the box's rendered width, which only the parent's layout knows (see tileSizes).
 const props = defineProps<{
   att: MediaAttachment
@@ -40,7 +41,12 @@ const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
 const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
-const ratio = computed(() => tileAspectRatio(props.width, props.height))
+// A video's stored dims are ffprobe's CODED width/height, which ignore the container's rotation
+// tag: a portrait phone clip reports them landscape. Shaping the box from those frames a poster
+// that IS rotated at a ratio it does not have, so a video keeps the fallback box until the probe
+// applies rotation. Mime rather than tile kind — the processing state renders the poster too.
+const isVideo = computed(() => props.att.mime.startsWith('video/'))
+const ratio = computed(() => (isVideo.value ? null : tileAspectRatio(props.width, props.height)))
 
 // The grid tier this tile loads (video tiles show the poster). Used as the retry base: a re-mint
 // refetch delivers a new URL here, which resets the tile via the watch below.

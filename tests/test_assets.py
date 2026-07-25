@@ -1,6 +1,8 @@
+import json
+
 from app.config import settings
 from app.main import app
-from app.routers.assets import media_event_stream
+from app.routers.assets import _ready_meta, media_event_stream
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine, text
@@ -8,7 +10,9 @@ from sqlalchemy import create_engine, text
 from tests.conftest import SYNC_URL
 
 
-def _seed_attachment(uid, owner_subject, status="ready", mime="image/jpeg"):
+def _seed_attachment(
+    uid, owner_subject, status="ready", mime="image/jpeg", width=None, height=None
+):
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
         oid = c.execute(
@@ -17,13 +21,23 @@ def _seed_attachment(uid, owner_subject, status="ready", mime="image/jpeg"):
         aid = c.execute(
             text(
                 "INSERT INTO attachments "
-                "(uid, owner_id, filename, mime, size, status, storage_path, blurhash) "
-                "VALUES (:u,:o,'x.jpg',:m,1,CAST(:st AS attachment_status),'/x',:bh) RETURNING id"
+                "(uid, owner_id, filename, mime, size, status, storage_path, blurhash, "
+                "width, height) "
+                "VALUES (:u,:o,'x.jpg',:m,1,CAST(:st AS attachment_status),'/x',:bh,:w,:h) "
+                "RETURNING id"
             ),
-            {"u": uid, "o": oid, "m": mime, "st": status, "bh": "LKO2"},
+            {"u": uid, "o": oid, "m": mime, "st": status, "bh": "LKO2", "w": width, "h": height},
         ).scalar_one()
     eng.dispose()
     return aid
+
+
+def _user_id(subject):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        uid = c.execute(text("SELECT id FROM users WHERE subject=:s"), {"s": subject}).scalar_one()
+    eng.dispose()
+    return uid
 
 
 def _cleanup(*aids):
@@ -97,12 +111,8 @@ def test_assets_require_auth(client):
     assert client.get("/api/events").status_code == 401
 
 
-async def test_sse_stream_emits_progress_then_ready():
-    states = [
-        [{"uid": "a", "status": "processing", "progress_pct": 40}],
-        [{"uid": "a", "status": "processing", "progress_pct": 90}],
-        [],  # dropped from non-ready → finished
-    ]
+def _stream_states(states):
+    """A snapshot callable that walks `states` and then repeats the last one."""
     calls = {"i": 0}
 
     async def snap():
@@ -110,9 +120,69 @@ async def test_sse_stream_emits_progress_then_ready():
         calls["i"] += 1
         return states[i]
 
-    events = [e async for e in media_event_stream(snap, interval=0)]
+    return snap
+
+
+async def test_sse_stream_emits_progress_then_ready():
+    snap = _stream_states(
+        [
+            [{"uid": "a", "status": "processing", "progress_pct": 40}],
+            [{"uid": "a", "status": "processing", "progress_pct": 90}],
+            [],  # dropped from non-ready → finished
+        ]
+    )
+
+    async def meta(uids):
+        return {"a": {"width": 1200, "height": 900, "blurhash": "LKO2"}}
+
+    events = [e async for e in media_event_stream(snap, meta, interval=0)]
+
     assert any('"progress_pct": 40' in e for e in events)
-    assert any('"status": "ready"' in e for e in events)  # synthetic ready on completion
+    ready = [json.loads(e.removeprefix("data: ")) for e in events if '"status": "ready"' in e]
+    # The terminal event carries the metadata the worker just wrote: a client that only patched
+    # `status` would leave the attachment at NULL dims until the next refetch.
+    assert ready == [
+        {
+            "uid": "a",
+            "status": "ready",
+            "progress_pct": 100,
+            "width": 1200,
+            "height": 900,
+            "blurhash": "LKO2",
+        }
+    ]
+
+
+async def test_sse_ready_event_is_still_emitted_without_metadata():
+    """A row whose metadata is unknown (video ffprobe found none, or the row vanished) still
+    finishes — the ready transition itself must not depend on the read-back."""
+    snap = _stream_states([[{"uid": "b", "status": "pending", "progress_pct": 0}], []])
+
+    async def meta(uids):
+        return {}
+
+    events = [e async for e in media_event_stream(snap, meta, interval=0)]
+
+    assert json.loads(events[-1].removeprefix("data: ")) == {
+        "uid": "b",
+        "status": "ready",
+        "progress_pct": 100,
+    }
+
+
+async def test_ready_meta_reads_back_the_owners_rows_only(logged_in_client):
+    """Where the terminal event's payload comes from: the attachment row, scoped to its owner."""
+    _, subject = logged_in_client
+    _mk_user("meta_other")
+    mine = _seed_attachment("meta-mine", subject, width=1200, height=900)
+    theirs = _seed_attachment("meta-theirs", "meta_other", width=10, height=20)
+    try:
+        meta = await _ready_meta(_user_id(subject), ["meta-mine", "meta-theirs"])
+
+        assert meta == {"meta-mine": {"width": 1200, "height": 900, "blurhash": "LKO2"}}
+    finally:
+        _cleanup(mine, theirs)
+        _rm("meta_other")
 
 
 def _seed_memo_with_attachment(memo_uid, att_uid, owner_subject, visibility, mime="image/jpeg"):
