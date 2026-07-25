@@ -6,7 +6,27 @@ import {
   REMINT_COOLDOWN_MS,
   retryDelayMs,
   shouldRemint,
+  withSameBust,
 } from '@/lib/imageRetry'
+
+describe('withSameBust', () => {
+  it('leaves the other tier alone while no retry is in flight', () => {
+    const signed = '/api/attachments/a1/mobile?exp=123&sig=abc'
+    expect(withSameBust(signed, '/api/attachments/a1/thumb?exp=123&sig=abc')).toBe(signed)
+  })
+
+  it('carries the bust the live src holds, so the srcset candidate re-requests too', () => {
+    expect(withSameBust('/api/attachments/a1/mobile?exp=123', '/api/attachments/a1/thumb?exp=123&_r=2')).toBe(
+      '/api/attachments/a1/mobile?exp=123&_r=2',
+    )
+  })
+
+  it('opens a query string when the other tier has none', () => {
+    expect(withSameBust('/api/attachments/a1/mobile', '/api/attachments/a1/thumb?_r=1')).toBe(
+      '/api/attachments/a1/mobile?_r=1',
+    )
+  })
+})
 
 describe('nextRetrySrc', () => {
   it('appends a cache-bust param to a bare URL on the first failure', () => {

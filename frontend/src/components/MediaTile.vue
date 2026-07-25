@@ -2,19 +2,24 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 import type { components } from '@/api/schema'
-import { nextRetrySrc, retryDelayMs } from '@/lib/imageRetry'
+import { nextRetrySrc, retryDelayMs, withSameBust } from '@/lib/imageRetry'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
 import { tileAspectRatio } from '@/lib/mediaLayout'
+import { imageSrcset } from '@/lib/mediaTiers'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 
 // Only the fields a tile renders — so both MemoOut.attachments (AttachmentRef) and the
-// Resources list (AttachmentListItem) satisfy it without a width/height/duration shape clash.
+// Resources list (AttachmentListItem) satisfy it without hitting their `duration` shape clash.
+// These dims are the FILE's, which is what the srcset descriptors describe; the width/height props
+// below are the layout box's and can differ (a two-up tile is 1:1 whatever the photo is).
 interface MediaAttachment {
   uid: string
   mime: string
   status: AttachmentStatus
   blurhash: string | null
+  width: number | null
+  height: number | null
   thumbnailUrl: string
   previewUrl: string
   posterUrl: string
@@ -23,11 +28,13 @@ interface MediaAttachment {
 
 // width/height give the tile box its shape (the caller passes the attachment's intrinsic dims, or the
 // uniform box of a multi-tile layout). Absent/unknown → the square box every tile used before.
+// sizes is the box's rendered width, which only the parent's layout knows (see tileSizes).
 const props = defineProps<{
   att: MediaAttachment
   progress?: number
   width?: number | null
   height?: number | null
+  sizes?: string
 }>()
 const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 
@@ -49,6 +56,19 @@ function clearRetryTimer() {
   clearTimeout(retryTimer)
   retryTimer = null
 }
+
+// Both image tiers, each with the pixel width it truly holds, so a wide tile or a dense screen loads
+// the mobile tier instead of stretching the 800px thumb. The thumb candidate is imgSrc rather than
+// the raw URL, and the preview mirrors its cache-bust: a retry that busts only `src` would never
+// re-request, because the browser picks from the srcset (see withSameBust).
+const srcset = computed(() =>
+  kind.value === 'image'
+    ? imageSrcset(props.att.width, props.att.height, {
+        thumbnailUrl: imgSrc.value,
+        previewUrl: withSameBust(props.att.previewUrl, imgSrc.value),
+      })
+    : undefined,
+)
 
 // A fresh URL (e.g. after a parent re-mint refetch) clears the failed state and retries from scratch.
 watch(baseUrl, (url) => {
@@ -172,6 +192,8 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
       />
       <img
         :src="imgSrc"
+        :srcset="srcset"
+        :sizes="srcset ? sizes : undefined"
         alt=""
         loading="lazy"
         decoding="async"

@@ -27,6 +27,16 @@ export function retryDelayMs(attempt: number, max = MAX_THUMB_RETRIES): number |
   return THUMB_RETRY_DELAYS_MS[attempt] ?? THUMB_RETRY_DELAYS_MS[THUMB_RETRY_DELAYS_MS.length - 1]
 }
 
+// A `srcset` wins over `src`, so busting only `src` would leave a retry inert: the browser re-picks
+// the same failed candidate. This carries whatever bust the live `src` holds onto another tier's URL,
+// keyed off that src so the candidates change exactly when — and as often as — the backoff fires.
+export function withSameBust(url: string, src: string): string {
+  const bust = /[?&]_r=(\d+)/.exec(src)
+  if (!bust) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}_r=${bust[1]}`
+}
+
 export const REMINT_COOLDOWN_MS = 30_000
 
 // Whether a feed-level re-mint (timeline refetch) should fire now. Not while one is already in

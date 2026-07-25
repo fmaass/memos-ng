@@ -15,7 +15,12 @@ import { useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
 import { justifyRows } from '@/lib/justified'
 import { renderMemoMarkdown } from '@/lib/markdown'
-import { mediaLayout } from '@/lib/mediaLayout'
+import {
+  justifiedTileSizes,
+  mediaLayout,
+  singleTileMaxWidthPx,
+  tileSizes,
+} from '@/lib/mediaLayout'
 import { toggleTask } from '@/lib/tasks'
 
 type Memo = components['schemas']['MemoOut']
@@ -120,6 +125,17 @@ const hasPrints = computed(() => (props.memo.attachments ?? []).some((a) => a.ha
 // ratio at content width, two crop into a uniform two-up, three or more pack into justified rows.
 const attachments = computed(() => props.memo.attachments ?? [])
 const layout = computed(() => mediaLayout(attachments.value))
+
+// Which of the tiles' srcset candidates to load: the width the box renders at. A pair tile is a
+// fixed share of the column, but a lone photo is only as wide as the height cap leaves it (the same
+// limit singleStyle puts on the box below), so its hint is per-photo. Justified tiles know their own.
+const singleSizes = computed(() =>
+  tileSizes(
+    'single',
+    singleTileMaxWidthPx(attachments.value[0]?.width, attachments.value[0]?.height),
+  ),
+)
+const pairSizes = tileSizes('pair')
 
 // Capping the HEIGHT of a lone photo has to narrow its box, otherwise a full-width portrait would
 // have to crop to obey the cap. The box runs the column width up to (cap × ratio); its
@@ -362,6 +378,7 @@ function onContentClick(event: MouseEvent) {
         :att="attachments[0]"
         :width="layout.width"
         :height="layout.height"
+        :sizes="singleSizes"
         @open="openLightbox"
         @retry="emit('retry', $event)"
       />
@@ -375,6 +392,7 @@ function onContentClick(event: MouseEvent) {
         :att="a"
         :width="layout.width"
         :height="layout.height"
+        :sizes="pairSizes"
         @open="openLightbox"
         @retry="emit('retry', $event)"
       />
@@ -400,6 +418,7 @@ function onContentClick(event: MouseEvent) {
           :att="li.item"
           :width="li.item.width"
           :height="li.item.height"
+          :sizes="justifiedTileSizes(li.width)"
           :style="{ width: li.width + 'px', height: li.height + 'px' }"
           @open="openLightbox"
           @retry="emit('retry', $event)"

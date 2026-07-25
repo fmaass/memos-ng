@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { mediaLayout, tileAspectRatio } from '@/lib/mediaLayout'
+import {
+  justifiedTileSizes,
+  mediaLayout,
+  singleTileMaxWidthPx,
+  tileAspectRatio,
+  tileSizes,
+} from '@/lib/mediaLayout'
 
 const landscape = { width: 3000, height: 2000 } // 3:2
 const portrait = { width: 2000, height: 3000 } // 2:3
@@ -20,6 +26,90 @@ describe('tileAspectRatio', () => {
     expect(tileAspectRatio(0, 2000)).toBeNull()
     expect(tileAspectRatio(3000, 0)).toBeNull()
     expect(tileAspectRatio(-3000, 2000)).toBeNull()
+  })
+})
+
+describe('singleTileMaxWidthPx', () => {
+  it('narrows a portrait to what the 35rem height cap leaves it (3:4 → 26.25rem → 420px)', () => {
+    expect(singleTileMaxWidthPx(3000, 4000)).toBe(420)
+  })
+
+  it('lets a landscape want more width than the column has (3:2 → 52.5rem → 840px)', () => {
+    expect(singleTileMaxWidthPx(3000, 2000)).toBe(840)
+  })
+
+  it('holds a square at the height cap itself (35rem → 560px)', () => {
+    expect(singleTileMaxWidthPx(2400, 2400)).toBe(560)
+  })
+
+  it('has no cap to give while the dims are unknown (that box is the cropped 4:3 fallback)', () => {
+    expect(singleTileMaxWidthPx(null, null)).toBeNull()
+    expect(singleTileMaxWidthPx(3000, null)).toBeNull()
+    expect(singleTileMaxWidthPx(undefined, undefined)).toBeNull()
+    expect(singleTileMaxWidthPx(0, 0)).toBeNull()
+  })
+})
+
+describe('tileSizes', () => {
+  // The column is 896px at xl and 672px below it (max-w-4xl / max-w-2xl), and the view's p-4 plus
+  // the card's p-4 take 64px off both: a lone tile renders 832px / 608px wide.
+  it('states the content-column width for a lone photo at each step of the column rule', () => {
+    expect(tileSizes('single')).toBe(
+      '(min-width: 1280px) 832px, (min-width: 672px) 608px, calc(100vw - 64px)',
+    )
+  })
+
+  it('halves the column, less the gap, for a two-up tile', () => {
+    // (832 - 8) / 2 = 412 at xl; (608 - 8) / 2 = 300 below it.
+    expect(tileSizes('pair')).toBe(
+      '(min-width: 1280px) 412px, (min-width: 672px) 300px, calc((100vw - 72px) / 2)',
+    )
+  })
+
+  it('advertises the height-capped width for a portrait single, not the whole column', () => {
+    // 3:4 against the 35rem cap renders 420px wide at every column step; below a 484px viewport
+    // (420 + the 64px insets) the box is the viewport again.
+    expect(tileSizes('single', 420)).toBe('(min-width: 484px) 420px, calc(100vw - 64px)')
+  })
+
+  it('leaves a wide landscape column-bound (its cap is wider than the column ever is)', () => {
+    expect(tileSizes('single', 840)).toBe(
+      '(min-width: 1280px) 832px, (min-width: 672px) 608px, calc(100vw - 64px)',
+    )
+  })
+
+  it('applies a cap that binds only on the wide column', () => {
+    // 5:4 → 700px: under the 832px xl media area, over the 608px one below it.
+    expect(tileSizes('single', 700)).toBe(
+      '(min-width: 1280px) 700px, (min-width: 672px) 608px, calc(100vw - 64px)',
+    )
+  })
+
+  it('keeps a capless single (unknown dims) and every pair on the column width', () => {
+    expect(tileSizes('single', null)).toBe(
+      '(min-width: 1280px) 832px, (min-width: 672px) 608px, calc(100vw - 64px)',
+    )
+    expect(tileSizes('pair', null)).toBe(
+      '(min-width: 1280px) 412px, (min-width: 672px) 300px, calc((100vw - 72px) / 2)',
+    )
+  })
+
+  it('claims a wider tile at xl than below it, in both layouts (the column widens there)', () => {
+    for (const mode of ['single', 'pair'] as const) {
+      const [xl, mid] = tileSizes(mode).split(', ').map((s) => parseInt(s.split(') ')[1], 10))
+      expect(xl).toBeGreaterThan(mid)
+    }
+  })
+})
+
+describe('justifiedTileSizes', () => {
+  it("states the tile's own rendered width in whole px", () => {
+    expect(justifiedTileSizes(266.6667)).toBe('267px')
+    expect(justifiedTileSizes(300)).toBe('300px')
+  })
+
+  it('never emits a zero-width hint for a sliver of a tile', () => {
+    expect(justifiedTileSizes(0.2)).toBe('1px')
   })
 })
 

@@ -3,6 +3,8 @@
 // — is unit-testable. The structural input accepts both AttachmentRef (memos) and AttachmentListItem
 // (resources): they share these fields.
 
+import { MOBILE_MAX_EDGE, tierSize } from '@/lib/mediaTiers'
+
 export interface LightboxItem {
   uid: string
   mime: string
@@ -33,10 +35,21 @@ export interface Slide {
 const FALLBACK_IMAGE = { width: 1600, height: 1200 }
 const FALLBACK_VIDEO = { width: 1600, height: 900 }
 
+// What the slide's `src` actually holds, which is what PhotoSwipe must be told: an image slide loads
+// the MOBILE tier, and declaring the original's dims over it set the zoom ceiling at pixels the file
+// does not have — zooming in past the tier just magnified blur. A video keeps its probed dims: it is
+// not zoomable (isContentZoomable), so the numbers only give the slide its aspect, which the web
+// transcode preserves. Null/unusable dims stay on the fallback box.
+function servedSize(a: LightboxItem, isVideo: boolean): { width: number; height: number } | null {
+  if (a.width == null || a.height == null || a.width <= 0 || a.height <= 0) return null
+  if (isVideo) return { width: a.width, height: a.height }
+  return tierSize(a.width, a.height, MOBILE_MAX_EDGE)
+}
+
 export function buildSlides(items: readonly LightboxItem[]): Slide[] {
   return items.map((a) => {
     const isVideo = a.mime.startsWith('video/')
-    const fallback = isVideo ? FALLBACK_VIDEO : FALLBACK_IMAGE
+    const served = servedSize(a, isVideo) ?? (isVideo ? FALLBACK_VIDEO : FALLBACK_IMAGE)
     return {
       uid: a.uid,
       mime: a.mime,
@@ -45,8 +58,8 @@ export function buildSlides(items: readonly LightboxItem[]): Slide[] {
       src: isVideo ? a.webUrl : a.previewUrl,
       msrc: isVideo ? undefined : a.thumbnailUrl,
       poster: isVideo ? a.posterUrl : undefined,
-      width: a.width ?? fallback.width,
-      height: a.height ?? fallback.height,
+      width: served.width,
+      height: served.height,
     }
   })
 }
