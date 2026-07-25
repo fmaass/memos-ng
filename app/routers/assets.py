@@ -411,12 +411,16 @@ def sse_event(payload: dict) -> str:
 
 
 async def media_event_stream(
-    snapshot: Callable[[], Awaitable[list[dict]]], *, interval: float = 1.5
+    snapshot: Callable[[], Awaitable[list[dict]]],
+    ready_meta: Callable[[list[str]], Awaitable[dict[str, dict]]],
+    *,
+    interval: float = 1.5,
 ) -> AsyncIterator[str]:
     """Yield SSE events as the user's attachments change; close when nothing is in-flight.
     `snapshot()` returns {uid,status,progress_pct} for the user's NON-ready attachments
     (uploading/pending/processing/failed). When a watched uid drops out of the snapshot it
-    has become 'ready' → emit a synthetic ready event. Unit-tested with an injected snapshot."""
+    has become 'ready' → emit a synthetic ready event, carrying the metadata `ready_meta()`
+    reads back for it. Unit-tested with both callables injected."""
     seen: dict[str, tuple] = {}
     watching: set[str] = set()
     while True:
@@ -432,9 +436,18 @@ async def media_event_stream(
                 yield sse_event(row)
             if row["status"] in ("uploading", "pending", "processing"):
                 in_flight = True
-        for uid in list(watching - present):  # dropped from non-ready → it finished
-            yield sse_event({"uid": uid, "status": "ready", "progress_pct": 100})
-            watching.discard(uid)
+        finished = sorted(watching - present)  # dropped from non-ready → it finished
+        if finished:
+            # The ready event is synthesised from an ABSENCE, so the row that now carries the
+            # worker's width/height/blurhash is not in hand — it is read back here. Without it the
+            # client learns only that the status changed and lays a fresh upload out in the
+            # fallback box, with no srcset, until something refetches the feed.
+            meta = await ready_meta(finished)
+            for uid in finished:
+                yield sse_event(
+                    {"uid": uid, "status": "ready", "progress_pct": 100, **meta.get(uid, {})}
+                )
+                watching.discard(uid)
         if not in_flight:
             break
         await asyncio.sleep(interval)
@@ -456,6 +469,23 @@ async def _user_snapshot(user_id: int) -> list[dict]:
     return [{"uid": uid, "status": status.value, "progress_pct": pct} for uid, status, pct in rows]
 
 
+async def _ready_meta(user_id: int, uids: list[str]) -> dict[str, dict]:
+    """The layout metadata a just-finished attachment gained, per uid.
+
+    Scoped to the owner like every other read here, even though the uids came from this user's own
+    snapshot — the stream must not become a way to read another account's rows if that ever changes.
+    """
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(
+                    Attachment.uid, Attachment.width, Attachment.height, Attachment.blurhash
+                ).where(Attachment.owner_id == user_id, Attachment.uid.in_(uids))
+            )
+        ).all()
+    return {uid: {"width": w, "height": h, "blurhash": b} for uid, w, h, b in rows}
+
+
 @router.get("/events")
 async def events(request: Request) -> StreamingResponse:
     # Authenticate in a short-lived session and release it before the stream opens — otherwise the
@@ -468,4 +498,7 @@ async def events(request: Request) -> StreamingResponse:
     async def snap() -> list[dict]:
         return await _user_snapshot(user_id)
 
-    return StreamingResponse(media_event_stream(snap), media_type="text/event-stream")
+    async def meta(uids: list[str]) -> dict[str, dict]:
+        return await _ready_meta(user_id, uids)
+
+    return StreamingResponse(media_event_stream(snap, meta), media_type="text/event-stream")

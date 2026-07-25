@@ -223,15 +223,21 @@ def test_plan_fields_never_touches_a_populated_column():
 
 
 def test_plan_fields_fills_only_the_null_columns():
-    att = _attachment("partial", width=None, height=222, blurhash=None)
+    att = _attachment("partial", width=None, height=None, blurhash="LEHV6nWB")
     computed = bf.Computed(size=(999, 888), blurhash="LKO2?U%2")
-    assert bf.plan_fields(att, computed) == ["width", "blurhash"]
+    assert bf.plan_fields(att, computed) == ["width", "height"]
 
 
-def test_tier_dims_are_not_mixed_with_an_already_stored_dimension():
-    """A tier width beside an original height would invent an aspect ratio matching neither."""
-    att = _attachment("half", width=None, height=3000, blurhash=None)
-    computed = bf.Computed(size=(512, 683), size_from_tier=True, blurhash="LKO2?U%2")
+@pytest.mark.parametrize("from_tier", [False, True])
+@pytest.mark.parametrize(("width", "height"), [(None, 3000), (512, None)])
+def test_dims_are_all_or_nothing_whatever_they_came_from(from_tier, width, height):
+    """One stored dimension completed from another source describes neither image.
+
+    Not a tier-only rule: an original's 900px height beside a stored width of 7 stores the ratio
+    7:900, and since the media layout batch that ratio IS the tile's box.
+    """
+    att = _attachment("half", width=width, height=height, blurhash=None)
+    computed = bf.Computed(size=(512, 683), size_from_tier=from_tier, blurhash="LKO2?U%2")
     assert bf.plan_fields(att, computed) == ["blurhash"]
 
     both_null = _attachment("none", width=None, height=None)
@@ -239,14 +245,14 @@ def test_tier_dims_are_not_mixed_with_an_already_stored_dimension():
 
 
 async def test_write_fill_writes_exactly_the_planned_fields(adb, tmp_path):
-    att = await _seed(adb, "apply", width=None, height=222, blurhash="LEHV6nWB")
+    att = await _seed(adb, "apply", width=None, height=None, blurhash="LEHV6nWB")
     computed = bf.Computed(size=(999, 888), blurhash="LKO2?U%2")
 
     written = await bf.write_fill(adb, att, computed, bf.plan_fields(att, computed))
 
-    assert written == ["width"]
+    assert written == ["width", "height"]
     await adb.refresh(att)
-    assert (att.width, att.height, att.blurhash) == (999, 222, "LEHV6nWB")
+    assert (att.width, att.height, att.blurhash) == (999, 888, "LEHV6nWB")
 
 
 # --- selection ---------------------------------------------------------------------------------
@@ -350,6 +356,33 @@ async def test_dims_written_after_the_candidate_load_are_not_overwritten(
     assert written == ["blurhash"]
 
 
+async def test_original_dims_are_not_paired_with_a_concurrently_written_dimension(
+    adb, monkeypatch, tmp_path
+):
+    """The all-or-nothing rule holds in SQL for original-derived dims too, not only tier ones.
+
+    The snapshot says both columns are NULL, so the pair is planned; a writer lands one of them
+    before the write. Completing the other per-column would store 4000x900 — neither the original's
+    ratio nor the concurrent writer's.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    src = _write_image(tmp_path / "originals" / "race4.jpg", size=(1200, 900))
+    att = await _seed(adb, "race4", storage_path=str(src))
+
+    assert att in await bf.load_candidates(adb)
+    computed = bf.compute("race4", str(src), True, False)
+    assert computed.size_from_tier is False
+    fields = bf.plan_fields(att, computed)
+    assert fields == ["width", "height"]
+
+    await _write_behind_the_session(adb, att.id, width=4000)
+    written = await bf.write_fill(adb, att, computed, fields)
+
+    await adb.refresh(att)
+    assert (att.width, att.height) == (4000, None)
+    assert written == []
+
+
 async def test_tier_dims_are_not_paired_with_a_concurrently_written_dimension(
     adb, monkeypatch, tmp_path
 ):
@@ -416,13 +449,35 @@ async def test_execute_respects_an_existing_value_and_fills_the_rest(adb, monkey
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     src = _write_image(tmp_path / "originals" / "keep.jpg", size=(1200, 900))
     _write_thumb(tmp_path, "keep")
-    att = await _seed(adb, "keep", storage_path=str(src), width=7, blurhash="LEHV6nWBaaaaaaaaaaaa")
+    att = await _seed(adb, "keep", storage_path=str(src), blurhash="LEHV6nWBaaaaaaaaaaaa")
 
-    await bf.run_backfill(adb, execute=True)
+    stats = await bf.run_backfill(adb, execute=True)
 
-    assert att.width == 7  # stored value wins over the original's 1200
-    assert att.height == 900
-    assert att.blurhash == "LEHV6nWBaaaaaaaaaaaa"
+    assert (att.width, att.height) == (1200, 900)  # the NULL pair was filled
+    assert att.blurhash == "LEHV6nWBaaaaaaaaaaaa"  # stored value wins over the re-encoded one
+    assert stats.dims_filled == 1 and stats.blurhash_filled == 0
+
+
+async def test_execute_never_completes_a_half_populated_dimension_pair(adb, monkeypatch, tmp_path):
+    """A stored width of 7 beside a 1200x900 original must NOT become 7x900.
+
+    The original-derived path filled the columns independently, so this row left the backfill with
+    an aspect ratio of 0.008 — which the feed then lays the photo's tile out at. The pair is left
+    exactly as found and reported, while the blurhash (no pairing) is still filled.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    src = _write_image(tmp_path / "originals" / "half.jpg", size=(1200, 900))
+    _write_thumb(tmp_path, "half")
+    att = await _seed(adb, "half", storage_path=str(src), width=7)
+
+    stats = await bf.run_backfill(adb, execute=True)
+
+    assert (att.width, att.height) == (7, None)
+    assert att.blurhash is not None and len(att.blurhash) == 28
+    assert stats.skipped_inconsistent_dims == 1
+    assert stats.dims_filled == 0 and stats.dims_unresolved == 0
+    assert stats.blurhash_filled == 1
+    assert "skipped_inconsistent_dims=1" in stats.format(execute=True)
 
 
 async def test_execute_falls_back_to_the_tier_and_counts_it_separately(adb, monkeypatch, tmp_path):

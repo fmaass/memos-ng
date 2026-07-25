@@ -48,6 +48,15 @@ function client(): QueryClient {
   })
 }
 
+function withMeta(
+  meta: Record<string, unknown> = { width: null, height: null, blurhash: null },
+): TimelineData {
+  return {
+    pages: [{ items: [{ attachments: [{ uid: 'x', status: 'processing', ...meta }] }] }],
+    pageParams: [undefined],
+  } as TimelineData
+}
+
 describe('applyMediaEvent', () => {
   it('updates only the matching attachment status across pages', () => {
     const data = {
@@ -61,6 +70,71 @@ describe('applyMediaEvent', () => {
     expect(atts.find((a) => a.uid === 'x')!.status).toBe('ready')
     expect(atts.find((a) => a.uid === 'y')!.status).toBe('ready') // unchanged
     expect(data.pages[0].items[0].attachments[0].status).toBe('processing') // original untouched
+  })
+
+  it('applies the dims and blurhash a ready event carries', () => {
+    const data = withMeta()
+
+    const att = applyMediaEvent(data, {
+      uid: 'x',
+      status: 'ready',
+      progress_pct: 100,
+      width: 1200,
+      height: 900,
+      blurhash: 'LKO2?U%2',
+    }).pages[0].items[0].attachments[0]
+
+    // Without this the tile stays in the fallback box with no srcset until the feed is refetched.
+    expect([att.status, att.width, att.height, att.blurhash]).toEqual([
+      'ready',
+      1200,
+      900,
+      'LKO2?U%2',
+    ])
+    expect(data.pages[0].items[0].attachments[0].width).toBeNull() // original untouched
+  })
+
+  it('keeps the stored metadata when a ready event carries none', () => {
+    const stored = { width: 1200, height: 900, blurhash: 'LKO2?U%2' }
+
+    const att = applyMediaEvent(withMeta(stored), {
+      uid: 'x',
+      status: 'ready',
+      progress_pct: 100,
+      width: null,
+      height: null,
+      blurhash: null,
+    }).pages[0].items[0].attachments[0]
+
+    expect([att.status, att.width, att.height, att.blurhash]).toEqual(['ready', ...Object.values(stored)])
+  })
+
+  it('ignores a half dimension pair rather than mixing it with the stored one', () => {
+    const att = applyMediaEvent(withMeta({ width: 1200, height: 900, blurhash: null }), {
+      uid: 'x',
+      status: 'ready',
+      width: 7,
+      height: null,
+      blurhash: 'LKO2?U%2',
+    }).pages[0].items[0].attachments[0]
+
+    expect([att.width, att.height]).toEqual([1200, 900]) // 7x900 is neither image
+    expect(att.blurhash).toBe('LKO2?U%2') // blurhash carries no pairing
+  })
+
+  it('leaves the metadata alone on a non-terminal progress event', () => {
+    const att = applyMediaEvent(withMeta({ width: 1200, height: 900, blurhash: 'LKO2?U%2' }), {
+      uid: 'x',
+      status: 'processing',
+      progress_pct: 40,
+    }).pages[0].items[0].attachments[0]
+
+    expect([att.status, att.width, att.height, att.blurhash]).toEqual([
+      'processing',
+      1200,
+      900,
+      'LKO2?U%2',
+    ])
   })
 })
 

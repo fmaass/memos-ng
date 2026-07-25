@@ -5,15 +5,37 @@ import { getCurrentInstance, onUnmounted } from 'vue'
 import type { components } from '@/api/schema'
 import { hasInFlight, nextAction, type TimelineData } from '@/lib/sseLifecycle'
 
+type Attachment = components['schemas']['AttachmentRef']
+
 export interface MediaEvent {
   uid: string
   status: components['schemas']['AttachmentStatus']
   progress_pct?: number
+  // The terminal `ready` event carries the metadata the worker has just written.
+  width?: number | null
+  height?: number | null
+  blurhash?: string | null
 }
 
-// Pure: return a new infinite-query data object with the event's attachment status applied.
+// What an event contributes to the cached attachment beyond its status. Dims are taken as a PAIR —
+// one of them beside the other's stale value would describe an aspect ratio neither source has, and
+// that ratio is exactly what the tile box is laid out from.
+function metadataPatch(ev: MediaEvent): Partial<Attachment> {
+  const patch: Partial<Attachment> = {}
+  if (ev.width != null && ev.height != null) {
+    patch.width = ev.width
+    patch.height = ev.height
+  }
+  if (ev.blurhash != null) patch.blurhash = ev.blurhash
+  return patch
+}
+
+// Pure: return a new infinite-query data object with the event's attachment status AND the metadata
+// it carries applied. Patching only the status left a just-finished upload at NULL dims in the
+// cache, so its tile kept the fallback box and served no srcset until something refetched the feed.
 // Exported so the cache transform is unit-tested without a live cache or EventSource.
 export function applyMediaEvent<T extends TimelineData>(data: T, ev: MediaEvent): T {
+  const meta = metadataPatch(ev)
   return {
     ...data,
     pages: data.pages.map((page) => ({
@@ -21,7 +43,7 @@ export function applyMediaEvent<T extends TimelineData>(data: T, ev: MediaEvent)
       items: page.items.map((memo) => ({
         ...memo,
         attachments: memo.attachments?.map((a) =>
-          a.uid === ev.uid ? { ...a, status: ev.status } : a,
+          a.uid === ev.uid ? { ...a, status: ev.status, ...meta } : a,
         ),
       })),
     })),

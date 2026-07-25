@@ -20,7 +20,9 @@ tiers for metadata that can be read cheaply:
   placeholder for the exact image the tile will load.
 
 Never overwrites: a column is filled only where it is NULL at the instant of the write, decided by
-the database rather than by this process's snapshot (see ``fill_statement``).
+the database rather than by this process's snapshot (see ``fill_statement``). Width and height are
+additionally all-or-nothing whatever they were derived from — a row already carrying one of them
+keeps its NULL, because a dimension paired with one from another source describes neither image.
 
 Default is a DRY RUN — it prints the per-attachment plan and the summary, and writes nothing. Pass
 ``--execute`` to write. Run inside the app container, which has the DB and the files::
@@ -96,6 +98,7 @@ class BackfillStats:
     dims_from_tier: int = 0  # subset of dims_filled: original unreadable, ratio from a derived tier
     blurhash_filled: int = 0
     dims_unresolved: int = 0  # dims still NULL: no readable original and no derived tier
+    skipped_inconsistent_dims: int = 0  # exactly one dim stored: the pair is left as it is
     blurhash_unresolved: int = 0  # blurhash still NULL: no thumb tier on disk
     failed: int = 0  # an item raised (per-item; the run continued)
 
@@ -107,6 +110,7 @@ class BackfillStats:
             f"dims_filled={self.dims_filled} (from_tier={self.dims_from_tier}) "
             f"blurhash_filled={self.blurhash_filled} | "
             f"dims_unresolved={self.dims_unresolved} "
+            f"skipped_inconsistent_dims={self.skipped_inconsistent_dims} "
             f"blurhash_unresolved={self.blurhash_unresolved} failed={self.failed}"
         )
 
@@ -214,20 +218,15 @@ def plan_fields(attachment: Attachment, computed: Computed) -> list[str]:
     worker-produced), and a backfilled value is the less authoritative of the two — tier-derived
     dims are smaller than the original's, a re-encoded blurhash differs in its trailing digits.
 
-    Tier-derived dims are additionally all-or-nothing: pairing a tier width with an already-stored
-    original height would invent an aspect ratio matching neither source, which is the one thing
-    these fields are read for.
+    Dims are additionally all-or-nothing, from EVERY source: a computed width beside an
+    already-stored height invents an aspect ratio matching neither image, which is the one thing
+    these fields are read for — a stored ``width=7`` completed with a 1200x900 original's height
+    would lay every tile of that photo out as 7:900. The pair is written together or not at all.
+    Blurhash carries no such pairing and stays per-column.
     """
     fields: list[str] = []
-    if computed.size is not None:
-        mixes_sources = computed.size_from_tier and (
-            attachment.width is not None or attachment.height is not None
-        )
-        if not mixes_sources:
-            if attachment.width is None:
-                fields.append("width")
-            if attachment.height is None:
-                fields.append("height")
+    if computed.size is not None and attachment.width is None and attachment.height is None:
+        fields.extend(("width", "height"))
     if computed.blurhash is not None and attachment.blurhash is None:
         fields.append("blurhash")
     return fields
@@ -243,8 +242,10 @@ def fill_statement(attachment_id: int, computed: Computed, fields: list[str]) ->
     decision inside the row's own write lock, so the concurrent writer always wins and this run
     fills only what is still NULL at the instant it writes.
 
-    Tier-derived dims keep their all-or-nothing pairing in SQL too (the CASE): a tier width beside
-    a height written concurrently from the original would invent an aspect ratio matching neither.
+    Dims keep their all-or-nothing pairing in SQL too (the CASE): a width from this run beside a
+    height a concurrent writer landed in the meantime would invent a ratio matching neither, so the
+    pair is written only while BOTH columns are still NULL. A per-column COALESCE cannot express
+    that — it would let exactly one of the two through.
     """
     new = _computed_values(computed)
     both_dims_null = and_(Attachment.width.is_(None), Attachment.height.is_(None))
@@ -253,7 +254,7 @@ def fill_statement(attachment_id: int, computed: Computed, fields: list[str]) ->
         column = getattr(Attachment, name)
         values[name] = (
             case((both_dims_null, new[name]), else_=column)
-            if computed.size_from_tier and name in ("width", "height")
+            if name in ("width", "height")
             else func.coalesce(column, new[name])
         )
     if not values:
@@ -322,7 +323,11 @@ async def run_backfill(
 
     for att in eligible if limit is None else eligible[: max(limit, 0)]:
         stats.processed += 1
-        want_size = att.width is None or att.height is None
+        # Dims are computed only when BOTH are NULL: a row already carrying one of them cannot be
+        # completed (see plan_fields), so decoding its original would be work with no destination.
+        stored = (att.width is not None, att.height is not None)
+        want_size = not any(stored)
+        inconsistent_dims = any(stored) and not all(stored)
         want_blurhash = att.blurhash is None
         try:
             computed = await to_thread.run_sync(
@@ -338,7 +343,9 @@ async def run_backfill(
             )
             continue
 
-        if want_size:
+        if inconsistent_dims:
+            stats.skipped_inconsistent_dims += 1
+        elif want_size:
             if "width" in fields or "height" in fields:
                 stats.dims_filled += 1
                 stats.dims_from_tier += int(computed.size_from_tier)
