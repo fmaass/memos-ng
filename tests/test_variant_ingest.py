@@ -16,8 +16,8 @@ async def _owner(adb, subject):
     return u
 
 
-async def _upload(adb, name, data, mime="image/png"):
-    up = await svc.create_upload(adb, filename=name, mime=mime, size=len(data))
+async def _upload(adb, owner, name, data, mime="image/png"):
+    up = await svc.create_upload(adb, owner_id=owner.id, filename=name, mime=mime, size=len(data))
     await svc.append_chunk(adb, up, 0, data)
     return up
 
@@ -44,8 +44,8 @@ async def _renditions(adb, attachment_id):
 async def test_in_batch_screen_and_print_groups(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_group")
-    screen = await _upload(adb, "_AR1.png", PNG + b"s" * 2000)
-    glossy = await _upload(adb, "_AR1 - print (glossy).png", PNG + b"g" * 3000)
+    screen = await _upload(adb, o, "_AR1.png", PNG + b"s" * 2000)
+    glossy = await _upload(adb, o, "_AR1 - print (glossy).png", PNG + b"g" * 3000)
     out = await svc.finalize_pending(adb, [screen.upload_uid, glossy.upload_uid], o.id)
 
     # exactly ONE visible Attachment (the screen); the print is NOT an Attachment row
@@ -68,10 +68,10 @@ async def test_identical_print_bytes_on_two_photos_are_not_file_shared(adb, monk
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_noshare")
     same_print = PNG + b"identical-print-bytes" * 200
-    s1 = await _upload(adb, "A.png", PNG + b"a" * 2000)
-    p1 = await _upload(adb, "A - print (glossy).png", same_print)
-    s2 = await _upload(adb, "B.png", PNG + b"b" * 2000)
-    p2 = await _upload(adb, "B - print (glossy).png", same_print)  # byte-identical to p1
+    s1 = await _upload(adb, o, "A.png", PNG + b"a" * 2000)
+    p1 = await _upload(adb, o, "A - print (glossy).png", same_print)
+    s2 = await _upload(adb, o, "B.png", PNG + b"b" * 2000)
+    p2 = await _upload(adb, o, "B - print (glossy).png", same_print)  # byte-identical to p1
     uids = [s1.upload_uid, p1.upload_uid, s2.upload_uid, p2.upload_uid]
     await svc.finalize_pending(adb, uids, o.id)
 
@@ -88,9 +88,9 @@ async def test_identical_print_bytes_on_two_photos_are_not_file_shared(adb, monk
 async def test_rendition_enqueues_zero_mediajob_even_for_heic(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_nojob")
-    screen = await _upload(adb, "X.png", PNG + b"x" * 2000)
+    screen = await _upload(adb, o, "X.png", PNG + b"x" * 2000)
     heic = b"\x00\x00\x00\x18ftypheic" + b"h" * 3000  # sniffs to image/heic, not the declared mime
-    pr = await _upload(adb, "X - print (matte).heic", heic, mime="application/octet-stream")
+    pr = await _upload(adb, o, "X - print (matte).heic", heic, mime="application/octet-stream")
     await svc.finalize_pending(adb, [screen.upload_uid, pr.upload_uid], o.id)
 
     att = (await _attachments(adb, o.id))[0]
@@ -104,7 +104,7 @@ async def test_rendition_enqueues_zero_mediajob_even_for_heic(adb, monkeypatch, 
 async def test_lone_print_is_promoted_to_visible(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_promote")
-    lone = await _upload(adb, "Y - print (glossy).png", PNG + b"y" * 2000)
+    lone = await _upload(adb, o, "Y - print (glossy).png", PNG + b"y" * 2000)
     out = await svc.finalize_pending(adb, [lone.upload_uid], o.id)
 
     assert len(out) == 1  # promoted to a normal visible photo
@@ -118,9 +118,9 @@ async def test_lone_print_is_promoted_to_visible(adb, monkeypatch, tmp_path):
 async def test_in_batch_variant_key_collision_promotes_loser(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_collide")
-    screen = await _upload(adb, "X.png", PNG + b"x" * 2000)
-    a = await _upload(adb, "X - print (glossy).png", PNG + b"a" * 2000)
-    b = await _upload(adb, "X - print (glossy).png", PNG + b"b" * 2500)  # same key, different bytes
+    screen = await _upload(adb, o, "X.png", PNG + b"x" * 2000)
+    a = await _upload(adb, o, "X - print (glossy).png", PNG + b"a" * 2000)
+    b = await _upload(adb, o, "X - print (glossy).png", PNG + b"b" * 2500)  # same key, other bytes
     out = await svc.finalize_pending(adb, [screen.upload_uid, a.upload_uid, b.upload_uid], o.id)
 
     # screen + the colliding loser (promoted) = 2 visible photos; exactly 1 rendition (the winner)
@@ -137,9 +137,9 @@ async def test_in_batch_variant_key_collision_promotes_loser(adb, monkeypatch, t
 async def test_two_screens_same_base_print_binds_first(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_two")
-    s1 = await _upload(adb, "X.png", PNG + b"1" * 2000)
-    s2 = await _upload(adb, "X - screen.png", PNG + b"2" * 2500)
-    pr = await _upload(adb, "X - print (matte).png", PNG + b"p" * 3000)
+    s1 = await _upload(adb, o, "X.png", PNG + b"1" * 2000)
+    s2 = await _upload(adb, o, "X - screen.png", PNG + b"2" * 2500)
+    pr = await _upload(adb, o, "X - print (matte).png", PNG + b"p" * 3000)
     out = await svc.finalize_pending(adb, [s1.upload_uid, s2.upload_uid, pr.upload_uid], o.id)
 
     assert len(out) == 2  # both screens are visible photos
@@ -154,13 +154,13 @@ async def test_print_attaches_to_a_deduped_pre_existing_screen(adb, monkeypatch,
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_dedup")
     body = PNG + b"z" * 4000
-    first = await _upload(adb, "Z.png", body)
+    first = await _upload(adb, o, "Z.png", body)
     await svc.finalize_pending(adb, [first.upload_uid], o.id)
     att_z = (await _attachments(adb, o.id))[0]
 
     # a later batch re-dumps the SAME screen bytes (dedups) + adds a print
-    again = await _upload(adb, "Z.png", body)
-    pr = await _upload(adb, "Z - print (glossy).png", PNG + b"p" * 3000)
+    again = await _upload(adb, o, "Z.png", body)
+    pr = await _upload(adb, o, "Z - print (glossy).png", PNG + b"p" * 3000)
     await svc.finalize_pending(adb, [again.upload_uid, pr.upload_uid], o.id)
 
     assert len(await _attachments(adb, o.id)) == 1  # no new screen (deduped)
@@ -172,15 +172,15 @@ async def test_redump_same_key_is_idempotent(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_idem")
     body = PNG + b"s" * 4000
-    s1 = await _upload(adb, "X.png", body)
-    p1 = await _upload(adb, "X - print (glossy).png", PNG + b"g" * 3000)
+    s1 = await _upload(adb, o, "X.png", body)
+    p1 = await _upload(adb, o, "X - print (glossy).png", PNG + b"g" * 3000)
     await svc.finalize_pending(adb, [s1.upload_uid, p1.upload_uid], o.id)
     att = (await _attachments(adb, o.id))[0]
     first_path = (await _renditions(adb, att.id))[0].storage_path
 
     # re-dump the SAME screen (dedups) + the SAME print key → write-once no-op
-    s2 = await _upload(adb, "X.png", body)
-    p2 = await _upload(adb, "X - print (glossy).png", PNG + b"DIFFERENT" * 200)
+    s2 = await _upload(adb, o, "X.png", body)
+    p2 = await _upload(adb, o, "X - print (glossy).png", PNG + b"DIFFERENT" * 200)
     await svc.finalize_pending(adb, [s2.upload_uid, p2.upload_uid], o.id)
 
     rends = await _renditions(adb, att.id)
@@ -194,12 +194,12 @@ async def test_dedup_finalize_tracks_no_file_for_rollback(adb, monkeypatch, tmp_
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_moved")
     data = b"dup-bytes" * 500
-    up1 = await _upload(adb, "a.bin", data, mime="application/octet-stream")
+    up1 = await _upload(adb, o, "a.bin", data, mime="application/octet-stream")
     moved1: list[str] = []
     att1 = await svc.finalize(adb, up1, o.id, moved1)
     assert moved1 == [att1.storage_path] and Path(att1.storage_path).exists()
 
-    up2 = await _upload(adb, "b.bin", data, mime="application/octet-stream")
+    up2 = await _upload(adb, o, "b.bin", data, mime="application/octet-stream")
     moved2: list[str] = []
     att2 = await svc.finalize(adb, up2, o.id, moved2)
     assert att2.uid == att1.uid  # deduped
@@ -213,8 +213,8 @@ async def test_dedup_finalize_tracks_no_file_for_rollback(adb, monkeypatch, tmp_
 async def test_delete_attachment_cascades_renditions_and_lists_files(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "vp_del")
-    screen = await _upload(adb, "D.png", PNG + b"d" * 2000)
-    pr = await _upload(adb, "D - print (glossy).png", PNG + b"p" * 3000)
+    screen = await _upload(adb, o, "D.png", PNG + b"d" * 2000)
+    pr = await _upload(adb, o, "D - print (glossy).png", PNG + b"p" * 3000)
     await svc.finalize_pending(adb, [screen.upload_uid, pr.upload_uid], o.id)
 
     att = (await _attachments(adb, o.id))[0]

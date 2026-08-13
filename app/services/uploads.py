@@ -127,8 +127,17 @@ def _sniff_mime(path: Path, declared: str) -> str:
 
 
 async def create_upload(
-    db: AsyncSession, *, filename: str, mime: str, size: int, last_modified: int | None = None
+    db: AsyncSession,
+    *,
+    owner_id: int,
+    filename: str,
+    mime: str,
+    size: int,
+    last_modified: int | None = None,
 ) -> Upload:
+    """Open an upload session BOUND to `owner_id`. The uid is unguessable but is not a capability:
+    every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
+    another user out of these bytes."""
     upload_uid = secrets.token_urlsafe(24)
     part = part_path(upload_uid)
     part.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +145,7 @@ async def create_upload(
     client_mtime = datetime.fromtimestamp(last_modified / 1000, UTC) if last_modified else None
     upload = Upload(
         upload_uid=upload_uid,
+        owner_id=owner_id,
         filename=filename,
         mime=mime,
         declared_size=size,
@@ -256,6 +266,12 @@ async def finalize_pending(
     return their uids. A missing/expired or incomplete upload is skipped (it expires via
     reap_expired) so an abandoned compose never creates an orphan attachment.
 
+    The lookup is scoped to `owner_id`, so this second entry point (memo create/edit carrying
+    upload_uids) binds sessions exactly as the direct upload routes do: another user's uid — or a
+    pre-ownership row with no owner — is INDISTINGUISHABLE from an unknown uid here and is simply
+    skipped. Without that scope, submitting a foreign uid would finalize the victim's bytes into an
+    attachment stamped with the SUBMITTER's owner_id.
+
     finalize()/finalize_rendition() move the part file to its final path BEFORE the (now shared)
     memo transaction commits — a non-transactional side effect. Each genuinely-moved path is
     appended to `moved_out` (inside those functions, new-file branch only) so the caller can
@@ -268,7 +284,9 @@ async def finalize_pending(
     pending: list[tuple[Upload, ParsedName]] = []
     for up_uid in upload_uids:
         upload = (
-            await db.execute(select(Upload).where(Upload.upload_uid == up_uid))
+            await db.execute(
+                select(Upload).where(Upload.upload_uid == up_uid, Upload.owner_id == owner_id)
+            )
         ).scalar_one_or_none()
         if upload is None:
             continue

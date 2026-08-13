@@ -44,8 +44,10 @@ async def _owner(adb, subject):
     return u
 
 
-async def _upload(adb, name, data, mime="image/png"):
-    up = await up_svc.create_upload(adb, filename=name, mime=mime, size=len(data))
+async def _upload(adb, owner, name, data, mime="image/png"):
+    up = await up_svc.create_upload(
+        adb, owner_id=owner.id, filename=name, mime=mime, size=len(data)
+    )
     await up_svc.append_chunk(adb, up, 0, data)
     return up
 
@@ -57,8 +59,8 @@ async def _att(adb, uid):
 async def test_screen_and_print_land_in_memo_folder_under_real_names(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_basic")
-    screen = await _upload(adb, "Holiday Sunset.png", PNG + b"s" * 2000)
-    glossy = await _upload(adb, "Holiday Sunset - print (glossy).png", PNG + b"g" * 3000)
+    screen = await _upload(adb, o, "Holiday Sunset.png", PNG + b"s" * 2000)
+    glossy = await _upload(adb, o, "Holiday Sunset - print (glossy).png", PNG + b"g" * 3000)
     moved: list[str] = []
     finalized = await up_svc.finalize_pending(
         adb, [screen.upload_uid, glossy.upload_uid], o.id, moved_out=moved
@@ -98,7 +100,7 @@ async def test_screen_and_print_land_in_memo_folder_under_real_names(adb, monkey
 async def test_finalized_but_unlinked_attachment_stays_in_unfiled(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_unfiled")
-    up = await _upload(adb, "lonely.png", PNG + b"s" * 2000)
+    up = await _upload(adb, o, "lonely.png", PNG + b"s" * 2000)
     finalized = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
     att = await _att(adb, finalized[0])
     assert storage.is_unfiled(att.storage_path, Path(settings.DATA_ROOT))
@@ -108,8 +110,8 @@ async def test_finalized_but_unlinked_attachment_stays_in_unfiled(adb, monkeypat
 async def test_same_filename_twice_in_one_memo_is_numbered(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_collide")
-    a1 = await _upload(adb, "IMG.png", PNG + b"a" * 2000)
-    a2 = await _upload(adb, "IMG.png", PNG + b"b" * 2000)  # same name, distinct bytes (no dedup)
+    a1 = await _upload(adb, o, "IMG.png", PNG + b"a" * 2000)
+    a2 = await _upload(adb, o, "IMG.png", PNG + b"b" * 2000)  # same name, distinct bytes (no dedup)
     finalized = await up_svc.finalize_pending(adb, [a1.upload_uid, a2.upload_uid], o.id)
     await memo_svc.create_memo(
         adb, o, content="x", visibility=Visibility.PUBLIC, attachment_uids=finalized
@@ -130,7 +132,7 @@ async def test_rollback_unlinks_placed_file_but_never_a_prior_memos_master(
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_rb")
     # a prior, committed memo + master
-    pre = await _upload(adb, "old.png", PNG + b"o" * 2000)
+    pre = await _upload(adb, o, "old.png", PNG + b"o" * 2000)
     pre_uids = await up_svc.finalize_pending(adb, [pre.upload_uid], o.id)
     await memo_svc.create_memo(
         adb, o, content="m1", visibility=Visibility.PUBLIC, attachment_uids=pre_uids
@@ -140,7 +142,7 @@ async def test_rollback_unlinks_placed_file_but_never_a_prior_memos_master(
     assert Path(pre_path).exists()
 
     # a new post that will "roll back"
-    new = await _upload(adb, "new.png", PNG + b"n" * 2000)
+    new = await _upload(adb, o, "new.png", PNG + b"n" * 2000)
     moved: list[str] = []
     new_uids = await up_svc.finalize_pending(adb, [new.upload_uid], o.id, moved_out=moved)
     await memo_svc.create_memo(
@@ -164,7 +166,7 @@ async def test_existing_master_is_not_moved_when_relinked(adb, monkeypatch, tmp_
     """Proves new-writes-only: an already-placed master re-linked to another memo stays put."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_guard")
-    up = await _upload(adb, "p.png", PNG + b"p" * 2000)
+    up = await _upload(adb, o, "p.png", PNG + b"p" * 2000)
     uids = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
     await memo_svc.create_memo(
         adb, o, content="m1", visibility=Visibility.PUBLIC, attachment_uids=uids
@@ -193,7 +195,7 @@ async def test_worker_sees_the_final_memo_folder_path(adb, monkeypatch, tmp_path
     pre-placement `_unfiled` path."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_job")
-    up = await _upload(adb, "w.png", PNG + b"w" * 2000)
+    up = await _upload(adb, o, "w.png", PNG + b"w" * 2000)
     uids = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
     memo = await memo_svc.create_memo(
         adb, o, content="x", visibility=Visibility.PUBLIC, attachment_uids=uids
@@ -215,14 +217,14 @@ async def test_same_photo_in_two_memos_does_not_strand_the_first(adb, monkeypatc
     o = await _owner(adb, "pl_steal")
     same = PNG + b"identical-photo-bytes" * 400
 
-    upA = await _upload(adb, "P.png", same)
+    upA = await _upload(adb, o, "P.png", same)
     finA = await up_svc.finalize_pending(adb, [upA.upload_uid], o.id)
     memoA = await memo_svc.create_memo(
         adb, o, content="A", visibility=Visibility.PUBLIC, attachment_uids=finA
     )
     attA = await _att(adb, finA[0])
 
-    upB = await _upload(adb, "P.png", same)  # byte-identical, second memo
+    upB = await _upload(adb, o, "P.png", same)  # byte-identical, second memo
     finB = await up_svc.finalize_pending(adb, [upB.upload_uid], o.id)
     assert finB[0] != finA[0]  # NOT deduped to A's (linked) attachment → a fresh row
     memoB = await memo_svc.create_memo(
@@ -252,8 +254,8 @@ async def test_in_post_duplicate_still_dedups(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_indedup")
     same = PNG + b"dup" * 700
-    u1 = await _upload(adb, "a.png", same)
-    u2 = await _upload(adb, "b.png", same)
+    u1 = await _upload(adb, o, "a.png", same)
+    u2 = await _upload(adb, o, "b.png", same)
     fin = await up_svc.finalize_pending(adb, [u1.upload_uid, u2.upload_uid], o.id)
     assert len(set(fin)) == 1  # collapsed to a single attachment within the post
 
@@ -263,7 +265,7 @@ async def test_relink_via_attachment_uids_does_not_steal(adb, monkeypatch, tmp_p
     to a new memo must NOT move it (link_attachments skips a foreign-memo attachment)."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_relink")
-    up = await _upload(adb, "x.png", PNG + b"x" * 2000)
+    up = await _upload(adb, o, "x.png", PNG + b"x" * 2000)
     fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
     memoA = await memo_svc.create_memo(
         adb, o, content="A", visibility=Visibility.PUBLIC, attachment_uids=fin
@@ -283,7 +285,7 @@ async def test_custom_created_at_drives_the_folder(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_date")
     custom = datetime(2021, 3, 7, 9, 5, tzinfo=UTC)
-    up = await _upload(adb, "d.png", PNG + b"d" * 2000)
+    up = await _upload(adb, o, "d.png", PNG + b"d" * 2000)
     fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id)
     memo = await memo_svc.create_memo(
         adb, o, content="x", visibility=Visibility.PUBLIC, attachment_uids=fin, created_at=custom
@@ -301,7 +303,7 @@ async def test_patch_memo_adds_photo_and_places_it(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_patch")
     memo = await memo_svc.create_memo(adb, o, content="m", visibility=Visibility.PUBLIC)
-    up = await _upload(adb, "added.png", PNG + b"p" * 2000)
+    up = await _upload(adb, o, "added.png", PNG + b"p" * 2000)
     moved: list[str] = []
     fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id, moved_out=moved)
     await memo_svc.link_attachments(adb, o.id, memo, fin, moved_out=moved)
