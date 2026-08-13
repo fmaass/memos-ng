@@ -214,7 +214,8 @@ All settings come from the environment (or a `.env` file). Key variables — see
   `alembic check` is now a CI gate, so a model change without a migration fails the build; the
   production image is built on every PR, so a dependency needing a compiler on
   `python:3.13-slim` can no longer reach `main` unseen; `APP_VERSION` is `<version>+<short-sha>`
-  instead of a bare commit SHA.
+  instead of a bare commit SHA. The release procedure itself is now codified in `RELEASING.md`
+  (version manifest, CI gates, jupiter deploy and image-retag rollback).
 - **Docs.** The frame-api-upload plan is tracked in git alongside its siblings, and the
   photo-book print tier + export API is specified (measured evidence, 4096px geometry, encode
   profile).

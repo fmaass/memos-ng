@@ -45,7 +45,10 @@ for the backend (`app/version.py` reads the environment), while the build-arg ba
 bundle's displayed version. Deploy with `docker compose up -d --force-recreate` (never `restart`).
 
 Rollback: retag the previous image `memos-ng:rollback-<short-sha>` *before* overwriting
-`memos-ng:local`; revert the compose env line and `up -d --force-recreate`.
+`memos-ng:local`. To roll back, point the fixed tag back at it —
+`docker tag memos-ng:rollback-<short-sha> memos-ng:local` — then revert the compose
+`APP_VERSION` env lines and `docker compose up -d --force-recreate` (compose always deploys the
+`memos-ng:local` tag; reverting only the env var would restart the BAD image under the old name).
 
 Recreating the worker kills any in-flight transcode/frame job (frame jobs currently strand in
 `claimed` on interruption — MEMNG-35): deploy in a quiet window — worker heartbeat fresh and no
