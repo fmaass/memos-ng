@@ -2,6 +2,7 @@ import asyncio
 import secrets
 import time
 
+import pytest
 from app import worker
 from app.config import settings
 from app.database import async_session
@@ -9,6 +10,7 @@ from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
 from app.services import media
 from PIL import Image
 from sqlalchemy import create_engine, select, text
+from structlog.testing import capture_logs
 
 from tests.conftest import SYNC_URL
 
@@ -196,3 +198,137 @@ def test_poster_cmd_uses_thumbnail_filter():
     assert "thumbnail=100" in cmd  # representative-frame heuristic, not the first frame
     assert "-ss" in cmd and "12.00" in cmd  # seeks past the intro
     assert cmd[-1] == "/out.jpg" and "/in.mov" in cmd
+
+
+# --- MEMNG-39: one poisoned job must never crash-loop the worker ---
+
+
+def test_sanitize_error_removes_what_postgres_refuses_and_bounds():
+    # The NUL byte is what Postgres rejects in a text column; a lone surrogate is what the
+    # driver cannot even UTF-8 encode. Both must leave, the readable remainder must stay.
+    assert worker.sanitize_error("bad\x00header\x00") == "badheader"
+    cleaned = worker.sanitize_error("path \udcff broke")
+    assert "\udcff" not in cleaned and cleaned.encode("utf-8")  # now encodable at all
+    assert "path" in cleaned and "broke" in cleaned
+    assert len(worker.sanitize_error("x" * 5000)) == 500  # column bound kept
+    # Escaping happens BEFORE truncation, so an all-surrogate message still ends up bounded.
+    assert len(worker.sanitize_error("\udcff" * 5000)) == 500
+
+
+async def test_poisoned_job_recorded_failed_and_worker_keeps_draining(
+    monkeypatch, tmp_path, db_engine
+):
+    # AC1 + AC2: a job whose processing raises an arbitrary exception — carrying a NUL byte
+    # that Postgres refuses in text — is RECORDED as failed, and the worker goes on to drain
+    # the next job. Before MEMNG-39 the NUL made the failure record's own commit raise out of
+    # run_once and kill the process, which restarted onto the same row: a crash-loop.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MEDIA_MAX_ATTEMPTS", 1)  # terminal on the first failure
+    poison_aid, poison_jid = _seed("image/png", str(tmp_path / "poison.png"))
+    good_aid, good_jid = _seed("image/png", str(tmp_path / "good.png"))
+
+    async def _process(db, job):
+        if job.id == poison_jid:
+            raise RuntimeError("pyvips: bad header\x00\x00 (NUL out of a C string)")
+        # The good job's processing is a dependency here, not the unit under test: what is
+        # being proven is that the worker still gets to it.
+
+    monkeypatch.setattr(media, "process_job", _process)
+    try:
+        # Bounded drain — never an unbounded loop in a test; stop as soon as the queue empties.
+        statuses = []
+        for _ in range(6):
+            statuses.append(await worker.run_media_drain())
+            if statuses[-1] == "idle":
+                break
+        assert "error" not in statuses  # no exception ever escaped run_once into the loop
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            p_state, p_error, p_attempts = c.execute(
+                text("SELECT state, error, attempts FROM media_jobs WHERE id=:j"), {"j": poison_jid}
+            ).one()
+            g_state = c.execute(
+                text("SELECT state FROM media_jobs WHERE id=:j"), {"j": good_jid}
+            ).scalar_one()
+            p_att_status = c.execute(
+                text("SELECT status FROM attachments WHERE id=:a"), {"a": poison_aid}
+            ).scalar_one()
+        eng.dispose()
+        assert p_state == "failed" and p_attempts == 1  # AC1: the failure is on the record
+        assert p_error is not None and "\x00" not in p_error  # AC2: the NUL never reached PG
+        assert "pyvips: bad header" in p_error  # ...and the message stayed diagnostic
+        assert p_att_status == "failed"  # the attachment is terminal + UI-visible
+        assert g_state == "done"  # the worker kept draining past the poisoned job
+    finally:
+        _cleanup(poison_aid, good_aid)
+
+
+async def test_run_media_drain_isolates_and_logs_an_escaping_error(monkeypatch):
+    # The loop guard: anything raising OUTSIDE run_once's own handler (claim_one, the failure
+    # record's commit, the session context manager's exit) must be logged and converted to a
+    # non-'processed' status, never propagated into run()'s while-loop.
+    async def boom(db):
+        raise RuntimeError("claim exploded")
+
+    monkeypatch.setattr(worker, "run_once", boom)
+    with capture_logs() as caps:
+        assert await worker.run_media_drain() == "error"  # backs off, keeps running
+    assert any(c["event"] == "media.drain_error" and c.get("exc_info") for c in caps)
+
+
+async def test_run_media_drain_does_not_swallow_cancellation(monkeypatch):
+    # Shutdown must stay clean: CancelledError/KeyboardInterrupt are BaseExceptions and the
+    # guard catches Exception only, so a stopping worker still stops.
+    async def cancel(db):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(worker, "run_once", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_media_drain()
+
+
+async def test_failure_record_commit_error_is_recovered_not_raised(
+    monkeypatch, tmp_path, db_engine
+):
+    # Second layer of the same defence: the failure record's own commit fails (dead connection,
+    # or a session poisoned by the flush inside process_job). run_once must roll back, log and
+    # report, not raise. Read back the AUTHORITATIVE row: the rollback also undoes claim_one's
+    # claim — claim and outcome are one transaction — so the job returns to `queued` and the
+    # ordinary claim picks it up again. Nothing is left stranded in `processing`.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid, jid = _seed("image/png", str(tmp_path / "x.png"))
+
+    async def boom(db, job):
+        raise RuntimeError("processing died")
+
+    monkeypatch.setattr(media, "process_job", boom)
+    try:
+        async with async_session() as db:
+
+            async def dead_commit():
+                raise RuntimeError("connection reset by peer")
+
+            monkeypatch.setattr(db, "commit", dead_commit)
+            with capture_logs() as caps:
+                assert await worker.run_once(db) == "deferred"  # recovered, not raised
+        assert any(c["event"] == "media_job_failure_record_error" for c in caps)
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            state, attempts = c.execute(
+                text("SELECT state, attempts FROM media_jobs WHERE id=:j"), {"j": jid}
+            ).one()
+        eng.dispose()
+        assert state == "queued" and attempts == 0  # re-claimable; no durable `processing`
+    finally:
+        _cleanup(aid)
+
+
+def test_worker_loop_wires_the_media_drain():
+    # Wiring pin (like the frame-share recovery's): a guard the loop does not call guards
+    # nothing. The media branch must go through run_media_drain, not a bare session + run_once.
+    import inspect
+
+    _, sep, loop = inspect.getsource(worker.run).partition("while True:")
+    assert sep, "worker.run no longer has the drain loop this pin anchors on"
+    assert "run_media_drain()" in loop
+    assert "run_once(" not in loop  # never called unguarded from the loop

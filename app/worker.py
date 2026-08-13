@@ -37,6 +37,7 @@ logger = structlog.get_logger(__name__)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
+ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message helps nobody
 
 
 def parse_worker_lanes(raw: str) -> list[JobLane]:
@@ -90,6 +91,21 @@ async def claim_one(db: AsyncSession, lanes: list[JobLane] | None = None) -> Med
     return job
 
 
+def sanitize_error(text: str, limit: int = ERROR_TEXT_LIMIT) -> str:
+    """Render an exception message so that STORING it can never become the next failure.
+
+    `job.error` is a Postgres text column, and Postgres refuses the NUL byte in text outright;
+    lone surrogates — what surrogateescape-decoded paths and raw ffmpeg/pyvips byte output leave
+    behind in a message — cannot be UTF-8 encoded by the driver at all. Either one turned the
+    *failure record's* own commit into a second exception, raised from inside run_once's except
+    handler: it escaped run(), killed the process, and the restarted container crash-looped on
+    the very same row (MEMNG-39).
+    """
+    # Truncate LAST: escaping a surrogate lengthens the text, so bounding first would not bind.
+    cleaned = text.replace("\x00", "")
+    return cleaned.encode("utf-8", "backslashreplace").decode("utf-8")[:limit]
+
+
 async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
     att = (
         await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
@@ -134,6 +150,49 @@ async def _notify_terminal_safe(attachment_id: int) -> None:
         logger.warning("push_notify_failed", attachment_id=attachment_id, error=str(exc))
 
 
+async def _record_job_failure(
+    db: AsyncSession, job: MediaJob, attachment_id: int, exc: Exception
+) -> str:
+    """Record one job's failure — a retry, or terminal after MEDIA_MAX_ATTEMPTS.
+
+    The whole body is guarded because this is the write that must not itself explode. The error
+    text is sanitized (see sanitize_error), but the commit can still fail for reasons this
+    process does not control: a session already poisoned by the failed flush inside process_job
+    (after which every statement on it errors), or a dropped connection. Before MEMNG-39 that
+    second exception escaped run_once and took the worker down with it. Here it is rolled back,
+    logged, and reported as 'deferred' so the loop backs off and keeps draining.
+
+    That rollback also undoes claim_one's claim: the claim and the outcome share ONE transaction
+    and media.process_job only ever flushes, so `processing` is never a durable state. The row
+    reverts to `queued` and the next poll re-claims it — the recovery path is the ordinary claim,
+    not a sweep (there is none for media_jobs; claim_one selects state=queued only). The cost is
+    that this attempt goes uncounted, so a failure whose *recording* keeps failing retries every
+    poll instead of aging out through MEDIA_MAX_ATTEMPTS — acceptable, because a commit that
+    cannot land is a DB-wide problem and a fresh session next poll records the failure normally.
+    """
+    job_id = job.id  # a rollback expires the instance — keep the id for the log lines
+    error = sanitize_error(str(exc))
+    try:
+        job.attempts += 1
+        job.error = error
+        if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
+            job.state = JobState.failed
+            await _fail_attachment(db, job)
+            logger.warning("media_job_failed_terminal", job_id=job_id, error=error)
+            await db.commit()
+            await _notify_terminal_safe(attachment_id)  # separate session, after commit
+            return "processed"
+        job.state = JobState.queued  # retry with backoff
+        job.claimed_by = None
+        logger.warning("media_job_retry", job_id=job_id, attempts=job.attempts, error=error)
+        await db.commit()
+        return "deferred"
+    except Exception:
+        await db.rollback()
+        logger.exception("media_job_failure_record_error", job_id=job_id)
+        return "deferred"
+
+
 async def run_once(db: AsyncSession) -> str:
     """Claim+process one job in one transaction (row locked until commit).
     Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off)."""
@@ -167,20 +226,29 @@ async def run_once(db: AsyncSession) -> str:
         await db.commit()
         return "deferred"
     except Exception as exc:  # a bad input must not kill the worker
-        job.attempts += 1
-        job.error = str(exc)[:500]
-        if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
-            job.state = JobState.failed
-            await _fail_attachment(db, job)
-            logger.warning("media_job_failed_terminal", job_id=job.id, error=str(exc))
-            await db.commit()
-            await _notify_terminal_safe(attachment_id)  # separate session, after commit
-            return "processed"
-        job.state = JobState.queued  # retry with backoff
-        job.claimed_by = None
-        logger.warning("media_job_retry", job_id=job.id, attempts=job.attempts, error=str(exc))
-        await db.commit()
-        return "deferred"
+        return await _record_job_failure(db, job, attachment_id, exc)
+
+
+async def run_media_drain() -> str:
+    """Drain one media job in its own session, isolating ALL errors from run()'s loop.
+
+    The same boundary guard run_frame_share_drain applies to the optional frame feature, now
+    applied to the media branch itself (MEMNG-39). run_once handles a *job* raising; this handles
+    everything outside that handler — the failure record's own commit, claim_one, the thermal
+    commit, and the session context manager's exit. Any of those escaping run() killed the
+    process, and because the restarted container re-claims the same row it crash-looped on one
+    poisoned job. Returns run_once's status, or 'error' when the drain raised (non-'processed',
+    so the loop backs off but keeps running).
+
+    `except Exception` deliberately: CancelledError and KeyboardInterrupt are BaseExceptions and
+    must keep propagating, or shutdown stops being prompt and clean.
+    """
+    try:
+        async with async_session() as db:
+            return await run_once(db)
+    except Exception:
+        logger.exception("media.drain_error")
+        return "error"
 
 
 async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
@@ -280,8 +348,7 @@ async def run() -> None:
     await run_frame_share_recover_safe()
     last_reap = 0.0
     while True:
-        async with async_session() as db:
-            status = await run_once(db)
+        status = await run_media_drain()  # own session, all errors isolated from this loop
         beat()  # heartbeat before the (possibly slow HTTP) frame drain — keep liveness honest
         # Drain a frame-share job opportunistically in its own session (like reap): the album upload
         # is decoupled from the media job's transaction so an upload error can't poison media work.
