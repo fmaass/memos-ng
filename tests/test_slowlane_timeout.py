@@ -6,7 +6,10 @@ without depending on ffmpeg actually wedging. The injected ceiling keeps every t
 """
 
 import asyncio
+import contextlib
+import os
 import secrets
+import signal
 import time
 from pathlib import Path
 
@@ -20,11 +23,31 @@ from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
 
-HANG_SECONDS = 30  # long enough to outlive the injected ceiling, short enough for a mutation run
+# Effectively forever: a stub grandchild must never be able to pass an "is it gone?" assertion by
+# exiting on its own while the ceiling and the poll windows elapse. Bounded runtime comes from the
+# injected ceiling and the reaper fixture below, never from the stub outliving the test by luck.
+HANG_SECONDS = 86_400
+
+
+@pytest.fixture(autouse=True)
+def _reap_stub_children(tmp_path):
+    """Teardown net: kill any stub grandchild still alive (a failed assertion, or a regression,
+    must not leave a day-long orphan behind). Only ever signals a pid that still looks like the
+    stub — a recycled pid belongs to a stranger."""
+    yield
+    for marker in tmp_path.rglob("*.child"):
+        try:
+            pid = int(marker.read_text().strip())
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except (OSError, ValueError):
+            continue
+        if b"sleep" in cmdline:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
 
 
 def _hang_cmd(src: str, dest: str, threads: int) -> list[str]:
-    """Stub argv: write a partial output file, spawn a CHILD that hangs, then wait on it.
+    """Stub argv: write a partial output file, spawn a CHILD that hangs ~forever, then wait on it.
 
     The grandchild is the point — only signalling the process GROUP reaches it, so a stopper that
     kills the direct child alone leaves it running. Its pid is written next to the output so the
@@ -34,6 +57,23 @@ def _hang_cmd(src: str, dest: str, threads: int) -> list[str]:
         "sh",
         "-c",
         f'printf partial > "$1"; sleep {HANG_SECONDS} & echo $! > "$1.child"; wait',
+        "sh",
+        dest,
+    ]
+
+
+def _orphan_cmd(src: str, dest: str, threads: int) -> list[str]:
+    """Stub argv where the LEADER exits immediately but leaves a descendant hanging ~forever and
+    still holding the inherited stdout pipe (no `wait`).
+
+    This is the case a leader-keyed cleanup misses entirely: proc.returncode is set long before the
+    ceiling fires, so a "kill only if the leader is still running" guard skips the sweep and the
+    descendant survives.
+    """
+    return [
+        "sh",
+        "-c",
+        f'printf partial > "$1"; sleep {HANG_SECONDS} & echo $! > "$1.child"',
         "sh",
         dest,
     ]
@@ -145,6 +185,26 @@ async def test_hung_transcode_is_killed_at_the_ceiling(adb, monkeypatch, tmp_pat
     assert started[0].returncode is not None  # actually reaped — no zombie holding the slot
     child_pid = int(Path(f"{tmp}.child").read_text().strip())
     assert _wait_gone(child_pid), f"grandchild {child_pid} survived the kill (group not signalled)"
+
+
+async def test_descendant_outliving_the_leader_is_killed(adb, monkeypatch, tmp_path):
+    # The leader exits at once; its descendant hangs ~forever holding stdout, so the pump never
+    # sees EOF and the ceiling fires with proc.returncode ALREADY SET. Cleanup keyed on the leader
+    # would skip the sweep here and leak the descendant — the sweep is keyed on the GROUP.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 1)
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _orphan_cmd)
+    started = _spy_on_subprocess(monkeypatch)
+    att, job = await _seed_attachment_job(adb, "orphan1", tmp_path / "originals" / "v.mp4")
+
+    with pytest.raises(RuntimeError, match="slow-lane transcode timed out after 1s"):
+        await media.process_job(adb, job)
+
+    tmp = tmp_path / "assets" / "web" / "orphan1.tmp.mp4"
+    assert not tmp.exists()
+    assert started[0].returncode is not None  # leader exited on its own and was reaped
+    child_pid = int(Path(f"{tmp}.child").read_text().strip())
+    assert _wait_gone(child_pid), f"descendant {child_pid} outlived the leader and was not swept"
 
 
 def test_worker_marks_a_hung_transcode_failed(monkeypatch, tmp_path):

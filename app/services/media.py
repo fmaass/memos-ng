@@ -25,6 +25,7 @@ MOBILE_MAX = 2048
 # Grace between SIGTERM and SIGKILL when stopping a runaway transcode: ffmpeg closes the output
 # file and exits on TERM, so this only has to cover finishing the frame in flight.
 KILL_GRACE_SECONDS = 5.0
+GROUP_POLL_SECONDS = 0.25  # cadence of the "is anything left in the group?" probe
 
 
 def _assets(sub: str) -> Path:
@@ -212,33 +213,99 @@ def slow_ffmpeg_cmd(src: str, dest: str, threads: int) -> list[str]:
     ]
 
 
-async def _stop_transcode(proc: asyncio.subprocess.Process) -> None:
-    """Stop a running transcode *and anything it spawned*, then reap it — no zombie, no orphan.
+def _capture_pgid(proc: asyncio.subprocess.Process) -> int:
+    """The transcode's process-group id, read at spawn while the child certainly still exists.
 
-    The process is started with start_new_session=True, so its pid is also its process-group id
-    and signalling the GROUP reaches children ffmpeg forked; signalling the direct child alone
-    would leave those alive, still holding the pipe and still writing the temp file. TERM first
-    (ffmpeg closes the file and exits), SIGKILL after a short grace. Every wait is BOUNDED: the
-    recovery from a hang must not become a second hang inside the worker's only slot.
+    start_new_session=True makes the child a session/group leader (pgid == pid), but the value is
+    read rather than assumed, and read IMMEDIATELY: once the leader exits and is reaped its pid can
+    be recycled, and a pgid derived later could then address a stranger's group. No await runs
+    between the spawn and this call, so the lookup cannot race a reap; the fallback exists only so
+    a cleanup helper can never raise.
     """
+    try:
+        return os.getpgid(proc.pid)
+    except OSError:
+        return proc.pid
+
+
+def _signal_group(pgid: int, sig: int) -> None:
+    """Signal the whole transcode group. Never raises — this runs from a `finally`, where an
+    exception would replace the primary failure (the timeout) with a cleanup error.
+
+    ESRCH means the group is already empty, which is the outcome being asked for. Any OTHER errno
+    is a real problem (we could not deliver the kill) and is logged loudly with the errno rather
+    than swallowed — a silent failure here is exactly how an orphan survives unnoticed.
+    """
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass  # nobody left in the group — success, not an error
+    except OSError as exc:
+        logger.error(
+            "transcode_group_signal_failed",
+            pgid=pgid,
+            signal=sig,
+            errno=exc.errno,
+            error=str(exc),
+        )
+
+
+def _group_alive(pgid: int) -> bool:
+    """True while ANY process remains in the transcode's group (signal 0 = existence probe).
+
+    Group liveness — not the leader's exit status — is what decides whether the tree is really
+    gone: ffmpeg's descendants outlive it, keep the stdout pipe open and keep writing the temp
+    file. An unexpected errno reads as ALIVE so the caller escalates instead of declaring victory
+    on an error it did not expect (it is reported by _signal_group's next call).
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        logger.error("transcode_group_probe_failed", pgid=pgid, errno=exc.errno, error=str(exc))
+    return True
+
+
+async def _await_group_exit(pgid: int, proc: asyncio.subprocess.Process) -> None:
+    """Wait until the group is empty AND the leader has been reaped.
+
+    Unbounded by design — the caller wraps it in asyncio.timeout, which is the only bound that
+    matters here. The leader is reaped along the way because its own zombie stays a member of the
+    group and would otherwise read as a live descendant forever.
+    """
+    while proc.returncode is None or _group_alive(pgid):
+        if proc.returncode is None:
+            try:  # reaps the leader the moment it dies; the short bound paces the poll
+                await asyncio.wait_for(proc.wait(), GROUP_POLL_SECONDS)
+            except TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(GROUP_POLL_SECONDS)
+
+
+async def _stop_transcode(pgid: int, proc: asyncio.subprocess.Process) -> None:
+    """Stop the transcode *and everything it spawned*, then reap it — no zombie, no orphan.
+
+    Everything here is keyed on the GROUP, never on the leader: a leader that already exited does
+    NOT prove the tree is gone (a descendant can still hold the pipe and the temp file), and a
+    descendant that ignores TERM must still be escalated to SIGKILL after the leader is long dead.
+    TERM first (ffmpeg closes its output and exits), SIGKILL after a short grace. Every wait is
+    BOUNDED: recovering from a hang must not become a second hang in the worker's only slot.
+    """
+    if not _group_alive(pgid) and proc.returncode is not None:
+        return  # nothing left to signal and the leader is already reaped
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        if proc.returncode is not None:
-            return
+        _signal_group(pgid, sig)
         try:
-            os.killpg(proc.pid, sig)
-        except OSError:
-            # Already exited (ProcessLookupError) or not signallable. Swallowed deliberately: this
-            # runs from a finally, where a raise here would REPLACE the real failure with a cleanup
-            # error. The bounded wait below still reaps an exited-but-unreaped child.
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), KILL_GRACE_SECONDS)
+            async with asyncio.timeout(KILL_GRACE_SECONDS):
+                await _await_group_exit(pgid, proc)
             return
         except TimeoutError:
-            continue
+            continue  # something ignored the signal — escalate
     # Survived SIGKILL: an uninterruptible-sleep (D-state) process, e.g. a stalled share read.
     # Nothing more this process can do, but it must be visible — it still holds a worker slot.
-    logger.error("transcode_unreapable", pid=proc.pid)
+    logger.error("transcode_group_unreapable", pgid=pgid, pid=proc.pid)
 
 
 async def _pump_progress(
@@ -287,25 +354,31 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # TREE (see _stop_transcode) instead of orphaning whatever ffmpeg forked.
         start_new_session=True,
     )
+    pgid = _capture_pgid(proc)  # read at spawn — a later lookup could address a recycled pid
     tail: deque[str] = deque(maxlen=12)
     ceiling = settings.SLOW_TRANSCODE_TIMEOUT_S
     timed_out = False
+    completed = False
     try:
         await asyncio.wait_for(_pump_progress(db, job, proc, tail, duration), ceiling)
+        completed = proc.returncode == 0
     except TimeoutError:
         # Unbounded, a wedged ffmpeg held the worker's only slot forever and the job never failed
         # visibly (MEMNG-38). Fall through the cleanup below, then fail loudly and namedly.
         timed_out = True
     finally:
-        # On the timeout, on cancellation (worker shutdown) or on any error, don't leak the
-        # ffmpeg process or a half-written tmp file — kill the tree and clean up.
-        if proc.returncode is None:
-            await _stop_transcode(proc)
+        # On the timeout, on cancellation (worker shutdown), on any error — and on success too:
+        # the sweep is unconditional because a leader that exited does not prove its descendants
+        # did (they can still hold the pipe and write the temp file). It is a cheap no-op when the
+        # group is already empty.
+        await _stop_transcode(pgid, proc)
+        # Keyed on "this run finished cleanly", NOT on the leader's exit status: a leader can exit
+        # 0 while a descendant hangs and the ceiling fires, and that partial must still go.
+        if not completed:
             tmp.unlink(missing_ok=True)
     if timed_out:
         raise RuntimeError(f"slow-lane transcode timed out after {ceiling}s")
     if proc.returncode != 0:
-        tmp.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
 
     os.replace(tmp, dest)  # atomic; poster was written by the fast lane first
