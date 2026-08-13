@@ -44,6 +44,21 @@ describe('MediaTile', () => {
     expect(w.text()).toContain('42%')
   })
 
+  it('shows the percentage the SSE channel wrote onto the attachment', () => {
+    // No caller passes `progress` for a feed tile — the number reaches it on the cached
+    // attachment, where applyMediaEvent puts what the stream reports (MEMNG-36). Read from the
+    // prop only, the overlay was a permanent 0% for every transcoding video.
+    const w = mount(MediaTile, {
+      props: { att: att('processing', 'video/mp4', { progress_pct: 63 }) },
+    })
+    expect(w.text()).toContain('63%')
+  })
+
+  it('falls back to 0% while the stream has reported nothing yet', () => {
+    const w = mount(MediaTile, { props: { att: att('processing', 'video/mp4') } })
+    expect(w.text()).toContain('0%')
+  })
+
   it('renders a lazy-loaded thumb (not the heavy mobile tier) for a ready image', () => {
     const w = mount(MediaTile, { props: { att: att('ready', 'image/png') } })
     const img = w.find('[data-test="tile-image"]')

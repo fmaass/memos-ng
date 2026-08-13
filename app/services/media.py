@@ -9,11 +9,21 @@ from pathlib import Path
 import pillow_heif
 import structlog
 from PIL import Image, ImageOps
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
+from app.database import async_session
+from app.models import (
+    Attachment,
+    AttachmentStatus,
+    JobLane,
+    JobState,
+    MediaJob,
+    MediaJobProgress,
+)
 from app.services import blurhash_pure
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
@@ -26,6 +36,9 @@ MOBILE_MAX = 2048
 # file and exits on TERM, so this only has to cover finishing the frame in flight.
 KILL_GRACE_SECONDS = 5.0
 GROUP_POLL_SECONDS = 0.25  # cadence of the "is anything left in the group?" probe
+# Bounded cadence for committed progress samples (see _pump_progress): ffmpeg reports per frame,
+# this publishes at most once per interval, so a long transcode costs a handful of tiny commits.
+PROGRESS_PUBLISH_SECONDS = 2.0
 
 
 def _assets(sub: str) -> Path:
@@ -532,26 +545,94 @@ async def _stop_transcode(pgid: int, proc: asyncio.subprocess.Process) -> None:
     logger.error("transcode_group_unreapable", pgid=pgid, pid=proc.pid)
 
 
+async def publish_progress(job_id: int, pct: int) -> None:
+    """Commit one progress sample for a running job, in a session of its OWN (MEMNG-36).
+
+    Why not the job row: the worker holds SELECT … FOR UPDATE on it for the whole transcode, so a
+    percentage written there is invisible to every other session until the job's final commit —
+    which is exactly when it stops being interesting — and a second session trying to write it
+    would block on the row lock for the length of the transcode. This session touches only
+    media_job_progress, is opened and committed per sample, and holds nothing.
+
+    Best-effort by construction: a progress sample is telemetry, and losing one (or every one)
+    must never fail a transcode that is otherwise fine. Every error is logged and swallowed,
+    including a failure to even open the session. This runs OUTSIDE the job's transaction, so a
+    poisoned session here cannot poison that one.
+    """
+    try:
+        async with async_session() as db:
+            await db.execute(
+                pg_insert(MediaJobProgress)
+                .values(job_id=job_id, progress_pct=pct)
+                .on_conflict_do_update(
+                    index_elements=[MediaJobProgress.job_id],
+                    set_={"progress_pct": pct, "updated_at": func.now()},
+                )
+            )
+            await db.commit()
+    except Exception as exc:  # telemetry must never break the work it describes
+        logger.warning("job_progress_publish_failed", job_id=job_id, error=str(exc))
+
+
+async def clear_progress(job_id: int) -> None:
+    """Drop a job's progress row once it stops running, in its own session and best-effort.
+
+    Called whichever way the transcode ended (success, ffmpeg error, timeout, a delete that
+    landed mid-job), so the side channel holds only jobs that are actually running. The worker's
+    periodic sweep is the backstop for the one case this cannot cover: a process killed outright.
+    """
+    try:
+        async with async_session() as db:
+            await db.execute(sa_delete(MediaJobProgress).where(MediaJobProgress.job_id == job_id))
+            await db.commit()
+    except Exception as exc:
+        logger.warning("job_progress_clear_failed", job_id=job_id, error=str(exc))
+
+
+async def sweep_orphan_progress() -> int:
+    """Delete progress rows whose media_jobs row is gone; returns how many were removed.
+
+    clear_progress covers every ordinary ending, so this only ever finds rows left by a worker
+    that died mid-transcode on a job later deleted with its attachment. Anti-join rather than an
+    age cutoff: a legitimate transcode may run for hours (SLOW_TRANSCODE_TIMEOUT_S), and no
+    horizon that survives that is also tight enough to be worth having. Raises — the worker's
+    `_safe` wrapper isolates it.
+    """
+    async with async_session() as db:
+        live = select(MediaJob.id).where(MediaJob.id == MediaJobProgress.job_id).exists()
+        # RETURNING rather than rowcount: the deleted ids are what the count is counting.
+        result = await db.execute(
+            sa_delete(MediaJobProgress).where(~live).returning(MediaJobProgress.job_id)
+        )
+        swept = len(result.all())
+        await db.commit()
+    return swept
+
+
 async def _pump_progress(
-    db: AsyncSession,
-    job: MediaJob,
+    job_id: int,
     proc: asyncio.subprocess.Process,
     tail: deque[str],
     duration: float | None,
 ) -> None:
-    """Consume ffmpeg's `-progress` stream (flushing job.progress_pct at most every 2s), then wait
-    for the process to exit. Split out of process_slow so the read loop AND the exit sit under one
-    asyncio.wait_for ceiling — a hang can happen in either."""
+    """Consume ffmpeg's `-progress` stream (publishing a committed sample at most every
+    PROGRESS_PUBLISH_SECONDS), then wait for the process to exit. Split out of process_slow so the
+    read loop AND the exit sit under one asyncio.wait_for ceiling — a hang can happen in either.
+
+    The throttle is what keeps this affordable: ffmpeg emits a progress block per frame, and one
+    committed round-trip per frame would be a write storm against a Postgres shared with
+    production. One sample every couple of seconds is finer than the SSE poll interval anyway.
+    """
     assert proc.stdout is not None
     last = 0.0
     async for raw in proc.stdout:
         line = raw.decode(errors="ignore")
         tail.append(line.rstrip())
         pct = parse_progress(line, duration)
-        if pct is not None and (asyncio.get_event_loop().time() - last) > 2:
-            job.progress_pct = pct
-            await db.flush()
-            last = asyncio.get_event_loop().time()
+        now = asyncio.get_event_loop().time()
+        if pct is not None and (now - last) > PROGRESS_PUBLISH_SECONDS:
+            await publish_progress(job_id, pct)
+            last = now
     await proc.wait()
 
 
@@ -579,12 +660,15 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         start_new_session=True,
     )
     pgid = _capture_pgid(proc)  # read at spawn — a later lookup could address a recycled pid
+    # The pump publishes from a session of its own, so it takes the id — never this instance, which
+    # belongs to the claiming transaction.
+    job_id = job.id
     tail: deque[str] = deque(maxlen=12)
     ceiling = settings.SLOW_TRANSCODE_TIMEOUT_S
     timed_out = False
     completed = False
     try:
-        await asyncio.wait_for(_pump_progress(db, job, proc, tail, duration), ceiling)
+        await asyncio.wait_for(_pump_progress(job_id, proc, tail, duration), ceiling)
         completed = proc.returncode == 0
     except TimeoutError:
         # Unbounded, a wedged ffmpeg held the worker's only slot forever and the job never failed
@@ -600,6 +684,10 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # 0 while a descendant hangs and the ceiling fires, and that partial must still go.
         if not completed:
             tmp.unlink(missing_ok=True)
+        # The transcode is over either way, so the side channel's row for it is stale from here on
+        # — including on the failure paths, where the job goes back to `queued` and would otherwise
+        # keep advertising the percentage the dead attempt reached.
+        await clear_progress(job_id)
     if timed_out:
         raise RuntimeError(f"slow-lane transcode timed out after {ceiling}s")
     if proc.returncode != 0:

@@ -268,6 +268,20 @@ async def run_media_drain() -> str:
         return "error"
 
 
+async def sweep_job_progress_safe() -> int:
+    """Remove progress rows whose job is gone (MEMNG-36), in its own session with ALL errors
+    isolated — the same boundary guard the other periodic sweeps get. Progress telemetry must
+    never be able to halt media processing. Returns the number of rows removed (0 on error)."""
+    try:
+        swept = await media.sweep_orphan_progress()
+    except Exception:
+        logger.exception("job_progress.sweep_error")
+        return 0
+    if swept:
+        logger.info("job_progress_swept", count=swept)
+    return swept
+
+
 async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
     """Atomically claim the next due frame-share job (queued AND next_attempt_at reached), skipping
     rows another worker holds. Sets state=claimed so a crash mid-send never re-runs it (at-most-once
@@ -378,6 +392,9 @@ async def run() -> None:
             # Piggybacks the reap cadence: a claim orphaned by something other than a restart
             # (an OOM-killed send that leaves the worker alive) is recovered within the hour.
             await run_frame_share_recover_safe()
+            # Same cadence for the progress side channel: a killed worker cannot clear its own
+            # row, so the anti-join sweep keeps the table bounded by what is actually running.
+            await sweep_job_progress_safe()
             last_reap = time.time()
         if status != "processed" and frame_status != "processed":  # idle/deferred → back off
             await asyncio.sleep(POLL_SECONDS)

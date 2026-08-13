@@ -17,6 +17,9 @@ interface MediaAttachment {
   uid: string
   mime: string
   status: AttachmentStatus
+  // SSE-only (see CachedAttachment): served by no endpoint, written onto the cached attachment by
+  // applyMediaEvent, so it is absent until the stream reports on this attachment.
+  progress_pct?: number
   blurhash: string | null
   width: number | null
   height: number | null
@@ -39,6 +42,11 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 
+// The percentage the processing overlay shows. `progress` is the caller's explicit override (an
+// upload the caller is itself driving); otherwise it comes from the attachment in the cache, where
+// applyMediaEvent writes what the SSE channel reports for the running job (MEMNG-36). Nobody
+// passed either before, so every transcoding video read 0% from start to finish.
+const percent = computed(() => props.progress ?? props.att.progress_pct ?? 0)
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
 const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
 // A video's stored dims are ffprobe's CODED width/height, which ignore the container's rotation
@@ -159,7 +167,7 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
         data-test="tile-processing"
       />
       <div class="absolute inset-0 flex items-center justify-center">
-        <span class="text-xs px-1.5 py-0.5 rounded bg-black/60 text-white">{{ progress ?? 0 }}%</span>
+        <span class="text-xs px-1.5 py-0.5 rounded bg-black/60 text-white">{{ percent }}%</span>
       </div>
     </template>
 

@@ -245,6 +245,34 @@ class MediaJob(Base):
     )
 
 
+class MediaJobProgress(Base):
+    """The latest progress sample of a RUNNING media job — a side channel, deliberately not a
+    column on `media_jobs` (MEMNG-36).
+
+    A worker claims its job with SELECT … FOR UPDATE and holds that row lock for the WHOLE job:
+    claim and outcome share one transaction on purpose, so a crash rolls the claim back to
+    `queued` (MEMNG-39). Two consequences make the job row unusable as a progress channel — the
+    percentages the worker writes into it are invisible to every other session until that final
+    commit, and any other session UPDATEing the claimed row would wait on the row lock for the
+    length of a transcode (the same wait MEMNG-41 removed from the delete path). This row is
+    written and COMMITTED by a short session of its own instead, so `/api/events` can read a
+    transcode's real progress while it runs.
+
+    `job_id` carries no FK — same reason media_jobs dropped its attachment FK: a cascade would
+    make a delete wait on precisely the locks this table exists to sidestep. The row is transient:
+    the transcode clears it when it stops running, and the worker sweeps any that a crash left
+    behind (worker.sweep_job_progress_safe), so nothing accumulates.
+    """
+
+    __tablename__ = "media_job_progress"
+
+    job_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    progress_pct: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class FrameShareState(enum.StrEnum):
     queued = "queued"
     claimed = "claimed"

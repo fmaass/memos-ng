@@ -4,6 +4,7 @@ import { defineComponent, h } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { components } from '@/api/schema'
+import type { CachedAttachment } from '@/composables/useMediaEvents'
 import {
   applyMediaEvent,
   RECONNECT_DELAY_MS,
@@ -120,6 +121,35 @@ describe('applyMediaEvent', () => {
 
     expect([att.width, att.height]).toEqual([1200, 900]) // 7x900 is neither image
     expect(att.blurhash).toBe('LKO2?U%2') // blurhash carries no pairing
+  })
+
+  it('applies the percentage a progress event carries', () => {
+    // The event's whole point. Dropping progress_pct here left the tile reading 0% for the entire
+    // transcode even once the backend reported real numbers (MEMNG-36).
+    const att = applyMediaEvent(withMeta(), {
+      uid: 'x',
+      status: 'processing',
+      progress_pct: 40,
+    }).pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect(att.progress_pct).toBe(40)
+  })
+
+  it('advances the percentage as later events arrive', () => {
+    const first = applyMediaEvent(withMeta(), { uid: 'x', status: 'processing', progress_pct: 40 })
+    const att = applyMediaEvent(first, { uid: 'x', status: 'processing', progress_pct: 75 })
+      .pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect(att.progress_pct).toBe(75)
+  })
+
+  it('keeps the last percentage when an event carries none', () => {
+    // Absent is not zero: an event without a percentage must not send the tile back to the start.
+    const first = applyMediaEvent(withMeta(), { uid: 'x', status: 'processing', progress_pct: 60 })
+    const att = applyMediaEvent(first, { uid: 'x', status: 'processing' }).pages[0].items[0]
+      .attachments[0] as CachedAttachment
+
+    expect(att.progress_pct).toBe(60)
   })
 
   it('leaves the metadata alone on a non-terminal progress event', () => {
