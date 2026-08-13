@@ -275,13 +275,14 @@ def _group_alive(pgid: int) -> bool:
         if not name.isdigit():
             continue
         try:
-            stat = Path(f"/proc/{name}/stat").read_text()
+            stat = Path(f"/proc/{name}/stat").read_bytes()
         except OSError:
             continue  # exited between the listing and the read — by definition not alive
-        # `pid (comm) state ppid pgrp ...` — comm is arbitrary bytes and can contain spaces and
-        # parentheses, so fields are read after the LAST ')' rather than by splitting the line.
-        fields = stat.rpartition(")")[2].split()
-        if len(fields) >= 3 and fields[2] == str(pgid) and fields[0] != "Z":
+        # `pid (comm) state ppid pgrp ...` — comm is arbitrary BYTES (not UTF-8; decoding can
+        # raise on someone else's process name) and can contain spaces and parentheses, so the
+        # line stays bytes and fields are read after the LAST ')'.
+        fields = stat.rpartition(b")")[2].split()
+        if len(fields) >= 3 and fields[2] == str(pgid).encode() and fields[0] != b"Z":
             return True
     return False
 
