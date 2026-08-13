@@ -45,6 +45,10 @@ async def test_authenticate_pat_roundtrip_and_unknown(adb):
     got = await auth.authenticate_pat(adb, token)
     assert got is not None and got.id == u.id
     assert await auth.authenticate_pat(adb, "memos_pat_bogus") is None
+    # The last_used stamp is scheduled, not awaited (MEMNG-81) — collect it here so it cannot
+    # outlive this test's event loop. Its UPDATE matches nothing: the PAT above lives in a
+    # transaction that is rolled back.
+    await auth.drain_pat_stamp_tasks()
 
 
 async def test_require_pat_or_user_rejects_unknown_token(adb):

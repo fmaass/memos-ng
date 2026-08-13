@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -235,9 +236,9 @@ def claim_pat_stamp(pat_id: int, now_mono: float) -> bool:
     return True
 
 
-async def stamp_pat_last_used(pat_id: int, last_used: datetime | None) -> bool:
-    """Persist the PAT's last_used, throttled. Returns True iff this call won the throttle claim
-    and issued the write (a cross-process race can still make it update 0 rows — see below).
+async def stamp_pat_last_used(pat_id: int, now: datetime) -> None:
+    """Persist the PAT's last_used. Only ever run as the body of a scheduled task — the claim is
+    already taken by schedule_pat_last_used_stamp, so this is the write and nothing else.
 
     Runs in its OWN session, never the request's: the compat surface never commits its request
     session, so a stamp left pending there was rolled back at request end and the row never
@@ -245,11 +246,6 @@ async def stamp_pat_last_used(pat_id: int, last_used: datetime | None) -> bool:
     instead of holding it for the rest of the request (the PAT gallery-burst convoy), injects no
     commit boundary into caller state, and — because a failed stamp dies with its own session —
     can never expire or poison the objects authentication has already loaded."""
-    now = datetime.now(UTC)
-    if not pat_stamp_due(last_used, now):
-        return False
-    if not claim_pat_stamp(pat_id, time.monotonic()):
-        return False
     # The same staleness predicate in the WHERE is the durable, cross-process/restart gate: another
     # worker (or this one after a restart) that has no in-process claim still writes at most once
     # per window, and a loser of the race updates 0 rows instead of overwriting a fresh stamp.
@@ -261,12 +257,70 @@ async def stamp_pat_last_used(pat_id: int, last_used: datetime | None) -> bool:
             .values(last_used=now)
         )
         await sdb.commit()
-    return True
+
+
+# Strong references to the in-flight stamp tasks. The event loop only keeps a WEAK reference to a
+# task, so a fire-and-forget one that nobody holds can be garbage-collected mid-write; this set is
+# that owner, and the done callback empties it again so it cannot grow without bound.
+_stamp_tasks: set[asyncio.Task[None]] = set()
+
+
+def _stamp_task_done(task: asyncio.Task[None]) -> None:
+    """Drop the strong reference and surface the task's failure — nothing awaits it, so an
+    exception left in a scheduled task would otherwise vanish (or resurface as an
+    "exception was never retrieved" warning at GC time, detached from the request)."""
+    _stamp_tasks.discard(task)
+    if task.cancelled():  # shutdown drain cancelled it; the row simply stays stale
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("pat_last_used_stamp_failed", exc_info=exc)
+
+
+def schedule_pat_last_used_stamp(
+    pat_id: int, last_used: datetime | None
+) -> asyncio.Task[None] | None:
+    """Claim this PAT's write window and hand the DB write to a background task.
+
+    Returns the task iff this caller won the claim (None = nothing to do), which is also the seam
+    tests await instead of sleeping. Synchronous and await-free up to the create_task, so a
+    concurrent burst is still collapsed by claim_pat_stamp before anyone reaches the row.
+    """
+    now = datetime.now(UTC)
+    if not pat_stamp_due(last_used, now):
+        return None
+    if not claim_pat_stamp(pat_id, time.monotonic()):
+        return None
+    task = asyncio.create_task(stamp_pat_last_used(pat_id, now))
+    _stamp_tasks.add(task)
+    task.add_done_callback(_stamp_task_done)
+    return task
+
+
+async def drain_pat_stamp_tasks(grace_s: float = 5.0) -> None:
+    """Await the in-flight stamp tasks; cancel whatever is still running after `grace_s`.
+
+    Called on lifespan shutdown so a stamp in flight either lands or dies deliberately: left
+    alone, the loop teardown cancels it mid-write anyway, but noisily (a pending task destroyed
+    with the engine already disposed). The bound matters because last_used is display-only
+    bookkeeping — it must never hold a shutdown (or a test) open waiting for the DB. It is a
+    grace period, not an error timeout: expiry cancels, and the caller is never raised into.
+    """
+    pending = tuple(_stamp_tasks)
+    if not pending:
+        return
+    _, still_running = await asyncio.wait(pending, timeout=grace_s)
+    for task in still_running:
+        task.cancel()
+    if still_running:
+        # Awaited, not just cancelled: this returns only once each one has actually finished
+        # unwinding, so the caller can rely on the queue being empty afterwards.
+        await asyncio.gather(*still_running, return_exceptions=True)
 
 
 async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
-    """Return the owning user for a valid PAT, else None. Stamps last_used at most once per
-    throttle window, committing that stamp itself (see stamp_pat_last_used)."""
+    """Return the owning user for a valid PAT, else None. Schedules the last_used stamp (at most
+    once per throttle window) as a background task; the request never waits for it."""
     pat = (
         await db.execute(select(Pat).where(Pat.hashed_token == hash_token(token)))
     ).scalar_one_or_none()
@@ -276,11 +330,19 @@ async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
     # lazy-refresh the attribute afterwards, which async IO cannot do from attribute access.
     user_id = pat.user_id
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    # The stamp is display-only bookkeeping in its OWN session: a dying UPDATE (canceled while
-    # waiting on the locked PAT row, a transient disconnect) fails that session alone — it can
-    # neither turn a valid token into a 500 nor expire the user object loaded above.
+    # Scheduled, never awaited here (MEMNG-81). The stamp needs a SECOND pooled connection while
+    # this request still holds its own, so awaiting it made the request block on that second
+    # checkout while holding the first — hold-and-wait, the cycle that lets a saturated pool
+    # deadlock on itself once enough simultaneously-due PATs pile up. Handing the write to a task
+    # breaks the cycle: this request returns and RELEASES its connection while the task waits for
+    # a slot, so the holder is never the waiter. The claim is taken synchronously inside the
+    # scheduler (before create_task), so a burst still collapses to one attempt, and the task
+    # logs its own failure — a stamp can neither turn a valid token into a 500 nor expire the
+    # user object loaded above. The guard below covers the one way SCHEDULING itself can fail:
+    # create_task on a loop that is already shutting down (a request still in flight while the
+    # app stops) raises, and that must not be the thing that 401/500s a valid token either.
     try:
-        await stamp_pat_last_used(pat.id, pat.last_used)
+        schedule_pat_last_used_stamp(pat.id, pat.last_used)
     except Exception:
         logger.warning("pat_last_used_stamp_failed", exc_info=True)
     return user
@@ -292,7 +354,7 @@ async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_s
         user = await authenticate_pat(db, authz[7:])
         if user is None:
             raise HTTPException(status_code=401, detail="Invalid or revoked token")
-        return user  # the last_used stamp is already committed by authenticate_pat
+        return user  # the last_used stamp runs off the request path (see authenticate_pat)
     return await require_user(request, db)
 
 
