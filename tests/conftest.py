@@ -13,9 +13,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
+from tests.db_guard import assert_database_is_disposable
+
 SYNC_URL = os.environ.get(
     "DATABASE_URL_SYNC", "postgresql+psycopg2://memosng:memosng@localhost:5433/memosng"
 )
+# Import-time, not fixture-time: collection must die before anything connects.
+assert_database_is_disposable(SYNC_URL)
 
 
 @pytest.fixture(scope="session")
