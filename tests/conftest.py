@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
+from app.csrf import canonical_origin
 from app.database import engine as async_engine
 from app.main import app
 from fastapi.testclient import TestClient
@@ -78,7 +79,14 @@ def _reset_rate_limit():
 def client() -> TestClient:
     # raise_server_exceptions=False so the degraded path's 503 is observable rather
     # than re-raised as a test error.
-    return TestClient(app, raise_server_exceptions=False)
+    c = TestClient(app, raise_server_exceptions=False)
+    # Browsers attach Origin to every unsafe-method request, same-origin included, and the CSRF
+    # middleware (app/csrf.py) demands it on cookie-authenticated mutations — so the default client
+    # speaks as this app's own origin does. A per-request `headers={"Origin": ...}` still wins
+    # (httpx merges request headers over client headers); that is how tests/test_csrf.py forges a
+    # sibling origin, and how it drops the header entirely.
+    c.headers["Origin"] = canonical_origin()
+    return c
 
 
 @pytest.fixture

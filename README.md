@@ -44,6 +44,11 @@ into two containers from one image:** `memos-ng-app` (SPA + API + asset serving)
   (`openapi-typescript`) — never hand-written (ADR-0009); CI fails on drift.
 - **Auth:** Authelia OIDC via a confidential **BFF** — tokens stay server-side behind an
   httpOnly rolling session cookie. Token/JWKS are fetched over public `https://auth…` URLs.
+  Because that cookie is SameSite (**site**-scoped, so every `*.discomarder.live` sibling is
+  same-site), one ASGI middleware (`app/csrf.py`) refuses any cookie-authenticated mutation whose
+  `Origin`/`Referer` is not this app's own origin — which is read from `OIDC_REDIRECT_URI`, so a
+  host change must update that one setting (as OIDC requires anyway). PAT/Bearer clients send no
+  session cookie and are unaffected.
 - **Media:** one image, two roles. The worker derives immutable, uid-keyed tiers; the app
   mints short-lived HMAC-signed URLs and serves the bytes with no DB or auth dependency.
   HEIC/HEVC originals are kept as the archive master (ADR-0008).
