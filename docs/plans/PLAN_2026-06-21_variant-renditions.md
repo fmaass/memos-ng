@@ -143,8 +143,17 @@ under Risks) is not something the export pipeline can guarantee.
   not bind to different rows).
 - The legacy slot holds ONE master: only the first print of a batch binds to a given sibling, and a
   slot already holding a DIFFERENT master is left alone — the newcomer is promoted rather than
-  overwriting a committed file this call could not sweep if the memo transaction rolled back. A
-  re-sent pair (the filename the slot already names) is REPLACED in place per MEMNG-78.
+  overwriting a committed file this call could not sweep if the memo transaction rolled back.
+- **Replacement needs provable same-file evidence.** A re-send replaces in place only on an EXACT
+  stored-name match (the sanitized client filename); a ` (n)` *bumped-form* match promotes instead.
+  The label grammar is `[^()]+`, so a **numeric label is legal**: a stored `X - print (2).png` is
+  either a collision bump of `X - print.png` or a genuine `print:2` master, and `is_placement_of`
+  cannot tell them apart — reading it as the former would destroy the latter. The slot itself
+  carries no variant identity to compare against (it is three columns: path/mime/size; renditions
+  are separate files), so the stored name is the only evidence, and the exact-match rule is the
+  safe reading of it. `POST /api/attachments/{uid}/print` keeps the looser `is_placement_of` rule
+  (MEMNG-78) — there the uploader explicitly names the attachment whose single print slot it is
+  replacing, so the file it supersedes is the one it aimed at, not one inferred from a filename.
 - Only `memo`-carrying callers can bind: `PATCH /api/memos/{uid}` passes the memo; create has none
   yet (a brand-new memo carries nothing), and the one-shot finalize route is unchanged.
 - Known asymmetry (accepted): a cross-batch print lands in the single legacy print slot and so loses

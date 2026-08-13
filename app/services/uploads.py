@@ -583,16 +583,21 @@ async def bind_print_to_sibling(
     folder. Returns True when the print was consumed, False when it was left untouched for the
     caller to promote. Enqueues NO MediaJob — a print master is an archive file, not a tier.
 
-    Placement mirrors `POST /api/attachments/{uid}/print` (assets.py): the same client filename the
-    slot already names is a RE-SEND of that master and replaces it in place (MEMNG-78 — reserving a
-    fresh ` (n)` name instead would orphan the previous file and renumber the column on every
-    re-send); anything else takes a fresh O_EXCL name.
-
     A slot already holding a DIFFERENT master is not touched — this returns False. Overwriting it
     would destroy a committed print the owner uploaded deliberately (two labels of one photo, or an
     earlier `/print` upload), and this call cannot sweep the superseded file afterwards: it runs
     inside the caller's memo transaction, which may still roll back. Promotion is the framework's
     existing never-lose answer, so the second master stays visible rather than vanishing.
+
+    Replacement therefore demands PROVABLE same-file evidence, and the only evidence this path has
+    is the stored name: the slot is three columns (path/mime/size) carrying no variant identity, and
+    the newcomer was matched by INFERENCE (a shared base) rather than aimed at this attachment by an
+    uploader. So it replaces only on an EXACT stored-name match of the sanitized client filename —
+    NOT on `storage.is_placement_of`, whose ` (n)` bumped form is ambiguous here: the grammar admits
+    a numeric label, so a stored `X - print (2).png` is either a bump of `X - print.png` or a
+    genuine `print:2` master, and reading it as the former would destroy the latter. A bumped-form
+    match consequently promotes. (`POST /api/attachments/{uid}/print` keeps the looser rule: there
+    the uploader names the attachment whose one print slot it is replacing, which IS the evidence.)
 
     Only a freshly-placed file is tracked in `moved_out`. The replaced path must NOT be: a rolled
     back edit unlinking it would leave the committed print_path pointing at nothing."""
@@ -606,12 +611,15 @@ async def bind_print_to_sibling(
     # lock) could otherwise leave the column naming neither file.
     await db.refresh(attachment, ["print_path"], with_for_update=True)
     dest_dir = storage.memo_dir(_data_root(), memo.created_at, memo.uid)
+    # The one file a re-send of THIS client filename can prove it owns: the exact name an
+    # unobstructed placement of it produces. Any other occupant is another master → promote.
+    same_file = dest_dir / storage.sanitize_name(upload.filename)
     old_print = Path(attachment.print_path) if attachment.print_path else None
-    if old_print is not None and not storage.is_placement_of(old_print, dest_dir, upload.filename):
+    if old_print is not None and old_print != same_file:
         return False  # occupied by a different master → caller promotes instead
 
     mime = await to_thread.run_sync(_sniff_mime, part, upload.mime)  # before the move
-    if old_print is not None:
+    if old_print is not None:  # exact stored-name match ⇒ a re-send of this very master
         path = await storage.replace_master(part, old_print)
     else:
         path = await storage.place_master(part, dest_dir, upload.filename)

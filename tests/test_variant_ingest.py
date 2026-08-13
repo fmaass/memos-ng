@@ -381,6 +381,54 @@ async def test_cross_batch_print_leaves_an_occupied_slot_alone(adb, monkeypatch,
     }
 
 
+async def test_numeric_label_master_is_not_mistaken_for_a_collision_bump(
+    adb, monkeypatch, tmp_path
+):
+    """The label grammar is `[^()]+`, so `N - print (2).png` is a legitimate `print:2` master whose
+    STORED name is also the ` (2)` form a collision bump produces. A later bare `N - print.png` must
+    NOT be read as a re-send of it: name inference alone cannot tell the two apart, so the bare
+    print promotes and the label-2 master survives byte-for-byte."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "vp_alias")
+    screen = await _upload(adb, o, "N.png", PNG + b"s" * 2000)
+    memo = await _memo_with(adb, o, await svc.finalize_pending(adb, [screen.upload_uid], o.id))
+    label2 = PNG + b"2" * 3000
+    two = await _upload(adb, o, "N - print (2).png", label2)  # label "2" → variant_key print:2
+    await svc.finalize_pending(adb, [two.upload_uid], o.id, memo=memo)
+    att = (await _attachments(adb, o.id))[0]
+    bound_path = att.print_path
+    assert Path(bound_path or "").name == "N - print (2).png"
+
+    bare = await _upload(adb, o, "N - print.png", PNG + b"b" * 3300)
+    out = await svc.finalize_pending(adb, [bare.upload_uid], o.id, memo=memo)
+
+    assert len(out) == 1  # promoted — the slot holds a different master
+    assert att.print_path == bound_path
+    assert Path(bound_path).read_bytes() == label2  # not overwritten by the bare print
+    assert {x.filename for x in await _attachments(adb, o.id)} == {"N.png", "N - print.png"}
+
+
+async def test_resent_labelled_cross_batch_print_replaces_in_place(adb, monkeypatch, tmp_path):
+    """The other side of that discrimination: an EXACT stored-name match is a true re-send and is
+    still replaced in place — the slot keeps naming one file, not a pile of numbered copies."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "vp_alias_resend")
+    screen = await _upload(adb, o, "M.png", PNG + b"s" * 2000)
+    memo = await _memo_with(adb, o, await svc.finalize_pending(adb, [screen.upload_uid], o.id))
+    first = await _upload(adb, o, "M - print (glossy).png", PNG + b"1" * 3000)
+    await svc.finalize_pending(adb, [first.upload_uid], o.id, memo=memo)
+    att = (await _attachments(adb, o.id))[0]
+    bound_path = att.print_path
+
+    corrected = PNG + b"2" * 3400
+    again = await _upload(adb, o, "M - print (glossy).png", corrected)
+    out = await svc.finalize_pending(adb, [again.upload_uid], o.id, memo=memo)
+
+    assert out == []  # bound, not promoted
+    assert att.print_path == bound_path and Path(bound_path).read_bytes() == corrected
+    assert _memo_files(memo) == ["M - print (glossy).png", "M.png"]  # no numbered leftover
+
+
 async def test_cross_batch_print_never_binds_onto_a_promoted_print(adb, monkeypatch, tmp_path):
     """Only a SCREEN owns print masters. A print an earlier batch already promoted parses as a
     print, so it is no bind target — a later print of the same base promotes instead of hanging a
