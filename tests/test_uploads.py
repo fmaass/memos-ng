@@ -65,6 +65,21 @@ def _drop_user(subject):
     eng.dispose()
 
 
+def _reap_expired_committed():
+    """Run the expiry reaper against the real DB from a sync test. Its own event loop is safe here:
+    the dev/test engine uses NullPool, so a fresh (loop-bound) connection is taken per checkout."""
+
+    async def _run():
+        from app.database import async_session
+
+        async with async_session() as s:
+            n = await svc.reap_expired(s)
+            await s.commit()
+            return n
+
+    return asyncio.run(_run())
+
+
 def _attachment_owners():
     """uid -> owning subject, read straight from the DB. The authoritative answer to 'whose bytes
     are these' — the library listing also surfaces other users' PUBLIC media, so it cannot decide
@@ -829,3 +844,70 @@ def test_pre_ownership_upload_row_fails_closed_on_every_verb(
         assert still_there == len(data)
     finally:
         _cleanup()
+
+
+def test_deleting_a_user_nulls_their_upload_instead_of_stranding_its_bytes(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # The owner FK is ON DELETE SET NULL, not CASCADE. reap_expired unlinks a .part file only by
+    # walking its uploads row (the orphan sweep matches *.spool), so cascading the row away with the
+    # user would strand those bytes on disk with nothing left to find them. Nulling the owner drops
+    # the row into the already-covered fail-closed state and keeps it reapable.
+    other, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        departing = _login_as(monkeypatch, "departing_user")
+        data = b"\x89PNG\r\n\x1a\n" + b"D" * 4000
+        uid = _start(departing, "leaving.png", "image/png", len(data))
+        departing.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        part = svc.part_path(uid)
+        assert part.read_bytes() == data
+
+        _drop_user("departing_user")
+
+        # the row OUTLIVES its owner — under CASCADE it would be gone here, orphaning the part file
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            row = c.execute(
+                text("SELECT owner_id, bytes_received FROM uploads WHERE upload_uid = :u"),
+                {"u": uid},
+            ).one()
+        eng.dispose()
+        assert row == (None, len(data))
+        assert part.exists()
+
+        # ...and an owner-less session is claimable by nobody: every verb still fails closed
+        assert other.head(f"/api/uploads/{uid}").status_code == 404
+        assert other.patch(
+            f"/api/uploads/{uid}", content=b"x" * 10, headers={"Upload-Offset": str(len(data))}
+        ).status_code == 404
+        assert other.post(f"/api/uploads/{uid}/finalize").status_code == 404
+        memo = other.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
+        )
+        assert memo.status_code == 201 and memo.json()["attachments"] == []
+        assert _attachment_owners() == {}
+
+        # ...and the reaper still reclaims BOTH the row and the bytes once it expires
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(
+                text(
+                    "UPDATE uploads SET expires_at = now() - interval '1 hour'"
+                    " WHERE upload_uid = :u"
+                ),
+                {"u": uid},
+            )
+        eng.dispose()
+        assert _reap_expired_committed() == 1
+        assert not part.exists()  # the bytes are gone, not stranded
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            left = c.execute(
+                text("SELECT count(*) FROM uploads WHERE upload_uid = :u"), {"u": uid}
+            ).scalar_one()
+        eng.dispose()
+        assert left == 0
+    finally:
+        _cleanup()
+        _drop_user("departing_user")

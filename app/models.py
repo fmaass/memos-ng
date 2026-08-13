@@ -193,10 +193,14 @@ class Upload(Base):
 
     upload_uid: Mapped[str] = mapped_column(String(64), primary_key=True)
     # The session's creating user. Every verb (HEAD/append/finalize) is scoped to it, so a uid alone
-    # is not an authorization — knowing someone else's uid buys nothing. Nullable ONLY for rows
-    # predating the owner column: those have no verifiable creator, match no owner, and so fail
-    # closed on every verb until the expiry reaper removes them.
-    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # is not an authorization — knowing someone else's uid buys nothing. Nullable for rows predating
+    # the owner column: those have no verifiable creator, match no owner, and so fail closed on
+    # every verb until the expiry reaper removes them.
+    # SET NULL, not CASCADE: reap_expired unlinks a .part file only by walking its uploads row (the
+    # orphan sweep matches *.spool only), so cascading the row away on user deletion would strand
+    # the bytes on disk forever. Nulling the owner lands the row in that same fail-closed state and
+    # lets the reaper collect row AND part normally.
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     filename: Mapped[str] = mapped_column(String(512))
     mime: Mapped[str] = mapped_column(String(255))
     declared_size: Mapped[int] = mapped_column(BigInteger)

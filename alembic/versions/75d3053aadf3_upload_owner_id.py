@@ -26,8 +26,11 @@ def upgrade() -> None:
     # (HEAD/append/finalize) rather than being claimable by whoever submits its uid. Those rows are
     # removed by the normal expiry reaper. No index: upload_uid is the PK and every ownership lookup
     # is PK-anchored, so an owner_id index would never be chosen.
+    # SET NULL rather than CASCADE: a .part file is unlinked only by walking its uploads row, so
+    # deleting the row on user deletion would strand those bytes on disk permanently. A NULLed owner
+    # is the same fail-closed state as a pre-migration row and is reclaimed by the expiry reaper.
     op.add_column('uploads', sa.Column('owner_id', sa.Integer(), nullable=True))
-    op.create_foreign_key(FK, 'uploads', 'users', ['owner_id'], ['id'], ondelete='CASCADE')
+    op.create_foreign_key(FK, 'uploads', 'users', ['owner_id'], ['id'], ondelete='SET NULL')
 
 
 def downgrade() -> None:
