@@ -14,7 +14,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import get_session
+from app.database import async_session, get_session
 from app.models import Pat, User, WebSession
 
 TX_COOKIE = "memosng_oidc_tx"
@@ -235,32 +235,32 @@ def claim_pat_stamp(pat_id: int, now_mono: float) -> bool:
     return True
 
 
-async def stamp_pat_last_used(db: AsyncSession, pat: Pat) -> bool:
+async def stamp_pat_last_used(pat_id: int, last_used: datetime | None) -> bool:
     """Persist the PAT's last_used, throttled. Returns True iff this call won the throttle claim
     and issued the write (a cross-process race can still make it update 0 rows — see below).
 
-    Committed HERE, in its own short transaction, rather than left pending for the caller: the
-    compat surface (routers/compat.py optional_user, and serve_file_compat's own session) never
-    commits, so a pending stamp was rolled back at request end and the row never changed
-    (MEMNG-31). Committing immediately also releases the row lock the UPDATE takes instead of
-    holding it for the rest of the request, which is what let a PAT gallery burst serialise on the
-    one PAT row and queue toward pool exhaustion. Nothing else is pending in `db` at this point —
-    authentication runs before any handler work — so the commit has no other side effect."""
+    Runs in its OWN session, never the request's: the compat surface never commits its request
+    session, so a stamp left pending there was rolled back at request end and the row never
+    changed (MEMNG-31). A dedicated session also means the commit releases the row lock at once
+    instead of holding it for the rest of the request (the PAT gallery-burst convoy), injects no
+    commit boundary into caller state, and — because a failed stamp dies with its own session —
+    can never expire or poison the objects authentication has already loaded."""
     now = datetime.now(UTC)
-    if not pat_stamp_due(pat.last_used, now):
+    if not pat_stamp_due(last_used, now):
         return False
-    if not claim_pat_stamp(pat.id, time.monotonic()):
+    if not claim_pat_stamp(pat_id, time.monotonic()):
         return False
     # The same staleness predicate in the WHERE is the durable, cross-process/restart gate: another
     # worker (or this one after a restart) that has no in-process claim still writes at most once
     # per window, and a loser of the race updates 0 rows instead of overwriting a fresh stamp.
     stale_before = now - timedelta(seconds=settings.PAT_LAST_USED_THROTTLE_S)
-    await db.execute(
-        update(Pat)
-        .where(Pat.id == pat.id, or_(Pat.last_used.is_(None), Pat.last_used < stale_before))
-        .values(last_used=now)
-    )
-    await db.commit()  # expire_on_commit=False keeps objects usable
+    async with async_session() as sdb:
+        await sdb.execute(
+            update(Pat)
+            .where(Pat.id == pat_id, or_(Pat.last_used.is_(None), Pat.last_used < stale_before))
+            .values(last_used=now)
+        )
+        await sdb.commit()
     return True
 
 
@@ -275,15 +275,15 @@ async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
     # Read the FK BEFORE the stamp commits: a session configured to expire on commit would have to
     # lazy-refresh the attribute afterwards, which async IO cannot do from attribute access.
     user_id = pat.user_id
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    # The stamp is display-only bookkeeping in its OWN session: a dying UPDATE (canceled while
+    # waiting on the locked PAT row, a transient disconnect) fails that session alone — it can
+    # neither turn a valid token into a 500 nor expire the user object loaded above.
     try:
-        await stamp_pat_last_used(db, pat)
+        await stamp_pat_last_used(pat.id, pat.last_used)
     except Exception:
-        # last_used is display-only bookkeeping: a stamp that dies (a canceled UPDATE on the
-        # locked PAT row, a transient disconnect) must never turn a valid token into a 500.
-        # Roll back so the session is usable again for the user lookup below.
         logger.warning("pat_last_used_stamp_failed", exc_info=True)
-        await db.rollback()
-    return (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    return user
 
 
 async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:

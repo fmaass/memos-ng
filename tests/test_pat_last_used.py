@@ -203,7 +203,7 @@ async def test_concurrent_burst_attempts_exactly_one_write(db_engine):
         async def one() -> bool:
             async with async_session() as db:
                 pat = (await db.execute(select(Pat).where(Pat.id == pat_id))).scalar_one()
-                return await auth.stamp_pat_last_used(db, pat)
+                return await auth.stamp_pat_last_used(pat.id, pat.last_used)
 
         results = await asyncio.gather(*(one() for _ in range(8)))
         assert sum(results) == 1
@@ -225,8 +225,9 @@ def test_first_claim_succeeds_even_at_low_monotonic_time():
 
 
 def test_a_failing_stamp_never_breaks_pat_authentication(client, db_engine, monkeypatch):
-    # The stamp is bookkeeping; a canceled UPDATE on the locked PAT row (or any
-    # transient DB error inside it) must not turn a valid token into a 500.
+    # The stamp is bookkeeping in its own dedicated session; a canceled UPDATE on
+    # the locked PAT row (or any transient DB error inside it) fails that session
+    # alone and must not turn a valid token into a 500 or expire loaded state.
     pat_id = _seed()
     try:
         async def _boom(db, pat):
