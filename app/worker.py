@@ -2,8 +2,10 @@
 
 Same image as the app, started with `command: worker`. Each worker drains the lanes in
 WORKER_LANES: the fast lane (thumbs/mobile/poster/blurhash/dims) and/or the slow lane (the
-CPU-heavy H.264 transcode). The Saturn in-stack worker runs `fast` and a Merkur worker runs
-`slow`, moving transcode off the thermally-bound NAS (ADR-0006 revisit). Default = both lanes.
+CPU-heavy H.264 transcode). Deployed as ONE in-stack worker running both lanes, recreated
+atomically with the app container from the same compose stack — schema and code move together,
+so no mixed-version worker ever runs against a newer app. (The Saturn-fast/Merkur-slow split
+this replaced is historical; see ADR-0006.)
 """
 
 import asyncio
