@@ -443,6 +443,40 @@ def test_upload_print_to_linked_attachment_lands_in_memo_folder(
         _cleanup()
 
 
+def test_patch_memo_binds_a_later_print_onto_its_screen(logged_in_client, monkeypatch, tmp_path):
+    """MEMNG-79 end-to-end over the real API — the incident path: the print export finished after
+    the memo was saved and arrived in a LATER edit. The memo must still show ONE photo, with the
+    print bound to that attachment; promoting it is what mailed the same picture twice."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"S" * 3000
+        su = _start(client, "_AR59988.png", "image/png", len(screen))
+        client.patch(f"/api/uploads/{su}", content=screen, headers={"Upload-Offset": "0"})
+        memo = client.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [su]}
+        ).json()
+        att_uid = memo["attachments"][0]["uid"]
+
+        printb = PNG + b"P" * 5000
+        pu = _start(client, "_AR59988 - print.png", "image/png", len(printb))
+        client.patch(f"/api/uploads/{pu}", content=printb, headers={"Upload-Offset": "0"})
+        r = client.patch(f"/api/memos/{memo['uid']}", json={"upload_uids": [pu]})
+        assert r.status_code == 200, r.text
+
+        atts = r.json()["attachments"]
+        assert len(atts) == 1  # no second visible copy of the photo the memo already shows
+        assert atts[0]["uid"] == att_uid
+        assert atts[0]["hasPrint"] is True and atts[0]["hasLegacyPrint"] is True
+        pp = _print_path(att_uid)
+        assert Path(pp).parent == _the_memo_folder(tmp_path)  # beside the screen master
+        assert Path(pp).name == "_AR59988 - print.png"
+        got = client.get(f"/api/attachments/{att_uid}/print")  # download-only print tier
+        assert got.status_code == 200 and got.content == printb
+    finally:
+        _cleanup()
+
+
 def test_upload_print_to_unlinked_attachment_keeps_print_dir(
     logged_in_client, monkeypatch, tmp_path
 ):

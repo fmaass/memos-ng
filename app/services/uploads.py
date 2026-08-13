@@ -23,6 +23,7 @@ from app.models import (
     JobLane,
     JobState,
     MediaJob,
+    Memo,
     Upload,
 )
 from app.services import storage
@@ -294,8 +295,46 @@ async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: byte
     return await append_stream(db, upload, offset, _one())
 
 
+async def _memo_screen_sibling(
+    db: AsyncSession, memo: Memo, base: str, owner_id: int
+) -> Attachment | None:
+    """The memo's already-linked SCREEN attachment for `base`, or None.
+
+    The match parses `Attachment.filename` — the client-facing name `finalize` copies verbatim off
+    the upload and nothing ever rewrites — with the SAME grammar the batch was parsed with, so a
+    screen stored as `X.png` or `X - screen.png` both answer to base `X`. The storage path is not
+    usable for this: it carries a uuid prefix while staged and a sanitized, possibly ` (n)`-bumped
+    name once placed, neither of which a dumped print's base can be compared against.
+
+    A print that an earlier batch already PROMOTED to a visible photo parses as a print and is
+    therefore never a bind target (repairing those rows is a separate job) — only a screen owns
+    print masters. Rows are ordered by id so a memo pathologically carrying two same-base screens
+    always yields the same (oldest) one: two identical calls must not bind to different rows.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(Attachment)
+                .where(Attachment.memo_id == memo.id, Attachment.owner_id == owner_id)
+                .order_by(Attachment.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for att in rows:
+        parsed = parse_variant(att.filename)
+        if not parsed.is_print and parsed.base == base:
+            return att
+    return None
+
+
 async def finalize_pending(
-    db: AsyncSession, upload_uids: list[str], owner_id: int, moved_out: list[str] | None = None
+    db: AsyncSession,
+    upload_uids: list[str],
+    owner_id: int,
+    moved_out: list[str] | None = None,
+    memo: Memo | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload is skipped (it expires via
@@ -312,10 +351,19 @@ async def finalize_pending(
     appended to `moved_out` (inside those functions, new-file branch only) so the caller can
     unlink it if the post rolls back. A dedup return moves nothing and appends nothing.
 
-    Screen/print grouping is IN-BATCH ONLY: screens (non-print files) become Attachments first, then
-    each print attaches to the same-base screen as a hidden rendition. A print with no screen
-    in this batch — or an in-batch (screen, variant_key) collision — is PROMOTED to a normal picture
-    (decision: a print is never silently dropped, never silently hidden without a screen)."""
+    Screen/print grouping runs in three steps, in this order (MEMNG-79 — the in-batch-only rule of
+    PLAN_2026-06-21_variant-renditions.md is superseded by the memo-sibling step):
+    1. IN-BATCH: screens (non-print files) become Attachments first, then each print attaches to the
+       same-base screen of this batch as a hidden rendition.
+    2. MEMO SIBLING: a print with no screen in this batch binds onto the `memo` the batch is being
+       finalized into, if that memo already carries the same-base screen (finalized by an earlier
+       edit) — it fills that attachment's print slot instead of becoming a second visible copy of a
+       photo the memo already shows. `memo` is None on create (the memo does not exist yet, so it
+       can carry nothing) and on the one-shot finalize route; then this step cannot apply.
+    3. PROMOTE: anything still unbound — no screen anywhere, an in-batch (screen, variant_key)
+       collision, or a sibling whose print slot already holds a different master — becomes a normal
+       picture (decision: a print is never silently dropped, never silently hidden without a
+       screen)."""
     pending: list[tuple[Upload, ParsedName]] = []
     for up_uid in upload_uids:
         upload = (
@@ -340,7 +388,11 @@ async def finalize_pending(
         out.append(att.uid)
 
     seen: set[tuple[int, str]] = set()
-    for upload, parsed in pending:  # PASS 2 — prints attach to their batch screen, else promote
+    # The memo sibling's print slot (print_path) holds exactly ONE master, so only the first print
+    # of this batch may bind to a given sibling — a second would overwrite the first's file. The
+    # loser is promoted, mirroring the in-batch (screen, variant_key) collision rule: never lost.
+    bound_siblings: set[int] = set()
+    for upload, parsed in pending:  # PASS 2 — batch screen, then memo sibling, else promote
         if not parsed.is_print:
             continue
         screen = base_to_attachment.get(parsed.base)
@@ -348,9 +400,22 @@ async def finalize_pending(
         if screen is not None and vk is not None and (screen.id, vk) not in seen:
             await finalize_rendition(db, upload, screen, parsed, moved_out)
             seen.add((screen.id, vk))
-        else:  # no matching screen, or an in-batch variant_key collision → promote to a photo
-            att = await finalize(db, upload, owner_id, moved_out)
-            out.append(att.uid)
+            continue
+        # No screen in THIS batch: before promoting, look for the screen on the memo being saved —
+        # a print exported minutes after its screen (a later edit) belongs to that photo, not to a
+        # duplicate of it. An in-batch (screen, variant_key) collision deliberately does NOT fall
+        # through here: its loser keeps promoting exactly as before (that screen is in this batch).
+        if screen is None and memo is not None:
+            sibling = await _memo_screen_sibling(db, memo, parsed.base, owner_id)
+            if (
+                sibling is not None
+                and sibling.id not in bound_siblings
+                and await bind_print_to_sibling(db, upload, sibling, memo, moved_out)
+            ):
+                bound_siblings.add(sibling.id)
+                continue
+        att = await finalize(db, upload, owner_id, moved_out)
+        out.append(att.uid)
     return out
 
 
@@ -504,6 +569,60 @@ async def finalize_rendition(
     await db.delete(upload)
     await db.flush()
     return rendition
+
+
+async def bind_print_to_sibling(
+    db: AsyncSession,
+    upload: Upload,
+    attachment: Attachment,
+    memo: Memo,
+    moved_out: list[str] | None = None,
+) -> bool:
+    """Bind a batch-orphan print onto an already-linked screen `attachment` of `memo`: fill its
+    print slot (print_path/print_mime/print_size) and place the file beside the screen in the memo
+    folder. Returns True when the print was consumed, False when it was left untouched for the
+    caller to promote. Enqueues NO MediaJob — a print master is an archive file, not a tier.
+
+    Placement mirrors `POST /api/attachments/{uid}/print` (assets.py): the same client filename the
+    slot already names is a RE-SEND of that master and replaces it in place (MEMNG-78 — reserving a
+    fresh ` (n)` name instead would orphan the previous file and renumber the column on every
+    re-send); anything else takes a fresh O_EXCL name.
+
+    A slot already holding a DIFFERENT master is not touched — this returns False. Overwriting it
+    would destroy a committed print the owner uploaded deliberately (two labels of one photo, or an
+    earlier `/print` upload), and this call cannot sweep the superseded file afterwards: it runs
+    inside the caller's memo transaction, which may still roll back. Promotion is the framework's
+    existing never-lose answer, so the second master stays visible rather than vanishing.
+
+    Only a freshly-placed file is tracked in `moved_out`. The replaced path must NOT be: a rolled
+    back edit unlinking it would leave the committed print_path pointing at nothing."""
+    part = part_path(upload.upload_uid)
+    actual = await to_thread.run_sync(_part_size_sync, part)
+    if actual != upload.declared_size:
+        raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
+
+    # Lock the row before reading print_path so the placement decision and the column write see one
+    # value — a concurrent print upload for the same attachment (the `/print` route takes the same
+    # lock) could otherwise leave the column naming neither file.
+    await db.refresh(attachment, ["print_path"], with_for_update=True)
+    dest_dir = storage.memo_dir(_data_root(), memo.created_at, memo.uid)
+    old_print = Path(attachment.print_path) if attachment.print_path else None
+    if old_print is not None and not storage.is_placement_of(old_print, dest_dir, upload.filename):
+        return False  # occupied by a different master → caller promotes instead
+
+    mime = await to_thread.run_sync(_sniff_mime, part, upload.mime)  # before the move
+    if old_print is not None:
+        path = await storage.replace_master(part, old_print)
+    else:
+        path = await storage.place_master(part, dest_dir, upload.filename)
+        if moved_out is not None:
+            moved_out.append(str(path))
+    attachment.print_path = str(path)
+    attachment.print_mime = mime
+    attachment.print_size = actual
+    await db.delete(upload)
+    await db.flush()
+    return True
 
 
 def _spool_owner_uid(spool: Path) -> str | None:

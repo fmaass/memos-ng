@@ -287,8 +287,11 @@ async def patch_memo(
         fields = body.model_dump(exclude_unset=True, exclude={"upload_uids"})
         memo = await svc.update_memo(db, memo, **fields)
         if body.upload_uids:
+            # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto that
+            # screen instead of promoting a second visible copy of the same photo (MEMNG-79); on
+            # create there is no memo yet, so only this path can carry one.
             finalized = await uploads_svc.finalize_pending(
-                db, body.upload_uids, user.id, moved_out=moved
+                db, body.upload_uids, user.id, moved_out=moved, memo=memo
             )
             await svc.link_attachments(db, user.id, memo, finalized, moved_out=moved)
         # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed tags,

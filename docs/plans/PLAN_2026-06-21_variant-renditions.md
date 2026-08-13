@@ -36,7 +36,9 @@ _AR55821 - print.png               → print rendition, no label        → vari
 3. **No migration.** Owner re-uploads; existing `print_path` + the legacy endpoint left **fully intact**
    (additive only; no backfill, no column drop).
 4. **A print with no matching screen in its dump → PROMOTED to a normal visible picture.** No orphan
-   table/reaper/recovery. ⇒ grouping is **IN-BATCH ONLY**.
+   table/reaper/recovery. ⇒ grouping is **IN-BATCH ONLY**. — **SUPERSEDED 2026-08-13 (MEMNG-79):
+   in-batch first, then the target memo's existing screen sibling, and only then promotion. See
+   "Decision reversal (2026-08-13)" below.**
 5. **Print download = household-visible** (owner-confirmed): the new rendition list/download endpoints use
    `_viewable`, exactly like the existing `print` tier — anyone who can see a shared photo can download its
    print masters. (Recorded so it's a deliberate choice, not an accident.)
@@ -89,6 +91,8 @@ categories: no-suffix, explicit-screen, print-bare, print-labeled, near-miss, la
 over-length→truncated, weird-charset→slug, malformed-parens→screen.
 
 ### Ingest / grouping — two passes in `finalize_pending` (`uploads.py:119`), in-batch only
+*(binding rule as first built; the current rule is the three-step order in "Decision reversal
+(2026-08-13)" immediately after this pseudocode.)*
 ```
 finalize_pending(db, upload_uids, owner_id, moved_out):
   parsed = {up: parse_variant(up.filename) for each pending+complete upload in the batch}
@@ -109,6 +113,43 @@ finalize_pending(db, upload_uids, owner_id, moved_out):
           att = await finalize(db, up, owner_id, moved_out); out.append(att.uid)   # PROMOTE → visible
   return out   # renditions are NOT in `out`
 ```
+#### Decision reversal (2026-08-13) — MEMNG-79: memo-sibling binding (owner-approved)
+**Reverses owner decision 4's "IN-BATCH ONLY" consequence** (the grouping rule only; the promotion
+fallback and every other decision stand). No in-repo ADR tree exists — memos-ng ADRs live on the
+BookStack shelf — so this dated subsection IS the recorded reversal; mirror it there when the shelf
+page is next touched.
+
+**Why.** Production incident: a Lightroom print export finished ~14 minutes after its screen and was
+added to the memo in a LATER edit, so `finalize_pending` saw a batch-orphan print and promoted it to
+a visible Attachment. The memo then showed the same photo twice and every `image/*` consumer (the
+daily mail) sent both copies. "Dump the screen and its prints together" (the documented mitigation
+under Risks) is not something the export pipeline can guarantee.
+
+**New binding order** — first match wins:
+1. **in-batch screen** → hidden `AttachmentRendition` (unchanged, incl. the `(screen, variant_key)`
+   collision → promote rule);
+2. **memo sibling** — no screen in this batch, but the memo being saved already carries a SCREEN
+   attachment whose `filename` parses (same grammar) to the print's base → bind onto that row's
+   legacy print slot: `print_path`/`print_mime`/`print_size`, file placed beside the screen in the
+   memo folder (`uploads.bind_print_to_sibling`). No new Attachment, no `MediaJob`;
+3. **promote** — everything else, exactly as before.
+
+**Rules that make step 2 safe:**
+- The match parses `Attachment.filename` (the client-facing name, never rewritten), NOT the storage
+  path (uuid-prefixed while staged, sanitized/` (n)`-bumped once placed).
+- A print already promoted by an earlier batch parses as a print and is **never** a bind target —
+  only a screen owns print masters (repair of already-duplicated rows: MEMNG-80, separate).
+- Several same-base screens on one memo → **lowest `id`** (deterministic; two identical calls must
+  not bind to different rows).
+- The legacy slot holds ONE master: only the first print of a batch binds to a given sibling, and a
+  slot already holding a DIFFERENT master is left alone — the newcomer is promoted rather than
+  overwriting a committed file this call could not sweep if the memo transaction rolled back. A
+  re-sent pair (the filename the slot already names) is REPLACED in place per MEMNG-78.
+- Only `memo`-carrying callers can bind: `PATCH /api/memos/{uid}` passes the memo; create has none
+  yet (a brand-new memo carries nothing), and the one-shot finalize route is unchanged.
+- Known asymmetry (accepted): a cross-batch print lands in the single legacy print slot and so loses
+  its `print:<label>` variant identity, while an in-batch print becomes a labelled rendition.
+
 Edge cases now explicit (gaps #4/#7/#8):
 - **Two screens, same base** (`X.png` + `X - screen.png`): both become visible photos; prints bind to the
   first (setdefault). Tested + documented.
@@ -215,17 +256,21 @@ files.
   green all 4 jobs; prod + memos-old still 200.
 
 ## Risks / watch-items
-- **Grouping is per-`finalize_pending` batch.** Prints added in a *later edit* (PATCH) than their screen
+- ~~**Grouping is per-`finalize_pending` batch.** Prints added in a *later edit* (PATCH) than their screen
   (gap #5), or via the one-shot `POST /api/uploads/{uid}/finalize` / legacy `attachment_uids` path, are
   **promoted** (not grouped). Documented: *dump a screen and its prints together in one compose/edit.*
-  Tested for the PATCH path.
+  Tested for the PATCH path.~~ — **this risk materialized in production; closed by MEMNG-79** (see the
+  reversal above). The PATCH path now binds onto the memo's screen sibling; the one-shot finalize route
+  and the `attachment_uids` path carry no memo and still promote.
 - **HEIC/HEVC/video print stays zero-MediaJob** even through the sniffer (thermal cardinal rule).
 - **Promoted-print cosmetics** — a promoted print keeps its `- print (…)` filename + gains derived tiers;
   intended, harmless.
 
 ## Rejected alternatives
 - Every-file-an-Attachment + `WHERE role='screen'` filter (fragile hiding, thermal risk).
-- Cross-batch base matching + orphan recovery + reaper (cut by decisions 2+4).
+- Cross-batch base matching + orphan recovery + reaper (cut by decisions 2+4). — **partially adopted
+  2026-08-13 (MEMNG-79):** cross-batch base matching against the TARGET MEMO's screens only; still no
+  orphan table, recovery pass or reaper (an unmatched print keeps promoting).
 - Deterministic shared rendition paths + cross-row sha256 dedup (caused the overwrite/leak/shared-deletion
   HIGHs) — unique uuid filenames + write-once/promote instead.
 - Backfill/drop `print_path` (cut by decision 3).
