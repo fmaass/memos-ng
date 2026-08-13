@@ -1,6 +1,9 @@
+import asyncio
 import hashlib
+import os
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from app.config import settings
 from app.models import Upload
 from app.services import uploads as svc
@@ -341,3 +344,262 @@ def test_upload_rejects_oversize(logged_in_client, monkeypatch):
         "/api/uploads", json={"filename": "ok.jpg", "mime": "image/jpeg", "size": 500 * 1024}
     )
     assert ok.status_code == 201  # within the cap
+
+
+async def _chunks(parts):
+    for p in parts:
+        yield p
+
+
+async def test_spool_stream_accumulates_received_bytes(monkeypatch, tmp_path):
+    # The received count is the RUNNING SUM over the transport's chunks — that accumulation is what
+    # the size ceiling is checked against.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    spool = tmp_path / "uploads" / "acc.spool"
+    chunks = [bytes([i]) * 1000 for i in range(5)]
+    assert await svc.spool_stream(_chunks(chunks), spool, start=0, ceiling=10_000) == 5000
+    assert spool.read_bytes() == b"".join(chunks)
+
+
+async def test_append_accumulates_bytes_received_across_appends(adb, monkeypatch, tmp_path):
+    # bytes_received accumulates both WITHIN an append (over its chunks) and ACROSS appends, and
+    # the part file is the concatenation in order — nothing overwritten, nothing zero-filled.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    a, b = b"A" * 1000, b"B" * 700
+    up = await svc.create_upload(
+        adb, filename="acc.bin", mime="application/octet-stream", size=1700
+    )
+    await svc.append_stream(adb, up, 0, _chunks([a[:400], a[400:]]))
+    assert up.bytes_received == 1000
+    await svc.append_stream(adb, up, 1000, _chunks([b]))
+    assert up.bytes_received == 1700
+    assert svc.part_path(up.upload_uid).read_bytes() == a + b
+
+
+async def test_append_rejects_accumulated_total_and_keeps_committed_bytes(
+    adb, monkeypatch, tmp_path
+):
+    # Every individual chunk is far under the ceiling — only the accumulated total crosses it, so a
+    # per-chunk check would let this through. The already-committed prefix must survive untouched.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    up = await svc.create_upload(adb, filename="c.bin", mime="application/octet-stream", size=200)
+    await svc.append_stream(adb, up, 0, _chunks([b"P" * 100]))
+    with pytest.raises(svc.UploadTooLarge):
+        await svc.append_stream(adb, up, 100, _chunks([b"x" * 50] * 20))
+    assert up.bytes_received == 100
+    assert svc.part_path(up.upload_uid).read_bytes() == b"P" * 100  # committed prefix intact
+    assert list((tmp_path / "uploads").glob("*.spool")) == []  # the failed request's spool is gone
+
+
+async def test_gap_and_replay_answer_before_consuming_the_body(adb, monkeypatch, tmp_path):
+    # Offset precedence outranks the ceiling: a gap answers 409 and a replay answers no-op WITHOUT
+    # pulling a single chunk, even when the body offered would blow the session ceiling.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    up = await svc.create_upload(adb, filename="p.bin", mime="application/octet-stream", size=800)
+    await svc.append_stream(adb, up, 0, _chunks([b"P" * 400]))
+    pulled = 0
+
+    async def oversize_body():
+        nonlocal pulled
+        for _ in range(100):  # 10 000 bytes — far past the 800-byte ceiling
+            pulled += 1
+            yield b"z" * 100
+
+    with pytest.raises(ValueError):  # gap wins over the ceiling: 409, not 413
+        await svc.append_stream(adb, up, 500, oversize_body())
+    assert await svc.append_stream(adb, up, 0, oversize_body()) is up  # replay wins too: no-op
+    assert pulled == 0  # neither request read a chunk
+    assert up.bytes_received == 400
+    assert svc.part_path(up.upload_uid).read_bytes() == b"P" * 400
+
+
+async def test_reaper_removes_orphaned_spools_but_spares_an_active_one(adb, monkeypatch, tmp_path):
+    # A process killed mid-append leaves a .spool that nothing else would ever remove. The reaper
+    # drops that debris, and must not pull the file out from under a request still streaming.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    spools = tmp_path / "uploads"
+    spools.mkdir(parents=True, exist_ok=True)
+    orphan = spools / "dead-uid.abc123.spool"
+    orphan.write_bytes(b"half a chunk")
+    stale = (datetime.now(UTC) - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS + 1)).timestamp()
+    os.utime(orphan, (stale, stale))
+    active = spools / "live-uid.def456.spool"
+    active.write_bytes(b"still streaming")  # touched just now → inside the horizon
+    part = svc.part_path("live-uid")
+    part.write_bytes(b"committed")
+
+    await svc.reap_expired(adb)
+
+    assert not orphan.exists()  # crash debris reaped
+    assert active.read_bytes() == b"still streaming"  # in-flight spool untouched
+    assert part.read_bytes() == b"committed"  # a live session's committed bytes untouched
+
+
+async def test_append_stops_pulling_the_body_once_the_ceiling_is_passed(adb, monkeypatch, tmp_path):
+    # Receive-TIME enforcement: the body generator is abandoned the moment the running total passes
+    # the ceiling, so an oversize upload is never pulled through in full (let alone buffered).
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    up = await svc.create_upload(adb, filename="s.bin", mime="application/octet-stream", size=500)
+    pulled = 0
+
+    async def body():
+        nonlocal pulled
+        for _ in range(100):  # 10 000 bytes on offer; only the first 500 may be accepted
+            pulled += 1
+            yield b"z" * 100
+
+    with pytest.raises(svc.UploadTooLarge):
+        await svc.append_stream(adb, up, 0, body())
+    assert pulled == 6  # 5 chunks fill the ceiling, the 6th trips it, the other 94 are never read
+    assert up.bytes_received == 0
+
+
+async def test_append_rejects_body_that_overshoots_once_landed_at_its_offset(
+    adb, monkeypatch, tmp_path
+):
+    # A body can fit the session's ceiling on its own yet overshoot once landed at its offset. That
+    # comparison needs the SETTLED offset, so it is taken at merge time rather than while streaming.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    up = await svc.create_upload(adb, filename="o.bin", mime="application/octet-stream", size=800)
+    await svc.append_stream(adb, up, 0, _chunks([b"P" * 700]))
+    with pytest.raises(svc.UploadTooLarge):  # 300 alone fits 800; landed at 700 it does not
+        await svc.append_stream(adb, up, 700, _chunks([b"x" * 300]))
+    assert up.bytes_received == 700
+    assert svc.part_path(up.upload_uid).read_bytes() == b"P" * 700
+    assert list((tmp_path / "uploads").glob("*.spool")) == []
+
+
+async def test_stale_append_that_streams_successfully_is_a_replay_under_the_lock(
+    adb, monkeypatch, tmp_path
+):
+    # Both appends start at offset 0 and both stream fine; A commits first. B's snapshot passed the
+    # early exit while it was still true, so the decision that matters is the one re-taken under the
+    # row lock: a replay no-op, NOT a second write at 0 that would overwrite A.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    up = await svc.create_upload(
+        adb, filename="both.bin", mime="application/octet-stream", size=900
+    )
+    b_in_flight, a_committed = asyncio.Event(), asyncio.Event()
+
+    async def b_body():
+        yield b"B" * 100
+        b_in_flight.set()
+        await a_committed.wait()
+        yield b"B" * 100  # stays inside the ceiling — B's BODY is fine, only its offset goes stale
+
+    b_task = asyncio.create_task(svc.append_stream(adb, up, 0, b_body()))
+    await b_in_flight.wait()
+    await svc.append_stream(adb, up, 0, _chunks([b"A" * 500]))
+    assert up.bytes_received == 500
+    a_committed.set()
+    await b_task  # completes without error: a replay is a no-op, not a failure
+
+    assert svc.part_path(up.upload_uid).read_bytes() == b"A" * 500  # B did not overwrite A
+    assert up.bytes_received == 500
+    assert list((tmp_path / "uploads").glob("*.spool")) == []
+
+
+async def test_failed_append_cannot_destroy_a_concurrent_appends_bytes(adb, monkeypatch, tmp_path):
+    # Two appends start from the same offset. A completes and advances the session; B — still
+    # holding the now-stale offset — then fails. B may discard only its OWN spool: A's bytes must
+    # be byte-for-byte intact with no zero-filled region, and B's stale offset must resolve as a
+    # replay no-op against the REFRESHED offset rather than overwriting A.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    up = await svc.create_upload(
+        adb, filename="race.bin", mime="application/octet-stream", size=900
+    )
+    b_in_flight, a_committed = asyncio.Event(), asyncio.Event()
+
+    async def b_body():
+        yield b"B" * 100  # B is mid-stream, built on offset 0 just like A
+        b_in_flight.set()
+        await a_committed.wait()  # ... A finishes and advances the session here
+        yield b"B" * 900  # B then blows the ceiling and unwinds
+
+    b_task = asyncio.create_task(svc.append_stream(adb, up, 0, b_body()))
+    await b_in_flight.wait()
+    await svc.append_stream(adb, up, 0, _chunks([b"A" * 500]))
+    assert up.bytes_received == 500
+    a_committed.set()
+    with pytest.raises(svc.UploadTooLarge):
+        await b_task
+
+    part = svc.part_path(up.upload_uid)
+    assert part.read_bytes() == b"A" * 500  # not truncated, not overwritten, no zero region
+    assert up.bytes_received == 500
+    assert list((tmp_path / "uploads").glob("*.spool")) == []
+
+    # a later append still carrying the stale offset is a replay no-op, not a second write at 0
+    await svc.append_stream(adb, up, 0, _chunks([b"C" * 500]))
+    assert up.bytes_received == 500 and part.read_bytes() == b"A" * 500
+
+
+def test_append_rejects_body_over_declared_size(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        uid = _start(client, "d.bin", "application/octet-stream", 1000)
+        over = client.patch(
+            f"/api/uploads/{uid}", content=b"x" * 1500, headers={"Upload-Offset": "0"}
+        )
+        assert over.status_code == 413
+        assert client.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == "0"
+        assert svc.part_path(uid).stat().st_size == 0  # rejected bytes were never kept
+        # the session survives the rejection: a correctly sized body still completes it
+        ok = client.patch(
+            f"/api/uploads/{uid}", content=b"x" * 1000, headers={"Upload-Offset": "0"}
+        )
+        assert ok.status_code == 200 and ok.json()["bytes_received"] == 1000
+        assert client.post(f"/api/uploads/{uid}/finalize").status_code == 200
+    finally:
+        _cleanup()
+
+
+def test_append_rejects_when_cap_drops_below_declared_size(logged_in_client, monkeypatch, tmp_path):
+    # MAX_UPLOAD_MIB is enforced at RECEIVE time, not only at session create — a cap that is lower
+    # than an already-declared size still stops the bytes at the door.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        size = 3 * 1024 * 1024
+        uid = _start(client, "big.bin", "application/octet-stream", size)
+        monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 1)
+        over = client.patch(
+            f"/api/uploads/{uid}", content=b"x" * size, headers={"Upload-Offset": "0"}
+        )
+        assert over.status_code == 413
+        assert "1 MiB" in over.json()["detail"]  # the server cap, not the declared size, tripped
+        assert svc.part_path(uid).stat().st_size == 0
+    finally:
+        _cleanup()
+
+
+def test_append_offset_gap_and_replay_still_behave(logged_in_client, monkeypatch, tmp_path):
+    # The offset branches are now decided BEFORE the body is received, so re-assert them: a forward
+    # gap is a 409 and a replay of an already-received range stays a no-op (not a second append).
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"y" * 400
+        uid = _start(client, "g.bin", "application/octet-stream", 800)
+        first = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        assert first.json()["bytes_received"] == 400
+        gap = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "500"})
+        assert gap.status_code == 409
+        replay = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        assert replay.status_code == 200 and replay.json()["bytes_received"] == 400
+        assert svc.part_path(uid).stat().st_size == 400  # replay wrote nothing a second time
+
+        # ...and the offset answer still wins when the body itself would blow the ceiling
+        huge = b"z" * 5000  # way past the 800-byte declared size
+        big_gap = client.patch(
+            f"/api/uploads/{uid}", content=huge, headers={"Upload-Offset": "500"}
+        )
+        assert big_gap.status_code == 409  # 409, not 413
+        big_replay = client.patch(
+            f"/api/uploads/{uid}", content=huge, headers={"Upload-Offset": "0"}
+        )
+        assert big_replay.status_code == 200 and big_replay.json()["bytes_received"] == 400
+        assert svc.part_path(uid).stat().st_size == 400
+    finally:
+        _cleanup()

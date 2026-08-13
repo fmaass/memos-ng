@@ -3,9 +3,11 @@ import json
 from app.config import settings
 from app.main import app
 from app.routers.assets import _ready_meta, media_event_stream
+from app.services import uploads as up_svc
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine, text
+from starlette.datastructures import UploadFile  # the class the multipart parser instantiates
 
 from tests.conftest import SYNC_URL
 
@@ -325,6 +327,39 @@ def test_upload_print_master_then_serve_and_flag(logged_in_client, monkeypatch, 
         assert r.status_code == 200 and r.json()["hasPrint"] is True
         served = client.get("/api/attachments/pr-img/print")
         assert served.status_code == 200 and served.content == b"PRINTMASTERBYTES"
+    finally:
+        _cleanup(aid)
+
+
+def test_upload_print_rejects_oversize_at_receive_time(logged_in_client, monkeypatch, tmp_path):
+    # The print master is read in BOUNDED chunks against a running byte count: an oversize export is
+    # refused about one chunk past the cap, never after the whole file has been pulled into memory.
+    # The pass-through spy on UploadFile.read (a dependency, still calling the real implementation)
+    # is what makes "streamed, not buffered" observable rather than assumed.
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 1)
+    body = b"B" * (4 * 1024 * 1024)
+    reads: list[int] = []
+    real_read = UploadFile.read
+
+    async def counting_read(self, size=-1):
+        chunk = await real_read(self, size)
+        reads.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(UploadFile, "read", counting_read)
+    aid = _seed_attachment("pr-big", subject, mime="image/jpeg")
+    try:
+        r = client.post(
+            "/api/attachments/pr-big/print", files={"file": ("big.tif", body, "image/tiff")}
+        )
+        assert r.status_code == 413
+        assert reads and max(reads) <= up_svc.STREAM_CHUNK_SIZE  # bounded reads, not one whole body
+        assert sum(reads) < len(body)  # stopped at the cap instead of consuming everything
+        assert client.get("/api/attachments/pr-big").json()["hasPrint"] is False
+        staging = tmp_path / "uploads"
+        assert not staging.exists() or list(staging.iterdir()) == []  # no staged bytes left behind
     finally:
         _cleanup(aid)
 
