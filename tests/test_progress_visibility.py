@@ -46,6 +46,14 @@ def _progress_cmd(src: str, dest: str, threads: int) -> list[str]:
     return [sys.executable, "-c", script, dest]
 
 
+def _silent_cmd(src: str, dest: str, threads: int) -> list[str]:
+    """Stub argv for a transcode that publishes NOTHING: it runs long enough to be observed, emits
+    no `-progress` lines at all, then writes its output. Anything that clears a progress row during
+    such a run can only be the claim, never a new sample."""
+    script = "import sys, time\ntime.sleep(0.8)\nopen(sys.argv[1], 'w').write('ok')\n"
+    return [sys.executable, "-c", script, dest]
+
+
 def _seed_owned_video(subject: str, storage_path: str) -> tuple[int, int, int, str]:
     """A committed user + processing video + queued slow job the worker's own session can claim."""
     uid = f"prog-{secrets.token_urlsafe(6)}"
@@ -120,6 +128,22 @@ def _write_progress_row(jid: int, pct: int) -> None:
             {"j": jid, "p": pct},
         )
     eng.dispose()
+
+
+def _progress_table() -> list[tuple]:
+    """Every progress row with the job state behind it — the sweep is database-wide, so a count
+    that disagrees has to name what else was in the table."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        rows = c.execute(
+            text(
+                "SELECT p.job_id, p.progress_pct, j.state, j.lane, j.attachment_id "
+                "FROM media_job_progress p LEFT JOIN media_jobs j ON j.id = p.job_id "
+                "ORDER BY p.job_id"
+            )
+        ).all()
+    eng.dispose()
+    return [tuple(r) for r in rows]
 
 
 def _attachment_status(aid: int) -> str:
@@ -218,6 +242,112 @@ async def test_sse_reports_real_progress_from_committed_worker_transitions(monke
         _cleanup(subject, aid)
 
 
+async def test_the_reported_percentage_never_goes_backwards(monkeypatch, tmp_path):
+    """The whole sequence a client sees must be monotonic, and 100 must mean ready.
+
+    The transcode's last sample lands while the worker still holds its claim; the outcome commits
+    a moment later. Clearing the progress row inside that window (as media.process_slow used to)
+    made the snapshot fall back to the job row's committed 0 while the attachment still read
+    `processing` — the tile ran up to 75%, snapped back to 0%, and only then went ready. The
+    window is widened deterministically here by delaying the real guard_publish, which sits
+    between the last sample and the commit; without the delay this race is a coin toss to
+    observe, and a flaky test proves nothing.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 60)
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _progress_cmd)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    monkeypatch.setattr(media, "PROGRESS_PUBLISH_SECONDS", 0.0)
+    real_guard = media.guard_publish
+
+    async def _slow_guard(db, attachment):
+        await asyncio.sleep(0.5)  # a real await point between the last sample and the commit
+        await real_guard(db, attachment)
+
+    monkeypatch.setattr(media, "guard_publish", _slow_guard)
+    src = tmp_path / "originals" / "v.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"stub source")
+    subject = "monotonic_owner"
+    owner, aid, jid, uid = _seed_owned_video(subject, str(src))
+
+    async def drain() -> str:
+        async with async_session() as db:
+            return await worker.run_once(db)
+
+    async def snap() -> list[dict]:
+        return await _user_snapshot(owner)
+
+    async def meta(uids: list[str]) -> dict[str, dict]:
+        return await _ready_meta(owner, uids)
+
+    try:
+        job = asyncio.create_task(drain())
+        events: list[dict] = []
+        async with asyncio.timeout(90):
+            async for chunk in media_event_stream(snap, meta, interval=0.05):
+                events.append(json.loads(chunk.removeprefix("data: ")))
+        assert await job == "processed"
+
+        seen = [(e["status"], e["progress_pct"]) for e in events]
+        pcts = [e["progress_pct"] for e in events]
+        assert pcts == sorted(pcts), f"the reported percentage went backwards: {seen}"
+        # 100 is the finish line, not a state the tile sits in while work continues.
+        assert [s for s, p in seen if p == 100 and s != "ready"] == [], seen
+        assert seen[-1] == ("ready", 100)
+        assert _attachment_status(aid) == "ready"
+        assert _read_progress(jid) is None  # cleared after the commit, not before it
+    finally:
+        _cleanup(subject, aid)
+
+
+async def test_a_reclaim_never_reports_the_dead_attempts_progress(monkeypatch, tmp_path):
+    """A killed worker clears nothing: its claim rolls back and the job returns to `queued` still
+    carrying the percentage the dead attempt reached. The next claim must drop that row before the
+    new attempt publishes anything — otherwise the snapshot reports a transcode as (say) 60% done
+    from the instant it restarts at 0.
+
+    The stub emits no progress at all, so the only thing that can clear the row while this attempt
+    runs is the claim itself.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 60)
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _silent_cmd)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    src = tmp_path / "originals" / "v.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"stub source")
+    subject = "reclaim_owner"
+    owner, aid, jid, _ = _seed_owned_video(subject, str(src))
+    _write_progress_row(jid, 60)  # what the killed attempt left behind
+
+    async def drain() -> str:
+        async with async_session() as db:
+            return await worker.run_once(db)
+
+    try:
+        assert _read_progress(jid) == 60  # the stale row is really there before the claim
+        job = asyncio.create_task(drain())
+        cleared_while_running = False
+        stale_snapshots: list[int] = []
+        async with asyncio.timeout(90):
+            while not job.done():
+                pct = _read_progress(jid)
+                if pct is None:
+                    cleared_while_running = True
+                    break
+                stale_snapshots.append(pct)
+                await asyncio.sleep(0.05)
+        assert await job == "processed"
+
+        assert cleared_while_running, (
+            f"the dead attempt's row survived into the new one: {stale_snapshots}"
+        )
+        assert _read_progress(jid) is None
+    finally:
+        _cleanup(subject, aid)
+
+
 async def test_publish_progress_commits_so_another_session_can_read_it(monkeypatch, tmp_path):
     """The publish is its own transaction: visible immediately, and repeatable (upsert)."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
@@ -302,25 +432,36 @@ async def test_progress_publishing_is_throttled_to_the_configured_cadence(monkey
     assert published == [10, 20, 30, 40, 50]  # the throttle is the only thing dropping samples
 
 
-async def test_sweep_removes_only_progress_rows_whose_job_is_gone(monkeypatch, tmp_path):
-    """The backstop for a worker killed mid-transcode: its row cannot be cleared by anyone else,
-    so the sweep collects rows whose job no longer exists — and nothing else."""
+async def test_sweep_removes_rows_no_running_job_stands_behind(monkeypatch, tmp_path):
+    """The backstop for a worker killed outright — it clears nothing, at either seam.
+
+    Both shapes it can leave are stale: a row whose job is GONE (deleted with its attachment) and
+    a row whose job has FINISHED between its outcome commit and the post-commit clear. A row whose
+    job may still be running is spared: from any other session that job reads `queued`, because
+    its claim is uncommitted.
+    """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    # The sweep is database-wide, and its RETURN VALUE is asserted exactly below — so start from a
+    # drained side channel rather than counting whatever residue an earlier test left behind.
+    await media.sweep_stale_progress()
     subject = "sweep_owner"
-    _, aid, live_jid, _ = _seed_owned_video(subject, str(tmp_path / "v.mp4"))
+    _, aid, running_jid, _ = _seed_owned_video(subject, str(tmp_path / "v.mp4"))
     orphan_jid = _seed_job_row(aid)
+    finished_jid = _seed_job_row(aid, state="done", progress_pct=100)
     try:
-        _write_progress_row(live_jid, 30)
+        _write_progress_row(running_jid, 30)
         _write_progress_row(orphan_jid, 60)
+        _write_progress_row(finished_jid, 90)
         eng = create_engine(SYNC_URL)
         with eng.begin() as c:  # the job vanishes (deleted attachment / discarded job) …
             c.execute(text("DELETE FROM media_jobs WHERE id=:j"), {"j": orphan_jid})
         eng.dispose()
 
-        assert await media.sweep_orphan_progress() == 1
+        assert await media.sweep_stale_progress() == 2, _progress_table()
 
         assert _read_progress(orphan_jid) is None
-        assert _read_progress(live_jid) == 30  # … the running job's sample is untouched
+        assert _read_progress(finished_jid) is None
+        assert _read_progress(running_jid) == 30  # … the running job's sample is untouched
     finally:
         _cleanup(subject, aid)
 
@@ -332,6 +473,6 @@ async def test_worker_sweep_isolates_its_errors(monkeypatch):
     async def _explode() -> int:
         raise RuntimeError("simulated sweep failure")
 
-    monkeypatch.setattr(media, "sweep_orphan_progress", _explode)
+    monkeypatch.setattr(media, "sweep_stale_progress", _explode)
 
     assert await worker.sweep_job_progress_safe() == 0

@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/vue-query'
 import { getCurrentInstance, onUnmounted } from 'vue'
 
 import type { components } from '@/api/schema'
-import { hasInFlight, nextAction, type TimelineData } from '@/lib/sseLifecycle'
+import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
 
 type Attachment = components['schemas']['AttachmentRef']
 
@@ -42,7 +42,15 @@ function metadataPatch(ev: MediaEvent): Partial<Attachment> {
 // here is why a transcoding video's tile sat at 0% for the whole transcode (MEMNG-36). Absent is
 // distinct from 0: an event without a percentage leaves the last known one in place rather than
 // resetting the tile to the start.
-function patchAttachment(att: Attachment, ev: MediaEvent): CachedAttachment {
+//
+// An IN-FLIGHT event never applies to an attachment already cached as ready/failed. The stream is
+// a poll, and a reconnect (or a slow client) can deliver a `processing` snapshot taken before the
+// job finished AFTER the terminal event — applying it would put a finished photo back under a
+// progress overlay that nothing will ever clear, since the job it describes is over and will
+// report nothing further. Terminal events still apply to terminal state (a retried `failed`
+// attachment may legitimately reach `ready`).
+function patchAttachment(att: CachedAttachment, ev: MediaEvent): CachedAttachment {
+  if (isTerminalStatus(att.status) && !isTerminalStatus(ev.status)) return att
   const next: CachedAttachment = { ...att, status: ev.status, ...metadataPatch(ev) }
   if (ev.progress_pct != null) next.progress_pct = ev.progress_pct
   return next

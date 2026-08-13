@@ -589,17 +589,28 @@ async def clear_progress(job_id: int) -> None:
         logger.warning("job_progress_clear_failed", job_id=job_id, error=str(exc))
 
 
-async def sweep_orphan_progress() -> int:
-    """Delete progress rows whose media_jobs row is gone; returns how many were removed.
+async def sweep_stale_progress() -> int:
+    """Delete progress rows no running job stands behind; returns how many were removed.
 
-    clear_progress covers every ordinary ending, so this only ever finds rows left by a worker
-    that died mid-transcode on a job later deleted with its attachment. Anti-join rather than an
-    age cutoff: a legitimate transcode may run for hours (SLOW_TRANSCODE_TIMEOUT_S), and no
-    horizon that survives that is also tight enough to be worth having. Raises — the worker's
-    `_safe` wrapper isolates it.
+    Stale means both shapes the worker's own cleanup can miss when it is killed outright: the job
+    row is GONE (deleted with its attachment), or the job has FINISHED (done/failed) between its
+    outcome commit and worker.run_once's post-commit clear. A row whose job is still queued or
+    processing is spared — from any other session a running job's row reads `queued`, because its
+    claim is uncommitted, so "not terminal" is exactly "may still be running".
+
+    Anti-join rather than an age cutoff: a legitimate transcode may run for hours
+    (SLOW_TRANSCODE_TIMEOUT_S), and no horizon that survives that is tight enough to be worth
+    having. Raises — the worker's `_safe` wrapper isolates it.
     """
     async with async_session() as db:
-        live = select(MediaJob.id).where(MediaJob.id == MediaJobProgress.job_id).exists()
+        live = (
+            select(MediaJob.id)
+            .where(
+                MediaJob.id == MediaJobProgress.job_id,
+                MediaJob.state.notin_((JobState.done, JobState.failed)),
+            )
+            .exists()
+        )
         # RETURNING rather than rowcount: the deleted ids are what the count is counting.
         result = await db.execute(
             sa_delete(MediaJobProgress).where(~live).returning(MediaJobProgress.job_id)
@@ -684,10 +695,11 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # 0 while a descendant hangs and the ceiling fires, and that partial must still go.
         if not completed:
             tmp.unlink(missing_ok=True)
-        # The transcode is over either way, so the side channel's row for it is stale from here on
-        # — including on the failure paths, where the job goes back to `queued` and would otherwise
-        # keep advertising the percentage the dead attempt reached.
-        await clear_progress(job_id)
+        # The progress row is deliberately NOT cleared here. This runs inside the claiming
+        # transaction, before the outcome commits, and in that window the snapshot would fall back
+        # to the job row's committed 0 while the attachment still reads `processing` — a transcode
+        # that visibly snapped from 100% back to 0% before turning ready. worker.run_once clears it
+        # after the commit, and again at claim time for the attempt a kill left behind (MEMNG-36).
     if timed_out:
         raise RuntimeError(f"slow-lane transcode timed out after {ceiling}s")
     if proc.returncode != 0:

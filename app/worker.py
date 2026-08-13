@@ -215,6 +215,14 @@ async def run_once(db: AsyncSession) -> str:
         await db.commit()
         return "idle"
     attachment_id = job.attachment_id  # captured before commit expires the job instance
+    job_id = job.id  # likewise — and the progress side channel is keyed on it
+    # Cleanup BEFORE reclaim (MEMNG-36). A worker killed mid-transcode clears nothing, and its
+    # rolled-back claim puts the job back to `queued` still carrying the dead attempt's progress
+    # row — which the snapshot would keep reporting until this attempt happened to overtake it,
+    # i.e. a percentage that goes backwards. Every attempt therefore starts from no sample at all.
+    # Committed from its own session, so it lands even though this claim is still uncommitted; on
+    # a job that never published (the whole fast lane) it is a no-op delete on a primary key.
+    await media.clear_progress(job_id)
     try:
         await media.process_job(db, job)
         job.state = JobState.done
@@ -235,7 +243,6 @@ async def run_once(db: AsyncSession) -> str:
         # transcode), so dropping it is the second half of that delete, not bookkeeping.
         # A commit failure here is left to run_media_drain: the claim rolls back to `queued` and
         # the next poll discards the job again.
-        job_id = job.id  # the commit expires the instance — keep the id for the log line
         await db.delete(job)
         await db.commit()
         logger.info(
@@ -244,6 +251,15 @@ async def run_once(db: AsyncSession) -> str:
         return "processed"
     except Exception as exc:  # a bad input must not kill the worker
         return await _record_job_failure(db, job, attachment_id, exc)
+    finally:
+        # Cleanup AFTER the outcome is committed — every branch above commits before it returns.
+        # Clearing the row from inside the transcode instead (media.process_slow) opened a window
+        # between that clear and this transaction's commit in which the snapshot fell back to the
+        # job row's committed progress (0) while the attachment still read `processing`: the
+        # client saw its transcode reach 100%, snap back to 0%, and only then turn ready
+        # (MEMNG-36). After the commit there is no such window — a finished job leaves the
+        # snapshot's active set in the same transaction that publishes the result.
+        await media.clear_progress(job_id)
 
 
 async def run_media_drain() -> str:
@@ -269,11 +285,14 @@ async def run_media_drain() -> str:
 
 
 async def sweep_job_progress_safe() -> int:
-    """Remove progress rows whose job is gone (MEMNG-36), in its own session with ALL errors
-    isolated — the same boundary guard the other periodic sweeps get. Progress telemetry must
-    never be able to halt media processing. Returns the number of rows removed (0 on error)."""
+    """Remove progress rows no running job stands behind (MEMNG-36), in its own session with ALL
+    errors isolated — the same boundary guard the other periodic sweeps get. Progress telemetry
+    must never be able to halt media processing. Returns the number of rows removed (0 on error).
+
+    The backstop for a killed worker only: run_once clears at claim time and after the outcome
+    commits, so an ordinary run leaves nothing here to find."""
     try:
-        swept = await media.sweep_orphan_progress()
+        swept = await media.sweep_stale_progress()
     except Exception:
         logger.exception("job_progress.sweep_error")
         return 0

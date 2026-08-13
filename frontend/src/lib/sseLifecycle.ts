@@ -8,6 +8,13 @@ export type TimelineData = InfiniteData<MemoList>
 
 const IN_FLIGHT_STATUSES = new Set<AttachmentStatus>(['uploading', 'pending', 'processing'])
 
+// The one place a status is classified as finished. `ready` and `failed` are the states the
+// backend never moves an attachment out of on its own, so a client that has seen one must not be
+// talked back out of it by a late in-flight event (see applyMediaEvent).
+export function isTerminalStatus(status: AttachmentStatus): boolean {
+  return !IN_FLIGHT_STATUSES.has(status)
+}
+
 export function hasInFlight(data: TimelineData | undefined): boolean {
   return (
     data?.pages.some((page) =>
