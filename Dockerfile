@@ -25,7 +25,10 @@ COPY pyproject.toml uv.lock* ./
 # No BuildKit cache mount: Saturn's Docker 24 defaults to the classic builder, and
 # the passwordless-sudo exclusion only covers `docker` (not `env`/buildkit). Plain
 # RUN keeps one Dockerfile that builds on both classic and BuildKit (CI).
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project --no-cache
+# The runtime never uses the interpreter's own pip stack (the app runs from the
+# uv-managed venv); dropping it keeps its vendored copies out of the image scan.
+RUN python -m pip uninstall -y pip setuptools
 
 COPY . .
 COPY --from=frontend /build/dist /app/frontend/dist
