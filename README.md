@@ -180,6 +180,7 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | `ASSET_URL_SECRET` | derived from `SESSION_SECRET` | HMAC key for signed media URLs (`_PREV` = rotation slot) |
 | `WORKER_LANES` | `fast,slow` | which media lanes a worker drains (`fast` = thumbs/posters, `slow` = transcode) |
 | `THERMAL_ZONE` / `THERMAL_MAX_C` | k10temp sensor / `70` | defer transcode while the (heat-bound) host is hot |
+| `SLOW_TRANSCODE_TIMEOUT_S` | `3600` | ceiling for one slow-lane transcode; on expiry the ffmpeg process tree is killed and the job fails visibly instead of holding the worker slot |
 | `MAX_UPLOAD_MIB` | `1024` | upload size cap |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | empty (push disabled) | Web Push (VAPID) keypair |
 | Authelia OIDC | — | confidential BFF client; public `https://auth…` endpoints only |

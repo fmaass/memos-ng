@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     THERMAL_ZONE: str = "/sys/class/hwmon/hwmon0/temp1_input"
     THERMAL_MAX_C: int = 70
     MEDIA_MAX_ATTEMPTS: int = 3
+    # Wall-clock ceiling for ONE slow-lane transcode (MEMNG-38). ffmpeg can wedge — a truncated
+    # stream, a stalled read on the bind-mounted share — and unbounded it holds the worker's only
+    # slot forever while the job sits `processing` and never fails visibly. The fast lane already
+    # bounds its work (ffprobe 30s, poster 60s); a full H.264 transcode is orders of magnitude more,
+    # so this is scaled, not copied: at FFMPEG_THREADS=1 / `-preset veryfast` a 1080p encode runs at
+    # roughly real-time on this hardware, so an hour covers a ~30-60 min household clip with
+    # headroom while still catching a wedged process within the hour instead of never. Keep it
+    # hours-not-days: a genuinely stuck job burns up to MEDIA_MAX_ATTEMPTS x this before it goes
+    # terminal. Raise it (env) if a legitimately long import starts timing out.
+    SLOW_TRANSCODE_TIMEOUT_S: int = 3600
 
     # Web push (VAPID) — T2.5. Empty keys = push disabled (every send is a no-op), so the
     # pipeline runs unchanged without VAPID configured. Generate a keypair with `vapid --gen`

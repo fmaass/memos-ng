@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+import signal
 import subprocess
 from collections import deque
 from pathlib import Path
 
 import pillow_heif
+import structlog
 from PIL import Image, ImageOps
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,8 +18,13 @@ from app.services import blurhash_pure
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
+logger = structlog.get_logger(__name__)
+
 THUMB_MAX = 800
 MOBILE_MAX = 2048
+# Grace between SIGTERM and SIGKILL when stopping a runaway transcode: ffmpeg closes the output
+# file and exits on TERM, so this only has to cover finishing the frame in flight.
+KILL_GRACE_SECONDS = 5.0
 
 
 def _assets(sub: str) -> Path:
@@ -172,19 +179,14 @@ def parse_progress(line: str, duration: float | None) -> int | None:
     return None
 
 
-async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
-    """H.264/AAC transcode (the slow lane). Defers while the host is too hot (ADR thermal)."""
-    if too_hot():
-        raise ThermalDefer
-    src = attachment.storage_path
-    assert src is not None
-    duration = attachment.duration or _ffprobe(src).get("duration")
+def slow_ffmpeg_cmd(src: str, dest: str, threads: int) -> list[str]:
+    """The slow-lane H.264/AAC transcode command (sibling of poster_ffmpeg_cmd for the fast lane).
 
-    dest = _assets("web") / f"{attachment.uid}.mp4"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    # keep the real extension so ffmpeg infers the mp4 muxer (a .mp4.tmp suffix fails)
-    tmp = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
-    cmd = [
+    Built separately from process_slow so the argv is unit-testable and substitutable — the
+    timeout tests drive the real subprocess machinery with a stub binary instead of relying on
+    real ffmpeg wedging.
+    """
+    return [
         "ffmpeg",
         "-y",
         "-i",
@@ -196,7 +198,7 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         "-crf",
         "23",
         "-threads",
-        str(settings.FFMPEG_THREADS),
+        str(threads),
         "-vf",
         "scale=-2:min(1080\\,ih)",
         "-c:a",
@@ -206,31 +208,102 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         "-progress",
         "pipe:1",
         "-nostats",
-        str(tmp),
+        dest,
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-    )
+
+
+async def _stop_transcode(proc: asyncio.subprocess.Process) -> None:
+    """Stop a running transcode *and anything it spawned*, then reap it — no zombie, no orphan.
+
+    The process is started with start_new_session=True, so its pid is also its process-group id
+    and signalling the GROUP reaches children ffmpeg forked; signalling the direct child alone
+    would leave those alive, still holding the pipe and still writing the temp file. TERM first
+    (ffmpeg closes the file and exits), SIGKILL after a short grace. Every wait is BOUNDED: the
+    recovery from a hang must not become a second hang inside the worker's only slot.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.returncode is not None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            # Already exited (ProcessLookupError) or not signallable. Swallowed deliberately: this
+            # runs from a finally, where a raise here would REPLACE the real failure with a cleanup
+            # error. The bounded wait below still reaps an exited-but-unreaped child.
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), KILL_GRACE_SECONDS)
+            return
+        except TimeoutError:
+            continue
+    # Survived SIGKILL: an uninterruptible-sleep (D-state) process, e.g. a stalled share read.
+    # Nothing more this process can do, but it must be visible — it still holds a worker slot.
+    logger.error("transcode_unreapable", pid=proc.pid)
+
+
+async def _pump_progress(
+    db: AsyncSession,
+    job: MediaJob,
+    proc: asyncio.subprocess.Process,
+    tail: deque[str],
+    duration: float | None,
+) -> None:
+    """Consume ffmpeg's `-progress` stream (flushing job.progress_pct at most every 2s), then wait
+    for the process to exit. Split out of process_slow so the read loop AND the exit sit under one
+    asyncio.wait_for ceiling — a hang can happen in either."""
     assert proc.stdout is not None
-    tail: deque[str] = deque(maxlen=12)
     last = 0.0
+    async for raw in proc.stdout:
+        line = raw.decode(errors="ignore")
+        tail.append(line.rstrip())
+        pct = parse_progress(line, duration)
+        if pct is not None and (asyncio.get_event_loop().time() - last) > 2:
+            job.progress_pct = pct
+            await db.flush()
+            last = asyncio.get_event_loop().time()
+    await proc.wait()
+
+
+async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
+    """H.264/AAC transcode (the slow lane). Defers while the host is too hot (ADR thermal).
+    Time-bound by SLOW_TRANSCODE_TIMEOUT_S: on expiry the process tree is killed and the job
+    fails through the worker's normal failure path (MEMNG-38)."""
+    if too_hot():
+        raise ThermalDefer
+    src = attachment.storage_path
+    assert src is not None
+    duration = attachment.duration or _ffprobe(src).get("duration")
+
+    dest = _assets("web") / f"{attachment.uid}.mp4"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # keep the real extension so ffmpeg infers the mp4 muxer (a .mp4.tmp suffix fails)
+    tmp = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
+    cmd = slow_ffmpeg_cmd(src, str(tmp), settings.FFMPEG_THREADS)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        # Own session ⇒ own process group, so a wedged transcode can be signalled as a whole
+        # TREE (see _stop_transcode) instead of orphaning whatever ffmpeg forked.
+        start_new_session=True,
+    )
+    tail: deque[str] = deque(maxlen=12)
+    ceiling = settings.SLOW_TRANSCODE_TIMEOUT_S
+    timed_out = False
     try:
-        async for raw in proc.stdout:
-            line = raw.decode(errors="ignore")
-            tail.append(line.rstrip())
-            pct = parse_progress(line, duration)
-            if pct is not None and (asyncio.get_event_loop().time() - last) > 2:
-                job.progress_pct = pct
-                await db.flush()
-                last = asyncio.get_event_loop().time()
-        await proc.wait()
+        await asyncio.wait_for(_pump_progress(db, job, proc, tail, duration), ceiling)
+    except TimeoutError:
+        # Unbounded, a wedged ffmpeg held the worker's only slot forever and the job never failed
+        # visibly (MEMNG-38). Fall through the cleanup below, then fail loudly and namedly.
+        timed_out = True
     finally:
-        # On cancellation (worker shutdown) or any error, don't leak the ffmpeg process or a
-        # half-written tmp file — kill it and clean up.
+        # On the timeout, on cancellation (worker shutdown) or on any error, don't leak the
+        # ffmpeg process or a half-written tmp file — kill the tree and clean up.
         if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+            await _stop_transcode(proc)
             tmp.unlink(missing_ok=True)
+    if timed_out:
+        raise RuntimeError(f"slow-lane transcode timed out after {ceiling}s")
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
