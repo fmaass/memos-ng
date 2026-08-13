@@ -4,7 +4,12 @@ slideshow, transcoder). Contract is the captured live fixtures in fixtures/live-
 Two ground-truth deviations from the original plan (see NOTES.md):
 - F1: no/invalid token → HTTP 200 with PUBLIC-only memos (NOT 401). A PAT widens the set.
 - F2: original files are NOT served over /file/* (404, as prod is today); only derived tiers
-  (thumbnail / mobile-UA / video) are HTTP-served, unauthenticated.
+  (thumbnail / mobile-UA / video) are HTTP-served.
+
+Derived tiers are served under the SAME visibility rules as the memo surfaces above, not
+unconditionally (MEMNG-25): anonymous → PUBLIC memos only, a PAT → that user's visible set.
+So a PUBLIC→PRIVATE flip, a memo deletion, or an attachment deletion revokes the media on the
+next request, instead of leaving every derived tier world-readable by uid forever.
 """
 
 import base64
@@ -20,8 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.config import settings
-from app.database import get_session
-from app.models import Memo, Tag, User, Visibility
+from app.database import async_session, get_session
+from app.models import Attachment, Memo, Tag, User, Visibility
 from app.services.memos import visible_clause
 
 router = APIRouter(tags=["compat"])
@@ -165,10 +170,41 @@ async def get_memo_compat(
     return _compat_memo(memo)
 
 
+async def file_visible(db: AsyncSession, user: User | None, uid: str) -> bool:
+    """May `user` (None = anonymous) fetch a derived tier of attachment `uid` over /file/*?
+
+    Mirrors the visibility rules already enforced elsewhere — it does not add a second model:
+    - authenticated: `assets._viewable` — they own the attachment, OR it hangs on a memo
+      `services.memos.visible_clause` lets them see (theirs, or non-PRIVATE).
+    - anonymous: the F1 rule the compat memo surfaces use (list :129, get :159) — PUBLIC only.
+      An orphan attachment (its memo was deleted → memo_id SET NULL) is therefore never
+      anonymously readable, which is what makes deletion revoke access.
+    A missing attachment row is a denial, not an error, so a deleted attachment 404s.
+    """
+    row = (
+        await db.execute(
+            select(Attachment.owner_id, Memo.id, Memo.visibility)
+            .outerjoin(Memo, Memo.id == Attachment.memo_id)
+            .where(Attachment.uid == uid)
+        )
+    ).first()
+    if row is None:
+        return False
+    owner_id, memo_id, visibility = row
+    if user is None:
+        return memo_id is not None and visibility == Visibility.PUBLIC
+    if owner_id is not None and owner_id == user.id:
+        return True
+    return memo_id is not None and visibility != Visibility.PRIVATE
+
+
 @router.get("/file/attachments/{uid}/{filename}")
 async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail: bool = False):
     """Derived tiers only (F2): ?thumbnail=true → thumb, mobile UA → mobile, video → web.
-    The original path stays 404, as prod is today. No auth (derived tiers are public)."""
+    The original path stays 404, as prod is today. Visibility-gated like the memo surfaces:
+    anonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's
+    visible set, and anything else (private, orphaned, deleted) is 404 — never 403, so the
+    denial does not disclose that the uid exists."""
     assets = Path(settings.DATA_ROOT) / "assets"
     is_mobile = "Mobile" in request.headers.get("user-agent", "")
     is_video = filename.lower().endswith(VIDEO_EXTS)
@@ -181,6 +217,17 @@ async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail
     else:
         # Original over /file/* is not served (F2).
         return JSONResponse({"message": "not found"}, status_code=404)
-    if not path.exists():
+    # Authorize in a short-lived session that is released BEFORE the file is streamed, so this
+    # high-fan-out media path never pins a pool connection for the length of a download (same
+    # reason assets.py opens its own session instead of taking the request-scoped dependency).
+    async with async_session() as db:
+        user = await optional_user(request, db)
+        allowed = await file_visible(db, user, uid)
+    if not allowed or not path.exists():
         return JSONResponse({"message": "not found"}, status_code=404)
-    return FileResponse(path, media_type=media_type)
+    # No shared cache may store these: the same URL is authorized per-caller now, and a
+    # PUBLIC→PRIVATE flip must take effect on the very next request rather than being replayed
+    # from a cache that outlives the flip.
+    return FileResponse(
+        path, media_type=media_type, headers={"Cache-Control": "private, no-store"}
+    )

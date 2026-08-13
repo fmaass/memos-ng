@@ -292,8 +292,9 @@ async def serve_asset(
         return _serve_file(resolved[0], resolved[1], request, format, cache)
     # UNSIGNED / AUTH PATH (original/print on THIS route): DB work in a short-lived session released
     # BEFORE streaming, so the download holds no pool connection either. (The /file/* compat route
-    # is separate — app/routers/compat.py — and serves derived tiers unauthenticated by design,
-    # ADR-0004 / fixtures F2; it does not pass through here.)
+    # is separate — app/routers/compat.py — and serves derived tiers only, per ADR-0004 /
+    # fixtures F2; it does not pass through here. Since MEMNG-25 it gates those tiers on the same
+    # visibility rules as `_viewable` below, with anonymous limited to PUBLIC.)
     # PAT-or-session so headless API clients (e.g. the memos-slideshow generator) can fetch the
     # original tier with a Personal Access Token, matching the /api/v1/* compat surface.
     async with async_session() as db:
