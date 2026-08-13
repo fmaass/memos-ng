@@ -89,3 +89,40 @@ async def test_place_master_async_wrapper_delegates(tmp_path):
     out = await storage.place_master(src, tmp_path / "d", "n.bin")
     assert out == tmp_path / "d" / "n.bin"
     assert out.read_bytes() == b"x"
+
+
+@pytest.mark.parametrize(
+    "existing,name,expected",
+    [
+        ("IMG.png", "IMG.png", True),  # the sanitized name itself
+        ("IMG (2).png", "IMG.png", True),  # …and the ` (n)` form _reserve bumped it to
+        ("IMG (11).png", "IMG.png", True),
+        ("IMG.png", "../IMG.png", True),  # compared after sanitization, like the placement
+        ("IMG (1).png", "IMG.png", False),  # _reserve starts at 2 → ` (1)` is a literal name
+        ("IMG (2).tif", "IMG.png", False),  # different extension → a different file
+        ("OTHER.png", "IMG.png", False),
+        ("IMG (2) (2).png", "IMG.png", False),  # only one bump level is _reserve's own output
+    ],
+)
+def test_is_placement_of(existing, name, expected):
+    dest = Path("/data/originals/2026/05/2026-05-21_1432_uid")
+    assert storage.is_placement_of(dest / existing, dest, name) is expected
+
+
+def test_is_placement_of_requires_the_same_directory():
+    dest = Path("/data/originals/2026/05/2026-05-21_1432_uid")
+    # the legacy print/ file of an attachment since linked to a memo is NOT the memo folder's file
+    assert not storage.is_placement_of("/data/print/uid.png", dest, "uid.png")
+
+
+async def test_replace_master_overwrites_in_place(tmp_path):
+    dest = tmp_path / "memo" / "IMG (2).png"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old-print")
+    src = tmp_path / "staged.part"
+    src.write_bytes(b"new-print")
+    out = await storage.replace_master(src, dest)
+    assert out == dest
+    assert dest.read_bytes() == b"new-print"
+    assert not src.exists()  # moved, not copied
+    assert sorted(p.name for p in dest.parent.iterdir()) == ["IMG (2).png"]  # no sibling created

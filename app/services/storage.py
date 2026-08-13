@@ -8,6 +8,7 @@ an existing (committed) master is never moved — so no GC, lock, or migration i
 """
 
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from anyio import to_thread
 
 # Cap the human-browsable name so a pathological dumped filename can't blow the share's NAME_MAX.
 MAX_NAME_LEN = 200
+
+# The ` (n)` tail `_reserve` appends on a collision — n starts at 2, so ` (1)` is a literal name.
+_BUMPED = re.compile(r"^(?P<stem>.*) \((?:[2-9]|[1-9]\d+)\)$")
 
 
 def _truncate_bytes(name: str, limit: int) -> str:
@@ -105,3 +109,41 @@ async def place_master(src: Path, dest_dir: Path, name: str) -> Path:
     """Atomically move a staged master `src` into `dest_dir` under a sanitized, collision-free
     `name`. Returns the final path. Off-loop (blocking disk I/O)."""
     return await to_thread.run_sync(_place_master_sync, src, dest_dir, name)
+
+
+def is_placement_of(existing: str | Path, dest_dir: Path, name: str) -> bool:
+    """True when `existing` is the file an earlier placement of client filename `name` into
+    `dest_dir` produced — its sanitized name, or the ` (n)` form `_reserve` bumped it to.
+
+    Re-uploading the SAME file (a corrected print master) must land ON that file rather than
+    reserve yet another numbered sibling, which would orphan the previous one. The bumped form
+    counts because a first placement is routinely bumped already: a print export usually carries
+    the screen master's filename, and the screen is sitting in the same memo folder.
+    """
+    path = Path(existing)
+    if path.parent != dest_dir:
+        return False
+    desired = Path(sanitize_name(name))
+    if path.name == desired.name:
+        return True
+    if path.suffix != desired.suffix:
+        return False
+    bumped = _BUMPED.match(path.stem)
+    return bumped is not None and bumped.group("stem") == desired.stem
+
+
+def _replace_master_sync(src: Path, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dest)
+    return dest
+
+
+async def replace_master(src: Path, dest: Path) -> Path:
+    """Move a staged master `src` ONTO the existing `dest`, replacing it. Off-loop (blocking I/O).
+
+    No torn file: `src` is already the caller's private staging copy (the temp half of a
+    temp-then-replace), and `os.replace` is rename(2) — the swap is atomic, and a reader that
+    opened the old file keeps reading that complete inode until it closes. Only for a path the
+    caller OWNS (this attachment's own print master); `place_master` is the one that reserves.
+    """
+    return await to_thread.run_sync(_replace_master_sync, src, dest)

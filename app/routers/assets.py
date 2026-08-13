@@ -442,6 +442,13 @@ async def upload_print(
         size = await up_svc.spool_stream(
             _file_chunks(file), staged, start=0, ceiling=settings.MAX_UPLOAD_MIB * 1024 * 1024
         )
+        # Lock this attachment's row for the rest of the request: the placement decision below
+        # reads print_path and the post-commit sweep unlinks the file it named, so two concurrent
+        # print uploads could otherwise leave the committed print_path pointing at a file the other
+        # one deleted. Taken AFTER the receive, so the lock spans only placement + commit (ms), and
+        # it also re-reads print_path — the value loaded before the upload streamed may be stale.
+        await db.refresh(att, ["print_path"], with_for_update=True)
+        old_print = Path(att.print_path) if att.print_path else None
         # A print uploaded to an attachment already in a memo lands in that memo's folder under its
         # real filename (beside the screen); an unlinked attachment keeps the legacy print/{uid}.
         memo = (
@@ -451,9 +458,16 @@ async def upload_print(
         )
         if memo is not None:
             dest = storage.memo_dir(data_root, memo.created_at, memo.uid)
-            path = str(
-                await storage.place_master(staged, dest, file.filename or f"{uid}-print{suffix}")
-            )
+            name = file.filename or f"{uid}-print{suffix}"
+            if old_print is not None and storage.is_placement_of(old_print, dest, name):
+                # Re-upload of this attachment's print under the same filename: replace the file
+                # print_path already names. Reserving a fresh `name (n)` here (what _reserve does,
+                # correctly, for a DIFFERENT attachment) would orphan the previous print on disk
+                # and renumber print_path on every re-upload. The idempotence key is the
+                # ATTACHMENT: it has exactly one legacy print master, and this is it.
+                path = str(await storage.replace_master(staged, old_print))
+            else:
+                path = str(await storage.place_master(staged, dest, name))
         else:  # legacy: deterministic print/{uid}{suffix} — may overwrite a prior print of this att
             path = await to_thread.run_sync(
                 _save_print_sync, data_root / "print", uid, staged, suffix
@@ -471,12 +485,26 @@ async def upload_print(
     try:
         await db.commit()
     except Exception:
-        # Only the memo-folder file is a brand-new UNIQUE (O_EXCL) name this request created, so
-        # it's safe to unlink on rollback. The legacy print/{uid}{suffix} path is deterministic and
-        # may be a file another (committed) request owns — never unlink it (would break it).
-        if memo is not None:
+        # Only a memo-folder file placed under a brand-new UNIQUE (O_EXCL) name by THIS request is
+        # safe to unlink on rollback. The legacy print/{uid}{suffix} path is deterministic and may
+        # be a file another (committed) request owns — never unlink it (would break it). Nor the
+        # in-place replacement: `path` is then the committed print_path, and removing it would
+        # leave the attachment's print tier pointing at nothing.
+        if memo is not None and (old_print is None or path != str(old_print)):
             await to_thread.run_sync(lambda: Path(path).unlink(missing_ok=True))
         raise
+    # The previous print file is now unreferenced — the upload either renamed the print (a different
+    # client filename) or moved it out of the legacy print/ dir into the memo folder. Delete it:
+    # nothing else can point at it (every print master is either O_EXCL-reserved or the uid-keyed
+    # legacy file of this one attachment), and keeping it would leak a full-size master per rename.
+    # AFTER the commit, so the ordering is crash-safe in one direction: until the commit lands,
+    # print_path still names the old file and that file still exists (the consistent OLD state);
+    # once it lands, print_path names the new file, which is already on disk (the consistent NEW
+    # state). A crash between the two leaves at worst an unreferenced file, never a dangling
+    # print_path. Best-effort (`_unlink_all` swallows OSError): the upload is already committed, so
+    # a failed cleanup must not turn a successful request into a 500.
+    if old_print is not None and path != str(old_print):
+        await to_thread.run_sync(_unlink_all, [old_print])
     return await attachment_meta(uid, user, db)
 
 
