@@ -28,7 +28,7 @@ from app.models import (
     MediaJob,
 )
 from app.services import frame_share, media, push
-from app.services.uploads import reap_expired
+from app.services.uploads import reap_expired_committed
 from app.version import __version__
 
 logger = structlog.get_logger(__name__)
@@ -260,8 +260,7 @@ async def run() -> None:
         frame_status = await run_frame_share_drain()
         beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
-            async with async_session() as db:
-                reaped = await reap_expired(db)
+            reaped = await reap_expired_committed()
             if reaped:
                 logger.info("uploads_reaped", count=reaped)
             last_reap = time.time()

@@ -913,3 +913,55 @@ def test_deleting_a_user_nulls_their_upload_instead_of_stranding_its_bytes(
     finally:
         _cleanup()
         _drop_user("departing_user")
+
+
+@pytest.mark.anyio
+async def test_worker_reap_entry_commits_the_deletions(db_engine, tmp_path, monkeypatch):
+    # The worker used to reap through a session it never committed: the part file
+    # died (unlinked pre-flush) but the row resurrected on rollback, so the same
+    # uploads were "reaped" every cycle forever. The committed entry must leave
+    # the row durably gone, visible from a fresh connection.
+    monkeypatch.setattr(svc.settings, "DATA_ROOT", str(tmp_path))
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        uid_owner = c.execute(
+            text(
+                "INSERT INTO users (subject, role) "
+                "VALUES ('reap_commit_user','user') RETURNING id"
+            )
+        ).scalar_one()
+        c.execute(
+            text(
+                "INSERT INTO uploads (upload_uid, filename, mime, declared_size, "
+                "bytes_received, owner_id, expires_at) "
+                "VALUES ('reap-commit-uid','f.bin','application/octet-stream',"
+                "1,0,:o, now() - interval '1 hour')"
+            ),
+            {"o": uid_owner},
+        )
+    eng.dispose()
+    try:
+        reaped = await svc.reap_expired_committed()
+        assert reaped >= 1
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            left = c.execute(
+                text("SELECT count(*) FROM uploads WHERE upload_uid='reap-commit-uid'")
+            ).scalar_one()
+        eng.dispose()
+        assert left == 0
+    finally:
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM users WHERE subject='reap_commit_user'"))
+        eng.dispose()
+
+
+def test_worker_loop_uses_the_committed_reap_entry():
+    # Wiring pin: the worker must call the committing wrapper, never the bare
+    # session-scoped reap whose deletions die with an uncommitted session.
+    from pathlib import Path
+
+    source = Path(__file__).parent.parent.joinpath("app", "worker.py").read_text()
+    assert "reap_expired_committed()" in source
+    assert "reap_expired(db)" not in source
