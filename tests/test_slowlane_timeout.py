@@ -195,6 +195,10 @@ def _cleanup(*aids: int) -> None:
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
         for aid in aids:
+            # media_jobs has no FK to attachments since MEMNG-41 (an ON DELETE CASCADE would make
+            # every delete wait on a running job's row lock), so the seeded job rows are this
+            # helper's to remove — otherwise they outlive the test as orphans.
+            c.execute(text("DELETE FROM media_jobs WHERE attachment_id=:a"), {"a": aid})
             c.execute(text("DELETE FROM attachments WHERE id=:a"), {"a": aid})
     eng.dispose()
 

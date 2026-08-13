@@ -214,12 +214,23 @@ class Upload(Base):
 
 
 class MediaJob(Base):
+    """One unit of derivation work for an attachment (a queue row, not a data row).
+
+    `attachment_id` carries NO foreign key on purpose (MEMNG-41). A worker claims a job with
+    SELECT … FOR UPDATE and holds that row lock until the job commits — for the slow lane that is
+    the whole transcode, up to SLOW_TRANSCODE_TIMEOUT_S. An FK's ON DELETE CASCADE would make
+    `DELETE FROM attachments` lock the same child row, so deleting a photo whose video was being
+    transcoded blocked a request-serving connection for up to an hour (with DB_POOL_SIZE 5 on a
+    shared Postgres, a few of those starve the app). The cascade was also redundant: the delete
+    endpoint already removes the job rows explicitly. It now removes every job row nobody is
+    running (SKIP LOCKED) and leaves the in-flight one to its worker, which discards it on
+    discovering the attachment is gone (media.AttachmentGone → worker.run_once).
+    """
+
     __tablename__ = "media_jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    attachment_id: Mapped[int] = mapped_column(
-        ForeignKey("attachments.id", ondelete="CASCADE"), index=True
-    )
+    attachment_id: Mapped[int] = mapped_column(Integer, index=True)
     lane: Mapped[JobLane] = mapped_column(Enum(JobLane, name="job_lane"))
     state: Mapped[JobState] = mapped_column(
         Enum(JobState, name="job_state"), default=JobState.queued, index=True
