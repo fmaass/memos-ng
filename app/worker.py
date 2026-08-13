@@ -67,6 +67,15 @@ def heartbeat_path() -> Path:
 
 
 def beat() -> None:
+    """Stamp the liveness file the healthcheck reads.
+
+    Stays synchronous on purpose (MEMNG-42). It runs only in the worker process, whose loop
+    drains one job at a time with nothing else pending, so there is no request to stall — and
+    the write must actually reach the share before the next (possibly slow) step, since a
+    heartbeat deferred to a thread is a heartbeat that can be reordered behind the very stall it
+    is supposed to make visible. It doubles as the share-ACL canary: this is the real file write
+    that proves the container's uid can write the bind-mounted volume.
+    """
     path = heartbeat_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(time.time()))
@@ -392,18 +401,20 @@ async def run_frame_share_recover_safe() -> int:
 
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
-    beat()
+    beat()  # blocking-ok: the liveness stamp itself — see beat()
     # Startup sweep: the common stranding cause is this very restart (a deploy --force-recreate
     # killing a send mid-flight), so adopt orphaned claims before draining anything new.
     await run_frame_share_recover_safe()
     last_reap = 0.0
     while True:
         status = await run_media_drain()  # own session, all errors isolated from this loop
-        beat()  # heartbeat before the (possibly slow HTTP) frame drain — keep liveness honest
+        # blocking-ok: heartbeat before the (possibly slow HTTP) frame drain — keep liveness
+        # honest. See beat() for why this one write stays synchronous.
+        beat()
         # Drain a frame-share job opportunistically in its own session (like reap): the album upload
         # is decoupled from the media job's transaction so an upload error can't poison media work.
         frame_status = await run_frame_share_drain()
-        beat()
+        beat()  # blocking-ok: the liveness stamp itself — see beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             reaped = await reap_expired_committed()
             if reaped:

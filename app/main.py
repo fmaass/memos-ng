@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import structlog
+from anyio import to_thread
 from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,12 +21,21 @@ logger = structlog.get_logger(__name__)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 
+DATA_SUBDIRS = ("originals", "assets/thumbs", "assets/mobile", "assets/web")
+
+
+def _create_data_dirs_sync(data_root: Path) -> None:
+    """All four tree roots in ONE off-loop hop — the data volume is a bind-mounted share, so
+    each mkdir is a network round-trip."""
+    for sub in DATA_SUBDIRS:
+        (data_root / sub).mkdir(parents=True, exist_ok=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_runtime_secrets()  # fail fast if prod is on the dev-default key
     data_root = Path(settings.DATA_ROOT)
-    for sub in ("originals", "assets/thumbs", "assets/mobile", "assets/web"):
-        (data_root / sub).mkdir(parents=True, exist_ok=True)
+    await to_thread.run_sync(_create_data_dirs_sync, data_root)
     logger.info("app_started", data_root=str(data_root), version=__version__)
     yield
     logger.info("app_stopped")
@@ -150,6 +160,9 @@ def resolve_spa_file(path: str) -> Path:
     Uses Path.is_relative_to (NOT a lexical startswith, which would let a
     sibling like dist-secret/ escape the served directory) so the result can
     never point outside FRONTEND_DIR.
+
+    Blocking (resolve + is_file touch the disk) and deliberately kept sync: callers on the
+    event loop run it through to_thread.run_sync.
     """
     dist = FRONTEND_DIR.resolve()
     candidate = (FRONTEND_DIR / path).resolve()
@@ -164,7 +177,9 @@ if FRONTEND_DIR.is_dir():
 
     @app.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
-        return FileResponse(resolve_spa_file(path))
+        # Highest-fan-out route in the app (every non-/api URL), and its resolve()+is_file()
+        # hit the bind-mounted volume — off the event loop.
+        return FileResponse(await to_thread.run_sync(resolve_spa_file, path))
 else:
     logger.warning("frontend_not_built", path=str(FRONTEND_DIR))
 

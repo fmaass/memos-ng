@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select, tuple_
@@ -223,7 +224,9 @@ async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail
     async with async_session() as db:
         user = await optional_user(request, db)
         allowed = await file_visible(db, user, uid)
-    if not allowed or not path.exists():
+    # Short-circuit preserved: a denied caller never costs a stat. The existence check itself
+    # goes off-loop — this is a high-fan-out media route on the bind-mounted volume.
+    if not allowed or not await to_thread.run_sync(path.exists):
         return JSONResponse({"message": "not found"}, status_code=404)
     # No shared cache may store these: the same URL is authorized per-caller now, and a
     # PUBLIC→PRIVATE flip must take effect on the very next request rather than being replayed

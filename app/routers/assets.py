@@ -63,21 +63,39 @@ def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
     return _derived_tier_path(attachment.uid, tier)
 
 
-def _serve_file(
+def _negotiated_path_sync(
+    path: Path, media_type: str, want_webp: bool
+) -> tuple[Path, str] | None:
+    """Pick the pre-generated webp variant when it was negotiated AND exists, else confirm the
+    original tier is there. None means 'nothing to serve' → the caller's 404.
+
+    Both existence checks live in ONE off-loop hop: this is the highest-fan-out path in the app
+    and the data volume is a bind-mounted share, so every stat is a network round-trip. (A webp
+    hit needs a single stat here — the old code re-stat'd the file it had just found.)"""
+    if want_webp:
+        webp = path.with_suffix(".webp")
+        if webp.exists():
+            return webp, "image/webp"
+    if not path.exists():
+        return None
+    return path, media_type
+
+
+async def _serve_file(
     path: Path, media_type: str, request: Request, format: str | None, cache_control: str
 ) -> FileResponse:
     # Prefer a pre-generated webp variant for image tiers when asked (falls back to JPEG if absent).
-    if media_type == "image/jpeg" and (
+    want_webp = media_type == "image/jpeg" and (
         format == "webp" or "image/webp" in request.headers.get("accept", "")
-    ):
-        webp = path.with_suffix(".webp")
-        if webp.exists():
-            path, media_type = webp, "image/webp"
-    if not path.exists():
+    )
+    resolved = await to_thread.run_sync(_negotiated_path_sync, path, media_type, want_webp)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Asset not generated yet")
     # Cache-Control is `private` (never `public`): these responses are either signature-scoped or
     # auth-gated to one viewer, so a shared/intermediary cache must not store and replay them.
-    return FileResponse(path, media_type=media_type, headers={"Cache-Control": cache_control})
+    return FileResponse(
+        resolved[0], media_type=resolved[1], headers={"Cache-Control": cache_control}
+    )
 
 
 async def _viewable(db: AsyncSession, user: User, uid: str) -> Attachment:
@@ -266,7 +284,7 @@ async def serve_rendition(uid: str, variant_key: str, request: Request) -> FileR
     if resolved is None:
         raise HTTPException(status_code=404, detail="Rendition not found")
     cache = f"private, max-age={settings.ASSET_CACHE_SECONDS}, immutable"  # immutable master
-    return _serve_file(Path(resolved[0]), resolved[1], request, None, cache)
+    return await _serve_file(Path(resolved[0]), resolved[1], request, None, cache)
 
 
 @router.get("/attachments/{uid}/{tier}")
@@ -297,7 +315,7 @@ async def serve_asset(
         # checker; verify_asset_sig already rejected a None/non-numeric exp.)
         remaining = (int(exp) - int(time.time())) if exp is not None else settings.ASSET_URL_TTL
         cache = f"private, max-age={max(1, remaining)}, immutable"
-        return _serve_file(resolved[0], resolved[1], request, format, cache)
+        return await _serve_file(resolved[0], resolved[1], request, format, cache)
     # UNSIGNED / AUTH PATH (original/print on THIS route): DB work in a short-lived session released
     # BEFORE streaming, so the download holds no pool connection either. (The /file/* compat route
     # is separate — app/routers/compat.py — and serves derived tiers only, per ADR-0004 /
@@ -313,7 +331,7 @@ async def serve_asset(
         raise HTTPException(status_code=404, detail="Unknown tier")
     # immutable uid-keyed bytes, but private (one authed viewer) — never cached by a shared proxy.
     cache = f"private, max-age={settings.ASSET_CACHE_SECONDS}, immutable"
-    return _serve_file(resolved[0], resolved[1], request, format, cache)
+    return await _serve_file(resolved[0], resolved[1], request, format, cache)
 
 
 def _all_asset_paths(att: Attachment) -> list[Path]:
