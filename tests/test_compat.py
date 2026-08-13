@@ -163,14 +163,27 @@ def test_single_memo_compat(client):
 
 
 def test_f2_file_serves_derived_tiers_only(client, monkeypatch, tmp_path):
-    """F2 ground truth: original /file/ → 404; ?thumbnail=true → the thumb tier."""
+    """F2 ground truth: original /file/ → 404; ?thumbnail=true → the thumb tier.
+
+    Both assertions are the captured contract, unchanged. The attachment is now seeded on a
+    PUBLIC memo because derived tiers are visibility-gated since MEMNG-25 — F2 fixes which
+    TIERS are served, and says nothing about serving a uid that has no attachment row.
+    """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     thumb = tmp_path / "assets" / "thumbs" / "fu.jpg"
     thumb.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (8, 8), (1, 2, 3)).save(thumb, "JPEG")
-
-    # original (no thumbnail, image) → 404 (not served, as prod today)
-    assert client.get("/file/attachments/fu/IMG.jpeg").status_code == 404
-    # ?thumbnail=true → 200 image/jpeg
-    r = client.get("/file/attachments/fu/IMG.jpeg?thumbnail=true")
-    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        owner = _seed_user(c, "compat_owner")
+        memo = _seed_memo(c, owner, "cmp-pub", "Public memo", "PUBLIC")
+        _seed_attachment(c, owner, memo, "fu", "IMG.jpeg", "image/jpeg", 1)
+    eng.dispose()
+    try:
+        # original (no thumbnail, image) → 404 (not served, as prod today)
+        assert client.get("/file/attachments/fu/IMG.jpeg").status_code == 404
+        # ?thumbnail=true → 200 image/jpeg
+        r = client.get("/file/attachments/fu/IMG.jpeg?thumbnail=true")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+    finally:
+        _cleanup("compat_owner")
