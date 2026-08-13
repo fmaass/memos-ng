@@ -56,6 +56,39 @@ async def _att(adb, uid):
     return (await adb.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one()
 
 
+def _print_path(uid):
+    """The committed print_path, read outside the app's session (the API never returns it)."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        pp = c.execute(
+            text("SELECT print_path FROM attachments WHERE uid=:u"), {"u": uid}
+        ).scalar_one()
+    eng.dispose()
+    return pp
+
+
+def _the_memo_folder(root):
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        ca, mu = c.execute(text("SELECT created_at, uid FROM memos")).first()
+    eng.dispose()
+    return storage.memo_dir(Path(str(root)), ca, mu)
+
+
+def _memo_with_screens(client, names, payloads):
+    """POST a memo carrying `names` as screen masters; returns the created memo JSON."""
+    uids = []
+    for name, body in zip(names, payloads, strict=True):
+        su = _start(client, name, "image/png", len(body))
+        client.patch(f"/api/uploads/{su}", content=body, headers={"Upload-Offset": "0"})
+        uids.append(su)
+    r = client.post(
+        "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": uids}
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
 async def test_screen_and_print_land_in_memo_folder_under_real_names(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     o = await _owner(adb, "pl_basic")
@@ -467,5 +500,182 @@ def test_reupload_print_to_unlinked_attachment_keeps_legacy_file(
         assert r2.status_code == 200
         got = client.get(f"/api/attachments/{att['uid']}/print")
         assert got.status_code == 200 and got.content == second  # latest content, file intact
+    finally:
+        _cleanup()
+
+
+def test_reupload_print_to_linked_attachment_replaces_it_in_place(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-78: re-uploading a print under the SAME client filename replaces the file print_path
+    already names — the memo-linked branch must not reserve `name (2)` beside it, which orphaned
+    the first master on disk and renumbered print_path on every re-upload."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"S" * 3000
+        memo = _memo_with_screens(client, ["beach.png"], [screen])
+        att_uid = memo["attachments"][0]["uid"]
+
+        first = PNG + b"first-print" * 300
+        second = PNG + b"second-print" * 400
+        r1 = client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("beach - print.tif", first, "image/tiff")},
+        )
+        assert r1.status_code == 200, r1.text
+        p1 = _print_path(att_uid)
+        r2 = client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("beach - print.tif", second, "image/tiff")},
+        )
+        assert r2.status_code == 200, r2.text
+        p2 = _print_path(att_uid)
+
+        assert p2 == p1  # print_path stable across the re-upload
+        folder = _the_memo_folder(tmp_path)
+        # no orphaned ` (2)` sibling: the folder holds the screen and exactly one print master
+        assert sorted(x.name for x in folder.iterdir()) == ["beach - print.tif", "beach.png"]
+        assert Path(p2).read_bytes() == second  # the bytes really were replaced
+        got = client.get(f"/api/attachments/{att_uid}/print")
+        assert got.status_code == 200 and got.content == second
+    finally:
+        _cleanup()
+
+
+def test_reupload_print_named_like_the_screen_keeps_its_numbered_name(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The common Lightroom case: the print export carries the screen master's filename, so the
+    FIRST placement is already collision-bumped to ` (2)`. A re-upload must land back on that same
+    file rather than climb to ` (3)` (which is the orphan bug wearing a different number)."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"S" * 3000
+        memo = _memo_with_screens(client, ["IMG_1234.png"], [screen])
+        att_uid = memo["attachments"][0]["uid"]
+
+        first = PNG + b"print-one" * 300
+        second = PNG + b"print-two" * 300
+        client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("IMG_1234.png", first, "image/png")},
+        )
+        p1 = _print_path(att_uid)
+        folder = _the_memo_folder(tmp_path)
+        assert Path(p1) == folder / "IMG_1234 (2).png"  # bumped off the screen master
+        r2 = client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("IMG_1234.png", second, "image/png")},
+        )
+        assert r2.status_code == 200, r2.text
+
+        assert _print_path(att_uid) == p1  # stable — no ` (3)`
+        assert sorted(x.name for x in folder.iterdir()) == ["IMG_1234 (2).png", "IMG_1234.png"]
+        assert Path(p1).read_bytes() == second
+        assert (folder / "IMG_1234.png").read_bytes() == screen  # the screen master is untouched
+    finally:
+        _cleanup()
+
+
+def test_reupload_print_under_a_new_name_removes_the_previous_file(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """A print re-uploaded under a DIFFERENT filename is a rename: print_path follows the new file
+    and the old one is removed, not left behind — nothing references it once print_path moves."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"S" * 3000
+        memo = _memo_with_screens(client, ["shore.png"], [screen])
+        att_uid = memo["attachments"][0]["uid"]
+
+        first = PNG + b"matte" * 300
+        second = PNG + b"glossy" * 300
+        client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("shore - matte.tif", first, "image/tiff")},
+        )
+        p1 = _print_path(att_uid)
+        assert Path(p1).exists()
+        r2 = client.post(
+            f"/api/attachments/{att_uid}/print",
+            files={"file": ("shore - glossy.tif", second, "image/tiff")},
+        )
+        assert r2.status_code == 200, r2.text
+        p2 = _print_path(att_uid)
+
+        assert Path(p2).name == "shore - glossy.tif" and p2 != p1
+        assert not Path(p1).exists()  # the superseded master is gone, not leaked
+        folder = _the_memo_folder(tmp_path)
+        assert sorted(x.name for x in folder.iterdir()) == ["shore - glossy.tif", "shore.png"]
+        got = client.get(f"/api/attachments/{att_uid}/print")
+        assert got.status_code == 200 and got.content == second
+    finally:
+        _cleanup()
+
+
+def test_first_print_upload_still_numbers_a_sibling_attachments_name(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The collision bump stays correct where it belongs: two DIFFERENT attachments in one memo,
+    each given a first print master under the same client filename, get two distinct files."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = _memo_with_screens(
+            client, ["one.png", "two.png"], [PNG + b"1" * 3000, PNG + b"2" * 3000]
+        )
+        uids = [a["uid"] for a in memo["attachments"]]
+        assert len(uids) == 2
+
+        bodies = {uids[0]: PNG + b"printA" * 300, uids[1]: PNG + b"printB" * 300}
+        for uid, body in bodies.items():
+            r = client.post(
+                f"/api/attachments/{uid}/print",
+                files={"file": ("art.tif", body, "image/tiff")},
+            )
+            assert r.status_code == 200, r.text
+
+        paths = {uid: _print_path(uid) for uid in uids}
+        assert len(set(paths.values())) == 2  # no attachment stole the other's file
+        assert sorted(Path(p).name for p in paths.values()) == ["art (2).tif", "art.tif"]
+        for uid, body in bodies.items():
+            assert Path(paths[uid]).read_bytes() == body
+    finally:
+        _cleanup()
+
+
+def test_reupload_print_to_unlinked_attachment_with_a_new_suffix_removes_the_old_file(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The same non-leak rule on the legacy branch: print/{uid}{suffix} is deterministic only for
+    an unchanged extension, so a re-upload as another format left the first file behind."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        screen = PNG + b"u" * 3000
+        su = _start(client, "loose.png", "image/png", len(screen))
+        client.patch(f"/api/uploads/{su}", content=screen, headers={"Upload-Offset": "0"})
+        att = client.post(f"/api/uploads/{su}/finalize").json()  # attachment, NOT in a memo
+
+        client.post(
+            f"/api/attachments/{att['uid']}/print",
+            files={"file": ("a.tif", PNG + b"tiff-print" * 100, "image/tiff")},
+        )
+        p1 = _print_path(att["uid"])
+        assert Path(p1).suffix == ".tif" and Path(p1).exists()
+        png_print = PNG + b"png-print" * 100
+        r2 = client.post(
+            f"/api/attachments/{att['uid']}/print",
+            files={"file": ("a.png", png_print, "image/png")},
+        )
+        assert r2.status_code == 200, r2.text
+        p2 = _print_path(att["uid"])
+
+        assert Path(p2).suffix == ".png" and Path(p2).read_bytes() == png_print
+        assert not Path(p1).exists()  # the superseded legacy file is gone
+        assert sorted(x.name for x in (Path(str(tmp_path)) / "print").iterdir()) == [Path(p2).name]
     finally:
         _cleanup()
