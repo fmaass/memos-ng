@@ -40,9 +40,15 @@ class AttachmentOut(BaseModel):
     duration: float | None
 
 
-async def _get_upload(db: AsyncSession, upload_uid: str) -> Upload:
+async def _get_upload(db: AsyncSession, upload_uid: str, owner_id: int) -> Upload:
+    """Resolve an upload session the caller OWNS. Scoping the lookup (rather than fetching then
+    comparing) makes another user's session answer exactly as an unknown uid does — same 404, same
+    body — so the endpoints disclose no existence. `owner_id IS NULL` rows predate the ownership
+    column and match no owner, so they fail closed here and age out via reap_expired."""
     upload = (
-        await db.execute(select(Upload).where(Upload.upload_uid == upload_uid))
+        await db.execute(
+            select(Upload).where(Upload.upload_uid == upload_uid, Upload.owner_id == owner_id)
+        )
     ).scalar_one_or_none()
     if upload is None:
         raise HTTPException(status_code=404, detail="Upload not found")
@@ -60,7 +66,12 @@ async def start_upload(
             status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
         )
     upload = await svc.create_upload(
-        db, filename=body.filename, mime=body.mime, size=body.size, last_modified=body.last_modified
+        db,
+        owner_id=user.id,
+        filename=body.filename,
+        mime=body.mime,
+        size=body.size,
+        last_modified=body.last_modified,
     )
     await db.commit()
     return UploadOut(
@@ -78,7 +89,7 @@ async def append_chunk(
     db: Annotated[AsyncSession, Depends(get_session)],
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
 ) -> UploadOut:
-    upload = await _get_upload(db, upload_uid)
+    upload = await _get_upload(db, upload_uid, user.id)
     try:
         upload = await svc.append_stream(db, upload, upload_offset, request.stream())
     except svc.UploadTooLarge as exc:
@@ -105,7 +116,7 @@ async def upload_offset(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> Response:
-    upload = await _get_upload(db, upload_uid)
+    upload = await _get_upload(db, upload_uid, user.id)
     return Response(status_code=200, headers={"Upload-Offset": str(upload.bytes_received)})
 
 
@@ -115,7 +126,7 @@ async def finalize_upload(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentOut:
-    upload = await _get_upload(db, upload_uid)
+    upload = await _get_upload(db, upload_uid, user.id)
     try:
         attachment = await svc.finalize(db, upload, owner_id=user.id)
     except ValueError as exc:

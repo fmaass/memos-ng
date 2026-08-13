@@ -192,6 +192,11 @@ class Upload(Base):
     __tablename__ = "uploads"
 
     upload_uid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # The session's creating user. Every verb (HEAD/append/finalize) is scoped to it, so a uid alone
+    # is not an authorization — knowing someone else's uid buys nothing. Nullable ONLY for rows
+    # predating the owner column: those have no verifiable creator, match no owner, and so fail
+    # closed on every verb until the expiry reaper removes them.
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     filename: Mapped[str] = mapped_column(String(512))
     mime: Mapped[str] = mapped_column(String(255))
     declared_size: Mapped[int] = mapped_column(BigInteger)

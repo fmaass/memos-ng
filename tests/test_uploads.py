@@ -5,8 +5,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.config import settings
+from app.main import app
 from app.models import Upload
 from app.services import uploads as svc
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
@@ -28,6 +30,63 @@ def _start(client, name, mime, size, mtime=1609459200000):
     )
     assert r.status_code == 201
     return r.json()["upload_uid"]
+
+
+def _login_as(monkeypatch, subject):
+    """A SECOND authenticated client. The conftest fixture is pinned to one subject, and ownership
+    is decided from the session's user — a cross-user test needs two real sessions, not two cookies
+    for the same one. Safe to call after the victim's session exists: that session resolves from its
+    SID cookie, so re-patching the token validator here cannot re-identify it."""
+    from unittest.mock import AsyncMock
+
+    from app import auth
+
+    client = TestClient(app, raise_server_exceptions=False)
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    monkeypatch.setattr(auth, "exchange_code", AsyncMock(return_value={"id_token": "x"}))
+    monkeypatch.setattr(
+        auth,
+        "validate_id_token",
+        lambda t: {"preferred_username": subject, "name": "O", "email": "o@x", "groups": []},
+    )
+    login = client.get("/api/auth/login", follow_redirects=False)
+    tx = login.cookies[auth.TX_COOKIE]
+    state = auth.decrypt(tx)["state"]
+    client.cookies.set(auth.TX_COOKIE, tx)
+    cb = client.get(f"/api/auth/callback?code=abc&state={state}", follow_redirects=False)
+    client.cookies.set(auth.SID_COOKIE, cb.cookies[auth.SID_COOKIE])
+    return client
+
+
+def _drop_user(subject):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
+    eng.dispose()
+
+
+def _attachment_owners():
+    """uid -> owning subject, read straight from the DB. The authoritative answer to 'whose bytes
+    are these' — the library listing also surfaces other users' PUBLIC media, so it cannot decide
+    ownership."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        rows = c.execute(
+            text("SELECT a.uid, u.subject FROM attachments a LEFT JOIN users u ON u.id=a.owner_id")
+        ).all()
+    eng.dispose()
+    return {uid: subject for uid, subject in rows}
+
+
+async def _owner(adb, subject):
+    """A real user row for the service-level tests — an upload session is bound to its creator, so
+    every create_upload needs an owner that actually exists (owner_id is an FK)."""
+    from app.models import User
+
+    u = User(subject=subject, role="user")
+    adb.add(u)
+    await adb.flush()
+    return u
 
 
 _LANES_SQL = (
@@ -128,7 +187,7 @@ async def test_dedup_is_per_owner(adb, monkeypatch, tmp_path):
 
     async def _finalize(owner_id, name):
         up = await svc.create_upload(
-            adb, filename=name, mime="application/octet-stream", size=len(data)
+            adb, owner_id=owner_id, filename=name, mime="application/octet-stream", size=len(data)
         )
         await svc.append_chunk(adb, up, 0, data)
         return await svc.finalize(adb, up, owner_id=owner_id)
@@ -151,9 +210,13 @@ async def test_finalize_pending_skips_incomplete_and_missing(adb, monkeypatch, t
     adb.add(u)
     await adb.flush()
     data = b"complete-bytes" * 100
-    done = await svc.create_upload(adb, filename="a.png", mime="image/png", size=len(data))
+    done = await svc.create_upload(
+        adb, owner_id=u.id, filename="a.png", mime="image/png", size=len(data)
+    )
     await svc.append_chunk(adb, done, 0, data)
-    incomplete = await svc.create_upload(adb, filename="b.png", mime="image/png", size=999999)
+    incomplete = await svc.create_upload(
+        adb, owner_id=u.id, filename="b.png", mime="image/png", size=999999
+    )
     uids = await svc.finalize_pending(
         adb, [done.upload_uid, incomplete.upload_uid, "nonexistent"], owner_id=u.id
     )
@@ -273,7 +336,9 @@ async def test_heic_finalize_routes_to_slow_lane(adb, monkeypatch, tmp_path):
     src = tmp_path / "src.heic"
     _make_heic(src)
     data = src.read_bytes()
-    up = await svc.create_upload(adb, filename="photo.heic", mime="image/heic", size=len(data))
+    up = await svc.create_upload(
+        adb, owner_id=u.id, filename="photo.heic", mime="image/heic", size=len(data)
+    )
     await svc.append_chunk(adb, up, 0, data)
     att = await svc.finalize(adb, up, owner_id=u.id)
 
@@ -366,8 +431,9 @@ async def test_append_accumulates_bytes_received_across_appends(adb, monkeypatch
     # the part file is the concatenation in order — nothing overwritten, nothing zero-filled.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     a, b = b"A" * 1000, b"B" * 700
+    o = await _owner(adb, "up_acc")
     up = await svc.create_upload(
-        adb, filename="acc.bin", mime="application/octet-stream", size=1700
+        adb, owner_id=o.id, filename="acc.bin", mime="application/octet-stream", size=1700
     )
     await svc.append_stream(adb, up, 0, _chunks([a[:400], a[400:]]))
     assert up.bytes_received == 1000
@@ -382,7 +448,10 @@ async def test_append_rejects_accumulated_total_and_keeps_committed_bytes(
     # Every individual chunk is far under the ceiling — only the accumulated total crosses it, so a
     # per-chunk check would let this through. The already-committed prefix must survive untouched.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    up = await svc.create_upload(adb, filename="c.bin", mime="application/octet-stream", size=200)
+    o = await _owner(adb, "up_ceil")
+    up = await svc.create_upload(
+        adb, owner_id=o.id, filename="c.bin", mime="application/octet-stream", size=200
+    )
     await svc.append_stream(adb, up, 0, _chunks([b"P" * 100]))
     with pytest.raises(svc.UploadTooLarge):
         await svc.append_stream(adb, up, 100, _chunks([b"x" * 50] * 20))
@@ -395,7 +464,10 @@ async def test_gap_and_replay_answer_before_consuming_the_body(adb, monkeypatch,
     # Offset precedence outranks the ceiling: a gap answers 409 and a replay answers no-op WITHOUT
     # pulling a single chunk, even when the body offered would blow the session ceiling.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    up = await svc.create_upload(adb, filename="p.bin", mime="application/octet-stream", size=800)
+    o = await _owner(adb, "up_gap")
+    up = await svc.create_upload(
+        adb, owner_id=o.id, filename="p.bin", mime="application/octet-stream", size=800
+    )
     await svc.append_stream(adb, up, 0, _chunks([b"P" * 400]))
     pulled = 0
 
@@ -439,7 +511,10 @@ async def test_append_stops_pulling_the_body_once_the_ceiling_is_passed(adb, mon
     # Receive-TIME enforcement: the body generator is abandoned the moment the running total passes
     # the ceiling, so an oversize upload is never pulled through in full (let alone buffered).
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    up = await svc.create_upload(adb, filename="s.bin", mime="application/octet-stream", size=500)
+    o = await _owner(adb, "up_stop")
+    up = await svc.create_upload(
+        adb, owner_id=o.id, filename="s.bin", mime="application/octet-stream", size=500
+    )
     pulled = 0
 
     async def body():
@@ -460,7 +535,10 @@ async def test_append_rejects_body_that_overshoots_once_landed_at_its_offset(
     # A body can fit the session's ceiling on its own yet overshoot once landed at its offset. That
     # comparison needs the SETTLED offset, so it is taken at merge time rather than while streaming.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    up = await svc.create_upload(adb, filename="o.bin", mime="application/octet-stream", size=800)
+    o = await _owner(adb, "up_over")
+    up = await svc.create_upload(
+        adb, owner_id=o.id, filename="o.bin", mime="application/octet-stream", size=800
+    )
     await svc.append_stream(adb, up, 0, _chunks([b"P" * 700]))
     with pytest.raises(svc.UploadTooLarge):  # 300 alone fits 800; landed at 700 it does not
         await svc.append_stream(adb, up, 700, _chunks([b"x" * 300]))
@@ -476,8 +554,9 @@ async def test_stale_append_that_streams_successfully_is_a_replay_under_the_lock
     # early exit while it was still true, so the decision that matters is the one re-taken under the
     # row lock: a replay no-op, NOT a second write at 0 that would overwrite A.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "up_stale")
     up = await svc.create_upload(
-        adb, filename="both.bin", mime="application/octet-stream", size=900
+        adb, owner_id=o.id, filename="both.bin", mime="application/octet-stream", size=900
     )
     b_in_flight, a_committed = asyncio.Event(), asyncio.Event()
 
@@ -505,8 +584,9 @@ async def test_failed_append_cannot_destroy_a_concurrent_appends_bytes(adb, monk
     # be byte-for-byte intact with no zero-filled region, and B's stale offset must resolve as a
     # replay no-op against the REFRESHED offset rather than overwriting A.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "up_race")
     up = await svc.create_upload(
-        adb, filename="race.bin", mime="application/octet-stream", size=900
+        adb, owner_id=o.id, filename="race.bin", mime="application/octet-stream", size=900
     )
     b_in_flight, a_committed = asyncio.Event(), asyncio.Event()
 
@@ -601,5 +681,151 @@ def test_append_offset_gap_and_replay_still_behave(logged_in_client, monkeypatch
         )
         assert big_replay.status_code == 200 and big_replay.json()["bytes_received"] == 400
         assert svc.part_path(uid).stat().st_size == 400
+    finally:
+        _cleanup()
+
+
+def test_cross_user_head_append_finalize_are_404_and_leave_the_session_intact(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # An upload_uid is not a capability. Another authenticated user who learns one must get the
+    # SAME answer as for a uid that never existed on every verb — otherwise a leaked uid lets them
+    # read the offset (HEAD), corrupt the bytes (append), or finalize the victim's file into an
+    # attachment stamped with THEIR owner_id.
+    victim, victim_subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"V" * 4000
+        uid = _start(victim, "victim.png", "image/png", len(data))
+        victim.patch(f"/api/uploads/{uid}", content=data[:2000], headers={"Upload-Offset": "0"})
+
+        attacker = _login_as(monkeypatch, "upload_thief")
+        ghost = "a-uid-that-never-existed"
+
+        # HEAD — probing an in-flight session
+        head, head_ghost = (attacker.head(f"/api/uploads/{x}") for x in (uid, ghost))
+        assert head.status_code == 404
+        assert (head.status_code, head.text) == (head_ghost.status_code, head_ghost.text)
+        assert "Upload-Offset" not in head.headers  # the victim's progress is not disclosed
+
+        # APPEND — a well-formed continuation at the victim's real offset
+        at_2000 = {"Upload-Offset": "2000"}
+        patch, patch_ghost = (
+            attacker.patch(f"/api/uploads/{x}", content=b"X" * 100, headers=at_2000)
+            for x in (uid, ghost)
+        )
+        assert patch.status_code == 404
+        assert (patch.status_code, patch.text) == (patch_ghost.status_code, patch_ghost.text)
+
+        # FINALIZE — of a now fully-received session
+        victim.patch(f"/api/uploads/{uid}", content=data[2000:], headers={"Upload-Offset": "2000"})
+        fin, fin_ghost = (attacker.post(f"/api/uploads/{x}/finalize") for x in (uid, ghost))
+        assert fin.status_code == 404
+        assert (fin.status_code, fin.text) == (fin_ghost.status_code, fin_ghost.text)
+        assert _attachment_owners() == {}  # nothing was finalized for anyone
+
+        # the victim's session is untouched by all of it, and still finalizes to the victim
+        assert victim.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == str(len(data))
+        assert svc.part_path(uid).read_bytes() == data  # no foreign bytes were merged in
+        own = victim.post(f"/api/uploads/{uid}/finalize")
+        assert own.status_code == 200
+        assert _attachment_owners() == {own.json()["uid"]: victim_subject}
+    finally:
+        _cleanup()
+        _drop_user("upload_thief")
+
+
+def test_cross_user_memo_create_and_edit_treat_a_foreign_upload_uid_as_unknown(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # The direct routes are not the only door: POST /api/memos and PATCH /api/memos/{uid} carry
+    # upload_uids into finalize_pending, which stamps the SUBMITTING user as owner. A foreign uid
+    # must be indistinguishable from an unknown one there too.
+    victim, victim_subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"W" * 4000
+        uid = _start(victim, "victim2.png", "image/png", len(data))
+        victim.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        ghost = "a-uid-that-never-existed"
+
+        attacker = _login_as(monkeypatch, "memo_thief")
+        stolen, stolen_ghost = (
+            attacker.post(
+                "/api/memos",
+                json={"content": "mine now", "visibility": "PUBLIC", "upload_uids": [x]},
+            )
+            for x in (uid, ghost)
+        )
+        assert stolen.status_code == stolen_ghost.status_code == 201
+        assert stolen.json()["attachments"] == stolen_ghost.json()["attachments"] == []
+
+        target = attacker.post(
+            "/api/memos", json={"content": "edit me", "visibility": "PUBLIC"}
+        ).json()
+        edited, edited_ghost = (
+            attacker.patch(f"/api/memos/{target['uid']}", json={"upload_uids": [x]})
+            for x in (uid, ghost)
+        )
+        assert edited.status_code == edited_ghost.status_code == 200
+        assert edited.json()["attachments"] == edited_ghost.json()["attachments"] == []
+        assert _attachment_owners() == {}  # no attachment was created for the submitter
+
+        # the victim's completed session survived both attempts and still finalizes to the victim
+        assert victim.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == str(len(data))
+        mine = victim.post(
+            "/api/memos", json={"content": "mine", "visibility": "PUBLIC", "upload_uids": [uid]}
+        ).json()
+        assert len(mine["attachments"]) == 1
+        assert _attachment_owners() == {mine["attachments"][0]["uid"]: victim_subject}
+    finally:
+        _cleanup()
+        _drop_user("memo_thief")
+
+
+def test_pre_ownership_upload_row_fails_closed_on_every_verb(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # A row created before the owner column carries owner_id NULL. It has no verifiable creator, so
+    # it is claimable by NOBODY — every verb answers 404 and it ages out via the expiry reaper.
+    # Anything else would hand the whole in-flight population to the first user who submits its uid.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    uid = "legacy-null-owner-uid"
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"N" * 4000
+        part = svc.part_path(uid)
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(data)  # fully received: only ownership can stop it being finalized
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(
+                text(
+                    "INSERT INTO uploads (upload_uid, owner_id, filename, mime, declared_size,"
+                    " bytes_received, expires_at) VALUES (:u, NULL, 'legacy.png', 'image/png',"
+                    " :s, :s, now() + interval '1 hour')"
+                ),
+                {"u": uid, "s": len(data)},
+            )
+        eng.dispose()
+
+        assert client.head(f"/api/uploads/{uid}").status_code == 404
+        assert client.patch(
+            f"/api/uploads/{uid}", content=b"x" * 10, headers={"Upload-Offset": str(len(data))}
+        ).status_code == 404
+        assert client.post(f"/api/uploads/{uid}/finalize").status_code == 404
+        memo = client.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
+        )
+        assert memo.status_code == 201 and memo.json()["attachments"] == []
+        assert _attachment_owners() == {}  # the orphaned bytes became nobody's attachment
+
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:  # the row itself is untouched, so the reaper can still collect it
+            still_there = c.execute(
+                text("SELECT bytes_received FROM uploads WHERE upload_uid = :u"), {"u": uid}
+            ).scalar_one()
+        eng.dispose()
+        assert still_there == len(data)
     finally:
         _cleanup()
