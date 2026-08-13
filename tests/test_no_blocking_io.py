@@ -66,25 +66,27 @@ SQL_ROOTS = frozenset({"select", "insert", "update", "delete", "exists", "text",
 
 MARKER = "blocking-ok:"
 
-# Every deliberately-inline site, as (module, enclosing async function, call). Pinned so that
-# adding a `# blocking-ok:` marker anywhere else fails this test rather than passing silently.
-EXPECTED_EXEMPTIONS: frozenset[tuple[str, str, str]] = frozenset(
+# Every deliberately-inline site, as (module, enclosing async function, call) with its
+# MULTIPLICITY — a plain set would collapse repeated identities, letting a new marked call that
+# shares an existing tuple pass without a registry edit. Pinned so that adding a `# blocking-ok:`
+# marker anywhere else fails this test rather than passing silently.
+EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
     {
         # --- worker process only: app/worker.py and app/services/media.py are imported by nothing
         # else under app/ (verified), so none of this runs on the request loop. worker.run() is a
         # strictly sequential single-job loop with no concurrent tasks, so an off-loop hop here
         # would delay nobody.
-        ("app/worker.py", "run", "beat"),  # x3 call sites, one label
-        ("app/services/media.py", "guard_publish", "discard_outputs"),
-        ("app/services/media.py", "process_slow", "too_hot"),
-        ("app/services/media.py", "process_slow", "mkdir"),
-        ("app/services/media.py", "process_slow", "unlink"),
-        ("app/services/media.py", "process_slow", "os.replace"),
-        ("app/services/media.py", "process_slow", "_stamp_mtime"),
-        ("app/services/media.py", "process_job", "process_image"),
-        ("app/services/media.py", "process_job", "process_video_poster"),
-        ("app/services/media.py", "_await_group_exit", "_group_alive"),
-        ("app/services/media.py", "_stop_transcode", "_group_alive"),
+        ("app/worker.py", "run", "beat"): 3,
+        ("app/services/media.py", "guard_publish", "discard_outputs"): 1,
+        ("app/services/media.py", "process_slow", "too_hot"): 1,
+        ("app/services/media.py", "process_slow", "mkdir"): 1,
+        ("app/services/media.py", "process_slow", "unlink"): 1,
+        ("app/services/media.py", "process_slow", "os.replace"): 1,
+        ("app/services/media.py", "process_slow", "_stamp_mtime"): 1,
+        ("app/services/media.py", "process_job", "process_image"): 2,
+        ("app/services/media.py", "process_job", "process_video_poster"): 1,
+        ("app/services/media.py", "_await_group_exit", "_group_alive"): 1,
+        ("app/services/media.py", "_stop_transcode", "_group_alive"): 1,
     }
 )
 
@@ -261,11 +263,14 @@ def test_no_inline_blocking_fs_calls_in_async_functions() -> None:
 
 def test_exemptions_are_exactly_the_pinned_set() -> None:
     """A new `# blocking-ok:` marker must be declared here — the escape hatch stays visible."""
+    from collections import Counter
+
     _, exemptions = _scan_app()
-    found = frozenset(exemptions)
-    assert found == EXPECTED_EXEMPTIONS, (
-        f"undeclared exemptions: {sorted(found - EXPECTED_EXEMPTIONS)}\n"
-        f"stale declarations: {sorted(EXPECTED_EXEMPTIONS - found)}"
+    found = Counter(exemptions)
+    expected = Counter(EXPECTED_EXEMPTIONS)
+    assert found == expected, (
+        f"undeclared exemptions: {sorted((found - expected).elements())}\n"
+        f"stale declarations: {sorted((expected - found).elements())}"
     )
 
 
