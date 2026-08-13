@@ -225,6 +225,21 @@ async def run_once(db: AsyncSession) -> str:
         job.claimed_by = None
         await db.commit()
         return "deferred"
+    except media.AttachmentGone as exc:
+        # The attachment was deleted while this job sat queued or ran (MEMNG-41). Nothing is left
+        # to derive, nothing to notify, and no attempt to count — the job is discarded here,
+        # where this worker still holds the row lock. That row is precisely the one
+        # delete_attachment could NOT remove (it skips locked rows rather than waiting out a
+        # transcode), so dropping it is the second half of that delete, not bookkeeping.
+        # A commit failure here is left to run_media_drain: the claim rolls back to `queued` and
+        # the next poll discards the job again.
+        job_id = job.id  # the commit expires the instance — keep the id for the log line
+        await db.delete(job)
+        await db.commit()
+        logger.info(
+            "media_job_discarded", job_id=job_id, attachment_id=attachment_id, reason=str(exc)
+        )
+        return "processed"
     except Exception as exc:  # a bad input must not kill the worker
         return await _record_job_failure(db, job, attachment_id, exc)
 

@@ -32,6 +32,76 @@ def _assets(sub: str) -> Path:
     return Path(settings.DATA_ROOT) / "assets" / sub
 
 
+class AttachmentGone(Exception):
+    """Raised when the attachment a job derives from was deleted while the job was running.
+
+    Not a failure of the job: the work is simply moot (MEMNG-41). `delete_attachment` never waits
+    for a running job, so the row can vanish under one at any moment; the worker discards the job
+    instead of counting an attempt against an attachment that no longer exists.
+    """
+
+
+def derived_outputs(uid: str) -> list[Path]:
+    """Every file a media job writes for one attachment — final tiers AND their in-flight temps.
+
+    Used to sweep a job's output when its attachment turns out to be deleted. The temps matter as
+    much as the finals: an abandoned `.tmp.mp4` of a 4K clip is the biggest file the worker ever
+    holds, and nothing else reaps it.
+    """
+    web = _assets("web")
+    return [
+        _assets("thumbs") / f"{uid}.jpg",
+        _assets("thumbs") / f"{uid}.jpg.tmp",  # _atomic_save
+        _assets("mobile") / f"{uid}.jpg",
+        _assets("mobile") / f"{uid}.jpg.tmp",
+        web / f"{uid}.poster.jpg",
+        web / f"{uid}.poster.tmp.jpg",  # process_video_poster
+        web / f"{uid}.mp4",
+        web / f"{uid}.tmp.mp4",  # process_slow
+    ]
+
+
+def discard_outputs(uid: str) -> None:
+    for path in derived_outputs(uid):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:  # best-effort sweep; the attachment row is already gone
+            pass
+
+
+async def attachment_still_exists(db: AsyncSession, attachment_id: int) -> bool:
+    """Re-read the attachment row UNDER A ROW LOCK, at the point where a job publishes its result.
+
+    This is the serialization point with `delete_attachment`, which no longer waits for a running
+    job (MEMNG-41). Without it, a transcode finishing a moment after a delete would `os.replace`
+    its output into place and resurrect a file the delete had already swept. With it, only two
+    orders are possible, both clean:
+
+    * this job wins — the delete blocks on this lock for the publish alone (milliseconds, until
+      the job's commit), then unlinks the just-published tier along with the rest;
+    * the delete wins — the row is already gone, this returns False, and the caller discards its
+      output instead of publishing it.
+
+    The lock is taken here and released by the job's commit; it is NEVER held across the transcode.
+    """
+    return (
+        await db.execute(
+            select(Attachment.id).where(Attachment.id == attachment_id).with_for_update()
+        )
+    ).scalar_one_or_none() is not None
+
+
+async def guard_publish(db: AsyncSession, attachment: Attachment) -> None:
+    """Checkpoint a job must pass before writing its result. Raises AttachmentGone (after sweeping
+    the files this run produced) when the attachment was deleted mid-job — which also keeps the
+    job from flushing an UPDATE against a row that no longer exists (0 rows → StaleDataError,
+    a spurious 'failure' for work nobody wants any more)."""
+    if await attachment_still_exists(db, attachment.id):
+        return
+    discard_outputs(attachment.uid)
+    raise AttachmentGone(f"attachment {attachment.id} was deleted while its job was running")
+
+
 def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
@@ -404,6 +474,10 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
 
+    # The delete endpoint does not wait for this job, so the attachment may have gone away during
+    # the transcode. Check under the row lock BEFORE publishing: past this point the tmp file
+    # becomes the served web tier, and republishing it after a delete would resurrect it.
+    await guard_publish(db, attachment)  # sweeps tmp + any tier files when the delete won
     os.replace(tmp, dest)  # atomic; poster was written by the fast lane first
     _stamp_mtime(dest, attachment)
     job.progress_pct = 100
@@ -416,7 +490,12 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     raises ThermalDefer to re-queue without counting a failure."""
     attachment = (
         await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
-    ).scalar_one()
+    ).scalar_one_or_none()
+    if attachment is None:
+        # Deleted before this job got its turn: delete_attachment removes every job row it can
+        # lock, but not one a worker already holds — and a claim that rolls back (restart, failed
+        # outcome write) returns that row to `queued` for a later poll (MEMNG-41).
+        raise AttachmentGone(f"attachment {job.attachment_id} no longer exists")
 
     if job.lane is JobLane.slow:
         if attachment.mime.startswith("video/"):
@@ -425,6 +504,7 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
             # Heavy image (HEIC/AVIF): the CPU-costly libheif decode + derivative generation runs
             # on the slow (Merkur) worker. process_image never touches the original (ADR-0008).
             meta = process_image(attachment)
+            await guard_publish(db, attachment)
             attachment.width = meta.get("width")
             attachment.height = meta.get("height")
             attachment.blurhash = meta.get("blurhash")
@@ -435,6 +515,7 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     is_video = attachment.mime.startswith("video/")
     meta = process_video_poster(attachment) if is_video else process_image(attachment)
 
+    await guard_publish(db, attachment)
     attachment.width = meta.get("width")
     attachment.height = meta.get("height")
     attachment.duration = meta.get("duration")

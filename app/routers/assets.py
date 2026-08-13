@@ -343,13 +343,38 @@ async def delete_attachment(
     """Delete an attachment — OWNER-only (a mutation, unlike viewing). Removes its media jobs,
     DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
     memo keeps its text; only the media is removed."""
+    # (Kept out of the docstring, which FastAPI publishes as this endpoint's OpenAPI description.)
+    # This request NEVER waits on a running media job. A worker claims a job with SELECT … FOR
+    # UPDATE and holds that row lock until the job commits — for a slow-lane transcode, the whole
+    # run (up to SLOW_TRANSCODE_TIMEOUT_S). Both statements this used to issue queued behind that
+    # lock: the plain `DELETE FROM media_jobs WHERE attachment_id = …`, and the attachment delete
+    # itself through the old FK's ON DELETE CASCADE. Either one pinned a request-serving
+    # connection for the transcode's duration, and a handful of those exhaust DB_POOL_SIZE +
+    # overflow on the shared Postgres (MEMNG-41). So the FK is gone (see MediaJob) and the job
+    # cleanup below takes only the rows it can lock immediately; the in-flight row belongs to its
+    # worker, which discards job and partial output on finding the attachment gone
+    # (media.AttachmentGone → worker.run_once).
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")
     paths = _all_asset_paths(att)
-    await db.execute(sa_delete(MediaJob).where(MediaJob.attachment_id == att.id))
+    unlocked_jobs = (
+        select(MediaJob.id)
+        .where(MediaJob.attachment_id == att.id)
+        .with_for_update(skip_locked=True)
+    )
+    await db.execute(
+        sa_delete(MediaJob)
+        .where(MediaJob.id.in_(unlocked_jobs))
+        .execution_options(synchronize_session=False)
+    )
     await db.delete(att)
     await db.commit()
+    # After the commit, so a worker that published a derived tier while this request was in flight
+    # published it BEFORE the row vanished (its publish holds the attachment row lock, which this
+    # delete waits on for those milliseconds) — and `paths` covers every uid-derived tier, so the
+    # sweep below removes it. Nothing the worker writes after this point survives: it re-reads the
+    # row under that lock and discards its output when the row is gone.
     await to_thread.run_sync(_unlink_all, paths)
 
 
