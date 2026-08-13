@@ -19,7 +19,10 @@ SYNC_URL = os.environ.get(
     "DATABASE_URL_SYNC", "postgresql+psycopg2://memosng:memosng@localhost:5433/memosng"
 )
 # Import-time, not fixture-time: collection must die before anything connects.
+# Both engines are checked — the sync bootstrap that drops the schema AND the
+# app's async engine, which API-driven tests commit real deletes through.
 assert_database_is_disposable(SYNC_URL)
+assert_database_is_disposable(async_engine.url)
 
 
 @pytest.fixture(scope="session")
