@@ -385,6 +385,13 @@ def _stream(width=320, height=240, *, side_data=None, tags=None):
         (-89.9998, 270),  # atan2 noise still has to land on a quarter turn
         ("90", 90),  # the legacy tag arrives as a string
         (45, 0),  # not a quarter turn: no swap can express it
+        # float() swallows these; round() then raises (OverflowError / ValueError). A junk
+        # rotation field must read as "no rotation", never take the whole probe down with it.
+        (float("inf"), 0),
+        (float("-inf"), 0),
+        (float("nan"), 0),
+        ("inf", 0),
+        ("nan", 0),
         ("", 0),
         ("north", 0),
         (None, 0),
@@ -438,15 +445,15 @@ def test_display_matrix_wins_over_a_disagreeing_rotate_tag():
     assert media.displayed_size(rotated) == (240, 320)
 
 
-def _write_clip(path, rotation=None):
-    """A 1s 320x240 clip, optionally stamped with a display matrix (stream-copied, so the frames
+def _write_clip(path, rotation=None, size="320x240"):
+    """A 1s clip, optionally stamped with a display matrix (stream-copied, so the frames
     stay landscape and only the rotation metadata differs from the control)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     src = [
         "-f",
         "lavfi",
         "-i",
-        "testsrc=duration=1:size=320x240:rate=5",
+        f"testsrc=duration=1:size={size}:rate=5",
         "-pix_fmt",
         "yuv420p",
     ]
@@ -515,3 +522,152 @@ def test_ffprobe_reports_displayed_dims_for_a_real_rotated_clip(tmp_path):
         320,
         240,
     )
+
+
+# --- stream selection (MEMNG-40 micro-round) -----------------------------------------------
+# The probe and BOTH ffmpeg lanes have to measure and render the same stream. ffmpeg's default
+# selection takes the highest-RESOLUTION video stream, which is neither the first one nor the
+# one a `v:0` probe measures — so the two disagreed on any multi-stream or cover-art file.
+
+
+def _vstream(index, width, height, attached_pic=None):
+    stream = {"index": index, "codec_type": "video", "width": width, "height": height}
+    if attached_pic is not None:
+        stream["disposition"] = {"attached_pic": attached_pic}
+    return stream
+
+
+def test_select_video_stream_skips_an_attached_picture():
+    # v:0 IS the cover art here (a music file's album art is a 1-frame video stream). Measuring
+    # it would report the artwork's shape for the clip sitting next to it.
+    cover = _vstream(0, 64, 64, attached_pic=1)
+    clip = _vstream(1, 320, 240, attached_pic=0)
+    assert media.select_video_stream([cover, clip]) is clip
+    assert media.displayed_size(media.select_video_stream([cover, clip])) == (320, 240)
+
+
+def test_select_video_stream_takes_the_first_not_the_biggest():
+    # The alignment invariant. ffmpeg's DEFAULT selection would take the 640x480 stream — that
+    # skew is exactly what `-map 0:V:0` removes, so the probe must pick first-by-index like it.
+    first = _vstream(0, 320, 240, attached_pic=0)
+    bigger = _vstream(1, 640, 480, attached_pic=0)
+    assert media.select_video_stream([first, bigger]) is first
+
+
+def test_select_video_stream_treats_a_missing_disposition_as_not_attached():
+    plain = _vstream(0, 320, 240)  # no `disposition` key at all, as ffmpeg reads a missing flag
+    assert media.select_video_stream([plain]) is plain
+
+
+@pytest.mark.parametrize(
+    "streams",
+    [
+        [],
+        [_vstream(0, 64, 64, attached_pic=1)],
+        [None],
+        [_vstream(0, 64, 64, attached_pic=1), None],
+    ],
+)
+def test_select_video_stream_reports_nothing_renderable(streams):
+    # The same answer ffmpeg gives: with no non-attached-pic video stream, `-map 0:V:0` matches
+    # nothing and the command fails outright, so there are no dimensions to report either.
+    assert media.select_video_stream(streams) == {}
+    assert media.displayed_size(media.select_video_stream(streams)) == (None, None)
+
+
+def test_probe_asks_for_every_video_stream():
+    cmd = media.probe_cmd("/in.mov")
+    # `v`, never `v:0` — the attached-picture exclusion cannot be expressed as an index.
+    assert cmd[cmd.index("-select_streams") + 1] == "v"
+    assert "-show_streams" in cmd  # the only form that carries side_data_list AND tags
+    assert cmd[-1] == "/in.mov"
+
+
+def test_both_ffmpeg_lanes_pin_the_probed_stream():
+    poster = media.poster_ffmpeg_cmd("/in.mov", "/out.jpg", 100.0)
+    slow = media.slow_ffmpeg_cmd("/in.mov", "/out.mp4", 1)
+    for cmd in (poster, slow):
+        # directly after the input, and the same specifier select_video_stream mirrors
+        i = cmd.index("-i")
+        assert cmd[i + 2 : i + 4] == ["-map", media.VIDEO_STREAM_MAP] == ["-map", "0:V:0"]
+    # Naming any -map turns ffmpeg's automatic selection OFF, so the audio has to be re-mapped
+    # or every transcoded clip loses its sound.
+    assert "0:a:0?" in slow
+    # ...and the `?` is not decoration: the bare form is fatal on a source with no audio track,
+    # which is most screen recordings and every lavfi fixture in this suite.
+    assert "0:a:0" not in slow
+    assert not any(a.startswith("0:a") for a in poster)  # a JPEG has no audio to map
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_probe_and_transcode_agree_on_a_multi_stream_container(tmp_path):
+    # End-to-end proof of the skew and its fix: a container whose FIRST video stream is the
+    # smaller one. Unpinned, ffmpeg renders the 640x480 stream while the probe measured the
+    # 320x240 one, and the stored dimensions describe a picture the web tier does not contain.
+    small, big = tmp_path / "small.mp4", tmp_path / "big.mp4"
+    _write_clip(small)
+    _write_clip(big, size="640x480")
+    both = tmp_path / "both.mkv"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(small), "-i", str(big), "-map", "0:v", "-map", "1:v"]
+        + ["-c", "copy", str(both)],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+
+    probed = media._ffprobe(str(both))
+    assert (probed["width"], probed["height"]) == (320, 240)  # the first stream, not the biggest
+
+    web = tmp_path / "web.mp4"
+    subprocess.run(
+        media.slow_ffmpeg_cmd(str(both), str(web), 1), capture_output=True, check=True, timeout=120
+    )
+    rendered = media._ffprobe(str(web))
+    assert (rendered["width"], rendered["height"]) == (probed["width"], probed["height"])
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_slow_lane_keeps_audio_and_survives_a_silent_source(tmp_path):
+    # The `-map 0:a:0?` half of the pair, both ways round: audio must still reach the web tier
+    # (naming a -map disables ffmpeg's automatic audio selection), and a source with no audio
+    # at all must still transcode (that is what the trailing `?` buys).
+    def _codec_types(path):
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"]
+            + [str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        return sorted(out.split())
+
+    with_audio = tmp_path / "av.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=5"]
+        + ["-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-pix_fmt", "yuv420p"]
+        + ["-c:a", "aac", str(with_audio)],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    out_av = tmp_path / "av-web.mp4"
+    subprocess.run(
+        media.slow_ffmpeg_cmd(str(with_audio), str(out_av), 1),
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    assert _codec_types(out_av) == ["audio", "video"]
+
+    silent = tmp_path / "silent.mp4"
+    _write_clip(silent)
+    out_silent = tmp_path / "silent-web.mp4"
+    subprocess.run(  # check=True: a bare `-map 0:a:0` exits 234 here
+        media.slow_ffmpeg_cmd(str(silent), str(out_silent), 1),
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    assert _codec_types(out_silent) == ["video"]

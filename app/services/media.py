@@ -159,8 +159,12 @@ def _as_quarter_turn(value: object) -> int | None:
     if not isinstance(value, int | float | str):
         return None
     try:
+        # BOTH exceptions are reachable from a malformed probe, and neither is hypothetical:
+        # float() accepts "inf"/"nan" happily, and round() then raises — OverflowError on an
+        # infinity, ValueError on a NaN. Uncaught, one junk rotation field would take down the
+        # whole probe (no dims, no duration) for a file that is otherwise perfectly playable.
         degrees = round(float(value)) % 360
-    except ValueError:
+    except (OverflowError, ValueError):
         return None
     return degrees if degrees in QUARTER_TURNS else None
 
@@ -202,33 +206,73 @@ def displayed_size(stream: dict) -> tuple[int | None, int | None]:
     return width, height
 
 
+VIDEO_STREAM_MAP = "0:V:0"  # the ONE stream the probe measures and both ffmpeg lanes render
+
+
+def select_video_stream(streams: list) -> dict:
+    """The video stream the derived tiers are actually made from — ffmpeg's `0:V:0`.
+
+    This has to agree with the ffmpeg commands or the whole probe describes the wrong picture.
+    ffmpeg's DEFAULT stream selection (no -map) picks the highest-RESOLUTION video stream, which
+    is not the first one: on a two-stream container a `v:0` probe measured 320x240 while the
+    transcode produced 640x480 (reproduced in the runtime image). So both lanes now pass an
+    explicit `-map 0:V:0` and this picks the same stream by the same rule.
+
+    `V` (as opposed to `v`) is ffmpeg's specifier for video streams that are NOT attached
+    pictures — the cover art in a music file is a 1-frame video stream, and measuring the album
+    art instead of the movie is the same bug in a different disguise. A stream with no
+    `disposition` at all counts as not-attached, which is how ffmpeg reads a missing flag too.
+
+    Returns {} when nothing qualifies. That is deliberately the same answer ffmpeg gives: with no
+    non-attached-pic video stream, `-map 0:V:0` fails the command outright ("Stream map '' matches
+    no streams", exit 234), so reporting no dimensions keeps the two consistent — better than
+    inventing dimensions from cover art that no derived tier will ever be rendered from.
+    """
+    for stream in streams:
+        if isinstance(stream, dict) and not (stream.get("disposition") or {}).get("attached_pic"):
+            return stream
+    return {}
+
+
+def probe_cmd(path: str) -> list[str]:
+    """The ffprobe argv (sibling of poster_ffmpeg_cmd / slow_ffmpeg_cmd — a builder so the two
+    choices encoded here stay unit-testable).
+
+    `-show_streams`, rather than a narrower `-show_entries stream=width,height`, because the
+    rotation has to come back too and the entry filter cannot reach into the side-data list:
+    `stream=...,side_data_list` yields entries stripped to `{}` (verified on ffprobe 7.1.5).
+    Only the child-section form `stream_side_data=rotation` selects it, and depending on that
+    section name would fail SILENTLY — as a rotation that reads absent, i.e. straight back into
+    this bug — if it were ever renamed. -show_streams carries both sources unconditionally.
+
+    `-select_streams v` asks for EVERY video stream, not `v:0`: picking the right one is
+    select_video_stream's job, because the attached-picture exclusion cannot be expressed as an
+    index and `v:0` would hand back the cover art of a music file.
+    """
+    return [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        path,
+    ]
+
+
 def _ffprobe(path: str) -> dict:
-    # -show_streams (rather than a narrower `-show_entries stream=width,height`) because the
-    # rotation has to come back too, and the entry filter cannot reach into the side-data list:
-    # `stream=...,side_data_list` yields entries stripped to `{}` (verified on ffprobe 7.1.5).
-    # Only the child-section form `stream_side_data=rotation` selects it, and depending on that
-    # section name would fail SILENTLY — as a rotation that reads absent, i.e. straight back into
-    # this bug — if it were ever renamed. -show_streams carries both sources unconditionally.
     out = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            path,
-        ],
+        probe_cmd(path),
         capture_output=True,
         text=True,
         timeout=30,
         check=True,
     ).stdout
     data = json.loads(out)
-    stream = (data.get("streams") or [{}])[0]
+    stream = select_video_stream(data.get("streams") or [])
     duration = data.get("format", {}).get("duration")
     width, height = displayed_size(stream)
     return {
@@ -249,7 +293,11 @@ def poster_seek_seconds(duration: float | None) -> float:
 def poster_ffmpeg_cmd(src: str, dest: str, duration: float | None) -> list[str]:
     """Pick a representative 'hero' frame: seek past the intro, then ffmpeg's `thumbnail`
     filter selects the frame most different from its neighbours' average over a 100-frame
-    window — the industry-standard cheap heuristic, instead of the odd first frame."""
+    window — the industry-standard cheap heuristic, instead of the odd first frame.
+
+    `-map 0:V:0` pins the poster to the SAME stream the probe measured (see
+    select_video_stream); without it ffmpeg auto-selects by resolution and a multi-stream
+    container gets a poster whose shape contradicts the stored dimensions."""
     return [
         "ffmpeg",
         "-y",
@@ -257,6 +305,8 @@ def poster_ffmpeg_cmd(src: str, dest: str, duration: float | None) -> list[str]:
         f"{poster_seek_seconds(duration):.2f}",
         "-i",
         src,
+        "-map",
+        VIDEO_STREAM_MAP,
         "-vf",
         "thumbnail=100",
         "-frames:v",
@@ -322,12 +372,27 @@ def slow_ffmpeg_cmd(src: str, dest: str, threads: int) -> list[str]:
     Built separately from process_slow so the argv is unit-testable and substitutable — the
     timeout tests drive the real subprocess machinery with a stub binary instead of relying on
     real ffmpeg wedging.
+
+    The two -map arguments are a pair and neither is optional:
+
+    * `-map 0:V:0` pins the transcode to the stream the probe measured (see select_video_stream).
+      ffmpeg's default selection picks the highest-RESOLUTION video stream instead, so on a
+      multi-stream container the web tier and the stored dimensions described different pictures.
+    * `-map 0:a:0?` only puts back what the default selection was already doing. Naming ANY -map
+      switches ffmpeg out of automatic selection entirely, so the video map alone would silently
+      drop the audio track from every transcoded clip. The trailing `?` is load-bearing too: the
+      map is otherwise fatal on a source with no audio ("Stream map '' matches no streams",
+      exit 234) — which is most phone screen recordings, and every fixture in this test suite.
     """
     return [
         "ffmpeg",
         "-y",
         "-i",
         src,
+        "-map",
+        VIDEO_STREAM_MAP,
+        "-map",
+        "0:a:0?",
         "-c:v",
         "libx264",
         "-preset",
