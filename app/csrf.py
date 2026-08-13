@@ -31,16 +31,42 @@ logger = structlog.get_logger(__name__)
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
 
-def origin_of(url: str) -> str:
-    """`scheme://host[:port]`, lowercased, of an absolute URL — `''` if `url` is not absolute.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
-    Lowercasing only normalises the comparison (scheme and host are case-insensitive); it can never
-    turn a foreign origin into this one.
+
+def origin_of(url: str) -> str:
+    """`scheme://host[:port]`, lowercased and default-port-normalised, of an absolute URL — `''` if
+    `url` is not an absolute URL with a usable host.
+
+    Both sides of the comparison run through here, so the normalisation is symmetric. It does two
+    things beyond parsing:
+
+    * Lowercases scheme and host (both are case-insensitive) — this can never turn a foreign origin
+      into this one.
+    * Drops the port when it is the scheme's default, because a browser never serialises it:
+      configuring `OIDC_REDIRECT_URI` as `https://host:443/...` would otherwise make
+      `canonical_origin()` `https://host:443` and refuse every legitimate same-origin mutation.
+      A NON-default port is significant and is kept (`https://host:8443` ≠ `https://host`).
+
+    Anything unparseable as an origin — a bad port, or a `user@host` netloc, which no browser ever
+    emits in `Origin`/`Referer` — yields `''` and therefore fails closed.
     """
     parts = urlsplit(url.strip())
-    if not parts.scheme or not parts.netloc:
+    if not parts.scheme or not parts.netloc or "@" in parts.netloc:
         return ""
-    return f"{parts.scheme}://{parts.netloc}".lower()
+    try:
+        port = parts.port
+    except ValueError:  # e.g. "https://host:notaport"
+        return ""
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if not host:
+        return ""
+    if ":" in host:  # IPv6 literal — urlsplit strips the brackets, the origin keeps them
+        host = f"[{host}]"
+    if port is None or port == _DEFAULT_PORTS.get(scheme):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
 
 
 def canonical_origin() -> str:

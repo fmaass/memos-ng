@@ -40,10 +40,57 @@ def test_canonical_origin_is_derived_from_the_oidc_redirect_uri(monkeypatch):
         ("https://MEMOS-NG.Discomarder.Live/", "https://memos-ng.discomarder.live"),
         ("/api/memos", ""),  # not absolute → no origin at all
         ("", ""),
+        # Default ports are never serialised by a browser, so they are dropped on BOTH sides.
+        (
+            "https://memos-ng.discomarder.live:443/api/auth/callback",
+            "https://memos-ng.discomarder.live",
+        ),
+        ("http://localhost:80/x", "http://localhost"),
+        # A non-default port is part of the origin and must survive verbatim.
+        ("https://memos-ng.discomarder.live:8443/x", "https://memos-ng.discomarder.live:8443"),
+        ("http://localhost:5173", "http://localhost:5173"),
+        ("https://localhost:80", "https://localhost:80"),  # 80 is not https's default
+        ("http://localhost:443", "http://localhost:443"),  # 443 is not http's default
+        # Unparseable as an origin → fail closed, never a match.
+        ("https://host:notaport/x", ""),
+        ("https://evil.example@memos-ng.discomarder.live/", ""),  # userinfo: no browser emits it
     ],
 )
 def test_origin_of_extracts_scheme_host_port(url, expected):
     assert origin_of(url) == expected
+
+
+def test_a_canonical_origin_configured_with_an_explicit_default_port_still_matches(monkeypatch):
+    """An operator writing `https://host:443/...` into OIDC_REDIRECT_URI must not silently 403
+    every legitimate mutation: browsers serialise Origin without the default port."""
+    monkeypatch.setattr(
+        settings, "OIDC_REDIRECT_URI", "https://memos-ng.discomarder.live:443/api/auth/callback"
+    )
+    assert canonical_origin() == "https://memos-ng.discomarder.live"
+    browser = {"origin": "https://memos-ng.discomarder.live"}
+    assert csrf_reject_reason("POST", browser, COOKIE) is None
+    # Symmetric: a client that DOES spell the default port out matches too.
+    spelled_out = {"origin": "https://memos-ng.discomarder.live:443"}
+    assert csrf_reject_reason("POST", spelled_out, COOKIE) is None
+    # ...and a sibling is still refused under the normalised canonical origin.
+    assert csrf_reject_reason("POST", {"origin": SIBLING}, COOKIE) is not None
+
+
+def test_http_default_port_normalizes_the_same_way(monkeypatch):
+    monkeypatch.setattr(settings, "OIDC_REDIRECT_URI", "http://localhost:80/api/auth/callback")
+    assert canonical_origin() == "http://localhost"
+    assert csrf_reject_reason("POST", {"origin": "http://localhost"}, COOKIE) is None
+    assert csrf_reject_reason("POST", {"origin": "http://localhost:80"}, COOKIE) is None
+
+
+def test_a_non_default_port_is_significant_and_must_match_exactly(monkeypatch):
+    monkeypatch.setattr(settings, "OIDC_REDIRECT_URI", "https://memos-ng.example:8443/api/auth/callback")
+    assert canonical_origin() == "https://memos-ng.example:8443"
+    assert csrf_reject_reason("POST", {"origin": "https://memos-ng.example:8443"}, COOKIE) is None
+    # The port is NOT stripped: the same host on another (or no) port is a different origin.
+    assert csrf_reject_reason("POST", {"origin": "https://memos-ng.example"}, COOKIE) is not None
+    for other in ("https://memos-ng.example:443", "https://memos-ng.example:9443"):
+        assert csrf_reject_reason("POST", {"origin": other}, COOKIE) is not None
 
 
 def test_stated_origin_prefers_origin_and_falls_back_to_referer():
