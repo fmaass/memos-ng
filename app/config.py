@@ -124,6 +124,14 @@ class Settings(BaseSettings):
     # lock-convoys (measured 60-90x slowdown). Refresh it at most once per this window per session.
     SESSION_ROLLING_THROTTLE_S: int = 600
 
+    # Same reasoning for a PAT's last_used: it is informational (shown in the PAT list), never an
+    # authorization input, so a bounded staleness window is fine. A satellite client fetching a
+    # gallery fires many /file/ requests at once, all against the ONE PAT row — stamping per
+    # request would serialise them on that row lock. Stamp at most once per this window per PAT.
+    # Shorter than the session window (600s): a PAT is a background client whose "is this token
+    # still in use?" answer wants finer granularity than a browser session's.
+    PAT_LAST_USED_THROTTLE_S: int = 300
+
     @property
     def is_production(self) -> bool:
         return self.ENV != "development"

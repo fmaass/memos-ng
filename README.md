@@ -176,6 +176,7 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | `DATA_ROOT` | `./data` | media storage root (bind-mounted at `/app/data` in prod) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `5` | connection cap — Postgres is **shared** with prod; never exhaust it |
 | `SESSION_ROLLING_THROTTLE_S` | `600` | min interval between session `last_seen` refreshes (avoids a hot-row write convoy on the feed fan-out) |
+| `PAT_LAST_USED_THROTTLE_S` | `300` | min interval between PAT `last_used` stamps (same hot-row reason, for a satellite's media burst) |
 | `ASSET_URL_SECRET` | derived from `SESSION_SECRET` | HMAC key for signed media URLs (`_PREV` = rotation slot) |
 | `WORKER_LANES` | `fast,slow` | which media lanes a worker drains (`fast` = thumbs/posters, `slow` = transcode) |
 | `THERMAL_ZONE` / `THERMAL_MAX_C` | k10temp sensor / `70` | defer transcode while the (heat-bound) host is hot |

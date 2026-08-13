@@ -9,7 +9,7 @@ import httpx
 import jwt
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -196,16 +196,77 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+# In-process record of when each PAT's last_used stamp was last claimed (monotonic seconds), the
+# PAT-side twin of _last_seen_claimed above. Same reason: claimed synchronously BEFORE the write so
+# a concurrent burst on one PAT (a satellite pulling a gallery's derived tiers) has exactly one
+# coroutine attempt the UPDATE — the rest never queue behind that row's lock.
+_pat_last_used_claimed: dict[int, float] = {}
+
+
+def pat_stamp_due(last_used: datetime | None, now: datetime) -> bool:
+    """True iff the PAT's informational last_used is unset or older than the throttle window and
+    should be refreshed. last_used is display-only (never an authorization input), so bounded
+    staleness is the right trade against per-request writes to the one hot PAT row. Pure."""
+    return last_used is None or last_used < now - timedelta(
+        seconds=settings.PAT_LAST_USED_THROTTLE_S
+    )
+
+
+def claim_pat_stamp(pat_id: int, now_mono: float) -> bool:
+    """Reserve this PAT's write window in-process; True iff the caller may do the write.
+
+    Synchronous and await-free by design — a concurrent burst that all read the same stale
+    last_used is collapsed here, before anyone takes the row lock."""
+    if now_mono - _pat_last_used_claimed.get(pat_id, 0.0) < settings.PAT_LAST_USED_THROTTLE_S:
+        return False
+    _pat_last_used_claimed[pat_id] = now_mono
+    if len(_pat_last_used_claimed) > 4096:  # bound the map (correctness lives in the DB WHERE)
+        _pat_last_used_claimed.clear()
+    return True
+
+
+async def stamp_pat_last_used(db: AsyncSession, pat: Pat) -> bool:
+    """Persist the PAT's last_used, throttled. Returns True iff this call won the throttle claim
+    and issued the write (a cross-process race can still make it update 0 rows — see below).
+
+    Committed HERE, in its own short transaction, rather than left pending for the caller: the
+    compat surface (routers/compat.py optional_user, and serve_file_compat's own session) never
+    commits, so a pending stamp was rolled back at request end and the row never changed
+    (MEMNG-31). Committing immediately also releases the row lock the UPDATE takes instead of
+    holding it for the rest of the request, which is what let a PAT gallery burst serialise on the
+    one PAT row and queue toward pool exhaustion. Nothing else is pending in `db` at this point —
+    authentication runs before any handler work — so the commit has no other side effect."""
+    now = datetime.now(UTC)
+    if not pat_stamp_due(pat.last_used, now):
+        return False
+    if not claim_pat_stamp(pat.id, time.monotonic()):
+        return False
+    # The same staleness predicate in the WHERE is the durable, cross-process/restart gate: another
+    # worker (or this one after a restart) that has no in-process claim still writes at most once
+    # per window, and a loser of the race updates 0 rows instead of overwriting a fresh stamp.
+    stale_before = now - timedelta(seconds=settings.PAT_LAST_USED_THROTTLE_S)
+    await db.execute(
+        update(Pat)
+        .where(Pat.id == pat.id, or_(Pat.last_used.is_(None), Pat.last_used < stale_before))
+        .values(last_used=now)
+    )
+    await db.commit()  # expire_on_commit=False keeps objects usable
+    return True
+
+
 async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
-    """Return the owning user for a valid PAT (stamping last_used), else None. No commit."""
+    """Return the owning user for a valid PAT, else None. Stamps last_used at most once per
+    throttle window, committing that stamp itself (see stamp_pat_last_used)."""
     pat = (
         await db.execute(select(Pat).where(Pat.hashed_token == hash_token(token)))
     ).scalar_one_or_none()
     if pat is None:
         return None
-    pat.last_used = datetime.now(UTC)
-    await db.flush()
-    return (await db.execute(select(User).where(User.id == pat.user_id))).scalar_one_or_none()
+    # Read the FK BEFORE the stamp commits: a session configured to expire on commit would have to
+    # lazy-refresh the attribute afterwards, which async IO cannot do from attribute access.
+    user_id = pat.user_id
+    await stamp_pat_last_used(db, pat)
+    return (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
 
 
 async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
@@ -214,8 +275,7 @@ async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_s
         user = await authenticate_pat(db, authz[7:])
         if user is None:
             raise HTTPException(status_code=401, detail="Invalid or revoked token")
-        await db.commit()
-        return user
+        return user  # the last_used stamp is already committed by authenticate_pat
     return await require_user(request, db)
 
 
