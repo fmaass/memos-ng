@@ -251,28 +251,47 @@ def _signal_group(pgid: int, sig: int) -> None:
 
 
 def _group_alive(pgid: int) -> bool:
-    """True while ANY process remains in the transcode's group (signal 0 = existence probe).
+    """True while a LIVE (non-zombie) process remains in the transcode's group.
 
     Group liveness — not the leader's exit status — is what decides whether the tree is really
     gone: ffmpeg's descendants outlive it, keep the stdout pipe open and keep writing the temp
-    file. An unexpected errno reads as ALIVE so the caller escalates instead of declaring victory
-    on an error it did not expect (it is reported by _signal_group's next call).
+    file.
+
+    Deliberately NOT `killpg(pgid, 0)`: that counts zombies as members. In the container the worker
+    process is PID 1, so a grandchild orphaned by the kill is re-parented to the worker ITSELF and
+    stays a zombie — a killpg probe would then read the group as alive through both grace periods,
+    log transcode_group_unreapable on every timed-out job, and never settle. A zombie cannot react
+    to a signal and holds no file or pipe, so for escalation purposes it is GONE.
+
+    Reaping those zombies is the CONTAINER INIT's job (`init: true` on the worker service), not
+    this code's: an os.waitpid(-1, ...) sweep here would race asyncio's child watcher for the exit
+    statuses of the children it owns.
     """
     try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
+        pids = os.listdir("/proc")
+    except OSError:  # no procfs (non-Linux dev box): nothing enumerable, signals were still sent
         return False
-    except OSError as exc:
-        logger.error("transcode_group_probe_failed", pgid=pgid, errno=exc.errno, error=str(exc))
-    return True
+    for name in pids:
+        if not name.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{name}/stat").read_text()
+        except OSError:
+            continue  # exited between the listing and the read — by definition not alive
+        # `pid (comm) state ppid pgrp ...` — comm is arbitrary bytes and can contain spaces and
+        # parentheses, so fields are read after the LAST ')' rather than by splitting the line.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) >= 3 and fields[2] == str(pgid) and fields[0] != "Z":
+            return True
+    return False
 
 
 async def _await_group_exit(pgid: int, proc: asyncio.subprocess.Process) -> None:
-    """Wait until the group is empty AND the leader has been reaped.
+    """Wait until no live member remains in the group AND the leader has been reaped.
 
     Unbounded by design — the caller wraps it in asyncio.timeout, which is the only bound that
-    matters here. The leader is reaped along the way because its own zombie stays a member of the
-    group and would otherwise read as a live descendant forever.
+    matters here. The leader is waited on explicitly (rather than left to the group probe, which
+    reads a zombie as gone) so this process reaps the one child it actually owns.
     """
     while proc.returncode is None or _group_alive(pgid):
         if proc.returncode is None:
@@ -285,7 +304,10 @@ async def _await_group_exit(pgid: int, proc: asyncio.subprocess.Process) -> None
 
 
 async def _stop_transcode(pgid: int, proc: asyncio.subprocess.Process) -> None:
-    """Stop the transcode *and everything it spawned*, then reap it — no zombie, no orphan.
+    """Stop the transcode *and everything it spawned*, and reap the one child this process owns.
+
+    Descendants orphaned by the kill are reaped by the container init (`init: true`), not here —
+    see _group_alive for why this code must not run a waitpid sweep of its own.
 
     Everything here is keyed on the GROUP, never on the leader: a leader that already exited does
     NOT prove the tree is gone (a descendant can still hold the pipe and the temp file), and a

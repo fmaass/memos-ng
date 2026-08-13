@@ -10,8 +10,10 @@ import contextlib
 import os
 import secrets
 import signal
+import subprocess
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 from app import worker
@@ -20,6 +22,7 @@ from app.database import async_session
 from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
 from app.services import media
 from sqlalchemy import create_engine, text
+from structlog.testing import capture_logs
 
 from tests.conftest import SYNC_URL
 
@@ -82,6 +85,36 @@ def _orphan_cmd(src: str, dest: str, threads: int) -> list[str]:
 def _quick_cmd(src: str, dest: str, threads: int) -> list[str]:
     """Stub argv for a transcode that finishes immediately with a valid (tiny) output."""
     return ["sh", "-c", 'printf ok > "$1"', "sh", dest]
+
+
+def _proc_state(pid: int) -> str | None:
+    """The Linux /proc state letter for a pid ('R'/'S'/'Z'/…), or None if it does not exist."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return stat.rpartition(")")[2].split()[0]
+
+
+def _await_state(pid: int, state: str, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _proc_state(pid) == state:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class _FakeLeader:
+    """Stand-in for an already-exited, already-reaped leader — a dependency of _stop_transcode,
+    not the unit under test (which is the group probe/escalation logic itself)."""
+
+    def __init__(self, pid: int, returncode: int = 0):
+        self.pid = pid
+        self.returncode = returncode
+
+    async def wait(self) -> int:
+        return self.returncode
 
 
 def _alive(pid: int) -> bool:
@@ -166,6 +199,53 @@ def _cleanup(*aids: int) -> None:
     eng.dispose()
 
 
+def _spawn_zombie() -> "subprocess.Popen[bytes]":
+    """A group whose ONLY member is a zombie, built the way production gets one.
+
+    The child exits at once and nothing reaps it: it is a plain Popen (never wait()ed until the
+    test's own teardown), so asyncio's child watcher never sees it — the same situation as the
+    container, where the worker runs as PID 1, adopts the orphans it killed and does not reap them.
+    start_new_session makes the child its own group leader, so pgid == pid.
+    """
+    zombie = subprocess.Popen(["sh", "-c", "exit 0"], start_new_session=True)
+    assert _await_state(zombie.pid, "Z"), "test setup: child never became a zombie"
+    return zombie
+
+
+def test_group_probe_reads_a_zombie_member_as_gone():
+    # A killpg(pgid, 0) probe counts a zombie as a live member, which would keep the stopper
+    # escalating through both grace periods on every timed-out job. A zombie can never react to a
+    # signal and holds nothing open, so the probe must read this group as GONE.
+    zombie = _spawn_zombie()
+    try:
+        assert media._group_alive(os.getpgid(zombie.pid)) is False
+    finally:
+        zombie.wait()  # the test owns this child — reap it here, nowhere in production code
+
+
+def test_group_probe_reads_a_live_member_as_alive():
+    live = subprocess.Popen(["sleep", str(HANG_SECONDS)], start_new_session=True)
+    try:
+        assert media._group_alive(os.getpgid(live.pid)) is True
+    finally:
+        live.kill()
+        live.wait()
+
+
+async def test_stop_transcode_settles_on_a_zombie_only_group():
+    # A group whose only member is a zombie is DONE: nothing left to signal, nothing left holding
+    # the temp file. The stopper must settle immediately and stay silent — logging
+    # transcode_group_unreapable here would fire on every timed-out job in production.
+    zombie = _spawn_zombie()
+    try:
+        leader = cast(asyncio.subprocess.Process, _FakeLeader(zombie.pid))
+        with capture_logs() as logs:
+            await media._stop_transcode(os.getpgid(zombie.pid), leader)
+        assert [entry for entry in logs if entry.get("event") == "transcode_group_unreapable"] == []
+    finally:
+        zombie.wait()
+
+
 async def test_hung_transcode_is_killed_at_the_ceiling(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 1)
@@ -197,9 +277,13 @@ async def test_descendant_outliving_the_leader_is_killed(adb, monkeypatch, tmp_p
     started = _spy_on_subprocess(monkeypatch)
     att, job = await _seed_attachment_job(adb, "orphan1", tmp_path / "originals" / "v.mp4")
 
-    with pytest.raises(RuntimeError, match="slow-lane transcode timed out after 1s"):
-        await media.process_job(adb, job)
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError, match="slow-lane transcode timed out after 1s"):
+            await media.process_job(adb, job)
 
+    # Regression pin: the sweep must SETTLE. A probe that counts zombies (killpg) keeps escalating
+    # and logs this on every timed-out job once the worker runs as PID 1 and adopts the orphans.
+    assert [entry for entry in logs if entry.get("event") == "transcode_group_unreapable"] == []
     tmp = tmp_path / "assets" / "web" / "orphan1.tmp.mp4"
     assert not tmp.exists()
     assert started[0].returncode is not None  # leader exited on its own and was reaped
