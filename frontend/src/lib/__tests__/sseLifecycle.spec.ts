@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { components } from '@/api/schema'
-import { hasInFlight, nextAction, type TimelineData } from '@/lib/sseLifecycle'
+import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 type MemoOut = components['schemas']['MemoOut']
@@ -24,6 +24,21 @@ function timeline(statuses: AttachmentStatus[]): TimelineData {
     pageParams: [undefined],
   }
 }
+
+describe('isTerminalStatus', () => {
+  // The single classification both the connection lifecycle and the cache patch read: a status is
+  // terminal exactly when it is not in flight.
+  it.each(['ready', 'failed'] satisfies AttachmentStatus[])('%s is terminal', (status) => {
+    expect(isTerminalStatus(status)).toBe(true)
+  })
+
+  it.each(['uploading', 'pending', 'processing'] satisfies AttachmentStatus[])(
+    '%s is not terminal',
+    (status) => {
+      expect(isTerminalStatus(status)).toBe(false)
+    },
+  )
+})
 
 describe('hasInFlight', () => {
   it.each(['uploading', 'pending', 'processing'] satisfies AttachmentStatus[])(

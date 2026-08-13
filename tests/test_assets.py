@@ -2,7 +2,7 @@ import json
 
 from app.config import settings
 from app.main import app
-from app.routers.assets import _ready_meta, media_event_stream
+from app.routers.assets import _ready_meta, _user_snapshot, media_event_stream
 from app.services import uploads as up_svc
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -170,6 +170,81 @@ async def test_sse_ready_event_is_still_emitted_without_metadata():
         "status": "ready",
         "progress_pct": 100,
     }
+
+
+def _seed_job(aid, lane, state, pct, live_pct=None):
+    """A media job for an attachment, optionally with a committed progress sample (MEMNG-36)."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        jid = c.execute(
+            text(
+                "INSERT INTO media_jobs (attachment_id, lane, state, attempts, progress_pct) "
+                "VALUES (:a, CAST(:l AS job_lane), CAST(:s AS job_state), 0, :p) RETURNING id"
+            ),
+            {"a": aid, "l": lane, "s": state, "p": pct},
+        ).scalar_one()
+        if live_pct is not None:
+            c.execute(
+                text(
+                    "INSERT INTO media_job_progress (job_id, progress_pct) VALUES (:j, :p)"
+                ),
+                {"j": jid, "p": live_pct},
+            )
+    eng.dispose()
+    return jid
+
+
+def _rm_jobs(*aids):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        for aid in aids:
+            c.execute(
+                text(
+                    "DELETE FROM media_job_progress WHERE job_id IN "
+                    "(SELECT id FROM media_jobs WHERE attachment_id=:a)"
+                ),
+                {"a": aid},
+            )
+            c.execute(text("DELETE FROM media_jobs WHERE attachment_id=:a"), {"a": aid})
+    eng.dispose()
+
+
+async def test_snapshot_reports_the_running_job_not_the_finished_fast_lane(logged_in_client):
+    """A video's fast lane finishes in seconds; its slow lane then transcodes for minutes.
+
+    max() over the attachment's jobs reported the fast lane's 100 for that whole time, so the
+    client showed 100% from the first second onwards (MEMNG-36). The snapshot must report the job
+    still doing work — here the slow lane's real 37%.
+    """
+    _, subject = logged_in_client
+    aid = _seed_attachment("prog-video", subject, status="processing", mime="video/mp4")
+    try:
+        _seed_job(aid, "fast", "done", 100)  # poster/thumbs: finished at 100
+        _seed_job(aid, "slow", "queued", 0, live_pct=37)  # transcoding, 37% in
+
+        rows = await _user_snapshot(_user_id(subject))
+
+        assert rows == [{"uid": "prog-video", "status": "processing", "progress_pct": 37}]
+    finally:
+        _rm_jobs(aid)
+        _cleanup(aid)
+
+
+async def test_snapshot_falls_back_to_the_job_row_when_no_sample_exists(logged_in_client):
+    """A queued job has published nothing yet: its own stored percentage is the honest answer
+    (0), not the finished lane's 100 and not a missing row."""
+    _, subject = logged_in_client
+    aid = _seed_attachment("prog-queued", subject, status="processing", mime="video/mp4")
+    try:
+        _seed_job(aid, "fast", "done", 100)
+        _seed_job(aid, "slow", "queued", 0)
+
+        rows = await _user_snapshot(_user_id(subject))
+
+        assert rows == [{"uid": "prog-queued", "status": "processing", "progress_pct": 0}]
+    finally:
+        _rm_jobs(aid)
+        _cleanup(aid)
 
 
 async def test_ready_meta_reads_back_the_owners_rows_only(logged_in_client):

@@ -3,9 +3,16 @@ import { useQueryClient } from '@tanstack/vue-query'
 import { getCurrentInstance, onUnmounted } from 'vue'
 
 import type { components } from '@/api/schema'
-import { hasInFlight, nextAction, type TimelineData } from '@/lib/sseLifecycle'
+import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
 
 type Attachment = components['schemas']['AttachmentRef']
+
+// The cached shape of an attachment the SSE channel has touched. progress_pct is deliberately NOT
+// part of AttachmentRef: the feed endpoints never serve it (computing every attachment's live
+// transcode percentage on every timeline page would be a join in the hottest read path for a
+// number that is stale a second later). It arrives only on the event stream, is carried on the
+// cached object, and is read from there by the tile — see MediaTile's `progress_pct`.
+export type CachedAttachment = Attachment & { progress_pct?: number }
 
 export interface MediaEvent {
   uid: string
@@ -30,21 +37,37 @@ function metadataPatch(ev: MediaEvent): Partial<Attachment> {
   return patch
 }
 
+// What one event makes of one attachment: its status, the metadata it carries, and — the reason
+// the event has a percentage at all — how far the work has actually got. Dropping progress_pct
+// here is why a transcoding video's tile sat at 0% for the whole transcode (MEMNG-36). Absent is
+// distinct from 0: an event without a percentage leaves the last known one in place rather than
+// resetting the tile to the start.
+//
+// An IN-FLIGHT event never applies to an attachment already cached as ready/failed. The stream is
+// a poll, and a reconnect (or a slow client) can deliver a `processing` snapshot taken before the
+// job finished AFTER the terminal event — applying it would put a finished photo back under a
+// progress overlay that nothing will ever clear, since the job it describes is over and will
+// report nothing further. Terminal events still apply to terminal state (a retried `failed`
+// attachment may legitimately reach `ready`).
+function patchAttachment(att: CachedAttachment, ev: MediaEvent): CachedAttachment {
+  if (isTerminalStatus(att.status) && !isTerminalStatus(ev.status)) return att
+  const next: CachedAttachment = { ...att, status: ev.status, ...metadataPatch(ev) }
+  if (ev.progress_pct != null) next.progress_pct = ev.progress_pct
+  return next
+}
+
 // Pure: return a new infinite-query data object with the event's attachment status AND the metadata
 // it carries applied. Patching only the status left a just-finished upload at NULL dims in the
 // cache, so its tile kept the fallback box and served no srcset until something refetched the feed.
 // Exported so the cache transform is unit-tested without a live cache or EventSource.
 export function applyMediaEvent<T extends TimelineData>(data: T, ev: MediaEvent): T {
-  const meta = metadataPatch(ev)
   return {
     ...data,
     pages: data.pages.map((page) => ({
       ...page,
       items: page.items.map((memo) => ({
         ...memo,
-        attachments: memo.attachments?.map((a) =>
-          a.uid === ev.uid ? { ...a, status: ev.status, ...meta } : a,
-        ),
+        attachments: memo.attachments?.map((a) => (a.uid === ev.uid ? patchAttachment(a, ev) : a)),
       })),
     })),
   }

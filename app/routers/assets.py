@@ -19,7 +19,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.config import settings
 from app.database import async_session, get_session
-from app.models import Attachment, AttachmentStatus, MediaJob, Memo, User
+from app.models import (
+    Attachment,
+    AttachmentStatus,
+    JobState,
+    MediaJob,
+    MediaJobProgress,
+    Memo,
+    User,
+)
 from app.services import asset_urls, storage
 from app.services import uploads as up_svc
 from app.services.memos import visible_clause
@@ -505,15 +513,36 @@ async def media_event_stream(
 
 
 async def _user_snapshot(user_id: int) -> list[dict]:
+    """{uid,status,progress_pct} for this user's non-ready attachments — the stream's poll.
+
+    progress_pct is ONE job's own percentage: the least-advanced job of that attachment that has
+    not finished. It used to be max() across every job of the attachment, which reported a
+    video's completed fast lane (poster/thumbs, done in seconds at 100) for the entire slow-lane
+    transcode that followed — the client sat at 100% from the first second to the last (MEMNG-36).
+    Finished and failed jobs are excluded rather than blended in: what the user is waiting for is
+    the work still outstanding, and the least-advanced of those jobs is what the wait is bounded by.
+
+    A running job's live percentage comes from media_job_progress, because the worker's own
+    media_jobs row is locked and unreadable-through until the job commits (see MediaJobProgress).
+    The job row's stored progress_pct is the fallback for a job with no sample yet (a queued one,
+    at 0).
+    """
     async with async_session() as db:
-        progress = (
-            select(MediaJob.attachment_id, func.max(MediaJob.progress_pct).label("pct"))
+        active = (
+            select(
+                MediaJob.attachment_id.label("attachment_id"),
+                func.min(func.coalesce(MediaJobProgress.progress_pct, MediaJob.progress_pct)).label(
+                    "pct"
+                ),
+            )
+            .join(MediaJobProgress, MediaJobProgress.job_id == MediaJob.id, isouter=True)
+            .where(MediaJob.state.notin_((JobState.done, JobState.failed)))
             .group_by(MediaJob.attachment_id)
             .subquery()
         )
         stmt = (
-            select(Attachment.uid, Attachment.status, func.coalesce(progress.c.pct, 0))
-            .join(progress, progress.c.attachment_id == Attachment.id, isouter=True)
+            select(Attachment.uid, Attachment.status, func.coalesce(active.c.pct, 0))
+            .join(active, active.c.attachment_id == Attachment.id, isouter=True)
             .where(Attachment.owner_id == user_id, Attachment.status != AttachmentStatus.ready)
         )
         rows = (await db.execute(stmt)).all()

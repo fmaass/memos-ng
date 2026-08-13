@@ -4,6 +4,7 @@ import { defineComponent, h } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { components } from '@/api/schema'
+import type { CachedAttachment } from '@/composables/useMediaEvents'
 import {
   applyMediaEvent,
   RECONNECT_DELAY_MS,
@@ -53,6 +54,14 @@ function withMeta(
 ): TimelineData {
   return {
     pages: [{ items: [{ attachments: [{ uid: 'x', status: 'processing', ...meta }] }] }],
+    pageParams: [undefined],
+  } as TimelineData
+}
+
+// One cached attachment 'x' in the given status — the state an event arrives against.
+function cachedAs(status: AttachmentStatus): TimelineData {
+  return {
+    pages: [{ items: [{ attachments: [{ uid: 'x', status }] }] }],
     pageParams: [undefined],
   } as TimelineData
 }
@@ -120,6 +129,81 @@ describe('applyMediaEvent', () => {
 
     expect([att.width, att.height]).toEqual([1200, 900]) // 7x900 is neither image
     expect(att.blurhash).toBe('LKO2?U%2') // blurhash carries no pairing
+  })
+
+  it('applies the percentage a progress event carries', () => {
+    // The event's whole point. Dropping progress_pct here left the tile reading 0% for the entire
+    // transcode even once the backend reported real numbers (MEMNG-36).
+    const att = applyMediaEvent(withMeta(), {
+      uid: 'x',
+      status: 'processing',
+      progress_pct: 40,
+    }).pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect(att.progress_pct).toBe(40)
+  })
+
+  it('advances the percentage as later events arrive', () => {
+    const first = applyMediaEvent(withMeta(), { uid: 'x', status: 'processing', progress_pct: 40 })
+    const att = applyMediaEvent(first, { uid: 'x', status: 'processing', progress_pct: 75 })
+      .pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect(att.progress_pct).toBe(75)
+  })
+
+  it('keeps the last percentage when an event carries none', () => {
+    // Absent is not zero: an event without a percentage must not send the tile back to the start.
+    const first = applyMediaEvent(withMeta(), { uid: 'x', status: 'processing', progress_pct: 60 })
+    const att = applyMediaEvent(first, { uid: 'x', status: 'processing' }).pages[0].items[0]
+      .attachments[0] as CachedAttachment
+
+    expect(att.progress_pct).toBe(60)
+  })
+
+  it('never lets a late in-flight event resurrect a finished attachment', () => {
+    // The stream is a poll: a reconnect can deliver a `processing` snapshot taken before the job
+    // finished AFTER the terminal event. Applying it would put a finished photo back under a
+    // progress overlay that nothing clears — the job it describes is over and reports no more.
+    const att = applyMediaEvent(cachedAs('ready'), {
+      uid: 'x',
+      status: 'processing',
+      progress_pct: 40,
+    }).pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect(att.status).toBe('ready')
+    expect(att.progress_pct).toBeUndefined() // and no percentage for work that is over
+  })
+
+  it('never lets a late in-flight event resurrect a failed attachment', () => {
+    const att = applyMediaEvent(cachedAs('failed'), { uid: 'x', status: 'pending' }).pages[0]
+      .items[0].attachments[0] as CachedAttachment
+
+    expect(att.status).toBe('failed')
+  })
+
+  it('still applies a terminal event to a terminal attachment', () => {
+    // The guard is about in-flight events only: a retried `failed` attachment reaching `ready` is
+    // a real transition the client must take.
+    const att = applyMediaEvent(cachedAs('failed'), {
+      uid: 'x',
+      status: 'ready',
+      progress_pct: 100,
+      width: 800,
+      height: 600,
+      blurhash: 'LKO2?U%2',
+    }).pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect([att.status, att.width, att.height, att.progress_pct]).toEqual(['ready', 800, 600, 100])
+  })
+
+  it('still applies an in-flight event to an in-flight attachment', () => {
+    const att = applyMediaEvent(withMeta(), {
+      uid: 'x',
+      status: 'processing',
+      progress_pct: 55,
+    }).pages[0].items[0].attachments[0] as CachedAttachment
+
+    expect([att.status, att.progress_pct]).toEqual(['processing', 55])
   })
 
   it('leaves the metadata alone on a non-terminal progress event', () => {
