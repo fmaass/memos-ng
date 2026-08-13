@@ -1,6 +1,7 @@
 import hashlib
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from app.config import settings
 from app.models import Upload
 from app.services import uploads as svc
@@ -341,3 +342,96 @@ def test_upload_rejects_oversize(logged_in_client, monkeypatch):
         "/api/uploads", json={"filename": "ok.jpg", "mime": "image/jpeg", "size": 500 * 1024}
     )
     assert ok.status_code == 201  # within the cap
+
+
+async def _chunks(parts):
+    for p in parts:
+        yield p
+
+
+async def test_stream_to_part_accumulates_received_bytes(monkeypatch, tmp_path):
+    # The received count is the RUNNING SUM over the transport's chunks, and it carries across
+    # appends via `start` — that accumulation is what the size ceiling is checked against.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    part = svc.part_path("acc-uid")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.touch()
+
+    first = [bytes([i]) * 1000 for i in range(5)]
+    assert await svc.stream_to_part(_chunks(first), part, start=0, ceiling=10_000) == 5000
+    assert part.read_bytes() == b"".join(first)
+
+    second = [b"Z" * 1000, b"Y" * 1000]
+    assert await svc.stream_to_part(_chunks(second), part, start=5000, ceiling=10_000) == 2000
+    assert part.read_bytes() == b"".join(first + second)  # appended at the offset, nothing lost
+
+
+async def test_stream_to_part_rejects_when_accumulated_total_passes_ceiling(monkeypatch, tmp_path):
+    # Every individual chunk is far under the ceiling — only the accumulated total crosses it, so a
+    # per-chunk check would let this through. The part file must roll back to the pre-append offset.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    part = svc.part_path("cap-uid")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"P" * 100)
+    with pytest.raises(svc.UploadTooLarge):
+        await svc.stream_to_part(_chunks([b"x" * 50] * 20), part, start=100, ceiling=250)
+    assert part.read_bytes() == b"P" * 100  # no partial bytes survive a rejected append
+
+
+def test_append_rejects_body_over_declared_size(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        uid = _start(client, "d.bin", "application/octet-stream", 1000)
+        over = client.patch(
+            f"/api/uploads/{uid}", content=b"x" * 1500, headers={"Upload-Offset": "0"}
+        )
+        assert over.status_code == 413
+        assert client.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == "0"
+        assert svc.part_path(uid).stat().st_size == 0  # rejected bytes were never kept
+        # the session survives the rejection: a correctly sized body still completes it
+        ok = client.patch(
+            f"/api/uploads/{uid}", content=b"x" * 1000, headers={"Upload-Offset": "0"}
+        )
+        assert ok.status_code == 200 and ok.json()["bytes_received"] == 1000
+        assert client.post(f"/api/uploads/{uid}/finalize").status_code == 200
+    finally:
+        _cleanup()
+
+
+def test_append_rejects_when_cap_drops_below_declared_size(logged_in_client, monkeypatch, tmp_path):
+    # MAX_UPLOAD_MIB is enforced at RECEIVE time, not only at session create — a cap that is lower
+    # than an already-declared size still stops the bytes at the door.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        size = 3 * 1024 * 1024
+        uid = _start(client, "big.bin", "application/octet-stream", size)
+        monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 1)
+        over = client.patch(
+            f"/api/uploads/{uid}", content=b"x" * size, headers={"Upload-Offset": "0"}
+        )
+        assert over.status_code == 413
+        assert "1 MiB" in over.json()["detail"]  # the server cap, not the declared size, tripped
+        assert svc.part_path(uid).stat().st_size == 0
+    finally:
+        _cleanup()
+
+
+def test_append_offset_gap_and_replay_still_behave(logged_in_client, monkeypatch, tmp_path):
+    # The offset branches are now decided BEFORE the body is received, so re-assert them: a forward
+    # gap is a 409 and a replay of an already-received range stays a no-op (not a second append).
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"y" * 400
+        uid = _start(client, "g.bin", "application/octet-stream", 800)
+        first = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        assert first.json()["bytes_received"] == 400
+        gap = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "500"})
+        assert gap.status_code == 409
+        replay = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        assert replay.status_code == 200 and replay.json()["bytes_received"] == 400
+        assert svc.part_path(uid).stat().st_size == 400  # replay wrote nothing a second time
+    finally:
+        _cleanup()

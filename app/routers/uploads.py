@@ -79,9 +79,16 @@ async def append_chunk(
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
 ) -> UploadOut:
     upload = await _get_upload(db, upload_uid)
-    data = await request.body()
     try:
-        upload = await svc.append_chunk(db, upload, upload_offset, data)
+        upload = await svc.append_stream(db, upload, upload_offset, request.stream())
+    except svc.UploadTooLarge as exc:
+        cap = settings.MAX_UPLOAD_MIB * 1024 * 1024
+        detail = (
+            f"Upload exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
+            if exc.total > cap
+            else f"Upload exceeds its declared size of {upload.declared_size} bytes"
+        )
+        raise HTTPException(status_code=413, detail=detail) from None
     except ValueError:
         raise HTTPException(status_code=409, detail="Offset gap; re-sync via HEAD") from None
     await db.commit()

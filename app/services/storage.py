@@ -105,21 +105,3 @@ async def place_master(src: Path, dest_dir: Path, name: str) -> Path:
     """Atomically move a staged master `src` into `dest_dir` under a sanitized, collision-free
     `name`. Returns the final path. Off-loop (blocking disk I/O)."""
     return await to_thread.run_sync(_place_master_sync, src, dest_dir, name)
-
-
-def _place_bytes_sync(data: bytes, dest_dir: Path, name: str) -> Path:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    reserved = _reserve(dest_dir, sanitize_name(name))  # O_EXCL → never overwrites another file
-    try:
-        with open(reserved, "wb") as f:
-            f.write(data)
-    except OSError:  # don't leave a partial/empty reservation behind on a write failure
-        reserved.unlink(missing_ok=True)
-        raise
-    return reserved
-
-
-async def place_bytes(data: bytes, dest_dir: Path, name: str) -> Path:
-    """Write in-memory `data` into `dest_dir` under a sanitized, collision-free `name` — for a
-    master that arrives as bytes rather than a staged file (a legacy /print upload). Off-loop."""
-    return await to_thread.run_sync(_place_bytes_sync, data, dest_dir, name)

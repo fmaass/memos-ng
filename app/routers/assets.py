@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,7 @@ from app.config import settings
 from app.database import async_session, get_session
 from app.models import Attachment, AttachmentStatus, MediaJob, Memo, User
 from app.services import asset_urls, storage
+from app.services import uploads as up_svc
 from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
@@ -349,11 +352,18 @@ async def delete_attachment(
     await to_thread.run_sync(_unlink_all, paths)
 
 
-def _save_print_sync(part_dir: Path, uid: str, data: bytes, suffix: str) -> str:
+def _save_print_sync(part_dir: Path, uid: str, staged: Path, suffix: str) -> str:
     part_dir.mkdir(parents=True, exist_ok=True)
     dest = part_dir / f"{uid}{suffix}"
-    dest.write_bytes(data)
+    os.replace(staged, dest)
     return str(dest)
+
+
+async def _file_chunks(file: UploadFile) -> AsyncIterator[bytes]:
+    """Yield the upload in bounded reads. Starlette spools the multipart part to disk, but a
+    single `file.read()` would still pull the whole master into memory before anything checks it."""
+    while chunk := await file.read(up_svc.STREAM_CHUNK_SIZE):
+        yield chunk
 
 
 @router.post("/attachments/{uid}/print", response_model=AttachmentMeta)
@@ -371,26 +381,41 @@ async def upload_print(
         raise HTTPException(status_code=404, detail="Attachment not found")
     if not att.mime.startswith("image/"):
         raise HTTPException(status_code=400, detail="Print masters are for images only")
-    data = await file.read()
-    if len(data) > settings.MAX_UPLOAD_MIB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Exceeds {settings.MAX_UPLOAD_MIB} MiB")
     data_root = Path(settings.DATA_ROOT)
     suffix = Path(file.filename or "").suffix or ".bin"
-    # A print uploaded to an attachment already in a memo lands in that memo's folder under its real
-    # filename (sits beside the screen); an unlinked attachment keeps the legacy print/{uid} path.
-    memo = (
-        (await db.execute(select(Memo).where(Memo.id == att.memo_id))).scalar_one_or_none()
-        if att.memo_id is not None
-        else None
-    )
-    if memo is not None:
-        dest = storage.memo_dir(data_root, memo.created_at, memo.uid)
-        path = str(await storage.place_bytes(data, dest, file.filename or f"{uid}-print{suffix}"))
-    else:  # legacy: deterministic print/{uid}{suffix} — may overwrite this attachment's prior print
-        path = await to_thread.run_sync(_save_print_sync, data_root / "print", uid, data, suffix)
+    # Receive to a staging file with the cap enforced on the running count, so an oversize export is
+    # refused mid-stream instead of after the whole master has been buffered.
+    staged = data_root / "uploads" / f"print-{uuid.uuid4().hex}.part"
+    try:
+        size = await up_svc.stream_to_part(
+            _file_chunks(file), staged, start=0, ceiling=settings.MAX_UPLOAD_MIB * 1024 * 1024
+        )
+        # A print uploaded to an attachment already in a memo lands in that memo's folder under its
+        # real filename (beside the screen); an unlinked attachment keeps the legacy print/{uid}.
+        memo = (
+            (await db.execute(select(Memo).where(Memo.id == att.memo_id))).scalar_one_or_none()
+            if att.memo_id is not None
+            else None
+        )
+        if memo is not None:
+            dest = storage.memo_dir(data_root, memo.created_at, memo.uid)
+            path = str(
+                await storage.place_master(staged, dest, file.filename or f"{uid}-print{suffix}")
+            )
+        else:  # legacy: deterministic print/{uid}{suffix} — may overwrite a prior print of this att
+            path = await to_thread.run_sync(
+                _save_print_sync, data_root / "print", uid, staged, suffix
+            )
+    except BaseException as exc:  # never leave the staged part behind — nothing else reaps it
+        await to_thread.run_sync(staged.unlink, True)
+        if isinstance(exc, up_svc.UploadTooLarge):
+            raise HTTPException(
+                status_code=413, detail=f"Exceeds {settings.MAX_UPLOAD_MIB} MiB"
+            ) from None
+        raise
     att.print_path = path
     att.print_mime = file.content_type or "application/octet-stream"
-    att.print_size = len(data)
+    att.print_size = size
     try:
         await db.commit()
     except Exception:

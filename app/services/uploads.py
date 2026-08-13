@@ -2,8 +2,10 @@ import hashlib
 import os
 import secrets
 import uuid
+from collections.abc import AsyncIterable, AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import BinaryIO
 
 import puremagic
 from anyio import to_thread
@@ -29,11 +31,37 @@ def _data_root() -> Path:
     return Path(settings.DATA_ROOT)
 
 
+# Bounded read granularity for receiving a request body. Chosen well under the 5 MiB client chunk
+# so an over-limit upload is refused after ~1 MiB of RAM, not after the whole chunk is buffered.
+STREAM_CHUNK_SIZE = 1 << 20
+
+
+class UploadTooLarge(Exception):
+    """An in-flight append would push the upload past its ceiling. Carries the running total that
+    tripped it so the caller can name which limit (server cap or declared size) applied."""
+
+    def __init__(self, total: int) -> None:
+        super().__init__(f"upload exceeds its size ceiling at {total} bytes")
+        self.total = total
+
+
 # Blocking disk I/O runs off the event loop (anyio.to_thread) so large chunk writes /
 # sha256 reads don't stall the server.
-def _append_sync(path: Path, data: bytes) -> None:
-    with open(path, "ab") as f:
-        f.write(data)
+def _open_part_sync(path: Path, offset: int) -> BinaryIO:
+    """Open the part file positioned at `offset`, dropping anything past it — a chunk that was
+    rejected or cut short must never bleed into the next append."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "r+b" if path.exists() else "w+b")
+    f.truncate(offset)
+    f.seek(offset)
+    return f
+
+
+def _truncate_sync(path: Path, size: int) -> None:
+    if not path.exists():
+        return
+    with open(path, "r+b") as f:
+        f.truncate(size)
 
 
 def _sha256_sync(path: Path) -> str:
@@ -114,17 +142,66 @@ async def create_upload(
     return upload
 
 
-async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: bytes) -> Upload:
-    """Append at `offset`. Idempotent: re-sending an already-received range is a no-op;
-    a forward gap is rejected (caller → 409)."""
-    if offset == upload.bytes_received:
-        await to_thread.run_sync(_append_sync, part_path(upload.upload_uid), data)
-        upload.bytes_received += len(data)
-        await db.flush()
-    elif offset > upload.bytes_received:
+async def stream_to_part(
+    stream: AsyncIterable[bytes], path: Path, *, start: int, ceiling: int
+) -> int:
+    """Write `stream` into `path` from byte `start`, chunk by chunk, and stop the moment the
+    RUNNING total would pass `ceiling` — the bytes are never accumulated in memory, so an
+    over-limit body is refused at receive time (UploadTooLarge) rather than after it has landed.
+    Returns the byte count received. On any failure the file is truncated back to `start`, so a
+    rejected or interrupted transfer leaves the on-disk state matching the recorded offset."""
+    received = 0
+    try:
+        f = await to_thread.run_sync(_open_part_sync, path, start)
+        try:
+            async for chunk in stream:
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if start + received > ceiling:
+                    raise UploadTooLarge(start + received)
+                await to_thread.run_sync(f.write, chunk)
+        finally:
+            await to_thread.run_sync(f.close)
+    except BaseException:
+        await to_thread.run_sync(_truncate_sync, path, start)
+        raise
+    return received
+
+
+def size_ceiling(upload: Upload) -> int:
+    """The lower of the session's declared size and the server cap. The cap is re-read here rather
+    than trusted from session-create time, so a cap lowered since then still binds."""
+    return min(upload.declared_size, settings.MAX_UPLOAD_MIB * 1024 * 1024)
+
+
+async def append_stream(
+    db: AsyncSession, upload: Upload, offset: int, stream: AsyncIterable[bytes]
+) -> Upload:
+    """Receive an append at `offset` straight to disk. Idempotent: re-sending an already-received
+    range is a no-op; a forward gap is rejected (caller → 409); a body that would carry the upload
+    past its size ceiling raises UploadTooLarge (caller → 413) with nothing partial kept."""
+    if offset > upload.bytes_received:
         raise ValueError("offset gap")
-    # offset < bytes_received → already have it; no-op
+    if offset < upload.bytes_received:
+        return upload  # already have it; no-op
+    start = upload.bytes_received
+    received = await stream_to_part(
+        stream, part_path(upload.upload_uid), start=start, ceiling=size_ceiling(upload)
+    )
+    upload.bytes_received = start + received
+    await db.flush()
     return upload
+
+
+async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: bytes) -> Upload:
+    """Append an already-materialized `data` chunk — the in-process path (migration, tests).
+    Network callers use append_stream so the bytes are never held whole in RAM."""
+
+    async def _one() -> AsyncIterator[bytes]:
+        yield data
+
+    return await append_stream(db, upload, offset, _one())
 
 
 async def finalize_pending(
