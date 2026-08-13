@@ -210,3 +210,15 @@ async def test_concurrent_burst_attempts_exactly_one_write(db_engine):
         assert _last_used(pat_id) is not None  # and the one write is committed
     finally:
         _cleanup()
+
+
+def test_first_claim_succeeds_even_at_low_monotonic_time():
+    # time.monotonic() counts from an arbitrary epoch — often boot. On a freshly
+    # booted runner it is smaller than the throttle window, and a 0.0-default
+    # claim map read as "claimed at monotonic zero", refusing every first claim.
+    from app import auth
+
+    pat_id = 999_901
+    auth._pat_last_used_claimed.pop(pat_id, None)
+    assert auth.claim_pat_stamp(pat_id, 5.0) is True
+    assert auth.claim_pat_stamp(pat_id, 6.0) is False

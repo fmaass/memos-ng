@@ -172,7 +172,8 @@ async def require_user(request: Request, db: AsyncSession = Depends(get_session)
         # Claim the write window IN MEMORY before any await: a concurrent same-session burst sees
         # the fresh marker and skips, so at most one coroutine per window hits the DB (no convoy —
         # even on first load after idle). The conditional UPDATE is the durable cross-restart gate.
-        if mono - _last_seen_claimed.get(sid, 0.0) >= settings.SESSION_ROLLING_THROTTLE_S:
+        prev_claim = _last_seen_claimed.get(sid)  # None = never claimed; see claim_pat_stamp
+        if prev_claim is None or mono - prev_claim >= settings.SESSION_ROLLING_THROTTLE_S:
             _last_seen_claimed[sid] = mono
             if len(_last_seen_claimed) > 4096:  # bound the map (correctness lives in the DB WHERE)
                 _last_seen_claimed.clear()
@@ -217,7 +218,12 @@ def claim_pat_stamp(pat_id: int, now_mono: float) -> bool:
 
     Synchronous and await-free by design — a concurrent burst that all read the same stale
     last_used is collapsed here, before anyone takes the row lock."""
-    if now_mono - _pat_last_used_claimed.get(pat_id, 0.0) < settings.PAT_LAST_USED_THROTTLE_S:
+    # A missing entry must read as "never claimed", not "claimed at monotonic zero":
+    # time.monotonic() counts from an arbitrary epoch (often boot), so a 0.0 default
+    # silently refused every first claim during the first window after a fresh boot -
+    # which is exactly what a just-started CI runner or a just-deployed container is.
+    prev = _pat_last_used_claimed.get(pat_id)
+    if prev is not None and now_mono - prev < settings.PAT_LAST_USED_THROTTLE_S:
         return False
     _pat_last_used_claimed[pat_id] = now_mono
     if len(_pat_last_used_claimed) > 4096:  # bound the map (correctness lives in the DB WHERE)
