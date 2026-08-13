@@ -387,7 +387,7 @@ async def upload_print(
     # refused mid-stream instead of after the whole master has been buffered.
     staged = data_root / "uploads" / f"print-{uuid.uuid4().hex}.part"
     try:
-        size = await up_svc.stream_to_part(
+        size = await up_svc.spool_stream(
             _file_chunks(file), staged, start=0, ceiling=settings.MAX_UPLOAD_MIB * 1024 * 1024
         )
         # A print uploaded to an attachment already in a memo lands in that memo's folder under its

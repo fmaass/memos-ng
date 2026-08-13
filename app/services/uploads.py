@@ -1,6 +1,7 @@
 import hashlib
 import os
 import secrets
+import shutil
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -47,21 +48,26 @@ class UploadTooLarge(Exception):
 
 # Blocking disk I/O runs off the event loop (anyio.to_thread) so large chunk writes /
 # sha256 reads don't stall the server.
-def _open_part_sync(path: Path, offset: int) -> BinaryIO:
-    """Open the part file positioned at `offset`, dropping anything past it — a chunk that was
-    rejected or cut short must never bleed into the next append."""
+def _open_spool_sync(path: Path) -> BinaryIO:
     path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(path, "r+b" if path.exists() else "w+b")
-    f.truncate(offset)
-    f.seek(offset)
-    return f
+    return open(path, "wb")
 
 
-def _truncate_sync(path: Path, size: int) -> None:
-    if not path.exists():
-        return
-    with open(path, "r+b") as f:
-        f.truncate(size)
+def _unlink_sync(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def _concat_sync(spool: Path, part: Path, offset: int) -> None:
+    """Append the spooled body onto the part file at `offset`. The caller holds the row lock and
+    `offset` equals the committed end of the file, so this only ever EXTENDS it — bytes an earlier
+    append committed are never rewritten. The closing truncate drops debris past the write (a
+    process killed between concat and commit leaves the file longer than the recorded offset);
+    those bytes are uncommitted by definition, so dropping them is safe."""
+    part.parent.mkdir(parents=True, exist_ok=True)
+    with open(part, "r+b" if part.exists() else "w+b") as dst, open(spool, "rb") as src:
+        dst.seek(offset)
+        shutil.copyfileobj(src, dst, STREAM_CHUNK_SIZE)
+        dst.truncate()
 
 
 def _sha256_sync(path: Path) -> str:
@@ -142,17 +148,19 @@ async def create_upload(
     return upload
 
 
-async def stream_to_part(
+async def spool_stream(
     stream: AsyncIterable[bytes], path: Path, *, start: int, ceiling: int
 ) -> int:
-    """Write `stream` into `path` from byte `start`, chunk by chunk, and stop the moment the
-    RUNNING total would pass `ceiling` — the bytes are never accumulated in memory, so an
-    over-limit body is refused at receive time (UploadTooLarge) rather than after it has landed.
-    Returns the byte count received. On any failure the file is truncated back to `start`, so a
-    rejected or interrupted transfer leaves the on-disk state matching the recorded offset."""
+    """Write `stream` into `path`, chunk by chunk, and stop the moment the RUNNING total — counted
+    from `start`, the offset this body claims to continue from — would pass `ceiling`. The bytes
+    are never accumulated in memory, so an over-limit body is refused at receive time
+    (UploadTooLarge). Returns the byte count received.
+
+    `path` MUST be private to this request: on any failure it is unlinked, so a request that is
+    rejected or cut short discards only its own bytes and can never disturb shared state."""
     received = 0
     try:
-        f = await to_thread.run_sync(_open_part_sync, path, start)
+        f = await to_thread.run_sync(_open_spool_sync, path)
         try:
             async for chunk in stream:
                 if not chunk:
@@ -164,7 +172,7 @@ async def stream_to_part(
         finally:
             await to_thread.run_sync(f.close)
     except BaseException:
-        await to_thread.run_sync(_truncate_sync, path, start)
+        await to_thread.run_sync(_unlink_sync, path)
         raise
     return received
 
@@ -175,23 +183,51 @@ def size_ceiling(upload: Upload) -> int:
     return min(upload.declared_size, settings.MAX_UPLOAD_MIB * 1024 * 1024)
 
 
+def _spool_path(upload_uid: str) -> Path:
+    """A spool file private to ONE append request — two concurrent appends to the same session get
+    different names and so never write through each other."""
+    return _data_root() / "uploads" / f"{upload_uid}.{secrets.token_urlsafe(8)}.spool"
+
+
 async def append_stream(
     db: AsyncSession, upload: Upload, offset: int, stream: AsyncIterable[bytes]
 ) -> Upload:
-    """Receive an append at `offset` straight to disk. Idempotent: re-sending an already-received
-    range is a no-op; a forward gap is rejected (caller → 409); a body that would carry the upload
-    past its size ceiling raises UploadTooLarge (caller → 413) with nothing partial kept."""
-    if offset > upload.bytes_received:
-        raise ValueError("offset gap")
-    if offset < upload.bytes_received:
-        return upload  # already have it; no-op
-    start = upload.bytes_received
-    received = await stream_to_part(
-        stream, part_path(upload.upload_uid), start=start, ceiling=size_ceiling(upload)
-    )
-    upload.bytes_received = start + received
-    await db.flush()
-    return upload
+    """Receive an append at `offset`: spool the body to a private file, then merge it into the
+    shared part file. Idempotent — replaying an already-received range is a no-op; a forward gap
+    raises ValueError (caller → 409); an over-ceiling body raises UploadTooLarge (caller → 413).
+
+    The offset the body was built against may be STALE by the time it is fully received, so the
+    merge re-reads the row FOR UPDATE and re-decides gap/replay/match against the refreshed
+    offset. The row lock — not an in-process lock — is the serialization point because it is held
+    until the caller COMMITS, which is when this append's bytes and offset actually become visible
+    to another request; an in-process lock released at function exit would still let the next
+    append read a pre-commit offset and write over these bytes."""
+    spool = _spool_path(upload.upload_uid)
+    try:
+        # Receive-time bound: no single body may exceed the session's whole ceiling, so an oversize
+        # upload is refused mid-stream. Where it LANDS is not yet known — that needs the offset the
+        # merge settles on, so the offset-relative check is the one under the lock below.
+        received = await spool_stream(stream, spool, start=0, ceiling=size_ceiling(upload))
+        upload = (
+            await db.execute(
+                select(Upload)
+                .where(Upload.upload_uid == upload.upload_uid)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        if offset > upload.bytes_received:
+            raise ValueError("offset gap")
+        if offset == upload.bytes_received:
+            if offset + received > size_ceiling(upload):
+                raise UploadTooLarge(offset + received)
+            await to_thread.run_sync(_concat_sync, spool, part_path(upload.upload_uid), offset)
+            upload.bytes_received = offset + received
+            await db.flush()
+        # offset < bytes_received → a concurrent append already covered this range; no-op
+        return upload
+    finally:
+        await to_thread.run_sync(_unlink_sync, spool)
 
 
 async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: bytes) -> Upload:
