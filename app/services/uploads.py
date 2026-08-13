@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import async_session
 from app.models import (
     Attachment,
     AttachmentRendition,
@@ -487,6 +488,16 @@ def _reap_spools_sync(spool_dir: Path, cutoff: float) -> int:
                 reaped += 1
         except OSError:  # vanished under us — its own request just cleaned it up
             continue
+    return reaped
+
+
+async def reap_expired_committed(now: datetime | None = None) -> int:
+    """The worker's reap entry: a dedicated session that COMMITS the deletions. A flush alone
+    dies with the session, which is how expired rows resurrected every cycle — their part files
+    already unlinked — while the hourly log counted the same rows forever (MEMNG-37)."""
+    async with async_session() as db:
+        reaped = await reap_expired(db)
+        await db.commit()
     return reaped
 
 
