@@ -50,9 +50,11 @@ Rollback: retag the previous image `memos-ng:rollback-<short-sha>` *before* over
 `APP_VERSION` env lines and `docker compose up -d --force-recreate` (compose always deploys the
 `memos-ng:local` tag; reverting only the env var would restart the BAD image under the old name).
 
-Recreating the worker kills any in-flight transcode/frame job (frame jobs currently strand in
-`claimed` on interruption — MEMNG-35): deploy in a quiet window — worker heartbeat fresh and no
-active job in the log tail.
+Recreating the worker kills any in-flight transcode/frame job. A frame job interrupted mid-send is
+no longer lost: the next worker start re-queues any claim older than `FRAME_CLAIM_STALE_MINUTES`
+(15 by default) and retries it, at the price of a possible re-upload of a photo the album already
+accepted — aura-frames dedups by sha256, so an unchanged photo does not duplicate (MEMNG-35). Still
+deploy in a quiet window — worker heartbeat fresh and no active job in the log tail.
 
 ## Acceptance probes (real surface: https://memos.discomarder.live)
 

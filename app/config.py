@@ -97,6 +97,12 @@ class Settings(BaseSettings):
     FRAME_API_URL: str = ""
     FRAME_ALBUM_ID: int = 0
     FRAME_API_TOKEN: str = Field(default="", repr=False)
+    # Stale-claim horizon (MEMNG-35): a job still `claimed` this many minutes after the tombstone
+    # commit is assumed orphaned by a crashed/recreated worker and is re-queued (or failed at the
+    # attempt ceiling). One render+upload takes seconds, so 15 minutes is far outside a healthy
+    # send while still recovering the same deploy window — it must stay well above the slowest
+    # real send (30s upload timeout) or a live job would be re-queued under itself.
+    FRAME_CLAIM_STALE_MINUTES: int = 15
 
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).

@@ -16,11 +16,12 @@ import pillow_heif
 import structlog
 from anyio import to_thread
 from PIL import Image, ImageOps
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import async_session
 from app.models import Attachment, FrameShareJob, FrameShareState, Memo, Tag, User, memo_tags
 
 logger = structlog.get_logger(__name__)
@@ -332,3 +333,84 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
     await db.flush()
     logger.info("frame_share.sent", job_id=job.id, bytes=len(jpeg))
     return "sent"
+
+
+# --- stale-claim recovery (MEMNG-35): un-strand jobs a crashed worker left in `claimed` ---
+
+
+async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -> int:
+    """Re-queue (or terminally fail) frame-share jobs stuck in `claimed` past the stale horizon.
+
+    The worker COMMITS the `claimed` tombstone before the external album upload, and only `queued`
+    rows are ever claimed — so a process death in that window (a `docker compose up -d
+    --force-recreate` during a send, an OOM kill, a host reboot) left the delivery in `claimed`
+    forever, invisible and never retried. This sweep is the lease side of that tombstone: a row
+    whose claimed_at is older than FRAME_CLAIM_STALE_MINUTES has no live worker behind it.
+
+    A NULL claimed_at is treated as stale: it can only be a row claimed before this column existed
+    (i.e. already stranded for far longer than any horizon), never a fresh claim — every claim path
+    stamps it.
+
+    Recovery costs one attempt, so a job that reliably kills the worker mid-send walks to the
+    visible `failed` state at FRAME_MAX_ATTEMPTS instead of re-queueing forever (a re-edit of the
+    memo still resurrects it via maybe_enqueue_frame_shares). Re-queued rows are due immediately —
+    the crash is not a rate-limit signal, so no backoff is scheduled.
+
+    DUPLICATE-DELIVERY TRADE: the album upload is not transactional, so a crash AFTER the album
+    accepted the photo but before the `sent` commit re-sends it. That is deliberate — MEMNG-35
+    prefers a possible duplicate over a silent loss. In practice aura-frames dedups by sha256 (it
+    answers 200 for a known photo, 201 for a new one, and upload_to_album treats both as success),
+    and re-rendering an unchanged original with the same fixed parameters yields byte-identical
+    JPEG bytes, so the duplicate is absorbed downstream. It is only truly visible if the source or
+    the memo's date changed between the two attempts (the render then differs → a new sha).
+
+    Returns the number of rows recovered; FLUSHES only — the caller owns the commit.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(minutes=settings.FRAME_CLAIM_STALE_MINUTES)
+    rows = (
+        (
+            await db.execute(
+                select(FrameShareJob)
+                .where(
+                    FrameShareJob.state == FrameShareState.claimed,
+                    or_(
+                        FrameShareJob.claimed_at.is_(None),
+                        FrameShareJob.claimed_at < cutoff,
+                    ),
+                )
+                # skip_locked: a row another worker holds mid-claim is someone else's business.
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for job in rows:
+        job.attempts += 1
+        job.claimed_by = None
+        job.claimed_at = None
+        if job.attempts >= FRAME_MAX_ATTEMPTS:
+            job.state = FrameShareState.failed  # terminal + visible, never a silent drop
+            job.error = f"stale claim recovery gave up after {job.attempts} attempts"
+            logger.warning(
+                "frame_share.stale_claim_failed", job_id=job.id, attempts=job.attempts
+            )
+            continue
+        job.state = FrameShareState.queued
+        job.next_attempt_at = None  # due immediately: a crash is not a backoff signal
+        job.error = "recovered from stale claim (worker interrupted mid-send)"
+        logger.warning(
+            "frame_share.stale_claim_requeued", job_id=job.id, attempts=job.attempts
+        )
+    await db.flush()
+    return len(rows)
+
+
+async def recover_stale_claimed_committed(now: datetime | None = None) -> int:
+    """The worker's recovery entry: a dedicated session that COMMITS. A flush alone dies with the
+    session, so the re-queue would evaporate and the job stay stranded (the MEMNG-37 shape)."""
+    async with async_session() as db:
+        recovered = await recover_stale_claimed(db, now)
+        await db.commit()
+    return recovered
