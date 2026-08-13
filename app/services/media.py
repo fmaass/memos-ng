@@ -143,7 +143,72 @@ def process_image(attachment: Attachment) -> dict:
     return {"width": width, "height": height, "blurhash": bhash}
 
 
+QUARTER_TURNS = (0, 90, 180, 270)
+
+
+def _as_quarter_turn(value: object) -> int | None:
+    """One raw rotation value → a normalized quarter turn, or None when it is not one.
+
+    Both rotation sources are loose about type and sign: the display matrix's angle is a number
+    ffprobe derives with atan2, so it arrives negative or float (-90 means "90° clockwise", i.e.
+    270° counter-clockwise), while the legacy stream tag is a string. Anything that does not
+    normalize to a quarter turn — a shear or arbitrary-angle matrix — is rejected rather than
+    rounded to the nearest one: no width/height swap can express such a transform, so the coded
+    dimensions stay the honest answer for it.
+    """
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        degrees = round(float(value)) % 360
+    except ValueError:
+        return None
+    return degrees if degrees in QUARTER_TURNS else None
+
+
+def probe_rotation(stream: dict) -> int:
+    """The rotation ffprobe reports for a video stream, normalized to one of QUARTER_TURNS.
+
+    Where the rotation lives depends on the container/encoder era, so BOTH places are read: a
+    Display Matrix in the stream's side data (what phone cameras write today and what the mov/mp4
+    demuxer exports) and the legacy `rotate` stream tag (older muxers). The matrix wins whenever
+    it is present — that is ffmpeg's own precedence, and matching it is what keeps the dimensions
+    reported here in agreement with the frames the transcode actually produces.
+    """
+    for entry in stream.get("side_data_list") or []:
+        if isinstance(entry, dict) and "rotation" in entry:
+            # Authoritative once present, including when it is NOT a quarter turn (→ no swap):
+            # falling through to the legacy tag here would let a stale tag override the matrix.
+            return _as_quarter_turn(entry["rotation"]) or 0
+    return _as_quarter_turn((stream.get("tags") or {}).get("rotate")) or 0
+
+
+def displayed_size(stream: dict) -> tuple[int | None, int | None]:
+    """The stream's DISPLAYED width/height — its coded dimensions with the rotation applied.
+
+    A portrait phone clip is stored landscape plus a 90°/270° rotation, so the coded dimensions
+    describe the wrong shape (MEMNG-40 / #37) and every consumer of attachment.width/height —
+    tile aspect ratio, feed layout — is misled by them.
+
+    Consistency with the derived tiers: ffmpeg AUTOROTATES on decode (verified against the runtime
+    image's ffprobe/ffmpeg 7.1.5 — a 320x240 + rotation-90 source transcodes to a 240x320 mp4 with
+    no rotation side data, and its poster frame comes out 240x320 too). Both the web tier and the
+    poster are therefore already display-oriented, so swapping here AGREES with them rather than
+    double-applying: the swap only re-states, for the original, the orientation the derived
+    artifacts were written in.
+    """
+    width, height = stream.get("width"), stream.get("height")
+    if probe_rotation(stream) in (90, 270):
+        return height, width
+    return width, height
+
+
 def _ffprobe(path: str) -> dict:
+    # -show_streams (rather than a narrower `-show_entries stream=width,height`) because the
+    # rotation has to come back too, and the entry filter cannot reach into the side-data list:
+    # `stream=...,side_data_list` yields entries stripped to `{}` (verified on ffprobe 7.1.5).
+    # Only the child-section form `stream_side_data=rotation` selects it, and depending on that
+    # section name would fail SILENTLY — as a rotation that reads absent, i.e. straight back into
+    # this bug — if it were ever renamed. -show_streams carries both sources unconditionally.
     out = subprocess.run(
         [
             "ffprobe",
@@ -151,8 +216,8 @@ def _ffprobe(path: str) -> dict:
             "error",
             "-select_streams",
             "v:0",
-            "-show_entries",
-            "stream=width,height:format=duration",
+            "-show_streams",
+            "-show_format",
             "-of",
             "json",
             path,
@@ -165,9 +230,10 @@ def _ffprobe(path: str) -> dict:
     data = json.loads(out)
     stream = (data.get("streams") or [{}])[0]
     duration = data.get("format", {}).get("duration")
+    width, height = displayed_size(stream)
     return {
-        "width": stream.get("width"),
-        "height": stream.get("height"),
+        "width": width,
+        "height": height,
         "duration": float(duration) if duration else None,
     }
 

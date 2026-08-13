@@ -1,5 +1,8 @@
 import asyncio
+import json
 import secrets
+import shutil
+import subprocess
 import time
 
 import pytest
@@ -332,3 +335,183 @@ def test_worker_loop_wires_the_media_drain():
     assert sep, "worker.run no longer has the drain loop this pin anchors on"
     assert "run_media_drain()" in loop
     assert "run_once(" not in loop  # never called unguarded from the loop
+
+
+# --- video rotation (MEMNG-40 / #37) -------------------------------------------------------
+# A portrait phone clip is stored LANDSCAPE plus a rotation, so the coded width/height describe
+# the wrong shape. The fixtures below are the two payload shapes ffprobe really emits, captured
+# from `ffprobe -show_streams` (7.1.5) against clips written with `-display_rotation`.
+
+DISPLAY_MATRIX_ROWS = (
+    "\n00000000:            0      -65536           0"
+    "\n00000001:        65536           0           0"
+    "\n00000002:            0           0  1073741824\n"
+)
+
+
+def _matrix(rotation):
+    """A Display Matrix side-data entry. The `displaymatrix` rows are carried so the fixture is
+    the real payload and not a hand-trimmed one; the parser reads `rotation`, which is the angle
+    ffprobe derives from those rows (counter-clockwise, hence the negative values it emits)."""
+    return {
+        "side_data_type": "Display Matrix",
+        "displaymatrix": DISPLAY_MATRIX_ROWS,
+        "rotation": rotation,
+    }
+
+
+def _stream(width=320, height=240, *, side_data=None, tags=None):
+    """One `streams[0]` entry, trimmed to the fields the parser reads."""
+    stream = {"codec_type": "video", "width": width, "height": height}
+    if side_data is not None:
+        stream["side_data_list"] = side_data
+    if tags is not None:
+        stream["tags"] = tags
+    return stream
+
+
+@pytest.mark.parametrize(
+    ("raw", "degrees"),
+    [
+        (0, 0),
+        (90, 90),
+        (180, 180),
+        (270, 270),
+        (-90, 270),  # what ffprobe actually emits for a 270° clip
+        (-180, 180),  # ...and for a 180° one
+        (-270, 90),
+        (360, 0),
+        (90.0, 90),  # the angle is a float in ffprobe's JSON, not always an int
+        (-89.9998, 270),  # atan2 noise still has to land on a quarter turn
+        ("90", 90),  # the legacy tag arrives as a string
+        (45, 0),  # not a quarter turn: no swap can express it
+        ("", 0),
+        ("north", 0),
+        (None, 0),
+        ([90], 0),
+    ],
+)
+def test_probe_rotation_normalizes_every_rotation_value(raw, degrees):
+    assert media.probe_rotation(_stream(side_data=[_matrix(raw)])) == degrees
+    assert media.probe_rotation(_stream(tags={"rotate": raw})) == degrees
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        # nothing to rotate by → the coded dimensions ARE the displayed ones
+        (_stream(), (320, 240)),
+        (_stream(side_data=[], tags={"language": "und"}), (320, 240)),
+        # modern source: the display matrix
+        (_stream(side_data=[_matrix(0)]), (320, 240)),
+        (_stream(side_data=[_matrix(90)]), (240, 320)),
+        (_stream(side_data=[_matrix(180)]), (320, 240)),
+        (_stream(side_data=[_matrix(270)]), (240, 320)),
+        (_stream(side_data=[_matrix(-90)]), (240, 320)),
+        (_stream(side_data=[_matrix(-180)]), (320, 240)),
+        # legacy source: the `rotate` stream tag
+        (_stream(tags={"rotate": "0"}), (320, 240)),
+        (_stream(tags={"rotate": "90"}), (240, 320)),
+        (_stream(tags={"rotate": "180"}), (320, 240)),
+        (_stream(tags={"rotate": "270"}), (240, 320)),
+        # other side data present, none of it a rotation → the tag still decides
+        (_stream(side_data=[{"side_data_type": "Stereo 3D"}], tags={"rotate": "90"}), (240, 320)),
+        # unprobeable stream (ffprobe found no video stream): nothing to report either way
+        ({}, (None, None)),
+        ({"side_data_list": [_matrix(90)]}, (None, None)),
+    ],
+)
+def test_displayed_size_reports_the_rotated_shape(stream, expected):
+    assert media.displayed_size(stream) == expected
+
+
+def test_display_matrix_wins_over_a_disagreeing_rotate_tag():
+    # Both sources present and CONTRADICTING each other. ffmpeg resolves to the matrix and
+    # autorotates the transcode by it, so the reported shape has to follow the matrix too —
+    # picking the tag here would describe a shape the poster and web tier do not have.
+    upright = _stream(side_data=[_matrix(0)], tags={"rotate": "90"})
+    assert media.probe_rotation(upright) == 0
+    assert media.displayed_size(upright) == (320, 240)
+
+    rotated = _stream(side_data=[_matrix(90)], tags={"rotate": "0"})
+    assert media.probe_rotation(rotated) == 90
+    assert media.displayed_size(rotated) == (240, 320)
+
+
+def _write_clip(path, rotation=None):
+    """A 1s 320x240 clip, optionally stamped with a display matrix (stream-copied, so the frames
+    stay landscape and only the rotation metadata differs from the control)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    src = [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=1:size=320x240:rate=5",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if rotation is None:
+        subprocess.run(
+            ["ffmpeg", "-y", *src, str(path)], capture_output=True, check=True, timeout=60
+        )
+        return
+    base = path.with_name(f"base-{path.name}")
+    subprocess.run(["ffmpeg", "-y", *src, str(base)], capture_output=True, check=True, timeout=60)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-display_rotation",
+            str(rotation),
+            "-i",
+            str(base),
+            "-c",
+            "copy",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+
+
+def _raw_side_data(path):
+    out = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_streams",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    return json.loads(out)["streams"][0].get("side_data_list") or []
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_ffprobe_reports_displayed_dims_for_a_real_rotated_clip(tmp_path):
+    # AC1 end-to-end against real ffmpeg: a clip whose FRAMES are 320x240 but which carries a
+    # 90° display matrix must probe as 240x320 — the shape a player shows and the shape the
+    # autorotated poster/web tier are written in.
+    rotated = tmp_path / "portrait.mp4"
+    _write_clip(rotated, rotation=90)
+    if not any("rotation" in sd for sd in _raw_side_data(rotated)):
+        pytest.skip("this ffmpeg cannot stamp a display matrix (-display_rotation)")
+
+    assert media._ffprobe(str(rotated))["width"] == 240
+    assert media._ffprobe(str(rotated))["height"] == 320
+
+    control = tmp_path / "landscape.mp4"  # same frames, no rotation → unswapped
+    _write_clip(control)
+    assert (media._ffprobe(str(control))["width"], media._ffprobe(str(control))["height"]) == (
+        320,
+        240,
+    )
