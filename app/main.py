@@ -11,6 +11,7 @@ from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
 
 from app.config import settings
+from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
 from app.version import __version__
 
@@ -104,6 +105,10 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+# Order matters: `add_middleware` inserts at the OUTSIDE of the stack, so the last one added runs
+# first. SecurityHeaders must stay outermost — it wraps `send`, and a CSRF rejection generated
+# inside it still gets the security headers.
+app.add_middleware(OriginCsrfMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 
 

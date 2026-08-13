@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.config import settings
+from app.csrf import canonical_origin
 from app.main import app
 from app.models import Upload
 from app.services import uploads as svc
@@ -42,6 +43,7 @@ def _login_as(monkeypatch, subject):
     from app import auth
 
     client = TestClient(app, raise_server_exceptions=False)
+    client.headers["Origin"] = canonical_origin()  # speak as a browser on this app's own origin
     monkeypatch.setattr(settings, "COOKIE_SECURE", False)
     monkeypatch.setattr(auth, "exchange_code", AsyncMock(return_value={"id_token": "x"}))
     monkeypatch.setattr(
