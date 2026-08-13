@@ -186,6 +186,39 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.3.1
+
+Security hardening patch (2026-08-13).
+
+**Security**
+- Upload size limits enforce at chunk-append time: bodies stream to a private per-request
+  spool with a running byte count (413 mid-stream on overshoot), offset gaps and replays
+  answer before any body is consumed, and the part-file merge runs under a row lock so a
+  failing request can only ever discard its own bytes.
+- The `/file/` compat surface honors memo visibility: anonymous requests see only public
+  memos' derived tiers, flips and deletions revoke on the next request, and every denial
+  is byte-identical to an unknown uid. Served tiers carry `Cache-Control: private, no-store`.
+- Upload sessions are bound to their creating user (additive migration): cross-user probe,
+  append, finalize — and a foreign upload uid submitted through memo create/edit — all
+  behave exactly like an unknown uid. Pre-migration rows fail closed and age out.
+- Cookie-authenticated mutations refuse cross-origin requests: Origin (or Referer) must
+  match the app's own origin, closing the cross-subdomain CSRF vector that SameSite's
+  site-scoping leaves open. PAT and cookie-less clients are unaffected.
+- The login rate limiter keys on the real client IP behind the reverse proxy
+  (`--proxy-headers` with an explicit private-range trust list).
+- The production image clears the Trivy HIGH gate again: aiohttp/cryptography/pillow at
+  fixed releases, no uv cache in the final layer, no unused interpreter pip stack.
+- `/metrics` is no longer publicly reachable on the production hostname (kept scrapeable
+  container-direct for internal consumers).
+
+**Fixed**
+- PAT `last_used` persists on the compat surface (it was flushed but rolled back on every
+  request) — stamped at most once per window in a dedicated session that neither holds
+  the row lock for the request's lifetime nor can fail authentication.
+- The destructive test bootstrap refuses to run against anything but an allowlisted local
+  throwaway database, including libpq query-string and environment rerouting.
+- Session absolute expiry and OIDC state mismatch are pinned by mutation-killing tests.
+
 ### v1.3.0
 
 - **Feed — photos render at their real shape.** Tiles cropped every photo to a small square
