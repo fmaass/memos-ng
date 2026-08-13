@@ -2,7 +2,12 @@ import json
 
 from app.config import settings
 from app.main import app
-from app.routers.assets import _ready_meta, _user_snapshot, media_event_stream
+from app.routers.assets import (
+    _negotiated_path_sync,
+    _ready_meta,
+    _user_snapshot,
+    media_event_stream,
+)
 from app.services import uploads as up_svc
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -569,3 +574,46 @@ def test_pat_can_download_original(logged_in_client, monkeypatch, tmp_path):
         assert anon.get("/api/attachments/att-pat-orig/original").status_code == 401  # no auth
     finally:
         _cleanup(aid)
+
+
+# --- _negotiated_path_sync: the webp/original choice + existence check that MEMNG-42 batched into
+# --- one off-loop hop. Tested directly as a pure function (project convention), because the
+# --- refactor moved the 404 decision out of _serve_file's control flow and into this helper.
+
+
+def test_negotiated_path_prefers_an_existing_webp(tmp_path):
+    jpeg, webp = tmp_path / "a.jpg", tmp_path / "a.webp"
+    jpeg.write_bytes(b"j")
+    webp.write_bytes(b"w")
+    assert _negotiated_path_sync(jpeg, "image/jpeg", True) == (webp, "image/webp")
+
+
+def test_negotiated_path_falls_back_to_jpeg_when_webp_absent(tmp_path):
+    jpeg = tmp_path / "a.jpg"
+    jpeg.write_bytes(b"j")
+    assert _negotiated_path_sync(jpeg, "image/jpeg", True) == (jpeg, "image/jpeg")
+
+
+def test_negotiated_path_ignores_webp_when_not_negotiated(tmp_path):
+    jpeg, webp = tmp_path / "a.jpg", tmp_path / "a.webp"
+    jpeg.write_bytes(b"j")
+    webp.write_bytes(b"w")
+    assert _negotiated_path_sync(jpeg, "image/jpeg", False) == (jpeg, "image/jpeg")
+
+
+def test_negotiated_path_is_none_when_nothing_exists(tmp_path):
+    """None is what _serve_file turns into its 404 'Asset not generated yet'."""
+    missing = tmp_path / "gone.jpg"
+    assert _negotiated_path_sync(missing, "image/jpeg", False) is None
+    assert _negotiated_path_sync(missing, "image/jpeg", True) is None
+
+
+def test_negotiated_path_404s_when_only_the_webp_is_missing_and_original_gone(tmp_path):
+    """A webp-negotiating client still 404s if neither tier was generated."""
+    only_webp = tmp_path / "b.webp"
+    only_webp.write_bytes(b"w")
+    assert _negotiated_path_sync(tmp_path / "b.jpg", "image/jpeg", True) == (
+        only_webp,
+        "image/webp",
+    )
+    assert _negotiated_path_sync(tmp_path / "c.jpg", "image/jpeg", True) is None

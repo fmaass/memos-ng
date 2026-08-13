@@ -58,6 +58,41 @@ def _unlink_sync(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def _unlink_many_sync(paths: list[Path]) -> None:
+    """A whole batch of part files in ONE hop — N separate offloads would be N round-trips
+    against a bind-mounted share. Errors propagate exactly as a single unlink's would."""
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def _create_part_sync(path: Path) -> None:
+    """Create the empty part file and its parent directory in one hop."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+
+
+def _mkdir_sync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _part_size_sync(path: Path) -> int:
+    return path.stat().st_size
+
+
+def _is_complete_sync(path: Path, declared_size: int) -> bool:
+    """Whether the part file is fully received: the existence check and the size read share one
+    hop. Semantics are the caller's previous `exists() and stat().st_size == declared` verbatim —
+    including a stat that loses a race with an unlink still raising, rather than being softened
+    into a False."""
+    return path.exists() and path.stat().st_size == declared_size
+
+
+def _move_into_sync(src: Path, dest: Path) -> None:
+    """Create the destination folder and atomically move `src` onto `dest`, in one hop."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dest)
+
+
 def _concat_sync(spool: Path, part: Path, offset: int) -> None:
     """Append the spooled body onto the part file at `offset`. The caller holds the row lock and
     `offset` equals the committed end of the file, so this only ever EXTENDS it — bytes an earlier
@@ -141,8 +176,7 @@ async def create_upload(
     another user out of these bytes."""
     upload_uid = secrets.token_urlsafe(24)
     part = part_path(upload_uid)
-    part.parent.mkdir(parents=True, exist_ok=True)
-    part.touch()
+    await to_thread.run_sync(_create_part_sync, part)
     client_mtime = datetime.fromtimestamp(last_modified / 1000, UTC) if last_modified else None
     upload = Upload(
         upload_uid=upload_uid,
@@ -292,7 +326,7 @@ async def finalize_pending(
         if upload is None:
             continue
         part = part_path(up_uid)
-        if not part.exists() or part.stat().st_size != upload.declared_size:
+        if not await to_thread.run_sync(_is_complete_sync, part, upload.declared_size):
             continue  # incomplete — leave it to expire, don't half-finalize
         pending.append((upload, parse_variant(upload.filename)))
 
@@ -324,7 +358,7 @@ async def finalize(
     db: AsyncSession, upload: Upload, owner_id: int, moved_out: list[str] | None = None
 ) -> Attachment:
     part = part_path(upload.upload_uid)
-    actual = part.stat().st_size
+    actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:
         raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
 
@@ -357,19 +391,18 @@ async def finalize(
         .first()
     )
     if existing is not None:
-        part.unlink(missing_ok=True)
+        await to_thread.run_sync(_unlink_sync, part)
         await db.delete(upload)
         await db.flush()
         return existing
 
-    mime = _sniff_mime(part, upload.mime)
+    mime = await to_thread.run_sync(_sniff_mime, part, upload.mime)
     now = datetime.now(UTC)
     # Stage in originals/_unfiled/ — the memo (and so the per-memo folder) doesn't exist yet; the
     # master is atomically moved into originals/YYYY/MM/<memo-folder>/ on link_attachments.
     dest_dir = storage.unfiled_dir(_data_root())
-    dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
-    await to_thread.run_sync(os.replace, part, dest)
+    await to_thread.run_sync(_move_into_sync, part, dest)  # mkdir + os.replace in one hop
     if moved_out is not None:  # only a genuinely-moved file; the dedup return above appends nothing
         moved_out.append(str(dest))
 
@@ -415,7 +448,7 @@ async def finalize_rendition(
     re-dump of an existing key is an idempotent no-op. Any mime is accepted (PNG/TIFF/RAW/…)."""
     assert parsed.variant_key is not None  # callers pass only prints (is_print ⇒ variant_key set)
     part = part_path(upload.upload_uid)
-    actual = part.stat().st_size
+    actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:
         raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
 
@@ -428,16 +461,18 @@ async def finalize_rendition(
         )
     ).scalar_one_or_none()
     if existing is not None:  # write-once — a re-dump of the same key changes nothing
-        part.unlink(missing_ok=True)
+        await to_thread.run_sync(_unlink_sync, part)
         await db.delete(upload)
         await db.flush()
         return None
 
-    mime = _sniff_mime(part, upload.mime)
+    mime = await to_thread.run_sync(_sniff_mime, part, upload.mime)
     digest = await to_thread.run_sync(_sha256_sync, part)
     # Stage beside the screen master in _unfiled/; link_attachments moves it into the memo folder.
+    # The mkdir stays HERE rather than being folded into the move below: it must keep happening
+    # before the savepoint insert, so a run that loses the race leaves the tree as it found it.
     dest_dir = storage.unfiled_dir(_data_root())
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    await to_thread.run_sync(_mkdir_sync, dest_dir)
     dest = dest_dir / f"{uuid.uuid4().hex}{Path(upload.filename).suffix or '.bin'}"
     rendition = AttachmentRendition(
         attachment_id=attachment.id,
@@ -458,7 +493,7 @@ async def finalize_rendition(
             db.add(rendition)
             await db.flush()
     except IntegrityError:  # lost a concurrent race for this (attachment, variant_key) → no-op
-        part.unlink(missing_ok=True)
+        await to_thread.run_sync(_unlink_sync, part)
         await db.delete(upload)
         await db.flush()
         return None
@@ -534,8 +569,10 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
     # this sweep runs can never be mistaken for a dead one — its spool simply waits a cycle.
     spools = await to_thread.run_sync(_list_spools_sync, _data_root() / "uploads")
     rows = (await db.execute(select(Upload).where(Upload.expires_at < now))).scalars().all()
+    # Every part file in ONE hop, still before the flush — an hourly sweep of a large backlog
+    # would otherwise be that many blocking unlinks in a row.
+    await to_thread.run_sync(_unlink_many_sync, [part_path(u.upload_uid) for u in rows])
     for upload in rows:
-        part_path(upload.upload_uid).unlink(missing_ok=True)
         await db.delete(upload)
     await db.flush()
     # Whatever survived the deletion above IS the live set. Reading it as that complement rather

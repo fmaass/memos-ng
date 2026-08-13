@@ -41,6 +41,15 @@ GROUP_POLL_SECONDS = 0.25  # cadence of the "is anything left in the group?" pro
 PROGRESS_PUBLISH_SECONDS = 2.0
 
 
+# Why this module keeps its filesystem calls inline while the request-serving code does not
+# (MEMNG-42). This module is imported by app/worker.py and by nothing else under app/, so none of
+# it ever runs on the loop that answers HTTP requests. worker.run() drains one job at a time and
+# starts nothing concurrently, so the only task an inline stat/mkdir/unlink here could delay is
+# the very job making the call. Offloading would buy no latency for anyone and would put an await
+# in places (a cancellation-time `finally`) where it is actively worse — so these sites carry a
+# `# blocking-ok:` marker with their individual reason and are pinned in
+# tests/test_no_blocking_io.py. If this module ever gains a caller in the app process, that
+# premise dies and every one of them has to move off the loop.
 def _assets(sub: str) -> Path:
     return Path(settings.DATA_ROOT) / "assets" / sub
 
@@ -111,6 +120,8 @@ async def guard_publish(db: AsyncSession, attachment: Attachment) -> None:
     a spurious 'failure' for work nobody wants any more)."""
     if await attachment_still_exists(db, attachment.id):
         return
+    # blocking-ok: worker-only, and it runs while this job holds the attachment row lock — the
+    # sweep must finish before the caller can publish anything, so it is not a yield point.
     discard_outputs(attachment.uid)
     raise AttachmentGone(f"attachment {attachment.id} was deleted while its job was running")
 
@@ -508,6 +519,8 @@ async def _await_group_exit(pgid: int, proc: asyncio.subprocess.Process) -> None
     matters here. The leader is waited on explicitly (rather than left to the group probe, which
     reads a zombie as gone) so this process reaps the one child it actually owns.
     """
+    # blocking-ok: procfs, not the data volume — a /proc listing costs no disk I/O, and this is
+    # the poll condition of a bounded kill/reap loop in the worker.
     while proc.returncode is None or _group_alive(pgid):
         if proc.returncode is None:
             try:  # reaps the leader the moment it dies; the short bound paces the poll
@@ -530,6 +543,7 @@ async def _stop_transcode(pgid: int, proc: asyncio.subprocess.Process) -> None:
     TERM first (ffmpeg closes its output and exits), SIGKILL after a short grace. Every wait is
     BOUNDED: recovering from a hang must not become a second hang in the worker's only slot.
     """
+    # blocking-ok: procfs again (see _await_group_exit) — a cheap in-memory read, worker-only.
     if not _group_alive(pgid) and proc.returncode is not None:
         return  # nothing left to signal and the leader is already reaped
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -651,6 +665,7 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     """H.264/AAC transcode (the slow lane). Defers while the host is too hot (ADR thermal).
     Time-bound by SLOW_TRANSCODE_TIMEOUT_S: on expiry the process tree is killed and the job
     fails through the worker's normal failure path (MEMNG-38)."""
+    # blocking-ok: a sysfs thermal-zone read (/sys/class/thermal), not the data volume.
     if too_hot():
         raise ThermalDefer
     src = attachment.storage_path
@@ -658,6 +673,8 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     duration = attachment.duration or _ffprobe(src).get("duration")
 
     dest = _assets("web") / f"{attachment.uid}.mp4"
+    # blocking-ok: worker-only, and it runs before the transcode is spawned — nothing else is
+    # pending on this loop to be delayed by it.
     dest.parent.mkdir(parents=True, exist_ok=True)
     # keep the real extension so ffmpeg infers the mp4 muxer (a .mp4.tmp suffix fails)
     tmp = dest.with_name(f"{dest.stem}.tmp{dest.suffix}")
@@ -694,6 +711,10 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # Keyed on "this run finished cleanly", NOT on the leader's exit status: a leader can exit
         # 0 while a descendant hangs and the ceiling fires, and that partial must still go.
         if not completed:
+            # blocking-ok: STAYS inline on purpose. This `finally` also runs on worker-shutdown
+            # cancellation, and an await here could be interrupted before the unlink ever
+            # happened — leaking a partial transcode (the biggest file the worker writes, and
+            # nothing else reaps a `.tmp.mp4`). A synchronous call cannot be cut short.
             tmp.unlink(missing_ok=True)
         # The progress row is deliberately NOT cleared here. This runs inside the claiming
         # transaction, before the outcome commits, and in that window the snapshot would fall back
@@ -709,8 +730,11 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     # the transcode. Check under the row lock BEFORE publishing: past this point the tmp file
     # becomes the served web tier, and republishing it after a delete would resurrect it.
     await guard_publish(db, attachment)  # sweeps tmp + any tier files when the delete won
+    # blocking-ok: the publish must follow guard_publish's row-lock check with no yield point in
+    # between — an await here would hand the loop back between "the attachment still exists" and
+    # the rename that resurrects its file. Worker-only either way.
     os.replace(tmp, dest)  # atomic; poster was written by the fast lane first
-    _stamp_mtime(dest, attachment)
+    _stamp_mtime(dest, attachment)  # blocking-ok: one utime, same no-yield window as the rename
     job.progress_pct = 100
     attachment.status = AttachmentStatus.ready
     await db.flush()
@@ -734,6 +758,8 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
         else:
             # Heavy image (HEIC/AVIF): the CPU-costly libheif decode + derivative generation runs
             # on the slow (Merkur) worker. process_image never touches the original (ADR-0008).
+            # blocking-ok: this IS the worker's job — a CPU-bound decode that would still occupy
+            # the process in a thread. Nothing else is queued on this loop to yield to.
             meta = process_image(attachment)
             await guard_publish(db, attachment)
             attachment.width = meta.get("width")
@@ -744,6 +770,8 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
         return
 
     is_video = attachment.mime.startswith("video/")
+    # blocking-ok: the fast lane's own work (Pillow decode / ffprobe+poster), same reasoning as
+    # the slow-lane branch above — CPU-bound, worker-only, nothing concurrent to starve.
     meta = process_video_poster(attachment) if is_video else process_image(attachment)
 
     await guard_publish(db, attachment)
