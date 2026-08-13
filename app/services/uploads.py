@@ -202,6 +202,15 @@ async def append_stream(
     until the caller COMMITS, which is when this append's bytes and offset actually become visible
     to another request; an in-process lock released at function exit would still let the next
     append read a pre-commit offset and write over these bytes."""
+    # Offset precedence outranks the size ceiling: a body that cannot land whatever its size gets
+    # the protocol's answer without being consumed at all — a gap is a 409 to re-sync from, and a
+    # replay is a no-op. This is an EARLY EXIT on the request's own snapshot, not the decision of
+    # record; the authoritative gap/replay/match call is re-taken under the row lock below against
+    # the refreshed offset.
+    if offset > upload.bytes_received:
+        raise ValueError("offset gap")
+    if offset < upload.bytes_received:
+        return upload
     spool = _spool_path(upload.upload_uid)
     try:
         # Receive-time bound: no single body may exceed the session's whole ceiling, so an oversize
@@ -443,12 +452,35 @@ async def finalize_rendition(
     return rendition
 
 
+def _reap_spools_sync(spool_dir: Path, cutoff: float) -> int:
+    """Delete spool files last written before `cutoff`.
+
+    Safe against an in-flight append: a spool's mtime advances on every chunk written to it, so a
+    file untouched since a whole session-expiry window ago cannot still have a writer — while a
+    live request's spool was touched a chunk ago. The `finally` in append_stream removes a spool
+    the moment its request ends; this only catches what a killed process left behind."""
+    if not spool_dir.is_dir():
+        return 0
+    reaped = 0
+    for spool in spool_dir.glob("*.spool"):
+        try:
+            if spool.stat().st_mtime < cutoff:
+                spool.unlink()
+                reaped += 1
+        except OSError:  # vanished under us — its own request just cleaned it up
+            continue
+    return reaped
+
+
 async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
-    """Delete abandoned uploads (past expires_at) + part files. Worker-wired in T2.2."""
+    """Delete abandoned uploads (past expires_at) + part files, and any spool file a killed process
+    orphaned mid-append. Returns the number of upload SESSIONS reaped. Worker-wired in T2.2."""
     now = now or datetime.now(UTC)
     rows = (await db.execute(select(Upload).where(Upload.expires_at < now))).scalars().all()
     for upload in rows:
         part_path(upload.upload_uid).unlink(missing_ok=True)
         await db.delete(upload)
     await db.flush()
+    cutoff = (now - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS)).timestamp()
+    await to_thread.run_sync(_reap_spools_sync, _data_root() / "uploads", cutoff)
     return len(rows)
