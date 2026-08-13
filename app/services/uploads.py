@@ -471,21 +471,45 @@ async def finalize_rendition(
     return rendition
 
 
-def _reap_spools_sync(spool_dir: Path, cutoff: float) -> int:
-    """Delete spool files last written before `cutoff`.
+def _spool_owner_uid(spool: Path) -> str | None:
+    """The upload session a spool file belongs to, or None if its name is not one this service
+    writes. `_spool_path` composes `<upload_uid>.<token>.spool` out of two token_urlsafe values,
+    and that alphabet contains no dot — so a well-formed name has exactly three fields and the
+    first one IS the uid. Anything else is unattributable debris."""
+    fields = spool.name.split(".")
+    if len(fields) != 3 or "" in fields or fields[2] != "spool":
+        return None
+    return fields[0]
 
-    Safe against an in-flight append: a spool's mtime advances on every chunk written to it, so a
-    file untouched since a whole session-expiry window ago cannot still have a writer — while a
-    live request's spool was touched a chunk ago. The `finally` in append_stream removes a spool
-    the moment its request ends; this only catches what a killed process left behind."""
-    if not spool_dir.is_dir():
-        return 0
+
+def _list_spools_sync(spool_dir: Path) -> list[Path]:
+    return sorted(spool_dir.glob("*.spool")) if spool_dir.is_dir() else []
+
+
+def _reap_spools_sync(spools: list[Path], cutoff: float, live_uids: frozenset[str]) -> int:
+    """Delete the spool files that can no longer have a writer — and only those.
+
+    The OWNING SESSION decides, not the clock. A spool belongs to one append request of one upload
+    session, and while that session is open the file may be written again at any moment however old
+    it looks: a stalled connection can leave an in-flight spool untouched for longer than the whole
+    expiry window, and unlinking it under its writer fails that request. So a spool whose uid is
+    still in `live_uids` is never touched, and one whose session is gone or already expired is
+    debris a killed process left behind — the `finally` in append_stream removes a spool the moment
+    its request ends normally.
+
+    The mtime horizon stays as the fallback for names carrying no parseable uid: those have no
+    session to ask about, so age is all there is to go on (they age out exactly as before)."""
     reaped = 0
-    for spool in spool_dir.glob("*.spool"):
+    for spool in spools:
         try:
-            if spool.stat().st_mtime < cutoff:
-                spool.unlink()
-                reaped += 1
+            uid = _spool_owner_uid(spool)
+            if uid is not None:
+                if uid in live_uids:
+                    continue
+            elif spool.stat().st_mtime >= cutoff:
+                continue
+            spool.unlink()
+            reaped += 1
         except OSError:  # vanished under us — its own request just cleaned it up
             continue
     return reaped
@@ -505,11 +529,19 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
     """Delete abandoned uploads (past expires_at) + part files, and any spool file a killed process
     orphaned mid-append. Returns the number of upload SESSIONS reaped. Worker-wired in T2.2."""
     now = now or datetime.now(UTC)
+    # List the spool directory BEFORE reading which sessions are live. In that order every listed
+    # file's session row was already committed when the read below ran, so a session opened while
+    # this sweep runs can never be mistaken for a dead one — its spool simply waits a cycle.
+    spools = await to_thread.run_sync(_list_spools_sync, _data_root() / "uploads")
     rows = (await db.execute(select(Upload).where(Upload.expires_at < now))).scalars().all()
     for upload in rows:
         part_path(upload.upload_uid).unlink(missing_ok=True)
         await db.delete(upload)
     await db.flush()
+    # Whatever survived the deletion above IS the live set. Reading it as that complement rather
+    # than re-deriving it from expires_at keeps a never-expiring row (NULL expires_at), which the
+    # row sweep also never collects, on the spared side instead of orphaning its spool.
+    live_uids = frozenset((await db.execute(select(Upload.upload_uid))).scalars().all())
     cutoff = (now - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS)).timestamp()
-    await to_thread.run_sync(_reap_spools_sync, _data_root() / "uploads", cutoff)
+    await to_thread.run_sync(_reap_spools_sync, spools, cutoff, live_uids)
     return len(rows)
