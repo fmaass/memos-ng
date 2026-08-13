@@ -265,6 +265,11 @@ class FrameShareJob(Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
     claimed_by: Mapped[str | None] = mapped_column(String(255))
+    # Lease stamp written when the worker commits the `claimed` tombstone (MEMNG-35). The recovery
+    # sweep re-queues a job still `claimed` past the stale horizon — without it a crash between the
+    # tombstone commit and the upload result stranded the delivery in `claimed` forever. NULL on a
+    # row claimed before this column existed, which the sweep reads as "long stranded".
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

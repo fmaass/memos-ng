@@ -572,6 +572,299 @@ async def test_run_frame_share_once_end_to_end_marks_sent(monkeypatch, tmp_path,
             await db.commit()
 
 
+async def test_crash_after_claim_commit_is_recovered_and_reclaimable(
+    monkeypatch, tmp_path, db_engine
+):
+    # MEMNG-35, the exact stranding window: the worker COMMITS the `claimed` tombstone and then dies
+    # before the upload finishes. Drives the real claim path (which commits), abandons the session
+    # like a SIGKILL would, ages the lease past the horizon, and asserts through FRESH sessions that
+    # the job is queued, attempt-counted and claimable again — the delivery resumes instead of
+    # sitting in `claimed` forever. Before the fix nothing ever reset that row.
+    _frame_api_settings(monkeypatch)
+    f = tmp_path / "stranded.jpg"
+    _write_jpeg(f, (100, 70))
+    subject = f"crash-{secrets.token_hex(4)}"
+    user_id = None
+    stale = timedelta(minutes=settings.FRAME_CLAIM_STALE_MINUTES + 1)
+    try:
+        async with async_session() as db:
+            u = User(subject=subject, role="user")
+            db.add(u)
+            await db.flush()
+            user_id = u.id
+            att = Attachment(
+                uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
+                size=1, status=AttachmentStatus.ready, storage_path=str(f),
+            )
+            db.add(att)
+            await db.flush()
+            memo = await memos_svc.create_memo(
+                db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
+            )
+            db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
+                                 state=FrameShareState.queued, attempts=0))
+            await db.commit()
+
+        # The crash: claim + commit the tombstone (worker.run_frame_share_once's commit BEFORE the
+        # external send), then never process it.
+        async with async_session() as db:
+            claimed = await worker.claim_frame_share_one(db)
+            assert claimed is not None and claimed.state is FrameShareState.claimed
+            await db.commit()
+
+        async with async_session() as db:
+            job = (
+                await db.execute(select(FrameShareJob).where(FrameShareJob.user_id == user_id))
+            ).scalar_one()
+            assert job.state is FrameShareState.claimed
+            assert job.claimed_at is not None  # the lease the sweep reads
+        assert await fs.recover_stale_claimed_committed() == 0  # still fresh → left alone
+
+        # Age the lease: the crash was longer ago than the horizon.
+        async with async_session() as db:
+            job = (
+                await db.execute(select(FrameShareJob).where(FrameShareJob.user_id == user_id))
+            ).scalar_one()
+            job.claimed_at = datetime.now(UTC) - stale
+            await db.commit()
+
+        assert await fs.recover_stale_claimed_committed() == 1
+
+        # Fresh session: read the committed truth back, not a stale in-memory identity.
+        async with async_session() as db:
+            job = (
+                await db.execute(select(FrameShareJob).where(FrameShareJob.user_id == user_id))
+            ).scalar_one()
+            assert job.state is FrameShareState.queued
+            assert job.claimed_by is None and job.claimed_at is None
+            assert job.attempts == 1  # recovery costs an attempt → a poison job can't loop forever
+            assert job.next_attempt_at is None  # due immediately; a crash is not a backoff signal
+            assert job.error is not None and "stale claim" in job.error  # visible why
+            reclaimed = await worker.claim_frame_share_one(db)  # the delivery can actually resume
+            assert reclaimed is not None and reclaimed.id == job.id
+            await db.rollback()
+    finally:
+        async with async_session() as db:
+            if user_id is not None:
+                await db.execute(delete(User).where(User.id == user_id))
+            await db.execute(delete(Tag).where(Tag.name == "curated"))
+            await db.commit()
+
+
+async def test_recover_leaves_a_fresh_claim_alone(adb, monkeypatch, tmp_path):
+    # A worker that claimed a second ago is mid-send, not dead: re-queueing it would duplicate a
+    # delivery that is still in flight. Only the horizon separates the two cases.
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    job.claimed_at = datetime.now(UTC)
+    await adb.flush()
+    assert await fs.recover_stale_claimed(adb) == 0
+    assert job.state is FrameShareState.claimed and job.attempts == 0
+    assert job.claimed_at is not None
+
+
+async def test_recover_treats_null_claimed_at_as_stale(adb, monkeypatch, tmp_path):
+    # A row claimed before claimed_at existed (the jobs stranded in prod today): no lease to expire,
+    # but it can only be an orphan — every claim path stamps the column now.
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    assert job.claimed_at is None
+    assert await fs.recover_stale_claimed(adb) == 1
+    assert job.state is FrameShareState.queued and job.attempts == 1
+
+
+async def test_recover_fails_job_at_the_attempt_ceiling(adb, monkeypatch, tmp_path):
+    # A job whose send reliably kills the worker must end VISIBLY failed at FRAME_MAX_ATTEMPTS, not
+    # be re-queued into a crash loop forever (a re-edit still resurrects it via the enqueue path).
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    job.attempts = fs.FRAME_MAX_ATTEMPTS - 1
+    job.claimed_at = datetime.now(UTC) - timedelta(minutes=settings.FRAME_CLAIM_STALE_MINUTES + 1)
+    await adb.flush()
+    assert await fs.recover_stale_claimed(adb) == 1
+    assert job.state is FrameShareState.failed
+    assert job.attempts == fs.FRAME_MAX_ATTEMPTS
+    assert job.error is not None and "gave up" in job.error
+    assert job.claimed_by is None and job.claimed_at is None
+
+
+async def test_recover_honors_the_configured_horizon(adb, monkeypatch, tmp_path):
+    # The horizon is a real knob, not a hardcoded constant: the same row is spared or recovered
+    # depending on FRAME_CLAIM_STALE_MINUTES.
+    job, *_ = await _make_claimed(adb, monkeypatch, tmp_path)
+    job.claimed_at = datetime.now(UTC) - timedelta(minutes=30)
+    await adb.flush()
+    monkeypatch.setattr(settings, "FRAME_CLAIM_STALE_MINUTES", 60)
+    assert await fs.recover_stale_claimed(adb) == 0
+    assert job.state is FrameShareState.claimed
+    monkeypatch.setattr(settings, "FRAME_CLAIM_STALE_MINUTES", 5)
+    assert await fs.recover_stale_claimed(adb) == 1
+    assert job.state is FrameShareState.queued
+
+
+async def test_recover_safe_swallows_errors(monkeypatch):
+    # Boundary guard: a DB failure inside recovery must not escape into run() — at startup it would
+    # kill the worker before the loop, and on the reap tick it would halt media processing.
+    async def boom():
+        raise RuntimeError("db exploded during recovery")
+
+    monkeypatch.setattr(fs, "recover_stale_claimed_committed", boom)
+    assert await worker.run_frame_share_recover_safe() == 0
+
+
+def test_worker_loop_wires_stale_claim_recovery():
+    # Wiring pin (like the upload reaper's): recovery that nothing calls fixes nothing. It must run
+    # at STARTUP (the deploy --force-recreate that caused the strand) and again inside the loop.
+    import inspect
+
+    head, sep, loop = inspect.getsource(worker.run).partition("while True:")
+    assert sep, "worker.run no longer has the drain loop this pin anchors on"
+    assert "run_frame_share_recover_safe()" in head  # startup sweep, before any drain
+    assert "run_frame_share_recover_safe()" in loop  # periodic, on the reap cadence
+    # ...and through the COMMITTING entry — a flushed re-queue dies with the session (MEMNG-37).
+    wrapper = inspect.getsource(worker.run_frame_share_recover_safe)
+    assert "recover_stale_claimed_committed()" in wrapper
+
+
+# --- MEMNG-35: the lease fence on post-claim outcome writes (superseded-actor interleave) ---
+
+
+async def _commit_queued_job(subject, storage, *, attempts=0):
+    """Commit a user + ready attachment + #curated memo + queued frame job. Returns the user id.
+    Committed (not adb-scoped) because these tests need SEPARATE sessions to see each other."""
+    async with async_session() as db:
+        u = User(subject=subject, role="user")
+        db.add(u)
+        await db.flush()
+        att = Attachment(
+            uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
+            size=1, status=AttachmentStatus.ready, storage_path=storage,
+        )
+        db.add(att)
+        await db.flush()
+        memo = await memos_svc.create_memo(
+            db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
+        )
+        db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
+                             state=FrameShareState.queued, attempts=attempts))
+        await db.commit()
+        return u.id
+
+
+async def _job_of(db, user_id):
+    return (
+        await db.execute(select(FrameShareJob).where(FrameShareJob.user_id == user_id))
+    ).scalar_one()
+
+
+async def _expire_lease_and_recover(user_id):
+    """Age the row's lease past the horizon and run the recovery sweep, as the worker would."""
+    async with async_session() as db:
+        job = await _job_of(db, user_id)
+        job.claimed_at = datetime.now(UTC) - timedelta(
+            minutes=settings.FRAME_CLAIM_STALE_MINUTES + 1
+        )
+        await db.commit()
+    return await fs.recover_stale_claimed_committed()
+
+
+async def _cleanup_committed(user_id):
+    async with async_session() as db:
+        if user_id is not None:
+            await db.execute(delete(User).where(User.id == user_id))
+        await db.execute(delete(Tag).where(Tag.name == "curated"))
+        await db.commit()
+
+
+async def test_superseded_actor_cannot_overwrite_a_reclaimed_job(monkeypatch, tmp_path, db_engine):
+    # The claim commit releases the row lock, so a slow W1 can still be uploading when its lease
+    # goes stale, recovery re-queues the row and W2 claims it. W1's outcome write must not land on
+    # that newer generation — unfenced it would overwrite W2's row (and the transient-failure
+    # branch would flip an already-`sent` row back to `queued`, re-uploading a photo the album has).
+    _frame_api_settings(monkeypatch)
+    _mock_album(monkeypatch, status=201)
+    f = tmp_path / "raced.jpg"
+    _write_jpeg(f, (100, 70))
+    user_id = None
+    try:
+        user_id = await _commit_queued_job(f"race-{secrets.token_hex(4)}", str(f))
+        async with async_session() as w1:
+            w1_job = await worker.claim_frame_share_one(w1)  # W1's generation
+            assert w1_job is not None
+            await w1.commit()  # the tombstone commit — from here W1 holds no lock, only the lease
+
+            assert await _expire_lease_and_recover(user_id) == 1
+            async with async_session() as w2:
+                w2_job = await worker.claim_frame_share_one(w2)  # the new generation
+                assert w2_job is not None and w2_job.id == w1_job.id
+                await w2.commit()
+                w2_lease = (w2_job.claimed_by, w2_job.claimed_at)
+            assert w2_lease[1] != w1_job.claimed_at  # a genuinely different generation
+
+            # W1's upload finally returns and it writes `sent` from its stale instance.
+            assert await fs.process_claimed_job(w1, w1_job) == "lease_lost"
+            await w1.commit()
+
+        async with async_session() as db:  # fresh session: W2's generation is untouched
+            job = await _job_of(db, user_id)
+            assert job.state is FrameShareState.claimed
+            assert (job.claimed_by, job.claimed_at) == w2_lease
+            assert job.sent_at is None  # W1's `sent` never landed
+            assert job.attempts == 1  # recovery's increment only
+    finally:
+        await _cleanup_committed(user_id)
+
+
+async def test_superseded_actor_cannot_lower_attempts_or_resurrect_a_failed_row(
+    monkeypatch, tmp_path, db_engine
+):
+    # The ceiling's integrity. W1 claims at attempts=0 and stalls; the row moves on through later
+    # generations (written directly here) and recovery's final increment retires it at
+    # FRAME_MAX_ATTEMPTS as terminal `failed`. W1 then wakes up with a transient upload error: its
+    # retry write carries state=queued and its STALE local attempts (0+1), which unfenced would both
+    # lower the counter and resurrect a job that is done being retried.
+    _frame_api_settings(monkeypatch)
+    _mock_album(monkeypatch, exc=httpx.TimeoutException("album slow"))  # transient → retry branch
+    f = tmp_path / "ceiling.jpg"
+    _write_jpeg(f, (100, 70))
+    user_id = None
+    try:
+        user_id = await _commit_queued_job(f"ceil-{secrets.token_hex(4)}", str(f))
+        async with async_session() as w1:
+            w1_job = await worker.claim_frame_share_one(w1)
+            assert w1_job is not None and w1_job.attempts == 0
+            await w1.commit()
+
+            async with async_session() as db:  # later generations burned the remaining attempts
+                job = await _job_of(db, user_id)
+                job.attempts = fs.FRAME_MAX_ATTEMPTS - 1
+                await db.commit()
+            assert await _expire_lease_and_recover(user_id) == 1  # → ceiling → failed
+
+            async with async_session() as db:
+                job = await _job_of(db, user_id)
+                assert job.state is FrameShareState.failed  # premise of this test
+                assert job.attempts == fs.FRAME_MAX_ATTEMPTS
+
+            assert await fs.process_claimed_job(w1, w1_job) == "lease_lost"
+            await w1.commit()
+
+        async with async_session() as db:
+            job = await _job_of(db, user_id)
+            assert job.state is FrameShareState.failed  # not resurrected to queued
+            assert job.attempts == fs.FRAME_MAX_ATTEMPTS  # counter never lowered
+            assert job.next_attempt_at is None  # no backoff scheduled by the superseded actor
+    finally:
+        await _cleanup_committed(user_id)
+
+
+def test_rerender_is_byte_identical_so_the_album_sha_dedups_a_retry(tmp_path):
+    # Underpins the duplicate-delivery trade documented in recover_stale_claimed: a recovered job
+    # re-renders the same original with the same fixed parameters, so the bytes — and the sha256
+    # aura-frames dedups on (200 = known photo) — match the first attempt's.
+    p = tmp_path / "o.jpg"
+    _write_jpeg(p, (300, 200))
+    dt = datetime(2024, 3, 1, 12, 30, 0, tzinfo=UTC)
+    assert fs.render_for_frame(str(p), dt) == fs.render_for_frame(str(p), dt)
+
+
 async def test_unconfigured_worker_leaves_frame_jobs_queued(monkeypatch, tmp_path, db_engine):
     # The Merkur slow-lane worker runs the same image without the album API configured. It must NOT
     # claim frame-share jobs (it couldn't upload) — it leaves them queued for the Saturn worker.

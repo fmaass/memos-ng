@@ -16,11 +16,12 @@ import pillow_heif
 import structlog
 from anyio import to_thread
 from PIL import Image, ImageOps
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import async_session
 from app.models import Attachment, FrameShareJob, FrameShareState, Memo, Tag, User, memo_tags
 
 logger = structlog.get_logger(__name__)
@@ -266,14 +267,64 @@ async def _revalidate(
     return att, memo, user
 
 
+async def _write_claimed_outcome(
+    db: AsyncSession,
+    job: FrameShareJob,
+    lease: tuple[str | None, datetime | None],
+    **values: object,
+) -> bool:
+    """Apply a post-claim outcome write ONLY while this actor still holds the lease it claimed
+    under.
+
+    The claim commit releases the row lock (the tombstone is the ownership token, not the lock),
+    so
+    between it and the outcome write the stale-claim sweep can re-queue the row and another worker
+    can claim it. Without a fence this actor's write would land on that newer generation: a `sent`
+    landing on a re-claimed row, or a transient-retry write flipping an already-`sent` row back to
+    `queued` (re-uploading a photo the album has), or a stale local `attempts` overwriting a higher
+    counter and resurrecting a job already failed at the ceiling.
+
+    So every outcome write is a conditional UPDATE on the lease identity — claimed_by AND the
+    claimed_at generation stamp, both read when this actor took the row. The sweep clears exactly
+    those two columns, which is what invalidates a superseded actor. A non-matching write touches
+    zero rows and returns False: the newer generation owns the row, this actor logs and stands down.
+    Holding the lease is also what makes the callers' local read-modify-write of `attempts` sound —
+    nothing else may have touched the row while the lease stood.
+
+    On success the instance is refreshed from the row actually written, so callers and tests read
+    committed truth rather than a hopeful in-memory value.
+    """
+    claimed_by, claimed_at = lease
+    result = await db.execute(
+        update(FrameShareJob)
+        .where(
+            FrameShareJob.id == job.id,
+            FrameShareJob.claimed_by == claimed_by,
+            FrameShareJob.claimed_at == claimed_at,
+        )
+        .values(**values)
+        .returning(FrameShareJob.id)  # RETURNING, not rowcount: a matched row yields a row
+        .execution_options(synchronize_session=False)
+    )
+    if result.first() is None:
+        logger.warning("frame_share.lease_lost", job_id=job.id, claimed_by=claimed_by)
+        return False
+    await db.refresh(job)
+    return True
+
+
 async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
-    """Render + send one job already committed as `claimed`. Mutates job state and FLUSHES only —
-    the worker owns the commit, so a crash before that commit leaves the job `claimed` and it is
-    never re-claimed (at-most-once; no duplicate upload — plan D1). Returns the outcome label."""
+    """Render + send one job already committed as `claimed`. Writes the outcome through the lease
+    fence and does NOT commit — the worker owns the commit, so a crash before it leaves the job
+    `claimed`, to be re-queued by recover_stale_claimed once the lease goes stale (MEMNG-35).
+
+    Returns the outcome label, or 'lease_lost' when the row moved on to a newer generation while
+    this actor was working and the write was refused (see _write_claimed_outcome)."""
+    lease = (job.claimed_by, job.claimed_at)  # the identity every write below is fenced on
     reval = await _revalidate(db, job)
     if reval is None:
-        job.state = FrameShareState.skipped
-        await db.flush()
+        if not await _write_claimed_outcome(db, job, lease, state=FrameShareState.skipped):
+            return "lease_lost"
         logger.info("frame_share.skipped", job_id=job.id)
         return "skipped"
     att, memo, _user = reval
@@ -288,10 +339,14 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
     try:
         jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
     except Exception as exc:
-        job.attempts += 1
-        job.state = FrameShareState.failed
-        job.error = str(exc)[:500]
-        await db.flush()
+        written = await _write_claimed_outcome(
+            db, job, lease,
+            attempts=job.attempts + 1,
+            state=FrameShareState.failed,
+            error=str(exc)[:500],
+        )
+        if not written:
+            return "lease_lost"
         logger.warning(
             "frame_share.render_failed", job_id=job.id, attempts=job.attempts, error=str(exc)[:200]
         )
@@ -309,26 +364,116 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         # escaped forms redaction can't catch — so build the stored/logged error from the exception
         # TYPE + HTTP status ONLY (leak-proof by construction; never str(exc)).
         safe = _safe_upload_error(exc)
-        job.attempts += 1
-        job.error = safe
-        if not _is_transient_http_error(exc) or job.attempts >= FRAME_MAX_ATTEMPTS:
-            job.state = FrameShareState.failed
-            await db.flush()
+        attempts = job.attempts + 1  # sound because the write below refuses without the lease
+        if not _is_transient_http_error(exc) or attempts >= FRAME_MAX_ATTEMPTS:
+            written = await _write_claimed_outcome(
+                db, job, lease, attempts=attempts, error=safe, state=FrameShareState.failed
+            )
+            if not written:
+                return "lease_lost"
             logger.warning(
                 "frame_share.failed", job_id=job.id, attempts=job.attempts, error=safe
             )
             return "failed"
-        job.state = FrameShareState.queued  # retry later
-        job.next_attempt_at = datetime.now(UTC) + timedelta(
-            seconds=FRAME_BACKOFF_BASE_S * 2 ** (job.attempts - 1)
+        written = await _write_claimed_outcome(
+            db, job, lease,
+            attempts=attempts,
+            error=safe,
+            state=FrameShareState.queued,  # retry later
+            next_attempt_at=datetime.now(UTC)
+            + timedelta(seconds=FRAME_BACKOFF_BASE_S * 2 ** (attempts - 1)),
         )
-        await db.flush()
+        if not written:
+            return "lease_lost"
         logger.warning(
             "frame_share.retry", job_id=job.id, attempts=job.attempts, error=safe
         )
         return "retry"
-    job.state = FrameShareState.sent
-    job.sent_at = datetime.now(UTC)
-    await db.flush()
+    written = await _write_claimed_outcome(
+        db, job, lease, state=FrameShareState.sent, sent_at=datetime.now(UTC)
+    )
+    if not written:
+        return "lease_lost"
     logger.info("frame_share.sent", job_id=job.id, bytes=len(jpeg))
     return "sent"
+
+
+# --- stale-claim recovery (MEMNG-35): un-strand jobs a crashed worker left in `claimed` ---
+
+
+async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -> int:
+    """Re-queue (or terminally fail) frame-share jobs stuck in `claimed` past the stale horizon.
+
+    The worker COMMITS the `claimed` tombstone before the external album upload, and only `queued`
+    rows are ever claimed — so a process death in that window (a `docker compose up -d
+    --force-recreate` during a send, an OOM kill, a host reboot) left the delivery in `claimed`
+    forever, invisible and never retried. This sweep is the lease side of that tombstone: a row
+    whose claimed_at is older than FRAME_CLAIM_STALE_MINUTES has no live worker behind it.
+
+    A NULL claimed_at is treated as stale: it can only be a row claimed before this column existed
+    (i.e. already stranded for far longer than any horizon), never a fresh claim — every claim path
+    stamps it.
+
+    Recovery costs one attempt, so a job that reliably kills the worker mid-send walks to the
+    visible `failed` state at FRAME_MAX_ATTEMPTS instead of re-queueing forever (a re-edit of the
+    memo still resurrects it via maybe_enqueue_frame_shares). Re-queued rows are due immediately —
+    the crash is not a rate-limit signal, so no backoff is scheduled.
+
+    DUPLICATE-DELIVERY TRADE: the album upload is not transactional, so a crash AFTER the album
+    accepted the photo but before the `sent` commit re-sends it. That is deliberate — MEMNG-35
+    prefers a possible duplicate over a silent loss. In practice aura-frames dedups by sha256 (it
+    answers 200 for a known photo, 201 for a new one, and upload_to_album treats both as success),
+    and re-rendering an unchanged original with the same fixed parameters yields byte-identical
+    JPEG bytes, so the duplicate is absorbed downstream. It is only truly visible if the source or
+    the memo's date changed between the two attempts (the render then differs → a new sha).
+
+    Returns the number of rows recovered; FLUSHES only — the caller owns the commit.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(minutes=settings.FRAME_CLAIM_STALE_MINUTES)
+    rows = (
+        (
+            await db.execute(
+                select(FrameShareJob)
+                .where(
+                    FrameShareJob.state == FrameShareState.claimed,
+                    or_(
+                        FrameShareJob.claimed_at.is_(None),
+                        FrameShareJob.claimed_at < cutoff,
+                    ),
+                )
+                # skip_locked: a row another worker holds mid-claim is someone else's business.
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for job in rows:
+        job.attempts += 1
+        job.claimed_by = None
+        job.claimed_at = None
+        if job.attempts >= FRAME_MAX_ATTEMPTS:
+            job.state = FrameShareState.failed  # terminal + visible, never a silent drop
+            job.error = f"stale claim recovery gave up after {job.attempts} attempts"
+            logger.warning(
+                "frame_share.stale_claim_failed", job_id=job.id, attempts=job.attempts
+            )
+            continue
+        job.state = FrameShareState.queued
+        job.next_attempt_at = None  # due immediately: a crash is not a backoff signal
+        job.error = "recovered from stale claim (worker interrupted mid-send)"
+        logger.warning(
+            "frame_share.stale_claim_requeued", job_id=job.id, attempts=job.attempts
+        )
+    await db.flush()
+    return len(rows)
+
+
+async def recover_stale_claimed_committed(now: datetime | None = None) -> int:
+    """The worker's recovery entry: a dedicated session that COMMITS. A flush alone dies with the
+    session, so the re-queue would evaporate and the job stay stranded (the MEMNG-37 shape)."""
+    async with async_session() as db:
+        recovered = await recover_stale_claimed(db, now)
+        await db.commit()
+    return recovered

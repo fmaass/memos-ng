@@ -10,6 +10,7 @@ import asyncio
 import os
 import socket
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -185,7 +186,10 @@ async def run_once(db: AsyncSession) -> str:
 async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
     """Atomically claim the next due frame-share job (queued AND next_attempt_at reached), skipping
     rows another worker holds. Sets state=claimed so a crash mid-send never re-runs it (at-most-once
-    — plan D1). Honors next_attempt_at for exponential retry backoff."""
+    — plan D1). Honors next_attempt_at for exponential retry backoff.
+
+    claimed_at stamps the lease the recovery sweep reads: at-most-once holds while a worker is
+    alive, but a claim no worker is behind any more expires instead of stranding (MEMNG-35)."""
     stmt = (
         select(FrameShareJob)
         .where(
@@ -203,6 +207,9 @@ async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
     if job is not None:
         job.state = FrameShareState.claimed
         job.claimed_by = WORKER_ID
+        # App clock on both ends (this stamp and the sweep's cutoff), so cross-worker clock skew is
+        # the only exposure — irrelevant at a minutes-scale horizon.
+        job.claimed_at = datetime.now(UTC)
         await db.flush()
     return job
 
@@ -211,8 +218,11 @@ async def run_frame_share_once(db: AsyncSession) -> str:
     """Claim + process one frame-share job. Returns 'processed' | 'idle' | 'deferred'.
 
     The `claimed` state is COMMITTED before any render/upload, so a crash between the album API
-    accepting the photo and the result commit strands the job in `claimed` (never re-claimed) rather
-    than re-uploading it."""
+    accepting the photo and the result commit does not re-run the send on the next poll
+    (at-most-once while a worker is alive). It no longer strands the job either:
+    claim_frame_share_one stamps the lease and recover_stale_claimed re-queues a claim nobody is
+    behind past the stale horizon, at the price of a possible duplicate upload — see that
+    function's trade note (MEMNG-35)."""
     if not frame_share.frame_api_configured():
         # Only a worker that can actually upload may CLAIM these jobs. The Merkur slow-lane worker
         # runs the same image without the frame API configured — without this guard it would win the
@@ -247,9 +257,27 @@ async def run_frame_share_drain() -> str:
         return "error"
 
 
+async def run_frame_share_recover_safe() -> int:
+    """Re-queue frame-share jobs a dead worker left in `claimed` (MEMNG-35), in its own committing
+    session with ALL errors isolated. Same boundary guard as run_frame_share_drain — the optional
+    frame feature must never halt media processing — and at startup an escaping error would kill
+    the worker before the loop even begins. Returns the number of rows recovered (0 on error)."""
+    try:
+        recovered = await frame_share.recover_stale_claimed_committed()
+    except Exception:
+        logger.exception("frame_share.recover_error")
+        return 0
+    if recovered:
+        logger.info("frame_share_recovered", count=recovered)
+    return recovered
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     beat()
+    # Startup sweep: the common stranding cause is this very restart (a deploy --force-recreate
+    # killing a send mid-flight), so adopt orphaned claims before draining anything new.
+    await run_frame_share_recover_safe()
     last_reap = 0.0
     while True:
         async with async_session() as db:
@@ -263,6 +291,9 @@ async def run() -> None:
             reaped = await reap_expired_committed()
             if reaped:
                 logger.info("uploads_reaped", count=reaped)
+            # Piggybacks the reap cadence: a claim orphaned by something other than a restart
+            # (an OOM-killed send that leaves the worker alive) is recovered within the hour.
+            await run_frame_share_recover_safe()
             last_reap = time.time()
         if status != "processed" and frame_status != "processed":  # idle/deferred → back off
             await asyncio.sleep(POLL_SECONDS)
