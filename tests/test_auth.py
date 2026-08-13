@@ -227,3 +227,46 @@ def test_rolling_refresh_due_throttle_boundary():
     assert rolling_refresh_due(now - timedelta(seconds=w + 1), now) is True  # past window → refresh
     assert rolling_refresh_due(now - timedelta(seconds=w - 1), now) is False  # within → skip
     assert rolling_refresh_due(now, now) is False  # just written → skip
+
+
+# --- mutation-killing pins: absolute expiry + present-but-wrong OIDC state ---
+
+
+def test_session_past_absolute_expiry_is_dead(logged_in_client):
+    client, subject = logged_in_client
+    assert client.get("/api/auth/user").status_code == 200
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE sessions SET absolute_expiry = now() - interval '1 minute' "
+                "WHERE user_id = (SELECT id FROM users WHERE subject = :s)"
+            ),
+            {"s": subject},
+        )
+    eng.dispose()
+    assert client.get("/api/auth/user").status_code == 401
+
+
+def test_callback_rejects_a_present_but_wrong_state(client, monkeypatch):
+    # The OIDC exchange is mocked to SUCCEED: if the state comparison were deleted,
+    # this callback would mint a session and answer 302 — the 400 rides on the
+    # comparison alone, which is what makes deleting it turn the suite red.
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    monkeypatch.setattr(auth, "exchange_code", AsyncMock(return_value={"id_token": "x"}))
+    monkeypatch.setattr(
+        auth,
+        "validate_id_token",
+        lambda t: {
+            "preferred_username": "state_pin_user",
+            "name": "S",
+            "email": "s@x",
+            "groups": [],
+        },
+    )
+    monkeypatch.setattr(auth, "fetch_userinfo", AsyncMock(return_value={}))
+    login = client.get("/api/auth/login", follow_redirects=False)
+    client.cookies.set(auth.TX_COOKIE, login.cookies[auth.TX_COOKIE])
+    cb = client.get("/api/auth/callback?code=abc&state=not-the-real-state", follow_redirects=False)
+    assert cb.status_code == 400
+    assert cb.json()["detail"] == "Invalid OIDC state"
