@@ -502,6 +502,18 @@ async def test_gap_and_replay_answer_before_consuming_the_body(adb, monkeypatch,
     assert svc.part_path(up.upload_uid).read_bytes() == b"P" * 400
 
 
+def _open_session(uid, hours=1):
+    """An upload session row that expires `hours` from now (negative → already expired)."""
+    return Upload(
+        upload_uid=uid,
+        filename="x",
+        mime="x",
+        declared_size=1,
+        bytes_received=0,
+        expires_at=datetime.now(UTC) + timedelta(hours=hours),
+    )
+
+
 async def test_reaper_removes_orphaned_spools_but_spares_an_active_one(adb, monkeypatch, tmp_path):
     # A process killed mid-append leaves a .spool that nothing else would ever remove. The reaper
     # drops that debris, and must not pull the file out from under a request still streaming.
@@ -512,8 +524,10 @@ async def test_reaper_removes_orphaned_spools_but_spares_an_active_one(adb, monk
     orphan.write_bytes(b"half a chunk")
     stale = (datetime.now(UTC) - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS + 1)).timestamp()
     os.utime(orphan, (stale, stale))
+    adb.add(_open_session("live-uid"))  # the session the active spool is being streamed into
+    await adb.flush()
     active = spools / "live-uid.def456.spool"
-    active.write_bytes(b"still streaming")  # touched just now → inside the horizon
+    active.write_bytes(b"still streaming")
     part = svc.part_path("live-uid")
     part.write_bytes(b"committed")
 
@@ -522,6 +536,63 @@ async def test_reaper_removes_orphaned_spools_but_spares_an_active_one(adb, monk
     assert not orphan.exists()  # crash debris reaped
     assert active.read_bytes() == b"still streaming"  # in-flight spool untouched
     assert part.read_bytes() == b"committed"  # a live session's committed bytes untouched
+
+
+async def test_reaper_spares_an_ancient_spool_while_its_session_is_open(adb, monkeypatch, tmp_path):
+    # mtime alone cannot tell a stalled upload from crash debris: a slow or wedged connection can
+    # leave an in-flight spool untouched for far longer than the expiry window, and unlinking it
+    # under its writer fails that request. The OPEN SESSION spares it — however ancient it looks.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    spools = tmp_path / "uploads"
+    spools.mkdir(parents=True, exist_ok=True)
+    adb.add(_open_session("slow-uid"))
+    await adb.flush()
+    stalled = spools / "slow-uid.tok123.spool"
+    stalled.write_bytes(b"mid-chunk")
+    ancient = (datetime.now(UTC) - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS * 10)).timestamp()
+    os.utime(stalled, (ancient, ancient))
+
+    await svc.reap_expired(adb)
+
+    assert stalled.read_bytes() == b"mid-chunk"
+
+
+async def test_reaper_reaps_a_fresh_spool_once_its_session_is_gone(adb, monkeypatch, tmp_path):
+    # The other half of the same rule: a spool whose session no longer exists — or expired in this
+    # very sweep — can have no writer left, so it is collected on its own merits rather than
+    # lingering for another whole window. Both files here were written a moment ago.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    spools = tmp_path / "uploads"
+    spools.mkdir(parents=True, exist_ok=True)
+    adb.add(_open_session("expiring-uid", hours=-1))  # collected by this same reap
+    await adb.flush()
+    expired = spools / "expiring-uid.tok456.spool"
+    expired.write_bytes(b"debris")
+    unknown = spools / "no-such-uid.tok789.spool"  # never had a row at all
+    unknown.write_bytes(b"debris")
+
+    await svc.reap_expired(adb)
+
+    assert not expired.exists() and not unknown.exists()
+
+
+async def test_reaper_ages_out_a_spool_whose_name_names_no_session(adb, monkeypatch, tmp_path):
+    # A name that is not '<uid>.<token>.spool' has no session to ask about (an older layout, a
+    # stray file), so for those the age horizon still decides — exactly as it did before.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    spools = tmp_path / "uploads"
+    spools.mkdir(parents=True, exist_ok=True)
+    aged = spools / "nameless.spool"
+    aged.write_bytes(b"old debris")
+    stale = (datetime.now(UTC) - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS + 1)).timestamp()
+    os.utime(aged, (stale, stale))
+    fresh = spools / "also.nameless.too.spool"
+    fresh.write_bytes(b"fresh debris")
+
+    await svc.reap_expired(adb)
+
+    assert not aged.exists()
+    assert fresh.read_bytes() == b"fresh debris"
 
 
 async def test_append_stops_pulling_the_body_once_the_ceiling_is_passed(adb, monkeypatch, tmp_path):
