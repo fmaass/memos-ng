@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
 
+from app import auth
 from app.config import settings
 from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
@@ -38,6 +39,10 @@ async def lifespan(app: FastAPI):
     await to_thread.run_sync(_create_data_dirs_sync, data_root)
     logger.info("app_started", data_root=str(data_root), version=__version__)
     yield
+    # PAT last_used stamps run as background tasks (MEMNG-81), so shutdown can catch one in
+    # flight. Give it a bounded moment to land; anything slower is cancelled deliberately here
+    # rather than being torn down mid-write by the loop with the engine already going away.
+    await auth.drain_pat_stamp_tasks()
     logger.info("app_stopped")
 
 
