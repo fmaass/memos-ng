@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import jwt
+import structlog
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import or_, select, update
@@ -204,6 +205,9 @@ def hash_token(token: str) -> str:
 _pat_last_used_claimed: dict[int, float] = {}
 
 
+logger = structlog.get_logger(__name__)
+
+
 def pat_stamp_due(last_used: datetime | None, now: datetime) -> bool:
     """True iff the PAT's informational last_used is unset or older than the throttle window and
     should be refreshed. last_used is display-only (never an authorization input), so bounded
@@ -271,7 +275,14 @@ async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
     # Read the FK BEFORE the stamp commits: a session configured to expire on commit would have to
     # lazy-refresh the attribute afterwards, which async IO cannot do from attribute access.
     user_id = pat.user_id
-    await stamp_pat_last_used(db, pat)
+    try:
+        await stamp_pat_last_used(db, pat)
+    except Exception:
+        # last_used is display-only bookkeeping: a stamp that dies (a canceled UPDATE on the
+        # locked PAT row, a transient disconnect) must never turn a valid token into a 500.
+        # Roll back so the session is usable again for the user lookup below.
+        logger.warning("pat_last_used_stamp_failed", exc_info=True)
+        await db.rollback()
     return (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
 
 

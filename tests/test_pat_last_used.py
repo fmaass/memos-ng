@@ -222,3 +222,19 @@ def test_first_claim_succeeds_even_at_low_monotonic_time():
     auth._pat_last_used_claimed.pop(pat_id, None)
     assert auth.claim_pat_stamp(pat_id, 5.0) is True
     assert auth.claim_pat_stamp(pat_id, 6.0) is False
+
+
+def test_a_failing_stamp_never_breaks_pat_authentication(client, db_engine, monkeypatch):
+    # The stamp is bookkeeping; a canceled UPDATE on the locked PAT row (or any
+    # transient DB error inside it) must not turn a valid token into a 500.
+    pat_id = _seed()
+    try:
+        async def _boom(db, pat):
+            raise RuntimeError("stamp exploded")
+
+        monkeypatch.setattr(auth, "stamp_pat_last_used", _boom)
+        r = client.get("/api/v1/memos", headers=HEADERS)
+        assert r.status_code == 200
+        assert _last_used(pat_id) is None
+    finally:
+        _cleanup()
