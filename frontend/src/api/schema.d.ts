@@ -1020,6 +1020,8 @@ export interface components {
             label: string | null;
             /** Mime */
             mime: string;
+            /** Rev */
+            rev: string | null;
             /** Size */
             size: number;
             /** Variant Key */
@@ -1035,6 +1037,8 @@ export interface components {
             label: string | null;
             /** Mime */
             mime: string;
+            /** Rev */
+            rev: string | null;
             /** Size */
             size: number;
             /** Variant Key */

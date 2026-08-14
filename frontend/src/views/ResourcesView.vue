@@ -125,6 +125,13 @@ function onDelete(uid: string) {
     <p v-else-if="!items.length" class="text-sm text-muted-color" data-test="resources-empty">
       No attachments yet.
     </p>
-    <JustifiedGallery v-else :items="items" :target-height="200" @open="openAt" @retry="onTileRetry" />
+    <JustifiedGallery
+      v-else
+      :items="items"
+      :target-height="200"
+      @open="openAt"
+      @retry="onTileRetry"
+      @print-retry="printMaster.retry($event)"
+    />
   </section>
 </template>

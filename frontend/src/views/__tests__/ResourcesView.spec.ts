@@ -21,21 +21,25 @@ vi.mock('@/composables/useMediaLightbox', () => ({
 }))
 // Print masters are a shared composable (Resources lightbox + memo feed), unit-tested in
 // composables/__tests__/usePrintMaster.spec.ts; here we only pin the wiring.
-const { printAttach, printRemove, usePrintMasterMock, refreshPrintMaster } = vi.hoisted(() => {
-  const printAttach = vi.fn()
-  const printRemove = vi.fn()
-  return {
-    printAttach,
-    printRemove,
-    refreshPrintMaster: vi.fn(),
-    usePrintMasterMock: vi.fn(() => ({
-      attach: printAttach,
-      remove: printRemove,
-      retry: vi.fn(),
-      uploads: new Map(),
-    })),
-  }
-})
+const { printAttach, printRemove, printRetry, usePrintMasterMock, refreshPrintMaster } = vi.hoisted(
+  () => {
+    const printAttach = vi.fn()
+    const printRemove = vi.fn()
+    const printRetry = vi.fn()
+    return {
+      printAttach,
+      printRemove,
+      printRetry,
+      refreshPrintMaster: vi.fn(),
+      usePrintMasterMock: vi.fn(() => ({
+        attach: printAttach,
+        remove: printRemove,
+        retry: printRetry,
+        uploads: new Map(),
+      })),
+    }
+  },
+)
 vi.mock('@/composables/usePrintMaster', () => ({
   usePrintMaster: usePrintMasterMock,
   fetchPrintMasters: vi.fn().mockResolvedValue([]),
@@ -76,6 +80,7 @@ describe('ResourcesView', () => {
     lightboxOpen.mockClear()
     printAttach.mockClear()
     printRemove.mockClear()
+    printRetry.mockClear()
     usePrintMasterMock.mockClear()
   })
 
@@ -109,6 +114,16 @@ describe('ResourcesView', () => {
 
     expect(usePrintMasterMock).toHaveBeenCalledWith(['attachments']) // this view's own cache
     expect(printAttach).toHaveBeenCalledWith({ uid: 'a1', file, variantKey: 'print' })
+  })
+
+  it('retries a failed print-master upload from the gallery tile itself', () => {
+    // Orphan attachments live here and have no memo card: if the tile could not retry, a failed
+    // upload would be unrecoverable once its toast is gone.
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('print-retry', 'a1')
+
+    expect(printRetry).toHaveBeenCalledWith('a1')
   })
 
   it('holds a REPLACE and a REMOVE behind a confirmation', () => {

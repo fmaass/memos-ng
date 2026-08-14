@@ -5,12 +5,15 @@ that writes an `attachment_renditions` row. The legacy multipart `/print` route 
 different pipe with its own tests and is deliberately untouched here (MEMNG-51 retires it).
 """
 
+import hashlib
 import io
 from pathlib import Path
 
 from app.config import settings
+from app.database import engine as async_engine
 from PIL import Image
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.conftest import SYNC_URL
 
@@ -121,10 +124,15 @@ def test_attach_writes_a_rendition_row_and_serves_it(logged_in_client, monkeypat
         # ...filed beside the screen master in the memo folder, under its own name.
         assert Path(rows[0][3]).name == "_AR9 - print.png"
 
+        # The cache-busting revision is the master's own content digest, so it moves iff the bytes
+        # do — the download URL itself is `immutable` and cannot carry that news on its own.
+        assert meta["renditions"][0]["rev"] == hashlib.sha256(master).hexdigest()[:8]
+
         # The dimension-bearing route measures the real file.
         detail = client.get(f"/api/attachments/{att['uid']}/renditions")
         assert detail.status_code == 200
         assert (detail.json()[0]["width"], detail.json()[0]["height"]) == (31, 17)
+        assert detail.json()[0]["rev"] == meta["renditions"][0]["rev"]
 
         # ...and it downloads.
         dl = client.get(f"/api/attachments/{att['uid']}/rendition/print")
@@ -136,30 +144,114 @@ def test_attach_writes_a_rendition_row_and_serves_it(logged_in_client, monkeypat
         _cleanup()
 
 
-def test_replace_keeps_one_row_and_one_file(logged_in_client, monkeypatch, tmp_path):
+def test_a_failed_commit_never_destroys_the_master_it_would_have_replaced(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The data-loss invariant: the only copy of the CURRENT master must survive until the
+    transaction that dereferences it commits, and a committed row's metadata must never describe
+    bytes that are gone. Driven by making the commit fail with the replacement already on disk."""
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         _, att = _memo_with_photo(client)
         first = _png(10, 10, (1, 2, 3))
         assert _attach(client, att["uid"], _upload(client, "master.png", first)).status_code == 201
-        original_path = _rendition_rows(att["uid"])[0][3]
+        committed = _rendition_rows(att["uid"])[0]
+        original_path = Path(committed[3])
 
-        # Re-uploading under the SAME name lands on the same file (no ` (2)` sibling, no orphan).
+        # The upload is prepared BEFORE the commit is sabotaged (its own endpoints commit too).
+        replacement = _upload(client, "master.png", _png(40, 40, (9, 9, 9)))
+
+        real_commit = AsyncSession.commit
+
+        async def failing_commit(self):
+            raise RuntimeError("commit refused")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+        assert _attach(client, att["uid"], replacement).status_code == 500  # the app's own handler
+        monkeypatch.setattr(AsyncSession, "commit", real_commit)
+
+        # The row is untouched AND still describes the bytes that are actually there.
+        assert _rendition_rows(att["uid"]) == [committed]
+        assert original_path.exists() and original_path.read_bytes() == first
+        assert client.get(f"/api/attachments/{att['uid']}/rendition/print").content == first
+        # ...and the replacement's file was reaped rather than left as a stray master.
+        strays = [p for p in original_path.parent.iterdir() if p.name.startswith("master")]
+        assert strays == [original_path]
+    finally:
+        _cleanup()
+
+
+def test_attach_reads_the_rendition_state_under_the_row_lock(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """A STRUCTURAL ordering assertion, deliberately not a concurrency test: the TestClient drives
+    one request at a time, so a genuine two-writer interleave cannot be staged here without a fake.
+    What is asserted is the property the interleave depends on — the attachment is read with FOR
+    UPDATE, and every read of attachment_renditions happens after that lock is taken. Reverting to
+    read-then-lock puts the selectin load of the renditions ahead of it and turns this red."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(" ".join(statement.split()))
+
+    try:
+        _, att = _memo_with_photo(client)
+        up = _upload(client, "m.png", _png(6, 6))
+        event.listen(async_engine.sync_engine, "before_cursor_execute", record)
+        try:
+            assert _attach(client, att["uid"], up).status_code == 201
+        finally:
+            event.remove(async_engine.sync_engine, "before_cursor_execute", record)
+
+        locked = [
+            i
+            for i, s in enumerate(statements)
+            if "FROM attachments" in s and "FOR UPDATE" in s and "attachments.uid" in s
+        ]
+        renditions = [i for i, s in enumerate(statements) if "FROM attachment_renditions" in s]
+        assert locked, f"the attachment is never read FOR UPDATE: {statements}"
+        assert renditions, "positive control: the request does read attachment_renditions"
+        assert min(renditions) > min(locked)
+    finally:
+        _cleanup()
+
+
+def test_replace_keeps_one_row_and_one_file(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, att = _memo_with_photo(client)
+        first = _png(10, 10, (1, 2, 3))
+        r = _attach(client, att["uid"], _upload(client, "master.png", first))
+        assert r.status_code == 201
+        first_rev = r.json()["renditions"][0]["rev"]
+        original_path = Path(_rendition_rows(att["uid"])[0][3])
+
+        # Even under the SAME client filename the replacement is written as its own file — the
+        # current master's bytes are never overwritten in place (see the failed-commit test) — and
+        # the file it displaces is reaped once the swap is committed.
         second = _png(40, 40, (9, 9, 9))
-        assert _attach(client, att["uid"], _upload(client, "master.png", second)).status_code == 201
+        r = _attach(client, att["uid"], _upload(client, "master.png", second))
+        assert r.status_code == 201
         rows = _rendition_rows(att["uid"])
         assert len(rows) == 1  # replaced, not accumulated
-        assert rows[0][2] == len(second) and rows[0][3] == original_path
-        assert Path(original_path).read_bytes() == second
+        assert rows[0][2] == len(second)
+        assert Path(rows[0][3]) != original_path and Path(rows[0][3]).read_bytes() == second
+        assert not original_path.exists()  # displaced master reaped, not leaked
+        # The URL is unchanged, so the cache key has to move with the bytes (FIX 3).
+        assert r.json()["renditions"][0]["rev"] != first_rev
 
-        # A replacement under a DIFFERENT name moves the master and reaps the file it displaced.
+        # A replacement under a DIFFERENT name behaves identically.
+        previous_path = Path(rows[0][3])
         third = _png(5, 5, (7, 7, 7))
         assert _attach(client, att["uid"], _upload(client, "other.png", third)).status_code == 201
         rows = _rendition_rows(att["uid"])
         assert len(rows) == 1 and Path(rows[0][3]).name == "other.png"
         assert Path(rows[0][3]).read_bytes() == third
-        assert not Path(original_path).exists()  # displaced master reaped, not leaked
+        assert not previous_path.exists()
         assert client.get(f"/api/attachments/{att['uid']}/rendition/print").content == third
     finally:
         _cleanup()
@@ -187,7 +279,8 @@ def test_rejects_keys_outside_the_print_variant_grammar(logged_in_client, monkey
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         _, att = _memo_with_photo(client)
-        for key in ("web", "printable", "print:", "print:Glossy Matte", "print:../etc"):
+        # "" is explicit nonsense, not an absent key — only absence may default to `print`.
+        for key in ("", " ", "web", "printable", "print:", "print:Glossy Matte", "print:../etc"):
             up = _upload(client, "x.png", _png(4, 4))
             r = _attach(client, att["uid"], up, variant_key=key)
             assert r.status_code == 400, key

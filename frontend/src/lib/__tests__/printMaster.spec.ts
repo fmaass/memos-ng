@@ -11,6 +11,7 @@ import {
   printMasterMeta,
   printRowState,
   printUploadVariantKey,
+  renditionUrl,
   selectPrintMaster,
   toPrintMasterInfo,
 } from '@/lib/printMaster'
@@ -22,6 +23,7 @@ function rendition(variantKey: string, over: Record<string, unknown> = {}) {
     mime: 'image/tiff',
     size: 8_598_323,
     downloadUrl: `/api/attachments/a1/rendition/${variantKey}`,
+    rev: 'a1b2c3d4',
     ...over,
   }
 }
@@ -215,16 +217,51 @@ describe('printRowState', () => {
   })
 })
 
+describe('renditionUrl', () => {
+  // The route serves masters `immutable`, but a master can be REPLACED under the same variant_key —
+  // so without a revision in the URL a browser keeps serving the displaced bytes for the max-age.
+  it('versions the master by its content revision', () => {
+    expect(renditionUrl('/api/attachments/a1/rendition/print', 'a1b2c3d4')).toBe(
+      '/api/attachments/a1/rendition/print?v=a1b2c3d4',
+    )
+  })
+
+  it('mints a different URL once the bytes change', () => {
+    const before = renditionUrl('/api/attachments/a1/rendition/print', 'a1b2c3d4')
+    const after = renditionUrl('/api/attachments/a1/rendition/print', '99887766')
+    expect(after).not.toBe(before)
+  })
+
+  it('appends to a URL that already carries a query, and encodes the value', () => {
+    expect(renditionUrl('/r?x=1', 'a+b')).toBe('/r?x=1&v=a%2Bb')
+  })
+
+  it.each([[null], [undefined], ['']])('leaves the URL alone with no revision (%s)', (rev) => {
+    expect(renditionUrl('/api/attachments/a1/rendition/print', rev as never)).toBe(
+      '/api/attachments/a1/rendition/print',
+    )
+  })
+})
+
 describe('toPrintMasterInfo', () => {
-  it('carries the key, the download URL and the measured pixel size into the viewer', () => {
+  it('carries the key, the VERSIONED download URL and the measured pixel size into the viewer', () => {
     const info = toPrintMasterInfo({ ...rendition('print:glossy'), width: 4032, height: 3024 })
     expect(info).toEqual({
       variantKey: 'print:glossy',
       meta: '4032 × 3024 · 8.2 MB · TIFF',
-      downloadUrl: '/api/attachments/a1/rendition/print:glossy',
+      downloadUrl: '/api/attachments/a1/rendition/print:glossy?v=a1b2c3d4',
       width: 4032,
       height: 3024,
     })
+  })
+
+  it('is what both the print row and the Print face fetch, so neither can serve stale bytes', () => {
+    const replaced = toPrintMasterInfo({
+      ...rendition('print:glossy', { rev: '99887766' }),
+      width: 4032,
+      height: 3024,
+    })
+    expect(replaced?.downloadUrl).toBe('/api/attachments/a1/rendition/print:glossy?v=99887766')
   })
 
   it('is null for a photo with no master', () => {

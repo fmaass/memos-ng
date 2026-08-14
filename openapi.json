@@ -1184,6 +1184,17 @@
             "title": "Mime",
             "type": "string"
           },
+          "rev": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rev"
+          },
           "size": {
             "title": "Size",
             "type": "integer"
@@ -1210,6 +1221,7 @@
           "mime",
           "size",
           "downloadUrl",
+          "rev",
           "width",
           "height"
         ],
@@ -1237,6 +1249,17 @@
             "title": "Mime",
             "type": "string"
           },
+          "rev": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rev"
+          },
           "size": {
             "title": "Size",
             "type": "integer"
@@ -1251,7 +1274,8 @@
           "label",
           "mime",
           "size",
-          "downloadUrl"
+          "downloadUrl",
+          "rev"
         ],
         "title": "RenditionItem",
         "type": "object"

@@ -57,6 +57,7 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
       mime: string
       size: number
       downloadUrl: string
+      rev: string | null
     }[],
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
@@ -79,6 +80,7 @@ function withMaster(att: ReturnType<typeof imageAtt>, variantKey = 'print') {
         mime: 'image/tiff',
         size: 8_598_323,
         downloadUrl: `/api/attachments/${att.uid}/rendition/${variantKey}`,
+        rev: 'a1b2c3d4',
       },
     ],
   }

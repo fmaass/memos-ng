@@ -165,12 +165,26 @@ export interface PrintMasterInfo {
   height: number | null
 }
 
+/**
+ * The URL to actually fetch a master from: its route plus the content revision.
+ *
+ * The route serves masters `immutable` with a long max-age — they are large archive files fetched
+ * rarely — but a master can be REPLACED under the same variant_key, and the URL alone would then be
+ * a lie: a browser that cached one before the replace would keep serving the displaced bytes for
+ * the whole max-age. `rev` is the master's own content digest, so replacing mints a new cache key
+ * and nothing else does. A row with no digest is left un-busted rather than given a fake version.
+ */
+export function renditionUrl(downloadUrl: string, rev?: string | null): string {
+  if (!rev) return downloadUrl
+  return `${downloadUrl}${downloadUrl.includes('?') ? '&' : '?'}v=${encodeURIComponent(rev)}`
+}
+
 export function toPrintMasterInfo(master: RenditionDetail | null | undefined): PrintMasterInfo | null {
   if (!master) return null
   return {
     variantKey: master.variant_key,
     meta: printMasterMeta(master),
-    downloadUrl: master.downloadUrl,
+    downloadUrl: renditionUrl(master.downloadUrl, master.rev),
     width: master.width,
     height: master.height,
   }

@@ -41,6 +41,14 @@ router = APIRouter(prefix="/api", tags=["assets"])
 # generated 4096 px book rendition (MEMNG-49). Neither is signed — see asset_urls.DERIVED_TIERS.
 TIERS = ("original", "thumb", "mobile", "web", "poster", "print", printready.TIER)
 
+# The key an UNLABELLED print master carries — the same one `variants.parse_variant` mints for a
+# `… - print.ext` dump, so a master attached in the UI and one dumped by filename are one thing.
+DEFAULT_PRINT_VARIANT_KEY = "print"
+# How much of a master's sha256 rides in its URL as `rev`. The value only has to change when the
+# BYTES change (see RenditionItem.rev); 8 hex chars is 4 billion buckets over the handful of
+# masters one photo ever has.
+REV_LENGTH = 8
+
 
 def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
     """Derived tiers resolve from the uid alone (no DB row) — used by the signed fast path."""
@@ -132,6 +140,13 @@ class RenditionItem(BaseModel):
     mime: str
     size: int
     downloadUrl: str
+    # A content revision for cache-busting. The download route serves masters `immutable` (they are
+    # archive files, fetched rarely and large), but since a master can now be REPLACED under the
+    # same variant_key, the URL alone is no longer a stable identity: a browser that cached one
+    # before a replace would keep serving the displaced bytes for the whole max-age. Clients append
+    # it as `?v=<rev>` (see the frontend's renditionUrl), so replacing mints a fresh cache key.
+    # None for a row with no digest — such a master is simply not cache-busted.
+    rev: str | None
 
 
 class RenditionDetail(RenditionItem):
@@ -157,6 +172,7 @@ def rendition_items(att: Attachment) -> list[RenditionItem]:
             mime=r.mime,
             size=r.size,
             downloadUrl=f"{base}/{r.variant_key}",
+            rev=r.sha256[:REV_LENGTH] if r.sha256 else None,
         )
         for r in att.renditions
     ]
@@ -334,7 +350,9 @@ def _print_variant_key(raw: str | None) -> tuple[str, str | None]:
     the download route and the identity the photo-book selector keys off, so an unnormalized or
     non-print key would mint a master the rest of the system cannot address.
     """
-    key = (raw or "print").strip()
+    # Only an ABSENT key defaults. An explicitly supplied empty string is a client sending
+    # nonsense, and it gets the 400 the grammar promises rather than a silent `print`.
+    key = DEFAULT_PRINT_VARIANT_KEY if raw is None else raw.strip()
     if not printready.is_print_variant(key):
         raise HTTPException(status_code=400, detail="Not a print master variant key")
     if key == "print":
@@ -347,7 +365,7 @@ def _print_variant_key(raw: str | None) -> tuple[str, str | None]:
 
 class RenditionAttach(BaseModel):
     upload_uid: str  # a finished resumable upload (POST /api/uploads → PATCH chunks)
-    variant_key: str | None = None  # default: the bare `print`
+    variant_key: str | None = None  # absent (only) → the bare `print`
 
 
 @router.post("/attachments/{uid}/renditions", response_model=AttachmentMeta, status_code=201)
@@ -364,7 +382,20 @@ async def attach_rendition(
     `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
     """
     variant_key, label = _print_variant_key(body.variant_key)
-    att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
+    # Take the attachment's row lock FIRST and read its rendition state THROUGH it. The placement
+    # below decides from the master this photo currently has, and the post-commit sweep unlinks the
+    # file that decision displaced — so a request that WAITED on this lock must not decide from the
+    # state it read before waiting: that stale decision would reap the file the winner just made
+    # current. `renditions` is selectin-loaded, i.e. a follow-up query issued once the lock is
+    # granted, and populate_existing overwrites anything this session already held.
+    att = (
+        await db.execute(
+            select(Attachment)
+            .where(Attachment.uid == uid)
+            .with_for_update(of=Attachment)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if att is None or att.owner_id != user.id:  # OWNER-only: a mutation, unlike viewing
         raise HTTPException(status_code=404, detail="Attachment not found")
     if not att.mime.startswith("image/"):
@@ -378,11 +409,6 @@ async def attach_rendition(
     ).scalar_one_or_none()
     if upload is None:
         raise HTTPException(status_code=404, detail="Upload not found")
-    # Lock this attachment's row for the rest of the request (created_at is refreshed only to TAKE
-    # the lock): the placement below reads the master this photo already has and the post-commit
-    # sweep unlinks the file it named, so two concurrent replaces could otherwise commit a row
-    # pointing at a file the other one deleted.
-    await db.refresh(att, ["created_at"], with_for_update=True)
     data_root = Path(settings.DATA_ROOT)
     # A master of a photo that lives in a memo files into that memo's folder beside the screen
     # master, under its own filename; an unlinked photo stages in _unfiled/ exactly like the ingest
@@ -404,8 +430,9 @@ async def attach_rendition(
     try:
         await db.commit()
     except Exception:
-        if placed.rollback_path is not None:
-            await to_thread.run_sync(_unlink_all, [Path(placed.rollback_path)])
+        # Only this request's brand-new file goes; the master it would have displaced is untouched
+        # and still exactly what the (still-committed) row describes.
+        await to_thread.run_sync(_unlink_all, [Path(placed.rollback_path)])
         raise
     # AFTER the commit, so the ordering is crash-safe in one direction: until it lands the row still
     # names the old file and that file still exists; once it lands the row names the new one, which

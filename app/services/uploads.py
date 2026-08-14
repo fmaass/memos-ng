@@ -578,7 +578,7 @@ class PrintMasterPlacement:
 
     rendition: AttachmentRendition
     displaced: str | None  # a file nothing references once the commit lands → delete AFTER it
-    rollback_path: str | None  # a brand-new file only this request knows → delete if it rolls back
+    rollback_path: str  # this request's brand-new file → delete if the transaction rolls back
 
 
 async def attach_print_master(
@@ -599,9 +599,13 @@ async def attach_print_master(
 
     Returns the row plus the path of the file it displaced, if any. The displaced file is NOT
     unlinked here: the caller removes it only AFTER its commit, so a transaction that rolls back
-    leaves the surviving row pointing at a file that still exists. Callers must hold the
-    attachment's row lock (see the endpoint) — that is what serialises two concurrent replaces of
-    the same key, so the loser displaces the winner's file rather than both landing at once.
+    leaves the surviving row pointing at a file that still exists — the invariant this function
+    exists to protect is that the only copy of the CURRENT master is never destroyed before the
+    transaction dereferencing it commits.
+
+    Callers must take the attachment's row lock BEFORE reading the state passed in here (see the
+    endpoint): that is what serialises two concurrent replaces of the same key, so the loser
+    displaces the winner's file instead of deciding from state the winner already replaced.
     """
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
@@ -618,17 +622,17 @@ async def attach_print_master(
         )
     ).scalar_one_or_none()
     old_path = existing.storage_path if existing is not None else None
-    # Re-uploading under the file's own name lands ON the file the row already names (like the
-    # legacy print upload): reserving a fresh ` (2)` sibling would renumber the master on every
-    # replace and litter the memo folder with orphans.
-    if old_path is not None and storage.is_placement_of(old_path, dest_dir, upload.filename):
-        # Replaced in place: there is no second file to reap, and the path is one a COMMITTED row
-        # already names — a rollback must leave it alone (unlinking it would break that row).
-        dest = await storage.replace_master(part, Path(old_path))
-        displaced, rollback_path = None, None
-    else:
-        dest = await storage.place_master(part, dest_dir, upload.filename)
-        displaced, rollback_path = old_path, str(dest)
+    # ALWAYS a new, uniquely-named (O_EXCL) file — NEVER a write onto the file the current row still
+    # names, not even when the client filename is identical. Writing in place keeps the folder
+    # tidier, and an earlier draft did exactly that, but it destroys the only copy of the current
+    # master BEFORE the transaction that dereferences it commits: a failed flush or commit then
+    # leaves the still-committed row's size/sha256 describing bytes that no longer exist. The
+    # invariant is worth the cosmetics — no committed row may ever disagree with its file, so the
+    # old master survives until the new one is committed, and only then is it reaped. A same-name
+    # replace therefore lands as `name (2).ext`; the post-commit reap frees `name.ext` again, so
+    # nothing accumulates and the next replace takes the plain name back.
+    dest = await storage.place_master(part, dest_dir, upload.filename)
+    displaced, rollback_path = old_path, str(dest)
     rendition = (
         existing
         if existing is not None
