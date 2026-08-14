@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 
 from app.config import settings
 from app.main import app
@@ -18,7 +19,13 @@ from tests.conftest import SYNC_URL
 
 
 def _seed_attachment(
-    uid, owner_subject, status="ready", mime="image/jpeg", width=None, height=None
+    uid,
+    owner_subject,
+    status="ready",
+    mime="image/jpeg",
+    width=None,
+    height=None,
+    captured_at=None,
 ):
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
@@ -29,11 +36,21 @@ def _seed_attachment(
             text(
                 "INSERT INTO attachments "
                 "(uid, owner_id, filename, mime, size, status, storage_path, blurhash, "
-                "width, height) "
-                "VALUES (:u,:o,'x.jpg',:m,1,CAST(:st AS attachment_status),'/x',:bh,:w,:h) "
+                "width, height, captured_at) "
+                "VALUES (:u,:o,'x.jpg',:m,1,CAST(:st AS attachment_status),'/x',:bh,:w,:h,"
+                "CAST(:cap AS timestamptz)) "
                 "RETURNING id"
             ),
-            {"u": uid, "o": oid, "m": mime, "st": status, "bh": "LKO2", "w": width, "h": height},
+            {
+                "u": uid,
+                "o": oid,
+                "m": mime,
+                "st": status,
+                "bh": "LKO2",
+                "w": width,
+                "h": height,
+                "cap": captured_at,
+            },
         ).scalar_one()
     eng.dispose()
     return aid
@@ -572,6 +589,84 @@ def test_pat_can_download_original(logged_in_client, monkeypatch, tmp_path):
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("image/")
         assert anon.get("/api/attachments/att-pat-orig/original").status_code == 401  # no auth
+    finally:
+        _cleanup(aid)
+
+
+def test_pat_can_read_attachment_meta(logged_in_client):
+    # Same headless client, same attachment, one level less sensitive: the metadata route accepts
+    # the PAT too (require_pat_or_user), so a generator that already downloads the bytes can read
+    # the capture timestamp instead of guessing it from upload time.
+    client, subject = logged_in_client
+    pat = client.post("/api/pats", json={"name": "slideshow"}).json()["token"]
+    aid = _seed_attachment("att-pat-meta", subject, captured_at="2026-03-04T05:06:07+00:00")
+    try:
+        anon = TestClient(app, raise_server_exceptions=False)  # no session cookie, PAT only
+        r = anon.get("/api/attachments/att-pat-meta", headers={"Authorization": f"Bearer {pat}"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["uid"] == "att-pat-meta"
+        # the field this widening exists for — present AND carrying the seeded instant
+        assert "captured_at" in body
+        assert datetime.fromisoformat(body["captured_at"]) == datetime(
+            2026, 3, 4, 5, 6, 7, tzinfo=UTC
+        )
+    finally:
+        _cleanup(aid)
+
+
+def test_attachment_meta_without_auth_is_401(logged_in_client):
+    # Widening to PAT-or-session must not open the route to no credential at all.
+    client, subject = logged_in_client
+    aid = _seed_attachment("att-meta-anon", subject)
+    try:
+        anon = TestClient(app, raise_server_exceptions=False)
+        assert anon.get("/api/attachments/att-meta-anon").status_code == 401  # no cookie, no PAT
+        # a Bearer token that is not a valid PAT is no better than none
+        bad = anon.get(
+            "/api/attachments/att-meta-anon",
+            headers={"Authorization": "Bearer memos_pat_nope"},
+        )
+        assert bad.status_code == 401
+    finally:
+        _cleanup(aid)
+
+
+def test_attachment_meta_response_fields_unchanged(logged_in_client):
+    # The auth change is auth-only: the AttachmentMeta payload keeps exactly the fields it had
+    # (pinned here so neither a dropped nor an added field can ride along unnoticed).
+    client, subject = logged_in_client
+    aid = _seed_attachment("att-meta-shape", subject, captured_at="2026-03-04T05:06:07+00:00")
+    try:
+        body = client.get("/api/attachments/att-meta-shape").json()
+        assert set(body) == {
+            "uid",
+            "mime",
+            "size",
+            "status",
+            "width",
+            "height",
+            "duration",
+            "blurhash",
+            "captured_at",
+            "mine",
+            "hasPrint",
+            "hasLegacyPrint",
+            "renditions",
+            "downloadUrl",
+            "printUrl",
+            "thumbnailUrl",
+            "previewUrl",
+            "webUrl",
+            "posterUrl",
+        }
+        # and a PAT caller is served the identical field set, not a reduced projection
+        pat = client.post("/api/pats", json={"name": "slideshow-shape"}).json()["token"]
+        anon = TestClient(app, raise_server_exceptions=False)
+        pat_body = anon.get(
+            "/api/attachments/att-meta-shape", headers={"Authorization": f"Bearer {pat}"}
+        ).json()
+        assert set(pat_body) == set(body)
     finally:
         _cleanup(aid)
 

@@ -187,6 +187,16 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.3.4
+
+API auth patch (2026-08-14).
+
+**Changed**
+- `GET /api/attachments/{uid}` accepts a Personal Access Token as well as a session cookie,
+  so a headless client that may already download the attachment's bytes can read the same
+  attachment's metadata (including `captured_at`). Visibility rules and the response shape
+  are unchanged.
+
 ### v1.3.3
 
 Frontend correctness patch (2026-08-14).
