@@ -30,8 +30,8 @@ interface MediaAttachment {
 }
 
 // width/height give the tile box its shape (the caller passes the attachment's intrinsic dims, or the
-// uniform box of a multi-tile layout). Absent/unknown → the square box every tile used before, which
-// is also where a video stays (see `ratio`).
+// uniform box of a multi-tile layout). Absent/unknown → the square box every tile used before,
+// videos included (see `ratio`).
 // sizes is the box's rendered width, which only the parent's layout knows (see tileSizes).
 const props = defineProps<{
   att: MediaAttachment
@@ -49,12 +49,15 @@ const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
 const percent = computed(() => props.progress ?? props.att.progress_pct ?? 0)
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
 const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
-// A video's stored dims are ffprobe's CODED width/height, which ignore the container's rotation
-// tag: a portrait phone clip reports them landscape. Shaping the box from those frames a poster
-// that IS rotated at a ratio it does not have, so a video keeps the fallback box until the probe
-// applies rotation. Mime rather than tile kind — the processing state renders the poster too.
-const isVideo = computed(() => props.att.mime.startsWith('video/'))
-const ratio = computed(() => (isVideo.value ? null : tileAspectRatio(props.width, props.height)))
+// Videos take their probed ratio exactly like images (#37): the probe applies the container's
+// rotation tag since v1.3.2 (displayed_size), so a portrait clip's stored dims now describe the
+// same orientation the poster and web tier are written in. No dims (probe pending or failed) still
+// means a null ratio, which is the neutral fallback box below.
+// Residual: a clip probed BEFORE that fix kept ffprobe's CODED dims — landscape numbers for a
+// portrait phone video — and nothing re-probes it (the worker writes dims once, in the fast lane at
+// ingest; the metadata backfill excludes videos), so those tile at the wrong shape until a re-probe
+// backfill ships.
+const ratio = computed(() => tileAspectRatio(props.width, props.height))
 
 // The grid tier this tile loads (video tiles show the poster). Used as the retry base: a re-mint
 // refetch delivers a new URL here, which resets the tile via the watch below.

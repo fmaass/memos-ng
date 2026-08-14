@@ -120,19 +120,45 @@ describe('MediaTile', () => {
     expect(box.classes()).not.toContain('aspect-square')
   })
 
-  it('keeps the fallback box for a video, whose stored dims ignore the rotation tag', () => {
-    // ffprobe records CODED dims, so a rotated portrait clip stores 1920x1080. Laying the box out
-    // from that would frame the (correctly rotated) poster at 16:9.
+  it('tiles a video at its probed ratio — a portrait clip renders portrait (#37)', () => {
+    // The probe applies the rotation tag since v1.3.2, so 1080x1920 IS the shape the poster and
+    // web tier are written in; the box must follow it instead of squaring the tile off.
     const w = mount(MediaTile, {
       props: {
-        att: att('ready', 'video/mp4', { width: 1920, height: 1080 }),
+        att: att('ready', 'video/mp4', { width: 1080, height: 1920 }),
+        width: 1080,
+        height: 1920,
+      },
+    })
+    const box = w.find('[data-test="media-tile"]')
+    expect(box.attributes('style')).toContain('aspect-ratio: 0.5625')
+    expect(box.classes()).not.toContain('aspect-square')
+  })
+
+  it('keeps the neutral fallback box for a video with no probed dims', () => {
+    // Probe pending or failed: there is no shape to take, so the tile stays on the square box
+    // rather than guessing one.
+    const w = mount(MediaTile, { props: { att: att('ready', 'video/mp4') } })
+    const box = w.find('[data-test="media-tile"]')
+    expect(box.classes()).toContain('aspect-square')
+    expect(box.attributes('style')).toBeUndefined()
+  })
+
+  it('shapes a processing video from its dims without disturbing the percent overlay', () => {
+    // The ratio and the SSE progress overlay share the tile box — a landscape clip mid-transcode
+    // shows both.
+    const w = mount(MediaTile, {
+      props: {
+        att: att('processing', 'video/mp4', { width: 1920, height: 1080, progress_pct: 63 }),
         width: 1920,
         height: 1080,
       },
     })
     const box = w.find('[data-test="media-tile"]')
-    expect(box.classes()).toContain('aspect-square')
-    expect(box.attributes('style')).toBeUndefined()
+    expect(box.attributes('style')).toContain('aspect-ratio: 1.7777')
+    expect(box.classes()).not.toContain('aspect-square')
+    expect(w.find('[data-test="tile-processing"]').exists()).toBe(true)
+    expect(w.text()).toContain('63%')
   })
 
   it('keeps the square box while dims are unknown', () => {
