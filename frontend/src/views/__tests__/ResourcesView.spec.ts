@@ -11,9 +11,17 @@ const refetch = vi.fn()
 
 vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn(), DELETE: vi.fn() }) }))
 // The viewer is PhotoSwipe (needs a real DOM) — mock the composable so jsdom doesn't boot it.
+const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
 vi.mock('@/composables/useMediaLightbox', () => ({
-  useMediaLightbox: () => ({ open: vi.fn(), destroy: vi.fn() }),
+  useMediaLightbox: () => ({ open: lightboxOpen, destroy: vi.fn() }),
 }))
+// The print upload is a shared composable (Resources lightbox + memo feed), unit-tested in
+// composables/__tests__/usePrintUpload.spec.ts; here we only pin the wiring.
+const { printMutate, usePrintUploadMock } = vi.hoisted(() => {
+  const printMutate = vi.fn()
+  return { printMutate, usePrintUploadMock: vi.fn(() => ({ mutate: printMutate })) }
+})
+vi.mock('@/composables/usePrintUpload', () => ({ usePrintUpload: usePrintUploadMock }))
 vi.mock('@tanstack/vue-query', () => ({
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
   useQuery: () => ({
@@ -46,6 +54,9 @@ describe('ResourcesView', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     refetch.mockClear()
+    lightboxOpen.mockClear()
+    printMutate.mockClear()
+    usePrintUploadMock.mockClear()
   })
 
   it('renders the justified gallery + type filter (not the old square grid)', () => {
@@ -62,6 +73,17 @@ describe('ResourcesView', () => {
     const classes = wrapper.find('[data-test="view-resources"]').classes()
     expect(classes).toContain('max-w-6xl')
     expect(classes).not.toContain('xl:max-w-4xl')
+  })
+
+  it('sends a lightbox print upload through the shared print-upload mutation', () => {
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+    const file = new File(['tiff-bytes'], 'master.tif', { type: 'image/tiff' })
+
+    lightboxOpen.mock.calls[0][2].onAddPrint('a1', file)
+
+    expect(usePrintUploadMock).toHaveBeenCalledWith(['attachments']) // this view's own cache
+    expect(printMutate).toHaveBeenCalledWith({ uid: 'a1', file })
   })
 
   it('re-mints Resources when gallery retry bubbles, throttled to one refetch per cooldown', async () => {

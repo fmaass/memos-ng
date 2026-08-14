@@ -42,6 +42,14 @@ vi.mock('@tanstack/vue-query', () => ({
   }),
 }))
 
+// The print upload lives in a shared composable (feed + Resources lightbox) and is unit-tested
+// there; here we only pin that the feed wires that one mutation, with its own cache key.
+const { printMutate, usePrintUploadMock } = vi.hoisted(() => {
+  const printMutate = vi.fn()
+  return { printMutate, usePrintUploadMock: vi.fn(() => ({ mutate: printMutate })) }
+})
+vi.mock('@/composables/usePrintUpload', () => ({ usePrintUpload: usePrintUploadMock }))
+
 const fetchNextPage = vi.fn()
 const refetch = vi.fn()
 const useTimelineMock = vi.fn()
@@ -81,6 +89,8 @@ describe('MemoFeed', () => {
     patch.mockClear()
     invalidateQueries.mockClear()
     refetch.mockClear()
+    printMutate.mockClear()
+    usePrintUploadMock.mockClear()
   })
 
   it('renders a card per memo under day-grouped headers', () => {
@@ -127,6 +137,20 @@ describe('MemoFeed', () => {
       body: { content: '- [x] todo' },
     })
     expect(invalidateQueries).toHaveBeenCalled()
+  })
+
+  it('sends an add-print bubbled from a card through the shared print-upload mutation', async () => {
+    // Before MEMNG-74 the feed carried its own copy with no error handling — a rejected upload
+    // reported nothing here while the same action in Resources toasted.
+    useTimelineMock.mockReturnValue(feedResult([memoStub('1', 'pic')]))
+    const wrapper = mountFeed()
+    const file = new File(['tiff-bytes'], 'master.tif', { type: 'image/tiff' })
+
+    wrapper.findComponent({ name: 'MemoCard' }).vm.$emit('add-print', { uid: 'a1', file })
+    await flushPromises()
+
+    expect(usePrintUploadMock).toHaveBeenCalledWith(['memos']) // the feed's own cache
+    expect(printMutate).toHaveBeenCalledWith({ uid: 'a1', file })
   })
 
   it('re-mints the feed when a card bubbles retry, throttled to one refetch per cooldown', async () => {

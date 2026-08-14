@@ -8,6 +8,7 @@ import { computed, onUnmounted, ref } from 'vue'
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import { useApi } from '@/composables/useApi'
 import { useMediaLightbox } from '@/composables/useMediaLightbox'
+import { usePrintUpload } from '@/composables/usePrintUpload'
 import type { MemoQuery } from '@/composables/useTimeline'
 import { shouldRemint } from '@/lib/imageRetry'
 
@@ -42,11 +43,15 @@ function onTileRetry() {
   void refetch()
 }
 
+// Shared with the memo feed's card action — the composable carries the success/error toasts and
+// refreshes this view's own attachment list (MEMNG-74).
+const addPrint = usePrintUpload(['attachments'])
+
 const lightbox = useMediaLightbox()
 function openAt(index: number) {
   lightbox.open(items.value, index, {
     onDelete,
-    onAddPrint: (uid, file) => onAddPrint({ uid, file }),
+    onAddPrint: (uid, file) => addPrint.mutate({ uid, file }),
   })
 }
 onUnmounted(() => lightbox.destroy())
@@ -67,22 +72,6 @@ function onDelete(uid: string) {
       await queryClient.invalidateQueries({ queryKey: ['attachments'] })
     },
   })
-}
-
-async function onAddPrint({ uid, file }: { uid: string; file: File }) {
-  const fd = new FormData()
-  fd.append('file', file)
-  const res = await fetch(`/api/attachments/${uid}/print`, {
-    method: 'POST',
-    body: fd,
-    credentials: 'include',
-  })
-  if (res.ok) {
-    toast.add({ severity: 'success', summary: 'Print version attached', life: 2500 })
-    await queryClient.invalidateQueries({ queryKey: ['attachments'] })
-  } else {
-    toast.add({ severity: 'error', summary: 'Print upload failed', life: 4000 })
-  }
 }
 </script>
 
