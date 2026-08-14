@@ -182,6 +182,40 @@ def test_a_failed_commit_never_destroys_the_master_it_would_have_replaced(
         _cleanup()
 
 
+def test_a_failed_flush_reaps_the_file_it_had_already_placed(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The narrower window inside the service itself: a raise between the O_EXCL placement and
+    the return never reaches the handler's rollback-unlink (the handler only learns the path from
+    the return value), so the service must reap its own placement before propagating."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, att = _memo_with_photo(client)
+        first = _png(10, 10, (1, 2, 3))
+        assert _attach(client, att["uid"], _upload(client, "master.png", first)).status_code == 201
+        committed = _rendition_rows(att["uid"])[0]
+        original_path = Path(committed[3])
+
+        replacement = _upload(client, "master.png", _png(40, 40, (9, 9, 9)))
+
+        real_flush = AsyncSession.flush
+
+        async def failing_flush(self, *args, **kwargs):
+            raise RuntimeError("flush refused")
+
+        monkeypatch.setattr(AsyncSession, "flush", failing_flush)
+        assert _attach(client, att["uid"], replacement).status_code == 500
+        monkeypatch.setattr(AsyncSession, "flush", real_flush)
+
+        assert _rendition_rows(att["uid"]) == [committed]
+        assert original_path.exists() and original_path.read_bytes() == first
+        strays = [p for p in original_path.parent.iterdir() if p.name.startswith("master")]
+        assert strays == [original_path]
+    finally:
+        _cleanup()
+
+
 def test_attach_reads_the_rendition_state_under_the_row_lock(
     logged_in_client, monkeypatch, tmp_path
 ):

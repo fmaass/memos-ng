@@ -633,21 +633,28 @@ async def attach_print_master(
     # nothing accumulates and the next replace takes the plain name back.
     dest = await storage.place_master(part, dest_dir, upload.filename)
     displaced, rollback_path = old_path, str(dest)
-    rendition = (
-        existing
-        if existing is not None
-        else AttachmentRendition(attachment_id=attachment.id, variant_key=variant_key)
-    )
-    rendition.label = label
-    rendition.filename = upload.filename
-    rendition.mime = mime
-    rendition.size = actual
-    rendition.sha256 = digest
-    rendition.storage_path = str(dest)
-    if existing is None:
-        db.add(rendition)
-    await db.delete(upload)
-    await db.flush()
+    try:
+        rendition = (
+            existing
+            if existing is not None
+            else AttachmentRendition(attachment_id=attachment.id, variant_key=variant_key)
+        )
+        rendition.label = label
+        rendition.filename = upload.filename
+        rendition.mime = mime
+        rendition.size = actual
+        rendition.sha256 = digest
+        rendition.storage_path = str(dest)
+        if existing is None:
+            db.add(rendition)
+        await db.delete(upload)
+        await db.flush()
+    except BaseException:
+        # A raise between placement and return never reaches the handler's rollback-unlink (it
+        # only learns the path from the return value) — reap the just-placed file here so a
+        # failed flush cannot strand an orphan no row references. The old master is untouched.
+        await to_thread.run_sync(_unlink_sync, dest)
+        raise
     return PrintMasterPlacement(
         rendition=rendition, displaced=displaced, rollback_path=rollback_path
     )
