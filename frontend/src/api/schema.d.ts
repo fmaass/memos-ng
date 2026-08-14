@@ -87,7 +87,12 @@ export interface paths {
         get: operations["serve_rendition_api_attachments__uid__rendition__variant_key__get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete Rendition
+         * @description Remove one print master — OWNER-only (a mutation; viewing a master is household-wide). The
+         *     screen photo and every derived tier are untouched: only the archive master goes.
+         */
+        delete: operations["delete_rendition_api_attachments__uid__rendition__variant_key__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -102,12 +107,21 @@ export interface paths {
         };
         /**
          * List Renditions
-         * @description A photo's hidden print renditions (household-visible, like the legacy print tier). Registered
-         *     BEFORE the generic /{uid}/{tier} route so the literal `renditions` segment isn't a tier.
+         * @description A photo's hidden print renditions, WITH their pixel dimensions (household-visible, like the
+         *     legacy print tier). Registered BEFORE the generic /{uid}/{tier} route so the literal
+         *     `renditions` segment isn't a tier.
          */
         get: operations["list_renditions_api_attachments__uid__renditions_get"];
         put?: never;
-        post?: never;
+        /**
+         * Attach Rendition
+         * @description Attach — or replace — the print master of an OWNED image, from a finished resumable upload.
+         *
+         *     Takes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,
+         *     resumable, progress-reporting path every other upload in this app uses. The legacy multipart
+         *     `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
+         */
+        post: operations["attach_rendition_api_attachments__uid__renditions_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -981,6 +995,38 @@ export interface components {
             /** Reacted */
             reacted: boolean;
         };
+        /** RenditionAttach */
+        RenditionAttach: {
+            /** Upload Uid */
+            upload_uid: string;
+            /** Variant Key */
+            variant_key?: string | null;
+        };
+        /**
+         * RenditionDetail
+         * @description One master with its pixel size — the shape the per-photo route returns.
+         *
+         *     Dimensions are NOT on RenditionItem because they are not in the database: learning them means
+         *     opening the file, and RenditionItem rides along on every feed page and library listing. This
+         *     subclass exists so the one place that needs them (the print row in the viewer, opened for a
+         *     single photo) can pay for them without putting a file read behind the feed.
+         */
+        RenditionDetail: {
+            /** Downloadurl */
+            downloadUrl: string;
+            /** Height */
+            height: number | null;
+            /** Label */
+            label: string | null;
+            /** Mime */
+            mime: string;
+            /** Size */
+            size: number;
+            /** Variant Key */
+            variant_key: string;
+            /** Width */
+            width: number | null;
+        };
         /** RenditionItem */
         RenditionItem: {
             /** Downloadurl */
@@ -1247,6 +1293,36 @@ export interface operations {
             };
         };
     };
+    delete_rendition_api_attachments__uid__rendition__variant_key__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                variant_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_renditions_api_attachments__uid__renditions_get: {
         parameters: {
             query?: never;
@@ -1264,7 +1340,42 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RenditionItem"][];
+                    "application/json": components["schemas"]["RenditionDetail"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    attach_rendition_api_attachments__uid__renditions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RenditionAttach"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentMeta"];
                 };
             };
             /** @description Validation Error */

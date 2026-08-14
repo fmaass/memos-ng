@@ -4,6 +4,7 @@ import secrets
 import shutil
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
@@ -569,6 +570,83 @@ async def finalize_rendition(
     await db.delete(upload)
     await db.flush()
     return rendition
+
+
+@dataclass(frozen=True)
+class PrintMasterPlacement:
+    """Where `attach_print_master` put the bytes, and what the caller owes the filesystem."""
+
+    rendition: AttachmentRendition
+    displaced: str | None  # a file nothing references once the commit lands → delete AFTER it
+    rollback_path: str | None  # a brand-new file only this request knows → delete if it rolls back
+
+
+async def attach_print_master(
+    db: AsyncSession,
+    upload: Upload,
+    attachment: Attachment,
+    variant_key: str,
+    label: str | None,
+    dest_dir: Path,
+) -> PrintMasterPlacement:
+    """Attach — or REPLACE — the print master a person picked in the web UI (MEMNG-75). The
+    interactive counterpart to `finalize_rendition`, which serves the filename-ingest path.
+
+    Deliberately NOT write-once. An ingest re-dump of an existing key is a no-op because the dump
+    is a mirror of a folder, so "already there" means "already correct". Someone clicking
+    "Replace…" is stating the opposite intent, and keeping the old master while reporting success
+    is the same class of silent lie MEMNG-74 fixed.
+
+    Returns the row plus the path of the file it displaced, if any. The displaced file is NOT
+    unlinked here: the caller removes it only AFTER its commit, so a transaction that rolls back
+    leaves the surviving row pointing at a file that still exists. Callers must hold the
+    attachment's row lock (see the endpoint) — that is what serialises two concurrent replaces of
+    the same key, so the loser displaces the winner's file rather than both landing at once.
+    """
+    part = part_path(upload.upload_uid)
+    actual = await to_thread.run_sync(_part_size_sync, part)
+    if actual != upload.declared_size:  # an abandoned/partial upload must not become a master
+        raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
+    mime = await to_thread.run_sync(_sniff_mime, part, upload.mime)
+    digest = await to_thread.run_sync(_sha256_sync, part)
+    existing = (
+        await db.execute(
+            select(AttachmentRendition).where(
+                AttachmentRendition.attachment_id == attachment.id,
+                AttachmentRendition.variant_key == variant_key,
+            )
+        )
+    ).scalar_one_or_none()
+    old_path = existing.storage_path if existing is not None else None
+    # Re-uploading under the file's own name lands ON the file the row already names (like the
+    # legacy print upload): reserving a fresh ` (2)` sibling would renumber the master on every
+    # replace and litter the memo folder with orphans.
+    if old_path is not None and storage.is_placement_of(old_path, dest_dir, upload.filename):
+        # Replaced in place: there is no second file to reap, and the path is one a COMMITTED row
+        # already names — a rollback must leave it alone (unlinking it would break that row).
+        dest = await storage.replace_master(part, Path(old_path))
+        displaced, rollback_path = None, None
+    else:
+        dest = await storage.place_master(part, dest_dir, upload.filename)
+        displaced, rollback_path = old_path, str(dest)
+    rendition = (
+        existing
+        if existing is not None
+        else AttachmentRendition(attachment_id=attachment.id, variant_key=variant_key)
+    )
+    rendition.label = label
+    rendition.filename = upload.filename
+    rendition.mime = mime
+    rendition.size = actual
+    rendition.sha256 = digest
+    rendition.storage_path = str(dest)
+    if existing is None:
+        db.add(rendition)
+    await db.delete(upload)
+    await db.flush()
+    return PrintMasterPlacement(
+        rendition=rendition, displaced=displaced, rollback_path=rollback_path
+    )
 
 
 async def bind_print_to_sibling(

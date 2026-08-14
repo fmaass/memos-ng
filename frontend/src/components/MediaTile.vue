@@ -6,6 +6,7 @@ import { nextRetrySrc, retryDelayMs, withSameBust } from '@/lib/imageRetry'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
 import { tileAspectRatio } from '@/lib/mediaLayout'
 import { imageSrcset } from '@/lib/mediaTiers'
+import type { PrintChip } from '@/lib/printMaster'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 
@@ -39,8 +40,15 @@ const props = defineProps<{
   width?: number | null
   height?: number | null
   sizes?: string
+  // The photo's print-master state (see printChipState) — null renders no chip at all. Computed by
+  // the parent, which is where both the memo's attachments and the upload queue are in scope.
+  printChip?: PrintChip | null
 }>()
-const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
+const emit = defineEmits<{
+  retry: [uid: string]
+  open: [uid: string]
+  'print-retry': [uid: string]
+}>()
 
 // The percentage the processing overlay shows. `progress` is the caller's explicit override (an
 // upload the caller is itself driving); otherwise it comes from the attachment in the cache, where
@@ -124,6 +132,18 @@ function manualRetry() {
   imgSrc.value = nextRetrySrc(baseUrl.value, 0) ?? baseUrl.value
   emit('retry', props.att.uid)
 }
+
+// The chip's colour carries the same three-way reading as its text: a stored master, one on its
+// way, one that failed and wants a click. Bottom-left, clear of the video play glyph and of the
+// processing overlay (a tile in either of those states has no print chip anyway).
+const PRINT_CHIP_CLASS = {
+  present: 'bg-emerald-600/90',
+  uploading: 'bg-amber-600/90',
+  failed: 'bg-red-700/95',
+} as const
+const printChipClass = computed(() =>
+  props.printChip ? PRINT_CHIP_CLASS[props.printChip.kind] : '',
+)
 
 // Signed URLs are bucket-quantized, so a re-mint inside the same bucket returns the
 // IDENTICAL url and the baseUrl watch never clears a failed tile — a tile that
@@ -247,5 +267,29 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
         <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
       </span>
     </button>
+
+    <!-- Print-master chip. A SIBLING of the tile's open-button, never inside it: a retry control
+         nested in a button is invalid markup and un-clickable on touch. -->
+    <button
+      v-if="printChip?.kind === 'failed'"
+      type="button"
+      class="absolute bottom-1 left-1 z-10 rounded-full px-1.5 py-0.5 text-[0.62rem] font-bold tracking-wide text-white"
+      :class="printChipClass"
+      data-test="print-chip"
+      data-chip-kind="failed"
+      aria-label="Print master upload failed — retry"
+      @click.stop="emit('print-retry', att.uid)"
+    >
+      {{ printChip.label }}
+    </button>
+    <span
+      v-else-if="printChip"
+      class="absolute bottom-1 left-1 z-10 rounded-full px-1.5 py-0.5 text-[0.62rem] font-bold tracking-wide text-white"
+      :class="printChipClass"
+      data-test="print-chip"
+      :data-chip-kind="printChip.kind"
+    >
+      {{ printChip.label }}
+    </span>
   </div>
 </template>

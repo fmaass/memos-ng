@@ -11,6 +11,7 @@ from typing import Annotated
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
@@ -26,9 +27,10 @@ from app.models import (
     MediaJob,
     MediaJobProgress,
     Memo,
+    Upload,
     User,
 )
-from app.services import asset_urls, printready, storage
+from app.services import asset_urls, printready, storage, variants
 from app.services import uploads as up_svc
 from app.services.memos import visible_clause
 
@@ -130,6 +132,19 @@ class RenditionItem(BaseModel):
     mime: str
     size: int
     downloadUrl: str
+
+
+class RenditionDetail(RenditionItem):
+    """One master with its pixel size — the shape the per-photo route returns.
+
+    Dimensions are NOT on RenditionItem because they are not in the database: learning them means
+    opening the file, and RenditionItem rides along on every feed page and library listing. This
+    subclass exists so the one place that needs them (the print row in the viewer, opened for a
+    single photo) can pay for them without putting a file read behind the feed.
+    """
+
+    width: int | None
+    height: int | None
 
 
 def rendition_items(att: Attachment) -> list[RenditionItem]:
@@ -272,16 +287,159 @@ async def attachment_meta(
     )
 
 
-@router.get("/attachments/{uid}/renditions", response_model=list[RenditionItem])
+def _rendition_dims_sync(paths: list[str]) -> dict[str, tuple[int, int]]:
+    """Measure every master of ONE photo in a single off-loop hop.
+
+    `Image.open` parses the header and stops — it does not decode — so this reads a few KB per
+    file rather than the tens of MB a full decode of a print master would (same trick the photo-book
+    manifest uses). A file Pillow cannot parse (an exotic TIFF/RAW, a truncated master) is left out
+    and its row reports null dimensions rather than failing the request.
+    """
+    dims: dict[str, tuple[int, int]] = {}
+    for path in paths:
+        try:
+            with Image.open(path) as img:
+                dims[path] = (img.width, img.height)
+        except Exception:
+            continue
+    return dims
+
+
+@router.get("/attachments/{uid}/renditions", response_model=list[RenditionDetail])
 async def list_renditions(
     uid: str,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
-) -> list[RenditionItem]:
-    """A photo's hidden print renditions (household-visible, like the legacy print tier). Registered
-    BEFORE the generic /{uid}/{tier} route so the literal `renditions` segment isn't a tier."""
+) -> list[RenditionDetail]:
+    """A photo's hidden print renditions, WITH their pixel dimensions (household-visible, like the
+    legacy print tier). Registered BEFORE the generic /{uid}/{tier} route so the literal
+    `renditions` segment isn't a tier."""
     att = await _viewable(db, user, uid)
-    return rendition_items(att)
+    dims = await to_thread.run_sync(_rendition_dims_sync, [r.storage_path for r in att.renditions])
+    return [
+        RenditionDetail(
+            **item.model_dump(),
+            width=dims.get(row.storage_path, (None, None))[0],
+            height=dims.get(row.storage_path, (None, None))[1],
+        )
+        for item, row in zip(rendition_items(att), att.renditions, strict=True)
+    ]
+
+
+def _print_variant_key(raw: str | None) -> tuple[str, str | None]:
+    """Validate a client-supplied print variant key → (variant_key, label).
+
+    Only print keys, and only in the shape the filename ingest itself produces (`variants`): the
+    bare `print`, or `print:<slug>` whose slug is ALREADY normalized. The key is a path segment on
+    the download route and the identity the photo-book selector keys off, so an unnormalized or
+    non-print key would mint a master the rest of the system cannot address.
+    """
+    key = (raw or "print").strip()
+    if not printready.is_print_variant(key):
+        raise HTTPException(status_code=400, detail="Not a print master variant key")
+    if key == "print":
+        return key, None
+    label = key.split(":", 1)[1]
+    if not label or label != variants.slug_label(label):
+        raise HTTPException(status_code=400, detail="Print master label must be a slug")
+    return key, label
+
+
+class RenditionAttach(BaseModel):
+    upload_uid: str  # a finished resumable upload (POST /api/uploads → PATCH chunks)
+    variant_key: str | None = None  # default: the bare `print`
+
+
+@router.post("/attachments/{uid}/renditions", response_model=AttachmentMeta, status_code=201)
+async def attach_rendition(
+    uid: str,
+    body: RenditionAttach,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> AttachmentMeta:
+    """Attach — or replace — the print master of an OWNED image, from a finished resumable upload.
+
+    Takes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,
+    resumable, progress-reporting path every other upload in this app uses. The legacy multipart
+    `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
+    """
+    variant_key, label = _print_variant_key(body.variant_key)
+    att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
+    if att is None or att.owner_id != user.id:  # OWNER-only: a mutation, unlike viewing
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if not att.mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Print masters are for images only")
+    # Scoped to the caller like every other upload verb, so another user's session answers exactly
+    # as an unknown uid does.
+    upload = (
+        await db.execute(
+            select(Upload).where(Upload.upload_uid == body.upload_uid, Upload.owner_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    # Lock this attachment's row for the rest of the request (created_at is refreshed only to TAKE
+    # the lock): the placement below reads the master this photo already has and the post-commit
+    # sweep unlinks the file it named, so two concurrent replaces could otherwise commit a row
+    # pointing at a file the other one deleted.
+    await db.refresh(att, ["created_at"], with_for_update=True)
+    data_root = Path(settings.DATA_ROOT)
+    # A master of a photo that lives in a memo files into that memo's folder beside the screen
+    # master, under its own filename; an unlinked photo stages in _unfiled/ exactly like the ingest
+    # path, and link_attachments moves it when the photo is attached to a memo.
+    memo = (
+        (await db.execute(select(Memo).where(Memo.id == att.memo_id))).scalar_one_or_none()
+        if att.memo_id is not None
+        else None
+    )
+    dest_dir = (
+        storage.memo_dir(data_root, memo.created_at, memo.uid)
+        if memo is not None
+        else storage.unfiled_dir(data_root)
+    )
+    try:
+        placed = await up_svc.attach_print_master(db, upload, att, variant_key, label, dest_dir)
+    except ValueError as exc:  # an incomplete upload — its part file and row are left to the reaper
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    try:
+        await db.commit()
+    except Exception:
+        if placed.rollback_path is not None:
+            await to_thread.run_sync(_unlink_all, [Path(placed.rollback_path)])
+        raise
+    # AFTER the commit, so the ordering is crash-safe in one direction: until it lands the row still
+    # names the old file and that file still exists; once it lands the row names the new one, which
+    # is already on disk. A crash between leaves at worst an unreferenced master.
+    if placed.displaced is not None:
+        await to_thread.run_sync(_unlink_all, [Path(placed.displaced)])
+    # The session does not expire on commit, and `attachment_meta` re-reads the SAME
+    # identity-mapped attachment — so without this the response would carry the collection loaded
+    # BEFORE the attach and report the photo as having no master at all.
+    await db.refresh(att, ["renditions"])
+    return await attachment_meta(uid, user, db)
+
+
+@router.delete("/attachments/{uid}/rendition/{variant_key}", status_code=204)
+async def delete_rendition(
+    uid: str,
+    variant_key: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Remove one print master — OWNER-only (a mutation; viewing a master is household-wide). The
+    screen photo and every derived tier are untouched: only the archive master goes."""
+    att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
+    if att is None or att.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    rendition = next((r for r in att.renditions if r.variant_key == variant_key), None)
+    if rendition is None:
+        raise HTTPException(status_code=404, detail="Rendition not found")
+    path = Path(rendition.storage_path)
+    await db.delete(rendition)
+    await db.commit()
+    # After the commit, for the same crash-safety reason as the attach above: a rendition file is
+    # unique and unshared (never a deterministic path), so once the row is gone nothing names it.
+    await to_thread.run_sync(_unlink_all, [path])
 
 
 @router.get("/attachments/{uid}/rendition/{variant_key}")

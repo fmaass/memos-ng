@@ -3,14 +3,15 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import SelectButton from 'primevue/selectbutton'
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import { useApi } from '@/composables/useApi'
-import { useMediaLightbox } from '@/composables/useMediaLightbox'
-import { usePrintUpload } from '@/composables/usePrintUpload'
+import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
+import { fetchPrintMasters, usePrintMaster } from '@/composables/usePrintMaster'
 import type { MemoQuery } from '@/composables/useTimeline'
 import { shouldRemint } from '@/lib/imageRetry'
+import { selectPrintMaster, toPrintMasterInfo } from '@/lib/printMaster'
 
 const api = useApi()
 const queryClient = useQueryClient()
@@ -44,17 +45,50 @@ function onTileRetry() {
 }
 
 // Shared with the memo feed's card action — the composable carries the success/error toasts and
-// refreshes this view's own attachment list (MEMNG-74).
-const addPrint = usePrintUpload(['attachments'])
+// refreshes this view's own attachment list (MEMNG-74/75).
+const printMaster = usePrintMaster(['attachments'])
 
 const lightbox = useMediaLightbox()
 function openAt(index: number) {
   lightbox.open(items.value, index, {
     onDelete,
-    onAddPrint: (uid, file) => addPrint.mutate({ uid, file }),
+    onAttachPrint,
+    onRemovePrint,
+    loadPrintMaster: async (uid) => toPrintMasterInfo(selectPrintMaster(await fetchPrintMasters(uid))),
   })
 }
 onUnmounted(() => lightbox.destroy())
+
+// The list refetched after an attach/remove — what the open viewer holds about the master is stale.
+watch(items, () => lightbox.refreshPrintMaster())
+
+// Replacing deletes the master that is there, so it is confirmed (naming the file that will
+// overwrite it); a first attach destroys nothing and goes straight through.
+function onAttachPrint({ uid, file, variantKey, replacing }: AttachPrintPayload) {
+  if (!replacing) {
+    printMaster.attach({ uid, file, variantKey })
+    return
+  }
+  confirm.require({
+    header: 'Replace print master',
+    message: `Replace the print master with “${file.name}”? The current one is deleted.`,
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Replace' },
+    accept: () => printMaster.attach({ uid, file, variantKey }),
+  })
+}
+
+function onRemovePrint({ uid, variantKey }: { uid: string; variantKey: string }) {
+  confirm.require({
+    header: 'Remove print master',
+    message: 'Remove this photo’s print master? The photo itself stays.',
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Remove', severity: 'danger' },
+    accept: () => printMaster.remove({ uid, variantKey }),
+  })
+}
 
 function onDelete(uid: string) {
   confirm.require({

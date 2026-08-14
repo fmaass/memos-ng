@@ -13,15 +13,34 @@ vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn(), DELETE: 
 // The viewer is PhotoSwipe (needs a real DOM) — mock the composable so jsdom doesn't boot it.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
 vi.mock('@/composables/useMediaLightbox', () => ({
-  useMediaLightbox: () => ({ open: lightboxOpen, destroy: vi.fn() }),
+  useMediaLightbox: () => ({
+    open: lightboxOpen,
+    destroy: vi.fn(),
+    refreshPrintMaster: refreshPrintMaster,
+  }),
 }))
-// The print upload is a shared composable (Resources lightbox + memo feed), unit-tested in
-// composables/__tests__/usePrintUpload.spec.ts; here we only pin the wiring.
-const { printMutate, usePrintUploadMock } = vi.hoisted(() => {
-  const printMutate = vi.fn()
-  return { printMutate, usePrintUploadMock: vi.fn(() => ({ mutate: printMutate })) }
+// Print masters are a shared composable (Resources lightbox + memo feed), unit-tested in
+// composables/__tests__/usePrintMaster.spec.ts; here we only pin the wiring.
+const { printAttach, printRemove, usePrintMasterMock, refreshPrintMaster } = vi.hoisted(() => {
+  const printAttach = vi.fn()
+  const printRemove = vi.fn()
+  return {
+    printAttach,
+    printRemove,
+    refreshPrintMaster: vi.fn(),
+    usePrintMasterMock: vi.fn(() => ({
+      attach: printAttach,
+      remove: printRemove,
+      retry: vi.fn(),
+      uploads: new Map(),
+    })),
+  }
 })
-vi.mock('@/composables/usePrintUpload', () => ({ usePrintUpload: usePrintUploadMock }))
+vi.mock('@/composables/usePrintMaster', () => ({
+  usePrintMaster: usePrintMasterMock,
+  fetchPrintMasters: vi.fn().mockResolvedValue([]),
+  printMasterUploads: () => new Map(),
+}))
 vi.mock('@tanstack/vue-query', () => ({
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
   useQuery: () => ({
@@ -55,8 +74,9 @@ describe('ResourcesView', () => {
     vi.restoreAllMocks()
     refetch.mockClear()
     lightboxOpen.mockClear()
-    printMutate.mockClear()
-    usePrintUploadMock.mockClear()
+    printAttach.mockClear()
+    printRemove.mockClear()
+    usePrintMasterMock.mockClear()
   })
 
   it('renders the justified gallery + type filter (not the old square grid)', () => {
@@ -75,15 +95,38 @@ describe('ResourcesView', () => {
     expect(classes).not.toContain('xl:max-w-4xl')
   })
 
-  it('sends a lightbox print upload through the shared print-upload mutation', () => {
+  it('sends a first print-master attach straight through the shared mutation', () => {
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
     wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
     const file = new File(['tiff-bytes'], 'master.tif', { type: 'image/tiff' })
 
-    lightboxOpen.mock.calls[0][2].onAddPrint('a1', file)
+    lightboxOpen.mock.calls[0][2].onAttachPrint({
+      uid: 'a1',
+      file,
+      variantKey: 'print',
+      replacing: false,
+    })
 
-    expect(usePrintUploadMock).toHaveBeenCalledWith(['attachments']) // this view's own cache
-    expect(printMutate).toHaveBeenCalledWith({ uid: 'a1', file })
+    expect(usePrintMasterMock).toHaveBeenCalledWith(['attachments']) // this view's own cache
+    expect(printAttach).toHaveBeenCalledWith({ uid: 'a1', file, variantKey: 'print' })
+  })
+
+  it('holds a REPLACE and a REMOVE behind a confirmation', () => {
+    // Both destroy a master that is already there; neither may fire on the click alone.
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+    const handlers = lightboxOpen.mock.calls[0][2]
+
+    handlers.onAttachPrint({
+      uid: 'a1',
+      file: new File(['x'], 'new.tif', { type: 'image/tiff' }),
+      variantKey: 'print:glossy',
+      replacing: true,
+    })
+    handlers.onRemovePrint({ uid: 'a1', variantKey: 'print:glossy' })
+
+    expect(printAttach).not.toHaveBeenCalled()
+    expect(printRemove).not.toHaveBeenCalled()
   })
 
   it('re-mints Resources when gallery retry bubbles, throttled to one refetch per cooldown', async () => {

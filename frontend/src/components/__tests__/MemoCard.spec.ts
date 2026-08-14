@@ -16,7 +16,19 @@ vi.mock('primevue/useconfirm', () => ({ useConfirm: () => ({ require: requireSpy
 // open() wiring without booting PhotoSwipe in jsdom.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
 vi.mock('@/composables/useMediaLightbox', () => ({
-  useMediaLightbox: () => ({ open: lightboxOpen, destroy: vi.fn() }),
+  useMediaLightbox: () => ({
+    open: lightboxOpen,
+    destroy: vi.fn(),
+    refreshPrintMaster: vi.fn(),
+  }),
+}))
+
+// The print-master mutations live in the view above this card; the card only reads the shared
+// upload queue (for its chips) and emits. Unit-tested in composables/__tests__/usePrintMaster.spec.
+const { printUploads } = vi.hoisted(() => ({ printUploads: new Map() }))
+vi.mock('@/composables/usePrintMaster', () => ({
+  printMasterUploads: () => printUploads,
+  fetchPrintMasters: vi.fn().mockResolvedValue([]),
 }))
 
 // The owner actions (⋯) menu is a PrimeVue popup teleported to body — open it, then return the
@@ -39,13 +51,36 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     mine: true,
     hasPrint: false,
     hasLegacyPrint: false,
-    renditions: [],
+    renditions: [] as {
+      variant_key: string
+      label: string | null
+      mime: string
+      size: number
+      downloadUrl: string
+    }[],
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
     webUrl: `/api/attachments/${uid}/web`,
     posterUrl: `/api/attachments/${uid}/poster`,
     downloadUrl: `/api/attachments/${uid}/original`,
     printUrl: `/api/attachments/${uid}/print`,
+  }
+}
+
+// The same photo, carrying a print master (what the API ships on every feed page).
+function withMaster(att: ReturnType<typeof imageAtt>, variantKey = 'print') {
+  return {
+    ...att,
+    hasPrint: true,
+    renditions: [
+      {
+        variant_key: variantKey,
+        label: null,
+        mime: 'image/tiff',
+        size: 8_598_323,
+        downloadUrl: `/api/attachments/${att.uid}/rendition/${variantKey}`,
+      },
+    ],
   }
 }
 
@@ -91,6 +126,7 @@ describe('MemoCard', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+    printUploads.clear() // module-level queue — a leftover entry would chip the next test's tiles
   })
 
   it('renders markdown content and tag chips', () => {
@@ -105,13 +141,40 @@ describe('MemoCard', () => {
     expect(wrapper.findAll('[data-test="tag-chip"]').map((c) => c.text())).toEqual(['#curated'])
   })
 
-  it('shows the 🖨 print badge iff a memo has print versions', () => {
+  it('states the print badge as a COUNT of the photos that have a master', () => {
+    // The old badge was a flag: two photos with one master looked exactly like two with two.
     const withPrint = mountCard({
-      memo: memo('trip', [], [{ ...imageAtt('p1'), hasPrint: true }]),
+      memo: memo('trip', [], [withMaster(imageAtt('p1')), imageAtt('p2')]),
     })
-    expect(withPrint.find('[data-test="print-badge"]').exists()).toBe(true)
+    expect(withPrint.find('[data-test="print-badge"]').text()).toBe('🖨 1 of 2')
+
+    const both = mountCard({
+      memo: memo('trip', [], [withMaster(imageAtt('p1')), withMaster(imageAtt('p2'))]),
+    })
+    expect(both.find('[data-test="print-badge"]').text()).toBe('🖨 2 of 2')
+
     const without = mountCard({ memo: memo('trip', [], [imageAtt('p2')]) })
     expect(without.find('[data-test="print-badge"]').exists()).toBe(false)
+  })
+
+  it('chips each photo with its OWN print state, including a live upload', () => {
+    printUploads.set('p2', { status: 'uploading', progress: 42 })
+    const wrapper = mountCard({
+      memo: memo('trip', [], [withMaster(imageAtt('p1')), imageAtt('p2')]),
+    })
+    const chips = wrapper.findAll('[data-test="print-chip"]')
+    expect(chips.map((c) => c.text())).toEqual(['PRINT', 'UPLOADING 42%'])
+    expect(chips.map((c) => c.attributes('data-chip-kind'))).toEqual(['present', 'uploading'])
+  })
+
+  it('offers RETRY on a failed print-master upload and bubbles it', async () => {
+    printUploads.set('p1', { status: 'error', progress: 12 })
+    const wrapper = mountCard({ memo: memo('trip', [], [imageAtt('p1'), imageAtt('p2')]) })
+    const chip = wrapper.find('[data-test="print-chip"]')
+    expect(chip.text()).toBe('PRINT FAILED · RETRY')
+
+    await chip.trigger('click')
+    expect(wrapper.emitted('retry-print')?.[0]).toEqual(['p1'])
   })
 
   it('renders a <script> in memo content inert (no live script tag)', () => {
