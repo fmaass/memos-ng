@@ -28,13 +28,16 @@ from app.models import (
     Memo,
     User,
 )
-from app.services import asset_urls, storage
+from app.services import asset_urls, printready, storage
 from app.services import uploads as up_svc
 from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
 
-TIERS = ("original", "thumb", "mobile", "web", "poster", "print")
+# `print` and `printready` are different things and both are load-bearing: `print` streams a
+# separately-uploaded print master verbatim (satellites depend on it), `printready` is the
+# generated 4096 px book rendition (MEMNG-49). Neither is signed — see asset_urls.DERIVED_TIERS.
+TIERS = ("original", "thumb", "mobile", "web", "poster", "print", printready.TIER)
 
 
 def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
@@ -48,6 +51,8 @@ def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
         return assets / "web" / f"{uid}.mp4", "video/mp4"
     if tier == "poster":
         return assets / "web" / f"{uid}.poster.jpg", "image/jpeg"
+    if tier == printready.TIER:
+        return printready.printready_path(uid), "image/jpeg"
     return None
 
 
@@ -350,7 +355,7 @@ def _all_asset_paths(att: Attachment) -> list[Path]:
         paths.append(Path(att.print_path))
     for rendition in att.renditions:  # hidden print masters (unique, unshared files)
         paths.append(Path(rendition.storage_path))
-    for tier in ("thumb", "mobile", "web", "poster"):
+    for tier in ("thumb", "mobile", "web", "poster", printready.TIER):
         resolved = tier_path(att, tier)
         if resolved is not None:
             p = resolved[0]

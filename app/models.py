@@ -47,6 +47,23 @@ class JobState(enum.StrEnum):
     failed = "failed"
 
 
+class JobKind(enum.StrEnum):
+    """WHAT a media job derives, orthogonal to the lane that decides WHERE it runs.
+
+    Until MEMNG-49 every job was the upload pipeline and the work was inferred from lane+mime, so
+    a second kind of image work on the slow lane had no way to announce itself. `derive` is that
+    original pipeline (tiers/poster/dims/blurhash, and the transcode it chains); `printready` is
+    the on-demand 4096 px print rendition, which is never produced by an upload — only by an
+    explicit enqueue (app/services/printready.py).
+
+    Deliberately a free string column rather than a Postgres enum: a new kind then costs no
+    ALTER TYPE (which cannot run in a transaction alongside its own use) and no migration at all.
+    """
+
+    derive = "derive"
+    printready = "printready"
+
+
 memo_tags = Table(
     "memo_tags",
     Base.metadata,
@@ -232,6 +249,15 @@ class MediaJob(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     attachment_id: Mapped[int] = mapped_column(Integer, index=True)
     lane: Mapped[JobLane] = mapped_column(Enum(JobLane, name="job_lane"))
+    # See JobKind: a plain string, so the value set can grow without a migration. The server
+    # default is what makes the column additive — every job row written before MEMNG-49 (and any
+    # INSERT that predates this column in a rolling deploy) reads back as the upload pipeline.
+    # Not indexed: every kind lookup is already scoped by attachment_id (indexed) or by the
+    # state+lane claim index, and media_jobs is a write-heavy queue where an index nothing selects
+    # on is pure insert cost.
+    kind: Mapped[str] = mapped_column(
+        String(32), default=JobKind.derive, server_default=JobKind.derive
+    )
     state: Mapped[JobState] = mapped_column(
         Enum(JobState, name="job_state"), default=JobState.queued, index=True
     )

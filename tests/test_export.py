@@ -10,6 +10,7 @@ from app.config import settings
 from app.models import Attachment
 from app.routers import assets
 from app.routers.export import ExportTier, _media_name, _unique_name
+from app.services import printready
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
@@ -170,9 +171,18 @@ def test_export_rejects_an_unknown_tier(logged_in_client):
     assert client.get("/api/export?include_media=true&tier=nope").status_code == 422
 
 
+# Asset tiers the generic export deliberately does NOT offer, each with the reason it is here:
+#   printready — the photo-book rendition (MEMNG-49). Its consumer is the photo-book export, which
+#     is Phase B and gets its own endpoint with its own selection; adding it to `tier` here would
+#     widen the public API a phase early
+#     (docs/plans/PLAN_2026-07-30_photobook-print-tier.md).
+NOT_EXPORTABLE = {printready.TIER}
+
+
 def test_export_tiers_are_the_asset_tiers():
-    """The export offers exactly the renditions the asset routes serve — no drift."""
-    assert set(get_args(ExportTier)) == set(assets.TIERS)
+    """The export offers exactly the renditions the asset routes serve, minus the ones listed
+    above — so a NEW asset tier still has to be dispositioned here or this test fails."""
+    assert set(get_args(ExportTier)) == set(assets.TIERS) - NOT_EXPORTABLE
 
 
 def _att(filename: str) -> Attachment:

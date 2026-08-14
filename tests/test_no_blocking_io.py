@@ -85,6 +85,8 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         ("app/services/media.py", "process_slow", "_stamp_mtime"): 1,
         ("app/services/media.py", "process_job", "process_image"): 2,
         ("app/services/media.py", "process_job", "process_video_poster"): 1,
+        ("app/services/media.py", "process_printready_job", "too_hot"): 1,
+        ("app/services/media.py", "process_printready_job", "process_printready"): 1,
         ("app/services/media.py", "_await_group_exit", "_group_alive"): 1,
         ("app/services/media.py", "_stop_transcode", "_group_alive"): 1,
         # --- not filesystem calls at all: `ZipFile.open(...)` opens a zip ENTRY over the export's

@@ -4,11 +4,14 @@ import os
 import signal
 import subprocess
 from collections import deque
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pillow_heif
 import structlog
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms, ImageOps
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -19,12 +22,13 @@ from app.database import async_session
 from app.models import (
     Attachment,
     AttachmentStatus,
+    JobKind,
     JobLane,
     JobState,
     MediaJob,
     MediaJobProgress,
 )
-from app.services import blurhash_pure
+from app.services import blurhash_pure, printready
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
@@ -32,6 +36,17 @@ logger = structlog.get_logger(__name__)
 
 THUMB_MAX = 800
 MOBILE_MAX = 2048
+# The print rendition (MEMNG-49). Every number here is a print requirement, not a screen one, and
+# each is measured in docs/plans/PLAN_2026-07-30_photobook-print-tier.md:
+#   4096 px  — 1.5 pages of a 21x21 cm layflat book at 300 dpi (3720 px) plus bleed, rounded up;
+#   q92      — q85 saves 38% of the bytes and shows on 382 g/m² gloss; q95 costs 37% for nothing;
+#   4:4:4    — chroma subsampling artefacts are visible in print, and the saving is ~28% of ~1 GB;
+#   300 dpi  — nothing else in this codebase writes a DPI, so layout software assumes 72 and
+#              mis-scales the photo on placement. This is the tag that makes the tier usable.
+PRINTREADY_MAX = 4096
+PRINTREADY_QUALITY = 92
+PRINTREADY_SUBSAMPLING = 0  # 4:4:4 — keep full chroma resolution
+PRINTREADY_DPI = (300, 300)
 # Grace between SIGTERM and SIGKILL when stopping a runaway transcode: ffmpeg closes the output
 # file and exits on TERM, so this only has to cover finishing the frame in flight.
 KILL_GRACE_SECONDS = 5.0
@@ -71,11 +86,14 @@ def derived_outputs(uid: str) -> list[Path]:
     holds, and nothing else reaps it.
     """
     web = _assets("web")
+    print_ready = printready.printready_path(uid)
     return [
         _assets("thumbs") / f"{uid}.jpg",
         _assets("thumbs") / f"{uid}.jpg.tmp",  # _atomic_save
         _assets("mobile") / f"{uid}.jpg",
         _assets("mobile") / f"{uid}.jpg.tmp",
+        print_ready,
+        print_ready.with_suffix(print_ready.suffix + ".tmp"),  # _atomic_save
         web / f"{uid}.poster.jpg",
         web / f"{uid}.poster.tmp.jpg",  # process_video_poster
         web / f"{uid}.mp4",
@@ -126,10 +144,15 @@ async def guard_publish(db: AsyncSession, attachment: Attachment) -> None:
     raise AttachmentGone(f"attachment {attachment.id} was deleted while its job was running")
 
 
-def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80) -> None:
+def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: Any) -> None:
+    """Encode to a sibling temp and rename it into place, so no reader ever sees a partial tier.
+
+    `params` passes the extra JPEG knobs the print rendition needs (subsampling, dpi, icc_profile)
+    straight through to Pillow; the screen tiers pass none and keep their encode byte-for-byte.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    img.save(tmp, "JPEG", quality=quality)
+    img.save(tmp, "JPEG", quality=quality, **params)
     os.replace(tmp, dest)
 
 
@@ -165,6 +188,80 @@ def process_image(attachment: Attachment) -> dict:
 
         bhash = blurhash_pure.encode(thumb)
     return {"width": width, "height": height, "blurhash": bhash}
+
+
+@lru_cache(maxsize=1)
+def srgb_profile() -> ImageCms.ImageCmsProfile:
+    """The sRGB profile this deployment converts to and embeds — built once (it is ~600 bytes of
+    little-cms state, and every print rendition needs the same one)."""
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+
+
+def to_srgb(img: Image.Image) -> tuple[Image.Image, bytes]:
+    """Colour-MANAGE an image into sRGB and return it with the profile bytes to embed.
+
+    `.convert("RGB")` — what every other tier does — changes the pixel MODE and nothing else: the
+    numbers are reinterpreted as sRGB whatever space they were actually in, so an AdobeRGB or
+    Display-P3 master (wider gamut, same numbers) prints visibly dull and desaturated. A real
+    transform through little-cms is the difference, and embedding the destination profile is the
+    other half: the book service requires sRGB and an untagged JPEG is a guess at the far end.
+
+    A source with no embedded profile is assumed to be sRGB — the same assumption every browser
+    makes, and the only one available. A source whose profile cannot be read falls back to that
+    assumption too, loudly: a corrupt ICC must not cost the photo its print rendition, and the
+    numbers are still far closer to right than to wrong.
+    """
+    profile = srgb_profile()
+    icc = img.info.get("icc_profile")
+    if img.mode in ("P", "PA"):
+        # little-cms cannot transform a palette. The entries are colour values in the source
+        # space, so expanding first and transforming after is the same picture, correctly managed.
+        img = img.convert("RGB")
+    if icc:
+        try:
+            converted = ImageCms.profileToProfile(
+                img, ImageCms.getOpenProfile(BytesIO(icc)), profile, outputMode="RGB"
+            )
+        except (ImageCms.PyCMSError, OSError) as exc:
+            logger.warning("printready_icc_unreadable", error=str(exc))
+            converted = None
+        if converted is not None:
+            return converted, profile.tobytes()
+    return img.convert("RGB"), profile.tobytes()
+
+
+def process_printready(attachment: Attachment) -> Path:
+    """Derive the print rendition of one photo and publish it. Returns the file it wrote.
+
+    Source preference is the point of the tier: the PRINT MASTER when the photo has one — that is
+    the user's own export for print, crop and output sharpening included — and only otherwise the
+    original (app/services/printready.py:source_path). Never a screen tier.
+
+    Downscaled with LANCZOS rather than `thumbnail`'s default bicubic: this is a 60 MP → 4096 px
+    reduction whose result is inspected at 300 dpi on gloss paper, where bicubic's softness is the
+    one artefact a reader can actually see. `thumbnail` never enlarges, so a source already at or
+    below 4096 px keeps its own dimensions — upscaling would invent detail and print worse than
+    the honest smaller image.
+    """
+    source = printready.source_path(attachment)
+    if source is None:  # enqueue refuses these; a hand-made job must fail loudly, not silently
+        raise RuntimeError(f"attachment {attachment.id} has no source file for a print rendition")
+    dest = printready.printready_path(attachment.uid)
+    with Image.open(source) as raw:
+        img = ImageOps.exif_transpose(raw)  # orientation first — the same path the tiers use
+        img, icc = to_srgb(img)
+        img.thumbnail((PRINTREADY_MAX, PRINTREADY_MAX), Image.Resampling.LANCZOS)
+        _atomic_save(
+            img,
+            dest,
+            quality=PRINTREADY_QUALITY,
+            subsampling=PRINTREADY_SUBSAMPLING,
+            optimize=True,
+            dpi=PRINTREADY_DPI,
+            icc_profile=icc,
+        )
+    _stamp_mtime(dest, attachment)  # carries the capture date, like every other derived tier
+    return dest
 
 
 QUARTER_TURNS = (0, 90, 180, 270)
@@ -740,6 +837,34 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     await db.flush()
 
 
+async def process_printready_job(db: AsyncSession, attachment: Attachment) -> None:
+    """Run one on-demand print rendition (MEMNG-49) — the second kind of slow-lane image work.
+
+    Slow lane and thermally deferred like the transcode, for the same reason: a 40-60 MP decode +
+    LANCZOS reduction + q92 encode is seconds of full-core CPU on a NAS that is shared with
+    production and bounded by heat, and a book asks for a few hundred of them at once. The worker
+    drains one job at a time and Pillow encodes on the calling thread, so "single-threaded and
+    throttled" is what this already is — nothing here fans out.
+
+    It publishes an EXTRA tier for a photo that is already `ready`, so unlike every other job it
+    changes no attachment column and no status: a print rendition that never gets made must not
+    make the photo itself look broken (see worker._fail_attachment).
+    """
+    # blocking-ok: a sysfs thermal-zone read (/sys/class/thermal), not the data volume — same
+    # guard process_slow takes, and for the same host.
+    if too_hot():
+        raise ThermalDefer
+    if not attachment.mime.startswith("image/"):
+        # enqueue_printready filters non-images out; reaching here means a hand-made job row.
+        raise RuntimeError(f"printready is image-only: attachment {attachment.id} is not an image")
+    # blocking-ok: this IS the worker's job — a CPU-bound decode/encode that would still occupy
+    # the process in a thread. Nothing else is queued on this loop to yield to.
+    process_printready(attachment)
+    # The delete endpoint never waits for a running job, so the photo may have been deleted while
+    # this ran. Checked under the row lock, which also sweeps the file just published.
+    await guard_publish(db, attachment)
+
+
 async def process_job(db: AsyncSession, job: MediaJob) -> None:
     """Dispatch a media job to its lane. Raises on failure (caller marks it failed);
     raises ThermalDefer to re-queue without counting a failure."""
@@ -751,6 +876,12 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
         # lock, but not one a worker already holds — and a claim that rolls back (restart, failed
         # outcome write) returns that row to `queued` for a later poll (MEMNG-41).
         raise AttachmentGone(f"attachment {job.attachment_id} no longer exists")
+
+    # Dispatched on KIND first: a printready job is slow-lane image work, so the lane+mime rules
+    # below would otherwise route it into the HEIC branch and re-derive the photo's own tiers.
+    if job.kind == JobKind.printready:
+        await process_printready_job(db, attachment)
+        return
 
     if job.lane is JobLane.slow:
         if attachment.mime.startswith("video/"):
