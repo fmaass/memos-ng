@@ -187,6 +187,38 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.3.2
+
+Media reliability patch (2026-08-13).
+
+**Fixed**
+- The upload reaper commits its deletions - expired rows stop resurrecting every cycle
+  (their part files had already been unlinked). Spool files of live sessions are never
+  reaped regardless of age; only sessions that are gone or expired lose theirs.
+- Frame-share jobs stranded in `claimed` by a worker crash recover: claims carry a lease,
+  a startup + hourly sweep re-queues stale claims with attempt accounting (failing visibly
+  at the ceiling), and every post-claim write is fenced on the lease so a superseded
+  attempt cannot overwrite a newer one. Pre-existing stranded jobs recover on this deploy.
+- One poisoned media job can no longer crash-loop the worker: error text is sanitized
+  (NUL bytes included), the failure record commits under its own guard, and the media
+  branch is isolated like the frame-share drain always was.
+- Slow-lane transcodes are time-bounded: expiry kills the whole process group (leader,
+  descendants, zombie-aware), unlinks partial output, and fails the job visibly.
+- Deleting an attachment no longer blocks behind an in-flight transcode's row lock -
+  deletion returns promptly and the worker discards the orphaned job as a logged outcome.
+- Video dimensions respect the rotation tag (both metadata forms), so portrait phone
+  videos report their displayed shape; probe, poster and transcode all measure the same
+  stream, and cover art can no longer be mistaken for the video.
+- Transcode progress is real end to end: per-job, visible mid-transcode through a
+  committed side channel, monotonic within an attempt, and rendered live in the feed.
+- Async request handlers no longer make inline blocking filesystem calls; an AST guard
+  keeps the class closed.
+- Print handling: a re-upload with the same client filename replaces the stored print
+  in place instead of orphaning numbered duplicates, and a print uploaded minutes after
+  its screen binds onto the existing photo instead of appearing as a duplicate - the
+  cause of duplicated images in the daily mail.
+- PAT last_used stamping runs off the request path (no pooled-connection hold-and-wait).
+
 ### v1.3.1
 
 Security hardening patch (2026-08-13).
