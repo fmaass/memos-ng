@@ -5,7 +5,15 @@
 // width, height-capped), two crop into a uniform two-up, three or more pack into justified rows —
 // the same aspect-preserving packing Resources uses (`justifyRows`).
 
-import { COLUMN_MAX_PX, COLUMN_MAX_XL_PX, COLUMN_PAD_PX, COLUMN_XL_MIN_PX, REM_PX } from '@/lib/layout'
+import {
+  COLUMN_MAX_PX,
+  COLUMN_MAX_XL_PX,
+  COLUMN_PAD_PX,
+  COLUMN_XL_MIN_PX,
+  REM_PX,
+  SIDEBAR_MIN_PX,
+  SIDEBAR_WIDTH_PX,
+} from '@/lib/layout'
 
 export interface LayoutAttachment {
   width: number | null
@@ -31,6 +39,13 @@ export const PAIR_GAP_PX = 8
 const MEDIA_INSET_PX = 2 * COLUMN_PAD_PX + 2 * CARD_PAD_PX
 const MEDIA_WIDTH_PX = COLUMN_MAX_PX - MEDIA_INSET_PX
 const MEDIA_WIDTH_XL_PX = COLUMN_MAX_XL_PX - MEDIA_INSET_PX
+// From `md` up the sidebar takes its width off the viewport before the column gets any, so the
+// column only reaches its cap once the viewport can hold both (768 + 240 = 912px). Between `md` and
+// here the media area is viewport-bound *and* a sidebar narrower than the fluid maths below `md`.
+const COLUMN_FULL_MIN_PX = COLUMN_MAX_PX + SIDEBAR_WIDTH_PX
+// What the viewport owes to something other than the media area, with and without the sidebar.
+const OUTSIDE_PX = MEDIA_INSET_PX
+const OUTSIDE_WITH_SIDEBAR_PX = MEDIA_INSET_PX + SIDEBAR_WIDTH_PX
 
 export type MediaLayout =
   | { mode: 'none' }
@@ -76,8 +91,13 @@ export function singleTileMaxWidthPx(
 
 /**
  * The `sizes` hint for a tile in the single/pair layouts: how wide it renders at each step of the
- * column rule, and below the column's cap the viewport minus the insets. A `srcset` without it is
- * guesswork — the browser assumes the tile is 100vw wide and over-fetches on a wide screen.
+ * column rule, and below the column's cap the viewport minus whatever the media area does not get.
+ * A `srcset` without it is guesswork — the browser assumes the tile is 100vw wide and over-fetches
+ * on a wide screen.
+ *
+ * The viewport is not all the column's: from `md` up AppShell's sidebar is in flow, so between it
+ * and COLUMN_FULL_MIN_PX the fluid width owes a sidebar as well as the insets. Skipping that term
+ * asks for a candidate up to a whole sidebar too wide across the whole band.
  *
  * `maxWidthPx` (single only) is the height cap's width limit: past it the box stops growing with
  * the column, so the hint must too, or a portrait pulls the mobile tier for a 420px render.
@@ -85,23 +105,39 @@ export function singleTileMaxWidthPx(
 export function tileSizes(mode: 'single' | 'pair', maxWidthPx?: number | null): string {
   const share = (px: number) => (mode === 'pair' ? Math.floor((px - PAIR_GAP_PX) / 2) : px)
   const cap = maxWidthPx == null ? Infinity : Math.floor(maxWidthPx)
-  const steps: [number, number][] = [
-    [COLUMN_XL_MIN_PX, Math.min(share(MEDIA_WIDTH_XL_PX), cap)],
-    [COLUMN_MAX_PX, Math.min(share(MEDIA_WIDTH_PX), cap)],
-  ]
-  // Below the column's own cap the box tracks the viewport, so a cap narrower than that starts
-  // binding at the viewport width where the media area would first outgrow it.
-  if (mode === 'single' && cap < share(MEDIA_WIDTH_PX)) steps.push([cap + MEDIA_INSET_PX, cap])
-  const fluid =
+  const fixed = (mediaPx: number) => `${Math.min(share(mediaPx), cap)}px`
+  // A media area of `100vw - outside`, and a pair tile is half of that once the gap is out.
+  const fluid = (outside: number) =>
     mode === 'pair'
-      ? `calc((100vw - ${MEDIA_INSET_PX + PAIR_GAP_PX}px) / 2)`
-      : `calc(100vw - ${MEDIA_INSET_PX}px)`
+      ? `calc((100vw - ${outside + PAIR_GAP_PX}px) / 2)`
+      : `calc(100vw - ${outside}px)`
+  // Where a binding cap takes over from a fluid width: the viewport at which the media area first
+  // grows past the cap. Only a single tile carries one (`maxWidthPx` is single-only).
+  const capBinds = mode === 'single' && cap < share(MEDIA_WIDTH_PX)
+  const capBindsAt = (outside: number) => cap + outside
+
+  const steps: [number, string][] = [
+    [COLUMN_XL_MIN_PX, fixed(MEDIA_WIDTH_XL_PX)],
+    [COLUMN_FULL_MIN_PX, fixed(MEDIA_WIDTH_PX)],
+  ]
+  // The `md`→COLUMN_FULL_MIN_PX band: sidebar in flow, column still short of its cap.
+  if (capBinds && capBindsAt(OUTSIDE_WITH_SIDEBAR_PX) <= SIDEBAR_MIN_PX) {
+    // The cap already binds at the band's narrow end, so it holds across the whole band.
+    steps.push([SIDEBAR_MIN_PX, `${cap}px`])
+  } else {
+    if (capBinds) steps.push([capBindsAt(OUTSIDE_WITH_SIDEBAR_PX), `${cap}px`])
+    steps.push([SIDEBAR_MIN_PX, fluid(OUTSIDE_WITH_SIDEBAR_PX)])
+  }
+  // Below `md` the sidebar is a drawer and the column has the viewport to itself, up to its cap.
+  steps.push([COLUMN_MAX_PX, fixed(MEDIA_WIDTH_PX)])
+  if (capBinds) steps.push([capBindsAt(OUTSIDE_PX), `${cap}px`])
+
   // `sizes` is first-match-wins, so a run of equal widths collapses onto its LOWEST breakpoint —
   // keeping the widest one instead would drop the tile back to the fluid width in between.
   const clauses = steps
-    .filter(([, px], i) => i === steps.length - 1 || px !== steps[i + 1][1])
-    .map(([min, px]) => `(min-width: ${min}px) ${px}px`)
-  return [...clauses, fluid].join(', ')
+    .filter(([, width], i) => i === steps.length - 1 || width !== steps[i + 1][1])
+    .map(([min, width]) => `(min-width: ${min}px) ${width}`)
+  return [...clauses, fluid(OUTSIDE_PX)].join(', ')
 }
 
 /** A justified tile is already laid out at an exact px width, so it states that width verbatim. */
