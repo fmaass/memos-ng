@@ -1127,6 +1127,107 @@
         "title": "ReactionSummary",
         "type": "object"
       },
+      "RenditionAttach": {
+        "properties": {
+          "upload_uid": {
+            "title": "Upload Uid",
+            "type": "string"
+          },
+          "variant_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Variant Key"
+          }
+        },
+        "required": [
+          "upload_uid"
+        ],
+        "title": "RenditionAttach",
+        "type": "object"
+      },
+      "RenditionDetail": {
+        "description": "One master with its pixel size \u2014 the shape the per-photo route returns.\n\nDimensions are NOT on RenditionItem because they are not in the database: learning them means\nopening the file, and RenditionItem rides along on every feed page and library listing. This\nsubclass exists so the one place that needs them (the print row in the viewer, opened for a\nsingle photo) can pay for them without putting a file read behind the feed.",
+        "properties": {
+          "downloadUrl": {
+            "title": "Downloadurl",
+            "type": "string"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "rev": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rev"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "variant_key": {
+            "title": "Variant Key",
+            "type": "string"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          }
+        },
+        "required": [
+          "variant_key",
+          "label",
+          "mime",
+          "size",
+          "downloadUrl",
+          "rev",
+          "width",
+          "height"
+        ],
+        "title": "RenditionDetail",
+        "type": "object"
+      },
       "RenditionItem": {
         "properties": {
           "downloadUrl": {
@@ -1148,6 +1249,17 @@
             "title": "Mime",
             "type": "string"
           },
+          "rev": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rev"
+          },
           "size": {
             "title": "Size",
             "type": "integer"
@@ -1162,7 +1274,8 @@
           "label",
           "mime",
           "size",
-          "downloadUrl"
+          "downloadUrl",
+          "rev"
         ],
         "title": "RenditionItem",
         "type": "object"
@@ -1643,6 +1756,49 @@
       }
     },
     "/api/attachments/{uid}/rendition/{variant_key}": {
+      "delete": {
+        "description": "Remove one print master \u2014 OWNER-only (a mutation; viewing a master is household-wide). The\nscreen photo and every derived tier are untouched: only the archive master goes.",
+        "operationId": "delete_rendition_api_attachments__uid__rendition__variant_key__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "variant_key",
+            "required": true,
+            "schema": {
+              "title": "Variant Key",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Rendition",
+        "tags": [
+          "assets"
+        ]
+      },
       "get": {
         "description": "Download a single print rendition \u2014 download-only, household-visible, on the short-session\nauth path (never the signed/public fast path; prints are low fan-out, not public-by-uid).",
         "operationId": "serve_rendition_api_attachments__uid__rendition__variant_key__get",
@@ -1694,7 +1850,7 @@
     },
     "/api/attachments/{uid}/renditions": {
       "get": {
-        "description": "A photo's hidden print renditions (household-visible, like the legacy print tier). Registered\nBEFORE the generic /{uid}/{tier} route so the literal `renditions` segment isn't a tier.",
+        "description": "A photo's hidden print renditions, WITH their pixel dimensions (household-visible, like the\nlegacy print tier). Registered BEFORE the generic /{uid}/{tier} route so the literal\n`renditions` segment isn't a tier.",
         "operationId": "list_renditions_api_attachments__uid__renditions_get",
         "parameters": [
           {
@@ -1713,7 +1869,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "$ref": "#/components/schemas/RenditionItem"
+                    "$ref": "#/components/schemas/RenditionDetail"
                   },
                   "title": "Response List Renditions Api Attachments  Uid  Renditions Get",
                   "type": "array"
@@ -1734,6 +1890,57 @@
           }
         },
         "summary": "List Renditions",
+        "tags": [
+          "assets"
+        ]
+      },
+      "post": {
+        "description": "Attach \u2014 or replace \u2014 the print master of an OWNED image, from a finished resumable upload.\n\nTakes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,\nresumable, progress-reporting path every other upload in this app uses. The legacy multipart\n`/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).",
+        "operationId": "attach_rendition_api_attachments__uid__renditions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenditionAttach"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentMeta"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attach Rendition",
         "tags": [
           "assets"
         ]

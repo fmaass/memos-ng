@@ -174,8 +174,12 @@ class Attachment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # Hidden, download-only extra files for this logical photo (e.g. print masters). NOT Attachment
     # rows, so they never surface in any feed/library/compat query — see AttachmentRendition.
+    # order_by id: the API serializes this list as-is and the UI names the FIRST print variant "the
+    # print master", which must be the same row `printready.print_rendition` derives from (lowest
+    # id = earliest attached). Without an explicit order that agreement rests on Postgres's physical
+    # row order, which nothing guarantees after an UPDATE moves a row.
     renditions: Mapped[list["AttachmentRendition"]] = relationship(
-        lazy="selectin", cascade="all, delete-orphan"
+        lazy="selectin", cascade="all, delete-orphan", order_by="AttachmentRendition.id"
     )
 
 

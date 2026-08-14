@@ -2,10 +2,13 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 
 import type { components } from '@/api/schema'
+import PrintChip from '@/components/PrintChip.vue'
 import { useElementWidth } from '@/composables/useElementWidth'
+import { printMasterUploads } from '@/composables/usePrintMaster'
 import { nextRetrySrc } from '@/lib/imageRetry'
 import { justifyRows } from '@/lib/justified'
 import { blurhashToDataUrl } from '@/lib/media'
+import { printChipState } from '@/lib/printMaster'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 
@@ -16,6 +19,7 @@ interface GalleryAttachment {
   blurhash: string | null
   width: number | null
   height: number | null
+  renditions?: components['schemas']['RenditionItem'][]
   thumbnailUrl: string
   posterUrl: string
 }
@@ -24,7 +28,19 @@ const props = withDefaults(
   defineProps<{ items: GalleryAttachment[]; targetHeight?: number; gap?: number }>(),
   { targetHeight: 200, gap: 4 },
 )
-const emit = defineEmits<{ open: [index: number]; retry: [uid: string] }>()
+const emit = defineEmits<{
+  open: [index: number]
+  retry: [uid: string]
+  'print-retry': [uid: string]
+}>()
+
+// Print-master state per photo. Resources is where ORPHAN attachments live — a photo with no memo
+// card anywhere — so if a failed print-master upload were not retryable here it would be retryable
+// nowhere: the toast is gone and there is no other tile for that photo.
+const printUploads = printMasterUploads()
+function printChipFor(att: GalleryAttachment) {
+  return printChipState(att, printUploads.get(att.uid))
+}
 
 const root = ref<HTMLElement | null>(null)
 const containerWidth = useElementWidth(root)
@@ -128,6 +144,11 @@ function bg(att: GalleryAttachment): string | undefined {
             Retry
           </button>
         </div>
+        <PrintChip
+          v-if="printChipFor(li.item)"
+          :chip="printChipFor(li.item)!"
+          @retry="emit('print-retry', li.item.uid)"
+        />
       </div>
     </div>
   </div>

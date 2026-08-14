@@ -46,6 +46,30 @@ function servedSize(a: LightboxItem, isVideo: boolean): { width: number; height:
   return tierSize(a.width, a.height, MOBILE_MAX_EDGE)
 }
 
+/**
+ * The slide data for one FACE of a photo (MEMNG-75): the screen rendition it was built from, or the
+ * print master itself.
+ *
+ * The master's own pixel size travels with it, so flipping to the print face raises the zoom ceiling
+ * to the file's real resolution — seeing what the book will actually print is the entire point of
+ * the toggle, and leaving the screen tier's dimensions on it would cap the zoom at the smaller
+ * image's pixels. Dimensions the server could not measure (an exotic TIFF/RAW) fall back to the
+ * screen slide's box rather than being guessed.
+ */
+export function slideForFace(
+  screen: Slide,
+  face: 'screen' | 'print',
+  master: { downloadUrl: string; width: number | null; height: number | null } | null,
+): Slide {
+  if (face !== 'print' || master === null) return screen
+  return {
+    ...screen,
+    src: master.downloadUrl,
+    width: master.width ?? screen.width,
+    height: master.height ?? screen.height,
+  }
+}
+
 export function buildSlides(items: readonly LightboxItem[]): Slide[] {
   return items.map((a) => {
     const isVideo = a.mime.startsWith('video/')

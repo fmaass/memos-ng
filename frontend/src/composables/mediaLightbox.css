@@ -22,6 +22,84 @@
   visibility: visible !important;
 }
 
+/* --- print master (MEMNG-75) -------------------------------------------------------------
+   Two pieces of chrome the viewer grew: a Screen|Print segmented control in the top bar, and a
+   strip along the bottom describing the master and offering its four verbs. Both are drawn in the
+   viewer's own dark palette rather than the app theme — the lightbox is always dark, whatever the
+   page behind it is doing. */
+.pswp-face-toggle {
+  display: inline-flex;
+  align-self: center;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  margin-inline-end: 0.25rem;
+}
+.pswp-face-toggle__option {
+  padding: 0.2rem 0.75rem;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.75);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.pswp-face-toggle__option.is-on {
+  background: rgba(16, 185, 129, 0.25);
+  color: #6ee7b7;
+  font-weight: 600;
+}
+
+.pswp-print-row {
+  position: absolute;
+  z-index: 10; /* above the slide canvas, below PhotoSwipe's own dialogs */
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(0.75rem + env(safe-area-inset-bottom));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  max-width: min(46rem, calc(100vw - 1.5rem));
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(23, 25, 28, 0.92);
+  color: #e6e9ed;
+  font-size: 0.85rem;
+  backdrop-filter: blur(6px);
+}
+.pswp-print-row__title {
+  font-weight: 600;
+}
+.pswp-print-row__meta {
+  color: rgba(255, 255, 255, 0.6);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.76rem;
+}
+.pswp-print-row__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-inline-start: auto;
+}
+.pswp-print-row__btn {
+  padding: 0.15rem 0.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.76rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+.pswp-print-row__btn.is-primary {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(52, 211, 153, 0.5);
+  color: #6ee7b7;
+}
+
 /* PhotoSwipe's paddingFn pads only the slide/zoom canvas, not the chrome: the top bar is
    hardcoded `top: 0` in photoswipe.css, so in the iOS standalone PWA (viewport-fit=cover) its
    icons sit under the Dynamic Island / notch. Shift the whole bar below the top inset and keep its

@@ -2,10 +2,12 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 import type { components } from '@/api/schema'
+import PrintChip from '@/components/PrintChip.vue'
 import { nextRetrySrc, retryDelayMs, withSameBust } from '@/lib/imageRetry'
 import { blurhashToDataUrl, tileKind } from '@/lib/media'
 import { tileAspectRatio } from '@/lib/mediaLayout'
 import { imageSrcset } from '@/lib/mediaTiers'
+import type { PrintChip as PrintChipState } from '@/lib/printMaster'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 
@@ -39,8 +41,15 @@ const props = defineProps<{
   width?: number | null
   height?: number | null
   sizes?: string
+  // The photo's print-master state (see printChipState) — null renders no chip at all. Computed by
+  // the parent, which is where both the memo's attachments and the upload queue are in scope.
+  printChip?: PrintChipState | null
 }>()
-const emit = defineEmits<{ retry: [uid: string]; open: [uid: string] }>()
+const emit = defineEmits<{
+  retry: [uid: string]
+  open: [uid: string]
+  'print-retry': [uid: string]
+}>()
 
 // The percentage the processing overlay shows. `progress` is the caller's explicit override (an
 // upload the caller is itself driving); otherwise it comes from the attachment in the cache, where
@@ -247,5 +256,7 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
         <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
       </span>
     </button>
+
+    <PrintChip v-if="printChip" :chip="printChip" @retry="emit('print-retry', att.uid)" />
   </div>
 </template>

@@ -5,7 +5,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import MemoCard from '@/components/MemoCard.vue'
 import MemoCardSkeleton from '@/components/MemoCardSkeleton.vue'
 import { useApi } from '@/composables/useApi'
-import { usePrintUpload } from '@/composables/usePrintUpload'
+import { usePrintMaster } from '@/composables/usePrintMaster'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
 import { shouldRemint } from '@/lib/imageRetry'
 import { groupByDay } from '@/lib/timeline'
@@ -87,9 +87,10 @@ const editMemo = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
-// Attach a print-quality master to one of your image attachments and refresh. Shared with the
-// Resources lightbox — the composable carries the success/error toasts (MEMNG-74).
-const addPrint = usePrintUpload(['memos'])
+// Attach/replace/remove the print master of one of your photos, and refresh. Shared with the
+// Resources lightbox — the composable carries the resumable upload, the per-photo progress the
+// tiles chip, and the success/error toasts (MEMNG-74/75).
+const printMaster = usePrintMaster(['memos'])
 
 // Delete one of a memo's attachments (owner-only on the server) and refresh the feed.
 const deleteAttachment = useMutation({
@@ -166,7 +167,9 @@ onUnmounted(() => observer?.disconnect())
         @delete-attachment="deleteAttachment.mutate($event)"
         @delete-attachments="deleteAttachments.mutate($event)"
         @delete-memo="deleteMemo.mutate($event)"
-        @add-print="addPrint.mutate($event)"
+        @attach-print="printMaster.attach($event)"
+        @remove-print="printMaster.remove($event)"
+        @retry-print="printMaster.retry($event)"
         @edit="editMemo.mutate($event)"
         @retry="onTileRetry"
       />

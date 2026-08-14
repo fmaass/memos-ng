@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildSlides, type LightboxItem } from '@/lib/lightboxSlides'
+import { buildSlides, type LightboxItem, slideForFace } from '@/lib/lightboxSlides'
 
 function item(over: Partial<LightboxItem> & Pick<LightboxItem, 'uid' | 'mime'>): LightboxItem {
   return {
@@ -66,12 +66,43 @@ describe('buildSlides', () => {
     expect([s.width, s.height]).toEqual([1600, 1200])
   })
 
-  it('preserves order and carries uid for delete/add-print callbacks', () => {
+  it('preserves order and carries uid for the delete/print-master callbacks', () => {
     const slides = buildSlides([
       item({ uid: 'a', mime: 'image/jpeg' }),
       item({ uid: 'b', mime: 'video/mp4' }),
       item({ uid: 'c', mime: 'image/png' }),
     ])
     expect(slides.map((s) => s.uid)).toEqual(['a', 'b', 'c'])
+  })
+})
+
+describe('slideForFace', () => {
+  const screen = () => buildSlides([item({ uid: 'p1', mime: 'image/jpeg' })])[0]
+
+  it('shows the master itself — at the master’s own pixel size, so zoom reaches it', () => {
+    const flipped = slideForFace(screen(), 'print', {
+      downloadUrl: '/api/attachments/p1/rendition/print:glossy',
+      width: 4032,
+      height: 3024,
+    })
+    expect(flipped.src).toBe('/api/attachments/p1/rendition/print:glossy')
+    expect([flipped.width, flipped.height]).toEqual([4032, 3024])
+    expect(flipped.uid).toBe('p1') // still the same photo — only the face changed
+  })
+
+  it('keeps the screen slide’s box when the master could not be measured', () => {
+    const base = screen()
+    const flipped = slideForFace(base, 'print', {
+      downloadUrl: '/x',
+      width: null,
+      height: null,
+    })
+    expect([flipped.width, flipped.height]).toEqual([base.width, base.height])
+  })
+
+  it('is the untouched screen slide for the screen face, or when there is no master', () => {
+    const base = screen()
+    expect(slideForFace(base, 'screen', { downloadUrl: '/x', width: 10, height: 10 })).toBe(base)
+    expect(slideForFace(base, 'print', null)).toBe(base)
   })
 })

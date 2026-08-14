@@ -5,14 +5,21 @@ import Menu from 'primevue/menu'
 import Popover from 'primevue/popover'
 import Select from 'primevue/select'
 import { useConfirm } from 'primevue/useconfirm'
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 
 import MediaTile from '@/components/MediaTile.vue'
 import type { components } from '@/api/schema'
 import { useElementWidth } from '@/composables/useElementWidth'
-import { useMediaLightbox } from '@/composables/useMediaLightbox'
+import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
+import { fetchPrintMasters, printMasterUploads } from '@/composables/usePrintMaster'
 import { useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
+import {
+  printBadgeLabel,
+  printChipState,
+  selectPrintMaster,
+  toPrintMasterInfo,
+} from '@/lib/printMaster'
 import { justifyRows } from '@/lib/justified'
 import { renderMemoMarkdown } from '@/lib/markdown'
 import {
@@ -35,7 +42,10 @@ const emit = defineEmits<{
   'delete-attachments': [uids: string[]] // bulk remove — deleted SEQUENTIALLY by the parent
   'delete-memo': [uid: string]
   retry: [uid: string] // a tile exhausted its in-place retries — ask the feed to re-mint URLs
-  'add-print': [payload: { uid: string; file: File }]
+  // Print masters: attach/replace (already confirmed here), remove (ditto), and retry a failed one.
+  'attach-print': [payload: { uid: string; file: File; variantKey: string }]
+  'remove-print': [payload: { uid: string; variantKey: string }]
+  'retry-print': [uid: string]
   edit: [
     payload: {
       uid: string
@@ -129,8 +139,16 @@ function addReaction(emoji: string) {
 // of its output is safe — raw HTML/script in memo content is escaped to inert text.
 const html = computed(() => renderMemoMarkdown(props.memo.content))
 
-// A subtle badge on memos that carry print masters (any attachment with a hidden print/rendition).
-const hasPrints = computed(() => (props.memo.attachments ?? []).some((a) => a.hasPrint))
+// The memo-level print badge is a COUNT ("🖨 1 of 3"): the old flag could not say WHICH photo it
+// meant. Per-photo state lives on the tiles themselves (printChipFor).
+const printBadge = computed(() => printBadgeLabel(props.memo.attachments ?? []))
+
+// Live print-master uploads, keyed by attachment uid — shared with the view that runs the mutation
+// (usePrintMaster), so progress and failure survive the feed refetch that replaces this memo object.
+const printUploads = printMasterUploads()
+function printChipFor(attachment: components['schemas']['AttachmentRef']) {
+  return printChipState(attachment, printUploads.get(attachment.uid))
+}
 
 // The media area's shape follows the attachment count (see mediaLayout): a lone photo keeps its own
 // ratio at content width, two crop into a uniform two-up, three or more pack into justified rows.
@@ -174,10 +192,52 @@ function openLightbox(uid: string) {
   if (i >= 0)
     lightbox.open(atts, i, {
       onDelete: onDeleteAttachment,
-      onAddPrint: (uid, file) => emit('add-print', { uid, file }),
+      onAttachPrint,
+      onRemovePrint,
+      loadPrintMaster,
     })
 }
 onUnmounted(() => lightbox.destroy())
+
+// The viewer holds the master it fetched; the feed refetching (an upload landed, a master was
+// removed) is the signal that what it holds is stale.
+watch(
+  () => props.memo.attachments,
+  () => lightbox.refreshPrintMaster(),
+)
+
+/** The one master the print row describes — the same row the backend derives the photo book from. */
+async function loadPrintMaster(uid: string) {
+  return toPrintMasterInfo(selectPrintMaster(await fetchPrintMasters(uid)))
+}
+
+// Replacing DESTROYS the master that is there, so it is confirmed — after the file is picked, so
+// the confirmation can name what is about to overwrite it. A first attach destroys nothing.
+function onAttachPrint({ uid, file, variantKey, replacing }: AttachPrintPayload) {
+  if (!replacing) {
+    emit('attach-print', { uid, file, variantKey })
+    return
+  }
+  confirm.require({
+    header: 'Replace print master',
+    message: `Replace the print master with “${file.name}”? The current one is deleted.`,
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Replace' },
+    accept: () => emit('attach-print', { uid, file, variantKey }),
+  })
+}
+
+function onRemovePrint({ uid, variantKey }: { uid: string; variantKey: string }) {
+  confirm.require({
+    header: 'Remove print master',
+    message: 'Remove this photo’s print master? The photo itself stays.',
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Remove', severity: 'danger' },
+    accept: () => emit('remove-print', { uid, variantKey }),
+  })
+}
 const confirm = useConfirm()
 function onDeleteAttachment(uid: string) {
   confirm.require({
@@ -392,8 +452,10 @@ function onContentClick(event: MouseEvent) {
         :width="layout.width"
         :height="layout.height"
         :sizes="singleSizes"
+        :print-chip="printChipFor(attachments[0])"
         @open="openLightbox"
         @retry="emit('retry', $event)"
+        @print-retry="emit('retry-print', $event)"
       />
     </div>
 
@@ -406,8 +468,10 @@ function onContentClick(event: MouseEvent) {
         :width="layout.width"
         :height="layout.height"
         :sizes="pairSizes"
+        :print-chip="printChipFor(a)"
         @open="openLightbox"
         @retry="emit('retry', $event)"
+        @print-retry="emit('retry-print', $event)"
       />
     </div>
 
@@ -432,14 +496,16 @@ function onContentClick(event: MouseEvent) {
           :width="li.item.width"
           :height="li.item.height"
           :sizes="justifiedTileSizes(li.width)"
+          :print-chip="printChipFor(li.item)"
           :style="{ width: li.width + 'px', height: li.height + 'px' }"
           @open="openLightbox"
           @retry="emit('retry', $event)"
+          @print-retry="emit('retry-print', $event)"
         />
       </div>
     </div>
 
-    <div v-if="memo.tags.length || hasPrints" class="flex flex-wrap items-center gap-1">
+    <div v-if="memo.tags.length || printBadge" class="flex flex-wrap items-center gap-1">
       <span
         v-for="t in memo.tags"
         :key="t"
@@ -448,12 +514,12 @@ function onContentClick(event: MouseEvent) {
         >#{{ t }}</span
       >
       <span
-        v-if="hasPrints"
+        v-if="printBadge"
         class="text-xs px-2 py-0.5 rounded-full bg-surface-200 dark:bg-surface-700 text-muted-color"
         data-test="print-badge"
-        title="This memo has print versions"
-        aria-label="Has print versions"
-        >🖨</span
+        title="Photos in this memo that have a print master"
+        :aria-label="`${printBadge.replace('🖨', 'Print masters:')}`"
+        >{{ printBadge }}</span
       >
     </div>
 
