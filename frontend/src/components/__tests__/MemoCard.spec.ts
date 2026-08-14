@@ -139,6 +139,21 @@ describe('MemoCard', () => {
     expect(wrapper.emitted('task-toggle')?.[0]).toEqual([{ uid: 'm1', content: '- [x] todo' }])
   })
 
+  it('maps the clicked checkbox to its own source line past a fence and a blockquote', async () => {
+    // The fenced literal renders as code (no checkbox) and the quoted task renders as one, so a
+    // DOM index only lands on the right line if both sides share the renderer's enumeration.
+    const content = '```\n- [ ] fenced\n```\n\n> - [ ] quoted\n\n- [ ] plain'
+    const wrapper = mountCard({ memo: memo(content) })
+    const boxes = wrapper.findAll('input.task-list-item-checkbox')
+    expect(boxes).toHaveLength(2)
+    await boxes[0]!.trigger('click')
+    await boxes[1]!.trigger('click')
+    expect(wrapper.emitted('task-toggle')).toEqual([
+      [{ uid: 'm1', content: '```\n- [ ] fenced\n```\n\n> - [x] quoted\n\n- [ ] plain' }],
+      [{ uid: 'm1', content: '```\n- [ ] fenced\n```\n\n> - [ ] quoted\n\n- [x] plain' }],
+    ])
+  })
+
   it('renders a lone photo at its own ratio, content width, capped in height', () => {
     const wrapper = mountCard({
       memo: memo('one big photo', [], [imageAtt('img1', { width: 3000, height: 2000 })]),

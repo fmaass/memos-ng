@@ -27,12 +27,25 @@ const ALLOWED_ATTR = ['href', 'title', 'class', 'type', 'checked', 'disabled']
 // and an inline tag in prose ("see #curated") is not a tag-only line and stays.
 const TAG_ONLY_LINE = /^[ \t]*#\w+(?:[ \t]+#\w+)*[ \t]*$/
 
+/** True for a line stripTagOnlyLines drops — exported so callers can map rendered output back
+ *  to source line numbers (the renderer never sees these lines). */
+export function isTagOnlyLine(line: string): boolean {
+  return TAG_ONLY_LINE.test(line)
+}
+
 /** Drop whole lines that consist solely of hashtags — the tags still appear as chips below. */
 export function stripTagOnlyLines(source: string): string {
   return (source ?? '')
     .split('\n')
-    .filter((line) => !TAG_ONLY_LINE.test(line))
+    .filter((line) => !isTagOnlyLine(line))
     .join('\n')
+}
+
+/** Token stream from the SAME markdown-it instance renderMemoMarkdown renders with (task-lists
+ *  plugin included). Callers pass stripTagOnlyLines() output — that is what the renderer parses —
+ *  and read `token.map` to learn which source line produced which rendered element. */
+export function parseMemoMarkdown(text: string) {
+  return md.parse(text, {})
 }
 
 export function renderMemoMarkdown(source: string): string {

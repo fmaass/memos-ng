@@ -21,7 +21,7 @@ import {
   singleTileMaxWidthPx,
   tileSizes,
 } from '@/lib/mediaLayout'
-import { toggleTask } from '@/lib/tasks'
+import { TASK_CHECKBOX_CLASS, toggleTask } from '@/lib/tasks'
 
 type Memo = components['schemas']['MemoOut']
 type Visibility = Memo['visibility']
@@ -200,13 +200,15 @@ function onRemoveAllAttachments() {
 
 // Clicking a rendered task checkbox flips it in the source markdown and asks the parent to
 // persist (PATCH). preventDefault so the box reflects server truth on re-render, not the click.
+// The DOM index is only meaningful because toggleTask enumerates source tasks with the renderer's
+// own parse — same checkboxes, same order (TASK_CHECKBOX_CLASS is the shared anchor).
 function onContentClick(event: MouseEvent) {
   const target = event.target
-  if (!(target instanceof HTMLInputElement) || !target.classList.contains('task-list-item-checkbox'))
+  if (!(target instanceof HTMLInputElement) || !target.classList.contains(TASK_CHECKBOX_CLASS))
     return
   event.preventDefault()
   const root = event.currentTarget as HTMLElement
-  const index = Array.from(root.querySelectorAll('input.task-list-item-checkbox')).indexOf(target)
+  const index = Array.from(root.querySelectorAll(`input.${TASK_CHECKBOX_CLASS}`)).indexOf(target)
   if (index >= 0) {
     emit('task-toggle', { uid: props.memo.uid, content: toggleTask(props.memo.content, index) })
   }
