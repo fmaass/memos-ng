@@ -61,7 +61,12 @@ def _media_files(memo: Memo, tier: str) -> tuple[export_svc.MediaFile, ...]:
         path = resolved[0] if resolved is not None else None
         name = _unique_name(used, _media_name(att, path))
         files.append(
-            export_svc.MediaFile(uid=att.uid, arcname=f"media/{memo.uid}/{name}", path=path)
+            export_svc.MediaFile(
+                uid=att.uid,
+                arcname=f"media/{memo.uid}/{name}",
+                path=path,
+                mtime=att.captured_at,
+            )
         )
     return tuple(files)
 

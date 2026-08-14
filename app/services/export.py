@@ -34,6 +34,24 @@ CHUNK_SIZE = 1 << 16  # media read/emit granularity
 _SPOOL_MAX = 1 << 20  # manifest bytes held in memory before the spool rolls to disk
 _FLUSH_AT = 1 << 16  # buffered manifest bytes before a spool write
 
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)  # DOS timestamps: zipfile raises below this ...
+_ZIP_MAX = (2107, 12, 31, 23, 59, 58)  # ... and the field wraps above this
+
+
+def _zip_date_time(value: tuple[int, ...]) -> tuple[int, int, int, int, int, int]:
+    """Clamp into the ZIP format's representable range.
+
+    Out-of-range inputs are legitimate here: a scanned pre-1980 photo carries its captured_at
+    both in the DB and (via media.py's mtime stamping) on its tier files, and ZipInfo would
+    raise mid-stream — after the 200 is sent — leaving a truncated archive.
+    """
+    t = cast(tuple[int, int, int, int, int, int], tuple(value[:6]))
+    if t < _ZIP_EPOCH:
+        return _ZIP_EPOCH
+    if t > _ZIP_MAX:
+        return _ZIP_MAX
+    return t
+
 
 @dataclass(frozen=True, slots=True)
 class MediaFile:
@@ -41,11 +59,15 @@ class MediaFile:
 
     `path` is None when the attachment has no file for the requested tier at all (a `print`
     tier on a photo with no print master) — recorded in the manifest like a missing file.
+    `mtime` is the attachment's captured_at when the row has one; the file's own mtime is only
+    the fallback (media.py stamps captured_at onto derived-tier files, but never onto originals,
+    and not at all when captured_at is NULL — so the DB value is the deterministic source).
     """
 
     uid: str
     arcname: str
     path: Path | None
+    mtime: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,12 +160,17 @@ def _open_sync(path: Path) -> tuple[BufferedReader, os.stat_result] | None:
 
 
 async def _media_entry(
-    zf: zipfile.ZipFile, sink: _Sink, arcname: str, handle: BufferedReader, stat: os.stat_result
+    zf: zipfile.ZipFile,
+    sink: _Sink,
+    arcname: str,
+    handle: BufferedReader,
+    stat: os.stat_result,
+    mtime: datetime | None,
 ) -> AsyncIterator[bytes]:
     """Stream one already-opened media payload into the archive, a chunk at a time."""
-    # The file's mtime IS the captured_at analogue: media.py stamps every derived tier with the
-    # attachment's capture time, exactly as a memo entry is stamped with the memo's created_at.
-    info = zipfile.ZipInfo(arcname, date_time=time.localtime(stat.st_mtime)[:6])
+    # captured_at from the row when it has one; the file's mtime otherwise (see MediaFile).
+    stamp = mtime.timetuple()[:6] if mtime else time.localtime(stat.st_mtime)[:6]
+    info = zipfile.ZipInfo(arcname, date_time=_zip_date_time(stamp))
     # Stored, not deflated: renditions are JPEG/MP4, already compressed, so deflating them would
     # spend CPU per byte for nothing. file_size lets zipfile decide about zip64 on its own.
     info.compress_type = zipfile.ZIP_STORED
@@ -199,7 +226,7 @@ async def stream_zip(items: AsyncIterator[ExportItem]) -> AsyncIterator[bytes]:
     manifest = _ManifestSpool()
     try:
         async for item in items:
-            info = zipfile.ZipInfo(item.arcname, date_time=item.mtime.timetuple()[:6])
+            info = zipfile.ZipInfo(item.arcname, date_time=_zip_date_time(item.mtime.timetuple()))
             info.compress_type = zipfile.ZIP_DEFLATED  # memo text, unlike media, compresses
             zf.writestr(info, item.text)
             for chunk in sink.drain():
@@ -212,7 +239,9 @@ async def stream_zip(items: AsyncIterator[ExportItem]) -> AsyncIterator[bytes]:
                     media.append({"attachment": entry.uid, "file": entry.arcname, "missing": True})
                     continue
                 handle, stat = opened
-                async for chunk in _media_entry(zf, sink, entry.arcname, handle, stat):
+                async for chunk in _media_entry(
+                    zf, sink, entry.arcname, handle, stat, entry.mtime
+                ):
                     yield chunk
                 media.append({"attachment": entry.uid, "file": entry.arcname, "size": stat.st_size})
             if item.media:

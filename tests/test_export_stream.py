@@ -152,3 +152,29 @@ async def test_large_media_payload_is_never_fully_read_into_memory(tmp_path: Pat
 
     assert total > size  # the payload really went through (stored, not compressed)
     assert peak < 4_000_000
+
+
+async def test_pre_1980_file_mtime_is_clamped_not_fatal(tmp_path: Path):
+    """media.py stamps captured_at onto tier files, so a scanned pre-1980 photo's file mtime is
+    pre-1980 on disk — without the clamp, ZipInfo raises mid-stream and truncates the archive."""
+    src = tmp_path / "scan.jpg"
+    src.write_bytes(b"pixels")
+    os.utime(src, (0, 0))
+    media = (MediaFile(uid="a1", arcname="media/m0/scan.jpg", path=src),)
+
+    blob = await _collect(_items(_item(0, media=media)))
+
+    zf = zipfile.ZipFile(io.BytesIO(blob))
+    assert zf.getinfo("media/m0/scan.jpg").date_time == (1980, 1, 1, 0, 0, 0)
+
+
+async def test_media_entry_prefers_captured_at_over_file_mtime(tmp_path: Path):
+    src = tmp_path / "photo.jpg"
+    src.write_bytes(b"pixels")
+    captured = datetime(2020, 5, 4, 12, 30, 2)  # even second: DOS granularity
+    media = (MediaFile(uid="a1", arcname="media/m0/photo.jpg", path=src, mtime=captured),)
+
+    blob = await _collect(_items(_item(0, media=media)))
+
+    zf = zipfile.ZipFile(io.BytesIO(blob))
+    assert zf.getinfo("media/m0/photo.jpg").date_time == (2020, 5, 4, 12, 30, 2)
