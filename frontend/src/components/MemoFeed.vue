@@ -5,6 +5,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import MemoCard from '@/components/MemoCard.vue'
 import MemoCardSkeleton from '@/components/MemoCardSkeleton.vue'
 import { useApi } from '@/composables/useApi'
+import { usePrintUpload } from '@/composables/usePrintUpload'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
 import { shouldRemint } from '@/lib/imageRetry'
 import { groupByDay } from '@/lib/timeline'
@@ -86,20 +87,9 @@ const editMemo = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
-// Attach a print-quality master to one of your image attachments and refresh.
-const addPrint = useMutation({
-  mutationFn: async ({ uid, file }: { uid: string; file: File }) => {
-    const fd = new FormData()
-    fd.append('file', file)
-    const res = await fetch(`/api/attachments/${uid}/print`, {
-      method: 'POST',
-      body: fd,
-      credentials: 'include',
-    })
-    if (!res.ok) throw new Error('print upload failed')
-  },
-  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
-})
+// Attach a print-quality master to one of your image attachments and refresh. Shared with the
+// Resources lightbox — the composable carries the success/error toasts (MEMNG-74).
+const addPrint = usePrintUpload(['memos'])
 
 // Delete one of a memo's attachments (owner-only on the server) and refresh the feed.
 const deleteAttachment = useMutation({
