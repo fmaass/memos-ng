@@ -475,6 +475,28 @@ async def test_a_rendition_older_than_its_source_is_rebuilt(adb, monkeypatch, tm
     assert result.enqueued == (att.id,)
 
 
+async def test_a_future_stamped_rendition_cannot_mask_a_replaced_source(
+    adb, monkeypatch, tmp_path
+):
+    # The other direction of the stamp problem: capture time descends from the client-supplied
+    # upload last_modified, which nothing bounds — a broken client clock stamps the rendition
+    # YEARS ahead. If freshness trusted mtime, that rendition would read "fresh" forever and a
+    # replaced master would keep shipping the old crop into a printed book.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = await _persisted(adb, tmp_path, source=tmp_path / "f.png")
+    dest = printready.printready_path(att.uid)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"rendered")
+    stamp = time.time() + 5 * 365 * 24 * 3600
+    os.utime(dest, (stamp, stamp))
+    await asyncio.sleep(0.01)  # keep the two writes distinguishable in filesystem time
+    _png(tmp_path / "f.png")  # the source is replaced AFTER the rendition was generated
+
+    result = await printready.enqueue_printready(adb, [att.id])
+
+    assert result.enqueued == (att.id,)
+
+
 async def test_an_empty_rendition_file_is_not_mistaken_for_a_finished_one(
     adb, monkeypatch, tmp_path
 ):

@@ -76,20 +76,20 @@ def source_path(attachment: Attachment) -> Path | None:
 
 
 def _effective_mtime(st: os.stat_result) -> float:
-    """The most recent moment a file was written, replaced, or re-stamped.
+    """The moment the file itself last changed — st_ctime, deliberately not st_mtime.
 
-    Plain st_mtime cannot answer "is this rendition newer than its source" HERE, because
-    media._stamp_mtime deliberately rewrites a derived tier's mtime back to the photo's capture
-    time (2019, say) so exports and the frame carry the real date. Compared on mtime alone, every
-    freshly generated printready would read as older than the source it was just made from, and
-    the enqueue would re-encode the whole library on every call — the opposite of idempotent.
+    mtime is untrustworthy in BOTH directions here: media._stamp_mtime rewrites a derived tier's
+    mtime to the photo's capture time, and capture time descends from the client-supplied upload
+    last_modified, which nothing bounds — a future-dated stamp would make a rendition read as
+    "fresh" forever, silently shipping stale print bytes after its source is replaced.
 
-    st_ctime is the inode's change time, which the utime stamp itself bumps to NOW, so it records
-    the generation. Taking the max of the two is symmetric (it is applied to source and rendition
-    alike) and errs toward regenerating: a source restored from backup or re-copied gets a fresh
-    ctime and its rendition is rebuilt, which is the safe direction to be wrong in.
+    st_ctime is the inode's change time: every write, replace, and the utime stamp itself bump it
+    to NOW, and userland cannot set it. Comparing ctime on both sides therefore reads "rendition
+    generated after the source last changed", errs toward regenerating (a source restored from
+    backup or re-copied gets a fresh ctime and its rendition is rebuilt — the safe direction),
+    and is immune to whatever value the mtime was stamped with.
     """
-    return max(st.st_mtime, st.st_ctime)
+    return st.st_ctime
 
 
 @dataclass(frozen=True, slots=True)
