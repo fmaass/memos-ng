@@ -105,12 +105,17 @@ def test_a_panorama_is_bound_by_the_spread_width():
 
 def test_max_pages_is_a_cap_not_a_multiplier():
     """Raising max_pages does NOT stretch a photo that already fits: a 3:2 photo is height-bound
-    at 1.5 pages, so allowing 3 pages leaves its printed size — and its dpi — unchanged."""
+    at 1.5 pages, so allowing 3 pages leaves its printed size — and its dpi — unchanged.
+
+    Both sides are pinned to the plan's hand-computed anchor (3720 px over 31.5 cm) rather than to
+    each other: comparing one call against another would pass identically if the formula were
+    wrong in both.
+    """
+    anchor = 3720 * 2.54 / 31.5  # = 299.96..., the plan's 300 dpi target
     wider = photobook.geometry("21x21", 3.0, 300)
 
-    assert photobook.effective_dpi(3720, 2480, wider) == pytest.approx(
-        photobook.effective_dpi(3720, 2480, BOOK)
-    )
+    assert photobook.effective_dpi(3720, 2480, BOOK) == pytest.approx(anchor)
+    assert photobook.effective_dpi(3720, 2480, wider) == pytest.approx(anchor)
 
 
 def test_lowering_max_pages_really_does_shrink_the_print_and_raise_the_dpi():
@@ -298,6 +303,84 @@ def _rendition(tmp_path: Path, uid: str, size: tuple[int, int] = (400, 200)) -> 
     dest.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, (10, 120, 200)).save(dest, "JPEG", quality=92)
     return dest
+
+
+def _delete_jobs(att_id: int) -> None:
+    eng = _engine()
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM media_jobs WHERE attachment_id=:a"), {"a": att_id})
+    eng.dispose()
+
+
+def _job_updated_at(att_id: int) -> datetime:
+    """The latest printready job's `updated_at` — what the staleness rule compares against."""
+    eng = _engine()
+    with eng.begin() as c:
+        stamp = c.execute(
+            text(
+                "SELECT updated_at FROM media_jobs WHERE attachment_id=:a AND kind='printready'"
+                " ORDER BY id DESC LIMIT 1"
+            ),
+            {"a": att_id},
+        ).scalar_one()
+    eng.dispose()
+    return stamp
+
+
+def _bump_ctime_past_job(source: Path, att_id: int) -> None:
+    """Re-write `source` until its ctime strictly postdates the recorded failure.
+
+    Established by looping, not by statement order: ctime is not settable, inode times come off a
+    coarse clock (see _make_stale), and here a DATABASE clock is being compared against a
+    FILESYSTEM one. Raises rather than proceeding, so the test can never degrade into asserting
+    nothing.
+    """
+    failed_at = _job_updated_at(att_id).timestamp()
+    for _ in range(500):
+        source.write_bytes(os.urandom(2048))
+        if source.stat().st_ctime > failed_at:
+            return
+        time.sleep(0.005)
+    raise AssertionError("could not make the source newer than the recorded failure")
+
+
+def _fail_after_source(source: Path, att_id: int) -> None:
+    """Record a terminal failure whose timestamp is at or after the source's last change — the
+    precondition for "this failure still describes the file on disk". The mirror image of
+    _bump_ctime_past_job, established the same way and for the same two-clock reason."""
+    for _ in range(500):
+        _job(att_id, "failed")
+        if _job_updated_at(att_id).timestamp() >= source.stat().st_ctime:
+            return
+        _delete_jobs(att_id)
+        time.sleep(0.005)
+    raise AssertionError("could not record a failure at or after the source's change time")
+
+
+def _backdate_job_creation(att_id: int) -> None:
+    """Move the job's `created_at` an hour before its `updated_at`, leaving `updated_at` alone.
+
+    Recreates the ordinary case the two columns disagree about: a job enqueued long before it
+    finally failed. A raw UPDATE does not fire SQLAlchemy's `onupdate`, so `updated_at` keeps the
+    value it was recorded with.
+    """
+    eng = _engine()
+    with eng.begin() as c:
+        c.execute(
+            text(
+                "UPDATE media_jobs SET created_at = updated_at - interval '1 hour'"
+                " WHERE attachment_id = :a AND kind = 'printready'"
+            ),
+            {"a": att_id},
+        )
+    eng.dispose()
+
+
+def _real_jpeg(path: Path, size: tuple[int, int]) -> Path:
+    """A decodable JPEG of exactly `size`: the manifest reads real headers, so stubs will not do."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, (200, 60, 30)).save(path, "JPEG", quality=90)
+    return path
 
 
 def _make_stale(source: Path, rendition: Path) -> None:
@@ -562,6 +645,71 @@ def test_manifest_projects_dpi_for_a_photo_that_is_not_generated_yet(
     assert photo["meets_dpi"] is True  # 330 dpi clears the 300 the plan sizes the rung for
 
 
+def test_a_pending_projection_uses_the_print_master_that_will_actually_render(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """The projection must describe the file the worker will OPEN, not the attachment's original.
+
+    `printready.source_path` prefers the print master — the user's edited crop — and a master is
+    often far smaller than the original it came from. Here the original is 9504x6336 (which alone
+    would project to 4096x2731 and a comfortable ~330 dpi) while the master is 800x600, and the
+    rung never upscales, so 800x600 is what will be printed.
+
+    Geometry by hand: 800/600 = 4:3, so at 21x21 / 1.5 pages the photo is height-bound —
+    printed width = min(21 x 1.5, 21 x 4/3) = 28.0 cm — and dpi = 800 x 2.54 / 28.0 = 72.57.
+    Reporting the original's ~330 here would flip meets_dpi from false to TRUE, which is precisely
+    the direction that makes this field dangerous rather than merely wrong.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "edited crop #curated")
+    aid = _attach(
+        memo["uid"], "pb-master-1", subject,
+        storage_path=_source(tmp_path, "huge-original.jpg"), width=9504, height=6336,
+    )
+    _print_master(aid, _real_jpeg(tmp_path / "masters" / "crop.jpg", (800, 600)))
+    try:
+        body = _manifest(client)
+    finally:
+        _cleanup(aid)
+
+    photo = body["photos"][0]
+    assert photo["status"] == "pending"
+    assert photo["source"] == "print-master"
+    assert (photo["width"], photo["height"]) == (800, 600)  # NOT 4096x2731
+    assert photo["projected"] is True
+    assert photo["effective_dpi"] == pytest.approx(800 * 2.54 / 28.0, abs=0.05)
+    assert photo["meets_dpi"] is False  # ~73 dpi: the warning triangle this endpoint exists for
+
+
+def test_a_projection_reports_unknown_rather_than_the_wrong_photos_dimensions(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """When the master cannot be measured, the manifest says so — it does not fall back to the
+    original's dimensions, because a confident wrong dpi is worse than an absent one."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "unreadable crop #curated")
+    aid = _attach(
+        memo["uid"], "pb-master-2", subject,
+        storage_path=_source(tmp_path, "orig2.jpg"), width=9504, height=6336,
+    )
+    master = tmp_path / "masters" / "not-an-image.jpg"
+    master.parent.mkdir(parents=True, exist_ok=True)
+    master.write_bytes(b"this is not a JPEG")
+    _print_master(aid, master)
+    try:
+        body = _manifest(client)
+    finally:
+        _cleanup(aid)
+
+    photo = body["photos"][0]
+    assert (photo["width"], photo["height"]) == (None, None)
+    assert photo["projected"] is False
+    assert photo["effective_dpi"] is None
+    assert photo["meets_dpi"] is None
+
+
 def test_manifest_reports_an_unavailable_photo_when_the_source_is_gone(
     logged_in_client, tmp_path, monkeypatch
 ):
@@ -711,6 +859,81 @@ def test_a_terminally_failed_photo_is_reported_not_retried(logged_in_client, tmp
 
     assert body["photos"][0]["status"] == "failed"
     assert jobs == ["failed"]  # still just the one, after two requests
+
+
+def test_replacing_the_source_clears_a_terminal_failure(logged_in_client, tmp_path, monkeypatch):
+    """A terminal failure is scoped to the SOURCE it failed against, not to the photo.
+
+    The worker gave up on a file that would not decode; the user then replaced it with a good one.
+    The old verdict describes a file that no longer exists, so the photo must go back in the queue —
+    otherwise fixing the master could never fix the page.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "master replaced #curated")
+    source = _source(tmp_path, "replaced.jpg")
+    aid = _attach(memo["uid"], "pb-refail-1", subject, storage_path=source)
+    _job(aid, "failed")
+    _bump_ctime_past_job(source, aid)  # the master is replaced AFTER the failure was recorded
+    try:
+        body = _manifest(client)
+        jobs = _jobs_for(aid)
+    finally:
+        _cleanup(aid)
+
+    assert body["photos"][0]["status"] == "pending"
+    assert jobs == ["failed", "queued"]  # the stale verdict kept, a fresh attempt queued
+
+
+def test_an_unchanged_source_keeps_its_terminal_failure(logged_in_client, tmp_path, monkeypatch):
+    """The inverse pin: nothing changed on disk, so the failure still describes reality and the
+    no-auto-retry property holds — no new job, however often the manifest is polled."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "still broken #curated")
+    source = _source(tmp_path, "broken.jpg")
+    aid = _attach(memo["uid"], "pb-refail-2", subject, storage_path=source)
+    _fail_after_source(source, aid)
+    try:
+        body = _manifest(client)
+        body = _manifest(client)
+        jobs = _jobs_for(aid)
+    finally:
+        _cleanup(aid)
+
+    assert body["photos"][0]["status"] == "failed"
+    assert jobs == ["failed"]  # untouched after two polls
+
+
+def test_staleness_is_judged_against_when_the_job_FAILED_not_when_it_was_enqueued(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """Pins the column choice: `updated_at`, not `created_at`.
+
+    media_jobs has no completion column, so the failure time is `updated_at` — the write that set
+    `state = failed`. `created_at` is when the job was ENQUEUED, which for a job that sat in the
+    slow lane before failing can be hours earlier.
+
+    Here the job was enqueued an hour before it failed, and the source has not changed since the
+    FAILURE (only since the enqueue). The verdict must therefore stand. Judging by `created_at`
+    would call this failure stale and re-queue a 60 MP encode on every manifest poll — the exact
+    storm the no-auto-retry rule exists to prevent.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "long-queued failure #curated")
+    source = _source(tmp_path, "slow-lane.jpg")
+    aid = _attach(memo["uid"], "pb-refail-3", subject, storage_path=source)
+    _fail_after_source(source, aid)  # failed AFTER the source was written
+    _backdate_job_creation(aid)  # ...but enqueued an hour BEFORE it
+    try:
+        body = _manifest(client)
+        jobs = _jobs_for(aid)
+    finally:
+        _cleanup(aid)
+
+    assert body["photos"][0]["status"] == "failed"
+    assert jobs == ["failed"]  # no retry: the source predates the failure, not just the enqueue
 
 
 def test_a_failed_job_does_not_hide_a_rendition_that_is_actually_on_disk(

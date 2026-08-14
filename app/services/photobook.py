@@ -230,17 +230,27 @@ async def select_photos(
     ]
 
 
-async def terminally_failed(db: AsyncSession, attachment_ids: Sequence[int]) -> set[int]:
-    """Attachments whose LATEST print job failed for good.
+async def terminally_failed(db: AsyncSession, attachment_ids: Sequence[int]) -> dict[int, datetime]:
+    """Attachments whose LATEST print job failed for good, mapped to WHEN it failed.
 
     `JobState.failed` is only ever reached at MEDIA_MAX_ATTEMPTS (app/worker.py) — a transient
     failure goes back to `queued` and retries itself — so membership here means "tried to the
     attempt limit, still broken", never "hit a blip". Latest-job-wins so a later success or a
     running regeneration supersedes an old failure rather than condemning the photo forever.
+
+    The timestamp is `updated_at`, NOT `created_at`: media_jobs has no completion column, and
+    created_at is when the job was ENQUEUED — a job that sat queued for hours before failing would
+    carry a time long before the failure, and every source replaced in that window would look newer
+    than the failure and be retried forever. `updated_at` carries `onupdate=func.now()`, and the
+    write that sets `state = failed` is an ordinary ORM update, so it is the moment the failure was
+    recorded. It is a proxy for a completion time and errs EARLY by design (Postgres `now()` is the
+    transaction's start, not the statement's), which biases toward treating a failure as stale and
+    retrying — the safe direction, since a needless retry costs one encode while a stuck failure
+    costs the photo its page forever.
     """
     ids = list(attachment_ids)
     if not ids:
-        return set()
+        return {}
     latest = (
         select(
             MediaJob.attachment_id.label("attachment_id"),
@@ -251,11 +261,33 @@ async def terminally_failed(db: AsyncSession, attachment_ids: Sequence[int]) -> 
         .subquery()
     )
     rows = await db.execute(
-        select(MediaJob.attachment_id)
+        select(MediaJob.attachment_id, MediaJob.updated_at)
         .join(latest, MediaJob.id == latest.c.job_id)
         .where(MediaJob.state == JobState.failed)
     )
-    return set(rows.scalars())
+    return {attachment_id: failed_at for attachment_id, failed_at in rows}
+
+
+def failure_still_applies(probe: printready.SourceProbe, failed_at: datetime) -> bool:
+    """Does a recorded terminal failure still describe the file that is on disk NOW?
+
+    A terminal failure is scoped to the SOURCE it failed against, not to the photo. Replacing an
+    undecodable master with a good one has to clear the verdict, or the photo is condemned for the
+    life of the book and no amount of fixing the file brings it back.
+
+    So the failure survives only while the source is unchanged: if the source's ctime postdates the
+    failure, the worker never saw this file and the photo goes back in the queue like any other
+    missing rendition. When the source is unchanged the failure stands and nothing is enqueued —
+    that is the no-auto-retry property, and its rationale (three exhausted 60 MP encodes per
+    manifest poll on a thermally coupled host) is untouched by this.
+
+    Compares a filesystem clock against the database clock. Both are the same host in this
+    deployment, and the comparison errs toward retrying (see `terminally_failed`), so the worst
+    case of skew is one redundant encode rather than a permanently lost page.
+    """
+    if probe.source_changed_at is None:  # source gone — `unavailable` decides this, not us
+        return True
+    return probe.source_changed_at <= failed_at.timestamp()
 
 
 def _dims_sync(targets: list[tuple[int, Path]]) -> dict[int, tuple[int, int]]:
@@ -274,6 +306,43 @@ def _dims_sync(targets: list[tuple[int, Path]]) -> dict[int, tuple[int, int]]:
         except Exception:  # a truncated or half-written rendition must not fail the manifest
             continue
     return dims
+
+
+async def source_dimensions(
+    attachments: Sequence[Attachment], *, needed: set[int]
+) -> dict[int, tuple[int, int]]:
+    """The pixel size of the file each photo's print rendition will actually be MADE from.
+
+    Not the same thing as the attachment's own width/height. `printready.source_path` prefers the
+    print master when a photo has one — the user's own edited crop — and a master is frequently
+    SMALLER than the original it was cut from. Since the rung never upscales, projecting a 9504 px
+    original for a photo whose master is 800 px reports a comfortable 330 dpi for something the
+    worker will render at 800 px and ~73 dpi: the `meets_dpi` flag flips from false to true and the
+    one field this endpoint exists for lies in the dangerous direction.
+
+    A master's dimensions are not in the database — `attachment_renditions` stores filename, mime,
+    size, sha256 and path, but no width/height (app/models.py) — so they are read from the file's
+    header, batched into one off-loop hop. `Image.open` parses the header and stops, so this is a
+    few KB per master, not a decode.
+
+    Only `needed` attachments are looked at: a photo whose rendition already exists is measured
+    from the rendition itself and never needs a projection at all, which keeps this to the members
+    still waiting. An unreadable or missing master yields no entry, and the manifest then reports
+    unknown dimensions rather than substituting the original's — a wrong number here is worse than
+    no number.
+    """
+    masters: list[tuple[int, Path]] = []
+    originals: dict[int, tuple[int, int]] = {}
+    for attachment in attachments:
+        if attachment.id not in needed:
+            continue
+        rendition = printready.print_rendition(attachment)
+        if rendition is not None:
+            masters.append((attachment.id, Path(rendition.storage_path)))
+        elif attachment.width and attachment.height:
+            originals[attachment.id] = (attachment.width, attachment.height)
+    measured = await to_thread.run_sync(_dims_sync, masters) if masters else {}
+    return originals | measured
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,20 +405,24 @@ def _entry(
     status: Readiness,
     geom: Geometry,
     real: tuple[int, int] | None,
+    source_px: tuple[int, int] | None,
 ) -> PhotoEntry:
     """Assemble one manifest row, resolving the dimensions the dpi is computed from.
 
     Measured beats projected: once a rendition exists its real pixel size is read off the file, so
     the reported dpi is the one the printer will actually get. Before then the size is projected by
-    putting the source through the rung (`rung_px`) — which is the honest prediction, because that
+    putting `source_px` through the rung (`rung_px`) — which is the honest prediction, because that
     is literally the operation the worker is queued to perform — and flagged `projected` so nobody
     mistakes a forecast for a measurement.
+
+    `source_px` is the size of the file that will ACTUALLY be rendered, which is not always the
+    original's: see `source_dimensions`.
     """
     attachment = selected.attachment
     if real is not None:
         width, height, projected = real[0], real[1], False
     else:
-        px = rung_px(attachment.width, attachment.height)
+        px = rung_px(source_px[0], source_px[1]) if source_px else None
         width, height = (px[0], px[1]) if px else (None, None)
         projected = px is not None
     dpi = effective_dpi(width, height, geom)
@@ -388,12 +461,16 @@ async def build(
     already-running job, and an ineligible attachment each queue nothing — so re-requesting is free
     and re-requesting IS how progress is watched.
 
-    A member whose last job failed terminally is deliberately NOT re-queued. `failed` means the
-    attempt limit was exhausted on a source that does not decode, and a book is polled repeatedly
-    while it builds: an automatic retry would burn a fresh round of 60 MP encodes on a thermally
-    coupled shared host every time the manifest was fetched, which is exactly the storm the plan
-    budgets against. Such a photo is reported `failed` — the state exists precisely so that a
-    person, not a poll loop, decides to retry it.
+    A member whose last job failed terminally against THE SOURCE THAT IS STILL THERE is deliberately
+    NOT re-queued. `failed` means the attempt limit was exhausted on a file that does not decode,
+    and a book is polled repeatedly while it builds: an automatic retry would burn a fresh round of
+    60 MP encodes on a thermally coupled shared host every time the manifest was fetched, which is
+    exactly the storm the plan budgets against. Such a photo is reported `failed` — the state exists
+    precisely so that a person, not a poll loop, decides to retry it.
+
+    That verdict is scoped to the source, not to the photo: replace the bad master and the failure
+    no longer describes anything on disk, so the member is queued again like any other missing
+    rendition (`failure_still_applies`). Without that, fixing the file could never fix the page.
 
     Order of operations matters and is not arbitrary: the FILE is probed before the job history is
     consulted, so a photo that has a good rendition on disk reads `ready` even if some later job
@@ -411,13 +488,16 @@ async def build(
     to_enqueue: list[int] = []
     for attachment in attachments:
         probe = probes[attachment.id]
+        failed_at = failed.get(attachment.id)
         if not probe.source_present:
             status[attachment.id] = "unavailable"
         elif probe.current:
             status[attachment.id] = "ready"
-        elif attachment.id in failed:
+        elif failed_at is not None and failure_still_applies(probe, failed_at):
             status[attachment.id] = "failed"
         else:
+            # Either never attempted, or attempted against a source that has since been replaced —
+            # a stale verdict, so this goes back in the queue like any other missing rendition.
             to_enqueue.append(attachment.id)
 
     if to_enqueue:
@@ -443,6 +523,11 @@ async def build(
         if ready_ids
         else {}
     )
+    # Everything the manifest must PROJECT rather than measure — the members with no rendition on
+    # disk (and the odd ready one whose file would not parse).
+    source_px = await source_dimensions(
+        attachments, needed={a.id for a in attachments if a.id not in real}
+    )
 
     entries = tuple(
         _entry(
@@ -451,6 +536,7 @@ async def build(
             status=status[item.attachment.id],
             geom=geom,
             real=real.get(item.attachment.id),
+            source_px=source_px.get(item.attachment.id),
         )
         for index, item in enumerate(selected, start=1)
     )

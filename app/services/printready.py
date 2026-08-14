@@ -103,6 +103,11 @@ def _effective_mtime(st: os.stat_result) -> float:
 class SourceProbe:
     source_present: bool  # the file to derive from exists (nothing to do if it doesn't)
     current: bool  # a non-empty rendition exists and is at least as new as that source
+    # When the source file itself last changed (_effective_mtime, i.e. ctime), or None if it is
+    # gone. Carried out of the stat that already happens here so a caller never has to re-stat:
+    # the photo-book export compares it against the time a job failed, to tell a failure that
+    # still applies from one whose source has since been replaced.
+    source_changed_at: float | None = None
 
 
 def _probe_sync(pairs: list[tuple[int, Path, Path]]) -> dict[int, SourceProbe]:
@@ -118,17 +123,20 @@ def _probe_sync(pairs: list[tuple[int, Path, Path]]) -> dict[int, SourceProbe]:
         except OSError:  # the master is gone — a job could only fail
             probes[attachment_id] = SourceProbe(source_present=False, current=False)
             continue
+        source_changed_at = _effective_mtime(source_stat)
         try:
             dest_stat = dest.stat()
         except OSError:  # not generated yet
-            probes[attachment_id] = SourceProbe(source_present=True, current=False)
+            probes[attachment_id] = SourceProbe(
+                source_present=True, current=False, source_changed_at=source_changed_at
+            )
             continue
         probes[attachment_id] = SourceProbe(
             source_present=True,
             # Size guards the one case mtimes cannot see: a 0-byte file left by a crash between
             # create and write would otherwise count as a finished rendition forever.
-            current=dest_stat.st_size > 0
-            and _effective_mtime(dest_stat) >= _effective_mtime(source_stat),
+            current=dest_stat.st_size > 0 and _effective_mtime(dest_stat) >= source_changed_at,
+            source_changed_at=source_changed_at,
         )
     return probes
 
