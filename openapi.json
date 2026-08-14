@@ -1725,6 +1725,7 @@
     },
     "/api/export": {
       "get": {
+        "description": "Stream the matching memos as a zip: `<memo-uid>.md` per memo plus a manifest.\n\nWith `include_media`, each memo's attachments are carried alongside its text under\n`media/<memo-uid>/`, in the rendition the `tier` names (the same tier keys the asset routes\nserve). A rendition that isn't on disk is skipped and noted in the manifest.",
         "operationId": "export_memos_api_export_get",
         "parameters": [
           {
@@ -1826,6 +1827,34 @@
                 }
               ],
               "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_media",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Media",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tier",
+            "required": false,
+            "schema": {
+              "default": "original",
+              "enum": [
+                "original",
+                "thumb",
+                "mobile",
+                "web",
+                "poster",
+                "print"
+              ],
+              "title": "Tier",
+              "type": "string"
             }
           }
         ],
