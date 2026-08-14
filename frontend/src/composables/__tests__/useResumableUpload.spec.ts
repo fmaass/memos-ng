@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { nextTick, watchEffect } from 'vue'
 
 import { uploadFile, useUploadQueue } from '@/composables/useResumableUpload'
@@ -15,7 +15,34 @@ function fileOf(size: number, name = 'clip.mp4', type = 'video/mp4') {
   return new File([new Uint8Array(size)], name, { type })
 }
 
-afterEach(() => vi.unstubAllGlobals())
+// Preview object URLs: happy-dom's real createObjectURL returns an opaque uuid, so pin a
+// deterministic one per file — the release assertions match URL against URL.
+let objectUrl: { create: MockInstance; revoke: MockInstance }
+beforeEach(() => {
+  objectUrl = {
+    create: vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation((f) => `blob:mock/${(f as File).name}`),
+    revoke: vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {}),
+  }
+})
+
+// The queue's File map is closure-private; record the ids it deletes while `fn` runs. Scoped to the
+// call so unrelated Map usage elsewhere in the suite can't pollute the assertion.
+function spyMapDeletes(fn: () => void): unknown[] {
+  const spy = vi.spyOn(Map.prototype, 'delete')
+  try {
+    fn()
+    return spy.mock.calls.map((c) => c[0])
+  } finally {
+    spy.mockRestore()
+  }
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
 
 describe('uploadFile (finalize-on-post)', () => {
   it('creates, sends each chunk at the right offset, returns the upload_uid, and does NOT finalize', async () => {
@@ -127,5 +154,106 @@ describe('useUploadQueue', () => {
     expect(items).toHaveLength(2)
     remove(a.id)
     expect(items.map((i) => i.id)).toEqual([b.id]) // only the removed one is gone
+  })
+
+  it('remove() revokes the tile preview and drops its File reference', () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonRes({ upload_uid: 'x', chunk_size: 100, bytes_received: 0 })))
+    const { add, remove } = useUploadQueue()
+    const [a] = add([fileOf(3, 'a.png', 'image/png')])
+    const deleted = spyMapDeletes(() => remove(a.id))
+    expect(objectUrl.revoke).toHaveBeenCalledWith('blob:mock/a.png')
+    expect(deleted).toContain(a.id) // the File left the queue's map
+  })
+
+  // MEMNG-46: the views used to clear with `items.length = 0`, which never reached remove() — every
+  // queued preview URL and File reference leaked per cleared queue.
+  it('clear() revokes EVERY preview object URL and drops EVERY File reference', () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonRes({ upload_uid: 'x', chunk_size: 100, bytes_received: 0 })))
+    const { items, add, clear } = useUploadQueue()
+    const staged = add([
+      fileOf(3, 'a.png', 'image/png'),
+      fileOf(3, 'b.png', 'image/png'),
+      fileOf(3, 'c.png', 'image/png'),
+    ])
+    expect(items).toHaveLength(3)
+    expect(objectUrl.create).toHaveBeenCalledTimes(3) // three live object URLs exist
+
+    const deleted = spyMapDeletes(clear)
+
+    expect(items).toHaveLength(0) // queue emptied
+    expect(objectUrl.revoke.mock.calls.map((c) => c[0]).sort()).toEqual([
+      'blob:mock/a.png',
+      'blob:mock/b.png',
+      'blob:mock/c.png',
+    ])
+    for (const it of staged) expect(deleted).toContain(it.id) // every File reference dropped
+  })
+
+  it('clear() releases a not-yet-started file so it is never uploaded afterwards', async () => {
+    const started: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const method = init.method ?? 'GET'
+        if (url === '/api/uploads' && method === 'POST') {
+          started.push(JSON.parse(init.body as string).filename)
+          return jsonRes({ upload_uid: 'u', chunk_size: 100, bytes_received: 0 })
+        }
+        if (url === '/api/uploads/u' && method === 'PATCH') return jsonRes({ bytes_received: 3 })
+        throw new Error(`unexpected ${method} ${url}`)
+      }),
+    )
+    const { items, add, clear } = useUploadQueue(1) // concurrency 1 → the 2nd file waits in `pending`
+    const [first, later] = add([fileOf(3, 'first.png', 'image/png'), fileOf(3, 'later.png', 'image/png')])
+    expect(started).toEqual(['first.png']) // only the first one got a slot
+
+    clear()
+    expect(items).toHaveLength(0)
+    await vi.waitFor(() => expect(first.status).toBe('done')) // the in-flight one still finishes…
+    await new Promise((r) => setTimeout(r, 0)) // …and its completion re-pumps the queue
+
+    // Release also un-queues the waiting file: its File is gone from the map, so a pump() that
+    // still picked it up would dereference a released File. It must never be touched again.
+    expect(started).toEqual(['first.png'])
+    expect(later.status).toBe('queued') // never moved to 'uploading'/'error' by a stale pump
+  })
+
+  it('clear() has the SAME in-flight semantics as remove(): the upload keeps running, neither aborts', async () => {
+    // The uploader has no AbortController — dropping a tile only detaches it from the queue, so its
+    // upload_uid is never posted and the server-side Upload expires (finalize-on-post).
+    async function patchCallsAfterDrop(drop: (q: ReturnType<typeof useUploadQueue>, id: number) => void) {
+      let release!: () => void
+      const gate = new Promise<void>((r) => (release = r))
+      const offsets: number[] = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init: RequestInit = {}) => {
+          const method = init.method ?? 'GET'
+          if (url === '/api/uploads' && method === 'POST')
+            return jsonRes({ upload_uid: 'g', chunk_size: 4, bytes_received: 0 })
+          if (url === '/api/uploads/g' && method === 'PATCH') {
+            const off = Number((init.headers as Record<string, string>)['Upload-Offset'])
+            if (off === 0) await gate // hold the first chunk until the queue is dropped
+            offsets.push(off)
+            return jsonRes({ bytes_received: Math.min(off + 4, 12) })
+          }
+          throw new Error(`unexpected ${method} ${url}`)
+        }),
+      )
+      const queue = useUploadQueue()
+      const [item] = queue.add([fileOf(12, 'big.png', 'image/png')])
+      await vi.waitFor(() => expect(item.status).toBe('uploading'))
+
+      drop(queue, item.id) // dropped mid-upload
+      expect(queue.items).toHaveLength(0)
+      release()
+      await vi.waitFor(() => expect(offsets).toEqual([0, 4, 8]))
+      vi.unstubAllGlobals()
+      return offsets
+    }
+
+    const viaRemove = await patchCallsAfterDrop((q, id) => q.remove(id))
+    const viaClear = await patchCallsAfterDrop((q) => q.clear())
+    expect(viaClear).toEqual(viaRemove) // identical per-item behaviour: no abort in either path
   })
 })

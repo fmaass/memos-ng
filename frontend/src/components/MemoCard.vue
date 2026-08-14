@@ -58,7 +58,12 @@ const editVisibility = ref<Visibility>('PRIVATE')
 const editDate = ref<Date | null>(null)
 // New images added while editing — uploaded in the background, attached on Save (finalize-on-patch).
 // Removing an existing image is a delete (onDeleteAttachment), so it's immediate, not staged.
-const { items: editUploads, add: addEditUploads, remove: removeEditUpload } = useUploadQueue()
+const {
+  items: editUploads,
+  add: addEditUploads,
+  remove: removeEditUpload,
+  clear: clearEditUploads,
+} = useUploadQueue()
 const editFileInput = ref<HTMLInputElement | null>(null)
 const editUploading = computed(() =>
   editUploads.some((u) => u.status === 'queued' || u.status === 'uploading'),
@@ -70,7 +75,7 @@ function startEdit() {
   editContent.value = props.memo.content
   editVisibility.value = props.memo.visibility
   editDate.value = new Date(props.memo.created_at)
-  editUploads.length = 0
+  clearEditUploads() // NOT `editUploads.length = 0` — that strands preview object URLs + File refs
   editing.value = true
 }
 function saveEdit() {
@@ -83,7 +88,13 @@ function saveEdit() {
       .filter((u) => u.status === 'done' && u.uploadUid)
       .map((u) => u.uploadUid as string),
   })
-  editUploads.length = 0
+  clearEditUploads()
+  editing.value = false
+}
+// Cancel discards the staged uploads — they were never going to be attached (startEdit would drop
+// them on the next open anyway), so release them now instead of stranding their object URLs.
+function cancelEdit() {
+  clearEditUploads()
   editing.value = false
 }
 
@@ -352,7 +363,7 @@ function onContentClick(event: MouseEvent) {
           data-test="edit-visibility"
         />
         <div class="ml-auto flex gap-1">
-          <Button text size="small" label="Cancel" data-test="edit-cancel" @click="editing = false" />
+          <Button text size="small" label="Cancel" data-test="edit-cancel" @click="cancelEdit" />
           <Button
             size="small"
             :label="editUploading ? 'Uploading…' : 'Save'"

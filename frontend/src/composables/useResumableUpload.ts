@@ -154,16 +154,32 @@ export function useUploadQueue(concurrency = 2) {
     return created
   }
 
-  // Drop a tile from the queue. A still-uploading file keeps uploading server-side but, since it's
-  // no longer in the queue, its upload_uid won't be posted → it expires (finalize-on-post). Frees
-  // the object-URL preview.
+  // THE single release path for a queue member — every removal (one tile or the whole queue) goes
+  // through here, so an object URL can never leak. A still-uploading file keeps uploading
+  // server-side (pump() already handed uploadFile its own File reference) but, since it's no longer
+  // in the queue, its upload_uid won't be posted → it expires (finalize-on-post). A not-yet-started
+  // file is also dropped from `pending`: it no longer has an entry in `files`, so leaving it queued
+  // would make pump() dereference a File that was just released.
+  function release(it: UploadItem): void {
+    if (it.preview && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(it.preview)
+    files.delete(it.id)
+    const p = pending.findIndex((q) => q.id === it.id)
+    if (p >= 0) pending.splice(p, 1)
+  }
+
+  // Drop a tile from the queue.
   function remove(id: number): void {
     const i = items.findIndex((it) => it.id === id)
     if (i < 0) return
     const [it] = items.splice(i, 1)
-    if (it.preview && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(it.preview)
-    files.delete(id)
+    release(it)
   }
 
-  return { items, add, remove }
+  // Drop every tile (after a post/edit saves, or when an edit is re-opened). Views MUST call this
+  // instead of `items.length = 0`, which would strand every preview URL and File reference.
+  function clear(): void {
+    for (const it of items.splice(0, items.length)) release(it)
+  }
+
+  return { items, add, remove, clear }
 }
