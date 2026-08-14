@@ -51,7 +51,10 @@ def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
     return None
 
 
-def _tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
+def tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
+    """Resolve an attachment's file for a tier — public because the export builds its media
+    payloads from the same map (app/routers/export.py); a second copy would drift the moment a
+    rendition rung is added."""
     if tier == "original":
         return (Path(attachment.storage_path), attachment.mime) if attachment.storage_path else None
     if tier == "print":  # separately-uploaded print master (download-only); None if absent
@@ -330,7 +333,7 @@ async def serve_asset(
     async with async_session() as db:
         user = await auth.require_pat_or_user(request, db)
         att = await _viewable(db, user, uid)
-        resolved = _tier_path(att, tier)
+        resolved = tier_path(att, tier)
     if resolved is None:
         raise HTTPException(status_code=404, detail="Unknown tier")
     # immutable uid-keyed bytes, but private (one authed viewer) — never cached by a shared proxy.
@@ -348,7 +351,7 @@ def _all_asset_paths(att: Attachment) -> list[Path]:
     for rendition in att.renditions:  # hidden print masters (unique, unshared files)
         paths.append(Path(rendition.storage_path))
     for tier in ("thumb", "mobile", "web", "poster"):
-        resolved = _tier_path(att, tier)
+        resolved = tier_path(att, tier)
         if resolved is not None:
             p = resolved[0]
             paths.append(p)

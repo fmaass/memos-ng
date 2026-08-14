@@ -87,6 +87,11 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         ("app/services/media.py", "process_job", "process_video_poster"): 1,
         ("app/services/media.py", "_await_group_exit", "_group_alive"): 1,
         ("app/services/media.py", "_stop_transcode", "_group_alive"): 1,
+        # --- not filesystem calls at all: `ZipFile.open(...)` opens a zip ENTRY over the export's
+        # in-memory sink. The scanner matches on the attribute name (`open`), which it cannot
+        # distinguish from `Path.open`; the real files in that module are opened and read off-loop.
+        ("app/services/export.py", "_media_entry", "open"): 1,
+        ("app/services/export.py", "_manifest_entry", "open"): 1,
     }
 )
 

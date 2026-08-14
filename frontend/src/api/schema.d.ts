@@ -189,7 +189,14 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Export Memos */
+        /**
+         * Export Memos
+         * @description Stream the matching memos as a zip: `<memo-uid>.md` per memo plus a manifest.
+         *
+         *     With `include_media`, each memo's attachments are carried alongside its text under
+         *     `media/<memo-uid>/`, in the rendition the `tier` names (the same tier keys the asset routes
+         *     serve). A rendition that isn't on disk is skipped and noted in the manifest.
+         */
         get: operations["export_memos_api_export_get"];
         put?: never;
         post?: never;
@@ -1264,6 +1271,8 @@ export interface operations {
                 visibility?: components["schemas"]["Visibility"] | null;
                 owner?: string | null;
                 q?: string | null;
+                include_media?: boolean;
+                tier?: "original" | "thumb" | "mobile" | "web" | "poster" | "print";
             };
             header?: never;
             path?: never;
