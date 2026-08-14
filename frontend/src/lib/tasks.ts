@@ -15,6 +15,11 @@ export const TASK_CHECKBOX_CLASS = 'task-list-item-checkbox'
 // `[ ]`/`[x]` after a list marker is the checkbox. Replacing only the mark keeps the `> `
 // prefix, the indentation and the bullet/number style intact.
 const CHECKBOX_MARK_RE = /^([^[\n]*?(?:[-*+]|\d{1,9}[.)])[ \t]+\[)([ xX])(\])/
+// A list marker may sit on its OWN line, with the item's first content — the checkbox — indented
+// on the next one (`-\n  [ ] a` renders a checkbox on line 2). The enumerated line is renderer-
+// certified, so when no marker precedes the box on it, the box that OPENS the line's content is
+// the checkbox. Secondary on purpose: the pattern above is stricter about stray brackets.
+const CONTINUATION_MARK_RE = /^((?:[ \t]|>[ \t]?)*\[)([ xX])(\])/
 
 /**
  * Source line indices (0-based, into `content.split('\n')`) of the tasks the renderer turns into
@@ -56,7 +61,10 @@ export function toggleTask(content: string, index: number): string {
   const lines = content.split('\n')
   const line = lines[target]
   if (line === undefined) return content
-  lines[target] = line.replace(CHECKBOX_MARK_RE, (_m, pre: string, mark: string, post: string) => {
+  // If neither pattern matches an enumerated line the content is left alone — a silent no-op
+  // beats corrupting a line whose shape we did not recognise.
+  const pattern = CHECKBOX_MARK_RE.test(line) ? CHECKBOX_MARK_RE : CONTINUATION_MARK_RE
+  lines[target] = line.replace(pattern, (_m, pre: string, mark: string, post: string) => {
     const flipped = mark === ' ' ? 'x' : ' '
     return `${pre}${flipped}${post}`
   })

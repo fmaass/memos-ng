@@ -18,6 +18,9 @@ const MIXED = [
   '1. [ ] ordered', // 8 — checkbox 2
 ].join('\n')
 
+// The list marker sits on its own line; the checkbox lands on the item's first content line.
+const MARKER_ALONE = '-\n  [ ] first\n- [ ] second'
+
 describe('taskCheckboxLines', () => {
   it('skips fenced literals and counts blockquoted and ordered tasks', () => {
     expect(taskCheckboxLines(MIXED)).toEqual([4, 6, 8])
@@ -111,6 +114,30 @@ describe('toggleTask', () => {
   it('preserves CRLF line endings', () => {
     expect(toggleTask('- [ ] a\r\n- [ ] b', 1)).toBe('- [ ] a\r\n- [x] b')
   })
+
+  // A bullet on its own line puts the checkbox on the NEXT line, indented into the item — the
+  // renderer draws a checkbox there, so the toggle has to find it without a marker to anchor on.
+  it('toggles a checkbox whose list marker sits on the preceding line', () => {
+    expect(taskCheckboxLines(MARKER_ALONE)).toEqual([1, 2])
+    expect(toggleTask(MARKER_ALONE, 0)).toBe('-\n  [x] first\n- [ ] second')
+    expect(toggleTask(MARKER_ALONE, 1)).toBe('-\n  [ ] first\n- [x] second')
+  })
+
+  it('toggles a marker-alone checkbox through blockquote and ordered markers', () => {
+    expect(toggleTask('> -\n>   [ ] first', 0)).toBe('> -\n>   [x] first')
+    expect(toggleTask('> > -\n> >   [ ] first', 0)).toBe('> > -\n> >   [x] first')
+    expect(toggleTask('1.\n   [ ] first', 0)).toBe('1.\n   [x] first')
+    expect(toggleTask('-\n  [x] first', 0)).toBe('-\n  [ ] first')
+  })
+
+  it('leaves a would-be continuation the renderer does NOT draw as a checkbox alone', () => {
+    // 6-space indent under a bare marker is an indented code block, and an unindented `[ ]` line
+    // is a paragraph of its own — neither renders a checkbox, so neither is toggleable.
+    expect(taskCheckboxLines('-\n      [ ] first')).toEqual([])
+    expect(toggleTask('-\n      [ ] first', 0)).toBe('-\n      [ ] first')
+    expect(taskCheckboxLines('-\n[ ] first')).toEqual([])
+    expect(toggleTask('-\n[ ] first', 0)).toBe('-\n[ ] first')
+  })
 })
 
 // The bug this guards: MemoCard indexes the rendered `.task-list-item-checkbox` inputs, so the
@@ -141,6 +168,9 @@ const CORPUS: Record<string, string> = {
   tagOnlyInFence: '```\n#tag\n- [ ] fenced\n```\n#tag\n- [ ] real',
   mixed: MIXED,
   crlf: '- [ ] a\r\n- [x] b',
+  markerAlone: MARKER_ALONE,
+  markerAloneQuoted: '> -\n>   [x] quoted\n\n- [ ] plain',
+  markerAloneOrdered: '1.\n   [ ] first\n\n- [x] plain',
 }
 
 describe('rendered checkboxes and source enumeration agree', () => {
