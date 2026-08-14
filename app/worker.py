@@ -26,6 +26,7 @@ from app.models import (
     AttachmentStatus,
     FrameShareJob,
     FrameShareState,
+    JobKind,
     JobLane,
     JobState,
     MediaJob,
@@ -118,6 +119,16 @@ def sanitize_error(text: str, limit: int = ERROR_TEXT_LIMIT) -> str:
 
 
 async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
+    """Mark the photo failed when the work that PRODUCES it gives up — and only then.
+
+    Scoped to `derive` (MEMNG-49): a printready job derives an extra, on-demand tier for a photo
+    that is already published and displaying. Failing that job says nothing about the photo, and
+    marking it `failed` would blank a perfectly good picture out of the feed because a print
+    rendition nobody is looking at yet could not be encoded. The failure stays on the job row,
+    which is where the enqueue path reads it back from.
+    """
+    if job.kind != JobKind.derive:
+        return
     att = (
         await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
     ).scalar_one_or_none()
@@ -182,6 +193,7 @@ async def _record_job_failure(
     cannot land is a DB-wide problem and a fresh session next poll records the failure normally.
     """
     job_id = job.id  # a rollback expires the instance — keep the id for the log lines
+    job_kind = job.kind  # ...and the commit below expires it too (see run_once)
     error = sanitize_error(str(exc))
     try:
         job.attempts += 1
@@ -191,7 +203,8 @@ async def _record_job_failure(
             await _fail_attachment(db, job)
             logger.warning("media_job_failed_terminal", job_id=job_id, error=error)
             await db.commit()
-            await _notify_terminal_safe(attachment_id)  # separate session, after commit
+            if job_kind == JobKind.derive:  # see run_once for why the push is kind-scoped
+                await _notify_terminal_safe(attachment_id)  # separate session, after commit
             return "processed"
         job.state = JobState.queued  # retry with backoff
         job.claimed_by = None
@@ -225,6 +238,7 @@ async def run_once(db: AsyncSession) -> str:
         return "idle"
     attachment_id = job.attachment_id  # captured before commit expires the job instance
     job_id = job.id  # likewise — and the progress side channel is keyed on it
+    job_kind = job.kind  # likewise; decides whether this job's outcome is the PHOTO's outcome
     # Cleanup BEFORE reclaim (MEMNG-36). A worker killed mid-transcode clears nothing, and its
     # rolled-back claim puts the job back to `queued` still carrying the dead attempt's progress
     # row — which the snapshot would keep reporting until this attempt happened to overtake it,
@@ -237,7 +251,11 @@ async def run_once(db: AsyncSession) -> str:
         job.state = JobState.done
         job.progress_pct = 100
         await db.commit()
-        await _notify_terminal_safe(attachment_id)  # separate session, after the job is durable
+        if job_kind == JobKind.derive:
+            # Only the pipeline that PRODUCES the photo announces it. A printready job leaves the
+            # attachment exactly as it found it (already `ready`), so pushing here would send the
+            # owner a second "your photo is ready" per photo — a few hundred of them per book.
+            await _notify_terminal_safe(attachment_id)  # separate session, after job is durable
         return "processed"
     except media.ThermalDefer:
         job.state = JobState.queued  # too hot — try again later, not a failure
