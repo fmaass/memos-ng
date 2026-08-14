@@ -28,7 +28,19 @@ describe('CaptureEditor', () => {
   afterEach(() => {
     vi.clearAllMocks()
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
   })
+
+  // Queue a real image so the composable mints a preview object URL; fetch is offline, so the
+  // upload errors out but the tile (and its object URL + File ref) stay in the queue.
+  async function queueImage(wrapper: ReturnType<typeof mountEditor>, name = 'pic.png') {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    const input = wrapper.find('[data-test="file-input"]')
+    const file = new File([new Uint8Array(3)], name, { type: 'image/png' })
+    Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
+    await input.trigger('change')
+    await nextTick()
+  }
 
   it('posts the memo content + visibility on save, emits saved, and clears the input', async () => {
     const wrapper = mountEditor()
@@ -70,14 +82,25 @@ describe('CaptureEditor', () => {
   })
 
   it('enqueues dropped/selected files for upload', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
     const wrapper = mountEditor()
-    const input = wrapper.find('[data-test="file-input"]')
-    const file = new File([new Uint8Array(3)], 'pic.png', { type: 'image/png' })
-    Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
-    await input.trigger('change')
-    await nextTick()
+    await queueImage(wrapper)
     expect(wrapper.find('[data-test="uploads"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="uploads"] [title="pic.png"]').exists()).toBe(true)
+  })
+
+  // MEMNG-46 wiring pin: save() must release the queue through the composable, not `uploads.length = 0`
+  // (which empties the array without ever revoking the preview URLs).
+  it('releases the upload queue on save — every preview object URL is revoked', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock/pic.png')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const wrapper = mountEditor()
+    await queueImage(wrapper)
+    await wrapper.find('[data-test="content"]').setValue('with a photo')
+
+    await wrapper.find('[data-test="save"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="uploads"]').exists()).toBe(false) // queue emptied
+    expect(revoke).toHaveBeenCalledWith('blob:mock/pic.png') // …and actually released
   })
 })

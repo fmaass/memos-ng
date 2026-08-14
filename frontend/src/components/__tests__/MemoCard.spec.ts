@@ -90,6 +90,7 @@ function stubResizeObserver(width: number) {
 describe('MemoCard', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
   })
 
   it('renders markdown content and tag chips', () => {
@@ -278,6 +279,49 @@ describe('MemoCard', () => {
     expect(payload.content).toBe('edited text')
     expect(payload.upload_uids).toEqual([]) // no new uploads staged this edit
     wrapper.unmount()
+  })
+
+  // MEMNG-46 wiring pins: both edit-mode queue clears must go through the composable's release path
+  // — `editUploads.length = 0` empties the array without ever revoking the preview object URLs.
+  describe('edit-upload queue release', () => {
+    async function openEditWithStagedImage(wrapper: ReturnType<typeof mountCard>) {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+      const editItem = await openAction(wrapper, 'memo-action-edit')
+      editItem.click()
+      await nextTick()
+      const input = wrapper.find('[data-test="edit-file-input"]')
+      const file = new File([new Uint8Array(3)], 'new.png', { type: 'image/png' })
+      Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
+      await input.trigger('change')
+      await nextTick()
+    }
+
+    it('revokes staged preview object URLs when the edit is saved', async () => {
+      vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock/new.png')
+      const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+      const wrapper = mountCard({ memo: memo('with staged image') })
+      await openEditWithStagedImage(wrapper)
+
+      await wrapper.find('[data-test="edit-save"]').trigger('click')
+      await nextTick()
+
+      expect(revoke).toHaveBeenCalledWith('blob:mock/new.png')
+      wrapper.unmount()
+    })
+
+    it('revokes staged preview object URLs when the edit is cancelled', async () => {
+      vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock/new.png')
+      const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+      const wrapper = mountCard({ memo: memo('with staged image') })
+      await openEditWithStagedImage(wrapper)
+
+      await wrapper.find('[data-test="edit-cancel"]').trigger('click')
+      await nextTick()
+
+      expect(wrapper.find('[data-test="memo-editor"]').exists()).toBe(false) // edit closed
+      expect(revoke).toHaveBeenCalledWith('blob:mock/new.png') // …and the queue released
+      wrapper.unmount()
+    })
   })
 
   it('edit mode shows a remove button for each existing image', async () => {

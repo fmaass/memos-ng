@@ -14,7 +14,12 @@ import { applyMarkdown, type MarkdownAction } from '@/lib/markdownToolbar'
 const emit = defineEmits<{ saved: [memo: unknown] }>()
 
 const api = useApi()
-const { items: uploads, add: addUploads, remove: removeUpload } = useUploadQueue()
+const {
+  items: uploads,
+  add: addUploads,
+  remove: removeUpload,
+  clear: clearUploads,
+} = useUploadQueue()
 const { settings } = useSettings()
 
 const content = ref('')
@@ -148,7 +153,7 @@ async function save() {
     content.value = ''
     memoDate.value = null
     showDate.value = false
-    uploads.length = 0
+    clearUploads() // NOT `uploads.length = 0` — that strands the preview object URLs and File refs
     nextTick(autosize)
   } finally {
     saving.value = false
