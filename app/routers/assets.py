@@ -232,10 +232,14 @@ async def list_attachments(
     return [_list_item(a, user.id) for a in rows]
 
 
+# PAT-or-session like the original-tier download below (not a docstring: FastAPI would publish it
+# as the operation's OpenAPI description). A headless client that may already fetch an attachment's
+# BYTES with its token can read that attachment's metadata too — strictly less sensitive than what
+# it can already download, and `_viewable` applies the identical visibility rules to either caller.
 @router.get("/attachments/{uid}", response_model=AttachmentMeta)
 async def attachment_meta(
     uid: str,
-    user: Annotated[User, Depends(auth.require_user)],
+    user: Annotated[User, Depends(auth.require_pat_or_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentMeta:
     att = await _viewable(db, user, uid)
