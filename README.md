@@ -187,6 +187,24 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.3.3
+
+Frontend correctness patch (2026-08-14).
+
+**Fixed**
+- Clicking a rendered task checkbox toggles the correct source line: the enumeration is
+  now the renderer's own parse, so blockquoted tasks count, fenced literals don't, and
+  ordered-list tasks and marker-on-previous-line boxes toggle correctly.
+- A failed print upload from the memo feed shows an error toast; both print-upload call
+  sites share one mutation with unified feedback.
+- Clearing the upload queue releases every preview object URL and File reference - on
+  save, on re-edit, and on the edit Cancel button - instead of leaking them for the
+  page's lifetime.
+- Videos tile at their probed aspect ratio now that dimensions respect rotation; the
+  neutral fallback box remains only for videos with no usable dimensions.
+- The responsive sizes attribute accounts for the sidebar between 768 and 912px, so the
+  browser stops fetching images up to 240px wider than the layout can render.
+
 ### v1.3.2
 
 Media reliability patch (2026-08-13).
