@@ -72,12 +72,20 @@ class MediaFile:
 
 @dataclass(frozen=True, slots=True)
 class ExportItem:
-    """One memo: its text entry, the manifest record describing it, and its media payloads."""
+    """One archive item: an optional text entry, the manifest record describing it, and its media
+    payloads.
 
-    arcname: str
-    text: str
+    `arcname`+`text` are a pair and both optional, because not every archive is a memo export: the
+    photo-book export (app/services/photobook.py) carries pure media — a folder of numbered JPEGs
+    that a layout program imports in order — and a stray `.md` beside each one would be imported
+    too. Leaving them unset writes no text entry; the item still contributes its manifest record
+    and its payloads. A memo export always sets both.
+    """
+
     mtime: datetime
     manifest: dict[str, Any]
+    arcname: str | None = None
+    text: str | None = None
     media: Sequence[MediaFile] = ()
 
 
@@ -210,8 +218,8 @@ async def _manifest_entry(
 
 
 async def stream_zip(items: AsyncIterator[ExportItem]) -> AsyncIterator[bytes]:
-    """Yield the export archive as its rows arrive: `<memo-uid>.md` per memo, each requested
-    media payload beside it, and the manifest last.
+    """Yield the export archive as its rows arrive: each item's text entry (when it has one — see
+    ExportItem), its media payloads beside it, and the manifest last.
 
     A media file that is missing on disk is SKIPPED and noted in the manifest rather than
     failing the export. Two reasons, both decisive: derived tiers are produced asynchronously,
@@ -226,11 +234,14 @@ async def stream_zip(items: AsyncIterator[ExportItem]) -> AsyncIterator[bytes]:
     manifest = _ManifestSpool()
     try:
         async for item in items:
-            info = zipfile.ZipInfo(item.arcname, date_time=_zip_date_time(item.mtime.timetuple()))
-            info.compress_type = zipfile.ZIP_DEFLATED  # memo text, unlike media, compresses
-            zf.writestr(info, item.text)
-            for chunk in sink.drain():
-                yield chunk
+            if item.arcname is not None and item.text is not None:  # media-only items have neither
+                info = zipfile.ZipInfo(
+                    item.arcname, date_time=_zip_date_time(item.mtime.timetuple())
+                )
+                info.compress_type = zipfile.ZIP_DEFLATED  # memo text, unlike media, compresses
+                zf.writestr(info, item.text)
+                for chunk in sink.drain():
+                    yield chunk
             record = dict(item.manifest)
             media: list[dict[str, Any]] = []
             for entry in item.media:

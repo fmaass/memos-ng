@@ -36,6 +36,13 @@ TIER = "printready"
 SUBDIR = "printready"  # assets/<SUBDIR>/<uid>.jpg, the layout thumb/mobile use
 IMAGE_PREFIX = "image/"
 
+# The rung: 4096 px on the long edge, never upscaled. It lives here rather than beside the encoder
+# in app/services/media.py because it is tier IDENTITY, not an encoder setting — the photo-book
+# manifest runs in the APP process (which must not import an image library to learn how big a
+# rendition will be) and projects a not-yet-generated size from it. media.py re-exports it as
+# PRINTREADY_MAX, so there is exactly one definition.
+MAX_EDGE = 4096
+
 
 def printready_path(uid: str) -> Path:
     """Where this attachment's print rendition lives. Resolves from the uid alone, like every
@@ -124,6 +131,29 @@ def _probe_sync(pairs: list[tuple[int, Path, Path]]) -> dict[int, SourceProbe]:
             and _effective_mtime(dest_stat) >= _effective_mtime(source_stat),
         )
     return probes
+
+
+async def probe_renditions(attachments: Iterable[Attachment]) -> dict[int, SourceProbe]:
+    """Each attachment's print-rendition freshness, in ONE batched off-loop stat pass.
+
+    Exactly the two facts `enqueue_printready` decides on, exposed as a READ-ONLY query. The
+    photo-book manifest needs them for members it deliberately does not enqueue (one whose last
+    job failed terminally is reported, not retried), and deriving the freshness rule a second time
+    there is how the two would drift — so both callers go through `_probe_sync`.
+
+    A non-image, or an attachment with no source file recorded at all, comes back
+    `source_present=False`: there is nothing to derive from, so there is nothing to wait for.
+    """
+    absent: dict[int, SourceProbe] = {}
+    pairs: list[tuple[int, Path, Path]] = []
+    for attachment in attachments:
+        source = source_path(attachment) if attachment.mime.startswith(IMAGE_PREFIX) else None
+        if source is None:
+            absent[attachment.id] = SourceProbe(source_present=False, current=False)
+            continue
+        pairs.append((attachment.id, source, printready_path(attachment.uid)))
+    probes = await to_thread.run_sync(_probe_sync, pairs) if pairs else {}
+    return absent | probes
 
 
 @dataclass(frozen=True, slots=True)

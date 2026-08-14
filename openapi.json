@@ -885,6 +885,194 @@
         "title": "PatOut",
         "type": "object"
       },
+      "PhotobookManifestOut": {
+        "description": "The book's manifest: the question that was asked, the tally, and every photo in it.",
+        "properties": {
+          "dpi": {
+            "title": "Dpi",
+            "type": "integer"
+          },
+          "max_pages": {
+            "title": "Max Pages",
+            "type": "number"
+          },
+          "page_cm": {
+            "title": "Page Cm",
+            "type": "string"
+          },
+          "photos": {
+            "items": {
+              "$ref": "#/components/schemas/PhotobookPhotoOut"
+            },
+            "title": "Photos",
+            "type": "array"
+          },
+          "profile": {
+            "const": "print-4096",
+            "title": "Profile",
+            "type": "string"
+          },
+          "tag": {
+            "title": "Tag",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/PhotobookTotalsOut"
+          }
+        },
+        "required": [
+          "profile",
+          "tag",
+          "page_cm",
+          "max_pages",
+          "dpi",
+          "totals",
+          "photos"
+        ],
+        "title": "PhotobookManifestOut",
+        "type": "object"
+      },
+      "PhotobookPhotoOut": {
+        "description": "One photo's page in the book. `width`/`height` are the print rendition's real pixels once it\nexists and a projection from the source until then \u2014 `projected` says which.",
+        "properties": {
+          "attachment": {
+            "title": "Attachment",
+            "type": "string"
+          },
+          "effective_dpi": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Dpi"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "meets_dpi": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Meets Dpi"
+          },
+          "memo": {
+            "title": "Memo",
+            "type": "string"
+          },
+          "memo_date": {
+            "format": "date",
+            "title": "Memo Date",
+            "type": "string"
+          },
+          "projected": {
+            "title": "Projected",
+            "type": "boolean"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "print-master",
+              "original"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "pending",
+              "failed",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          }
+        },
+        "required": [
+          "sequence",
+          "attachment",
+          "memo",
+          "memo_date",
+          "filename",
+          "source",
+          "status",
+          "width",
+          "height",
+          "projected",
+          "effective_dpi",
+          "meets_dpi"
+        ],
+        "title": "PhotobookPhotoOut",
+        "type": "object"
+      },
+      "PhotobookTotalsOut": {
+        "properties": {
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "pending": {
+            "title": "Pending",
+            "type": "integer"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "integer"
+          },
+          "selected": {
+            "title": "Selected",
+            "type": "integer"
+          },
+          "unavailable": {
+            "title": "Unavailable",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "selected",
+          "ready",
+          "pending",
+          "failed",
+          "unavailable"
+        ],
+        "title": "PhotobookTotalsOut",
+        "type": "object"
+      },
       "PushKeys": {
         "properties": {
           "auth": {
@@ -1879,6 +2067,139 @@
           }
         },
         "summary": "Export Memos",
+        "tags": [
+          "export"
+        ]
+      }
+    },
+    "/api/exports/photobook": {
+      "get": {
+        "description": "The photo book for a tag and date range: a print-readiness manifest, or the archive itself.\n\nSelection is `tag` (default `curated`) joined to the owner's image attachments, in memo-date\norder; `from`/`to` bound the memo date and are inclusive whole days. `profile` names the single\nrung the book is printed at.\n\n**Requesting a book schedules it.** Both formats enqueue a print rendition for every member\nthat lacks a current one, so the first request starts the work and later requests report on it;\nthe enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).\n\n`format=manifest` (the default) answers with one record per photo \u2014 the name it will carry in\nthe archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,\nand the **effective dpi** it will print at for the given `page_cm`/`max_pages` geometry, judged\nagainst `dpi`. That is the field worth having: it names the photos a layout program will flag,\nbefore the import rather than after it. Re-fetching it is also how progress is followed.\n\n`format=zip` streams the ready renditions as `0001_<date>_<uid>.jpg`, numbered in book order so\na folder import lands in sequence. Photos that are not ready yet are left out and recorded in\nthe archive's manifest.json, exactly as the generic export treats a rendition that is missing.",
+        "operationId": "export_photobook_api_exports_photobook_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "default": "curated",
+              "title": "Tag",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "const": "print-4096",
+              "default": "print-4096",
+              "title": "Profile",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "manifest",
+              "enum": [
+                "manifest",
+                "zip"
+              ],
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_cm",
+            "required": false,
+            "schema": {
+              "default": "21x21",
+              "title": "Page Cm",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_pages",
+            "required": false,
+            "schema": {
+              "default": 1.5,
+              "title": "Max Pages",
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dpi",
+            "required": false,
+            "schema": {
+              "default": 300,
+              "title": "Dpi",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PhotobookManifestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Photobook",
         "tags": [
           "export"
         ]

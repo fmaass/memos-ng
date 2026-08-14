@@ -43,7 +43,10 @@ MOBILE_MAX = 2048
 #   4:4:4    — chroma subsampling artefacts are visible in print, and the saving is ~28% of ~1 GB;
 #   300 dpi  — nothing else in this codebase writes a DPI, so layout software assumes 72 and
 #              mis-scales the photo on placement. This is the tag that makes the tier usable.
-PRINTREADY_MAX = 4096
+# Re-exported, not redefined: the rung is tier identity and lives in app/services/printready.py,
+# which the app process can import without pulling in Pillow (the photo-book manifest projects a
+# rendition's size from it). Two literals here and there would be two rungs the day one changes.
+PRINTREADY_MAX = printready.MAX_EDGE
 PRINTREADY_QUALITY = 92
 PRINTREADY_SUBSAMPLING = 0  # 4:4:4 — keep full chroma resolution
 PRINTREADY_DPI = (300, 300)

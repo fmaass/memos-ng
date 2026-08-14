@@ -206,6 +206,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/exports/photobook": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export Photobook
+         * @description The photo book for a tag and date range: a print-readiness manifest, or the archive itself.
+         *
+         *     Selection is `tag` (default `curated`) joined to the owner's image attachments, in memo-date
+         *     order; `from`/`to` bound the memo date and are inclusive whole days. `profile` names the single
+         *     rung the book is printed at.
+         *
+         *     **Requesting a book schedules it.** Both formats enqueue a print rendition for every member
+         *     that lacks a current one, so the first request starts the work and later requests report on it;
+         *     the enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).
+         *
+         *     `format=manifest` (the default) answers with one record per photo — the name it will carry in
+         *     the archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,
+         *     and the **effective dpi** it will print at for the given `page_cm`/`max_pages` geometry, judged
+         *     against `dpi`. That is the field worth having: it names the photos a layout program will flag,
+         *     before the import rather than after it. Re-fetching it is also how progress is followed.
+         *
+         *     `format=zip` streams the ready renditions as `0001_<date>_<uid>.jpg`, numbered in book order so
+         *     a folder import lands in sequence. Photos that are not ready yet are left out and recorded in
+         *     the archive's manifest.json, exactly as the generic export treats a rendition that is missing.
+         */
+        get: operations["export_photobook_api_exports_photobook_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/memos": {
         parameters: {
             query?: never;
@@ -847,6 +885,81 @@ export interface components {
             /** Name */
             name: string;
         };
+        /**
+         * PhotobookManifestOut
+         * @description The book's manifest: the question that was asked, the tally, and every photo in it.
+         */
+        PhotobookManifestOut: {
+            /** Dpi */
+            dpi: number;
+            /** Max Pages */
+            max_pages: number;
+            /** Page Cm */
+            page_cm: string;
+            /** Photos */
+            photos: components["schemas"]["PhotobookPhotoOut"][];
+            /**
+             * Profile
+             * @constant
+             */
+            profile: "print-4096";
+            /** Tag */
+            tag: string;
+            totals: components["schemas"]["PhotobookTotalsOut"];
+        };
+        /**
+         * PhotobookPhotoOut
+         * @description One photo's page in the book. `width`/`height` are the print rendition's real pixels once it
+         *     exists and a projection from the source until then — `projected` says which.
+         */
+        PhotobookPhotoOut: {
+            /** Attachment */
+            attachment: string;
+            /** Effective Dpi */
+            effective_dpi: number | null;
+            /** Filename */
+            filename: string;
+            /** Height */
+            height: number | null;
+            /** Meets Dpi */
+            meets_dpi: boolean | null;
+            /** Memo */
+            memo: string;
+            /**
+             * Memo Date
+             * Format: date
+             */
+            memo_date: string;
+            /** Projected */
+            projected: boolean;
+            /** Sequence */
+            sequence: number;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "print-master" | "original";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "pending" | "failed" | "unavailable";
+            /** Width */
+            width: number | null;
+        };
+        /** PhotobookTotalsOut */
+        PhotobookTotalsOut: {
+            /** Failed */
+            failed: number;
+            /** Pending */
+            pending: number;
+            /** Ready */
+            ready: number;
+            /** Selected */
+            selected: number;
+            /** Unavailable */
+            unavailable: number;
+        };
         /** PushKeys */
         PushKeys: {
             /** Auth */
@@ -1287,6 +1400,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_photobook_api_exports_photobook_get: {
+        parameters: {
+            query?: {
+                from?: string | null;
+                to?: string | null;
+                tag?: string;
+                profile?: "print-4096";
+                format?: "manifest" | "zip";
+                page_cm?: string;
+                max_pages?: number;
+                dpi?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PhotobookManifestOut"];
                 };
             };
             /** @description Validation Error */
