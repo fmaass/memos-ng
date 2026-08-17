@@ -134,17 +134,30 @@ async def attachment_still_exists(db: AsyncSession, attachment_id: int) -> bool:
     ).scalar_one_or_none() is not None
 
 
-async def guard_publish(db: AsyncSession, attachment: Attachment) -> None:
+async def guard_publish(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
     """Checkpoint a job must pass before writing its result. Raises AttachmentGone (after sweeping
     the files this run produced) when the attachment was deleted mid-job — which also keeps the
     job from flushing an UPDATE against a row that no longer exists (0 rows → StaleDataError,
-    a spurious 'failure' for work nobody wants any more)."""
-    if await attachment_still_exists(db, attachment.id):
+    a spurious 'failure' for work nobody wants any more).
+
+    Locks THIS job's media_jobs row BEFORE the attachment row (attachment_still_exists), matching
+    the order delete_attachment takes — jobs first (its SKIP-LOCKED cleanup), then the attachment.
+    Since MEMNG-90 commits the claim before processing, this job no longer holds the media_jobs lock
+    across the transcode, so without a consistent order the worker (attachment→job at its result
+    commit) and a concurrent delete (job→attachment) would deadlock. A job row that has already
+    vanished means delete_attachment removed it — it won the race — so treat it exactly like a
+    deleted attachment: sweep this run's output and discard."""
+    locked = (
+        await db.execute(select(MediaJob).where(MediaJob.id == job.id).with_for_update())
+    ).scalar_one_or_none()
+    if locked is not None and await attachment_still_exists(db, attachment.id):
         return
-    # blocking-ok: worker-only, and it runs while this job holds the attachment row lock — the
+    # blocking-ok: worker-only, and it runs while this job holds the attachment/job row lock — the
     # sweep must finish before the caller can publish anything, so it is not a yield point.
     discard_outputs(attachment.uid)
-    raise AttachmentGone(f"attachment {attachment.id} was deleted while its job was running")
+    raise AttachmentGone(
+        f"attachment {attachment.id} (job {job.id}) was deleted while its job was running"
+    )
 
 
 def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: Any) -> None:
@@ -829,7 +842,7 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     # The delete endpoint does not wait for this job, so the attachment may have gone away during
     # the transcode. Check under the row lock BEFORE publishing: past this point the tmp file
     # becomes the served web tier, and republishing it after a delete would resurrect it.
-    await guard_publish(db, attachment)  # sweeps tmp + any tier files when the delete won
+    await guard_publish(db, job, attachment)  # sweeps tmp + any tier files when the delete won
     # blocking-ok: the publish must follow guard_publish's row-lock check with no yield point in
     # between — an await here would hand the loop back between "the attachment still exists" and
     # the rename that resurrects its file. Worker-only either way.
@@ -840,7 +853,7 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     await db.flush()
 
 
-async def process_printready_job(db: AsyncSession, attachment: Attachment) -> None:
+async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
     """Run one on-demand print rendition (MEMNG-49) — the second kind of slow-lane image work.
 
     Slow lane and thermally deferred like the transcode, for the same reason: a 40-60 MP decode +
@@ -865,7 +878,7 @@ async def process_printready_job(db: AsyncSession, attachment: Attachment) -> No
     process_printready(attachment)
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
-    await guard_publish(db, attachment)
+    await guard_publish(db, job, attachment)
 
 
 async def process_job(db: AsyncSession, job: MediaJob) -> None:
@@ -876,14 +889,21 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     ).scalar_one_or_none()
     if attachment is None:
         # Deleted before this job got its turn: delete_attachment removes every job row it can
-        # lock, but not one a worker already holds — and a claim that rolls back (restart, failed
-        # outcome write) returns that row to `queued` for a later poll (MEMNG-41).
+        # lock. A `processing` claim it could not remove is recovered by recover_stale_media_claims;
+        # a job discarded here on finding the attachment gone is worker.run_once's AttachmentGone
+        # path (MEMNG-41).
         raise AttachmentGone(f"attachment {job.attachment_id} no longer exists")
+
+    # Release the read transaction BEFORE the (up to SLOW_TRANSCODE_TIMEOUT_S) derivation below, so
+    # no DB session sits idle-in-transaction across the transcode — the kill that wedged the queue
+    # (MEMNG-90). The claim is already durable (run_once committed `processing`); the result is
+    # written in a fresh transaction that guard_publish re-locks (job row, then attachment row).
+    await db.commit()
 
     # Dispatched on KIND first: a printready job is slow-lane image work, so the lane+mime rules
     # below would otherwise route it into the HEIC branch and re-derive the photo's own tiers.
     if job.kind == JobKind.printready:
-        await process_printready_job(db, attachment)
+        await process_printready_job(db, job, attachment)
         return
 
     if job.lane is JobLane.slow:
@@ -895,7 +915,7 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
             # blocking-ok: this IS the worker's job — a CPU-bound decode that would still occupy
             # the process in a thread. Nothing else is queued on this loop to yield to.
             meta = process_image(attachment)
-            await guard_publish(db, attachment)
+            await guard_publish(db, job, attachment)
             attachment.width = meta.get("width")
             attachment.height = meta.get("height")
             attachment.blurhash = meta.get("blurhash")
@@ -908,7 +928,7 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     # the slow-lane branch above — CPU-bound, worker-only, nothing concurrent to starve.
     meta = process_video_poster(attachment) if is_video else process_image(attachment)
 
-    await guard_publish(db, attachment)
+    await guard_publish(db, job, attachment)
     attachment.width = meta.get("width")
     attachment.height = meta.get("height")
     attachment.duration = meta.get("duration")

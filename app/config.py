@@ -79,6 +79,22 @@ class Settings(BaseSettings):
     # hours-not-days: a genuinely stuck job burns up to MEDIA_MAX_ATTEMPTS x this before it goes
     # terminal. Raise it (env) if a legitimately long import starts timing out.
     SLOW_TRANSCODE_TIMEOUT_S: int = 3600
+    # Stale-claim horizon for media_jobs (MEMNG-90). run_once commits the claim (`state=processing`)
+    # before the transcode so no DB transaction is held across it; the price is that a worker that
+    # dies mid-job leaves a durable `processing` row that claim_one (queued-only) never re-claims.
+    # recover_stale_media_claims re-queues a `processing` row whose updated_at is older than this.
+    # INVARIANT: it MUST exceed SLOW_TRANSCODE_TIMEOUT_S — a legitimately running transcode keeps
+    # updated_at pinned at claim time for its whole duration (progress lives in a separate table),
+    # so a shorter horizon would re-queue a live job and double-transcode it. Default = 2 h, a full
+    # hour of headroom past the 1 h transcode ceiling.
+    MEDIA_CLAIM_STALE_SECONDS: int = 7200
+    # Worker healthcheck honesty (MEMNG-90): the loop stamps a liveness file every pass, which
+    # stayed green even while every drain failed. After this many CONSECUTIVE run_media_drain()
+    # results (an exception escaping run_once — a DB outage, not an ordinary job failure, which is
+    # handled and returns processed/deferred), the loop stops stamping so the Docker healthcheck can
+    # trip. Reset on the first non-error drain. At POLL_SECONDS backoff this is ~1 min of sustained
+    # hard failure before the container is reported unhealthy.
+    WORKER_UNHEALTHY_ERROR_STREAK: int = 6
     # Worker schema gate (MEMNG-86): the worker polls alembic_version until the live schema reaches
     # the head its image was built with before it drains anything, so a deploy that recreates app +
     # worker together can't run the worker's recovery sweep against a not-yet-migrated schema. Only

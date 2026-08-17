@@ -12,7 +12,7 @@ import asyncio
 import os
 import socket
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import structlog
@@ -174,29 +174,28 @@ async def _notify_terminal_safe(attachment_id: int) -> None:
 
 
 async def _record_job_failure(
-    db: AsyncSession, job: MediaJob, attachment_id: int, exc: Exception
+    db: AsyncSession, job_id: int, attachment_id: int, job_kind: str, exc: Exception
 ) -> str:
-    """Record one job's failure — a retry, or terminal after MEDIA_MAX_ATTEMPTS.
+    """Record one job's failure — a retry, or terminal after MEDIA_MAX_ATTEMPTS — in a FRESH
+    transaction. Returns 'processed' (terminal) | 'deferred' (retry / could-not-record).
 
-    The whole body is guarded because this is the write that must not itself explode. The error
-    text is sanitized (see sanitize_error), but the commit can still fail for reasons this
-    process does not control: a session already poisoned by the failed flush inside process_job
-    (after which every statement on it errors), or a dropped connection. Before MEMNG-39 that
-    second exception escaped run_once and took the worker down with it. Here it is rolled back,
-    logged, and reported as 'deferred' so the loop backs off and keeps draining.
+    ROLLS BACK FIRST (MEMNG-90 amplifier #1): the failing job may have poisoned the session with a
+    bad flush, and committing a poisoned session raises PendingRollbackError — which before this fix
+    turned the failure record itself into a second exception, so `job.attempts` never incremented
+    and the job looped at attempts=0 forever. After the rollback the job is re-fetched by id and the
+    attempt actually persists, so a persistently-bad job ages out to `failed` at MEDIA_MAX_ATTEMPTS.
 
-    That rollback also undoes claim_one's claim: the claim and the outcome share ONE transaction
-    and media.process_job only ever flushes, so `processing` is never a durable state. The row
-    reverts to `queued` and the next poll re-claims it — the recovery path is the ordinary claim,
-    not a sweep (there is none for media_jobs; claim_one selects state=queued only). The cost is
-    that this attempt goes uncounted, so a failure whose *recording* keeps failing retries every
-    poll instead of aging out through MEDIA_MAX_ATTEMPTS — acceptable, because a commit that
-    cannot land is a DB-wide problem and a fresh session next poll records the failure normally.
+    The whole record is still guarded: if even this commit cannot land (a DB-wide problem), the row
+    stays `processing` (run_once committed the claim before processing) for the stale-claim sweep to
+    recover. Because claim_one is queued-only, a stuck `processing` row is skipped, not re-claimed
+    every poll — so a single unrecordable failure no longer blocks the queue head (amplifier #2).
     """
-    job_id = job.id  # a rollback expires the instance — keep the id for the log lines
-    job_kind = job.kind  # ...and the commit below expires it too (see run_once)
+    await db.rollback()  # clear any poison/partial txn from process_job BEFORE writing
     error = sanitize_error(str(exc))
     try:
+        job = await db.get(MediaJob, job_id)
+        if job is None:  # discarded elsewhere (an attachment delete raced) — nothing to record
+            return "deferred"
         job.attempts += 1
         job.error = error
         if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
@@ -207,7 +206,7 @@ async def _record_job_failure(
             if job_kind == JobKind.derive:  # see run_once for why the push is kind-scoped
                 await _notify_terminal_safe(attachment_id)  # separate session, after commit
             return "processed"
-        job.state = JobState.queued  # retry with backoff
+        job.state = JobState.queued  # retry
         job.claimed_by = None
         logger.warning("media_job_retry", job_id=job_id, attempts=job.attempts, error=error)
         await db.commit()
@@ -218,9 +217,42 @@ async def _record_job_failure(
         return "deferred"
 
 
+async def _requeue_claim(db: AsyncSession, job_id: int) -> None:
+    """Return a job whose claim was committed (`processing`) to `queued`, in a fresh transaction —
+    used when processing defers (thermal). Drops any partial transaction first; a job deleted out
+    from under us (a delete raced the defer) is simply nothing to requeue."""
+    await db.rollback()
+    job = await db.get(MediaJob, job_id)
+    if job is None:
+        return
+    job.state = JobState.queued
+    job.claimed_by = None
+    await db.commit()
+
+
+async def _discard_claim(db: AsyncSession, job_id: int, attachment_id: int, reason: str) -> None:
+    """Discard a job whose attachment is gone (MEMNG-41), in a fresh transaction. Drops any partial
+    transaction, then deletes the job row if it still exists — delete_attachment may have already
+    removed it (it no longer skips this row, since the claim released the media_jobs lock)."""
+    await db.rollback()
+    job = await db.get(MediaJob, job_id)
+    if job is not None:
+        await db.delete(job)
+        await db.commit()
+    logger.info("media_job_discarded", job_id=job_id, attachment_id=attachment_id, reason=reason)
+
+
 async def run_once(db: AsyncSession) -> str:
-    """Claim+process one job in one transaction (row locked until commit).
-    Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off)."""
+    """Claim one job, COMMIT the claim, then process it in a SEPARATE transaction (MEMNG-90).
+    Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off).
+
+    The claim (`state=processing`) is committed BEFORE media.process_job so no DB transaction is
+    held open across the transcode — an idle-in-transaction session across a slow-lane transcode is
+    exactly what Postgres killed mid-job, wedging the queue. `processing` is therefore DURABLE: a
+    worker that dies mid-job leaves the row for the stale-claim sweep (claim_one is queued-only, so
+    it also never re-claims and blocks behind such a row), not a rollback-to-queued. The result is
+    written in a fresh transaction that re-locks the job row before the attachment (guard_publish),
+    matching delete_attachment's lock order so the two cannot deadlock."""
     # Whole-worker thermal gate: when the host is too hot, claim/process NOTHING (the fast
     # lane's image work has no inner thermal check, so a bulk import could otherwise drive a
     # transcode/thumbnail storm). Back off until it cools — protects the thermally-coupled host.
@@ -231,21 +263,21 @@ async def run_once(db: AsyncSession) -> str:
             temp_c=round(temp_mc / 1000, 1) if temp_mc is not None else None,
             max_c=settings.THERMAL_MAX_C,
         )
-        await db.commit()
+        await db.rollback()  # nothing claimed — drop the empty transaction
         return "deferred"
     job = await claim_one(db)
     if job is None:
-        await db.commit()
+        await db.rollback()
         return "idle"
-    attachment_id = job.attachment_id  # captured before commit expires the job instance
-    job_id = job.id  # likewise — and the progress side channel is keyed on it
-    job_kind = job.kind  # likewise; decides whether this job's outcome is the PHOTO's outcome
-    # Cleanup BEFORE reclaim (MEMNG-36). A worker killed mid-transcode clears nothing, and its
-    # rolled-back claim puts the job back to `queued` still carrying the dead attempt's progress
-    # row — which the snapshot would keep reporting until this attempt happened to overtake it,
-    # i.e. a percentage that goes backwards. Every attempt therefore starts from no sample at all.
-    # Committed from its own session, so it lands even though this claim is still uncommitted; on
-    # a job that never published (the whole fast lane) it is a no-op delete on a primary key.
+    attachment_id = job.attachment_id  # captured before the commits below
+    job_id = job.id  # ...and the progress side channel is keyed on it
+    job_kind = job.kind  # ...decides whether this job's outcome is the PHOTO's outcome
+    # Commit the claim BEFORE processing (see docstring): `processing` becomes durable and the
+    # media_jobs row lock is released for the transcode's whole duration.
+    await db.commit()
+    # Cleanup BEFORE processing (MEMNG-36): drop any progress row a dead attempt left behind, so the
+    # snapshot never reports a percentage that goes backwards. Its own committing session; a no-op
+    # delete on a fast-lane job that never published.
     await media.clear_progress(job_id)
     try:
         await media.process_job(db, job)
@@ -259,26 +291,15 @@ async def run_once(db: AsyncSession) -> str:
             await _notify_terminal_safe(attachment_id)  # separate session, after job is durable
         return "processed"
     except media.ThermalDefer:
-        job.state = JobState.queued  # too hot — try again later, not a failure
-        job.claimed_by = None
-        await db.commit()
+        await _requeue_claim(db, job_id)  # too hot — back to queued, not a failure
         return "deferred"
     except media.AttachmentGone as exc:
-        # The attachment was deleted while this job sat queued or ran (MEMNG-41). Nothing is left
-        # to derive, nothing to notify, and no attempt to count — the job is discarded here,
-        # where this worker still holds the row lock. That row is precisely the one
-        # delete_attachment could NOT remove (it skips locked rows rather than waiting out a
-        # transcode), so dropping it is the second half of that delete, not bookkeeping.
-        # A commit failure here is left to run_media_drain: the claim rolls back to `queued` and
-        # the next poll discards the job again.
-        await db.delete(job)
-        await db.commit()
-        logger.info(
-            "media_job_discarded", job_id=job_id, attachment_id=attachment_id, reason=str(exc)
-        )
+        # The attachment was deleted while this job ran (MEMNG-41): nothing to derive or notify,
+        # no attempt to count. guard_publish already swept this run's output; discard the job row.
+        await _discard_claim(db, job_id, attachment_id, str(exc))
         return "processed"
     except Exception as exc:  # a bad input must not kill the worker
-        return await _record_job_failure(db, job, attachment_id, exc)
+        return await _record_job_failure(db, job_id, attachment_id, job_kind, exc)
     finally:
         # Cleanup AFTER the outcome is committed — every branch above commits before it returns.
         # Clearing the row from inside the transcode instead (media.process_slow) opened a window
@@ -310,6 +331,72 @@ async def run_media_drain() -> str:
     except Exception:
         logger.exception("media.drain_error")
         return "error"
+
+
+async def recover_stale_media_claims(db: AsyncSession, now: datetime | None = None) -> int:
+    """Re-queue (or terminally fail) media jobs stuck in `processing` past the stale horizon.
+
+    run_once commits the claim (`state=processing`) before the transcode so no DB transaction is
+    held across it (MEMNG-90). The price of that durable claim: a worker that dies mid-job — a
+    deploy --force-recreate, an OOM kill, a host reboot — leaves the row in `processing`, which
+    claim_one (queued-only) never re-claims. This sweep is the lease side of the claim: a
+    `processing` row whose updated_at is older than MEDIA_CLAIM_STALE_SECONDS has no live worker
+    behind it. (Mirrors run_frame_share_recover_safe for the media queue.)
+
+    The horizon MUST exceed SLOW_TRANSCODE_TIMEOUT_S — a legitimately running transcode keeps
+    updated_at pinned at claim time for its whole duration (progress lives in a separate table), so
+    a shorter horizon would re-queue a live job and double-transcode it. Recovery costs one attempt,
+    so a job that reliably kills its worker walks to the visible `failed` state at the attempt
+    ceiling instead of looping forever. TRADE: because the horizon must sit above the transcode cap,
+    a crash mid-transcode delays that one video's re-processing by up to the horizon — accepted, as
+    a deploy landing during an active transcode is rare and the alternative (holding the txn/lock to
+    keep instant rollback-recovery) is the wedge this fixes. Returns rows recovered; FLUSHES only —
+    the caller owns the commit."""
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(seconds=settings.MEDIA_CLAIM_STALE_SECONDS)
+    rows = (
+        (
+            await db.execute(
+                select(MediaJob)
+                .where(MediaJob.state == JobState.processing, MediaJob.updated_at < cutoff)
+                # skip_locked: a row a worker is actively finishing (its brief result txn) is theirs
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for job in rows:
+        job.attempts += 1
+        job.claimed_by = None
+        if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
+            job.state = JobState.failed  # terminal + visible, never a silent drop
+            job.error = f"stale claim recovery gave up after {job.attempts} attempts"
+            await _fail_attachment(db, job)  # kind-scoped, like the failure path
+            logger.warning("media_stale_claim_failed", job_id=job.id, attempts=job.attempts)
+        else:
+            job.state = JobState.queued
+            job.error = "recovered from stale claim (worker interrupted mid-job)"
+            logger.warning("media_stale_claim_requeued", job_id=job.id, attempts=job.attempts)
+    await db.flush()
+    return len(rows)
+
+
+async def run_media_recover_safe() -> int:
+    """Re-queue media jobs a dead worker left in `processing` (MEMNG-90), in its own committing
+    session with ALL errors isolated — the boundary guard every periodic sweep gets, and at startup
+    an escaping error would kill the worker before the loop begins. Returns rows recovered (0 on
+    error)."""
+    try:
+        async with async_session() as db:
+            recovered = await recover_stale_media_claims(db)
+            await db.commit()
+    except Exception:
+        logger.exception("media.recover_error")
+        return 0
+    if recovered:
+        logger.info("media_stale_claims_recovered", count=recovered)
+    return recovered
 
 
 async def sweep_job_progress_safe() -> int:
@@ -418,6 +505,30 @@ async def run_frame_share_recover_safe() -> int:
     return recovered
 
 
+class _DrainHealth:
+    """Heartbeat honesty for the media loop (MEMNG-90). The loop stamps a liveness file every pass,
+    which stayed green even while every drain failed — the wedge hid for ~5 h. An ordinary job
+    failure is handled inside run_once and returns processed/deferred, so it never reaches here;
+    this counts only run_media_drain() == 'error' — an exception that ESCAPED run_once (a DB outage,
+    a bug), the systemic state that should surface. After `threshold` consecutive such errors the
+    loop stops stamping so the Docker healthcheck can trip; a non-error drain resets the streak."""
+
+    def __init__(self, threshold: int) -> None:
+        self._streak = 0
+        self._threshold = threshold
+
+    def record(self, status: str) -> None:
+        self._streak = self._streak + 1 if status == "error" else 0
+
+    @property
+    def healthy(self) -> bool:
+        return self._streak < self._threshold
+
+    @property
+    def streak(self) -> int:
+        return self._streak
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     beat()  # blocking-ok: the liveness stamp itself — see beat()
@@ -426,26 +537,37 @@ async def run() -> None:
     # recovery sweep or the loop — otherwise the sweep hits UndefinedColumnError against the old
     # schema. Raises (worker exits, Docker restarts) if the schema never catches up.
     await migrations.wait_for_migrated_schema()
-    # Startup sweep: the common stranding cause is this very restart (a deploy --force-recreate
-    # killing a send mid-flight), so adopt orphaned claims before draining anything new.
+    # Startup sweeps: the common stranding cause is this very restart (a deploy --force-recreate
+    # killing work mid-flight), so adopt orphaned claims — frame-share AND media (MEMNG-90) — before
+    # draining anything new.
     await run_frame_share_recover_safe()
+    await run_media_recover_safe()
+    health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
     last_reap = 0.0
     while True:
         status = await run_media_drain()  # own session, all errors isolated from this loop
-        # blocking-ok: heartbeat before the (possibly slow HTTP) frame drain — keep liveness
-        # honest. See beat() for why this one write stays synchronous.
-        beat()
+        health.record(status)
+        # Heartbeat honesty (MEMNG-90): stamp only while the media loop is not hard-erroring in a
+        # streak, so a systemically failing worker (e.g. DB down) trips the healthcheck instead of
+        # looking alive.
+        if health.healthy:
+            beat()  # blocking-ok: the liveness stamp itself — see beat()
+        else:
+            logger.error("worker_unhealthy_error_streak", streak=health.streak)
         # Drain a frame-share job opportunistically in its own session (like reap): the album upload
         # is decoupled from the media job's transaction so an upload error can't poison media work.
         frame_status = await run_frame_share_drain()
-        beat()  # blocking-ok: the liveness stamp itself — see beat()
+        if health.healthy:
+            beat()  # blocking-ok: the liveness stamp itself — see beat()
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             reaped = await reap_expired_committed()
             if reaped:
                 logger.info("uploads_reaped", count=reaped)
             # Piggybacks the reap cadence: a claim orphaned by something other than a restart
-            # (an OOM-killed send that leaves the worker alive) is recovered within the hour.
+            # (an OOM-killed send that leaves the worker alive) is recovered within the hour —
+            # frame-share and media alike.
             await run_frame_share_recover_safe()
+            await run_media_recover_safe()
             # Same cadence for the progress side channel: a killed worker cannot clear its own
             # row, so the anti-join sweep keeps the table bounded by what is actually running.
             await sweep_job_progress_safe()

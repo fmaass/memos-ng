@@ -349,12 +349,13 @@ def test_guard_publish_sweeps_and_raises_when_the_row_is_gone(monkeypatch, tmp_p
 
     async def _go():
         async with async_session() as db:
-            from app.models import Attachment
+            from app.models import Attachment, MediaJob
 
             att = (await db.execute(select(Attachment).where(Attachment.id == aid))).scalar_one()
+            job = (await db.execute(select(MediaJob).where(MediaJob.id == _jid))).scalar_one()
             _sql("DELETE FROM attachments WHERE id = :a", a=aid)  # committed by another actor
             with pytest.raises(media.AttachmentGone):
-                await media.guard_publish(db, att)
+                await media.guard_publish(db, job, att)  # job survives; the attachment is gone
 
     try:
         asyncio.run(_go())

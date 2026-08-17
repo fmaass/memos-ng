@@ -290,14 +290,16 @@ async def test_run_media_drain_does_not_swallow_cancellation(monkeypatch):
         await worker.run_media_drain()
 
 
-async def test_failure_record_commit_error_is_recovered_not_raised(
+async def test_failure_record_commit_error_leaves_job_for_the_stale_sweep(
     monkeypatch, tmp_path, db_engine
 ):
-    # Second layer of the same defence: the failure record's own commit fails (dead connection,
-    # or a session poisoned by the flush inside process_job). run_once must roll back, log and
-    # report, not raise. Read back the AUTHORITATIVE row: the rollback also undoes claim_one's
-    # claim — claim and outcome are one transaction — so the job returns to `queued` and the
-    # ordinary claim picks it up again. Nothing is left stranded in `processing`.
+    # MEMNG-90: run_once commits the CLAIM before processing, then processing fails, then the
+    # failure record's own commit fails too (a dead connection / poisoned session). run_once must
+    # roll back, log, and report 'deferred' — never raise — and leave the row durable at
+    # `processing` (attempts still 0) for recover_stale_media_claims to recover. Because claim_one
+    # is queued-only, that stuck row is SKIPPED, not re-claimed under itself, so it never blocks the
+    # queue head. (This replaces the pre-MEMNG-90 behaviour where a rollback returned the job to
+    # `queued`: the claim was uncommitted then, so a rollback undid it.)
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     aid, jid = _seed("image/png", str(tmp_path / "x.png"))
 
@@ -307,11 +309,17 @@ async def test_failure_record_commit_error_is_recovered_not_raised(
     monkeypatch.setattr(media, "process_job", boom)
     try:
         async with async_session() as db:
+            real_commit = db.commit
+            calls = {"n": 0}
 
-            async def dead_commit():
-                raise RuntimeError("connection reset by peer")
+            async def flaky_commit():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    await real_commit()  # let the CLAIM commit land — `processing` is durable
+                    return
+                raise RuntimeError("connection reset by peer")  # the failure record cannot commit
 
-            monkeypatch.setattr(db, "commit", dead_commit)
+            monkeypatch.setattr(db, "commit", flaky_commit)
             with capture_logs() as caps:
                 assert await worker.run_once(db) == "deferred"  # recovered, not raised
         assert any(c["event"] == "media_job_failure_record_error" for c in caps)
@@ -321,7 +329,7 @@ async def test_failure_record_commit_error_is_recovered_not_raised(
                 text("SELECT state, attempts FROM media_jobs WHERE id=:j"), {"j": jid}
             ).one()
         eng.dispose()
-        assert state == "queued" and attempts == 0  # re-claimable; no durable `processing`
+        assert state == "processing" and attempts == 0  # durable claim, awaits the stale sweep
     finally:
         _cleanup(aid)
 
@@ -671,3 +679,187 @@ def test_slow_lane_keeps_audio_and_survives_a_silent_source(tmp_path):
         timeout=120,
     )
     assert _codec_types(out_silent) == ["video"]
+
+
+# --- MEMNG-90: durable-claim transaction lifetime + stale-claim recovery + healthcheck honesty ---
+
+
+def _seed_processing(age_seconds, attempts=0):
+    """A media_jobs row already in `processing`, with updated_at set `age_seconds` in the past — the
+    shape a worker that committed its claim (MEMNG-90) then died mid-job leaves behind."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        aid = c.execute(
+            text(
+                "INSERT INTO attachments (uid, filename, mime, size, status, storage_path) "
+                "VALUES (:u,'x','image/png',1,CAST('processing' AS attachment_status),:sp) "
+                "RETURNING id"
+            ),
+            {"u": secrets.token_urlsafe(8), "sp": "/tmp/x"},
+        ).scalar_one()
+        jid = c.execute(
+            text(
+                "INSERT INTO media_jobs "
+                "(attachment_id, lane, state, attempts, progress_pct, updated_at) VALUES "
+                "(:a, CAST('fast' AS job_lane), CAST('processing' AS job_state), :at, 0, "
+                "now() - (:age * interval '1 second')) RETURNING id"
+            ),
+            {"a": aid, "at": attempts, "age": age_seconds},
+        ).scalar_one()
+    eng.dispose()
+    return aid, jid
+
+
+def _cleanup_jobs(*jids):
+    # media_jobs has no FK to attachments (MEMNG-41), so _cleanup does not remove them.
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        for jid in jids:
+            c.execute(text("DELETE FROM media_jobs WHERE id=:j"), {"j": jid})
+    eng.dispose()
+
+
+def _job_row(jid):
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        row = c.execute(
+            text("SELECT state, attempts FROM media_jobs WHERE id=:j"), {"j": jid}
+        ).one()
+    eng.dispose()
+    return row
+
+
+def test_run_once_commits_the_claim_before_processing(monkeypatch, tmp_path, db_engine):
+    # MEMNG-90: the claim (state=processing) must be COMMITTED before process_job runs, so no DB
+    # transaction is held across the (up to an hour) transcode. Proven from a SEPARATE connection:
+    # at the instant process_job is entered, the row already reads `processing`. (Old worker: the
+    # claim was uncommitted, so another session read `queued` until the whole job committed.)
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid, jid = _seed("image/png", str(tmp_path / "x.png"))
+    seen = {}
+
+    async def _peek(db, job):
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            seen["state"] = c.execute(
+                text("SELECT state FROM media_jobs WHERE id=:j"), {"j": jid}
+            ).scalar_one()
+        eng.dispose()
+        att = (
+            await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
+        ).scalar_one()
+        att.status = AttachmentStatus.ready  # a normal terminal write so run_once finishes clean
+        await db.flush()
+
+    monkeypatch.setattr(media, "process_job", _peek)
+    try:
+
+        async def _go():
+            async with async_session() as db:
+                return await worker.run_once(db)
+
+        assert asyncio.run(_go()) == "processed"
+        assert seen["state"] == "processing"  # committed & visible to another session BEFORE work
+        assert _job_row(jid)[0] == "done"
+    finally:
+        _cleanup(aid)
+        _cleanup_jobs(jid)
+
+
+def test_result_commits_when_processing_outlasts_idle_in_transaction_timeout(
+    monkeypatch, tmp_path, db_engine
+):
+    # The MEMNG-90 incident, reproduced: a job whose processing outlasts the DB's
+    # idle_in_transaction_session_timeout. With the claim committed and the result written in a
+    # fresh transaction, no session sits idle-in-transaction across the work, so the result still
+    # commits. (The old single-transaction worker held the claim's txn open across the transcode;
+    # Postgres killed the connection at the timeout and the result write raised.)
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid, jid = _seed("image/png", str(tmp_path / "x.png"))
+
+    async def _slow(db, job):
+        await asyncio.sleep(0.4)  # longer than the 150 ms idle timeout set below
+        att = (
+            await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
+        ).scalar_one()
+        att.status = AttachmentStatus.ready
+        await db.flush()
+
+    monkeypatch.setattr(media, "process_job", _slow)
+    try:
+
+        async def _go():
+            async with async_session() as db:
+                await db.execute(text("SET idle_in_transaction_session_timeout = '150ms'"))
+                return await worker.run_once(db)
+
+        assert asyncio.run(_go()) == "processed"
+        assert _job_row(jid)[0] == "done"
+    finally:
+        _cleanup(aid)
+        _cleanup_jobs(jid)
+
+
+async def test_recover_stale_media_claims_requeues_old_but_leaves_fresh(
+    monkeypatch, tmp_path, db_engine
+):
+    # A `processing` row older than the horizon has no live worker behind it → requeue (one attempt
+    # counted). A FRESH `processing` row is a live transcode → MUST be left alone, or the sweep
+    # would double-transcode a running job. This is the horizon-above-the-transcode-cap invariant.
+    monkeypatch.setattr(settings, "MEDIA_CLAIM_STALE_SECONDS", 100)
+    stale_aid, stale_jid = _seed_processing(age_seconds=200, attempts=0)
+    fresh_aid, fresh_jid = _seed_processing(age_seconds=5, attempts=0)
+    try:
+        async with async_session() as db:
+            await worker.recover_stale_media_claims(db)
+            await db.commit()
+        assert _job_row(stale_jid) == ("queued", 1)  # requeued, one attempt counted
+        assert _job_row(fresh_jid) == ("processing", 0)  # a live job is never yanked
+    finally:
+        _cleanup(stale_aid, fresh_aid)
+        _cleanup_jobs(stale_jid, fresh_jid)
+
+
+async def test_recover_stale_media_claims_fails_terminally_at_the_attempt_ceiling(
+    monkeypatch, tmp_path, db_engine
+):
+    # A stale `processing` job on its last life goes to the visible `failed` state (never a silent
+    # drop), and — being a `derive` job — marks its attachment failed too.
+    monkeypatch.setattr(settings, "MEDIA_CLAIM_STALE_SECONDS", 100)
+    monkeypatch.setattr(settings, "MEDIA_MAX_ATTEMPTS", 3)
+    aid, jid = _seed_processing(age_seconds=200, attempts=2)  # +1 → terminal
+    try:
+        async with async_session() as db:
+            await worker.recover_stale_media_claims(db)
+            await db.commit()
+        assert _job_row(jid) == ("failed", 3)
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            status = c.execute(
+                text("SELECT status FROM attachments WHERE id=:a"), {"a": aid}
+            ).scalar_one()
+        eng.dispose()
+        assert status == "failed"
+    finally:
+        _cleanup(aid)
+        _cleanup_jobs(jid)
+
+
+def test_drain_health_stops_heartbeat_after_an_error_streak():
+    # MEMNG-90 healthcheck honesty: only run_media_drain()=='error' (an escape from run_once)
+    # counts; any other outcome — including a legitimately idle queue — resets, so an idle worker
+    # never looks unhealthy. Consecutive hard errors past the threshold suppress the heartbeat.
+    h = worker._DrainHealth(threshold=3)
+    assert h.healthy
+    h.record("error")
+    h.record("error")
+    assert h.healthy  # 2 < 3
+    h.record("error")
+    assert not h.healthy  # 3 → unhealthy, the loop stops stamping
+    h.record("processed")
+    assert h.healthy  # any non-error resets the streak
+    for _ in range(5):
+        h.record("error")
+    assert not h.healthy
+    h.record("idle")
+    assert h.healthy  # an empty queue is not a failure
