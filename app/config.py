@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     # hours-not-days: a genuinely stuck job burns up to MEDIA_MAX_ATTEMPTS x this before it goes
     # terminal. Raise it (env) if a legitimately long import starts timing out.
     SLOW_TRANSCODE_TIMEOUT_S: int = 3600
+    # Worker schema gate (MEMNG-86): the worker polls alembic_version until the live schema reaches
+    # the head its image was built with before it drains anything, so a deploy that recreates app +
+    # worker together can't run the worker's recovery sweep against a not-yet-migrated schema. Only
+    # the app runs alembic (docker-entrypoint.sh), so there is one migrator and no double-run.
+    # Budget generous enough for a real migration; on expiry the worker exits (Docker restarts it)
+    # rather than draining a stale schema.
+    WORKER_SCHEMA_GATE_TIMEOUT_S: int = 300
+    WORKER_SCHEMA_GATE_INTERVAL_S: float = 1.0
 
     # Web push (VAPID) — T2.5. Empty keys = push disabled (every send is a no-op), so the
     # pipeline runs unchanged without VAPID configured. Generate a keypair with `vapid --gen`
