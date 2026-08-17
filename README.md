@@ -187,6 +187,29 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.4.0
+
+Photo-book print tier, streaming export, and media-worker reliability (2026-08-17).
+
+**Added**
+- Streaming export pipeline carrying media payloads (#73).
+- Photo-book print tier: a 4096-px on-demand `printready` rendition + `GET /api/exports/photobook`
+  manifest/archive API; adds the additive `media_jobs.kind` column (#74).
+- Print-master management in the memo view (#75).
+
+**Changed**
+- Bare `- glossy` / `- matte` attachments are recognized as print variants and bind to their screen
+  sibling instead of duplicating (#76).
+- Worker startup is gated on the migrated schema so a deploy can't run the worker against an
+  un-migrated DB (#77, MEMNG-86).
+
+**Fixed**
+- Media worker no longer holds a DB transaction open across the transcode: the claim is committed
+  before processing, the result is written in a fresh transaction (re-locking the job row before the
+  attachment to avoid a delete-path deadlock), a stale-claim sweep recovers a crashed worker's job,
+  and the failure recorder rolls back first so attempts increment — fixing the idle-in-transaction
+  queue wedge (#78, MEMNG-90).
+
 ### v1.3.4
 
 API auth patch (2026-08-14).
