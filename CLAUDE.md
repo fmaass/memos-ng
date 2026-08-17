@@ -2,40 +2,57 @@
 
 ## What this is / current state
 
-A from-scratch replacement for the production `memos` (`neosmemo/memos:0.29.1`) plus its
-three support containers (`memos-nginx`, `memos-imgproxy`, `memos-resizer`) and the Merkur
-`memos-transcoder`. **All four collapse into memos-ng**: FastAPI serves the SPA + API +
-asset tiers (no nginx), and an in-stack `memos-ng-worker` (pyvips + ffmpeg, Postgres
-`media_jobs` queue) replaces imgproxy + resizer + the 5-minute NFS transcoder.
+A from-scratch replacement for the old `memos` (`neosmemo/memos:0.29.1`) plus its three support
+containers (`memos-nginx`, `memos-imgproxy`, `memos-resizer`) and the Merkur `memos-transcoder`.
+**All four collapse into memos-ng**: FastAPI serves the SPA + API + asset tiers (no nginx), and an
+in-stack `memos-ng-worker` (pyvips + ffmpeg, Postgres `media_jobs` queue) replaces imgproxy +
+resizer + the 5-minute NFS transcoder.
 
-**State: greenfield.** Repo is not yet scaffolded (that's plan task T0.1). The only contents
-today are `docs/plans/PLAN_2026-06-20_memos-ng.md` (the roadmap of record) and
-`fixtures/live-0.29.1/` (captured compat ground truth — see below).
+**State: SHIPPED — memos-ng IS production** at `https://memos.discomarder.live`. Cutover is DONE.
+The old `neosmemo/memos` stack is retired. Work now is ticket-scoped maintenance/features, not
+greenfield phases. (The `docs/plans/PLAN_2026-06-20_memos-ng.md` build roadmap is historical;
+`fixtures/live-0.29.1/` remains the compat ground truth — see below.)
 
-## CARDINAL RULE — build in parallel, never touch running memos until cutover
+### Deployed topology (the "jupiter" host = the local machine, merkur)
 
-The whole point of this project: memos-ng is built, tested, and deployed **alongside** the
-running memos at a **separate** host/DB/volume/Authelia-client. Production memos must keep
-working untouched. The switch happens only at Phase 5 cutover, on explicit go-ahead, with a
-≤5-min rollback and a 7-day soak. Until then:
-- Staging host `memos-ng.discomarder.live`; never bind `memos.discomarder.live`.
-- Separate Postgres DB `memosng`, separate volume `/volume1/docker/memos-ng`, separate
-  Authelia client `memos-ng`. Never edit the live `memos` client/stack/volume.
-- Old data is read **read-only** and **copied** (`cp -p`), never moved.
+- **App + worker** run on the **local Docker** (jupiter), NOT on Saturn: containers
+  `memos-ng-app` and `memos-ng-worker`, both the locally-built image **`memos-ng:local`**, user
+  `1027:100`. Routed by Traefik router `memos-ng-cutover` → `Host(memos.discomarder.live)`.
+- **Deploy config (stack)**: `/opt/jupiter-stacks/stacks/memos-ng/docker-compose.yml` — its own
+  git repo, **pins-to-main** convention (compose bumps commit to its `main`, needs
+  `ALLOW_MAIN_COMMIT=1`). Build context = **this** repo's `Dockerfile`.
+- **DB**: Postgres17 on **Saturn**, `192.168.1.50:5455`, DB/role `memosng`. Reach with
+  `ssh saturn.local 'sudo /usr/local/bin/docker exec postgres17 psql -U memosng -d memosng -c "…"'`.
+- **Data volumes**: originals on Saturn NFS `/volume1/docker/memos-ng`; derived tiers on NVMe
+  `/volume2/nvme2/cache/memos` → mounted `/app/data` and `/app/data/assets`.
+- **This repo is NOT the deployed path** — the image is built FROM this repo and referenced by the
+  `/opt/jupiter-stacks` stack. Deploy = LOCAL build (`RELEASING.md` local path), retag the running
+  image `memos-ng:rollback-<sha>` FIRST, then `up -d --force-recreate`; verify running image Id ==
+  built `memos-ng:local` Id and a live `/health` before calling it done. See `/safe-deploy`.
 
-### The only shared-infra touchpoints (handle with care)
-1. **Authelia restart** (registering the `memos-ng` OIDC client) interrupts *all* household
-   SSO, not just memos. The change is purely additive (append a new `- client_id: 'memos-ng'`
-   item; do not touch the `memos` block). **Run `authelia validate-config` before restart**,
-   in a quiet window.
-2. **Shared Postgres17 + shared Saturn host.** memos-ng's DB and worker share hardware with
-   prod. The real coupling is **thermal** — a transcode storm can trip a host shutdown that
-   takes prod memos down too. Reuse existing derived mp4s on migration (no mass re-transcode);
-   1-thread throttle; monitor `/sys/class/thermal`, stay <70 °C.
-3. **Traefik** routes per-service (label-based / own rule file) — additive and isolated; give
-   memos-ng its own router so a bad config can't cascade.
+## CARDINAL RULE — this IS production; a bad deploy is a real outage
 
-## Architecture (target)
+memos-ng serves the household at `memos.discomarder.live` from prod data. There is no separate
+staging. Treat every deploy and every prod DB migration as production-affecting:
+- **Never** `docker compose restart` to pick up code (reuses the old image) — `up -d
+  --force-recreate` (hook-enforced; `ALLOW_RESTART=1` only for genuine config reloads).
+- **Never** overwrite `memos-ng:local` without first retagging the running image
+  `memos-ng:rollback-<sha>` (the ≤5-min rollback reference).
+- **Never** run a prod DB migration without a plan through the plan gate first; apply
+  expand/contract, no data loss.
+- Old-memos data lives only as read-only archives now; never move or mutate it in place.
+
+### Shared-infra touchpoints (handle with care)
+1. **Authelia restart** (any OIDC client change) interrupts *all* household SSO. Changes are
+   additive; **run `authelia validate-config` before restart**, in a quiet window. Mirror every
+   live change into the sanitized in-repo template the same session.
+2. **Shared Postgres17 + Saturn host.** memos-ng's DB shares hardware with other household
+   services. The real coupling is **thermal** — a transcode storm can trip a host shutdown.
+   Reuse existing derived mp4s (no mass re-transcode); 1-thread throttle; stay <70 °C.
+3. **Traefik** routes per-service (own router) — additive and isolated; a bad router config can
+   still cascade, so do router changes as their own change in a quiet window.
+
+## Architecture
 
 - **Backend:** FastAPI, SQLAlchemy 2 async, Alembic, pydantic-settings, structlog;
   **uv + ruff + pyright**, `python:3.13-slim`. Serves SPA + `/api/*` (clean REST) +
@@ -51,7 +68,10 @@ working untouched. The switch happens only at Phase 5 cutover, on explicit go-ah
 
 Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
 
-## Saturn (Synology NAS) conventions
+## Hosts: jupiter (local, runs the app) + Saturn (NAS, runs the DB & holds data)
+
+The app/worker containers run on the **local machine (jupiter/merkur)** — deploy there with the
+local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn conventions:
 
 - SSH alias: **`ssh saturn.local`** (Host in `~/.ssh/config`, port 27022, user `fabian`).
   Merkur IS the local machine — never ssh to it.
@@ -63,15 +83,15 @@ Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
 - **Protected-path writes:** write to `/tmp` on Saturn, then `sudo cp` — do **not**
   heredoc-through-`sudo tee` (produces 0-byte files). sudo password (when needed) is in
   `/volume1/docker/.sudo_pass` on Saturn.
-- Stack git repo: `/volume1/docker-compose/stacks/`; app data: `/volume1/docker/`.
-- Deploy with `up -d` (never `restart` — reuses the old image). Verify the running image
-  digest + a live request before calling it deployed. After `up -d --force-recreate`,
-  Traefik takes ~20–40s to re-sync the new container — a brief external 404 right after
+- **Deploy stack (jupiter):** `/opt/jupiter-stacks/stacks/memos-ng/docker-compose.yml`. Deploy
+  with `docker compose -f … up -d --force-recreate` (never `restart` — reuses the old image).
+  Verify the running image Id == the built `memos-ng:local` Id + a live `/health` before calling
+  it deployed. Traefik takes ~20–40s to re-sync a new container — a brief external 404 right after
   deploy is normal; wait and retry before assuming a routing break.
-- **Containers writing a bind-mounted `/volume1/docker/...` share must run as the share
-  owner** (`user: "1027:100"` in compose) — the Synology share ACL masks the unix mode, so a
-  0777 dir still denies a non-owner container UID. Verify with a real file write (heartbeat /
-  derived asset), not just `mkdir -p` (which no-ops on existing dirs and hides the denial).
+- **Containers writing a bind-mounted `/volume1/docker/...` Saturn share must run as the share
+  owner** (`user: "1027:100"`) — the Synology share ACL masks the unix mode, so a 0777 dir still
+  denies a non-owner container UID. Verify with a real file write (heartbeat / derived asset), not
+  just `mkdir -p` (which no-ops on existing dirs and hides the denial).
 
 ## G1 compat fixtures — `fixtures/live-0.29.1/`
 
@@ -81,19 +101,15 @@ deviate from the plan: (F1) no-auth returns 200/PUBLIC-only, **not 401**; (F2) o
 fetch over `/file/` 404s today, only derived tiers are HTTP-served. Do not regenerate after
 old memos is stopped.
 
-## Phase discipline (hard gate)
+## Work discipline (ticket-scoped)
 
-Implement strictly in phases. **Each phase is a distinct, self-contained unit that must be
-tested and verified against its acceptance criteria before the next phase starts.** Do not
-begin Phase N+1 until Phase N is demonstrably done (its AC met, evidence shown). Same within a
-phase: each task ends at its objective Verification gate. No racing ahead, no half-finished
-phases left open. Current position: **Phase 0 → T0.1**.
-
-**End-of-phase gate (mandatory):** close every phase with `/converge` for independent
-validation before advancing. Sequence: finish the phase's tasks → `/session-review` +
-`/implementation-report` (the packet `/converge` consumes) → **`/converge`** (L1–L4 validator
-lenses + Codex cross-model review). Only a converged, adversarially-verified phase unlocks the
-next one.
+The greenfield build is done; work is now ticket-scoped (windshift workspace **MEMNG**, id 16 —
+see the tracker for status, which META never owns). Each ticket ends at its own objective
+verification gate: tests exist and pass, the LOCAL gate is green (below), evidence shown. Finish
+one before starting the next; no half-finished branches left open. For a substantial or
+concurrency/data-critical change, add an independent review before merge (the local gate is the
+floor, not the ceiling). A prod deploy or prod DB migration additionally goes through the plan
+gate first (see CARDINAL RULE).
 
 ## Tests first (front, back, and center)
 
@@ -107,18 +123,23 @@ met until its tests exist and pass.
   category, not just the happy path.
 - **Manual verification supplements, never replaces.** Live `curl`/browser checks are evidence
   on top of tests, not instead of them.
-- **CI green is the per-task gate.** A task/phase is not done until the CI run on its commit is
-  green across ALL jobs (backend, frontend, api-drift, release). Never advance past a red or
-  pending CI. Never commit while a local gate is RED — run
+- **The LOCAL gate is the gate — there is NO CI** (GitHub Actions was abandoned; MEMNG-1
+  cancelled). A task is not done until, run **bare** (never piped — a pipe hides the exit code)
+  and each exit code cited:
   `uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q && uv run alembic check`
-  and observe all green first.
+  are all green. Never commit while any is RED. The test DB the gate needs: bring it up with
+  `docker compose -f compose.dev.yaml up -d` and export
+  `DATABASE_URL_SYNC=postgresql+psycopg2://memosng:memosng@localhost:5433/memosng` (pytest and
+  the app fall back to that DSN; `alembic check` reads it explicitly).
 - **Local gates can't see the slim image.** When a change touches `pyproject.toml` deps or the
-  `Dockerfile`, run a local/Saturn `docker build` BEFORE pushing — `python:3.13-slim` has no
-  compiler, so C-extension wheels (e.g. blurhash-python) fail there but not on your dev machine.
+  `Dockerfile`, run a local `docker build` BEFORE deploy — `python:3.13-slim` has no compiler, so
+  C-extension wheels (e.g. blurhash-python) fail there but not on your dev machine.
 
 ## Conventions
 
-- Branch discipline: each task on `feature/<task-slug>`; never commit to main.
+- Branch discipline: each task on `fix/<slug>` or `feature/<slug>`; never commit to main
+  (hook-enforced). Merge via PR (squash). NOTE: the `/opt/jupiter-stacks` deploy repo is the one
+  exception — it is pins-to-main (`ALLOW_MAIN_COMMIT=1` for compose bumps).
 - **Off-loop blocking I/O uses `from anyio import to_thread` then `to_thread.run_sync(...)`** —
   never `import anyio` + `anyio.to_thread.run_sync`, which pyright misresolves to
   `BrokenWorkerInterpreter` and fails the gate.
@@ -129,7 +150,7 @@ met until its tests exist and pass.
 - Every live Authelia/Traefik change is mirrored into the sanitized in-repo template the
   same session.
 - Session review at the end of every implementation session (see `~/CLAUDE.md`).
-- ARCHIMEDES: documented under the `memos-ng` BookStack shelf (to be created, plan T6.1);
-  roadmap of record is BookStack page 1649 (book 1648 "memos-ng — Features"; page 1646 is the
-  superseded portainer-stacks draft) / local plan above. Read accepted ADRs before
-  re-litigating settled decisions.
+- ARCHIMEDES: documented in BookStack book **1648 "memos-ng — Features"** (Session Reviews
+  chapter 2689; page 1649 is the historical build roadmap; page 1646 is the superseded
+  portainer-stacks draft). Read accepted ADRs before re-litigating settled decisions. Update
+  BookStack pages via `node ~/projects/archimedes/lib/bookstack.mjs put-safe <id>` ONLY.
