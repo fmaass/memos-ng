@@ -19,6 +19,7 @@ import structlog
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import migrations
 from app.config import settings
 from app.database import async_session
 from app.models import (
@@ -420,6 +421,11 @@ async def run_frame_share_recover_safe() -> int:
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     beat()  # blocking-ok: the liveness stamp itself — see beat()
+    # Schema gate (MEMNG-86): a deploy recreates app + worker together, but only the app migrates.
+    # Wait for the live schema to reach the head this image was built with before running the
+    # recovery sweep or the loop — otherwise the sweep hits UndefinedColumnError against the old
+    # schema. Raises (worker exits, Docker restarts) if the schema never catches up.
+    await migrations.wait_for_migrated_schema()
     # Startup sweep: the common stranding cause is this very restart (a deploy --force-recreate
     # killing a send mid-flight), so adopt orphaned claims before draining anything new.
     await run_frame_share_recover_safe()
