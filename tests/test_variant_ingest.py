@@ -76,6 +76,25 @@ async def test_in_batch_screen_and_print_groups(adb, monkeypatch, tmp_path):
     assert Path(r.storage_path).parent == Path(settings.DATA_ROOT) / "originals" / "_unfiled"
 
 
+async def test_bare_glossy_label_binds_as_hidden_print_rendition(adb, monkeypatch, tmp_path):
+    # The Lightroom convention that caused the daily-mail duplicates: a photo dumped as
+    # `X - screen` + `X - glossy` must collapse to ONE visible screen carrying the glossy as a
+    # hidden print:glossy rendition — like the `- print (glossy)` form, not two separate photos.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "vp_bare_glossy")
+    screen = await _upload(adb, o, "_AR1 - screen.png", PNG + b"s" * 2000)
+    glossy = await _upload(adb, o, "_AR1 - glossy.png", PNG + b"g" * 3000)
+    out = await svc.finalize_pending(adb, [screen.upload_uid, glossy.upload_uid], o.id)
+
+    assert len(out) == 1  # only the screen is a visible attachment; the glossy is not its own row
+    atts = await _attachments(adb, o.id)
+    assert len(atts) == 1 and atts[0].filename == "_AR1 - screen.png"
+    rends = await _renditions(adb, atts[0].id)
+    assert len(rends) == 1
+    assert rends[0].variant_key == "print:glossy" and rends[0].label == "glossy"
+    assert Path(rends[0].storage_path).exists()
+
+
 async def test_identical_print_bytes_on_two_photos_are_not_file_shared(adb, monkeypatch, tmp_path):
     # sha256 is informational only — two photos with byte-identical prints must get DISTINCT files,
     # so deleting one photo can never unlink the other's rendition (the cross-row deletion hazard)
