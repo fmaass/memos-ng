@@ -25,6 +25,44 @@ def test_print_labeled():
     assert p.label == "glossy" and p.variant_key == "print:glossy"
 
 
+def test_bare_known_label_is_a_print():
+    # the household Lightroom convention: `X - glossy` / `X - matte` == `X - print (glossy/matte)`
+    g = parse_variant("_AR55821 - glossy.png")
+    assert g.base == "_AR55821" and g.is_print
+    assert g.label == "glossy" and g.variant_key == "print:glossy"
+    m = parse_variant("_AR55821 - matte.png")
+    assert m.base == "_AR55821" and m.is_print
+    assert m.label == "matte" and m.variant_key == "print:matte"
+
+
+def test_bare_known_label_is_case_insensitive():
+    # a preset emitting ` - Glossy` / ` - MATTE` must still be hidden, slugged lowercase
+    for name, key in (("X - Glossy.png", "print:glossy"), ("X - MATTE.png", "print:matte")):
+        p = parse_variant(name)
+        assert p.is_print and p.variant_key == key, name
+
+
+def test_bare_known_label_shares_base_with_its_screen():
+    # a `- glossy` print groups onto the SAME base as its `- screen`/no-suffix sibling
+    assert parse_variant("_AR1 - glossy.png").base == parse_variant("_AR1 - screen.png").base
+    assert parse_variant("_AR1 - matte.png").base == parse_variant("_AR1.png").base
+
+
+def test_unknown_bare_label_stays_a_visible_screen():
+    # ONLY the closed known-label set is hidden; any other trailing ` - <word>` is a real title and
+    # must never be silently hidden from the web (the safe failure)
+    for name in ("Sunset - orange.png", "Trip - day 3.png", "X - printed.png", "X - glossyish.png"):
+        p = parse_variant(name)
+        assert not p.is_print, name
+        assert p.variant_key is None and p.base == name.rsplit(".", 1)[0]
+
+
+def test_bare_known_label_must_be_anchored_at_the_end():
+    # ` - glossy` only counts immediately before the extension — trailing words make it a screen
+    for name in ("X - glossy morning.png", "X - matte finish shot.png"):
+        assert not parse_variant(name).is_print, name
+
+
 def test_screen_and_print_share_a_base():
     # the grouping key: a screen and its print must yield the SAME base
     assert parse_variant("_AR55821.png").base == parse_variant("_AR55821 - print (matte).png").base
