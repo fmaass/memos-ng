@@ -177,11 +177,14 @@ def _cleanup(subject: str | None = None, *aids: int) -> None:
 async def test_sse_reports_real_progress_from_committed_worker_transitions(monkeypatch, tmp_path):
     """End to end, against the real worker: /api/events' stream must show the transcode moving.
 
-    The SSE layer polls _user_snapshot from its own session while worker.run_once holds the claim.
-    Before MEMNG-36 the percentages existed only inside that uncommitted transaction, so every
+    The SSE layer polls _user_snapshot from its own session while worker.run_once processes the job.
+    Before MEMNG-36 the percentages existed only inside the worker's own transaction, so every
     event carried the value the row had when the job was claimed — the client watched a
     frozen number until the job finished. The mid-run assertions here (a percentage strictly
-    between 0 and 100 seen while the job row is STILL uncommitted) are what pins that.
+    between 0 and 100 seen while the job row's OWN progress_pct is still 0) pin that the live number
+    comes from the committed media_job_progress side channel, not the row. Since MEMNG-90 the claim
+    is committed before processing, so the row reads `processing` (not `queued`) during the run —
+    its progress_pct is still 0, which is the point.
     """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 60)
@@ -211,23 +214,24 @@ async def test_sse_reports_real_progress_from_committed_worker_transitions(monke
     try:
         job = asyncio.create_task(drain())
         events: list[dict] = []
-        uncommitted: list[tuple[str, int]] = []
+        job_rows: list[tuple[str, int]] = []
         async with asyncio.timeout(90):  # a stuck stream must fail the test, not hang the suite
             async for chunk in media_event_stream(snap, meta, interval=0.05):
                 event = json.loads(chunk.removeprefix("data: "))
                 events.append(event)
                 if 0 < event["progress_pct"] < 100 and not job.done():
                     # Read the job row from a THIRD session at the moment the stream reports
-                    # movement: it is still `queued` at 0 there, because the worker's claim and
-                    # its progress writes are uncommitted. So the number the stream just
-                    # reported cannot have come from that row.
-                    uncommitted.append(_read_job(jid))
+                    # movement: it reads `processing` at progress_pct 0 there — the claim IS
+                    # committed (MEMNG-90) but the live percentage is written to the separate
+                    # media_job_progress table, so the number the stream just reported cannot
+                    # have come from the job row.
+                    job_rows.append(_read_job(jid))
         assert await job == "processed"
 
         moving = [e["progress_pct"] for e in events if 0 < e["progress_pct"] < 100]
         assert moving, f"stream never reported progress between 0 and 100: {events}"
         assert set(moving) <= {25, 50, 75}  # the stub's real marks, not a synthesised number
-        assert uncommitted and all(row == ("queued", 0) for row in uncommitted), uncommitted
+        assert job_rows and all(row == ("processing", 0) for row in job_rows), job_rows
         assert events[-1] == {
             "uid": uid,
             "status": "ready",
@@ -245,9 +249,9 @@ async def test_sse_reports_real_progress_from_committed_worker_transitions(monke
 async def test_the_reported_percentage_never_goes_backwards(monkeypatch, tmp_path):
     """The whole sequence a client sees must be monotonic, and 100 must mean ready.
 
-    The transcode's last sample lands while the worker still holds its claim; the outcome commits
-    a moment later. Clearing the progress row inside that window (as media.process_slow used to)
-    made the snapshot fall back to the job row's committed 0 while the attachment still read
+    The transcode's last sample lands during processing; the outcome (attachment ready + job done)
+    commits a moment later. Clearing the progress row inside that window (as media.process_slow used
+    to) made the snapshot fall back to the job row's committed 0 while the attachment still read
     `processing` — the tile ran up to 75%, snapped back to 0%, and only then went ready. The
     window is widened deterministically here by delaying the real guard_publish, which sits
     between the last sample and the commit; without the delay this race is a coin toss to
@@ -260,9 +264,9 @@ async def test_the_reported_percentage_never_goes_backwards(monkeypatch, tmp_pat
     monkeypatch.setattr(media, "PROGRESS_PUBLISH_SECONDS", 0.0)
     real_guard = media.guard_publish
 
-    async def _slow_guard(db, attachment):
+    async def _slow_guard(db, job, attachment):
         await asyncio.sleep(0.5)  # a real await point between the last sample and the commit
-        await real_guard(db, attachment)
+        await real_guard(db, job, attachment)
 
     monkeypatch.setattr(media, "guard_publish", _slow_guard)
     src = tmp_path / "originals" / "v.mp4"
