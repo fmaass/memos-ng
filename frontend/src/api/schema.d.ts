@@ -866,6 +866,8 @@ export interface components {
         };
         /** PatCreate */
         PatCreate: {
+            /** Expires In Days */
+            expires_in_days?: number | null;
             /** Name */
             name: string;
         };
@@ -876,6 +878,8 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Expires At */
+            expires_at: string | null;
             /** Id */
             id: number;
             /** Last Used */
@@ -892,6 +896,8 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Expires At */
+            expires_at: string | null;
             /** Id */
             id: number;
             /** Last Used */
@@ -1095,6 +1101,8 @@ export interface components {
         };
         /** UserOut */
         UserOut: {
+            /** Auth Kind */
+            auth_kind: string;
             /** Avatar */
             avatar?: string | null;
             /** Display Name */

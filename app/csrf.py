@@ -100,9 +100,11 @@ def csrf_reject_reason(
     if SID_COOKIE not in cookies:
         # No ambient authority to abuse: PAT/Bearer satellites and curl carry no session cookie, so
         # nothing here can be riding a browser's stored credentials. (A PAT arriving *together with*
-        # a session cookie is deliberately NOT exempted: routes that depend on `require_user` ignore
-        # `Authorization` entirely and authenticate from the cookie, so honouring the header would
-        # hand any header-setting caller a way around this check.)
+        # a session cookie is deliberately NOT exempted, even though `require_user` now resolves the
+        # bearer first: this check runs in middleware, before any route decides which credential
+        # wins, and exempting on a header alone would hand any header-setting caller a way around
+        # it. A same-site attacker page cannot set `Authorization` cross-origin without a preflight
+        # this app answers for nobody, so nothing legitimate is lost.)
         return None
     expected = canonical_origin()
     stated = stated_origin(headers.get("origin"), headers.get("referer"))

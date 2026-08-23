@@ -1,4 +1,5 @@
 import hashlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app import auth
@@ -78,3 +79,44 @@ def test_pat_http_create_list_delete(logged_in_client):
 def test_pat_create_rejects_empty_name(logged_in_client):
     client, _ = logged_in_client
     assert client.post("/api/pats", json={"name": ""}).status_code == 422  # name min_length=1
+
+
+def test_pat_create_rejects_an_out_of_range_lifetime(logged_in_client):
+    client, _ = logged_in_client
+    # 0 is a token that is already dead; 366 is past the one-year cap a lost device is bounded to.
+    assert client.post("/api/pats", json={"name": "x", "expires_in_days": 0}).status_code == 422
+    assert client.post("/api/pats", json={"name": "x", "expires_in_days": 366}).status_code == 422
+    assert client.post("/api/pats", json={"name": "x", "expires_in_days": -1}).status_code == 422
+
+
+def test_pat_lifetime_becomes_an_absolute_expiry(logged_in_client):
+    client, _ = logged_in_client
+    before = datetime.now(UTC)
+    created = client.post("/api/pats", json={"name": "device", "expires_in_days": 30})
+    assert created.status_code == 201
+    expires_at = datetime.fromisoformat(created.json()["expires_at"])
+    # 30 days from the moment of minting, not a duration the client has to re-derive.
+    assert timedelta(days=30) <= expires_at - before <= timedelta(days=30, seconds=60)
+    listed = client.get("/api/pats").json()
+    assert datetime.fromisoformat(listed[0]["expires_at"]) == expires_at
+
+
+def test_pat_without_a_lifetime_never_expires(logged_in_client):
+    client, _ = logged_in_client
+    created = client.post("/api/pats", json={"name": "forever"})
+    assert created.status_code == 201 and created.json()["expires_at"] is None
+    assert client.get("/api/pats").json()[0]["expires_at"] is None
+
+
+async def test_authenticate_pat_refuses_an_expired_token(adb):
+    u = await _user(adb, "carol")
+    _, token = await svc.create_pat(
+        adb, u, "expired", expires_at=datetime.now(UTC) - timedelta(seconds=1)
+    )
+    assert await auth.authenticate_pat(adb, token) is None
+    _, live = await svc.create_pat(
+        adb, u, "live", expires_at=datetime.now(UTC) + timedelta(days=1)
+    )
+    got = await auth.authenticate_pat(adb, live)
+    assert got is not None and got.id == u.id
+    await auth.drain_pat_stamp_tasks()

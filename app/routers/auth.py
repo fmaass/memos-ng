@@ -29,6 +29,9 @@ class UserOut(BaseModel):
     email: str | None
     role: str
     avatar: str | None = None
+    # Which credential answered this request — a native client that pasted a token needs to see
+    # that the token, not a leftover browser session, is what is speaking for it.
+    auth_kind: str
 
 
 @router.get("/login", include_in_schema=False)
@@ -92,13 +95,14 @@ async def callback(
 
 
 @router.get("/user", response_model=UserOut)
-async def whoami(user: User = Depends(auth.require_user)) -> UserOut:
+async def whoami(request: Request, user: User = Depends(auth.require_user)) -> UserOut:
     return UserOut(
         subject=user.subject,
         display_name=user.display_name,
         email=user.email,
         role=user.role,
         avatar=user.avatar,
+        auth_kind=request.state.auth_kind,
     )
 
 

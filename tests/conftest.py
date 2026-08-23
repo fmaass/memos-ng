@@ -9,6 +9,7 @@ from app.csrf import canonical_origin
 from app.database import engine as async_engine
 from app.main import app
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
@@ -129,6 +130,36 @@ def logged_in_client(client, db_engine, monkeypatch):
         with eng.begin() as c:
             c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
         eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def pat_client(logged_in_client):
+    """`(bearer_client, subject, token)` — an httpx client that carries a PAT and nothing else.
+
+    A SEPARATE client on purpose: reusing `logged_in_client` with an extra header would leave the
+    session cookie in the jar, and every "the bearer got me in" assertion would still pass with the
+    bearer branch deleted. This one has an empty cookie jar, so only the token can answer.
+
+    The token is minted through the session client, which is also the only way to mint one
+    (`/api/pats` is session-only by design).
+    """
+    from app import auth
+
+    client, subject = logged_in_client
+    created = client.post("/api/pats", json={"name": "device"})
+    assert created.status_code == 201, created.text
+    token = created.json()["token"]
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as bearer:
+        try:
+            yield bearer, subject, token
+        finally:
+            # The last_used stamp is a background task on THIS test's loop; land or cancel it here
+            # rather than letting the loop close under a half-finished write.
+            await auth.drain_pat_stamp_tasks()
 
 
 class _CtxSession:

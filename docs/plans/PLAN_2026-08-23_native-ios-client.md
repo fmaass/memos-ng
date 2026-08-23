@@ -104,7 +104,7 @@ Codex AND ChatGPT-Pro reviews, run separately; `~/.claude/CLAUDE.md` → Agent C
 - **Decision records.** No ADR ever locked "PWA-primary"; it lives as plan prose
   (`docs/plans/PLAN_2026-06-20_memos-ng.md:43,97,227` = BookStack page 1649; feature-parity plan
   page 1884). Estate ADR index (page 2697) already says **"OIDC for mobile-capable apps"**
-  (homelab-infra ADR-0002, `/link/1429`); bookstack-ng ADR-0002 (`/link/1432`) chose
+  (portainer-stacks ADR-0002 (estate-scope), `/link/1429`); bookstack-ng ADR-0002 (`/link/1432`) chose
   "server-side OIDC with session cookies, no client-side tokens" for a *browser-only* app — a
   project-scoped precedent this plan must cite, not silently contradict. memos-ng ADRs live in
   BookStack book 1648, chapter 2690 "Decisions", highest ADR-0014 (page 2584) → next is
@@ -861,6 +861,6 @@ Codex (`codex-cli 0.144.6`, `--sandbox read-only`, `model_reasoning_effort=high`
   needed an exchange contract). All folded.
 - Round 3 — **APPROVE**, zero blocking, zero advisory.
 
-Estate ADR index (page 2697) checked 2026-08-23: homelab-infra ADR-0002 (`/link/1429`, OIDC for
+Estate ADR index (page 2697) checked 2026-08-23: portainer-stacks ADR-0002 (estate-scope) (`/link/1429`, OIDC for
 mobile-capable apps) honoured; bookstack-ng ADR-0002 (`/link/1432`) cited as a project-scoped
 precedent for a different client type; no estate ADR settles a web or iOS stack.

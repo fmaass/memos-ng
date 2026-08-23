@@ -74,7 +74,8 @@ The app/worker containers run on the **local machine (jupiter/merkur)** — depl
 local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn conventions:
 
 - SSH alias: **`ssh saturn.local`** (Host in `~/.ssh/config`, port 27022, user `fabian`).
-  Merkur IS the local machine — never ssh to it.
+  **merkur** (`ssh merkur.local`) is the Mac mini M1 **build host for the iOS client** — no app
+  containers run there; **jupiter is the local machine** that runs the app and worker.
 - Non-interactive SSH needs **full paths + sudo** for docker/git:
   `sudo /usr/local/bin/docker …`, `/usr/local/bin/git …`. docker/git are in the sudo
   exclusion list (no password). Other commands (mkdir, tee) have **no** sudo — write via
@@ -154,3 +155,17 @@ met until its tests exist and pass.
   chapter 2689; page 1649 is the historical build roadmap; page 1646 is the superseded
   portainer-stacks draft). Read accepted ADRs before re-litigating settled decisions. Update
   BookStack pages via `node ~/projects/archimedes/lib/bookstack.mjs put-safe <id>` ONLY.
+
+### BookStack Page Registry (resolve write targets BY ID — name-search is discovery-only)
+
+- Book **1648** "memos-ng — Features": Session Reviews chapter **2689**, Decisions chapter **2690**,
+  Lessons Learned page **1664**.
+- Plan pages: **1649** (historical build roadmap), **1884** (feature-parity roadmap), **3151**
+  (native iOS client + reference iOS architecture, 2026-08-23).
+- ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
+  ADR-0013 **2316**, ADR-0014 **2584**, ADR-0015 **3152** (native client; PAT bearer; HTTPS
+  callback brokered by the BFF).
+- Sibling project **memos-ng-ios** (the reference iOS repo): book **3153** (Decisions **3154**,
+  Session Reviews **3155**), Project Overview **3158**, doctrine "Reference iOS Architecture"
+  **3156**, ADR-0001 **3157**.
+- Estate ADR Decision Index **2697** (cross-project allow-list; edited only at ADR acceptance).
