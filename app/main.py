@@ -61,6 +61,7 @@ from app.routers import auth as auth_router  # noqa: E402
 from app.routers import compat as compat_router  # noqa: E402
 from app.routers import export as export_router  # noqa: E402
 from app.routers import memos as memos_router  # noqa: E402
+from app.routers import native as native_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
 from app.routers import push as push_router  # noqa: E402
 from app.routers import settings as settings_router  # noqa: E402
@@ -82,6 +83,10 @@ app.router.routes.extend(push_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
 # Compat (/api/v1/*, /file/*) must precede the /api/* fallback and the SPA catch-all.
 app.router.routes.extend(compat_router.router.routes)
+# Likewise the two non-/api native-login URLs (/.well-known/apple-app-site-association,
+# /ios/auth/callback): the SPA catch-all below would otherwise answer both with the shell, and
+# Apple refuses an association file served as HTML.
+app.router.routes.extend(native_router.router.routes)
 
 # Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
@@ -93,7 +98,9 @@ SECURITY_SCHEMES = {
         "scheme": "bearer",
         "bearerFormat": "memos_pat",
         "description": "A personal access token (`memos_pat_…`). Accepted on every /api/* route "
-        "except /api/pats/*, which is browser-session-only.",
+        "except /api/pats/*, which is browser-session-only, and POST /api/auth/native/exchange, "
+        "which is anonymous by construction — it is how a device obtains a token in the first "
+        "place, so requiring one would be circular.",
     },
     "sessionCookie": {
         "type": "apiKey",

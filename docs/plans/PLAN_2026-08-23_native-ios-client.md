@@ -503,9 +503,11 @@ Each phase is independently shippable and ends in an objective verification gate
   `Location: https://memos.discomarder.live/ios/auth/callback?code=…` (no app needed yet);
   `curl -X POST …/api/auth/native/exchange` with the matching verifier returns a token that lists
   memos; a second identical POST → 400 `code_consumed`; `native/logout` with the token → the
-  `pats` row is gone (DB read-back); `curl -sI https://memos.discomarder.live/ios/auth/callback`
-  → 200 text/html with the native-callback marker, and `/.well-known/apple-app-site-association`
-  → 404 (unset in prod until Phase 4) — neither returns the SPA shell. `diff` of the live Authelia
+  `pats` row is gone (DB read-back); `curl -s -o body.html -w '%{http_code} %{content_type}'
+  https://memos.discomarder.live/ios/auth/callback` → `200 text/html…` and `grep -c
+  data-memosng-native-callback body.html` → 1 (GET, not HEAD — a GET-only route answers 405 to
+  HEAD), and `curl -s -o /dev/null -w '%{http_code}' …/.well-known/apple-app-site-association` →
+  404 (unset in prod until Phase 4) — neither returns the SPA shell. `diff` of the live Authelia
   config hash before/after the
   phase is empty (positive control: the hash changes when a byte is appended to a scratch copy).
 - **Status:** pending
@@ -884,3 +886,9 @@ Codex (`codex-cli 0.144.6`, `--sandbox read-only`, `model_reasoning_effort=high`
 Estate ADR index (page 2697) checked 2026-08-23: portainer-stacks ADR-0002 (estate-scope) (`/link/1429`, OIDC for
 mobile-capable apps) honoured; bookstack-ng ADR-0002 (`/link/1432`) cited as a project-scoped
 precedent for a different client type; no estate ADR settles a web or iOS stack.
+
+Phase 2 premise gate (session `01a02d1a-36d1-7211-96d7-1ea1162e0e37`): round 1 REVISE (3
+BLOCKING — cleanup vs. classification, authorize-URL equality, route precedence; all folded),
+round 2 REVISE with one marginal blocker (HEAD vs GET in the production probe — folded) and 3
+advisories (folded into the implementer brief). No round 3 run: per round discipline the
+remaining findings were marginal; the post-phase code gate on the actual diff is the next check.

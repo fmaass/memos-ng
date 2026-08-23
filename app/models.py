@@ -369,6 +369,29 @@ class Pat(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class NativeAuthCode(Base):
+    """A one-shot browser→app handoff code from a native device login.
+
+    Nothing here is a credential on its own: the row is useless without the PKCE verifier only the
+    initiating app holds, and only the sha256 of the code is stored — so a database read cannot be
+    replayed into a token. Rows are short-lived (`expires_at`), single-use (`consumed_at`) and
+    swept an hour past expiry by the next mint.
+    """
+
+    __tablename__ = "native_auth_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # The APP's PKCE challenge, not the BFF's — it binds this code to the app instance that
+    # started the login, so a code intercepted in flight cannot be exchanged by anyone else.
+    code_challenge: Mapped[str] = mapped_column(String(128))
+    device_name: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Reaction(Base):
     __tablename__ = "reactions"
     __table_args__ = (UniqueConstraint("memo_id", "user_id", "emoji", name="uq_reaction"),)

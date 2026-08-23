@@ -172,6 +172,27 @@ class Settings(BaseSettings):
     # still in use?" answer wants finer granularity than a browser session's.
     PAT_LAST_USED_THROTTLE_S: int = 300
 
+    # Browser-brokered native device login. The app never talks to Authelia itself (Decision 1/2):
+    # it opens the ordinary web login in ASWebAuthenticationSession, and the BFF hands the result
+    # back over an HTTPS callback the app owns via its associated-domains entitlement.
+    NATIVE_CALLBACK_URL: str = "https://memos.discomarder.live/ios/auth/callback"
+    # Seconds a handoff code stays exchangeable. Short by design — the code travels through a URL
+    # and its only job is to survive the hop from the auth session back into the app.
+    NATIVE_CODE_TTL_S: int = 120
+    # Lifetime of the PAT a device login mints. Bounds the blast radius of a lost phone that
+    # nobody revokes; matches the /api/pats upper bound (PatCreate.expires_in_days le=365).
+    NATIVE_TOKEN_DAYS: int = 365
+    # Apple associated-domains identity. While APPLE_TEAM_ID is unset (no Developer Program
+    # membership yet) the AASA route 404s, which is the correct answer for a domain that claims
+    # no app. Settings are read ONCE at process start, so enabling this is an env change plus a
+    # same-image `up -d --force-recreate` — never a bare env edit.
+    APPLE_TEAM_ID: str | None = None
+    IOS_BUNDLE_ID: str = "live.discomarder.memosng"
+    # Which AASA sections to emit. `webcredentials` is what the callback interception needs;
+    # `applinks` is kept switchable because which one ASWebAuthenticationSession's HTTPS callback
+    # actually requires is an OPEN question answered in Phase 4 against Apple's docs.
+    AASA_KEYS: list[str] = ["webcredentials"]
+
     @property
     def is_production(self) -> bool:
         return self.ENV != "development"
