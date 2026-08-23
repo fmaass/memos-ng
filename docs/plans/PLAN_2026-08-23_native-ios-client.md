@@ -436,8 +436,10 @@ Each phase is independently shippable and ends in an objective verification gate
     expires_at = now+120 s, consumed_at NULL}` (new table, expand-only migration); 302 to
     `settings.NATIVE_CALLBACK_URL` (default `https://memos.discomarder.live/ios/auth/callback`)
     with `?code=<random 32 B urlsafe>`. On an IdP error (`error=` param) in ios mode: 302 to the
-    same URL with `?error=<code>`. Opportunistically delete expired rows on each mint (no worker
-    job).
+    same URL with `?error=<code>`. Opportunistically delete rows whose `expires_at < now() −
+    1 hour` on each mint (no worker job) — NOT merely expired rows, so a code stays classifiable
+    as `code_expired` for an hour after expiry; after cleanup it reports `code_invalid`
+    (documented; both are terminal for the client).
   - `POST /api/auth/native/exchange` body `{code, code_verifier}` (no cookie, no CSRF by
     construction): **consume atomically in ONE statement** — `UPDATE native_auth_codes SET
     consumed_at = now() WHERE code_hash = :h AND consumed_at IS NULL AND expires_at > now()
@@ -447,7 +449,11 @@ Each phase is independently shippable and ends in an objective verification gate
     (default **365**); return `{token, expires_at, user}` — the one and only plaintext exposure.
     Failures → 400 with a stable `detail` code (`code_invalid|code_expired|code_consumed|
     verifier_mismatch`), nothing else leaked (`expired` vs `consumed` derived from a follow-up
-    read when the UPDATE matched nothing; `invalid` when no row exists).
+    read when the UPDATE matched nothing; `invalid` when no row exists — including an expired
+    code already swept by the 1-hour cleanup). On `verifier_mismatch` the consumption is
+    COMMITTED before the 400 is raised (the request-scoped session does not auto-commit).
+    Table shape: integer PK, `code_hash` UNIQUE + indexed, `user_id` FK → users ON DELETE
+    CASCADE, timestamps TIMESTAMPTZ.
   - `POST /api/auth/native/logout`: requires a bearer (`auth_kind == "pat"`), deletes THAT PAT
     row only (Decision 5); 401 otherwise.
   - `GET /.well-known/apple-app-site-association`: anonymous, `application/json`, built from
@@ -461,9 +467,14 @@ Each phase is independently shippable and ends in an objective verification gate
     `AASA_KEYS = ["webcredentials"]`.
   - Regenerate `openapi.json` + `frontend/src/api/schema.d.ts` (the Phase 1 drift test enforces
     it); `vue-tsc` green; no SPA view change.
-  - Tests (through the mocked-OIDC flow the `logged_in_client` fixture already uses): ios-mode
-    login 302 targets the SAME Authelia URL as web mode (assert client_id / redirect_uri / scope
-    equality — the "Authelia untouched" proof in code); callback in ios mode → 302 to
+  - Tests (through the mocked-OIDC flow the `logged_in_client` fixture already uses, plus a CLEAN
+    mocked-OIDC client with no session for the no-session assertions): ios-mode login 302
+    targets the SAME Authelia authorize request as web mode — parse both `Location` URLs and
+    assert identical scheme/host/path, an identical SET of query keys, and identical values for
+    every key except the per-request randoms `state`, `code_challenge` (the BFF's own PKCE
+    challenge; the app's challenge is never forwarded) and `nonce` if present — the "Authelia
+    untouched" proof in code; the app-supplied `code_challenge` and `device` MUST NOT appear in
+    the authorize URL; callback in ios mode → 302 to
     `NATIVE_CALLBACK_URL?code=` and NO `memosng_sid` cookie and NO `sessions` row; exchange happy
     path returns a PAT that then authenticates `GET /api/memos` and carries `expires_at ≈
     now+365 d`; wrong verifier → 400 `verifier_mismatch` and the code is consumed; second
@@ -471,8 +482,14 @@ Each phase is independently shippable and ends in an objective verification gate
     400 `code_invalid`; **two concurrent exchanges (`asyncio.gather`) of one code → exactly one
     200 and one 400 `code_consumed`**; IdP error → 302 with `error=`; `native/logout` revokes only
     the presenting PAT (two PATs, one survives); web-mode login/callback regression unchanged;
-    `code_challenge` validation (too short / bad alphabet → 422); AASA 404 when unset, valid
-    JSON with team + bundle when set.
+    `code_challenge` validation (too short / bad alphabet → 422); `device` propagates verbatim
+    into the created PAT's name and `next` is ignored in ios mode; expired-code test backdates
+    `expires_at` in PostgreSQL (not only a frozen Python clock); **route precedence over the SPA
+    catch-all** (`app/main.py` SPA fallback): `GET /ios/auth/callback` returns 200 `text/html`
+    containing the marker `data-memosng-native-callback` (NOT the SPA shell — assert the SPA's
+    root marker is absent), `GET /.well-known/apple-app-site-association` returns 404 when unset
+    and `application/json` with the team + bundle when set (never SPA HTML); the OpenAPI
+    security description marks `native/exchange` as anonymous.
 - **Do NOT:** add a second Authelia client; add a custom URL scheme; build any UI; add refresh
   tokens; store OIDC tokens for device logins (the PAT is the credential; the OIDC tokens from
   the exchange are discarded); change web-mode behaviour; add rate limiting (codes are 256-bit
@@ -486,7 +503,10 @@ Each phase is independently shippable and ends in an objective verification gate
   `Location: https://memos.discomarder.live/ios/auth/callback?code=…` (no app needed yet);
   `curl -X POST …/api/auth/native/exchange` with the matching verifier returns a token that lists
   memos; a second identical POST → 400 `code_consumed`; `native/logout` with the token → the
-  `pats` row is gone (DB read-back). `diff` of the live Authelia config hash before/after the
+  `pats` row is gone (DB read-back); `curl -sI https://memos.discomarder.live/ios/auth/callback`
+  → 200 text/html with the native-callback marker, and `/.well-known/apple-app-site-association`
+  → 404 (unset in prod until Phase 4) — neither returns the SPA shell. `diff` of the live Authelia
+  config hash before/after the
   phase is empty (positive control: the hash changes when a byte is appended to a scratch copy).
 - **Status:** pending
 
