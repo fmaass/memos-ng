@@ -162,7 +162,31 @@ def rolling_refresh_due(last_seen: datetime, now: datetime) -> bool:
     return last_seen < now - timedelta(seconds=settings.SESSION_ROLLING_THROTTLE_S)
 
 
-async def require_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
+def bearer_credential(request: Request) -> str | None:
+    """The credential of an `Authorization: Bearer …` header, else None.
+
+    None means "this request makes no bearer claim at all" — an empty or whitespace-only bearer
+    credential is still a claim, and returns "" so it is judged (and refused) as one rather than
+    silently falling through to the cookie. Any other scheme (Basic, Negotiate) is not a bearer
+    claim and leaves the caller on the cookie path.
+    """
+    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return credential.strip()
+
+
+async def require_session_user(
+    request: Request, db: AsyncSession = Depends(get_session)
+) -> User:
+    """Authenticate the browser session, and ONLY that.
+
+    A request carrying a bearer header is refused here before the cookie is read (Decision 6):
+    on the routes that mint and revoke tokens, a device token riding alongside a valid session
+    cookie must not be able to reach token management by having its header ignored.
+    """
+    if bearer_credential(request) is not None:
+        raise HTTPException(status_code=401, detail="Session authentication required")
     sid = request.cookies.get(SID_COOKIE)
     if not sid:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -189,6 +213,7 @@ async def require_user(request: Request, db: AsyncSession = Depends(get_session)
     user = (await db.execute(select(User).where(User.id == ws.user_id))).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
+    request.state.auth_kind = "session"
     return user
 
 
@@ -319,12 +344,17 @@ async def drain_pat_stamp_tasks(grace_s: float = 5.0) -> None:
 
 
 async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
-    """Return the owning user for a valid PAT, else None. Schedules the last_used stamp (at most
-    once per throttle window) as a background task; the request never waits for it."""
+    """Return the owning user for a valid, unexpired PAT, else None. Schedules the last_used stamp
+    (at most once per throttle window) as a background task; the request never waits for it."""
     pat = (
         await db.execute(select(Pat).where(Pat.hashed_token == hash_token(token)))
     ).scalar_one_or_none()
     if pat is None:
+        return None
+    # Expiry is enforced HERE rather than in the callers so every bearer surface inherits it from
+    # one place — the compat surface (which downgrades an unusable token to anonymous/PUBLIC-only)
+    # as much as the routes that 401. An expired token is also not worth a last_used stamp.
+    if pat.expires_at is not None and pat.expires_at <= datetime.now(UTC):
         return None
     # Read the FK BEFORE the stamp commits: a session configured to expire on commit would have to
     # lazy-refresh the attribute afterwards, which async IO cannot do from attribute access.
@@ -348,13 +378,29 @@ async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
     return user
 
 
+async def require_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
+    """Authenticate a request by bearer PAT first, else by session cookie.
+
+    Bearer-first and fail-closed (Decision 6): once a request states a bearer credential, that
+    credential decides the outcome — an unknown, revoked or expired one is a 401 even when a valid
+    session cookie rides along, because ambiguous credentials must not silently downgrade to the
+    weaker-bound one. A header in another scheme states no bearer claim and leaves the cookie path
+    exactly as it was.
+    """
+    credential = bearer_credential(request)
+    if credential is None:
+        return await require_session_user(request, db)
+    user = await authenticate_pat(db, credential)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or revoked token")
+    request.state.auth_kind = "pat"
+    return user  # the last_used stamp runs off the request path (see authenticate_pat)
+
+
 async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
-    authz = request.headers.get("Authorization", "")
-    if authz.startswith("Bearer ") and authz[7:].startswith(PAT_PREFIX):
-        user = await authenticate_pat(db, authz[7:])
-        if user is None:
-            raise HTTPException(status_code=401, detail="Invalid or revoked token")
-        return user  # the last_used stamp runs off the request path (see authenticate_pat)
+    """Alias of require_user, kept so the routes widened to PAT auth before this change keep the
+    dependency name they were reviewed under. Now that every route accepts a bearer it carries no
+    meaning of its own; the call sites collapse onto require_user in a later cleanup."""
     return await require_user(request, db)
 
 

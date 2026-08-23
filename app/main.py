@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import structlog
 from anyio import to_thread
 from fastapi import FastAPI, Response
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -83,6 +85,43 @@ app.router.routes.extend(compat_router.router.routes)
 
 # Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+
+SECURITY_SCHEMES = {
+    "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "memos_pat",
+        "description": "A personal access token (`memos_pat_…`). Accepted on every /api/* route "
+        "except /api/pats/*, which is browser-session-only.",
+    },
+    "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": auth.SID_COOKIE,
+        "description": "The BFF session cookie set by the OIDC login flow.",
+    },
+}
+
+
+def custom_openapi() -> dict[str, Any]:
+    """The served schema plus the two credentials the API actually accepts.
+
+    FastAPI derives `securitySchemes` from security dependencies, and this app authenticates in
+    plain dependency functions (app/auth.py) — so the exported document, which is the ONLY contract
+    the generated clients see (ADR-0009), would otherwise describe an API with no way in. The
+    schemes are catalogued, not attached per operation: which credential a route takes is decided
+    by its dependency, and asserting a blanket requirement here would misdescribe the public
+    surfaces (/health, the /api/v1 compat reads, signed asset URLs).
+    """
+    if app.openapi_schema is None:
+        schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+        schema.setdefault("components", {})["securitySchemes"] = SECURITY_SCHEMES
+        app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi  # type: ignore[method-assign]
 
 CSP = (
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,9 +13,16 @@ from app.services import pats as svc
 
 router = APIRouter(prefix="/api/pats", tags=["pats"])
 
+# Session-only by design (Decision 5): a leaked device token must not be able to mint successors
+# that outlive its own revocation, so token management is reachable from a browser session alone.
+
 
 class PatCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    # Omitted = a token that never expires (every PAT that existed before device tokens). The
+    # upper bound keeps a device token's blast radius bounded to a year even when the device is
+    # lost and nobody revokes it; the lower bound refuses a token that is already dead on arrival.
+    expires_in_days: int | None = Field(default=None, ge=1, le=365)
 
 
 class PatOut(BaseModel):
@@ -23,6 +30,7 @@ class PatOut(BaseModel):
     name: str
     last_used: datetime | None
     created_at: datetime
+    expires_at: datetime | None
 
 
 class PatCreated(PatOut):
@@ -33,31 +41,48 @@ class PatCreated(PatOut):
 @router.post("", response_model=PatCreated, status_code=201)
 async def create_pat(
     body: PatCreate,
-    user: Annotated[User, Depends(auth.require_user)],
+    user: Annotated[User, Depends(auth.require_session_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> PatCreated:
-    pat, token = await svc.create_pat(db, user, body.name)
+    expires_at = (
+        datetime.now(UTC) + timedelta(days=body.expires_in_days)
+        if body.expires_in_days is not None
+        else None
+    )
+    pat, token = await svc.create_pat(db, user, body.name, expires_at=expires_at)
     await db.commit()
     return PatCreated(
-        id=pat.id, name=pat.name, last_used=pat.last_used, created_at=pat.created_at, token=token
+        id=pat.id,
+        name=pat.name,
+        last_used=pat.last_used,
+        created_at=pat.created_at,
+        expires_at=pat.expires_at,
+        token=token,
     )
 
 
 @router.get("", response_model=list[PatOut])
 async def list_pats(
-    user: Annotated[User, Depends(auth.require_user)],
+    user: Annotated[User, Depends(auth.require_session_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> list[PatOut]:
     rows = (await db.execute(select(Pat).where(Pat.user_id == user.id))).scalars().all()
     return [
-        PatOut(id=p.id, name=p.name, last_used=p.last_used, created_at=p.created_at) for p in rows
+        PatOut(
+            id=p.id,
+            name=p.name,
+            last_used=p.last_used,
+            created_at=p.created_at,
+            expires_at=p.expires_at,
+        )
+        for p in rows
     ]
 
 
 @router.delete("/{pat_id}", status_code=204)
 async def revoke_pat(
     pat_id: int,
-    user: Annotated[User, Depends(auth.require_user)],
+    user: Annotated[User, Depends(auth.require_session_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
     pat = (await db.execute(select(Pat).where(Pat.id == pat_id))).scalar_one_or_none()
