@@ -525,7 +525,9 @@ Each phase is independently shippable and ends in an objective verification gate
   that re-renders the committed inputs and fails on any projection difference (it never
   writes); (iv) `fixtures/markdown-parity.schema.md` defining the projection exactly: an ordered
   list of blocks `{type: heading|paragraph|list|task|code|blockquote|table|hr, level?, text,
-  checked?, items?, rows?, links}` where `text` is Unicode NFC, runs of whitespace collapsed to
+  checked?, items?, rows?, links, inline}` where `inline` is the ordered list of styled spans
+  `{type: strike|em|strong|code, text}` found in the block (so a renderer that drops
+  strikethrough or emphasis cannot pass), and `text` is Unicode NFC, runs of whitespace collapsed to
   one space, trimmed, `<br>` (soft breaks) kept as `\n`; code blocks verbatim; tables as rows
   of cell texts; links as ordered `{href, text}` with only `http(s)`/`mailto` hrefs retained
   (others projected as plain text); tag-only lines absent. Verification for 3a: local gate
@@ -546,7 +548,11 @@ Each phase is independently shippable and ends in an objective verification gate
   **fail-fast**: `xcodegen generate` → `swift format lint --strict --recursive .` →
   `xcodebuild test -scheme MemosNG -destination 'platform=iOS Simulator,name=<iPhone>'` → for each
   package `swift package show-dependencies` (dependency-rule check) → a test-count check that
-  greps `Executed N tests` per suite and fails if any of the three suites ran 0 tests; (5) the
+  reads per-bundle test counts from the `.xcresult` (`xcrun xcresulttool get test-results
+  summary`/`tests` JSON — Swift Testing reports `Test run with N tests`, NOT XCTest's
+  `Executed N tests`, which may read 0 for a correct Swift Testing bundle) and fails if any of the
+  three suites ran 0 tests (the empty-project first probe is expected to fail here — that failure
+  IS the proof the check engages); (5) the
   gate log begins with provenance — local HEAD SHA, the FULL `git status --porcelain` (not only
   `--stat`) and `git diff --stat` — and ends with one summary line listing every step's exit
   code; (6) the script's own exit code is the first non-zero step (never masked by a pipe) and
@@ -576,8 +582,8 @@ Each phase is independently shippable and ends in an objective verification gate
     ported from `frontend/src/lib/markdown.ts:24-42` and `toggleTask` from
     `frontend/src/lib/tasks.ts`, each with the SAME vectors as `frontend/src/lib/__tests__/`;
     `Keychain` wrapper using `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` in the app's
-    DEFAULT keychain — it takes an optional access-group parameter that stays unset until Phase 5
-    adds the App Groups + Keychain Sharing entitlements (setting `kSecAttrAccessGroup` without the
+    DEFAULT keychain — it takes an optional access-group parameter that stays unset until Phase 4
+    provisions the App Groups + Keychain Sharing entitlements (Phase 5's extension consumes them) (setting `kSecAttrAccessGroup` without the
     entitlement fails with `errSecMissingEntitlement`)), `MemosFeatures` (`TimelineView`,
     `MemoDetailView`, `SettingsView`/`SignInView`). Dependency rule enforced by package
     manifests: Features → Core → API; the app target only composes. Third-party: `MarkdownUI`
@@ -627,7 +633,7 @@ Each phase is independently shippable and ends in an objective verification gate
   Packages/MemosCore/Package.swift` → 0 hits, with `grep -n "MemosCore"
   Packages/MemosFeatures/Package.swift` ≥ 1 as the positive control; parity suite green with
   ≥ 15 cases and shown red once against a deliberately altered projection; the gate log shows
-  `Executed N tests` with N ≥ 1 for each of the three suites; Codex read-only
+  the `.xcresult`-derived count N ≥ 1 for each of the three suites; Codex read-only
   review of the Swift diff (medium) → APPROVE; an Opus verifier re-runs `bin/mac-gate.sh`.
   Known-unknown: simulator reachability of `memos.discomarder.live` from merkur is assumed;
   pivot = run the backend on merkur (`uv run` + `compose.dev.yaml`) for development and keep prod
@@ -654,9 +660,10 @@ Each phase is independently shippable and ends in an objective verification gate
   visibility, tags; task toggle = `toggleTask` → `PATCH /api/memos/{uid}` with optimistic store
   update and rollback on failure. Error doctrine: typed `APIError`, `.unauthorized` →
   `SessionStore.signOut()`. Pasted-PAT sign-in stays as the "advanced" option (reviewer/demo
-  path). Optional `SwiftData` read cache of the timeline (no offline writes). Entitlements:
-  Associated Domains (`webcredentials:memos.discomarder.live` or `applinks:` per the probe),
-  App Groups, Keychain Sharing.
+  path). Optional `SwiftData` read cache of the timeline (no offline writes). Entitlements (Phase 4 provisions ALL three; Phase 5 only adds the extension target to the
+  group): Associated Domains (`webcredentials:memos.discomarder.live` or `applinks:` per the
+  probe), App Groups (`group.live.discomarder.memosng`), Keychain Sharing — and the `Keychain`
+  wrapper's access group is set to the app group here.
 - **Do NOT:** custom URL scheme fallback; offline edit queue; conflict resolution; share
   extension; iPad layout.
 - **Verification:** Swift Testing: PKCE known-answer vectors (RFC 7636 Appendix B), `toggleTask`
@@ -915,6 +922,12 @@ Codex (`codex-cli 0.144.6`, `--sandbox read-only`, `model_reasoning_effort=high`
 Estate ADR index (page 2697) checked 2026-08-23: portainer-stacks ADR-0002 (estate-scope) (`/link/1429`, OIDC for
 mobile-capable apps) honoured; bookstack-ng ADR-0002 (`/link/1432`) cited as a project-scoped
 precedent for a different client type; no estate ADR settles a web or iOS stack.
+
+Phase 3 premise gate (session `01a02ddc-c5a9-7af2-9911-99e9005df77e`): round 1 REVISE (6
+BLOCKING — fixture inputs/structure, write-separation, happy-dom vs DOMPurify, mac-gate contract,
+scheme test targets, keychain entitlement; all folded), round 2 REVISE with 3 precision items
+(inline marks in the projection, Swift Testing count source, entitlement phase ownership — folded)
++ advisories; no round 3 per round discipline — the post-phase gate on the diff is next.
 
 Phase 2 premise gate (session `01a02d1a-36d1-7211-96d7-1ea1162e0e37`): round 1 REVISE (3
 BLOCKING — cleanup vs. classification, authorize-URL equality, route precedence; all folded),
