@@ -219,7 +219,7 @@ A Swift phase cannot be built on jupiter at all — its build/test gate runs on 
 3. **Reference architecture = SwiftUI + Observation (`@Observable` store per feature, "MVVM-lite")
    + environment-based DI + local SwiftPM feature packages + `swift-openapi-generator` client +
    Swift Testing + `swift format`, Swift 6 language mode with strict concurrency ON, iOS 26
-   minimum.** Alternatives: TCA (rejected: polarizing, not "common best practice"); Swift 5
+   minimum, project-as-code via XcodeGen (`project.yml` committed, `.xcodeproj` generated).** Alternatives: TCA (rejected: polarizing, not "common best practice"); Swift 5
    mode (rejected: a reference must be strict from day one); iOS 18 minimum (rejected: iOS 26
    is at ~80 % and iOS 27 ships before the app does). Cost to change: TCA = rewrite Phases 3–5;
    min-iOS raise = trivial, lower = loss of Liquid-Glass-era APIs.
@@ -240,8 +240,9 @@ A Swift phase cannot be built on jupiter at all — its build/test gate runs on 
    change: trivial.
 7. **Markdown rendering via the `MarkdownUI` package** (GFM incl. task lists) over a
    hand-written renderer on Apple's `swift-markdown`. OPEN: its 2026 maintenance state was not
-   verified — Phase 3's first action checks it; pivot to `swift-markdown` + a small renderer if
-   the last release is older than 12 months or it lacks Swift 6 mode.
+   verified — Phase 3's first action checks it; MarkdownUI's self-declared maintenance mode alone does NOT trigger the pivot; the trigger is a
+   failed build under Swift 6 strict mode on Xcode 26.6 or missing GFM task-list/table rendering;
+   pivot = `swift-markdown` + a small renderer.
 8. **Tickets live in windshift MEMNG (id 16) under one Epic labelled `plan` + `ios`**; no new
    workspace until `memos-ng-ios` is cloned by a second project. Cost to change: trivial.
 
@@ -514,43 +515,76 @@ Each phase is independently shippable and ends in an objective verification gate
 
 ### Phase 3 — `memos-ng-ios` foundation: the reference skeleton
 - **Branch:** TWO declared branches. (3a) memos-ng `feature/markdown-parity-fixture` — a small
-  PR merged FIRST: the vitest projection generator, the tracked `fixtures/markdown-parity.json`,
-  and a vitest drift test that fails when the committed JSON no longer matches the SPA
-  renderer's output (local gate + `npm test` green, Codex diff review medium). (3b) new repo
+  PR merged FIRST: (i) `fixtures/markdown-parity.json` = a **versioned** document
+  `{schema: 1, generator: "<renderer sha>", cases: [{id, markdown, projection}]}` that CARRIES
+  each case's Markdown input; (ii) `frontend/scripts/gen-markdown-parity.ts` run by
+  `npm run gen:markdown-parity` — the ONLY writer, rendering each case through the real SPA
+  renderer (`renderMemoMarkdown` incl. DOMPurify) under **jsdom** (DOMPurify supports jsdom,
+  not happy-dom — per-file `@vitest-environment jsdom`, jsdom added as a dev dependency if
+  absent); (iii) `frontend/src/lib/__tests__/markdown-parity.spec.ts` — READ-ONLY drift test
+  that re-renders the committed inputs and fails on any projection difference (it never
+  writes); (iv) `fixtures/markdown-parity.schema.md` defining the projection exactly: an ordered
+  list of blocks `{type: heading|paragraph|list|task|code|blockquote|table|hr, level?, text,
+  checked?, items?, rows?, links, inline}` where `inline` is the ordered list of styled spans
+  `{type: strike|em|strong|code, text}` found in the block (so a renderer that drops
+  strikethrough or emphasis cannot pass), and `text` is Unicode NFC, runs of whitespace collapsed to
+  one space, trimmed, `<br>` (soft breaks) kept as `\n`; code blocks verbatim; tables as rows
+  of cell texts; links as ordered `{href, text}` with only `http(s)`/`mailto` hrefs retained
+  (others projected as plain text); tag-only lines absent. Verification for 3a: local gate
+  + `npm run typecheck` + `npm test` green; the drift spec shown red once against a hand-edited
+  projection; Codex diff review (medium). (3b) new repo
   `memos-ng-ios` (GitHub, private until Phase 7), default branch `main`, work on
   `feature/foundation`, which vendors the merged fixture by memos-ng SHA.
 - **Execution model:** implementer = Opus `implementer` in a worktree on jupiter (Swift is text;
   no toolchain is needed to write it); build host = **merkur** once Xcode 26.6 is installed
   (user action: ~30 GB disk cleanup from the reclaimable set + App Store install; then
   `xcode-select -s`, license acceptance and the iOS 26 simulator runtime are scriptable over
-  SSH). The gate is **`bin/mac-gate.sh`** — the first deliverable of this phase: `rsync --delete` the
-  worktree to a **dedicated, disposable gate directory** `merkur:~/build/memos-ng-ios/gate/<branch>/`,
-  run `xcodebuild test` and `swift format lint --strict --recursive .` there, stream output,
-  **return the remote exit code**, and copy the `.xcresult` and simulator screenshots back to
+  SSH). The gate is **`bin/mac-gate.sh`** — the first deliverable of this phase. Contract: (1) refuse
+  (exit 2) unless the local tree has a HEAD; (2) compute the remote target
+  `~/build/memos-ng-ios/gate/<branch>/` and refuse unless its realpath is inside
+  `~/build/memos-ng-ios/gate/` (never `~/projects/`); (3) `rsync -a --delete` the worktree
+  EXCLUDING `.git`, `.build`, `DerivedData`, `*.xcodeproj`, `*.xcresult`; (4) on merkur, with
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` exported, run in order and
+  **fail-fast**: `xcodegen generate` → `swift format lint --strict --recursive .` →
+  `xcodebuild test -scheme MemosNG -destination 'platform=iOS Simulator,name=<iPhone>'` → for each
+  package `swift package show-dependencies` (dependency-rule check) → a test-count check that
+  reads per-bundle test counts from the `.xcresult` (`xcrun xcresulttool get test-results
+  summary`/`tests` JSON — Swift Testing reports `Test run with N tests`, NOT XCTest's
+  `Executed N tests`, which may read 0 for a correct Swift Testing bundle) and fails if any of the
+  three suites ran 0 tests (the empty-project first probe is expected to fail here — that failure
+  IS the proof the check engages); (5) the
+  gate log begins with provenance — local HEAD SHA, the FULL `git status --porcelain` (not only
+  `--stat`) and `git diff --stat` — and ends with one summary line listing every step's exit
+  code; (6) the script's own exit code is the first non-zero step (never masked by a pipe) and
+  is returned to the caller; (7) the `.xcresult` and simulator screenshots are copied back to
   the local scratchpad. **Exchange contract (the B7 guard):** git is the ONLY medium between
-  machines. The gate directory is never a git checkout and is never opened in Xcode; the user's
-  hands-on checkout is an ordinary clone at `merkur:~/projects/memos-ng-ios` that the user
-  commits and pushes from; implementers `git pull` before starting and never rsync toward that
-  path. `mac-gate.sh` refuses to run (exit 2) if its target resolves inside `~/projects/` on
-  merkur or if the local worktree has no commit (`git rev-parse HEAD` fails); the remote run
-  records the local HEAD SHA in the gate log so a reviewed PR and a gated tree are provably the
-  same commit plus the declared uncommitted diff (`git diff --stat` is printed into the log).
+  machines; the gate directory is never a git checkout and never opened in Xcode; the user's
+  hands-on checkout is an ordinary clone at `merkur:~/projects/memos-ng-ios` (run `xcodegen
+  generate` after clone) that is never an rsync target; implementers `git pull` before starting.
 - **Build:**
-  - Xcode 26.x project `MemosNG`, bundle id `live.discomarder.memosng`, iOS 26.0 minimum,
-    iPhone only, **Swift 6 language mode + strict concurrency enabled explicitly** in every
+  - Xcode project `MemosNG` **generated by XcodeGen from a committed `project.yml`** (project as
+    code: the `.xcodeproj` is gitignored and regenerated by `bin/mac-gate.sh` and by a developer's
+    `xcodegen generate` after clone — a hand-maintained `.xcodeproj` is an opaque, merge-hostile
+    artifact that agents on jupiter cannot author or review; XcodeGen 2.46 is installed on merkur),
+    bundle id `live.discomarder.memosng`, iOS 26.0 minimum, iPhone only; `project.yml` declares
+    one scheme `MemosNG` whose test action runs the package test targets `MemosCoreTests`,
+    `MemosAPITests` and `MemosFeaturesTests` — `xcodebuild test` MUST execute all three, **Swift 6 language mode + strict concurrency enabled explicitly** in every
     target and every local package (`swiftLanguageModes: [.v6]`), Approachable Concurrency +
     MainActor default isolation on the app and Features targets. **Build with Xcode 26.6, not
     the 27 beta** (the Liquid Glass compatibility key is ignored under 27; keep the toolchain
     stable until Phase 6).
   - Local SwiftPM packages under `Packages/`: `MemosAPI` (swift-openapi-generator plugin +
-    `openapi.json` vendored by `scripts/sync-openapi.sh <memos-ng-sha>` with the SHA recorded in
-    `Packages/MemosAPI/OPENAPI_SOURCE`; `BearerAuthMiddleware`; `ServerConfiguration` (base URL);
+    `openapi.json` AND `fixtures/markdown-parity.json` vendored together by
+    `scripts/sync-openapi.sh <memos-ng-full-sha>` (both fetched from that one SHA via `git show`;
+    SHA recorded in `Packages/MemosAPI/OPENAPI_SOURCE`); `BearerAuthMiddleware`; `ServerConfiguration` (base URL);
     `APIClientFactory`), `MemosCore` (domain models mapped from generated types; `@Observable`
     stores `SessionStore`, `TimelineStore`; pure functions `stripTagOnlyLines` / `isTagOnlyLine`
     ported from `frontend/src/lib/markdown.ts:24-42` and `toggleTask` from
     `frontend/src/lib/tasks.ts`, each with the SAME vectors as `frontend/src/lib/__tests__/`;
-    `Keychain` wrapper using `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` + app-group
-    access group `group.live.discomarder.memosng`), `MemosFeatures` (`TimelineView`,
+    `Keychain` wrapper using `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` in the app's
+    DEFAULT keychain — it takes an optional access-group parameter that stays unset until Phase 4
+    provisions the App Groups + Keychain Sharing entitlements (Phase 5's extension consumes them) (setting `kSecAttrAccessGroup` without the
+    entitlement fails with `errSecMissingEntitlement`)), `MemosFeatures` (`TimelineView`,
     `MemoDetailView`, `SettingsView`/`SignInView`). Dependency rule enforced by package
     manifests: Features → Core → API; the app target only composes. Third-party: `MarkdownUI`
     (Decision 7, verified first), nothing else.
@@ -559,13 +593,13 @@ Each phase is independently shippable and ends in an objective verification gate
     bare URLs become links (`linkify`); GFM task lists, tables, strikethrough, headings, block
     quotes, code; a link is tappable only when its scheme is `http`, `https` or `mailto`
     (`ALLOWED_URI_REGEXP`), any other scheme renders as plain text; tag-only lines are stripped.
-    **Parity fixture:** a committed corpus of ≥ 15 synthetic memos covering every rule (incl.
-    `<script>`, `javascript:` links, nested task lists, `#tag`-only lines, soft breaks, tables)
-    is rendered by the SPA renderer in a vitest spec that emits one *projection* per memo — text
-    content, ordered link hrefs, checkbox states — to `fixtures/markdown-parity.json` in memos-ng
-    (branch 3a above; tracked, regenerated like `openapi.json`, drift-tested by vitest); the Swift
-    side vendors the merged file next to `openapi.json` with the same source SHA and a Swift Testing suite asserts the same projection from
-    the rendered document model. A renderer that diverges from the SPA fails this suite.
+    **Parity fixture (consumer side):** the Swift side vendors the merged
+    `fixtures/markdown-parity.json` next to `openapi.json` (same source SHA) and a Swift Testing
+    suite renders each case's **carried Markdown input** through the app's renderer and asserts
+    the same block-structured projection (schema 1) — headings, lists, task states, code,
+    blockquotes, tables, strikethrough, links, soft breaks, stripped tag-only lines. A renderer
+    that flattens structure or tests different inputs cannot pass. Residual: jsdom ≠ Safari;
+    accepted and documented in the schema file.
   - Sign-in v1: server URL + pasted PAT (MoeMemos pattern) → validated with `GET /api/auth/user`
     → Keychain. Signed-out state on any 401.
   - Timeline: cursor-paginated `GET /api/memos`, pull-to-refresh, `AsyncImage` for `thumb`/
@@ -598,7 +632,8 @@ Each phase is independently shippable and ends in an objective verification gate
   Packages/MemosAPI/Package.swift` → 0 hits and `grep -n "MemosFeatures"
   Packages/MemosCore/Package.swift` → 0 hits, with `grep -n "MemosCore"
   Packages/MemosFeatures/Package.swift` ≥ 1 as the positive control; parity suite green with
-  ≥ 15 cases and shown red once against a deliberately altered projection; Codex read-only
+  ≥ 15 cases and shown red once against a deliberately altered projection; the gate log shows
+  the `.xcresult`-derived count N ≥ 1 for each of the three suites; Codex read-only
   review of the Swift diff (medium) → APPROVE; an Opus verifier re-runs `bin/mac-gate.sh`.
   Known-unknown: simulator reachability of `memos.discomarder.live` from merkur is assumed;
   pivot = run the backend on merkur (`uv run` + `compose.dev.yaml`) for development and keep prod
@@ -625,9 +660,10 @@ Each phase is independently shippable and ends in an objective verification gate
   visibility, tags; task toggle = `toggleTask` → `PATCH /api/memos/{uid}` with optimistic store
   update and rollback on failure. Error doctrine: typed `APIError`, `.unauthorized` →
   `SessionStore.signOut()`. Pasted-PAT sign-in stays as the "advanced" option (reviewer/demo
-  path). Optional `SwiftData` read cache of the timeline (no offline writes). Entitlements:
-  Associated Domains (`webcredentials:memos.discomarder.live` or `applinks:` per the probe),
-  App Groups, Keychain Sharing.
+  path). Optional `SwiftData` read cache of the timeline (no offline writes). Entitlements (Phase 4 provisions ALL three; Phase 5 only adds the extension target to the
+  group): Associated Domains (`webcredentials:memos.discomarder.live` or `applinks:` per the
+  probe), App Groups (`group.live.discomarder.memosng`), Keychain Sharing — and the `Keychain`
+  wrapper's access group is set to the app group here.
 - **Do NOT:** custom URL scheme fallback; offline edit queue; conflict resolution; share
   extension; iPad layout.
 - **Verification:** Swift Testing: PKCE known-answer vectors (RFC 7636 Appendix B), `toggleTask`
@@ -886,6 +922,12 @@ Codex (`codex-cli 0.144.6`, `--sandbox read-only`, `model_reasoning_effort=high`
 Estate ADR index (page 2697) checked 2026-08-23: portainer-stacks ADR-0002 (estate-scope) (`/link/1429`, OIDC for
 mobile-capable apps) honoured; bookstack-ng ADR-0002 (`/link/1432`) cited as a project-scoped
 precedent for a different client type; no estate ADR settles a web or iOS stack.
+
+Phase 3 premise gate (session `01a02ddc-c5a9-7af2-9911-99e9005df77e`): round 1 REVISE (6
+BLOCKING — fixture inputs/structure, write-separation, happy-dom vs DOMPurify, mac-gate contract,
+scheme test targets, keychain entitlement; all folded), round 2 REVISE with 3 precision items
+(inline marks in the projection, Swift Testing count source, entitlement phase ownership — folded)
++ advisories; no round 3 per round discipline — the post-phase gate on the diff is next.
 
 Phase 2 premise gate (session `01a02d1a-36d1-7211-96d7-1ea1162e0e37`): round 1 REVISE (3
 BLOCKING — cleanup vs. classification, authorize-URL equality, route precedence; all folded),

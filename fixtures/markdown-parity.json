@@ -1,0 +1,554 @@
+{
+  "cases": [
+    {
+      "id": "blockquote",
+      "markdown": "> Quoted line one\n> Quoted line two\n\nAfter the quote.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "Quoted line one\nQuoted line two",
+          "type": "blockquote"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "After the quote.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "code-fenced",
+      "markdown": "```js\nconst a = 1\n  indented\n<div>raw</div>\n```",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "const a = 1\n  indented\n<div>raw</div>\n",
+          "type": "code"
+        }
+      ]
+    },
+    {
+      "id": "emphasis-and-inline-code",
+      "markdown": "**bold** and _italic_ and ~~struck~~ and `inline code` in one line.",
+      "projection": [
+        {
+          "inline": [
+            {
+              "text": "bold",
+              "type": "strong"
+            },
+            {
+              "text": "italic",
+              "type": "em"
+            },
+            {
+              "text": "struck",
+              "type": "strike"
+            },
+            {
+              "text": "inline code",
+              "type": "code"
+            }
+          ],
+          "links": [],
+          "text": "bold and italic and struck and inline code in one line.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "emphasis-in-list-and-quote",
+      "markdown": "- ~~done~~ item\n- **bold** item\n\n> a _quoted_ emphasis and `code`",
+      "projection": [
+        {
+          "inline": [
+            {
+              "text": "done",
+              "type": "strike"
+            },
+            {
+              "text": "bold",
+              "type": "strong"
+            }
+          ],
+          "items": [
+            "done item",
+            "bold item"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        },
+        {
+          "inline": [
+            {
+              "text": "quoted",
+              "type": "em"
+            },
+            {
+              "text": "code",
+              "type": "code"
+            }
+          ],
+          "links": [],
+          "text": "a quoted emphasis and code",
+          "type": "blockquote"
+        }
+      ]
+    },
+    {
+      "id": "headings-h1-h3",
+      "markdown": "# Heading one\n\n## Heading two\n\n### Heading three\n\nBody text.",
+      "projection": [
+        {
+          "inline": [],
+          "level": 1,
+          "links": [],
+          "text": "Heading one",
+          "type": "heading"
+        },
+        {
+          "inline": [],
+          "level": 2,
+          "links": [],
+          "text": "Heading two",
+          "type": "heading"
+        },
+        {
+          "inline": [],
+          "level": 3,
+          "links": [],
+          "text": "Heading three",
+          "type": "heading"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "Body text.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "hr",
+      "markdown": "Above the rule.\n\n---\n\nBelow the rule.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "Above the rule.",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "",
+          "type": "hr"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "Below the rule.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "image",
+      "markdown": "![A red square](https://example.com/red.png)\n\nThe image above renders as nothing.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "The image above renders as nothing.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-schemes",
+      "markdown": "[site](https://example.com/a?b=1) and [mail](mailto:memo@example.com) are links;\n\n[js](javascript:alert(1)) and [data](data:text/html,hi) are not.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [
+            {
+              "href": "https://example.com/a?b=1",
+              "text": "site"
+            },
+            {
+              "href": "mailto:memo@example.com",
+              "text": "mail"
+            }
+          ],
+          "text": "site and mail are links;",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "[js](javascript:alert(1)) and [data](data:text/html,hi) are not.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "linkify-bare",
+      "markdown": "Bare https://example.com/a?b=1 and memo@example.com become links.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [
+            {
+              "href": "https://example.com/a?b=1",
+              "text": "https://example.com/a?b=1"
+            },
+            {
+              "href": "mailto:memo@example.com",
+              "text": "memo@example.com"
+            }
+          ],
+          "text": "Bare https://example.com/a?b=1 and memo@example.com become links.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "list-ordered",
+      "markdown": "1. first\n2. second\n3. third",
+      "projection": [
+        {
+          "inline": [],
+          "items": [
+            "first",
+            "second",
+            "third"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": true,
+          "text": "",
+          "type": "list"
+        }
+      ]
+    },
+    {
+      "id": "list-unordered-nested",
+      "markdown": "- alpha\n  - alpha one\n  - alpha two\n- beta",
+      "projection": [
+        {
+          "inline": [],
+          "items": [
+            "alpha"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        },
+        {
+          "inline": [],
+          "items": [
+            "alpha one",
+            "alpha two"
+          ],
+          "level": 1,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        },
+        {
+          "inline": [],
+          "items": [
+            "beta"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        }
+      ]
+    },
+    {
+      "id": "memo-mixed",
+      "markdown": "## Trip planning\n\n#curated #trip\n\nPacked the **camera** and a spare battery, see #gear for the rest.\nFerry leaves at 07:15.\n\n- [x] book tickets\n- [ ] print the [confirmation](https://example.com/booking?id=7)\n\n> Weather looks fine.\n\n---\n\nNotes in `~/trips/2026.md`.",
+      "projection": [
+        {
+          "inline": [],
+          "level": 2,
+          "links": [],
+          "text": "Trip planning",
+          "type": "heading"
+        },
+        {
+          "inline": [
+            {
+              "text": "camera",
+              "type": "strong"
+            }
+          ],
+          "links": [],
+          "text": "Packed the camera and a spare battery, see #gear for the rest.\nFerry leaves at 07:15.",
+          "type": "paragraph"
+        },
+        {
+          "checked": true,
+          "inline": [],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "book tickets",
+          "type": "task"
+        },
+        {
+          "checked": false,
+          "inline": [],
+          "level": 0,
+          "links": [
+            {
+              "href": "https://example.com/booking?id=7",
+              "text": "confirmation"
+            }
+          ],
+          "ordered": false,
+          "text": "print the confirmation",
+          "type": "task"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "Weather looks fine.",
+          "type": "blockquote"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "",
+          "type": "hr"
+        },
+        {
+          "inline": [
+            {
+              "text": "~/trips/2026.md",
+              "type": "code"
+            }
+          ],
+          "links": [],
+          "text": "Notes in ~/trips/2026.md.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "raw-html-literal",
+      "markdown": "<script>alert('x')</script>\n\nAn inline <b>tag</b> and <img src=x onerror=alert(1)> stay literal.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "<script>alert('x')</script>",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "An inline <b>tag</b> and <img src=x onerror=alert(1)> stay literal.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "soft-breaks",
+      "markdown": "line one\nline two\nline three\n\nA second paragraph.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "line one\nline two\nline three",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "A second paragraph.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "table",
+      "markdown": "| tier | size | note |\n| --- | --- | --- |\n| thumb | 320 | **fast** |\n| mobile | 1080 | [docs](https://example.com/tiers) |",
+      "projection": [
+        {
+          "inline": [
+            {
+              "text": "fast",
+              "type": "strong"
+            }
+          ],
+          "links": [
+            {
+              "href": "https://example.com/tiers",
+              "text": "docs"
+            }
+          ],
+          "rows": [
+            [
+              "tier",
+              "size",
+              "note"
+            ],
+            [
+              "thumb",
+              "320",
+              "fast"
+            ],
+            [
+              "mobile",
+              "1080",
+              "docs"
+            ]
+          ],
+          "text": "",
+          "type": "table"
+        }
+      ]
+    },
+    {
+      "id": "tags-stripped-vs-inline",
+      "markdown": "#curated\n\nsee #curated inline\n\n#curated #trip\n\n# Heading is not a tag",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "see #curated inline",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "level": 1,
+          "links": [],
+          "text": "Heading is not a tag",
+          "type": "heading"
+        }
+      ]
+    },
+    {
+      "id": "task-list-basic",
+      "markdown": "- [ ] unchecked item\n- [x] checked item\n- plain item",
+      "projection": [
+        {
+          "checked": false,
+          "inline": [],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "unchecked item",
+          "type": "task"
+        },
+        {
+          "checked": true,
+          "inline": [],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "checked item",
+          "type": "task"
+        },
+        {
+          "inline": [],
+          "items": [
+            "plain item"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        }
+      ]
+    },
+    {
+      "id": "task-list-nested",
+      "markdown": "- [x] outer done\n  - [ ] inner todo\n  - [x] inner done\n- [ ] outer todo",
+      "projection": [
+        {
+          "checked": true,
+          "inline": [],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "outer done",
+          "type": "task"
+        },
+        {
+          "checked": false,
+          "inline": [],
+          "level": 1,
+          "links": [],
+          "ordered": false,
+          "text": "inner todo",
+          "type": "task"
+        },
+        {
+          "checked": true,
+          "inline": [],
+          "level": 1,
+          "links": [],
+          "ordered": false,
+          "text": "inner done",
+          "type": "task"
+        },
+        {
+          "checked": false,
+          "inline": [],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "outer todo",
+          "type": "task"
+        }
+      ]
+    },
+    {
+      "id": "unicode-nfc-nfd",
+      "markdown": "caf\u00e9 vs cafe\u0301 \ud83d\ude80",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "caf\u00e9 vs caf\u00e9 \ud83d\ude80",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "whitespace-collapsing",
+      "markdown": "a   b\t\tc   \n   d",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "a b c\nd",
+          "type": "paragraph"
+        }
+      ]
+    }
+  ],
+  "generator": "markdown-it@14.2.0+markdown-it-task-lists@2.1.1+dompurify@3.4.11+renderer-sha256:647012201ad20b80",
+  "schema": 1
+}
