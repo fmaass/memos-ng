@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "typecheck": "vue-tsc -b --noEmit",
-    "gen:api": "openapi-typescript ../openapi.json -o src/api/schema.d.ts"
+    "gen:api": "openapi-typescript ../openapi.json -o src/api/schema.d.ts",
+    "gen:markdown-parity": "node scripts/gen-markdown-parity.ts"
   },
   "dependencies": {
     "@primeuix/themes": "^2.0.3",
@@ -40,6 +41,7 @@
     "eslint": "^9.17.0",
     "eslint-plugin-vue": "^9.32.0",
     "happy-dom": "^20.9.0",
+    "jsdom": "^30.0.1",
     "openapi-typescript": "^7.4.4",
     "typescript": "~6.0.2",
     "vite": "^8.0.4",
