@@ -791,6 +791,51 @@
         "title": "MemoPatch",
         "type": "object"
       },
+      "NativeExchangeIn": {
+        "properties": {
+          "code": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "code_verifier": {
+            "maxLength": 128,
+            "minLength": 43,
+            "title": "Code Verifier",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "code_verifier"
+        ],
+        "title": "NativeExchangeIn",
+        "type": "object"
+      },
+      "NativeExchangeOut": {
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserOut"
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "user"
+        ],
+        "title": "NativeExchangeOut",
+        "type": "object"
+      },
       "PatCreate": {
         "properties": {
           "expires_in_days": {
@@ -1602,7 +1647,7 @@
     "securitySchemes": {
       "bearerAuth": {
         "bearerFormat": "memos_pat",
-        "description": "A personal access token (`memos_pat_\u2026`). Accepted on every /api/* route except /api/pats/*, which is browser-session-only.",
+        "description": "A personal access token (`memos_pat_\u2026`). Accepted on every /api/* route except /api/pats/*, which is browser-session-only, and POST /api/auth/native/exchange, which is anonymous by construction \u2014 it is how a device obtains a token in the first place, so requiring one would be circular.",
         "scheme": "bearer",
         "type": "http"
       },
@@ -2131,6 +2176,63 @@
           }
         },
         "summary": "Logout",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/auth/native/exchange": {
+      "post": {
+        "description": "Trade a handoff code plus its PKCE verifier for a device PAT.\n\nAnonymous by construction \u2014 this is how a device gets its first credential, so requiring one\nwould be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the\nrequest carries no ambient authority a browser could be tricked into attaching.\n\nEvery failure is a 400 with a stable machine-readable `detail`; none of them distinguishes\n\"wrong\" from \"not yours\", and all of them are terminal \u2014 the client starts a new login rather\nthan retrying, because a code is burned by the attempt whatever its outcome.",
+        "operationId": "native_exchange_api_auth_native_exchange_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NativeExchangeIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeExchangeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Native Exchange",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/auth/native/logout": {
+      "post": {
+        "description": "Revoke the presenting device token, and only that one.\n\nA bearer may revoke ITSELF and nothing else (Decision 5): the rest of token management stays\nbehind a browser session, so a leaked device token can neither mint successors that outlive its\nrevocation nor take another device offline. A session cookie is refused here for the same\nreason from the other side \u2014 the SPA revokes through `/api/pats/{id}`, which knows which token\nit is talking about.",
+        "operationId": "native_logout_api_auth_native_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Logout",
         "tags": [
           "auth"
         ]

@@ -162,6 +162,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/native/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Native Exchange
+         * @description Trade a handoff code plus its PKCE verifier for a device PAT.
+         *
+         *     Anonymous by construction — this is how a device gets its first credential, so requiring one
+         *     would be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the
+         *     request carries no ambient authority a browser could be tricked into attaching.
+         *
+         *     Every failure is a 400 with a stable machine-readable `detail`; none of them distinguishes
+         *     "wrong" from "not yours", and all of them are terminal — the client starts a new login rather
+         *     than retrying, because a code is burned by the attempt whatever its outcome.
+         */
+        post: operations["native_exchange_api_auth_native_exchange_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/native/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Native Logout
+         * @description Revoke the presenting device token, and only that one.
+         *
+         *     A bearer may revoke ITSELF and nothing else (Decision 5): the rest of token management stays
+         *     behind a browser session, so a leaked device token can neither mint successors that outlive its
+         *     revocation nor take another device offline. A session cookie is refused here for the same
+         *     reason from the other side — the SPA revokes through `/api/pats/{id}`, which knows which token
+         *     it is talking about.
+         */
+        post: operations["native_logout_api_auth_native_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/user": {
         parameters: {
             query?: never;
@@ -864,6 +918,24 @@ export interface components {
             upload_uids?: string[] | null;
             visibility?: components["schemas"]["Visibility"] | null;
         };
+        /** NativeExchangeIn */
+        NativeExchangeIn: {
+            /** Code */
+            code: string;
+            /** Code Verifier */
+            code_verifier: string;
+        };
+        /** NativeExchangeOut */
+        NativeExchangeOut: {
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Token */
+            token: string;
+            user: components["schemas"]["UserOut"];
+        };
         /** PatCreate */
         PatCreate: {
             /** Expires In Days */
@@ -1455,6 +1527,57 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+        };
+    };
+    native_exchange_api_auth_native_exchange_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeExchangeIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeExchangeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    native_logout_api_auth_native_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

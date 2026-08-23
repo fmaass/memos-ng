@@ -70,7 +70,7 @@ Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
 
 ## Hosts: jupiter (local, runs the app) + Saturn (NAS, runs the DB & holds data)
 
-The app/worker containers run on the **local machine (jupiter/merkur)** — deploy there with the
+The app/worker containers run on the **local machine (jupiter)** — deploy there with the
 local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn conventions:
 
 - SSH alias: **`ssh saturn.local`** (Host in `~/.ssh/config`, port 27022, user `fabian`).
