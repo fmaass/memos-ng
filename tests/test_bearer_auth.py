@@ -239,37 +239,62 @@ def test_bearer_carrying_no_credential_is_refused_not_ignored(logged_in_client):
 
 
 def test_expired_pat_is_anonymous_on_the_compat_surface(logged_in_client):
-    """The compat surface downgrades an unusable token to anonymous (PUBLIC-only, fixture F1)
-    rather than 401ing — expiry must not change that shape, only what counts as usable."""
+    """The compat surface downgrades an unusable token to anonymous rather than 401ing (F1), so
+    expiry has to be visible in the RESULT SET, not the status: the same request lists the owner's
+    PRIVATE memo while the token is live and stops listing it once the token has expired."""
     client, _ = logged_in_client
+    private = client.post("/api/memos", json={"content": "compat private", "visibility": "PRIVATE"})
+    assert private.status_code == 201
+    uid = private.json()["uid"]
     token = client.post("/api/pats", json={"name": "compat"}).json()["token"]
-    _sql(
-        "UPDATE pats SET expires_at = now() - interval '1 minute' WHERE hashed_token = :h",
-        h=auth.hash_token(token),
-    )
     anon = TestClient(app, raise_server_exceptions=False)
-    assert (
-        anon.get("/api/v1/memos", headers={"Authorization": f"Bearer {token}"}).status_code == 200
-    )
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        widened = anon.get("/api/v1/memos", headers=headers)
+        assert widened.status_code == 200
+        assert f"memos/{uid}" in {m["name"] for m in widened.json()["memos"]}
+
+        _sql(
+            "UPDATE pats SET expires_at = now() - interval '1 minute' WHERE hashed_token = :h",
+            h=auth.hash_token(token),
+        )
+        degraded = anon.get("/api/v1/memos", headers=headers)
+        assert degraded.status_code == 200  # F1 shape kept: anonymous, not refused
+        assert f"memos/{uid}" not in {m["name"] for m in degraded.json()["memos"]}
+    finally:
+        client.delete(f"/api/memos/{uid}")
 
 
-def test_pat_expiry_is_enforced_on_the_boundary_not_before(logged_in_client, monkeypatch):
-    """A PAT is valid up to its expiry instant and refused from it on — pinned through
-    authenticate_pat, so the same boundary holds on every bearer surface."""
+def test_pat_expiry_is_decided_by_the_stored_instant(logged_in_client):
+    """One token, three verdicts: valid while its expiry is in the future, refused once it is in
+    the past, usable again if it is moved back — so only the stored instant can be deciding it.
+
+    Past/future rather than the exact expiry instant: `now()` and the check race at microsecond
+    range, and a sleep would trade a real assertion for a slow one.
+    """
     client, _ = logged_in_client
     token = client.post("/api/pats", json={"name": "boundary", "expires_in_days": 1}).json()[
         "token"
     ]
     anon = TestClient(app, raise_server_exceptions=False)
     headers = {"Authorization": f"Bearer {token}"}
+    hashed = auth.hash_token(token)
     assert anon.get("/api/memos", headers=headers).status_code == 200
 
-    expires_at = _sql(
-        "SELECT expires_at FROM pats WHERE hashed_token = :h", h=auth.hash_token(token)
-    )[0][0]
+    expires_at = _sql("SELECT expires_at FROM pats WHERE hashed_token = :h", h=hashed)[0][0]
     assert expires_at is not None
     delta = expires_at - datetime.now(UTC)
-    assert 23.5 * 3600 < delta.total_seconds() <= 24 * 3600
+    assert 23.5 * 3600 < delta.total_seconds() <= 24 * 3600  # +30 days would also pass a range test
+
+    _sql(
+        "UPDATE pats SET expires_at = now() - interval '1 second' WHERE hashed_token = :h", h=hashed
+    )
+    assert anon.get("/api/memos", headers=headers).status_code == 401
+
+    _sql(
+        "UPDATE pats SET expires_at = now() + interval '1 hour' WHERE hashed_token = :h", h=hashed
+    )
+    assert anon.get("/api/memos", headers=headers).status_code == 200
 
 
 def test_rejection_logging_never_carries_the_token(logged_in_client):
