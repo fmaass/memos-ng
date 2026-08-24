@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -7,11 +8,13 @@ from anyio import to_thread
 from fastapi import FastAPI, Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
+from starlette.routing import BaseRoute
 
 from app import auth
 from app.config import settings
@@ -111,19 +114,141 @@ SECURITY_SCHEMES = {
 }
 
 
+USER_SECURITY = [{"bearerAuth": []}, {"sessionCookie": []}]
+SESSION_SECURITY = [{"sessionCookie": []}]
+# `{}` is the OAS spelling of "no credential also works": these surfaces answer an anonymous
+# caller with the PUBLIC-only slice (fixtures F1) and widen when a credential is presented, so
+# neither a hard requirement nor silence would describe them truthfully.
+OPTIONAL_PAT_SECURITY = [{"bearerAuth": []}, {}]
+SIGNED_OR_USER_SECURITY = [{"bearerAuth": []}, {"sessionCookie": []}, {}]
+
+DEPENDENCY_SECURITY: dict[str, list[dict[str, list[str]]]] = {
+    "require_user": USER_SECURITY,
+    "require_pat_or_user": USER_SECURITY,
+    "require_session_user": SESSION_SECURITY,
+    "optional_user": OPTIONAL_PAT_SECURITY,
+}
+
+# These handlers authenticate INSIDE the body, in a short-lived session released before the
+# response streams (an SSE stream or a media download must not pin a pool connection for its
+# lifetime), so there is no dependency to read and the requirement has to be stated here.
+# The signed asset fast path is the reason /attachments/{uid}/{tier} also accepts no credential:
+# a valid HMAC signature was minted against the feed's own authorization (ADR-0009).
+INLINE_AUTH_SECURITY: dict[tuple[str, str], list[dict[str, list[str]]]] = {
+    ("GET", "/api/events"): USER_SECURITY,
+    ("GET", "/api/attachments/{uid}/rendition/{variant_key}"): USER_SECURITY,
+    ("GET", "/api/attachments/{uid}/{tier}"): SIGNED_OR_USER_SECURITY,
+    ("GET", "/file/attachments/{uid}/{filename}"): OPTIONAL_PAT_SECURITY,
+}
+
+# Operations that take no credential at all. An /api/* operation that is in neither this set nor
+# one of the two maps above fails tests/test_openapi_drift.py, so a new route cannot reach the
+# schema with its authentication left unsaid.
+PUBLIC_OPERATIONS: set[tuple[str, str]] = {
+    ("GET", "/health"),
+    ("GET", "/api/push/vapid-public-key"),
+    ("POST", "/api/auth/logout"),
+    ("POST", "/api/auth/native/exchange"),
+}
+
+
+def route_security(route: APIRoute) -> list[dict[str, list[str]]] | None:
+    """The credentials this route accepts, or None when it takes none.
+
+    Read off the route's auth dependency rather than declared alongside it, so the published
+    contract cannot drift from what the route enforces (MEMNG-111).
+    """
+    for dependency in route.dependant.dependencies:
+        derived = DEPENDENCY_SECURITY.get(getattr(dependency.call, "__name__", ""))
+        if derived is not None:
+            return derived
+    for method in route.methods or ():
+        inline = INLINE_AUTH_SECURITY.get((method, route.path_format))
+        if inline is not None:
+            return inline
+    return None
+
+
+def attach_route_security(schema: dict[str, Any], routes: Sequence[BaseRoute]) -> None:
+    for route in routes:
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        security = route_security(route)
+        if security is None:
+            continue
+        operations = schema["paths"].get(route.path_format, {})
+        for method in route.methods or ():
+            operation = operations.get(method.lower())
+            if operation is not None:
+                operation["security"] = [dict(requirement) for requirement in security]
+
+
+class NullableMergeCollision(Exception):
+    """A nullable `anyOf` member and its parent disagree about a shared keyword."""
+
+
+def _is_null_schema(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") == "null" and len(node) == 1
+
+
+def _merge_nullable(keep: dict[str, Any], parent: dict[str, Any], path: str) -> dict[str, Any]:
+    rest = {k: v for k, v in parent.items() if k != "anyOf"}
+    for key in sorted(set(keep) & set(rest)):
+        if keep[key] != rest[key]:
+            raise NullableMergeCollision(
+                f"{path}: '{key}' differs between the anyOf member ({keep[key]!r}) and its "
+                f"parent ({rest[key]!r}); merging would silently drop one"
+            )
+    merged = dict(keep)
+    merged.update(rest)
+    merged["type"] = [keep["type"], "null"]
+    return merged
+
+
+def collapse_nullable_anyof(node: Any, path: str = "#") -> None:
+    """Rewrite `anyOf: [{type: X}, {type: "null"}]` into `type: [X, "null"]` in place.
+
+    Pydantic spells an optional field the first way; swift-openapi-generator has no support for a
+    bare `"null"` schema and DROPS the whole property rather than failing, so `MemoOut.archived_at`
+    and friends simply did not exist in the generated Swift types. The two spellings say the same
+    thing in JSON Schema 2020-12, so emitting the type array here retires the iOS repo's
+    vendoring-time rewrite and keeps every generated client on one contract (ADR-0009, MEMNG-105).
+
+    Only that exact two-arm inline shape is touched: `anyOf: [{$ref: …}, {type: "null"}]` cannot
+    become a type array (a reference plus null needs a different fix) and a wider union is not a
+    nullable at all. A keyword the retained member and its parent disagree about raises, because a
+    served contract that differs from the model in a way nobody chose is worse than a loud stop.
+    """
+    if isinstance(node, dict):
+        members = node.get("anyOf")
+        if isinstance(members, list) and len(members) == 2 and any(map(_is_null_schema, members)):
+            keep = next(m for m in members if not _is_null_schema(m))
+            if isinstance(keep, dict) and isinstance(keep.get("type"), str) and "$ref" not in keep:
+                merged = _merge_nullable(keep, node, path)
+                node.clear()
+                node.update(merged)
+        for key, value in list(node.items()):
+            collapse_nullable_anyof(value, f"{path}/{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            collapse_nullable_anyof(value, f"{path}/{index}")
+
+
 def custom_openapi() -> dict[str, Any]:
-    """The served schema plus the two credentials the API actually accepts.
+    """The served schema, the two credentials the API accepts, and where each one is required.
 
     FastAPI derives `securitySchemes` from security dependencies, and this app authenticates in
     plain dependency functions (app/auth.py) — so the exported document, which is the ONLY contract
-    the generated clients see (ADR-0009), would otherwise describe an API with no way in. The
-    schemes are catalogued, not attached per operation: which credential a route takes is decided
-    by its dependency, and asserting a blanket requirement here would misdescribe the public
-    surfaces (/health, the /api/v1 compat reads, signed asset URLs).
+    the generated clients see (ADR-0009), would otherwise describe an API with no way in. Each
+    operation's requirement is derived from the auth dependency it actually uses rather than
+    asserted in bulk, because a blanket requirement would misdescribe the surfaces that serve an
+    anonymous caller (/health, the /api/v1 compat reads, signed asset URLs).
     """
     if app.openapi_schema is None:
         schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
         schema.setdefault("components", {})["securitySchemes"] = SECURITY_SCHEMES
+        collapse_nullable_anyof(schema)
+        attach_route_security(schema, app.routes)
         app.openapi_schema = schema
     return app.openapi_schema
 

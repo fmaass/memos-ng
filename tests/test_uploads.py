@@ -127,17 +127,15 @@ def test_resumable_upload_resumes_and_finalizes(logged_in_client, monkeypatch, t
         c1, c2 = content[:60000], content[60000:]
         uid = _start(client, "v.mov", "video/quicktime", len(content))
 
-        assert (
-            client.patch(f"/api/uploads/{uid}", content=c1, headers={"Upload-Offset": "0"}).json()[
-                "bytes_received"
-            ]
-            == 60000
-        )
+        first = client.patch(f"/api/uploads/{uid}", content=c1, headers={"Upload-Offset": "0"})
+        assert first.json()["bytes_received"] == 60000
+        # the declared contract: every successful PATCH echoes the cursor as a header too
+        assert first.headers["Upload-Offset"] == "60000"
         # interruption → client re-syncs via HEAD, then continues from the offset
         assert client.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == "60000"
-        assert client.patch(
-            f"/api/uploads/{uid}", content=c2, headers={"Upload-Offset": "60000"}
-        ).json()["bytes_received"] == len(content)
+        second = client.patch(f"/api/uploads/{uid}", content=c2, headers={"Upload-Offset": "60000"})
+        assert second.json()["bytes_received"] == len(content)
+        assert second.headers["Upload-Offset"] == str(len(content))
 
         fin = client.post(f"/api/uploads/{uid}/finalize")
         assert fin.status_code == 200

@@ -4,15 +4,11 @@
       "AttachmentListItem": {
         "properties": {
           "blurhash": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Blurhash"
+            "title": "Blurhash",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "downloadUrl": {
             "title": "Downloadurl",
@@ -27,15 +23,11 @@
             "type": "boolean"
           },
           "height": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Height"
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
@@ -84,15 +76,11 @@
             "type": "string"
           },
           "width": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Width"
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -120,42 +108,30 @@
       "AttachmentMeta": {
         "properties": {
           "blurhash": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Blurhash"
+            "title": "Blurhash",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "captured_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Captured At"
+            "format": "date-time",
+            "title": "Captured At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "downloadUrl": {
             "title": "Downloadurl",
             "type": "string"
           },
           "duration": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Duration"
+            "title": "Duration",
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "hasLegacyPrint": {
             "title": "Haslegacyprint",
@@ -166,15 +142,11 @@
             "type": "boolean"
           },
           "height": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Height"
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
@@ -223,15 +195,11 @@
             "type": "string"
           },
           "width": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Width"
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -261,42 +229,30 @@
       "AttachmentOut": {
         "properties": {
           "captured_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Captured At"
+            "format": "date-time",
+            "title": "Captured At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "duration": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Duration"
+            "title": "Duration",
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "filename": {
             "title": "Filename",
             "type": "string"
           },
           "height": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Height"
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
@@ -314,15 +270,11 @@
             "type": "string"
           },
           "width": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Width"
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -342,30 +294,22 @@
       "AttachmentRef": {
         "properties": {
           "blurhash": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Blurhash"
+            "title": "Blurhash",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "downloadUrl": {
             "title": "Downloadurl",
             "type": "string"
           },
           "duration": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Duration"
+            "title": "Duration",
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "hasLegacyPrint": {
             "title": "Haslegacyprint",
@@ -376,15 +320,11 @@
             "type": "boolean"
           },
           "height": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Height"
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
@@ -429,15 +369,11 @@
             "type": "string"
           },
           "width": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Width"
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -503,15 +439,11 @@
       "HealthResponse": {
         "properties": {
           "db": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Db"
+            "title": "Db",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "title": "Status",
@@ -544,16 +476,12 @@
             "type": "string"
           },
           "created_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created At"
+            "format": "date-time",
+            "title": "Created At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "pinned": {
             "default": false,
@@ -588,26 +516,18 @@
             "type": "array"
           },
           "nextCursor": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Nextcursor"
+            "title": "Nextcursor",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "totalCount": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totalcount"
+            "title": "Totalcount",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -621,16 +541,12 @@
       "MemoOut": {
         "properties": {
           "archived_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Archived At"
+            "format": "date-time",
+            "title": "Archived At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "attachments": {
             "default": [],
@@ -712,63 +628,43 @@
       "MemoPatch": {
         "properties": {
           "archived": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Archived"
+            "title": "Archived",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "content": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Content"
+            "title": "Content",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "created_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created At"
+            "format": "date-time",
+            "title": "Created At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "pinned": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pinned"
+            "title": "Pinned",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "upload_uids": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Upload Uids"
+            "items": {
+              "type": "string"
+            },
+            "title": "Upload Uids",
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "visibility": {
             "$ref": "#/components/schemas/Visibility"
@@ -825,17 +721,13 @@
       "PatCreate": {
         "properties": {
           "expires_in_days": {
-            "anyOf": [
-              {
-                "maximum": 365.0,
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expires In Days"
+            "maximum": 365.0,
+            "minimum": 1.0,
+            "title": "Expires In Days",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "name": {
             "maxLength": 255,
@@ -858,32 +750,24 @@
             "type": "string"
           },
           "expires_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expires At"
+            "format": "date-time",
+            "title": "Expires At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "title": "Id",
             "type": "integer"
           },
           "last_used": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Used"
+            "format": "date-time",
+            "title": "Last Used",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "title": "Name",
@@ -913,32 +797,24 @@
             "type": "string"
           },
           "expires_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expires At"
+            "format": "date-time",
+            "title": "Expires At",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "title": "Id",
             "type": "integer"
           },
           "last_used": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Used"
+            "format": "date-time",
+            "title": "Last Used",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "title": "Name",
@@ -1010,41 +886,29 @@
             "type": "string"
           },
           "effective_dpi": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Effective Dpi"
+            "title": "Effective Dpi",
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "filename": {
             "title": "Filename",
             "type": "string"
           },
           "height": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Height"
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "meets_dpi": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Meets Dpi"
+            "title": "Meets Dpi",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "memo": {
             "title": "Memo",
@@ -1082,15 +946,11 @@
             "type": "string"
           },
           "width": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Width"
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1204,15 +1064,11 @@
             "type": "string"
           },
           "variant_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Variant Key"
+            "title": "Variant Key",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1229,41 +1085,29 @@
             "type": "string"
           },
           "height": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Height"
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "label": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Label"
+            "title": "Label",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
             "type": "string"
           },
           "rev": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rev"
+            "title": "Rev",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "size": {
             "title": "Size",
@@ -1274,15 +1118,11 @@
             "type": "string"
           },
           "width": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Width"
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1305,30 +1145,22 @@
             "type": "string"
           },
           "label": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Label"
+            "title": "Label",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
             "type": "string"
           },
           "rev": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rev"
+            "title": "Rev",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "size": {
             "title": "Size",
@@ -1353,15 +1185,11 @@
       "SettingsOut": {
         "properties": {
           "avatar": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Avatar"
+            "title": "Avatar",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "default_visibility": {
             "$ref": "#/components/schemas/Visibility"
@@ -1382,30 +1210,22 @@
       "SettingsPatch": {
         "properties": {
           "avatar": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Avatar"
+            "title": "Avatar",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "default_visibility": {
             "$ref": "#/components/schemas/Visibility",
             "title": "Default Visibility"
           },
           "theme": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Theme"
+            "title": "Theme",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "title": "SettingsPatch",
@@ -1453,15 +1273,11 @@
             "type": "string"
           },
           "last_modified": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Modified"
+            "title": "Last Modified",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mime": {
             "title": "Mime",
@@ -1510,37 +1326,25 @@
             "type": "string"
           },
           "avatar": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Avatar"
+            "title": "Avatar",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "display_name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Display Name"
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "email": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Email"
+            "title": "Email",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "role": {
             "title": "Role",
@@ -1655,15 +1459,11 @@
             "name": "type",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Type"
+              "title": "Type",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -1703,6 +1503,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Attachments",
         "tags": [
           "assets"
@@ -1739,6 +1547,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Delete Attachment",
         "tags": [
           "assets"
@@ -1779,6 +1595,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Attachment Meta",
         "tags": [
           "assets"
@@ -1832,6 +1656,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Upload Print",
         "tags": [
           "assets"
@@ -1877,6 +1709,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Delete Rendition",
         "tags": [
           "assets"
@@ -1925,6 +1765,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Serve Rendition",
         "tags": [
           "assets"
@@ -1972,6 +1820,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Renditions",
         "tags": [
           "assets"
@@ -2023,6 +1879,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Attach Rendition",
         "tags": [
           "assets"
@@ -2056,15 +1920,11 @@
             "name": "exp",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Exp"
+              "title": "Exp",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2072,15 +1932,11 @@
             "name": "scope",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Scope"
+              "title": "Scope",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2088,15 +1944,11 @@
             "name": "sig",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Sig"
+              "title": "Sig",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2104,15 +1956,11 @@
             "name": "format",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Format"
+              "title": "Format",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -2136,6 +1984,15 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {}
+        ],
         "summary": "Serve Asset",
         "tags": [
           "assets"
@@ -2212,6 +2069,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Native Logout",
         "tags": [
           "auth"
@@ -2234,6 +2099,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Native Renew",
         "tags": [
           "auth"
@@ -2255,6 +2128,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Whoami",
         "tags": [
           "auth"
@@ -2274,6 +2155,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Events",
         "tags": [
           "assets"
@@ -2290,16 +2179,12 @@
             "name": "created_before",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "format": "date-time",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Created Before"
+              "format": "date-time",
+              "title": "Created Before",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2307,16 +2192,12 @@
             "name": "created_after",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "format": "date-time",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Created After"
+              "format": "date-time",
+              "title": "Created After",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2324,18 +2205,14 @@
             "name": "tag",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Tag"
+              "items": {
+                "type": "string"
+              },
+              "title": "Tag",
+              "type": [
+                "array",
+                "null"
+              ]
             }
           },
           {
@@ -2351,15 +2228,11 @@
             "name": "owner",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Owner"
+              "title": "Owner",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2367,15 +2240,11 @@
             "name": "q",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Q"
+              "title": "Q",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2427,6 +2296,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Export Memos",
         "tags": [
           "export"
@@ -2443,16 +2320,12 @@
             "name": "from",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "format": "date",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "From"
+              "format": "date",
+              "title": "From",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2460,16 +2333,12 @@
             "name": "to",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "format": "date",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "To"
+              "format": "date",
+              "title": "To",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2560,6 +2429,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Export Photobook",
         "tags": [
           "export"
@@ -2575,16 +2452,12 @@
             "name": "created_before",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "format": "date-time",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Created Before"
+              "format": "date-time",
+              "title": "Created Before",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2592,16 +2465,12 @@
             "name": "created_after",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "format": "date-time",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Created After"
+              "format": "date-time",
+              "title": "Created After",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2609,18 +2478,14 @@
             "name": "tag",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Tag"
+              "items": {
+                "type": "string"
+              },
+              "title": "Tag",
+              "type": [
+                "array",
+                "null"
+              ]
             }
           },
           {
@@ -2636,15 +2501,11 @@
             "name": "owner",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Owner"
+              "title": "Owner",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2652,15 +2513,11 @@
             "name": "q",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Q"
+              "title": "Q",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2698,15 +2555,11 @@
             "name": "cursor",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Cursor"
+              "title": "Cursor",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -2754,6 +2607,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Memos",
         "tags": [
           "memos"
@@ -2793,6 +2654,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Create Memo",
         "tags": [
           "memos"
@@ -2828,6 +2697,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Delete Memo",
         "tags": [
           "memos"
@@ -2868,6 +2745,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Get Memo",
         "tags": [
           "memos"
@@ -2918,6 +2803,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Patch Memo",
         "tags": [
           "memos"
@@ -2960,6 +2853,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Pin Memo",
         "tags": [
           "memos"
@@ -3012,6 +2913,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "React",
         "tags": [
           "memos"
@@ -3063,6 +2972,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Unreact",
         "tags": [
           "memos"
@@ -3105,6 +3022,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Unpin Memo",
         "tags": [
           "memos"
@@ -3130,6 +3055,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Pats",
         "tags": [
           "pats"
@@ -3169,6 +3099,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Create Pat",
         "tags": [
           "pats"
@@ -3204,6 +3139,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Revoke Pat",
         "tags": [
           "pats"
@@ -3238,6 +3178,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Unsubscribe",
         "tags": [
           "push"
@@ -3270,6 +3218,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Subscribe",
         "tags": [
           "push"
@@ -3313,6 +3269,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Get Settings",
         "tags": [
           "settings"
@@ -3352,6 +3316,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Update Settings",
         "tags": [
           "settings"
@@ -3377,6 +3349,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Stats Heatmap",
         "tags": [
           "memos"
@@ -3402,6 +3382,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Tags",
         "tags": [
           "memos"
@@ -3443,6 +3431,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Start Upload",
         "tags": [
           "uploads"
@@ -3470,7 +3466,15 @@
                 "schema": {}
               }
             },
-            "description": "Successful Response"
+            "description": "Successful Response",
+            "headers": {
+              "Upload-Offset": {
+                "description": "Bytes the server now holds for this upload session \u2014 the offset the next chunk must start at.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "422": {
             "content": {
@@ -3483,6 +3487,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Upload Offset",
         "tags": [
           "uploads"
@@ -3511,6 +3523,17 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -3520,7 +3543,30 @@
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful Response",
+            "headers": {
+              "Upload-Offset": {
+                "description": "Bytes the server now holds for this upload session \u2014 the offset the next chunk must start at.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Offset gap \u2014 re-sync with HEAD and resend from the offset it reports."
           },
           "422": {
             "content": {
@@ -3533,6 +3579,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Append Chunk",
         "tags": [
           "uploads"
@@ -3575,6 +3629,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Finalize Upload",
         "tags": [
           "uploads"
@@ -3600,15 +3662,11 @@
             "name": "pageToken",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Pagetoken"
+              "title": "Pagetoken",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -3616,15 +3674,11 @@
             "name": "filter",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Filter"
+              "title": "Filter",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -3648,6 +3702,12 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {}
+        ],
         "summary": "List Memos Compat",
         "tags": [
           "compat"
@@ -3688,6 +3748,12 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {}
+        ],
         "summary": "Get Memo Compat",
         "tags": [
           "compat"
@@ -3748,6 +3814,12 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {}
+        ],
         "summary": "Serve File Compat",
         "tags": [
           "compat"

@@ -7,7 +7,10 @@ never runs (CI is abandoned), which left this contract with no gate at all; this
 """
 
 import importlib.util
+from copy import deepcopy
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATOR = REPO_ROOT / "scripts" / "gen-openapi.py"
@@ -60,3 +63,226 @@ def test_custom_openapi_still_describes_the_routes():
 
     paths = app.openapi()["paths"]
     assert "/api/memos" in paths and "/api/pats" in paths and "/api/auth/user" in paths
+
+
+def _mappings(node: object, path: str = "#"):
+    """Every mapping in the document, with the JSON pointer that reaches it."""
+    if isinstance(node, dict):
+        yield path, node
+        for key, value in node.items():
+            yield from _mappings(value, f"{path}/{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _mappings(value, f"{path}/{index}")
+
+
+def _inline_nullable_anyof(node: dict) -> bool:
+    members = node.get("anyOf")
+    if not isinstance(members, list) or len(members) != 2:
+        return False
+    if not any(m == {"type": "null"} for m in members):
+        return False
+    keep = next(m for m in members if m != {"type": "null"})
+    return isinstance(keep, dict) and "type" in keep and "$ref" not in keep
+
+
+def test_no_inline_nullable_anyof_survives_anywhere_in_the_document():
+    """swift-openapi-generator drops a property whose schema contains a bare `null` member, so a
+    single surviving one silently deletes a field from the generated client (MEMNG-105)."""
+    from app.main import app
+
+    offenders = [
+        pointer for pointer, node in _mappings(app.openapi()) if _inline_nullable_anyof(node)
+    ]
+    assert offenders == [], f"{len(offenders)} nullable anyOf survived, e.g. {offenders[:3]}"
+
+
+def test_a_nullable_field_reaches_the_client_as_a_type_array():
+    from app.main import app
+
+    archived_at = app.openapi()["components"]["schemas"]["MemoOut"]["properties"]["archived_at"]
+    assert archived_at["type"] == ["string", "null"]
+    assert archived_at["format"] == "date-time"
+    assert archived_at["title"] == "Archived At"
+    assert "anyOf" not in archived_at
+
+
+def test_a_genuine_union_is_left_as_an_anyof():
+    """FastAPI's own ValidationError.loc is `string | integer` — a union, not a nullable."""
+    from app.main import app
+
+    loc = app.openapi()["components"]["schemas"]["ValidationError"]["properties"]["loc"]["items"]
+    assert loc == {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+
+
+def test_reference_and_wider_unions_are_not_rewritten():
+    from app.main import collapse_nullable_anyof
+
+    document = {
+        "ref_plus_null": {
+            "anyOf": [{"$ref": "#/components/schemas/Visibility"}, {"type": "null"}]
+        },
+        "three_arm": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
+        "union": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+        "already_a_type_array": {"type": ["string", "null"]},
+    }
+    untouched = deepcopy(document)
+    collapse_nullable_anyof(document)
+    assert document == untouched
+
+
+def test_sibling_keywords_survive_the_collapse():
+    from app.main import collapse_nullable_anyof
+
+    node = {"anyOf": [{"type": "string", "maxLength": 64}, {"type": "null"}], "title": "Cursor"}
+    collapse_nullable_anyof(node)
+    assert node == {"type": ["string", "null"], "maxLength": 64, "title": "Cursor"}
+
+
+def test_a_disagreeing_keyword_stops_the_schema_instead_of_dropping_one_side():
+    from app.main import NullableMergeCollision, collapse_nullable_anyof
+
+    with pytest.raises(NullableMergeCollision) as raised:
+        collapse_nullable_anyof(
+            {
+                "properties": {
+                    "q": {
+                        "anyOf": [{"type": "string", "maxLength": 8}, {"type": "null"}],
+                        "maxLength": 99,
+                    }
+                }
+            }
+        )
+    assert "#/properties/q" in str(raised.value)
+    assert "maxLength" in str(raised.value)
+
+
+UPLOAD_PATH = "/api/uploads/{upload_uid}"
+
+
+def test_the_chunked_upload_patch_declares_its_octet_stream_body():
+    """The handler reads `request.stream()`, so FastAPI declares no requestBody and a generated
+    client cannot express the chunk at all (MEMNG-109)."""
+    from app.main import app
+
+    body = app.openapi()["paths"][UPLOAD_PATH]["patch"]["requestBody"]
+    assert body["required"] is True
+    assert body["content"]["application/octet-stream"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+
+def test_both_upload_operations_model_the_upload_offset_response_header():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    for method in ("patch", "head"):
+        header = paths[UPLOAD_PATH][method]["responses"]["200"]["headers"]["Upload-Offset"]
+        assert header["schema"] == {"type": "integer"}
+        assert header["description"]
+
+
+def test_the_upload_offset_request_header_is_declared_exactly_once():
+    """It already comes from the handler signature; the extra must not add a second one."""
+    from app.main import app
+
+    parameters = app.openapi()["paths"][UPLOAD_PATH]["patch"]["parameters"]
+    offsets = [p for p in parameters if p["name"] == "Upload-Offset"]
+    assert len(offsets) == 1
+    assert offsets[0]["in"] == "header"
+
+
+def test_the_offset_gap_conflict_is_part_of_the_upload_contract():
+    """tests/test_uploads.py drives the real 409; this is the schema saying the same thing."""
+    from app.main import app
+
+    conflict = app.openapi()["paths"][UPLOAD_PATH]["patch"]["responses"]["409"]
+    assert conflict["description"]
+    schema = conflict["content"]["application/json"]["schema"]
+    assert schema["properties"]["detail"] == {"type": "string"}
+
+
+def _schema_operations():
+    """Every operation the document publishes, as (method, path, operation)."""
+    from app.main import app
+    from fastapi.routing import APIRoute
+
+    document = app.openapi()
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        for method in route.methods:
+            operation = document["paths"].get(route.path_format, {}).get(method.lower())
+            if operation is not None:
+                yield method, route.path_format, operation
+
+
+def test_every_published_operation_states_its_credential_or_is_a_declared_public_one():
+    """The drift guard for MEMNG-111: a route added later either carries an auth dependency the
+    schema pass understands, or its author has to say out loud that it is public."""
+    from app.main import PUBLIC_OPERATIONS
+
+    unstated = [
+        (method, path)
+        for method, path, operation in _schema_operations()
+        if "security" not in operation and (method, path) not in PUBLIC_OPERATIONS
+    ]
+    assert unstated == [], (
+        f"{unstated} reached the schema with no security requirement — give the route its auth "
+        "dependency, add it to INLINE_AUTH_SECURITY if it authenticates in the handler, or "
+        "declare it public in PUBLIC_OPERATIONS"
+    )
+
+
+def test_the_public_allow_list_names_only_live_operations():
+    from app.main import PUBLIC_OPERATIONS
+
+    published = {(method, path) for method, path, _ in _schema_operations()}
+    assert PUBLIC_OPERATIONS <= published, PUBLIC_OPERATIONS - published
+
+
+def test_a_declared_public_operation_carries_no_requirement():
+    from app.main import PUBLIC_OPERATIONS
+
+    for method, path, operation in _schema_operations():
+        if (method, path) in PUBLIC_OPERATIONS:
+            assert "security" not in operation, (method, path)
+
+
+def test_the_pat_surface_is_session_cookie_only():
+    """A PAT must not be able to mint or revoke PATs — /api/pats/* takes require_session_user."""
+    pat_operations = [
+        (method, path, operation)
+        for method, path, operation in _schema_operations()
+        if path.startswith("/api/pats")
+    ]
+    assert pat_operations
+    for method, path, operation in pat_operations:
+        assert operation["security"] == [{"sessionCookie": []}], (method, path)
+
+
+def test_a_bearer_route_states_both_credentials():
+    from app.main import app
+
+    assert app.openapi()["paths"]["/api/memos"]["get"]["security"] == [
+        {"bearerAuth": []},
+        {"sessionCookie": []},
+    ]
+
+
+def test_a_handler_that_authenticates_inline_is_not_published_as_public():
+    """/api/events opens its own session inside the handler, so nothing in the route signature
+    says it authenticates — the schema must say it anyway."""
+    from app.main import app
+
+    assert app.openapi()["paths"]["/api/events"]["get"]["security"] == [
+        {"bearerAuth": []},
+        {"sessionCookie": []},
+    ]
+
+
+def test_the_compat_reads_publish_their_optional_credential():
+    from app.main import app
+
+    assert app.openapi()["paths"]["/api/v1/memos"]["get"]["security"] == [{"bearerAuth": []}, {}]
