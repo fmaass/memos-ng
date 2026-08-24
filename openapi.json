@@ -569,14 +569,7 @@
             "type": "array"
           },
           "visibility": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Visibility"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "$ref": "#/components/schemas/Visibility"
           }
         },
         "required": [
@@ -778,14 +771,7 @@
             "title": "Upload Uids"
           },
           "visibility": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Visibility"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "$ref": "#/components/schemas/Visibility"
           }
         },
         "title": "MemoPatch",
@@ -1407,14 +1393,8 @@
             "title": "Avatar"
           },
           "default_visibility": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Visibility"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "$ref": "#/components/schemas/Visibility",
+            "title": "Default Visibility"
           },
           "theme": {
             "anyOf": [
@@ -2341,15 +2321,7 @@
             "name": "visibility",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "$ref": "#/components/schemas/Visibility"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Visibility"
+              "$ref": "#/components/schemas/Visibility"
             }
           },
           {
@@ -2634,15 +2606,7 @@
             "name": "visibility",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "$ref": "#/components/schemas/Visibility"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Visibility"
+              "$ref": "#/components/schemas/Visibility"
             }
           },
           {

@@ -641,7 +641,18 @@ Each phase is independently shippable and ends in an objective verification gate
 - **Status:** pending — blocked on Xcode 26.6 on merkur (user action: disk cleanup + install)
 
 ### Phase 4 — Native login and all write paths (memos-ng-ios)
-- **Branch:** `feature/native-login-writes`
+- **Branch:** TWO declared branches (premise gate 01a03201, round 1). (4a) memos-ng
+  `fix/nullable-request-schemas`, merged FIRST: the four request-side nullable-enum fields
+  (`MemoCreate.visibility`, `MemoPatch.visibility`, `SettingsPatch.default_visibility`, and the
+  `visibility` query params of list/export) switch to `SkipJsonSchema[None]` so the schema emits
+  a plain `$ref` with the field simply not required. ONE deliberate behaviour change: an explicit
+  JSON `null` for these fields becomes a 422 (absent stays valid). REQUIRED gates: a pytest that
+  asserts each of the four schema locations EXISTS and carries no `anyOf` null branch; runtime
+  tests per body field for absent-accepted / value-accepted / explicit-null-422; and a cited grep
+  of the SPA payload construction proving the SPA never sends explicit null for them (if it does,
+  4a STOPS and reports). `openapi.json`/`schema.d.ts` regenerated, drift test green; partial
+  delivery of MEMNG-105.
+  (4b) memos-ng-ios `feature/native-login-writes`, vendoring 4a's merge SHA.
 - **Dependencies:** Phase 2 deployed; Phase 3 merged; **Apple Developer Program enrolled** (the
   Team ID is needed for the associated-domains entitlement and the AASA file — user action,
   $99/yr, moved here from Phase 6).
@@ -654,7 +665,19 @@ Each phase is independently shippable and ends in an objective verification gate
   `.https(host: "memos.discomarder.live", path: "/ios/auth/callback")` callback,
   `prefersEphemeralWebBrowserSession = false` (Authelia's browser session is reused); PKCE
   verifier via `CryptoKit` (32 random bytes → base64url; challenge = S256); exchange → Keychain;
-  sign-out = `POST /api/auth/native/logout` then Keychain wipe (wipe even if the request fails).
+  sign-out = `POST /api/auth/native/logout`, wiping the Keychain ONLY on 2xx or 401 (401 = the
+  token is already dead); on a transport error or 5xx the credentials are KEPT, the failure is
+  surfaced, and the user gets an explicit "sign out without revoking" choice — silently wiping
+  after a failed revoke leaves a stolen PAT valid for up to a year while the UI claims success
+  (premise gate B3). The Keychain switch to the app-group access group ships with a dual-read
+  migration: read the group namespace first, fall back to the legacy nil-group items and migrate
+  them on first read, with tests for both paths (premise gate B2). Entitlements are generated
+  through `project.yml` WITHOUT any committed team id, and the teamless `bin/mac-gate.sh` run
+  must stay green. `?mode=developer` is an experiment, not a guaranteed simulator pivot. Tags
+  are content-derived hashtags — there is no tags request field. The native-login URL builder
+  (client=ios, code_challenge, bounded nonempty device name) is a pure tested function; session
+  error paths (presentation failure, user cancel, backend `?error=` callback, malformed
+  callback, PKCE-secret disposal) are all handled and tested.
   Re-sync the vendored `openapi.json` to the post-Phase-2 memos-ng SHA (`scripts/sync-openapi.sh`)
   so the generated client carries the native-auth operations. Compose, edit, delete, pin,
   visibility, tags; task toggle = `toggleTask` → `PATCH /api/memos/{uid}` with optimistic store
@@ -667,11 +690,11 @@ Each phase is independently shippable and ends in an objective verification gate
 - **Do NOT:** custom URL scheme fallback; offline edit queue; conflict resolution; share
   extension; iPad layout.
 - **Verification:** Swift Testing: PKCE known-answer vectors (RFC 7636 Appendix B), `toggleTask`
-  vectors identical to `tasks.spec.ts`, optimistic rollback on a failing fake API, 401 →
-  signed-out transition; `bin/mac-gate.sh` → 0; end-to-end on a **physical device** (associated
-  domains need extra setup on a simulator — known-unknown; pivot: AASA developer mode /
-  `?mode=developer` for the simulator): native login against production completes and a created
-  memo appears in the SPA (browser-harness read-back) and in the DB; Codex read-only diff review
+  vectors identical to `tasks.spec.ts`, optimistic rollback and the 401 → signed-out transition exercised through the REAL generated
+  client backed by a StubTransport (never a hand-rolled fake of the store's surface); `bin/mac-gate.sh` → 0; end-to-end on a **physical device** (simulator associated-domains behaviour is undocumented;
+  `?mode=developer` is an optional direct-fetch experiment, not a pivot): native login against
+  production completes and a memo created with a UNIQUE marker string appears with that marker in
+  the SPA (browser-harness read-back) and in the DB row; Codex read-only diff review
   (medium) → APPROVE.
 - **Status:** pending
 

@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
@@ -156,7 +157,7 @@ async def export_memos(
     created_before: datetime | None = None,
     created_after: datetime | None = None,
     tag: Annotated[list[str] | None, Query()] = None,
-    visibility: Visibility | None = None,
+    visibility: Visibility | SkipJsonSchema[None] = None,  # see list_memos
     owner: str | None = None,
     q: str | None = None,
     include_media: bool = False,
