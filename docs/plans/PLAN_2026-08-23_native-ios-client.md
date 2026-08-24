@@ -772,15 +772,55 @@ these named exceptions the annex phases out the remaining gap, not the whole lis
 AMENDMENT: MEMNG-108 (zoomable viewer) moves from Phase 5's Build/Verification into 5c —
 Phase 5's text above is edited accordingly.
 
-- **Phase 5c — Read parity core** (branch feature/read-parity): search bar + filter sheet
-  (q, tags, visibility, archived, created_before/created_after date range — all params
+- **Phase 5c — Read parity core + navigation shell** (branch feature/read-parity;
+  IA DECIDED 2026-08-24, user-approved, Calendar-informed): the app gets a floating glass
+  bottom bar with THREE destinations — Timeline, Gallery, and a detached Search role —
+  minimizing on scroll (iOS 26 tab APIs); NO separate Explore/public feed (user decision:
+  "everyone's memos" IS the unfiltered timeline — this supersedes the parity-gap framing of
+  an Explore view); filtering is a Calendar-style half-sheet over the one timeline (per-member
+  avatar toggles as INDEPENDENT toggles with OR semantics, visibility, archive scope, tag
+  browse) so filtering never costs your place — BACKEND ENABLER REQUIRED FIRST (MEMNG-133,
+  deployed before 5c): authenticated GET /api/members -> [{subject, display_name, avatar}]
+  (no members enumeration exists today) AND repeatable owner= on /api/memos with OR semantics
+  (today it accepts exactly one). Archive scope maps to the REAL tri-state contract —
+  default omits both params; include_archived=true; archived_only=true (there is no
+  archived= param); tag counts are DELIBERATELY active-only (/api/tags excludes archived —
+  recorded decision, not an oversight); re-tapping Timeline snaps to newest; Settings sits behind the profile avatar
+  top-left — this surface MOVES profile identity + default-visibility OUT of 5d into 5c
+  (5d's bullet is amended accordingly) and adds the user-requested APPEARANCE setting
+  (System/Light/Dark, persisted, applied at the root so it sticks across launches); sign-out
+  relocates here from the overflow menu WITH its shipped safety flow intact — both alerts,
+  the exactly-once revoke machine, and the keep-credentials-on-transport-failure rule move
+  unchanged, menu-specific test names renamed as part of the move; the floating + capture button stays separate from the bar. The Gallery tab ships as
+  the shell + the 5d justified gallery fills it; until then the tab is backed by the REAL
+  household-visible GET /api/attachments endpoint (image/video filter, capped 500,
+  non-paginated) and honestly labeled "Recent media — up to 500" — never a loaded-pages
+  projection passed off as a gallery (5d's full gallery adds the attachments cursor
+  pagination it needs as part of its own scope). Original 5c scope retained:
+  search bar + filter sheet
+  (q, tags, visibility, archive scope via include_archived / archived_only, created_before/created_after date range — all params
   verified on /api/memos) driving the existing cursor query; tag browse (counts from
   /api/tags); SSE /api/events subscription patching attachment status/blurhash/progress
   live (URLSession bytes stream — no third-party dep; blurhash RENDERING is 5c-design's
   deliverable — this phase only patches the value live); full-screen zoomable image viewer with swipe-between-attachments
   (MEMNG-108). Do NOT: offline search index, saved searches. Verification: filter/search
   round-trips against prod fixtures; SSE patch test via a scripted event stream; viewer
-  zoom/swipe presentation tests; mac-gate 0; Codex review APPROVE. Filter/search
+  zoom/swipe presentation tests; IA-shell verification is EXACT and production-coupled: the rendered shell shows exactly
+  Timeline/Gallery/Search with Explore and Capture absent from the tab projection (Capture
+  present as the separate action); Timeline→Timeline re-tap emits exactly one
+  scroll-to-newest and selecting Timeline from another destination emits none; tapping the
+  rendered avatar presents Settings AND the old overflow sign-out entry is asserted absent;
+  opening+cancelling the filter sheet preserves navigation path, query, and scroll anchor,
+  and APPLYING a changed filter has a defined postcondition — pagination resets and the
+  timeline scrolls to newest under the new query, navigation path unchanged — asserted as
+  such; the COMPLETE generated query is
+  asserted incl. repeated owner values and the archive tri-state mapping, and every cursor
+  request preserves it; the Gallery stub's endpoint and disclosure label are asserted; bar
+  minimization on scroll gets a simulator acceptance (unit tests cannot exercise it); the
+  deterministic live suite exhausts cursor pages, isolates assertions with unique probe
+  markers, and runs member-filter cases under TWO authenticated identities; mac-gate 0;
+  Codex review APPROVE.
+  Filter/search
   verification is DETERMINISTIC: the test seeds N probe memos with known tags/dates/
   visibility, asserts EXACT uid sets per filter combination, and deletes them (env-gated
   live suite, LiveWriteTests pattern) — an ignored filter fails the set equality.
@@ -791,8 +831,8 @@ Phase 5's text above is edited accordingly.
   finalize, so a lost response is unrecoverable without a backend idempotency contract for
   edits; the backend enabler is a filed ticket and offline media-edit stays out of scope until
   it lands); justified media gallery view (all/image/video); download/share
-  original via share sheet; compose backdate override; profile header + default-visibility
-  setting (server-persisted, same /api/settings). Do NOT: print masters (backlog ticket),
+  original via share sheet; compose backdate override (SHIPPED early by user request); profile identity and the
+  default-visibility setting MOVED into 5c's settings surface (IA amendment). Do NOT: print masters (backlog ticket),
   avatar upload, heatmap (backlog). Verification: per-interaction store tests incl. rollback
   paths; gallery projection tests; mac-gate 0; Codex review APPROVE.
 - **Phase 5e — Native-first surfaces** (branch feature/native-surfaces): WidgetKit (lock/home
