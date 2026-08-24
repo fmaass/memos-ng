@@ -11,11 +11,15 @@ the poster lands as the tier (and only as the tier), the worker leaves a supplie
 while still extracting one when none was supplied, and a refusal costs the caller nothing.
 """
 
+import asyncio
 import errno
 import io
 import os
 import shutil
 import subprocess
+import threading
+import time
+from pathlib import Path
 from typing import get_args
 
 import pytest
@@ -259,6 +263,87 @@ def test_a_poster_override_lands_across_the_deployed_mount_split(
         # The video's own original still travels by RENAME (uploads → originals → the memo folder,
         # one filesystem by design) — the guard above would have raised had that changed.
         assert client.get(f"/api/attachments/{uid}").json()["hasPoster"] is True
+    finally:
+        _cleanup()
+
+
+async def _upload_async(bearer, name, mime, data: bytes) -> str:
+    """The same two-step upload the sync helper does, over a bearer client (POST /api/memos and
+    the upload verbs all take a PAT — app/auth.require_user)."""
+    opened = await bearer.post(
+        "/api/uploads",
+        json={"filename": name, "mime": mime, "size": len(data), "last_modified": 1609459200000},
+    )
+    assert opened.status_code == 201, opened.text
+    uid = opened.json()["upload_uid"]
+    sent = await bearer.patch(
+        f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"}
+    )
+    assert sent.status_code == 200, sent.text
+    return uid
+
+
+async def test_a_cancelled_create_never_strands_the_poster_it_was_copying(
+    pat_client, monkeypatch, tmp_path
+):
+    """A client that hangs up mid-copy must not leave a poster behind.
+
+    The copy runs in a worker thread, and a cancelled request does NOT wait for it — anyio raises
+    the cancellation out of the await while the thread carries on placing the file. So the record
+    the cleanup acts on is written BEFORE the copy starts, and publish/discard are serialised
+    against each other, which is what makes the outcome the same in both orders. Nothing about the
+    unit is stubbed: only the copy primitive is slowed down, so the cancellation has a window to
+    land in that a real 200 KB copy would not reliably give.
+    """
+    bearer, _, _ = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    started = threading.Event()
+    existed_after_copy: list[bool] = []
+    real_copy = up_svc._copy_into_sync
+
+    def slow_copy(src, dest, tmp):
+        started.set()
+        time.sleep(0.5)  # the window the cancellation lands in
+        real_copy(src, dest, tmp)
+        existed_after_copy.append(Path(dest).exists())  # the positive control, taken under the lock
+
+    monkeypatch.setattr(up_svc, "_copy_into_sync", slow_copy)
+    try:
+        title_card = _jpeg(color=(11, 22, 33))
+        video_uid = await _upload_async(bearer, "clip.mov", "video/quicktime", VIDEO_BYTES)
+        poster_uid = await _upload_async(bearer, "title.jpg", "image/jpeg", title_card)
+
+        posting = asyncio.create_task(
+            bearer.post(
+                "/api/memos",
+                json={
+                    "content": "hung up mid-copy",
+                    "visibility": "PUBLIC",
+                    "upload_uids": [video_uid],
+                    "video_posters": {video_uid: poster_uid},
+                },
+            )
+        )
+        for _ in range(500):  # cancel only once the copy is genuinely under way
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "the copy never started — cancelling here would prove nothing"
+        posting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await posting
+
+        # Positive control: the stub really did place its file, and saw it on disk. Without this,
+        # "nothing survives" would also be satisfied by a copy that never happened at all.
+        assert existed_after_copy == [True]
+
+        assets = tmp_path / "assets"
+        survivors = [str(p) for p in assets.rglob("*") if p.is_file()] if assets.exists() else []
+        assert survivors == []  # no poster, no temp, under any uid
+        assert _count("SELECT count(*) FROM memos") == 0
+        assert _count("SELECT count(*) FROM attachments") == 0
+        # The client's bytes are untouched, so the post it never completed can simply be retried.
+        assert up_svc.part_path(poster_uid).read_bytes() == title_card
     finally:
         _cleanup()
 

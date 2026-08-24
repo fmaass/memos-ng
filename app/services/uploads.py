@@ -5,8 +5,10 @@ import shutil
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import BinaryIO, Literal
 
 import puremagic
@@ -95,27 +97,67 @@ VideoPosterReason = Literal[
 ]
 
 
-@dataclass(frozen=True)
+@dataclass
 class PosterCopy:
-    """One poster override published by COPY, and the two files whose fate the caller's commit
-    decides (`attach_video_poster`).
+    """One poster override on its way onto disk, and the arbitration that stops it from outliving
+    the memo write it belongs to (`attach_video_poster`).
 
     A copy, unlike the rename every other placement here uses, leaves the source in place — so
-    neither file can be settled until the transaction has: `placed` is real on disk but describes
-    an attachment that may still vanish, and `part` still holds bytes an upload row may still
-    promise. The caller therefore removes exactly one of them:
+    neither file can be settled until the transaction has: `placed` describes an attachment that
+    may still be rolled back, and `part` still holds bytes an upload row may still promise. The
+    caller removes exactly one of them:
 
-    * the write does NOT land → unlink `placed`. The attachment row is rolled back with it, so the
-      file would be an orphan under a uid nothing references; `part` stays, which is what leaves
-      the client's poster re-postable (the restored Upload row names it, intact).
-    * the write DOES land → unlink `part`, best-effort and AFTER the commit. Its upload row is
-      consumed, and the expiry reaper only unlinks part files by walking `uploads` rows — so a
-      part left here is leaked permanently rather than collected later. A crash between the commit
-      and that unlink leaves at worst one unreferenced file, never a row without its bytes.
+    * the write does NOT land → `discard()`. The attachment row is rolled back, so the poster would
+      be an orphan under a uid nothing references; `part` stays untouched, which is what leaves the
+      client's poster re-postable (the restored Upload row names it, intact).
+    * the write DOES land → unlink `part` after the commit. Its upload row is consumed, and the
+      expiry reaper only unlinks part files by walking `uploads` rows, so a part left behind here
+      is leaked permanently rather than collected later. A crash in between leaves at worst one
+      unreferenced file, never a row without its bytes.
+
+    The lock is what makes that a decision rather than a race. The copy runs in a worker thread,
+    and a cancelled request does NOT wait for it: anyio raises the cancellation out of the await
+    while the thread keeps going (verified against anyio 4.14 — an external task cancel abandons
+    it, `abandon_on_cancel=False` notwithstanding). So publishing and discarding are serialised
+    against each other and each acts on state the other cannot have changed underneath it:
+    a discard that gets there first leaves `publish()` with nothing to do, and one that arrives
+    mid-copy waits out the (bounded, sub-second) copy and then removes what it produced. Neither
+    order can leave a file behind.
     """
 
-    part: str  # the upload's part file — the copy READ it, so it is still there
-    placed: str  # the poster tier file this request created
+    part: str  # the upload's part file — the copy READS it, so it stays where it is
+    placed: str  # where the poster tier lands
+    tmp: str  # the in-flight name inside the destination directory
+    _lock: Lock = dataclass_field(default_factory=Lock, repr=False)
+    _published: bool = False
+    _discarded: bool = False
+
+    def publish(self) -> None:
+        """Put the bytes in place. Runs in a worker thread, which nothing can interrupt — so this
+        either finishes or fails, and never stops half way at someone else's request."""
+        with self._lock:
+            if self._discarded:
+                return  # the write unwound before this got its turn: publish nothing at all
+            _copy_into_sync(Path(self.part), Path(self.placed), Path(self.tmp))
+            self._published = True
+
+    def discard(self) -> list[str]:
+        """Take back this copy because the write did not land; returns the paths it could NOT
+        remove, for the caller to log.
+
+        Never raises: it runs while an exception is already unwinding (a rollback, or a
+        cancellation), where an error of its own would replace the outcome that got us here.
+        """
+        with self._lock:
+            self._discarded = True
+            doomed = [self.tmp] + ([self.placed] if self._published else [])
+        failed: list[str] = []
+        for path in doomed:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                failed.append(path)
+        return failed
 
 
 @dataclass(frozen=True)
@@ -599,8 +641,13 @@ async def attach_video_poster(
     (see `_copy_into_sync` — this is the production incident that followed the feature's first
     real use). So the placement is NOT recorded in `moved_out`, whose restore would re-attempt
     exactly that cross-device rename; it is recorded as a `PosterCopy`, which the caller settles
-    after its commit — unlinking the placed poster if the write did not land, and the now-consumed
-    part file if it did.
+    after its commit — discarding the copy if the write did not land, and unlinking the
+    now-consumed part file if it did.
+
+    The record is appended BEFORE the copy starts, and deliberately not after the await returns.
+    A request cancelled mid-copy raises out of that await while the worker thread carries on
+    (see PosterCopy), so a record appended afterwards would never exist — and the thread would
+    then place a file no cleanup could ever know about, orphaned under a rolled-back uid.
 
     The destination always belongs to a brand-new attachment uid — a video carrying an override
     finalizes with dedup disabled (see finalize_pending) — so this can never displace a poster some
@@ -611,10 +658,11 @@ async def attach_video_poster(
     if actual != upload.declared_size:  # re-checked here, as finalize does for a master
         raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
     dest = poster.poster_path(attachment.uid)
-    await to_thread.run_sync(
-        _copy_into_sync, part, dest, poster.poster_tmp_path(attachment.uid)
+    record = PosterCopy(
+        part=str(part), placed=str(dest), tmp=str(poster.poster_tmp_path(attachment.uid))
     )
-    poster_copies_out.append(PosterCopy(part=str(part), placed=str(dest)))
+    poster_copies_out.append(record)  # before the copy, never after — see above
+    await to_thread.run_sync(record.publish)
     await db.delete(upload)
     await db.flush()
     return dest

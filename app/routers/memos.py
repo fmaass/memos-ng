@@ -74,6 +74,27 @@ def _restore_moved(moves: list[tuple[str, str]]) -> None:
             )
 
 
+def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
+    """Take back every poster this write copied into place, because it did not land.
+
+    Called INLINE rather than through `to_thread.run_sync`, and this is the one place in this
+    module where that is the point. The caller may be unwinding a CANCELLED request — a client
+    that hung up, a server shutting down — and an await in that state is not guaranteed to resume:
+    the cleanup would be skipped and the poster left orphaned under a uid the rollback has already
+    erased. A synchronous call cannot be cut short (same reasoning as the transcode's inline temp
+    sweep in app/services/media.process_slow). It costs an uncontended lock and at most two
+    unlinks, except when it lands mid-copy, where it waits out a bounded sub-second copy on a
+    request that is already dead.
+
+    The AST guard in tests/test_no_blocking_io.py cannot see this one — it resolves blocking
+    helpers within a module, and these are methods on a class imported from another — so it is
+    named here instead of hidden behind a marker.
+    """
+    for copy in copies:
+        for path in copy.discard():
+            logger.error("memo.write.poster_discard_failed", path=path)
+
+
 def _unlink_all(paths: list[str]) -> None:
     """Remove files a memo write no longer has any use for (off-loop). Never raises.
 
@@ -719,13 +740,15 @@ async def create_memo(
                 await to_thread.run_sync(_unlink_all, [c.part for c in poster_copies])
             return memo
         except BaseException:
+            # Posters FIRST, and synchronously. The attachments they belong to are rolled back with
+            # this write, so the placed files would be orphans under uids nothing references —
+            # and the `await` below is not guaranteed to resume when this handler is unwinding a
+            # cancellation, so anything sequenced after it can be skipped entirely. Their part
+            # files stay untouched: that is what leaves the client's poster re-postable.
+            if poster_copies:
+                _discard_poster_copies(poster_copies)
             if moved:
                 await to_thread.run_sync(_restore_moved, moved)
-            if poster_copies:
-                # The attachments these posters belong to are rolled back with this write, so the
-                # placed files would be orphans under uids nothing references. Their part files
-                # stay untouched: that is what leaves the client's poster re-postable.
-                await to_thread.run_sync(_unlink_all, [c.placed for c in poster_copies])
             raise
 
     if key is None:
