@@ -74,6 +74,42 @@ def _restore_moved(moves: list[tuple[str, str]]) -> None:
             )
 
 
+def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
+    """Take back every poster this write copied into place, because it did not land.
+
+    Called INLINE rather than through `to_thread.run_sync`, and this is the one place in this
+    module where that is the point. The caller may be unwinding a CANCELLED request — a client
+    that hung up, a server shutting down — and an await in that state is not guaranteed to resume:
+    the cleanup would be skipped and the poster left orphaned under a uid the rollback has already
+    erased. A synchronous call cannot be cut short (same reasoning as the transcode's inline temp
+    sweep in app/services/media.process_slow). It costs an uncontended lock and at most two
+    unlinks, except when it lands mid-copy, where it waits out a bounded sub-second copy on a
+    request that is already dead.
+
+    The AST guard in tests/test_no_blocking_io.py cannot see this one — it resolves blocking
+    helpers within a module, and these are methods on a class imported from another — so it is
+    named here instead of hidden behind a marker.
+    """
+    for copy in copies:
+        for path in copy.discard():
+            logger.error("memo.write.poster_discard_failed", path=path)
+
+
+def _unlink_all(paths: list[str]) -> None:
+    """Remove files a memo write no longer has any use for (off-loop). Never raises.
+
+    Runs on both sides of the commit — after one that already landed, where an OSError must not
+    turn a stored memo into a 500, and inside the failure path, where it must not replace the error
+    that got us there. A file it cannot remove is logged and left; the alternative is losing the
+    real outcome to a cleanup problem.
+    """
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.error("memo.write.cleanup_failed", path=path, error=str(exc)[:200])
+
+
 class AttachmentRef(BaseModel):
     uid: str
     mime: str
@@ -655,6 +691,14 @@ async def create_memo(
         # finalize moves files to disk before the commit — if this try then fails, move those
         # originals BACK, so the rolled-back upload rows still name the bytes they promise.
         moved: list[tuple[str, str]] = []
+        # A poster override is COPIED into the derived-asset tree (a separate mount, so it cannot
+        # be renamed there), which leaves BOTH files alive until this transaction settles: see
+        # uploads.PosterCopy for which one each outcome removes. Per-attempt like `moved`.
+        poster_copies: list[uploads_svc.PosterCopy] = []
+        # The line between "this write may still be undone" and "this memo is stored". Everything
+        # the failure path does — discarding posters, moving originals back — destroys files that
+        # a COMMITTED memo owns, so it must never run once this is set.
+        committed = False
         try:
             try:
                 # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
@@ -667,6 +711,7 @@ async def create_memo(
                         owner_id,
                         moved_out=moved,
                         video_posters=body.video_posters,
+                        poster_copies_out=poster_copies,
                     )
                     if body.upload_uids or body.video_posters
                     else []
@@ -690,8 +735,32 @@ async def create_memo(
             # unless configured). Savepoint-isolated so a feature error can't fail the save.
             await _enqueue_frame_shares_safe(db, memo, user)
             await db.commit()
+            # A plain assignment with NO await between it and the commit that earned it: a
+            # cancellation cannot be delivered in that gap, so this flag can never be missing for
+            # a memo that is stored.
+            committed = True
+            # AFTER the commit, and only then: each consumed poster's part file is now bytes no
+            # row names, and nothing else will ever collect it (the expiry reaper walks `uploads`
+            # rows, and this one is gone). Best-effort by construction — the memo is already
+            # stored, so a file that will not delete must not fail the request.
+            if poster_copies:
+                await to_thread.run_sync(_unlink_all, [c.part for c in poster_copies])
             return memo
         except BaseException:
+            if committed:
+                # The memo is STORED, and the only thing that can raise past this point is a
+                # cancellation delivered during the part reap above. The cleanups below would then
+                # strip media off a LIVE memo — discarding its poster, moving its originals back
+                # out of the memo folder — which is far worse than the leak they would be tidying.
+                # The worst outcome here is an unreaped part file; the memo is complete without it.
+                raise
+            # Posters FIRST, and synchronously. The attachments they belong to are rolled back with
+            # this write, so the placed files would be orphans under uids nothing references —
+            # and the `await` below is not guaranteed to resume when this handler is unwinding a
+            # cancellation, so anything sequenced after it can be skipped entirely. Their part
+            # files stay untouched: that is what leaves the client's poster re-postable.
+            if poster_copies:
+                _discard_poster_copies(poster_copies)
             if moved:
                 await to_thread.run_sync(_restore_moved, moved)
             raise

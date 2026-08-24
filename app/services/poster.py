@@ -38,6 +38,22 @@ def poster_path(uid: str) -> Path:
     return Path(settings.DATA_ROOT) / "assets" / SUBDIR / f"{uid}{SUFFIX}"
 
 
+def poster_tmp_path(uid: str) -> Path:
+    """The in-flight name a poster is written to before it is renamed into place.
+
+    ONE definition, shared by both writers — the worker's ffmpeg extraction and the app's
+    placement of a client-supplied override — because it is a real file in a real directory and
+    each of them has to reap it. The `.tmp` sits BEFORE the extension rather than after it:
+    ffmpeg infers its muxer from the extension, and a `.jpg.tmp` output fails outright.
+
+    The two writers cannot collide over one uid. The app copies an override before the memo
+    commits, so neither the attachment nor the media job that would derive a frame for it is
+    visible to the worker until the file is already published.
+    """
+    path = poster_path(uid)
+    return path.with_name(f"{path.stem}.tmp{path.suffix}")
+
+
 def _exists_sync(path: Path) -> bool:
     return path.exists()
 

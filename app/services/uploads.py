@@ -5,8 +5,10 @@ import shutil
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import BinaryIO, Literal
 
 import puremagic
@@ -95,6 +97,69 @@ VideoPosterReason = Literal[
 ]
 
 
+@dataclass
+class PosterCopy:
+    """One poster override on its way onto disk, and the arbitration that stops it from outliving
+    the memo write it belongs to (`attach_video_poster`).
+
+    A copy, unlike the rename every other placement here uses, leaves the source in place — so
+    neither file can be settled until the transaction has: `placed` describes an attachment that
+    may still be rolled back, and `part` still holds bytes an upload row may still promise. The
+    caller removes exactly one of them:
+
+    * the write does NOT land → `discard()`. The attachment row is rolled back, so the poster would
+      be an orphan under a uid nothing references; `part` stays untouched, which is what leaves the
+      client's poster re-postable (the restored Upload row names it, intact).
+    * the write DOES land → unlink `part` after the commit. Its upload row is consumed, and the
+      expiry reaper only unlinks part files by walking `uploads` rows, so a part left behind here
+      is leaked permanently rather than collected later. A crash in between leaves at worst one
+      unreferenced file, never a row without its bytes.
+
+    The lock is what makes that a decision rather than a race. The copy runs in a worker thread,
+    and a cancelled request does NOT wait for it: anyio raises the cancellation out of the await
+    while the thread keeps going (verified against anyio 4.14 — an external task cancel abandons
+    it, `abandon_on_cancel=False` notwithstanding). So publishing and discarding are serialised
+    against each other and each acts on state the other cannot have changed underneath it:
+    a discard that gets there first leaves `publish()` with nothing to do, and one that arrives
+    mid-copy waits out the (bounded, sub-second) copy and then removes what it produced. Neither
+    order can leave a file behind.
+    """
+
+    part: str  # the upload's part file — the copy READS it, so it stays where it is
+    placed: str  # where the poster tier lands
+    tmp: str  # the in-flight name inside the destination directory
+    _lock: Lock = dataclass_field(default_factory=Lock, repr=False)
+    _published: bool = False
+    _discarded: bool = False
+
+    def publish(self) -> None:
+        """Put the bytes in place. Runs in a worker thread, which nothing can interrupt — so this
+        either finishes or fails, and never stops half way at someone else's request."""
+        with self._lock:
+            if self._discarded:
+                return  # the write unwound before this got its turn: publish nothing at all
+            _copy_into_sync(Path(self.part), Path(self.placed), Path(self.tmp))
+            self._published = True
+
+    def discard(self) -> list[str]:
+        """Take back this copy because the write did not land; returns the paths it could NOT
+        remove, for the caller to log.
+
+        Never raises: it runs while an exception is already unwinding (a rollback, or a
+        cancellation), where an error of its own would replace the outcome that got us here.
+        """
+        with self._lock:
+            self._discarded = True
+            doomed = [self.tmp] + ([self.placed] if self._published else [])
+        failed: list[str] = []
+        for path in doomed:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                failed.append(path)
+        return failed
+
+
 @dataclass(frozen=True)
 class VideoPosterProblem:
     """One `video_posters` mapping that cannot be honoured, and why."""
@@ -159,9 +224,43 @@ def _is_complete_sync(path: Path, declared_size: int) -> bool:
 
 
 def _move_into_sync(src: Path, dest: Path) -> None:
-    """Create the destination folder and atomically move `src` onto `dest`, in one hop."""
+    """Create the destination folder and atomically move `src` onto `dest`, in one hop.
+
+    A rename, so both sides must live on ONE filesystem. Its callers all move an original within
+    the data volume (uploads → originals/_unfiled → the memo folder), which is same-device by
+    design; a derived asset under `assets/` is NOT — see `_copy_into_sync`.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.replace(src, dest)
+
+
+def _copy_into_sync(src: Path, dest: Path, tmp: Path) -> None:
+    """Publish `src`'s bytes at `dest` atomically, WITHOUT assuming the two share a filesystem.
+
+    In the deployed stack `/app/data/assets` is a separate mount from the rest of `/app/data`
+    (derived tiers on NVMe, originals and upload parts on the HDD share), so renaming a part file
+    onto a derived-asset path raises OSError EXDEV — "invalid cross-device link" — which is what
+    took the first real poster override down in production. Copying into `tmp`, which the caller
+    puts in the DESTINATION directory, keeps the publish itself a within-device rename, and that
+    rename is what makes the file atomic for readers: nobody ever sees a half-written poster.
+
+    Unconditional rather than a rename with an EXDEV fallback: the two would differ in whether
+    `src` survives, so the caller's cleanup would have to differ too — and an env-dependent branch
+    that only production ever takes is precisely the shape of the bug this replaces.
+
+    fsync before the rename so the bytes are durable before a name points at them. `src` is left
+    exactly as it was: the caller decides when its transaction has earned the right to remove it.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(src, "rb") as reader, open(tmp, "wb") as writer:
+            shutil.copyfileobj(reader, writer, STREAM_CHUNK_SIZE)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # never leave a half-written temp behind for the sweep to find
+        raise
 
 
 def _concat_sync(spool: Path, part: Path, offset: int) -> None:
@@ -523,7 +622,7 @@ async def attach_video_poster(
     db: AsyncSession,
     upload: Upload,
     attachment: Attachment,
-    moved_out: list[tuple[str, str]] | None = None,
+    poster_copies_out: list[PosterCopy],
 ) -> Path:
     """Consume a validated poster upload as `attachment`'s poster tier; returns where it landed.
 
@@ -537,21 +636,33 @@ async def attach_video_poster(
     an export listing, and above all the #curated frame-share queue, which mails every image
     ATTACHMENT of a curated memo to a photo frame (app/services/frame_share.py).
 
-    Like `finalize`, the move is a non-transactional side effect performed before the caller's
-    commit, and the (source, destination) pair is recorded in `moved_out` so a write that rolls back
-    puts the bytes back in the part file the restored Upload row still names. The destination always
-    belongs to a brand-new attachment uid — a video carrying an override finalizes with dedup
-    disabled (see finalize_pending) — so this move can never displace a poster some other memo is
-    already showing.
+    The bytes are COPIED, not renamed: the poster tier lives under `assets/`, which is a separate
+    mount from the upload parts in the deployed stack, and a rename across it fails with EXDEV
+    (see `_copy_into_sync` — this is the production incident that followed the feature's first
+    real use). So the placement is NOT recorded in `moved_out`, whose restore would re-attempt
+    exactly that cross-device rename; it is recorded as a `PosterCopy`, which the caller settles
+    after its commit — discarding the copy if the write did not land, and unlinking the
+    now-consumed part file if it did.
+
+    The record is appended BEFORE the copy starts, and deliberately not after the await returns.
+    A request cancelled mid-copy raises out of that await while the worker thread carries on
+    (see PosterCopy), so a record appended afterwards would never exist — and the thread would
+    then place a file no cleanup could ever know about, orphaned under a rolled-back uid.
+
+    The destination always belongs to a brand-new attachment uid — a video carrying an override
+    finalizes with dedup disabled (see finalize_pending) — so this can never displace a poster some
+    other memo is already showing.
     """
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:  # re-checked here, as finalize does for a master
         raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
     dest = poster.poster_path(attachment.uid)
-    await to_thread.run_sync(_move_into_sync, part, dest)  # mkdir + os.replace in one hop
-    if moved_out is not None:
-        moved_out.append((str(part), str(dest)))
+    record = PosterCopy(
+        part=str(part), placed=str(dest), tmp=str(poster.poster_tmp_path(attachment.uid))
+    )
+    poster_copies_out.append(record)  # before the copy, never after — see above
+    await to_thread.run_sync(record.publish)
     await db.delete(upload)
     await db.flush()
     return dest
@@ -564,6 +675,7 @@ async def finalize_pending(
     moved_out: list[tuple[str, str]] | None = None,
     memo: Memo | None = None,
     video_posters: dict[str, str] | None = None,
+    poster_copies_out: list[PosterCopy] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -601,7 +713,11 @@ async def finalize_pending(
     (`attach_video_poster`), replacing the hero frame the worker would otherwise seek out. Every
     mapping is validated before pass 1 and the batch is refused WHOLE (VideoPostersInvalid) if any
     one of them cannot be honoured — the same all-or-nothing rule, for the same reason, as the
-    missing/incomplete refusal above."""
+    missing/incomplete refusal above. A poster is COPIED into place, so passing `video_posters`
+    also means passing `poster_copies_out` for the caller to settle after its commit (PosterCopy);
+    omitting it is refused outright rather than leaking a file per post."""
+    if video_posters and poster_copies_out is None:
+        raise ValueError("video_posters requires poster_copies_out to settle after the commit")
     pending: list[tuple[Upload, ParsedName]] = []
     missing: list[str] = []
     incomplete: list[str] = []
@@ -646,7 +762,8 @@ async def finalize_pending(
         poster_upload = posters.get(upload.upload_uid)
         att = await finalize(db, upload, owner_id, moved_out, dedup=poster_upload is None)
         if poster_upload is not None:
-            await attach_video_poster(db, poster_upload, att, moved_out)
+            assert poster_copies_out is not None  # guaranteed by the guard above
+            await attach_video_poster(db, poster_upload, att, poster_copies_out)
         return att
 
     out: list[str] = []

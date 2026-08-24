@@ -11,9 +11,15 @@ the poster lands as the tier (and only as the tier), the worker leaves a supplie
 while still extracting one when none was supplied, and a refusal costs the caller nothing.
 """
 
+import asyncio
+import errno
 import io
+import os
 import shutil
 import subprocess
+import threading
+import time
+from pathlib import Path
 from typing import get_args
 
 import pytest
@@ -83,6 +89,14 @@ def _count(sql: str) -> int:
     return int(n)
 
 
+def _scalar(sql: str):
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        value = c.execute(text(sql)).scalar_one()
+    eng.dispose()
+    return value
+
+
 def _post(client, **body):
     return client.post("/api/memos", json={"visibility": "PUBLIC", **body})
 
@@ -115,11 +129,17 @@ def test_a_poster_override_lands_as_the_tier_and_never_as_an_attachment(
 
         # The bytes are the client's, verbatim, at the path the worker's hero frame would occupy.
         assert poster.poster_path(attachment["uid"]).read_bytes() == title_card
+        assert not poster.poster_tmp_path(attachment["uid"]).exists()  # renamed into place
 
         # Both uploads are consumed — the poster one included, which is what makes it impossible to
         # replay or to finalize into an attachment afterwards.
         assert client.head(f"/api/uploads/{video_uid}").status_code == 404
         assert client.head(f"/api/uploads/{poster_uid}").status_code == 404
+        # The poster is COPIED (its destination is on another mount), so its part file outlives the
+        # copy and is reaped once the commit lands. Nothing else would ever collect it: the expiry
+        # reaper unlinks part files by walking `uploads` rows, and this one's row is gone.
+        assert not up_svc.part_path(poster_uid).exists()
+        assert not up_svc.part_path(video_uid).exists()
 
         meta = client.get(f"/api/attachments/{attachment['uid']}")
         assert meta.status_code == 200
@@ -147,12 +167,14 @@ def test_a_video_posted_without_an_override_has_no_poster_yet(
         _cleanup()
 
 
-def test_a_failed_post_puts_the_poster_bytes_back_in_their_part_file(
+def test_a_failed_post_leaves_the_poster_retryable_and_no_orphan_tier_file(
     logged_in_client, monkeypatch, tmp_path
 ):
-    """Consumption is atomic with the memo write. The poster moves before the commit, so a write
-    that does not land has to leave the bytes where the (rolled-back) upload row still promises
-    them — otherwise the retry the client is entitled to has nothing to send."""
+    """Consumption is atomic with the memo write. The poster is placed before the commit, so a
+    write that does not land must (a) leave the bytes where the rolled-back upload row still
+    promises them — otherwise the retry the client is entitled to has nothing to send — and
+    (b) take the placed file with it: the attachment it was named after is rolled back too, so
+    the poster would be an orphan under a uid nothing references."""
     from app.services import memos as memo_svc
 
     client, _ = logged_in_client
@@ -178,7 +200,8 @@ def test_a_failed_post_puts_the_poster_bytes_back_in_their_part_file(
         assert up_svc.part_path(poster_uid).read_bytes() == title_card  # byte for byte
         web = tmp_path / "assets" / "web"
         stranded = [p for p in web.rglob("*") if p.is_file()] if web.exists() else []
-        assert stranded == []  # no poster left behind for an attachment that never existed
+        # No poster AND no in-flight temp, under any uid — the copy is swept whatever it was named.
+        assert stranded == []
 
         # ...and the session really is intact: the identical request succeeds on a later attempt.
         monkeypatch.undo()
@@ -192,6 +215,206 @@ def test_a_failed_post_puts_the_poster_bytes_back_in_their_part_file(
         assert retried.status_code == 201, retried.text
         uid = retried.json()["attachments"][0]["uid"]
         assert poster.poster_path(uid).read_bytes() == title_card
+    finally:
+        _cleanup()
+
+
+def _split_the_mounts(monkeypatch, tmp_path):
+    """Reproduce the deployed layout: `data/assets` (derived tiers, NVMe) is a SEPARATE filesystem
+    from `data/uploads` (parts, HDD share), so a rename between them fails with EXDEV.
+
+    Patching `os.replace` patches a DEPENDENCY of the placement, not the code under test — the
+    placement runs in full — and it is the only way to reproduce a two-mount layout no test box
+    has. Every other rename is delegated to the real one, so an over-broad patch cannot be what
+    makes this pass.
+    """
+    real_replace = os.replace
+    uploads_dir = str(tmp_path / "uploads")
+    assets_dir = str(tmp_path / "assets")
+
+    def guarded(src, dst, **kwargs):
+        if str(src).startswith(uploads_dir) and str(dst).startswith(assets_dir):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", guarded)
+
+
+def test_a_poster_override_lands_across_the_deployed_mount_split(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The production incident, pinned: the first real create through this feature 500'd because
+    the poster was RENAMED from the upload parts onto the derived-asset mount. Publishing it has
+    to be a copy into the destination directory followed by a within-device rename, so that no
+    step of it ever crosses the boundary.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _split_the_mounts(monkeypatch, tmp_path)
+    try:
+        title_card = _jpeg(color=(3, 33, 133))
+        video_uid = _video(client)
+        poster_uid = _upload(client, "title.jpg", "image/jpeg", title_card)
+
+        created = _post(
+            client,
+            content="posted onto a split volume",
+            upload_uids=[video_uid],
+            video_posters={video_uid: poster_uid},
+        )
+
+        assert created.status_code == 201, created.text
+        uid = created.json()["attachments"][0]["uid"]
+        assert poster.poster_path(uid).read_bytes() == title_card
+        assert not poster.poster_tmp_path(uid).exists()
+        assert not up_svc.part_path(poster_uid).exists()  # reaped after the commit, as designed
+        # The video's own original still travels by RENAME (uploads → originals → the memo folder,
+        # one filesystem by design) — the guard above would have raised had that changed.
+        assert client.get(f"/api/attachments/{uid}").json()["hasPoster"] is True
+    finally:
+        _cleanup()
+
+
+async def _upload_async(bearer, name, mime, data: bytes) -> str:
+    """The same two-step upload the sync helper does, over a bearer client (POST /api/memos and
+    the upload verbs all take a PAT — app/auth.require_user)."""
+    opened = await bearer.post(
+        "/api/uploads",
+        json={"filename": name, "mime": mime, "size": len(data), "last_modified": 1609459200000},
+    )
+    assert opened.status_code == 201, opened.text
+    uid = opened.json()["upload_uid"]
+    sent = await bearer.patch(
+        f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"}
+    )
+    assert sent.status_code == 200, sent.text
+    return uid
+
+
+async def test_a_cancelled_create_never_strands_the_poster_it_was_copying(
+    pat_client, monkeypatch, tmp_path
+):
+    """A client that hangs up mid-copy must not leave a poster behind.
+
+    The copy runs in a worker thread, and a cancelled request does NOT wait for it — anyio raises
+    the cancellation out of the await while the thread carries on placing the file. So the record
+    the cleanup acts on is written BEFORE the copy starts, and publish/discard are serialised
+    against each other, which is what makes the outcome the same in both orders. Nothing about the
+    unit is stubbed: only the copy primitive is slowed down, so the cancellation has a window to
+    land in that a real 200 KB copy would not reliably give.
+    """
+    bearer, _, _ = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    started = threading.Event()
+    existed_after_copy: list[bool] = []
+    real_copy = up_svc._copy_into_sync
+
+    def slow_copy(src, dest, tmp):
+        started.set()
+        time.sleep(0.5)  # the window the cancellation lands in
+        real_copy(src, dest, tmp)
+        existed_after_copy.append(Path(dest).exists())  # the positive control, taken under the lock
+
+    monkeypatch.setattr(up_svc, "_copy_into_sync", slow_copy)
+    try:
+        title_card = _jpeg(color=(11, 22, 33))
+        video_uid = await _upload_async(bearer, "clip.mov", "video/quicktime", VIDEO_BYTES)
+        poster_uid = await _upload_async(bearer, "title.jpg", "image/jpeg", title_card)
+
+        posting = asyncio.create_task(
+            bearer.post(
+                "/api/memos",
+                json={
+                    "content": "hung up mid-copy",
+                    "visibility": "PUBLIC",
+                    "upload_uids": [video_uid],
+                    "video_posters": {video_uid: poster_uid},
+                },
+            )
+        )
+        for _ in range(500):  # cancel only once the copy is genuinely under way
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "the copy never started — cancelling here would prove nothing"
+        posting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await posting
+
+        # Positive control: the stub really did place its file, and saw it on disk. Without this,
+        # "nothing survives" would also be satisfied by a copy that never happened at all.
+        assert existed_after_copy == [True]
+
+        assets = tmp_path / "assets"
+        survivors = [str(p) for p in assets.rglob("*") if p.is_file()] if assets.exists() else []
+        assert survivors == []  # no poster, no temp, under any uid
+        assert _count("SELECT count(*) FROM memos") == 0
+        assert _count("SELECT count(*) FROM attachments") == 0
+        # The client's bytes are untouched, so the post it never completed can simply be retried.
+        assert up_svc.part_path(poster_uid).read_bytes() == title_card
+    finally:
+        _cleanup()
+
+
+async def test_a_cancel_during_the_post_commit_reap_leaves_the_stored_memo_whole(
+    pat_client, monkeypatch, tmp_path
+):
+    """The mirror of the test above, and the more dangerous half: once the memo is COMMITTED, the
+    failure path must not run at all. A cancellation delivered during the best-effort part reap
+    lands in the same handler that discards posters and moves originals back — on a memo that is
+    already stored, that is not cleanup, it is deleting a live memo's media. The committed flag is
+    what makes the handler stand down; at worst a part file is left unreaped.
+    """
+    from app.routers import memos as memos_router
+
+    bearer, _, _ = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    started = threading.Event()
+    reaping: list[list[str]] = []
+    real_unlink_all = memos_router._unlink_all
+
+    def slow_reap(paths):
+        reaping.append(list(paths))  # in-stub control: the reap really began, with these files
+        started.set()
+        time.sleep(0.5)  # the cancellation lands here, AFTER the commit
+        real_unlink_all(paths)
+
+    monkeypatch.setattr(memos_router, "_unlink_all", slow_reap)
+    try:
+        title_card = _jpeg(color=(44, 55, 66))
+        video_uid = await _upload_async(bearer, "clip.mov", "video/quicktime", VIDEO_BYTES)
+        poster_uid = await _upload_async(bearer, "title.jpg", "image/jpeg", title_card)
+
+        posting = asyncio.create_task(
+            bearer.post(
+                "/api/memos",
+                json={
+                    "content": "committed, then hung up",
+                    "visibility": "PUBLIC",
+                    "upload_uids": [video_uid],
+                    "video_posters": {video_uid: poster_uid},
+                },
+            )
+        )
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "the reap never started — this would not test the committed gate"
+        posting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await posting
+
+        # The control: the reap really was in flight, and over this poster's own part file.
+        assert reaping == [[str(up_svc.part_path(poster_uid))]]
+
+        # Everything the commit stored is still there — this is the data-loss assertion.
+        assert _count("SELECT count(*) FROM memos") == 1
+        assert _count("SELECT count(*) FROM attachments") == 1
+        uid = _scalar("SELECT uid FROM attachments")
+        assert poster.poster_path(uid).read_bytes() == title_card
+        # The accepted worst case, and the only one: the consumed part file was not reaped.
+        assert up_svc.part_path(poster_uid).exists()
     finally:
         _cleanup()
 
@@ -444,7 +667,7 @@ def test_the_fast_lane_still_extracts_a_hero_frame_when_none_was_supplied(monkey
     assert derived.exists()
     with Image.open(derived) as image:
         assert image.format == "JPEG" and image.size == (320, 240)
-    assert not media._poster_tmp(derived).exists()  # renamed into place, no debris left
+    assert not poster.poster_tmp_path(attachment.uid).exists()  # renamed into place, no debris
     assert isinstance(meta["blurhash"], str) and meta["blurhash"]
 
 
