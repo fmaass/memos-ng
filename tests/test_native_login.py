@@ -8,6 +8,8 @@ The properties under test, in the order the flow exercises them:
 * that code becomes a PAT exactly once, only for the holder of the PKCE verifier, and only if it
   is neither expired nor already burned;
 * a device token may revoke itself and nothing else;
+* that token renews itself on use — rotating rather than extending, and exactly once
+  under a concurrent pair — so a year-old install never silently signs out;
 * the two anonymous URLs Apple and the authentication session need beat the SPA catch-all.
 
 Every case drives the real flow with only the OIDC network calls mocked (the seam `conftest`'s
@@ -445,6 +447,139 @@ def test_native_logout_refuses_a_browser_session(logged_in_client):
 
 def test_native_logout_refuses_an_unauthenticated_caller(client, db_engine):
     assert client.post("/api/auth/native/logout").status_code == 401
+
+
+# --- a device token renews itself on use ------------------------------------------------------
+
+
+def _renew(token: str):
+    """Renew the way the app does: a clean client whose only credential is the bearer."""
+    anon = TestClient(app, raise_server_exceptions=False)
+    return anon.post("/api/auth/native/renew", headers={"Authorization": f"Bearer {token}"})
+
+
+def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc):
+    """The point of the endpoint: a phone that keeps using its token never reaches the expiry
+    that would sign it out — and the token it presented is dead the moment it is renewed.
+    """
+    client, subject = native_oidc
+    device = "RenewingPhone"
+    old = _exchange(client, _handoff_code(client, device=device)).json()["token"]
+    # Backdated to a day out so a successor that merely COPIED the old expiry would fail the
+    # lifetime assertion below instead of passing on the mint's own year.
+    _sql(
+        "UPDATE pats SET expires_at = now() + interval '1 day' WHERE hashed_token = :h",
+        h=auth.hash_token(old),
+    )
+
+    resp = _renew(old)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    new = body["token"]
+    assert new != old
+    assert new.startswith(auth.PAT_PREFIX)
+    assert body["user"]["subject"] == subject
+    assert body["user"]["auth_kind"] == "pat"
+
+    anon = TestClient(app, raise_server_exceptions=False)
+    assert anon.get("/api/memos", headers={"Authorization": f"Bearer {new}"}).status_code == 200
+    assert anon.get("/api/memos", headers={"Authorization": f"Bearer {old}"}).status_code == 401
+
+    rows = _sql("SELECT hashed_token, expires_at FROM pats WHERE name = :n", n=device)
+    assert len(rows) == 1  # rotated, never accumulated
+    hashed_token, expires_at = rows[0]
+    assert hashed_token == auth.hash_token(new)
+    lifetime = expires_at - datetime.now(UTC)
+    assert timedelta(days=364) < lifetime <= timedelta(days=365)
+    assert abs(datetime.fromisoformat(body["expires_at"]) - expires_at) < timedelta(seconds=5)
+
+
+def test_an_expired_token_is_refused_before_the_renew_logic_runs(native_oidc):
+    """Expiry is authentication's answer, not renewal's — so the expired row is still sitting
+    there afterwards, unrotated, with no successor beside it.
+
+    Backdated in PostgreSQL rather than with a frozen clock: only a real stored instant tests the
+    predicate the running code evaluates.
+    """
+    client, _ = native_oidc
+    device = "ExpiredPhone"
+    token = _exchange(client, _handoff_code(client, device=device)).json()["token"]
+    _sql(
+        "UPDATE pats SET expires_at = now() - interval '1 second' WHERE hashed_token = :h",
+        h=auth.hash_token(token),
+    )
+
+    resp = _renew(token)
+    assert resp.status_code == 401
+    assert [r[0] for r in _sql("SELECT hashed_token FROM pats WHERE name = :n", n=device)] == [
+        auth.hash_token(token)
+    ]
+
+
+def test_a_revoked_token_cannot_renew_itself_back_to_life(native_oidc):
+    client, _ = native_oidc
+    device = "RevokedPhone"
+    token = _exchange(client, _handoff_code(client, device=device)).json()["token"]
+    anon = TestClient(app, raise_server_exceptions=False)
+    revoked = anon.post("/api/auth/native/logout", headers={"Authorization": f"Bearer {token}"})
+    assert revoked.status_code == 204
+
+    assert _renew(token).status_code == 401
+    assert _sql("SELECT count(*) FROM pats WHERE name = :n", n=device)[0][0] == 0
+
+
+async def test_two_concurrent_renews_mint_exactly_one_successor(native_oidc):
+    """The single-statement rotate is what makes this deterministic: read-then-delete would let
+    both requests see a renewable row, mint two successors and leave one of them orphaned.
+    """
+    client, _ = native_oidc
+    device = "RacingPhone"
+    token = _exchange(client, _handoff_code(client, device=device)).json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as ac:
+        first, second = await asyncio.gather(
+            ac.post("/api/auth/native/renew", headers=headers),
+            ac.post("/api/auth/native/renew", headers=headers),
+        )
+
+    assert sorted([first.status_code, second.status_code]) == [200, 401]
+    winner = first if first.status_code == 200 else second
+    assert [r[0] for r in _sql("SELECT hashed_token FROM pats WHERE name = :n", n=device)] == [
+        auth.hash_token(winner.json()["token"])
+    ]
+
+
+async def test_a_token_that_never_expires_is_not_renewable(pat_client):
+    """Renewal exists so a BOUNDED token does not silently sign out; a PAT with no expiry has
+    nothing to renew, and the table cannot tell a device token from an SPA-created one by anything
+    else — so the unbounded class is refused in-band rather than rotated by a bearer (Decision 5).
+    """
+    bearer, _, token = pat_client
+
+    resp = await bearer.post("/api/auth/native/renew")
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "token_not_renewable"
+    assert _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(token))[0][
+        0
+    ] == 1
+    assert (await bearer.get("/api/memos")).status_code == 200  # refused, not revoked
+
+
+def test_renew_refuses_a_browser_session(logged_in_client):
+    """A cookie names no token, and a session must not be able to mint a device successor at all:
+    the SPA creates tokens through `/api/pats`, which says which one it means (Decision 5/6).
+    """
+    client, _ = logged_in_client
+    minted = client.post("/api/pats", json={"name": "session-minted", "expires_in_days": 30})
+    assert minted.status_code == 201
+
+    assert client.post("/api/auth/native/renew").status_code == 401
+    assert _sql("SELECT count(*) FROM pats WHERE name = 'session-minted'")[0][0] == 1
+
+
+def test_renew_refuses_an_unauthenticated_caller(client, db_engine):
+    assert client.post("/api/auth/native/renew").status_code == 401
 
 
 # --- the two anonymous URLs, and their precedence over the SPA catch-all -----------------------

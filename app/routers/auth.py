@@ -176,10 +176,28 @@ class NativeExchangeIn(BaseModel):
 
 
 class NativeExchangeOut(BaseModel):
-    # The plaintext token exists in exactly one response in this application's lifetime: this one.
+    # The plaintext token exists in exactly one response per mint — this one — whether the mint is
+    # the first exchange or a renewal, which returns this same shape by design.
     token: str
     expires_at: datetime
     user: UserOut
+
+
+def _native_token_response(user: User, token: str, expires_at: datetime) -> NativeExchangeOut:
+    """The one shape a device ever receives a token in, so exchange and renewal cannot drift apart
+    — a native client parses a renewal with the same decoder it parsed its first token with."""
+    return NativeExchangeOut(
+        token=token,
+        expires_at=expires_at,
+        user=UserOut(
+            subject=user.subject,
+            display_name=user.display_name,
+            email=user.email,
+            role=user.role,
+            avatar=user.avatar,
+            auth_kind="pat",
+        ),
+    )
 
 
 @router.post("/native/exchange", response_model=NativeExchangeOut)
@@ -213,18 +231,86 @@ async def native_exchange(
     expires_at = datetime.now(UTC) + timedelta(days=settings.NATIVE_TOKEN_DAYS)
     _, token = await pats_svc.create_pat(db, user, claim.device_name, expires_at=expires_at)
     await db.commit()
-    return NativeExchangeOut(
-        token=token,
-        expires_at=expires_at,
-        user=UserOut(
-            subject=user.subject,
-            display_name=user.display_name,
-            email=user.email,
-            role=user.role,
-            avatar=user.avatar,
-            auth_kind="pat",
-        ),
-    )
+    return _native_token_response(user, token, expires_at)
+
+
+async def _renew_rejection(db: AsyncSession, hashed_token: str) -> HTTPException:
+    """Why the conditional rotate matched nothing — read back, never inferred.
+
+    The token authenticated moments ago, so its absence here means it stopped existing in between:
+    a concurrent renewal took it (exactly the race the single statement exists to settle) or the
+    owner revoked it. Either way the client is holding a dead credential and logs in again.
+
+    `id` is selected only so an absent row stays distinguishable from a present one whose expiry
+    is NULL — the difference between "gone" and "never renewable", which is the whole verdict.
+    """
+    row = (
+        await db.execute(select(Pat.id, Pat.expires_at).where(Pat.hashed_token == hashed_token))
+    ).one_or_none()
+    if row is not None and row.expires_at is None:
+        return HTTPException(status_code=400, detail="token_not_renewable")
+    return HTTPException(status_code=401, detail="Invalid or revoked token")
+
+
+@router.post("/native/renew", response_model=NativeExchangeOut)
+async def native_renew(
+    request: Request,
+    user: User = Depends(auth.require_user),
+    db: AsyncSession = Depends(get_session),
+) -> NativeExchangeOut:
+    """Rotate the presenting device token: mint a successor and revoke the presenter, atomically.
+
+    A device token is deliberately bounded — it lives on hardware that gets lost, and nobody
+    revokes what they have not noticed is gone — which without this route means every phone set up
+    a year ago signs out one morning with no warning and no way back except a full login. Renewal
+    refreshes that lifetime from USE instead of removing the bound.
+
+    It ROTATES rather than extends: the successor is a new secret and the presenter is gone in the
+    same statement, so a token copied out of a backup or a log stops working at the owner's next
+    renewal instead of living the full year twice over.
+
+    Restricted to a token that carries an expiry. `pats` has no column that tells a device token
+    from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
+    only a token that expires can silently sign out, so an unbounded PAT is refused
+    (`token_not_renewable`) rather than rotated: token management stays behind a browser session
+    (Decision 5), and this route reaches no further than the class it exists for.
+
+    Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
+    session cookie names no token at all.
+    """
+    if getattr(request.state, "auth_kind", None) != "pat":
+        raise HTTPException(status_code=401, detail="Token authentication required")
+    credential = auth.bearer_credential(request)
+    if credential is None:  # unreachable while auth_kind == "pat"; refuse rather than rotate blind
+        raise HTTPException(status_code=401, detail="Token authentication required")
+    hashed_token = auth.hash_token(credential)
+    now = datetime.now(UTC)
+    # ONE statement, for the reason `native_auth.consume_code` is one: reading the row, judging it
+    # renewable and then deleting it would let two concurrent renewals both find a live token and
+    # both mint a successor — leaving one of them orphaned on a device that thinks it is signed in.
+    # The conditional DELETE ... RETURNING makes the database the arbiter: the second writer blocks
+    # on the row lock, re-evaluates against the committed version and matches nothing. Expiry is in
+    # the WHERE as well, so the rotate is fail-closed however it is reached.
+    revoked = (
+        await db.execute(
+            delete(Pat)
+            .where(
+                Pat.hashed_token == hashed_token,
+                Pat.user_id == user.id,
+                Pat.expires_at.is_not(None),
+                Pat.expires_at > now,
+            )
+            .returning(Pat.name)
+        )
+    ).one_or_none()
+    if revoked is None:
+        raise await _renew_rejection(db, hashed_token)
+    # The device name rides across unchanged: the successor is the same phone in the token list,
+    # not a new entry the owner has to recognise.
+    expires_at = now + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    _, token = await pats_svc.create_pat(db, user, revoked.name, expires_at=expires_at)
+    await db.commit()
+    return _native_token_response(user, token, expires_at)
 
 
 @router.post("/native/logout", status_code=204)
