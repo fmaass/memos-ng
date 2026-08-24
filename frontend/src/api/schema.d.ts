@@ -879,6 +879,50 @@ export interface components {
         CreateRacedError: {
             detail: components["schemas"]["CreateRacedDetail"];
         };
+        /**
+         * EditKeyConflictDetail
+         * @description Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT
+         *     memo. Both alternatives to refusing are wrong — replaying would answer a PATCH of one memo with
+         *     another memo's body (a uid the client never asked about), and applying would leave one key
+         *     naming two edits, after which neither could be replayed. `memo_uid` names the memo the key is
+         *     bound to so a client can tell a stale key apart from a mis-generated one. Retrying is pointless:
+         *     the fix is a fresh key, which is why this is a 4xx and not the 503 a raced edit gets.
+         */
+        EditKeyConflictDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "edit_key_conflict";
+            /** Memo Uid */
+            memo_uid: string;
+            /** Message */
+            message: string;
+        };
+        /** EditKeyConflictError */
+        EditKeyConflictError: {
+            detail: components["schemas"]["EditKeyConflictDetail"];
+        };
+        /**
+         * EditRacedDetail
+         * @description Why a keyed edit could not be resolved (MEMNG-124): the write collided on the edit-key
+         *     constraint, and the edit it collided with was gone by the time it could be read back — the memo
+         *     itself was deleted, taking its recorded edits with it. Retrying with the same key is safe (that
+         *     is what the key is for) and self-correcting: the retry finds no memo and answers 404.
+         */
+        EditRacedDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "edit_raced";
+            /** Message */
+            message: string;
+        };
+        /** EditRacedError */
+        EditRacedError: {
+            detail: components["schemas"]["EditRacedDetail"];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -990,6 +1034,11 @@ export interface components {
              * Format: date-time
              */
             created_at?: string | null;
+            /**
+             * Edit Key
+             * @description Optional client-generated retry token: a UUID, or any opaque 8-64 character token of [A-Za-z0-9_-], unique per logical edit. Sending it a second time does NOT re-apply the edit; it answers **200 with the memo's CURRENT state** — which is the state after any later write, not a snapshot of what this edit produced. The token records that the edit landed, not what the memo looked like afterwards. Crucially the replay is answered BEFORE `upload_uids` are checked, so a retry whose uploads the first attempt already consumed gets its memo instead of a 409. A key already used on a DIFFERENT memo is refused (409 `edit_key_conflict`); two owners may reuse one token. Without a key, a retried media edit is refused with 409 `uploads_unlinkable`.
+             */
+            edit_key?: string | null;
             /** Pinned */
             pinned?: boolean | null;
             /** Upload Uids */
@@ -2011,13 +2060,13 @@ export interface operations {
                     "application/json": components["schemas"]["MemoOut"];
                 };
             };
-            /** @description A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked — resolve the named uploads and retry. */
+            /** @description Either a requested upload_uid is missing, expired or incomplete (`uploads_unlinkable`), or the `edit_key` is already bound to a different memo (`edit_key_conflict`). Switch on `detail.code`. Nothing is edited and no attachment is linked in either case. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["UploadsUnlinkableError"];
+                    "application/json": components["schemas"]["UploadsUnlinkableError"] | components["schemas"]["EditKeyConflictError"];
                 };
             };
             /** @description Validation Error */
@@ -2027,6 +2076,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Concurrent writes raced this keyed edit and the edit they raced for is gone. Retry the same request, edit_key included. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EditRacedError"];
                 };
             };
         };

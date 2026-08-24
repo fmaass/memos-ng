@@ -15,6 +15,7 @@ from app.models import (
     Attachment,
     AttachmentRendition,
     Memo,
+    MemoEditKey,
     Reaction,
     Tag,
     User,
@@ -201,6 +202,54 @@ async def get_by_idempotency_key(db: AsyncSession, owner_id: int, key: str) -> M
             .with_for_update(read=True)
         )
     ).scalar_one_or_none()
+
+
+async def get_memo_by_edit_key(db: AsyncSession, owner_id: int, key: str) -> Memo | None:
+    """The memo this owner's edit `key` was already applied to, or None (MEMNG-124).
+
+    The answer is the memo's CURRENT state, deliberately — the recorded row says THAT the edit
+    landed, never what the row looked like afterwards. A replay arriving after some later write is
+    therefore answered with the memo as it stands now, which is both the only thing obtainable
+    without storing response bodies and what a retrying client is asking: "did my edit land, and
+    what does the memo say now?".
+
+    Scoped to the owner because the key is the CLIENT's name for its own edit, not a global one —
+    the same scope the unique constraint enforces. The memo it returns may belong to a DIFFERENT
+    memo than the one being patched (a client reusing one key across two memos); resolving that is
+    the router's job, because only it knows which memo the request addressed.
+
+    FOR SHARE on the memo row alone (`of=Memo` — the join row must not be locked, and locking it
+    would serialize replays against each other for nothing), for the reason get_by_idempotency_key
+    documents: the relationships are `selectin`, so reading one memo is several statements, each
+    seeing a newer READ COMMITTED snapshot than the last, and a DELETE committing midway would hand
+    back a 200 carrying a memo with some or none of its attachments. A share lock stops exactly
+    that — a delete must take a conflicting lock on this same parent row before its cascade can
+    remove any child — and no more: share locks do not exclude each other, so two replays of one
+    key still run concurrently.
+    """
+    return (
+        await db.execute(
+            select(Memo)
+            .join(MemoEditKey, MemoEditKey.memo_id == Memo.id)
+            .where(MemoEditKey.owner_id == owner_id, MemoEditKey.edit_key == key)
+            .with_for_update(read=True, of=Memo)
+        )
+    ).scalar_one_or_none()
+
+
+async def record_edit_key(db: AsyncSession, memo: Memo, owner_id: int, key: str) -> None:
+    """Record that `key` has been applied to this memo, in the caller's transaction (MEMNG-124).
+
+    Flushed here rather than left to the commit so the unique violation — the settlement for two
+    patches racing with one key — surfaces at a point the caller can still handle, and surfaces
+    EARLY: called before the edit does any work, the loser blocks on the index and fails before it
+    has moved a single upload's bytes, so there is nothing to move back.
+
+    Not committed here: the row and the edit it names must land together or not at all. A recorded
+    key whose edit rolled back would answer the client's honest retry with "already applied" for an
+    edit that never happened."""
+    db.add(MemoEditKey(memo_id=memo.id, owner_id=owner_id, edit_key=key))
+    await db.flush()
 
 
 async def get_memo(db: AsyncSession, user: User, uid: str) -> Memo | None:

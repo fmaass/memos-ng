@@ -150,6 +150,38 @@ class Memo(Base):
     )
 
 
+class MemoEditKey(Base):
+    """One client-supplied `edit_key` that has already been applied to a memo (MEMNG-124).
+
+    The create side records its retry token ON the memo (`Memo.idempotency_key`) because a create
+    produces exactly one memo. An edit cannot: a memo is edited many times, so the token belongs in
+    its own row, and this table is the ledger of "this owner's edit K already landed on that memo".
+
+    A separate table rather than a column also keeps the semantics honest: the row records THAT the
+    edit landed, not what the memo looked like afterwards. A replay therefore answers with the
+    memo's CURRENT state — see `services.memos.get_memo_by_edit_key`.
+
+    `memo_id` cascades, so deleting a memo takes its recorded edits with it: rows pointing at a memo
+    nobody has are useless, and keeping them would hold a key hostage against a later legitimate
+    edit. Uniqueness is per OWNER, not global — the key is the client's name for its own edit, so
+    two phones minting the same token must not collide — and it is also the concurrency settlement:
+    two racing patches carrying one key cannot both insert, so the loser reads the winner back
+    instead of the edit being applied twice."""
+
+    __tablename__ = "memo_edit_keys"
+
+    __table_args__ = (UniqueConstraint("owner_id", "edit_key", name="uq_memo_edit_keys_owner_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    memo_id: Mapped[int] = mapped_column(ForeignKey("memos.id", ondelete="CASCADE"), index=True)
+    # No index=True on owner_id: uq_memo_edit_keys_owner_key is a btree LEADING with owner_id, so it
+    # already serves both the replay lookup and the cascade when a user is deleted. A second index
+    # over the same column would be paid for on every write and read by nothing.
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    edit_key: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Tag(Base):
     __tablename__ = "tags"
 
