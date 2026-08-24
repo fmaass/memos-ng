@@ -216,6 +216,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/native/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Native Renew
+         * @description Rotate the presenting device token: mint a successor and revoke the presenter, atomically.
+         *
+         *     A device token is deliberately bounded — it lives on hardware that gets lost, and nobody
+         *     revokes what they have not noticed is gone — which without this route means every phone set up
+         *     a year ago signs out one morning with no warning and no way back except a full login. Renewal
+         *     refreshes that lifetime from USE instead of removing the bound.
+         *
+         *     It ROTATES rather than extends: the successor is a new secret and the presenter is gone in the
+         *     same statement, so a token copied out of a backup or a log stops working at the owner's next
+         *     renewal instead of living the full year twice over.
+         *
+         *     Restricted to a token that carries an expiry. `pats` has no column that tells a device token
+         *     from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
+         *     only a token that expires can silently sign out, so an unbounded PAT is refused
+         *     (`token_not_renewable`) rather than rotated: token management stays behind a browser session
+         *     (Decision 5), and this route reaches no further than the class it exists for.
+         *
+         *     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
+         *     session cookie names no token at all.
+         */
+        post: operations["native_renew_api_auth_native_renew_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/user": {
         parameters: {
             query?: never;
@@ -1579,6 +1617,26 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    native_renew_api_auth_native_renew_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeExchangeOut"];
+                };
             };
         };
     };
