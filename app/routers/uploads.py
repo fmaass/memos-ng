@@ -94,8 +94,9 @@ async def start_upload(
 
 
 # The chunk arrives as a raw `request.stream()`, which FastAPI cannot see, so it declares no
-# request body at all and a generated client has no way to send one (MEMNG-109). The response
-# header and the offset-gap 409 are likewise invisible to FastAPI: both come from the handler.
+# request body at all and a generated client has no way to send one (MEMNG-109). The
+# offset-gap 409 is likewise invisible to FastAPI, and the Upload-Offset response header is
+# set on the injected Response so resync clients can read the cursor without parsing JSON.
 @router.patch(
     "/{upload_uid}",
     response_model=UploadOut,
@@ -126,6 +127,7 @@ async def start_upload(
 async def append_chunk(
     upload_uid: str,
     request: Request,
+    response: Response,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
@@ -144,6 +146,7 @@ async def append_chunk(
     except ValueError:
         raise HTTPException(status_code=409, detail="Offset gap; re-sync via HEAD") from None
     await db.commit()
+    response.headers["Upload-Offset"] = str(upload.bytes_received)
     return UploadOut(
         upload_uid=upload.upload_uid,
         chunk_size=settings.UPLOAD_CHUNK_SIZE,
