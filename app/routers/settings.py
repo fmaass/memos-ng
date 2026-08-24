@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.database import get_session
 from app.models import User, Visibility
+from app.routers import RequestVisibility
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -20,7 +21,7 @@ class SettingsOut(BaseModel):
 
 
 class SettingsPatch(BaseModel):
-    default_visibility: Visibility | None = None
+    default_visibility: RequestVisibility = None
     theme: str | None = None
     avatar: str | None = None  # data:image/ URL; "" clears it
 

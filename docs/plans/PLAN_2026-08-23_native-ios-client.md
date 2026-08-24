@@ -645,9 +645,13 @@ Each phase is independently shippable and ends in an objective verification gate
   `fix/nullable-request-schemas`, merged FIRST: the four request-side nullable-enum fields
   (`MemoCreate.visibility`, `MemoPatch.visibility`, `SettingsPatch.default_visibility`, and the
   `visibility` query params of list/export) switch to `SkipJsonSchema[None]` so the schema emits
-  a plain `$ref` with the field simply not required — no API behaviour change (absent ≡ null for
-  these fields), `openapi.json`/`schema.d.ts` regenerated, drift test green, a pytest asserting
-  none of the four carries an `anyOf` with a null branch; partial delivery of MEMNG-105.
+  a plain `$ref` with the field simply not required. ONE deliberate behaviour change: an explicit
+  JSON `null` for these fields becomes a 422 (absent stays valid). REQUIRED gates: a pytest that
+  asserts each of the four schema locations EXISTS and carries no `anyOf` null branch; runtime
+  tests per body field for absent-accepted / value-accepted / explicit-null-422; and a cited grep
+  of the SPA payload construction proving the SPA never sends explicit null for them (if it does,
+  4a STOPS and reports). `openapi.json`/`schema.d.ts` regenerated, drift test green; partial
+  delivery of MEMNG-105.
   (4b) memos-ng-ios `feature/native-login-writes`, vendoring 4a's merge SHA.
 - **Dependencies:** Phase 2 deployed; Phase 3 merged; **Apple Developer Program enrolled** (the
   Team ID is needed for the associated-domains entitlement and the AASA file — user action,
@@ -686,11 +690,11 @@ Each phase is independently shippable and ends in an objective verification gate
 - **Do NOT:** custom URL scheme fallback; offline edit queue; conflict resolution; share
   extension; iPad layout.
 - **Verification:** Swift Testing: PKCE known-answer vectors (RFC 7636 Appendix B), `toggleTask`
-  vectors identical to `tasks.spec.ts`, optimistic rollback on a failing fake API, 401 →
-  signed-out transition; `bin/mac-gate.sh` → 0; end-to-end on a **physical device** (associated
-  domains need extra setup on a simulator — known-unknown; pivot: AASA developer mode /
-  `?mode=developer` for the simulator): native login against production completes and a created
-  memo appears in the SPA (browser-harness read-back) and in the DB; Codex read-only diff review
+  vectors identical to `tasks.spec.ts`, optimistic rollback and the 401 → signed-out transition exercised through the REAL generated
+  client backed by a StubTransport (never a hand-rolled fake of the store's surface); `bin/mac-gate.sh` → 0; end-to-end on a **physical device** (simulator associated-domains behaviour is undocumented;
+  `?mode=developer` is an optional direct-fetch experiment, not a pivot): native login against
+  production completes and a memo created with a UNIQUE marker string appears with that marker in
+  the SPA (browser-harness read-back) and in the DB row; Codex read-only diff review
   (medium) → APPROVE.
 - **Status:** pending
 

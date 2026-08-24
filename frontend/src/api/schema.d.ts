@@ -850,7 +850,7 @@ export interface components {
              * @default []
              */
             upload_uids: string[];
-            visibility?: components["schemas"]["Visibility"] | null;
+            visibility?: components["schemas"]["Visibility"];
         };
         /** MemoList */
         MemoList: {
@@ -916,7 +916,7 @@ export interface components {
             pinned?: boolean | null;
             /** Upload Uids */
             upload_uids?: string[] | null;
-            visibility?: components["schemas"]["Visibility"] | null;
+            visibility?: components["schemas"]["Visibility"];
         };
         /** NativeExchangeIn */
         NativeExchangeIn: {
@@ -1134,7 +1134,8 @@ export interface components {
         SettingsPatch: {
             /** Avatar */
             avatar?: string | null;
-            default_visibility?: components["schemas"]["Visibility"] | null;
+            /** Default Visibility */
+            default_visibility?: components["schemas"]["Visibility"];
             /** Theme */
             theme?: string | null;
         };
@@ -1627,7 +1628,7 @@ export interface operations {
                 created_before?: string | null;
                 created_after?: string | null;
                 tag?: string[] | null;
-                visibility?: components["schemas"]["Visibility"] | null;
+                visibility?: components["schemas"]["Visibility"];
                 owner?: string | null;
                 q?: string | null;
                 include_media?: boolean;
@@ -1703,7 +1704,7 @@ export interface operations {
                 created_before?: string | null;
                 created_after?: string | null;
                 tag?: string[] | null;
-                visibility?: components["schemas"]["Visibility"] | null;
+                visibility?: components["schemas"]["Visibility"];
                 owner?: string | null;
                 q?: string | null;
                 include_archived?: boolean;

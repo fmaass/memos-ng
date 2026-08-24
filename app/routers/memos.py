@@ -8,11 +8,13 @@ import structlog
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.database import get_session
 from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
+from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
@@ -87,7 +89,7 @@ class MemoOut(BaseModel):
 
 class MemoCreate(BaseModel):
     content: str
-    visibility: Visibility | None = None  # None → the user's default_visibility setting
+    visibility: RequestVisibility = None  # unset → the user's default_visibility setting
     pinned: bool = False
     # Finalize-on-post: pending upload_uids become attachments only when the memo is created, so
     # an abandoned compose leaves only Uploads (which expire) — never an orphan attachment.
@@ -98,7 +100,7 @@ class MemoCreate(BaseModel):
 
 class MemoPatch(BaseModel):
     content: str | None = None
-    visibility: Visibility | None = None
+    visibility: RequestVisibility = None
     pinned: bool | None = None
     archived: bool | None = None
     created_at: datetime | None = None  # edit a memo's display date
@@ -183,7 +185,9 @@ async def list_memos(
     created_before: datetime | None = None,
     created_after: datetime | None = None,
     tag: Annotated[list[str] | None, Query()] = None,
-    visibility: Visibility | None = None,
+    # SkipJsonSchema, same as the request bodies — no BeforeValidator: a query string cannot
+    # carry a JSON null, so absent is already the only way this one arrives unset.
+    visibility: Visibility | SkipJsonSchema[None] = None,
     owner: str | None = None,
     q: str | None = None,
     include_archived: bool = False,
