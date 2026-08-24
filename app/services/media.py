@@ -81,13 +81,6 @@ class AttachmentGone(Exception):
     """
 
 
-def _poster_tmp(poster_file: Path) -> Path:
-    """The in-flight name a poster is encoded to before it is renamed into place. The real `.jpg`
-    extension has to survive (`.jpg.tmp` would leave ffmpeg unable to infer the muxer), so the
-    marker goes in front of it: `<uid>.poster.tmp.jpg`."""
-    return poster_file.with_name(f"{poster_file.stem}.tmp{poster_file.suffix}")
-
-
 def derived_outputs(uid: str) -> list[Path]:
     """Every file a media job writes for one attachment — final tiers AND their in-flight temps.
 
@@ -106,7 +99,7 @@ def derived_outputs(uid: str) -> list[Path]:
         print_ready,
         print_ready.with_suffix(print_ready.suffix + ".tmp"),  # _atomic_save
         poster_file,  # the hero frame OR a client-supplied override (app/services/poster.py)
-        _poster_tmp(poster_file),  # process_video_poster
+        poster.poster_tmp_path(uid),  # in flight: process_video_poster, or an override's copy
         web / f"{uid}.mp4",
         web / f"{uid}.tmp.mp4",  # process_slow
     ]
@@ -480,7 +473,7 @@ def process_video_poster(attachment: Attachment) -> dict:
     poster_file = poster.poster_path(attachment.uid)
     if not poster_file.exists():
         poster_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _poster_tmp(poster_file)
+        tmp = poster.poster_tmp_path(attachment.uid)
         subprocess.run(
             poster_ffmpeg_cmd(src, str(tmp), meta.get("duration")),
             capture_output=True,
