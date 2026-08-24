@@ -16,5 +16,9 @@ export default createRouter({
     { path: '/resources', name: 'resources', component: () => import('./views/ResourcesView.vue') },
     { path: '/search', name: 'search', component: () => import('./views/SearchView.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
+    // The canonical URL of one memo — what the app shares out and what a phone without the app
+    // installed falls back to (the /m/* pattern the AASA applinks document claims). Lazy like the
+    // rest: a deep-linked cold open pays for this chunk, the feed's opening does not.
+    { path: '/m/:uid', name: 'memo', component: () => import('./views/MemoView.vue') },
   ],
 })
