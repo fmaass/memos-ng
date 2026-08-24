@@ -483,6 +483,21 @@
               "null"
             ]
           },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 8,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional client-generated retry token: a UUID, or any opaque 8-64 character token of [A-Za-z0-9_-], unique per logical create. Posting it a second time returns the memo the first call stored \u2014 same uid, same attachments \u2014 and returns it with **201, the same status as the original create**. The body is the whole answer (the uid tells a client which memo is now stored), so the status is not used as a second channel, and a safe retry looks exactly like the success it is repeating. Two owners may reuse one token. Without a key, a retry stores a SECOND memo.",
+            "title": "Idempotency Key"
+          },
           "pinned": {
             "default": false,
             "title": "Pinned",

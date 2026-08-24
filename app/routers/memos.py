@@ -7,8 +7,9 @@ from typing import Annotated, Any, Literal
 import structlog
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
@@ -87,6 +88,11 @@ class MemoOut(BaseModel):
     total_size: int = 0
 
 
+# Bounded and opaque: the shape gate only has to bound what the unique index stores and reject
+# junk, so a client is free to use a UUID, a ULID or a random token instead of one id library.
+IdempotencyKey = Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+
+
 class UploadsUnlinkableDetail(BaseModel):
     """Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).
 
@@ -135,6 +141,18 @@ class MemoCreate(BaseModel):
     upload_uids: list[str] = []
     attachment_uids: list[str] = []  # already-finalized attachments (back-compat)
     created_at: datetime | None = None  # custom display date (None → server now), parity w/ memos
+    idempotency_key: IdempotencyKey | None = Field(
+        default=None,
+        description=(
+            "Optional client-generated retry token: a UUID, or any opaque 8-64 character token of "
+            "[A-Za-z0-9_-], unique per logical create. Posting it a second time returns the memo "
+            "the first call stored — same uid, same attachments — and returns it with **201, the "
+            "same status as the original create**. The body is the whole answer (the uid tells a "
+            "client which memo is now stored), so the status is not used as a second channel, and "
+            "a safe retry looks exactly like the success it is repeating. Two owners may reuse one "
+            "token. Without a key, a retry stores a SECOND memo."
+        ),
+    )
 
 
 class MemoPatch(BaseModel):
@@ -263,6 +281,19 @@ async def create_memo(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
+    # Read off the ORM user BEFORE any rollback below: rolling back expires every object in the
+    # session, and a later `user.id` would then lazy-refresh — sync IO in an async context, which
+    # is a MissingGreenlet, not a working attribute read.
+    owner_id = user.id
+    key = body.idempotency_key
+    if key is not None:
+        # The replay lookup comes FIRST — ahead of the uploads (MEMNG-110 before MEMNG-113). By the
+        # time a retry arrives, its upload_uids are gone: the first attempt finalized them, or they
+        # expired. Validating them first would answer 409 to precisely the client the key exists to
+        # protect, and the memo it is asking about is already stored WITH those attachments.
+        replayed = await svc.get_by_idempotency_key(db, owner_id, key)
+        if replayed is not None:
+            return _out(replayed, owner_id)
     # Finalize-on-post: pending uploads become attachments now, then link them alongside any
     # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
     # finalize moves files to disk before the shared commit — if the post then rolls back, unlink
@@ -287,16 +318,29 @@ async def create_memo(
             attachment_uids=[*body.attachment_uids, *finalized],
             created_at=body.created_at,
             moved_out=moved,  # placement into the memo folder appends here → unlinked on rollback
+            idempotency_key=key,
         )
         # After all attachments are linked, enqueue frame shares for #curated photos (no-op unless
         # the feature is configured). Savepoint-isolated so a feature error can't fail the save.
         await _enqueue_frame_shares_safe(db, memo, user)
         await db.commit()
         committed = True
+    except IntegrityError:
+        # The lookup above lost a race: a concurrent create carrying this key reached the partial
+        # unique index first. That index is the settlement — one of the two inserts fails, and the
+        # loser answers with the winner rather than with an error the caller cannot act on. Any
+        # OTHER integrity failure (or one with no winner to find) is a real fault and re-raises.
+        if key is None:
+            raise
+        await db.rollback()
+        winner = await svc.get_by_idempotency_key(db, owner_id, key)
+        if winner is None:
+            raise
+        memo = winner
     finally:
         if not committed and moved:
             await to_thread.run_sync(_unlink_paths, moved)
-    return _out(memo, user.id)
+    return _out(memo, owner_id)
 
 
 async def _require_owned(db: AsyncSession, user: User, uid: str) -> Memo:

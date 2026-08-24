@@ -8,12 +8,14 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     String,
     Table,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -99,6 +101,22 @@ class User(Base):
 class Memo(Base):
     __tablename__ = "memos"
 
+    __table_args__ = (
+        # PARTIAL unique index (MEMNG-110): a key is unique per owner, and the WHERE clause keeps
+        # every key-less memo out of it — every memo predating this column, and every one posted by
+        # a client that sends no key, would otherwise collide on a single NULL-bearing entry in
+        # some engines and cost an index entry each here. Uniqueness is also the concurrency
+        # settlement: two racing creates with one key cannot both insert, so the loser reads the
+        # winner back instead of a second memo existing.
+        Index(
+            "uq_memos_owner_idempotency_key",
+            "owner_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
+
     id: Mapped[int] = mapped_column(primary_key=True)
     # Stable public id preserved from old memos (base62) — unique-indexed.
     uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -115,6 +133,9 @@ class Memo(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Client-supplied retry token (MEMNG-110). NULL for every memo posted without one — the column
+    # records what the client called this create, and nothing else reads it.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64))
 
     # selectin so async serialization can read tags/owner without a lazy-load error
     tags: Mapped[list["Tag"]] = relationship(

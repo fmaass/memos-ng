@@ -77,9 +77,15 @@ async def create_memo(
     attachment_uids: Sequence[str] | None = None,
     created_at: datetime | None = None,
     moved_out: list[str] | None = None,
+    idempotency_key: str | None = None,
 ) -> Memo:
     memo = Memo(
-        uid=gen_uid(), owner_id=owner.id, content=content, visibility=visibility, pinned=pinned
+        uid=gen_uid(),
+        owner_id=owner.id,
+        content=content,
+        visibility=visibility,
+        pinned=pinned,
+        idempotency_key=idempotency_key,
     )
     if created_at is not None:
         memo.created_at = created_at  # custom display date (parity with old memos)
@@ -165,6 +171,17 @@ async def link_attachments(
         att.memo_id = memo.id
         await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)
     await db.flush()
+
+
+async def get_by_idempotency_key(db: AsyncSession, owner_id: int, key: str) -> Memo | None:
+    """The memo this owner already stored under `key`, or None (MEMNG-110).
+
+    Scoped to the owner because the key is the CLIENT's name for a create, not a global one: two
+    users retrying with the same token must each get their own memo, which is also exactly what the
+    partial unique index enforces."""
+    return (
+        await db.execute(select(Memo).where(Memo.owner_id == owner_id, Memo.idempotency_key == key))
+    ).scalar_one_or_none()
 
 
 async def get_memo(db: AsyncSession, user: User, uid: str) -> Memo | None:
