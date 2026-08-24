@@ -30,6 +30,9 @@ ALLOWED_DATABASES = frozenset({"memosng"})
 # Per-run scratch databases for parallel suite runs; see the module docstring.
 PARALLEL_DATABASE_PATTERN = re.compile(r"^memosng_test_[a-z0-9_]+$")
 ROUTING_ENV_OVERRIDES = ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE")
+# libpq's default when a URL omits the port; two URLs that differ only in spelling of the
+# loopback host reach the same server, two that differ in port do not.
+DEFAULT_PORT = 5432
 
 
 def _refuse(reason: str) -> None:
@@ -64,19 +67,38 @@ def assert_database_is_disposable(url: str | URL) -> None:
         )
 
 
+def _resolved_target(url: URL) -> tuple[str, int, str]:
+    """The server+database a URL actually reaches, as a comparable triple.
+
+    The loopback spellings collapse to one token — `localhost`, `127.0.0.1` and `::1` are
+    the same reachability class the host allowlist already grants. Ports do NOT collapse:
+    5433 and 5432 are two different Postgres servers on this box, and a bootstrap that
+    drops one server's schema while the API tests write into the other is the split brain
+    this check exists to catch.
+    """
+    host = url.host or ""
+    canonical = "loopback" if host in ALLOWED_HOSTS else host
+    return (canonical, url.port or DEFAULT_PORT, url.database or "")
+
+
+def _render(target: tuple[str, int, str]) -> str:
+    host, port, database = target
+    return f"{host}:{port}/{database or '<no database>'}"
+
+
 def assert_urls_target_one_database(sync_url: str | URL, async_url: str | URL) -> None:
-    """Abort unless both engines name the same database.
+    """Abort unless both engines resolve to the same server and database.
 
     Only DATABASE_URL_SYNC is exported for a scratch run in the obvious reading, but the
     app's async engine reads DATABASE_URL — half-configured, the API-driven tests would
     keep committing into the shared `memosng` and re-create the cross-run pollution that
     the per-run databases exist to end.
     """
-    sync = make_url(sync_url) if isinstance(sync_url, str) else sync_url
-    asyn = make_url(async_url) if isinstance(async_url, str) else async_url
-    if sync.database != asyn.database:
+    sync = _resolved_target(make_url(sync_url) if isinstance(sync_url, str) else sync_url)
+    asyn = _resolved_target(make_url(async_url) if isinstance(async_url, str) else async_url)
+    if sync != asyn:
         raise RuntimeError(
             "Refusing the destructive test bootstrap: the sync bootstrap targets "
-            f"{sync.database!r} while the app's async engine targets {asyn.database!r}. "
+            f"{_render(sync)} while the app's async engine targets {_render(asyn)}. "
             "Export BOTH DATABASE_URL and DATABASE_URL_SYNC at the same database."
         )
