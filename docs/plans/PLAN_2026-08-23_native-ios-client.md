@@ -796,8 +796,10 @@ Phase 5's text above is edited accordingly.
   household-visible GET /api/attachments endpoint (image/video filter, capped 500,
   non-paginated) and honestly labeled "Recent media — up to 500" — never a loaded-pages
   projection passed off as a gallery (5d's full gallery adds the attachments cursor
-  pagination it needs as part of its own scope). Original 5c scope retained:
-  search bar + filter sheet
+  pagination it needs as part of its own scope). Original 5c scope retained (ELABORATION 2026-08-24, user: Calendar-loupe semantics):
+  the Search role includes JUMP-TO-DATE — a calendar affordance that scrolls the timeline to a
+  chosen day/week (query anchored via created_before, landing on the day group), distinct from
+  range FILTERING which stays in the sheet; search bar + filter sheet
   (q, tags, visibility, archive scope via include_archived / archived_only, created_before/created_after date range — all params
   verified on /api/memos) driving the existing cursor query; tag browse (counts from
   /api/tags); SSE /api/events subscription patching attachment status/blurhash/progress
