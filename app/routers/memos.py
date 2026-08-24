@@ -1,4 +1,4 @@
-import contextlib
+import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -40,11 +40,30 @@ async def _enqueue_frame_shares_safe(db: AsyncSession, memo: Memo, user: User) -
         logger.warning("frame_share.enqueue_error", memo_id=memo.id, error=str(exc)[:200])
 
 
-def _unlink_paths(paths: list[str]) -> None:
-    """Best-effort remove files finalize moved to disk when a post rolls back (off-loop)."""
-    for path in paths:
-        with contextlib.suppress(OSError):
-            Path(path).unlink(missing_ok=True)
+def _restore_moved(moves: list[tuple[str, str]]) -> None:
+    """Put every original a failed write moved back where it came from (off-loop).
+
+    The DB rollback returns each upload row to pending, so the bytes must return to the part file
+    that row names — otherwise the row promises a file that is gone, and the client's only copy is
+    destroyed. Deleting them instead is safe ONLY if the write can never be retried; a keyed create
+    retries by design (MEMNG-110), and it re-reads exactly these part files.
+
+    Reversed, because a freshly finalized master moves TWICE — upload part → originals/_unfiled/ →
+    the memo folder — and undoing the last hop first is what walks the bytes back to the part path.
+    A restore that fails is logged and LEFT IN PLACE: a file in the wrong directory can still be
+    recovered by hand, an unlinked one cannot."""
+    for src, dest in reversed(moves):
+        try:
+            destination = Path(dest)
+            if not destination.exists():
+                continue  # never moved, or already restored
+            source = Path(src)
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(destination, source)
+        except OSError as exc:
+            logger.error(
+                "memo.write.restore_failed", src=src, dest=dest, error=str(exc)[:200]
+            )
 
 
 class AttachmentRef(BaseModel):
@@ -349,6 +368,10 @@ async def create_memo(
     # session, and a later `user.id` would then lazy-refresh — sync IO in an async context, which
     # is a MissingGreenlet, not a working attribute read.
     owner_id = user.id
+    # Everything the create reads off the ORM `user`, resolved ONCE here: a rollback inside the
+    # retry loop expires every object in the session, and a plain attribute read on an expired one
+    # lazy-loads — sync IO in an async context, i.e. MissingGreenlet, not a working read.
+    visibility = body.visibility or user.default_visibility  # prod parity: per-user default
     key = body.idempotency_key
     if key is not None:
         # The replay lookup comes FIRST — ahead of the uploads (MEMNG-110 before MEMNG-113). By the
@@ -365,9 +388,9 @@ async def create_memo(
         leave the previous try's files behind with no row referencing them."""
         # Finalize-on-post: pending uploads become attachments now, then link them alongside any
         # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
-        # finalize moves files to disk before the commit — if this try then fails, unlink those
-        # moved originals so they don't leak (the DB row reverts but the file would remain).
-        moved: list[str] = []
+        # finalize moves files to disk before the commit — if this try then fails, move those
+        # originals BACK, so the rolled-back upload rows still name the bytes they promise.
+        moved: list[tuple[str, str]] = []
         try:
             try:
                 finalized = (
@@ -383,11 +406,11 @@ async def create_memo(
                 db,
                 user,
                 content=body.content,
-                visibility=body.visibility or user.default_visibility,  # per-user default (parity)
+                visibility=visibility,
                 pinned=body.pinned,
                 attachment_uids=[*body.attachment_uids, *finalized],
                 created_at=body.created_at,
-                moved_out=moved,  # placement into the memo folder appends here → unlinked on fail
+                moved_out=moved,  # placement into the memo folder appends here → undone on fail
                 idempotency_key=key,
             )
             # After all attachments are linked, enqueue frame shares for #curated photos (no-op
@@ -397,17 +420,24 @@ async def create_memo(
             return memo
         except BaseException:
             if moved:
-                await to_thread.run_sync(_unlink_paths, moved)
+                await to_thread.run_sync(_restore_moved, moved)
             raise
 
     if key is None:
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
         # before this feature existed.
         return _out(await attempt(), owner_id)
+    async def rollback_for_retry() -> None:
+        await db.rollback()
+        # `user` itself outlives the rollback and the next attempt still hands it to create_memo
+        # (which reads owner.id) and to the frame-share enqueue (user.id). Reload it HERE, where
+        # the load can be awaited, rather than letting those reads lazy-load off an expired object.
+        await db.refresh(user)
+
     memo = await _create_or_replay(
         attempt=attempt,
         lookup=lambda: svc.get_by_idempotency_key(db, owner_id, key),
-        rollback=db.rollback,
+        rollback=rollback_for_retry,
     )
     return _out(memo, owner_id)
 
@@ -440,7 +470,7 @@ async def patch_memo(
         raise HTTPException(status_code=403, detail="Not your memo")
     # Same finalize-on-post pattern as create: new uploads become attachments and link to this memo;
     # if the patch rolls back, unlink the moved originals so they don't leak.
-    moved: list[str] = []
+    moved: list[tuple[str, str]] = []
     committed = False
     try:
         fields = body.model_dump(exclude_unset=True, exclude={"upload_uids"})
@@ -466,7 +496,7 @@ async def patch_memo(
         committed = True
     finally:
         if not committed and moved:
-            await to_thread.run_sync(_unlink_paths, moved)
+            await to_thread.run_sync(_restore_moved, moved)
     await db.refresh(memo)
     return _out(memo, user.id)
 

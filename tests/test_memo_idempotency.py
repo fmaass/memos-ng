@@ -8,6 +8,8 @@ refused outright. The key is what turns that retry back into the answer the clie
 """
 
 import asyncio
+import hashlib
+from pathlib import Path
 
 import pytest
 from app.config import settings
@@ -312,3 +314,80 @@ async def test_the_replay_lookup_holds_a_concurrent_delete_off_until_it_has_read
             c.execute(text("DELETE FROM memos WHERE uid = 'lock-probe-memo'"))
             c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
         eng.dispose()
+
+
+def _insert_racing_winner(owner_id: int, key: str) -> None:
+    """A concurrent create landing under the same key, committed from another connection."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text(
+                "INSERT INTO memos (uid, owner_id, content, visibility, pinned, idempotency_key)"
+                " VALUES ('racing-winner-memo', :o, 'raced in', 'PRIVATE', false, :k)"
+            ),
+            {"o": owner_id, "k": key},
+        )
+    eng.dispose()
+
+
+def _attachment_bytes(att_uid: str) -> bytes:
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        path = c.execute(
+            text("SELECT storage_path FROM attachments WHERE uid = :u"), {"u": att_uid}
+        ).scalar_one()
+    eng.dispose()
+    return Path(path).read_bytes()
+
+
+def test_a_vanished_winner_is_retried_with_its_media_intact(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The retry path carrying uploads — where deleting the moved originals would be unrecoverable.
+
+    Attempt 1 finalizes the upload (moving its part file), then collides with a memo a concurrent
+    create landed under the same key. That attempt rolls back, which returns the upload row to
+    pending — so the bytes have to be back at the part file too, or the retry re-finalizes an
+    upload whose file is gone and the photo is lost for good. The winner is then deleted before it
+    can be read back, which frees the key, and the retry must produce a COMPLETE memo.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    real_lookup = memo_svc.get_by_idempotency_key
+    lookups = 0
+
+    async def racing_lookup(db, owner_id, key):
+        # Orchestrates WHEN the two concurrent writes land; the lookup itself is the real one.
+        nonlocal lookups
+        lookups += 1
+        if lookups == 2:  # the winner is deleted before this read-back can see it
+            _delete_memos_with_key(key)
+        found = await real_lookup(db, owner_id, key)
+        if lookups == 1:  # ...and a rival create lands just after our pre-check came back empty
+            _insert_racing_winner(owner_id, key)
+        return found
+
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"V" * 4000
+        uid = _start(client, "precious.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+
+        monkeypatch.setattr(memo_svc, "get_by_idempotency_key", racing_lookup)
+        posted = client.post(
+            "/api/memos",
+            # visibility deliberately OMITTED: the effective one then comes off the ORM user, the
+            # exact read that must have been hoisted out of the retried closure.
+            json={"content": "my only copy", "upload_uids": [uid], "idempotency_key": KEY},
+        )
+        assert posted.status_code == 201, posted.text
+        assert lookups == 2  # the collision and the vanished read-back both really happened
+        attachments = posted.json()["attachments"]
+        assert len(attachments) == 1  # the retry kept the media, it did not save the text alone
+        assert (
+            hashlib.sha256(_attachment_bytes(attachments[0]["uid"])).hexdigest()
+            == hashlib.sha256(data).hexdigest()
+        )  # ...and the stored bytes are the uploaded bytes, not a truncated or empty file
+        assert _memo_uids_with_key(KEY) == [posted.json()["uid"]]
+    finally:
+        _delete_memos_with_key(KEY)
+        _cleanup()

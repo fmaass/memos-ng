@@ -279,9 +279,13 @@ def test_abandoned_upload_leaves_no_attachment(logged_in_client, monkeypatch, tm
         _cleanup()
 
 
-def test_failed_post_cleans_up_moved_original(logged_in_client, monkeypatch, tmp_path):
-    # finalize moves the file to disk before the shared commit; if the post then fails, the
-    # compensating cleanup must unlink it (else it leaks with no DB row — the review's MED finding).
+def test_failed_post_puts_the_moved_original_back_where_it_came_from(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # finalize moves the file to disk before the shared commit; if the post then fails, the DB
+    # rollback returns the upload row to pending — so the bytes have to return to the part file
+    # that row names. Unlinking them instead leaves the row promising a file that is gone and
+    # destroys what may be the client's only copy.
     from app.services import memos as memo_svc
 
     client, _ = logged_in_client
@@ -300,8 +304,17 @@ def test_failed_post_cleans_up_moved_original(logged_in_client, monkeypatch, tmp
             "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
         ).status_code == 500
         originals = tmp_path / "originals"
-        leaked = [p for p in originals.rglob("*") if p.is_file()] if originals.exists() else []
-        assert leaked == []  # moved original was unlinked on the failed post
+        stranded = [p for p in originals.rglob("*") if p.is_file()] if originals.exists() else []
+        assert stranded == []  # nothing left half-filed under a memo that does not exist
+        assert svc.part_path(uid).read_bytes() == data  # ...because it went back, byte for byte
+
+        # and the session really is intact: the very same upload finalizes cleanly on a later post
+        monkeypatch.undo()
+        monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+        retried = client.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
+        )
+        assert retried.status_code == 201 and len(retried.json()["attachments"]) == 1
     finally:
         _cleanup()
 

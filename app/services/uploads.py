@@ -353,7 +353,7 @@ async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
     owner_id: int,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
     memo: Memo | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
@@ -369,8 +369,9 @@ async def finalize_pending(
 
     finalize()/finalize_rendition() move the part file to its final path BEFORE the (now shared)
     memo transaction commits — a non-transactional side effect. Each genuinely-moved path is
-    appended to `moved_out` (inside those functions, new-file branch only) so the caller can
-    unlink it if the post rolls back. A dedup return moves nothing and appends nothing.
+    appended to `moved_out` as (source, destination) (inside those functions, new-file branch only)
+    so a caller whose post rolls back can move it BACK to where it came from, leaving the upload
+    pending and intact. A dedup return moves nothing and appends nothing.
 
     Screen/print grouping runs in three steps, in this order (MEMNG-79 — the in-batch-only rule of
     PLAN_2026-06-21_variant-renditions.md is superseded by the memo-sibling step):
@@ -449,7 +450,10 @@ async def finalize_pending(
 
 
 async def finalize(
-    db: AsyncSession, upload: Upload, owner_id: int, moved_out: list[str] | None = None
+    db: AsyncSession,
+    upload: Upload,
+    owner_id: int,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> Attachment:
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
@@ -498,7 +502,7 @@ async def finalize(
     dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
     await to_thread.run_sync(_move_into_sync, part, dest)  # mkdir + os.replace in one hop
     if moved_out is not None:  # only a genuinely-moved file; the dedup return above appends nothing
-        moved_out.append(str(dest))
+        moved_out.append((str(part), str(dest)))
 
     is_video = mime.startswith("video/")
     attachment = Attachment(
@@ -533,7 +537,7 @@ async def finalize_rendition(
     upload: Upload,
     attachment: Attachment,
     parsed: ParsedName,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> AttachmentRendition | None:
     """Attach a hidden, download-only rendition (print master) to its screen `attachment`. Writes a
     UNIQUE uuid-named file (never a shared/deterministic path → safe to delete, never overwrites a
@@ -594,7 +598,7 @@ async def finalize_rendition(
 
     await to_thread.run_sync(os.replace, part, dest)
     if moved_out is not None:
-        moved_out.append(str(dest))
+        moved_out.append((str(part), str(dest)))
     await db.delete(upload)
     await db.flush()
     return rendition
@@ -693,7 +697,7 @@ async def bind_print_to_sibling(
     upload: Upload,
     attachment: Attachment,
     memo: Memo,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> bool:
     """Bind a batch-orphan print onto an already-linked screen `attachment` of `memo`: fill its
     print slot (print_path/print_mime/print_size) and place the file beside the screen in the memo
@@ -741,7 +745,7 @@ async def bind_print_to_sibling(
     else:
         path = await storage.place_master(part, dest_dir, upload.filename)
         if moved_out is not None:
-            moved_out.append(str(path))
+            moved_out.append((str(part), str(path)))
     attachment.print_path = str(path)
     attachment.print_mime = mime
     attachment.print_size = actual
