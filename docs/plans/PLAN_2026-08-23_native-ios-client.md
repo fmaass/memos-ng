@@ -706,7 +706,13 @@ wifi. VPN integration (NetBird) was considered and REJECTED: the capture outbox 
 connectivity irrelevant for writing, and iOS's background `URLSession` natively provides
 "upload when a usable network returns" (cellular disallowed via `allowsCellularAccess=false`,
 so draining waits for wifi; tasks started offline are delivered by the OS when a path exists,
-without the app running; on non-home wifi the attempts fail and the OS retries — acceptable).
+without the app running). IMPORTANT nuance (user-corrected 2026-08-24): only the HOME wifi can
+reach the backend — on a foreign wifi an attempt starts and FAILS, and iOS does not auto-retry a
+failed task. The design therefore treats failure as a first-class state: a failing task wakes
+the app in the background (`handleEventsForBackgroundURLSession`), the outbox re-arms the job
+with capped, spaced retries paced by a `BGAppRefreshTask`, and the drainer sends one cheap
+`/health` probe before moving payloads so a foreign-wifi cycle costs one small request, not a
+video. A queued memo is never dropped — it leaves the outbox only on server confirmation.
 Remote READ access stays out of scope until explicitly decided. Two shipped-surface gaps join
 this phase (user-reported 2026-08-24): video attachments render nothing (MEMNG-107) and images
 cannot be opened full screen (MEMNG-108).
