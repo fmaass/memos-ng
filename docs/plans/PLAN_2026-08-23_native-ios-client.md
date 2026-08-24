@@ -786,7 +786,7 @@ Phase 5's text above is edited accordingly.
   default omits both params; include_archived=true; archived_only=true (there is no
   archived= param); tag counts are DELIBERATELY active-only (/api/tags excludes archived —
   recorded decision, not an oversight); re-tapping Timeline snaps to newest; Settings sits behind the profile avatar
-  top-left — this surface MOVES profile identity + default-visibility OUT of 5d into 5c
+  top-RIGHT (user preference 2026-08-24, matching the SPA) — this surface MOVES profile identity + default-visibility OUT of 5d into 5c
   (5d's bullet is amended accordingly) and adds the user-requested APPEARANCE setting
   (System/Light/Dark, persisted, applied at the root so it sticks across launches); sign-out
   relocates here from the overflow menu WITH its shipped safety flow intact — both alerts,
