@@ -89,6 +89,14 @@ def _count(sql: str) -> int:
     return int(n)
 
 
+def _scalar(sql: str):
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        value = c.execute(text(sql)).scalar_one()
+    eng.dispose()
+    return value
+
+
 def _post(client, **body):
     return client.post("/api/memos", json={"visibility": "PUBLIC", **body})
 
@@ -344,6 +352,69 @@ async def test_a_cancelled_create_never_strands_the_poster_it_was_copying(
         assert _count("SELECT count(*) FROM attachments") == 0
         # The client's bytes are untouched, so the post it never completed can simply be retried.
         assert up_svc.part_path(poster_uid).read_bytes() == title_card
+    finally:
+        _cleanup()
+
+
+async def test_a_cancel_during_the_post_commit_reap_leaves_the_stored_memo_whole(
+    pat_client, monkeypatch, tmp_path
+):
+    """The mirror of the test above, and the more dangerous half: once the memo is COMMITTED, the
+    failure path must not run at all. A cancellation delivered during the best-effort part reap
+    lands in the same handler that discards posters and moves originals back — on a memo that is
+    already stored, that is not cleanup, it is deleting a live memo's media. The committed flag is
+    what makes the handler stand down; at worst a part file is left unreaped.
+    """
+    from app.routers import memos as memos_router
+
+    bearer, _, _ = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    started = threading.Event()
+    reaping: list[list[str]] = []
+    real_unlink_all = memos_router._unlink_all
+
+    def slow_reap(paths):
+        reaping.append(list(paths))  # in-stub control: the reap really began, with these files
+        started.set()
+        time.sleep(0.5)  # the cancellation lands here, AFTER the commit
+        real_unlink_all(paths)
+
+    monkeypatch.setattr(memos_router, "_unlink_all", slow_reap)
+    try:
+        title_card = _jpeg(color=(44, 55, 66))
+        video_uid = await _upload_async(bearer, "clip.mov", "video/quicktime", VIDEO_BYTES)
+        poster_uid = await _upload_async(bearer, "title.jpg", "image/jpeg", title_card)
+
+        posting = asyncio.create_task(
+            bearer.post(
+                "/api/memos",
+                json={
+                    "content": "committed, then hung up",
+                    "visibility": "PUBLIC",
+                    "upload_uids": [video_uid],
+                    "video_posters": {video_uid: poster_uid},
+                },
+            )
+        )
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "the reap never started — this would not test the committed gate"
+        posting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await posting
+
+        # The control: the reap really was in flight, and over this poster's own part file.
+        assert reaping == [[str(up_svc.part_path(poster_uid))]]
+
+        # Everything the commit stored is still there — this is the data-loss assertion.
+        assert _count("SELECT count(*) FROM memos") == 1
+        assert _count("SELECT count(*) FROM attachments") == 1
+        uid = _scalar("SELECT uid FROM attachments")
+        assert poster.poster_path(uid).read_bytes() == title_card
+        # The accepted worst case, and the only one: the consumed part file was not reaped.
+        assert up_svc.part_path(poster_uid).exists()
     finally:
         _cleanup()
 

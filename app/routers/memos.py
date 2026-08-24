@@ -695,6 +695,10 @@ async def create_memo(
         # be renamed there), which leaves BOTH files alive until this transaction settles: see
         # uploads.PosterCopy for which one each outcome removes. Per-attempt like `moved`.
         poster_copies: list[uploads_svc.PosterCopy] = []
+        # The line between "this write may still be undone" and "this memo is stored". Everything
+        # the failure path does — discarding posters, moving originals back — destroys files that
+        # a COMMITTED memo owns, so it must never run once this is set.
+        committed = False
         try:
             try:
                 # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
@@ -731,15 +735,25 @@ async def create_memo(
             # unless configured). Savepoint-isolated so a feature error can't fail the save.
             await _enqueue_frame_shares_safe(db, memo, user)
             await db.commit()
+            # A plain assignment with NO await between it and the commit that earned it: a
+            # cancellation cannot be delivered in that gap, so this flag can never be missing for
+            # a memo that is stored.
+            committed = True
             # AFTER the commit, and only then: each consumed poster's part file is now bytes no
             # row names, and nothing else will ever collect it (the expiry reaper walks `uploads`
             # rows, and this one is gone). Best-effort by construction — the memo is already
-            # stored, so a file that will not delete must not fail the request or reach the
-            # rollback path below.
+            # stored, so a file that will not delete must not fail the request.
             if poster_copies:
                 await to_thread.run_sync(_unlink_all, [c.part for c in poster_copies])
             return memo
         except BaseException:
+            if committed:
+                # The memo is STORED, and the only thing that can raise past this point is a
+                # cancellation delivered during the part reap above. The cleanups below would then
+                # strip media off a LIVE memo — discarding its poster, moving its originals back
+                # out of the memo folder — which is far worse than the leak they would be tidying.
+                # The worst outcome here is an unreaped part file; the memo is complete without it.
+                raise
             # Posters FIRST, and synchronously. The attachments they belong to are rolled back with
             # this write, so the placed files would be orphans under uids nothing references —
             # and the `await` below is not guaranteed to resume when this handler is unwinding a
