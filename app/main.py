@@ -111,6 +111,57 @@ SECURITY_SCHEMES = {
 }
 
 
+class NullableMergeCollision(Exception):
+    """A nullable `anyOf` member and its parent disagree about a shared keyword."""
+
+
+def _is_null_schema(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") == "null" and len(node) == 1
+
+
+def _merge_nullable(keep: dict[str, Any], parent: dict[str, Any], path: str) -> dict[str, Any]:
+    rest = {k: v for k, v in parent.items() if k != "anyOf"}
+    for key in sorted(set(keep) & set(rest)):
+        if keep[key] != rest[key]:
+            raise NullableMergeCollision(
+                f"{path}: '{key}' differs between the anyOf member ({keep[key]!r}) and its "
+                f"parent ({rest[key]!r}); merging would silently drop one"
+            )
+    merged = dict(keep)
+    merged.update(rest)
+    merged["type"] = [keep["type"], "null"]
+    return merged
+
+
+def collapse_nullable_anyof(node: Any, path: str = "#") -> None:
+    """Rewrite `anyOf: [{type: X}, {type: "null"}]` into `type: [X, "null"]` in place.
+
+    Pydantic spells an optional field the first way; swift-openapi-generator has no support for a
+    bare `"null"` schema and DROPS the whole property rather than failing, so `MemoOut.archived_at`
+    and friends simply did not exist in the generated Swift types. The two spellings say the same
+    thing in JSON Schema 2020-12, so emitting the type array here retires the iOS repo's
+    vendoring-time rewrite and keeps every generated client on one contract (ADR-0009, MEMNG-105).
+
+    Only that exact two-arm inline shape is touched: `anyOf: [{$ref: …}, {type: "null"}]` cannot
+    become a type array (a reference plus null needs a different fix) and a wider union is not a
+    nullable at all. A keyword the retained member and its parent disagree about raises, because a
+    served contract that differs from the model in a way nobody chose is worse than a loud stop.
+    """
+    if isinstance(node, dict):
+        members = node.get("anyOf")
+        if isinstance(members, list) and len(members) == 2 and any(map(_is_null_schema, members)):
+            keep = next(m for m in members if not _is_null_schema(m))
+            if isinstance(keep, dict) and isinstance(keep.get("type"), str) and "$ref" not in keep:
+                merged = _merge_nullable(keep, node, path)
+                node.clear()
+                node.update(merged)
+        for key, value in list(node.items()):
+            collapse_nullable_anyof(value, f"{path}/{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            collapse_nullable_anyof(value, f"{path}/{index}")
+
+
 def custom_openapi() -> dict[str, Any]:
     """The served schema plus the two credentials the API actually accepts.
 
@@ -124,6 +175,7 @@ def custom_openapi() -> dict[str, Any]:
     if app.openapi_schema is None:
         schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
         schema.setdefault("components", {})["securitySchemes"] = SECURITY_SCHEMES
+        collapse_nullable_anyof(schema)
         app.openapi_schema = schema
     return app.openapi_schema
 

@@ -751,7 +751,10 @@ export interface components {
         AttachmentMeta: {
             /** Blurhash */
             blurhash: string | null;
-            /** Captured At */
+            /**
+             * Captured At
+             * Format: date-time
+             */
             captured_at: string | null;
             /** Downloadurl */
             downloadUrl: string;
@@ -789,7 +792,10 @@ export interface components {
         };
         /** AttachmentOut */
         AttachmentOut: {
-            /** Captured At */
+            /**
+             * Captured At
+             * Format: date-time
+             */
             captured_at: string | null;
             /** Duration */
             duration: number | null;
@@ -876,7 +882,10 @@ export interface components {
             attachment_uids: string[];
             /** Content */
             content: string;
-            /** Created At */
+            /**
+             * Created At
+             * Format: date-time
+             */
             created_at?: string | null;
             /**
              * Pinned
@@ -901,7 +910,10 @@ export interface components {
         };
         /** MemoOut */
         MemoOut: {
-            /** Archived At */
+            /**
+             * Archived At
+             * Format: date-time
+             */
             archived_at: string | null;
             /**
              * Attachments
@@ -948,7 +960,10 @@ export interface components {
             archived?: boolean | null;
             /** Content */
             content?: string | null;
-            /** Created At */
+            /**
+             * Created At
+             * Format: date-time
+             */
             created_at?: string | null;
             /** Pinned */
             pinned?: boolean | null;
@@ -988,11 +1003,17 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
-            /** Expires At */
+            /**
+             * Expires At
+             * Format: date-time
+             */
             expires_at: string | null;
             /** Id */
             id: number;
-            /** Last Used */
+            /**
+             * Last Used
+             * Format: date-time
+             */
             last_used: string | null;
             /** Name */
             name: string;
@@ -1006,11 +1027,17 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
-            /** Expires At */
+            /**
+             * Expires At
+             * Format: date-time
+             */
             expires_at: string | null;
             /** Id */
             id: number;
-            /** Last Used */
+            /**
+             * Last Used
+             * Format: date-time
+             */
             last_used: string | null;
             /** Name */
             name: string;

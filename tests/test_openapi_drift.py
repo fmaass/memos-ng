@@ -7,7 +7,10 @@ never runs (CI is abandoned), which left this contract with no gate at all; this
 """
 
 import importlib.util
+from copy import deepcopy
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATOR = REPO_ROOT / "scripts" / "gen-openapi.py"
@@ -60,3 +63,95 @@ def test_custom_openapi_still_describes_the_routes():
 
     paths = app.openapi()["paths"]
     assert "/api/memos" in paths and "/api/pats" in paths and "/api/auth/user" in paths
+
+
+def _mappings(node: object, path: str = "#"):
+    """Every mapping in the document, with the JSON pointer that reaches it."""
+    if isinstance(node, dict):
+        yield path, node
+        for key, value in node.items():
+            yield from _mappings(value, f"{path}/{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _mappings(value, f"{path}/{index}")
+
+
+def _inline_nullable_anyof(node: dict) -> bool:
+    members = node.get("anyOf")
+    if not isinstance(members, list) or len(members) != 2:
+        return False
+    if not any(m == {"type": "null"} for m in members):
+        return False
+    keep = next(m for m in members if m != {"type": "null"})
+    return isinstance(keep, dict) and "type" in keep and "$ref" not in keep
+
+
+def test_no_inline_nullable_anyof_survives_anywhere_in_the_document():
+    """swift-openapi-generator drops a property whose schema contains a bare `null` member, so a
+    single surviving one silently deletes a field from the generated client (MEMNG-105)."""
+    from app.main import app
+
+    offenders = [
+        pointer for pointer, node in _mappings(app.openapi()) if _inline_nullable_anyof(node)
+    ]
+    assert offenders == [], f"{len(offenders)} nullable anyOf survived, e.g. {offenders[:3]}"
+
+
+def test_a_nullable_field_reaches_the_client_as_a_type_array():
+    from app.main import app
+
+    archived_at = app.openapi()["components"]["schemas"]["MemoOut"]["properties"]["archived_at"]
+    assert archived_at["type"] == ["string", "null"]
+    assert archived_at["format"] == "date-time"
+    assert archived_at["title"] == "Archived At"
+    assert "anyOf" not in archived_at
+
+
+def test_a_genuine_union_is_left_as_an_anyof():
+    """FastAPI's own ValidationError.loc is `string | integer` — a union, not a nullable."""
+    from app.main import app
+
+    loc = app.openapi()["components"]["schemas"]["ValidationError"]["properties"]["loc"]["items"]
+    assert loc == {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+
+
+def test_reference_and_wider_unions_are_not_rewritten():
+    from app.main import collapse_nullable_anyof
+
+    document = {
+        "ref_plus_null": {
+            "anyOf": [{"$ref": "#/components/schemas/Visibility"}, {"type": "null"}]
+        },
+        "three_arm": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
+        "union": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+        "already_a_type_array": {"type": ["string", "null"]},
+    }
+    untouched = deepcopy(document)
+    collapse_nullable_anyof(document)
+    assert document == untouched
+
+
+def test_sibling_keywords_survive_the_collapse():
+    from app.main import collapse_nullable_anyof
+
+    node = {"anyOf": [{"type": "string", "maxLength": 64}, {"type": "null"}], "title": "Cursor"}
+    collapse_nullable_anyof(node)
+    assert node == {"type": ["string", "null"], "maxLength": 64, "title": "Cursor"}
+
+
+def test_a_disagreeing_keyword_stops_the_schema_instead_of_dropping_one_side():
+    from app.main import NullableMergeCollision, collapse_nullable_anyof
+
+    with pytest.raises(NullableMergeCollision) as raised:
+        collapse_nullable_anyof(
+            {
+                "properties": {
+                    "q": {
+                        "anyOf": [{"type": "string", "maxLength": 8}, {"type": "null"}],
+                        "maxLength": 99,
+                    }
+                }
+            }
+        )
+    assert "#/properties/q" in str(raised.value)
+    assert "maxLength" in str(raised.value)
