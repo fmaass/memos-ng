@@ -4057,6 +4057,25 @@
         },
         "summary": "Health"
       }
+    },
+    "/privacy": {
+      "get": {
+        "description": "The privacy policy, served to anyone \u2014 no credential, like /health and the association file.\n\nA policy behind a login is not a published policy: App Store review, and any reader deciding\nwhether to sign in at all, fetch this URL anonymously. It is therefore named in\nPUBLIC_OPERATIONS, because the schema pass reads each route's requirement off its auth\ndependency and a route that has none has to say so out loud (tests/test_openapi_drift.py).\n\nDeclared before the SPA catch-all below, which would otherwise answer it with the shell.",
+        "operationId": "privacy_privacy_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Privacy"
+      }
     }
   }
 }

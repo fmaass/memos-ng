@@ -707,6 +707,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/privacy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Privacy
+         * @description The privacy policy, served to anyone — no credential, like /health and the association file.
+         *
+         *     A policy behind a login is not a published policy: App Store review, and any reader deciding
+         *     whether to sign in at all, fetch this URL anonymously. It is therefore named in
+         *     PUBLIC_OPERATIONS, because the schema pass reads each route's requirement off its auth
+         *     dependency and a route that has none has to say so out loud (tests/test_openapi_drift.py).
+         *
+         *     Declared before the SPA catch-all below, which would otherwise answer it with the shell.
+         */
+        get: operations["privacy_privacy_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2738,6 +2765,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    privacy_privacy_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
                 };
             };
         };

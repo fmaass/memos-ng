@@ -7,7 +7,7 @@ import structlog
 from anyio import to_thread
 from fastapi import FastAPI, Response
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -25,6 +25,9 @@ from app.version import __version__
 logger = structlog.get_logger(__name__)
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+# Documents the backend serves itself, kept out of the SPA bundle on purpose: they must stay
+# readable and reachable at a stable URL whether or not a frontend build exists.
+STATIC_DIR = Path(__file__).parent / "static"
 
 
 DATA_SUBDIRS = ("originals", "assets/thumbs", "assets/mobile", "assets/web")
@@ -146,6 +149,7 @@ INLINE_AUTH_SECURITY: dict[tuple[str, str], list[dict[str, list[str]]]] = {
 # schema with its authentication left unsaid.
 PUBLIC_OPERATIONS: set[tuple[str, str]] = {
     ("GET", "/health"),
+    ("GET", "/privacy"),
     ("GET", "/api/push/vapid-public-key"),
     ("POST", "/api/auth/logout"),
     ("POST", "/api/auth/native/exchange"),
@@ -313,6 +317,32 @@ async def health(response: Response) -> HealthResponse:
         response.status_code = 503
         return HealthResponse(status="degraded", version=__version__, db="unreachable")
     return HealthResponse(status="ok", version=__version__, db="ok")
+
+
+PRIVACY_PAGE = STATIC_DIR / "privacy-policy.html"
+# `public`, deliberately unlike every media response's `private` (app/routers/assets.py): this is
+# one published document, identical for every reader and addressed to readers who have not signed
+# in, so a shared cache holding it leaks nothing. An hour keeps a correction from being stuck
+# behind a long max-age.
+PRIVACY_CACHE_CONTROL = "public, max-age=3600"
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy() -> FileResponse:
+    """The privacy policy, served to anyone — no credential, like /health and the association file.
+
+    A policy behind a login is not a published policy: App Store review, and any reader deciding
+    whether to sign in at all, fetch this URL anonymously. It is therefore named in
+    PUBLIC_OPERATIONS, because the schema pass reads each route's requirement off its auth
+    dependency and a route that has none has to say so out loud (tests/test_openapi_drift.py).
+
+    Declared before the SPA catch-all below, which would otherwise answer it with the shell.
+    """
+    return FileResponse(
+        PRIVACY_PAGE,
+        media_type="text/html",
+        headers={"Cache-Control": PRIVACY_CACHE_CONTROL},
+    )
 
 
 @app.api_route(

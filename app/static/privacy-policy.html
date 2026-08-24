@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy — memosng</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 4rem; max-width: 40rem;
+    font: 1rem/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #fff; color: #1c1c1e;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #111214; color: #e6e6e8; } }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.1rem; margin: 2rem 0 .5rem; }
+  p, li { margin: .5rem 0; }
+  ul { padding-left: 1.2rem; }
+  .date { opacity: .7; font-size: .9rem; margin-bottom: 2rem; }
+  code { font-size: .95em; }
+</style>
+</head>
+<body>
+
+<h1>memosng — privacy</h1>
+<p class="date">Last updated 24 August 2026</p>
+
+<p>I operate this service for my household. The memos-ng server runs on hardware I own, at
+memos.discomarder.live, and the memosng app on your phone talks to that server and to nothing
+else.</p>
+
+<h2>What the app keeps on your phone</h2>
+<ul>
+  <li>The sign-in token, in the device keychain. It is removed when you sign out, and when the
+      server rejects it.</li>
+  <li>Captures that have not been uploaded yet — your text and a copy of each photo or video —
+      in the app's own storage, until the server has them.</li>
+  <li>Recently viewed pictures, cached so the timeline does not fetch the same photo twice. The
+      copies held in memory are dropped when you sign out or switch accounts. The copies on disk
+      were fetched through links that expire, and an entry whose link has expired is discarded
+      rather than shown again.</li>
+</ul>
+
+<h2>What the server keeps</h2>
+<ul>
+  <li>Your account, as the household sign-on knows it.</li>
+  <li>Your memos: text, dates, tags, and the visibility you chose.</li>
+  <li>Photos and videos as you uploaded them — unchanged originals, including whatever metadata
+      the camera wrote into them — plus the smaller versions the server derives for the timeline
+      and for full-screen viewing.</li>
+  <li>Tokens issued to your devices, and browser sessions.</li>
+  <li>Technical logs of the requests it serves, as any web server does.</li>
+</ul>
+
+<h2>Who can see a memo</h2>
+<p>Every memo carries one of three settings, and you pick it when you post:</p>
+<ul>
+  <li><strong>Private</strong> — only you.</li>
+  <li><strong>Protected</strong> — anyone signed in to this server, which means the rest of the
+      household.</li>
+  <li><strong>Public</strong> — anyone who can reach the server address, with no sign-in at all.
+      Public memos and their pictures are served to visitors who have not signed in; that is what
+      the setting means here, not a leak. Most memos in this household are posted Public, so check
+      the setting before posting something you would rather keep in.</li>
+</ul>
+
+<h2>What does not happen</h2>
+<ul>
+  <li>No analytics, no tracking, no advertising identifier, no ads.</li>
+  <li>No third-party service receives your memos, your photos or your account. The app's only
+      network destinations are the household server and, while you sign in, the household sign-on
+      page opened in the system browser. The app never sees your password.</li>
+  <li>Nothing is sold, and nothing is handed to anyone outside the household.</li>
+  <li>No cloud storage other than the household server.</li>
+  <li>The app asks for no location.</li>
+</ul>
+
+<h2>While the app is in TestFlight</h2>
+<p>Apple distributes the beta builds and gives me the crash reports from them, together with any
+feedback a tester chooses to send through TestFlight. That channel is Apple's, covered by Apple's
+own privacy terms; I add no reporting of my own on top of it.</p>
+
+<h2>Deleting things</h2>
+<p>Deleting a memo in the app removes it from the server: it leaves the timeline, and its pictures
+stop being served. If you want something gone from the server's storage for good, including copies
+in any backup I hold, ask me and I will remove it.</p>
+<p>Signing out takes the token off the phone and revokes it on the server, so a device that is
+signed out cannot read anything.</p>
+
+<h2>Children</h2>
+<p>This is a family app, run by the family for itself. Accounts exist only because I created them
+for people in my household. There is no sign-up, and nobody outside the household can get one.</p>
+
+<h2>Asking me something</h2>
+<p>I administer this server myself, and I am the only person who does. If you have a question about
+your data — what is stored, or getting it removed — ask me directly. Everyone with an account here
+knows how to reach me.</p>
+
+<h2>Changes</h2>
+<p>If what the app or the server does with your data changes, I change this page and date it.</p>
+
+</body>
+</html>
