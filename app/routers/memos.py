@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.database import get_session
 from app.models import (
+    CREATE_KEY_CONSTRAINT,
     EDIT_KEY_CONSTRAINT,
     Attachment,
     AttachmentStatus,
@@ -428,6 +429,16 @@ def violated_constraint(exc: IntegrityError) -> str | None:
     return None
 
 
+def _is_create_key_collision(exc: IntegrityError) -> bool:
+    """True only for a violation of the create-side idempotency-key index (MEMNG-131).
+
+    Read when a keyed create has run out of retries, to decide whether the 503 that tells the
+    client to repeat itself with the same key is honest: it is exactly when the key is what kept
+    colliding. Unlike the edit side this does NOT gate entry to the retry loop — a foreign conflict
+    is still retried there, because it is usually transient and the retry is what saves the memo."""
+    return violated_constraint(exc) == CREATE_KEY_CONSTRAINT
+
+
 def _is_edit_key_collision(exc: IntegrityError) -> bool:
     """True only for a violation of the edit-key uniqueness constraint (MEMNG-124).
 
@@ -446,6 +457,7 @@ async def _apply_or_replay(
     rollback: Callable[[], Awaitable[None]],
     exhausted: HTTPException,
     replayable: Callable[[IntegrityError], bool],
+    key_collision: Callable[[IntegrityError], bool] | None = None,
     tries: int = 2,
 ) -> Memo:
     """Perform a keyed memo write, resolving a lost race against its unique index.
@@ -462,6 +474,12 @@ async def _apply_or_replay(
     a create passes `tries=2` and takes one more run at it; an edit passes `tries=1`, because a
     freed edit key means the memo itself is gone and there is nothing left to edit.
 
+    `key_collision` decides what an EXHAUSTED loop may claim, defaulting to `replayable`. Running
+    out of retries only justifies the caller's 503 — "someone kept beating you to this key, repeat
+    yourself" — if the key really is what kept colliding; when the last failure was a foreign
+    constraint, that error is re-raised instead, because no amount of repeating the same key can
+    resolve it.
+
     `replayable` decides which IntegrityError is even a lost race. Not every integrity violation a
     keyed write can raise is one — the caller's own work may collide on an unrelated constraint —
     and absorbing one of those into "retry with the same key" would both answer a conflict retrying
@@ -469,19 +487,37 @@ async def _apply_or_replay(
 
     Bounded rather than looping until success: each extra round needs a concurrent write AND a
     concurrent delete of that write to land inside the same window, so more rounds buy nothing an
-    unbounded retry could not turn into a hot loop. Exhausting them raises the caller's 503 — never
-    a bare IntegrityError as a 500 — because the client's remedy is real: retrying with the same
-    key is safe by construction, and 5xx is the class our retry contract already says to repeat."""
+    unbounded retry could not turn into a hot loop. Exhausting them on the caller's OWN key raises
+    the caller's 503 rather than a bare IntegrityError as a 500, because the client's remedy is
+    real there: retrying with the same key is safe by construction, and 5xx is the class our retry
+    contract already says to repeat. Exhausting them on anything else is `key_collision`'s call,
+    above — that error has no such remedy and is handed back as itself."""
+    # Default: the predicate that let a conflict INTO the retry loop is the one that decides what
+    # an exhausted loop may claim about it. That is the right reading for a caller whose
+    # `replayable` is already narrow (the edit path admits only its own key, so only its own key
+    # can ever reach the end); a caller that retries broadly has to say separately what it may
+    # claim, which is exactly what the create path passes in.
+    claims = key_collision or replayable
+    last: IntegrityError | None = None
     for _ in range(tries):
         try:
             return await attempt()
         except IntegrityError as exc:
             if not replayable(exc):
                 raise  # someone else's constraint — not a lost race, and not ours to absorb
+            last = exc
             await rollback()
             winner = await lookup()
             if winner is not None:
                 return winner
+    if last is not None and not claims(last):
+        # The retries were spent on a conflict that was never about the key, and it outlived them.
+        # `exhausted` would answer it with "retry with the same key", which cannot resolve someone
+        # else's constraint and would bury a fault that surfaced plainly before keys existed. The
+        # error that actually kept happening is the honest answer. An error naming no constraint
+        # lands here too: unrecognised is not "mine", the same fail-closed reading
+        # `violated_constraint` documents.
+        raise last
     raise exhausted
 
 
@@ -502,10 +538,14 @@ async def _create_or_replay(
         lookup=lookup,
         rollback=rollback,
         tries=tries,
-        # Every IntegrityError, exactly as the shipped MEMNG-110 contract has always treated them.
-        # The same narrowing the edit path now does would fit here too, but changing what a shipped
-        # create does with a foreign constraint violation is not this ticket's to make.
+        # Every IntegrityError is worth a try here, and that breadth is load-bearing (MEMNG-131):
+        # a foreign conflict is usually TRANSIENT — two creates inventing the same hashtag at once
+        # collide on the tags index, and by the retry the winner's tag is committed — so the retry
+        # is what turns a lost race on someone else's constraint into a stored memo rather than a
+        # 500 and a memo the user posted but does not have. Narrowing this to the key would delete
+        # that self-heal; what is narrowed instead is what an exhausted loop may CLAIM.
         replayable=lambda _: True,
+        key_collision=_is_create_key_collision,
         exhausted=HTTPException(
             status_code=503,
             detail=CreateRacedDetail(
