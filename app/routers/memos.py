@@ -2,7 +2,7 @@ import contextlib
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 import structlog
 from anyio import to_thread
@@ -85,6 +85,45 @@ class MemoOut(BaseModel):
     attachments: list[AttachmentRef] = []
     reactions: list[ReactionSummary] = []
     total_size: int = 0
+
+
+class UploadsUnlinkableDetail(BaseModel):
+    """Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).
+
+    A dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed
+    request — a retrying client has to tell "that upload is gone, re-upload the bytes" apart from
+    "this request is malformed, never send it again", and a body it cannot classify is how an outbox
+    loops forever. The two buckets carry different remedies: `missing` (never existed, or expired
+    and reaped — an upload owned by another user reads as missing too) needs a fresh upload;
+    `incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD."""
+
+    code: Literal["uploads_unlinkable"]  # required, not defaulted: generated clients switch on it
+    missing_upload_uids: list[str]
+    incomplete_upload_uids: list[str]
+
+
+class UploadsUnlinkableError(BaseModel):
+    detail: UploadsUnlinkableDetail
+
+
+UNLINKABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
+    409: {
+        "model": UploadsUnlinkableError,
+        "description": "A requested upload_uid is missing, expired or incomplete. No memo is "
+        "created and no attachment is linked — resolve the named uploads and retry.",
+    }
+}
+
+
+def _unlinkable(exc: uploads_svc.UploadsUnlinkable) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=UploadsUnlinkableDetail(
+            code="uploads_unlinkable",
+            missing_upload_uids=exc.missing,
+            incomplete_upload_uids=exc.incomplete,
+        ).model_dump(),
+    )
 
 
 class MemoCreate(BaseModel):
@@ -218,7 +257,7 @@ async def list_memos(
     )
 
 
-@router.post("/memos", response_model=MemoOut, status_code=201)
+@router.post("/memos", response_model=MemoOut, status_code=201, responses=UNLINKABLE_RESPONSE)
 async def create_memo(
     body: MemoCreate,
     user: Annotated[User, Depends(auth.require_user)],
@@ -231,11 +270,14 @@ async def create_memo(
     moved: list[str] = []
     committed = False
     try:
-        finalized = (
-            await uploads_svc.finalize_pending(db, body.upload_uids, user.id, moved_out=moved)
-            if body.upload_uids
-            else []
-        )
+        try:
+            finalized = (
+                await uploads_svc.finalize_pending(db, body.upload_uids, user.id, moved_out=moved)
+                if body.upload_uids
+                else []
+            )
+        except uploads_svc.UploadsUnlinkable as exc:
+            raise _unlinkable(exc) from None
         memo = await svc.create_memo(
             db,
             user,
@@ -273,7 +315,7 @@ async def get_memo(
     return _out(await _require_owned(db, user, uid), user.id)
 
 
-@router.patch("/memos/{uid}", response_model=MemoOut)
+@router.patch("/memos/{uid}", response_model=MemoOut, responses=UNLINKABLE_RESPONSE)
 async def patch_memo(
     uid: str,
     body: MemoPatch,
@@ -294,9 +336,14 @@ async def patch_memo(
             # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto that
             # screen instead of promoting a second visible copy of the same photo (MEMNG-79); on
             # create there is no memo yet, so only this path can carry one.
-            finalized = await uploads_svc.finalize_pending(
-                db, body.upload_uids, user.id, moved_out=moved, memo=memo
-            )
+            try:
+                finalized = await uploads_svc.finalize_pending(
+                    db, body.upload_uids, user.id, moved_out=moved, memo=memo
+                )
+            except uploads_svc.UploadsUnlinkable as exc:
+                # The edits applied above are still uncommitted: this raise leaves the session to be
+                # rolled back by get_session, so a refused edit changes nothing at all.
+                raise _unlinkable(exc) from None
             await svc.link_attachments(db, user.id, memo, finalized, moved_out=moved)
         # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed tags,
         # so both "added #curated on edit" and "added a new photo to a curated memo" are caught.

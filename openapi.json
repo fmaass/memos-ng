@@ -1319,6 +1319,49 @@
         "title": "UploadOut",
         "type": "object"
       },
+      "UploadsUnlinkableDetail": {
+        "description": "Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).\n\nA dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed\nrequest \u2014 a retrying client has to tell \"that upload is gone, re-upload the bytes\" apart from\n\"this request is malformed, never send it again\", and a body it cannot classify is how an outbox\nloops forever. The two buckets carry different remedies: `missing` (never existed, or expired\nand reaped \u2014 an upload owned by another user reads as missing too) needs a fresh upload;\n`incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD.",
+        "properties": {
+          "code": {
+            "const": "uploads_unlinkable",
+            "title": "Code",
+            "type": "string"
+          },
+          "incomplete_upload_uids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Incomplete Upload Uids",
+            "type": "array"
+          },
+          "missing_upload_uids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Upload Uids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "code",
+          "missing_upload_uids",
+          "incomplete_upload_uids"
+        ],
+        "title": "UploadsUnlinkableDetail",
+        "type": "object"
+      },
+      "UploadsUnlinkableError": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/UploadsUnlinkableDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "UploadsUnlinkableError",
+        "type": "object"
+      },
       "UserOut": {
         "properties": {
           "auth_kind": {
@@ -2643,6 +2686,16 @@
             },
             "description": "Successful Response"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadsUnlinkableError"
+                }
+              }
+            },
+            "description": "A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked \u2014 resolve the named uploads and retry."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2791,6 +2844,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadsUnlinkableError"
+                }
+              }
+            },
+            "description": "A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked \u2014 resolve the named uploads and retry."
           },
           "422": {
             "content": {
