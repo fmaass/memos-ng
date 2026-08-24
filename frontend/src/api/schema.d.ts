@@ -1992,7 +1992,8 @@ export interface operations {
                 created_after?: string | null;
                 tag?: string[] | null;
                 visibility?: components["schemas"]["Visibility"];
-                owner?: string | null;
+                /** @description Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page — like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all. */
+                owner?: string[] | null;
                 q?: string | null;
                 include_archived?: boolean;
                 archived_only?: boolean;

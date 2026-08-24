@@ -359,7 +359,22 @@ async def list_memos(
     # SkipJsonSchema, same as the request bodies — no BeforeValidator: a query string cannot
     # carry a JSON null, so absent is already the only way this one arrives unset.
     visibility: Visibility | SkipJsonSchema[None] = None,
-    owner: str | None = None,
+    owner: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Filter to memos owned by the named household members (`User.subject`, as "
+                "published by `GET /api/members`). Repeatable, and repeating it ORs: "
+                "`?owner=alice&owner=bob` returns the union of what alice and bob wrote that "
+                "the caller may see, never a memo of anyone else's, and never a memo of "
+                "theirs the caller could not already see. Composes with every other filter "
+                "(they still AND), and must be resent unchanged on each page — like every "
+                "filter here, it is not carried inside `cursor`. A single `owner=alice` "
+                "behaves exactly as it did before it was repeatable; omitting it filters by "
+                "owner not at all."
+            )
+        ),
+    ] = None,
     q: str | None = None,
     include_archived: bool = False,
     archived_only: bool = False,
