@@ -3,17 +3,24 @@ import Button from 'primevue/button'
 import DatePicker from 'primevue/datepicker'
 import Menu from 'primevue/menu'
 import Select from 'primevue/select'
+import { useToast } from 'primevue/usetoast'
 import { computed, nextTick, ref, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { useUploadQueue } from '@/composables/useResumableUpload'
 import { useSettings } from '@/composables/useSettings'
-import { canPost, composerKeyAction, formatMemoDate } from '@/lib/composer'
+import {
+  canPost,
+  composerKeyAction,
+  formatMemoDate,
+  uploadsUnlinkableMessage,
+} from '@/lib/composer'
 import { applyMarkdown, type MarkdownAction } from '@/lib/markdownToolbar'
 
 const emit = defineEmits<{ saved: [memo: unknown] }>()
 
 const api = useApi()
+const toast = useToast()
 const {
   items: uploads,
   add: addUploads,
@@ -148,7 +155,18 @@ async function save() {
     }
     if (memoDate.value) body.created_at = memoDate.value.toISOString() // only when backdated
     const { data, error } = await api.POST('/api/memos', { body: body as never })
-    if (error) throw error
+    if (error) {
+      // A composer left open past the upload expiry still shows its tiles as `done`, but the
+      // sessions behind them are reaped and the server now refuses the whole post (MEMNG-113)
+      // rather than saving the text without the photos. Say which files were lost — silently
+      // failing here is what the strict refusal exists to prevent.
+      const lost = uploadsUnlinkableMessage(error, uploads)
+      if (lost) {
+        toast.add({ severity: 'error', summary: 'Memo not posted', detail: lost, life: 10000 })
+        return
+      }
+      throw error
+    }
     emit('saved', data)
     content.value = ''
     memoDate.value = null

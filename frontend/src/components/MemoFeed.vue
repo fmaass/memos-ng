@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
+import { useToast } from 'primevue/usetoast'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
@@ -7,6 +8,7 @@ import MemoCardSkeleton from '@/components/MemoCardSkeleton.vue'
 import { useApi } from '@/composables/useApi'
 import { usePrintMaster } from '@/composables/usePrintMaster'
 import { type MemoQuery, useTimeline } from '@/composables/useTimeline'
+import { uploadsUnlinkableMessage } from '@/lib/composer'
 import { shouldRemint } from '@/lib/imageRetry'
 import { groupByDay } from '@/lib/timeline'
 
@@ -20,6 +22,7 @@ const emit = defineEmits<{ restore: [uid: string] }>()
 
 const api = useApi()
 const queryClient = useQueryClient()
+const toast = useToast()
 
 const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching, isPending, isError, refetch } =
   useTimeline(() => props.query)
@@ -85,6 +88,13 @@ const editMemo = useMutation({
     if (error) throw error
   },
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
+  // Same refusal as the composer's (MEMNG-113), reached from an edit panel left open past the
+  // upload expiry. The card cleared its tiles on Save, so the message counts the lost files
+  // rather than naming them; without it the edit just silently does nothing.
+  onError: (error) => {
+    const lost = uploadsUnlinkableMessage(error)
+    if (lost) toast.add({ severity: 'error', summary: 'Memo not saved', detail: lost, life: 10000 })
+  },
 })
 
 // Attach/replace/remove the print master of one of your photos, and refresh. Shared with the

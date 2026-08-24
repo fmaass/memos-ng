@@ -888,6 +888,11 @@ export interface components {
              */
             created_at?: string | null;
             /**
+             * Idempotency Key
+             * @description Optional client-generated retry token: a UUID, or any opaque 8-64 character token of [A-Za-z0-9_-], unique per logical create. Posting it a second time returns the memo the first call stored — same uid, same attachments — and returns it with **201, the same status as the original create**. The body is the whole answer (the uid tells a client which memo is now stored), so the status is not used as a second channel, and a safe retry looks exactly like the success it is repeating. Two owners may reuse one token. Without a key, a retry stores a SECOND memo.
+             */
+            idempotency_key?: string | null;
+            /**
              * Pinned
              * @default false
              */
@@ -1236,6 +1241,32 @@ export interface components {
             chunk_size: number;
             /** Upload Uid */
             upload_uid: string;
+        };
+        /**
+         * UploadsUnlinkableDetail
+         * @description Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).
+         *
+         *     A dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed
+         *     request — a retrying client has to tell "that upload is gone, re-upload the bytes" apart from
+         *     "this request is malformed, never send it again", and a body it cannot classify is how an outbox
+         *     loops forever. The two buckets carry different remedies: `missing` (never existed, or expired
+         *     and reaped — an upload owned by another user reads as missing too) needs a fresh upload;
+         *     `incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD.
+         */
+        UploadsUnlinkableDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "uploads_unlinkable";
+            /** Incomplete Upload Uids */
+            incomplete_upload_uids: string[];
+            /** Missing Upload Uids */
+            missing_upload_uids: string[];
+        };
+        /** UploadsUnlinkableError */
+        UploadsUnlinkableError: {
+            detail: components["schemas"]["UploadsUnlinkableDetail"];
         };
         /** UserOut */
         UserOut: {
@@ -1847,6 +1878,15 @@ export interface operations {
                     "application/json": components["schemas"]["MemoOut"];
                 };
             };
+            /** @description A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked — resolve the named uploads and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadsUnlinkableError"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1940,6 +1980,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoOut"];
+                };
+            };
+            /** @description A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked — resolve the named uploads and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadsUnlinkableError"];
                 };
             };
             /** @description Validation Error */
