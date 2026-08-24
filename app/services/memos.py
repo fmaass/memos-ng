@@ -178,9 +178,22 @@ async def get_by_idempotency_key(db: AsyncSession, owner_id: int, key: str) -> M
 
     Scoped to the owner because the key is the CLIENT's name for a create, not a global one: two
     users retrying with the same token must each get their own memo, which is also exactly what the
-    partial unique index enforces."""
+    partial unique index enforces.
+
+    FOR SHARE on the memo row, because a replay must answer with the WHOLE memo. The relationships
+    are `selectin`, so reading one memo is several statements, and under READ COMMITTED each of
+    them sees a newer snapshot than the last: a DELETE committing midway through would otherwise
+    hand back a 201 carrying a memo with some or none of its attachments, tags and reactions — a
+    lie no client could detect. A share lock is enough to stop exactly that, and no more: deleting
+    the memo has to take a conflicting lock on this same parent row before its cascade can remove
+    any child, so a concurrent delete serializes behind this read instead of tearing it in half.
+    Two replays of one key still run concurrently, since share locks do not exclude each other."""
     return (
-        await db.execute(select(Memo).where(Memo.owner_id == owner_id, Memo.idempotency_key == key))
+        await db.execute(
+            select(Memo)
+            .where(Memo.owner_id == owner_id, Memo.idempotency_key == key)
+            .with_for_update(read=True)
+        )
     ).scalar_one_or_none()
 
 

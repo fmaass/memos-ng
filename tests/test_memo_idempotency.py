@@ -11,8 +11,12 @@ import asyncio
 
 import pytest
 from app.config import settings
+from app.models import Memo, User, Visibility
+from app.routers.memos import _create_or_replay
 from app.services import memos as memo_svc
-from sqlalchemy import create_engine, text
+from fastapi import HTTPException
+from sqlalchemy import create_engine, delete, text
+from sqlalchemy.exc import IntegrityError
 
 from tests.conftest import SYNC_URL
 from tests.test_uploads import _cleanup, _drop_user, _login_as, _reap_expired_committed, _start
@@ -164,3 +168,147 @@ async def test_two_concurrent_creates_with_one_key_store_exactly_one_memo(pat_cl
         assert _memo_uids_with_key(KEY) == [first.json()["uid"]]
     finally:
         _delete_memos_with_key(KEY)
+
+
+# --- the lost-race resolution, as control flow ---------------------------------------------------
+# Driving these through the DB would need a concurrent create AND a concurrent delete of that
+# create to land inside one microsecond-wide window, twice over. The loop's three dependencies are
+# injected instead — the attempt, the read-back and the rollback are what the loop CALLS, not what
+# it is — so every branch, including the exhausted one, is reachable and its call order is visible.
+# The real race stays covered end-to-end by the concurrent-create test above.
+
+
+def _collision() -> IntegrityError:
+    return IntegrityError("INSERT INTO memos ...", {}, Exception("duplicate key value"))
+
+
+class _Loop:
+    """Scripted stand-ins for attempt/lookup/rollback that record the order they were called in."""
+
+    def __init__(self, attempts: list, lookups: list | None = None) -> None:
+        self._attempts = list(attempts)
+        self._lookups = list(lookups or [])
+        self.calls: list[str] = []
+
+    async def attempt(self) -> Memo:
+        self.calls.append("attempt")
+        outcome = self._attempts.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    async def lookup(self) -> Memo | None:
+        self.calls.append("lookup")
+        return self._lookups.pop(0)
+
+    async def rollback(self) -> None:
+        self.calls.append("rollback")
+
+    async def run(self) -> Memo:
+        return await _create_or_replay(
+            attempt=self.attempt, lookup=self.lookup, rollback=self.rollback
+        )
+
+
+async def test_a_create_that_lands_is_returned_untouched():
+    stored = Memo(uid="first-try")
+    loop = _Loop([stored])
+    assert await loop.run() is stored
+    assert loop.calls == ["attempt"]  # no rollback, no read-back on the happy path
+
+
+async def test_losing_the_race_returns_the_winner_without_inserting_again():
+    winner = Memo(uid="the-winner")
+    loop = _Loop([_collision()], [winner])
+    assert await loop.run() is winner
+    # the insert is NOT retried while a winner exists — that would be the duplicate memo the key
+    # is there to prevent
+    assert loop.calls == ["attempt", "rollback", "lookup"]
+
+
+async def test_a_winner_deleted_before_the_read_back_is_retried_rather_than_500ing():
+    # The blocking case: we collided, so a row existed; by the time we read it back it was gone.
+    # The key is free again, so a fresh insert is legitimate and must be taken.
+    second = Memo(uid="second-try")
+    loop = _Loop([_collision(), second], [None])
+    assert await loop.run() is second
+    assert loop.calls == ["attempt", "rollback", "lookup", "attempt"]
+
+
+async def test_a_winner_that_appears_on_the_second_round_is_returned():
+    winner = Memo(uid="late-winner")
+    loop = _Loop([_collision(), _collision()], [None, winner])
+    assert await loop.run() is winner
+    assert loop.calls == ["attempt", "rollback", "lookup", "attempt", "rollback", "lookup"]
+
+
+async def test_exhausting_the_retries_is_a_503_the_client_may_repeat():
+    loop = _Loop([_collision(), _collision()], [None, None])
+    with pytest.raises(HTTPException) as raised:
+        await loop.run()
+    assert raised.value.status_code == 503  # never a bare IntegrityError surfacing as a 500
+    assert raised.value.detail["code"] == "create_raced"
+    assert "idempotency_key" in raised.value.detail["message"]
+    assert loop.calls.count("attempt") == 2  # bounded: no hot loop on a pathological race
+
+
+async def test_any_other_failure_propagates_with_no_recovery_attempted():
+    # Only a unique-index collision means "someone else got there first". Anything else is a real
+    # fault and must not be swallowed into a retry.
+    boom = RuntimeError("disk fell over")
+    loop = _Loop([boom])
+    with pytest.raises(RuntimeError):
+        await loop.run()
+    assert loop.calls == ["attempt"]
+
+
+async def test_the_replay_lookup_holds_a_concurrent_delete_off_until_it_has_read_the_memo(
+    db_engine,
+):
+    """A replay answers 201 with the WHOLE memo, so the read cannot be torn in half.
+
+    The relationships load as separate statements, and under READ COMMITTED each one sees a fresh
+    snapshot — a delete committing between them would produce a 201 carrying a memo with some or
+    none of its attachments. The share lock is what makes that impossible, and the only way to
+    prove it is to hold the lock and watch a real DELETE queue behind it.
+    """
+    from app.database import async_session
+
+    subject = "idem_lock_owner"
+    async with async_session() as setup:
+        owner = User(subject=subject, role="user")
+        setup.add(owner)
+        await setup.flush()
+        memo = Memo(
+            uid="lock-probe-memo",
+            owner_id=owner.id,
+            content="read me whole",
+            visibility=Visibility.PRIVATE,
+            idempotency_key=KEY,
+        )
+        setup.add(memo)
+        await setup.commit()
+        owner_id, memo_id = owner.id, memo.id
+    try:
+        async with async_session() as reader:
+            found = await memo_svc.get_by_idempotency_key(reader, owner_id, KEY)
+            assert found is not None and found.id == memo_id
+
+            async with async_session() as deleter:
+                deleting = asyncio.create_task(
+                    deleter.execute(delete(Memo).where(Memo.id == memo_id))
+                )
+                # Still blocked a second later: the delete has to take a conflicting lock on this
+                # same row before its cascade can touch a single child.
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(deleting), timeout=1.0)
+
+                await reader.rollback()  # the replay is done reading — release the share lock
+                await asyncio.wait_for(deleting, timeout=10)  # ...and the delete goes through
+                await deleter.commit()
+    finally:
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM memos WHERE uid = 'lock-probe-memo'"))
+            c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
+        eng.dispose()

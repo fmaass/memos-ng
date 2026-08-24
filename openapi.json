@@ -423,6 +423,38 @@
         "title": "Body_upload_print_api_attachments__uid__print_post",
         "type": "object"
       },
+      "CreateRacedDetail": {
+        "description": "Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the\nmemo they raced for was deleted before it could be read back. Retrying with the same key is\nsafe \u2014 that is what the key is for \u2014 which is why this is a 5xx the client may repeat and not\na 4xx telling it to stop.",
+        "properties": {
+          "code": {
+            "const": "create_raced",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "CreateRacedDetail",
+        "type": "object"
+      },
+      "CreateRacedError": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/CreateRacedDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "CreateRacedError",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -2720,6 +2752,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRacedError"
+                }
+              }
+            },
+            "description": "Concurrent writes raced this keyed create. Nothing was stored under the key \u2014 retry the same request, idempotency_key included."
           }
         },
         "security": [

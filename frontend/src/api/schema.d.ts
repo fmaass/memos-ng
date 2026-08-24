@@ -859,6 +859,26 @@ export interface components {
             /** File */
             file: string;
         };
+        /**
+         * CreateRacedDetail
+         * @description Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the
+         *     memo they raced for was deleted before it could be read back. Retrying with the same key is
+         *     safe — that is what the key is for — which is why this is a 5xx the client may repeat and not
+         *     a 4xx telling it to stop.
+         */
+        CreateRacedDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "create_raced";
+            /** Message */
+            message: string;
+        };
+        /** CreateRacedError */
+        CreateRacedError: {
+            detail: components["schemas"]["CreateRacedDetail"];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1894,6 +1914,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Concurrent writes raced this keyed create. Nothing was stored under the key — retry the same request, idempotency_key included. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateRacedError"];
                 };
             };
         };

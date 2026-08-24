@@ -1,5 +1,6 @@
 import contextlib
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -112,12 +113,36 @@ class UploadsUnlinkableError(BaseModel):
     detail: UploadsUnlinkableDetail
 
 
+class CreateRacedDetail(BaseModel):
+    """Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the
+    memo they raced for was deleted before it could be read back. Retrying with the same key is
+    safe — that is what the key is for — which is why this is a 5xx the client may repeat and not
+    a 4xx telling it to stop."""
+
+    code: Literal["create_raced"]
+    message: str
+
+
+class CreateRacedError(BaseModel):
+    detail: CreateRacedDetail
+
+
 UNLINKABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
     409: {
         "model": UploadsUnlinkableError,
         "description": "A requested upload_uid is missing, expired or incomplete. No memo is "
         "created and no attachment is linked — resolve the named uploads and retry.",
     }
+}
+
+
+CREATE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **UNLINKABLE_RESPONSE,
+    503: {
+        "model": CreateRacedError,
+        "description": "Concurrent writes raced this keyed create. Nothing was stored under the "
+        "key — retry the same request, idempotency_key included.",
+    },
 }
 
 
@@ -275,7 +300,46 @@ async def list_memos(
     )
 
 
-@router.post("/memos", response_model=MemoOut, status_code=201, responses=UNLINKABLE_RESPONSE)
+async def _create_or_replay(
+    *,
+    attempt: Callable[[], Awaitable[Memo]],
+    lookup: Callable[[], Awaitable[Memo | None]],
+    rollback: Callable[[], Awaitable[None]],
+    tries: int = 2,
+) -> Memo:
+    """Insert a keyed memo, resolving a lost race against the partial unique index (MEMNG-110).
+
+    Losing that race normally means the winner is there to be read back and returned. It can also
+    mean the winner was DELETED in the moment between our insert failing and our reading it back —
+    the key is then free again, so a fresh insert is legitimate and we take one more run at it
+    rather than answering an error for a memo nobody has.
+
+    Two tries, not a loop until success: each round needs a concurrent create AND a concurrent
+    delete of that create to land inside the same window, so a third round buys nothing an
+    unbounded retry could not turn into a hot loop. Exhausting them raises 503 — never a bare
+    IntegrityError as a 500 — because the client's remedy is real: retrying with the same key is
+    safe by construction, and 5xx is the class our retry contract already says to repeat."""
+    for _ in range(tries):
+        try:
+            return await attempt()
+        except IntegrityError:
+            await rollback()
+            winner = await lookup()
+            if winner is not None:
+                return winner
+    raise HTTPException(
+        status_code=503,
+        detail=CreateRacedDetail(
+            code="create_raced",
+            message=(
+                "Concurrent writes raced this create and the memo they raced for was deleted "
+                "before it could be read back. Retry with the same idempotency_key."
+            ),
+        ).model_dump(),
+    )
+
+
+@router.post("/memos", response_model=MemoOut, status_code=201, responses=CREATE_RESPONSES)
 async def create_memo(
     body: MemoCreate,
     user: Annotated[User, Depends(auth.require_user)],
@@ -294,52 +358,57 @@ async def create_memo(
         replayed = await svc.get_by_idempotency_key(db, owner_id, key)
         if replayed is not None:
             return _out(replayed, owner_id)
-    # Finalize-on-post: pending uploads become attachments now, then link them alongside any
-    # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
-    # finalize moves files to disk before the shared commit — if the post then rolls back, unlink
-    # those moved originals so they don't leak (the DB row is reverted but the file would remain).
-    moved: list[str] = []
-    committed = False
-    try:
+
+    async def attempt() -> Memo:
+        """One whole create, from finalize to commit. Owns its own `moved` list because it may run
+        twice: each try must clean up only the originals IT moved, or a retry that succeeds would
+        leave the previous try's files behind with no row referencing them."""
+        # Finalize-on-post: pending uploads become attachments now, then link them alongside any
+        # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
+        # finalize moves files to disk before the commit — if this try then fails, unlink those
+        # moved originals so they don't leak (the DB row reverts but the file would remain).
+        moved: list[str] = []
         try:
-            finalized = (
-                await uploads_svc.finalize_pending(db, body.upload_uids, user.id, moved_out=moved)
-                if body.upload_uids
-                else []
+            try:
+                finalized = (
+                    await uploads_svc.finalize_pending(
+                        db, body.upload_uids, owner_id, moved_out=moved
+                    )
+                    if body.upload_uids
+                    else []
+                )
+            except uploads_svc.UploadsUnlinkable as exc:
+                raise _unlinkable(exc) from None
+            memo = await svc.create_memo(
+                db,
+                user,
+                content=body.content,
+                visibility=body.visibility or user.default_visibility,  # per-user default (parity)
+                pinned=body.pinned,
+                attachment_uids=[*body.attachment_uids, *finalized],
+                created_at=body.created_at,
+                moved_out=moved,  # placement into the memo folder appends here → unlinked on fail
+                idempotency_key=key,
             )
-        except uploads_svc.UploadsUnlinkable as exc:
-            raise _unlinkable(exc) from None
-        memo = await svc.create_memo(
-            db,
-            user,
-            content=body.content,
-            visibility=body.visibility or user.default_visibility,  # prod parity: per-user default
-            pinned=body.pinned,
-            attachment_uids=[*body.attachment_uids, *finalized],
-            created_at=body.created_at,
-            moved_out=moved,  # placement into the memo folder appends here → unlinked on rollback
-            idempotency_key=key,
-        )
-        # After all attachments are linked, enqueue frame shares for #curated photos (no-op unless
-        # the feature is configured). Savepoint-isolated so a feature error can't fail the save.
-        await _enqueue_frame_shares_safe(db, memo, user)
-        await db.commit()
-        committed = True
-    except IntegrityError:
-        # The lookup above lost a race: a concurrent create carrying this key reached the partial
-        # unique index first. That index is the settlement — one of the two inserts fails, and the
-        # loser answers with the winner rather than with an error the caller cannot act on. Any
-        # OTHER integrity failure (or one with no winner to find) is a real fault and re-raises.
-        if key is None:
+            # After all attachments are linked, enqueue frame shares for #curated photos (no-op
+            # unless configured). Savepoint-isolated so a feature error can't fail the save.
+            await _enqueue_frame_shares_safe(db, memo, user)
+            await db.commit()
+            return memo
+        except BaseException:
+            if moved:
+                await to_thread.run_sync(_unlink_paths, moved)
             raise
-        await db.rollback()
-        winner = await svc.get_by_idempotency_key(db, owner_id, key)
-        if winner is None:
-            raise
-        memo = winner
-    finally:
-        if not committed and moved:
-            await to_thread.run_sync(_unlink_paths, moved)
+
+    if key is None:
+        # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
+        # before this feature existed.
+        return _out(await attempt(), owner_id)
+    memo = await _create_or_replay(
+        attempt=attempt,
+        lookup=lambda: svc.get_by_idempotency_key(db, owner_id, key),
+        rollback=db.rollback,
+    )
     return _out(memo, owner_id)
 
 
