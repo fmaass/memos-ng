@@ -150,6 +150,12 @@ class Memo(Base):
     )
 
 
+# Named, and named ONCE, because the router has to recognise this constraint by name at runtime:
+# only a violation of THIS constraint means "a same-key edit got there first" and may be answered
+# with a replay. Any other integrity error belongs to the caller's own write and must surface.
+EDIT_KEY_CONSTRAINT = "uq_memo_edit_keys_owner_key"
+
+
 class MemoEditKey(Base):
     """One client-supplied `edit_key` that has already been applied to a memo (MEMNG-124).
 
@@ -170,7 +176,7 @@ class MemoEditKey(Base):
 
     __tablename__ = "memo_edit_keys"
 
-    __table_args__ = (UniqueConstraint("owner_id", "edit_key", name="uq_memo_edit_keys_owner_key"),)
+    __table_args__ = (UniqueConstraint("owner_id", "edit_key", name=EDIT_KEY_CONSTRAINT),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     memo_id: Mapped[int] = mapped_column(ForeignKey("memos.id", ondelete="CASCADE"), index=True)

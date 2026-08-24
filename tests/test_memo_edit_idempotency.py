@@ -23,8 +23,12 @@ import uuid
 
 import pytest
 from app.config import settings
+from app.models import EDIT_KEY_CONSTRAINT, Memo
+from app.routers.memos import _apply_or_replay, _is_edit_key_collision, violated_constraint
 from app.services import memos as memo_svc
+from fastapi import HTTPException
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 from tests.conftest import SYNC_URL
 from tests.test_uploads import _cleanup, _drop_user, _login_as, _reap_expired_committed, _start
@@ -54,6 +58,23 @@ def _edit_keys(key: str) -> list[tuple[str, str]]:
         ).all()
     eng.dispose()
     return [(memo_uid, subject) for memo_uid, subject in rows]
+
+
+def _edit_key_row_count(key: str) -> int:
+    """Rows in memo_edit_keys under `key`, read DIRECTLY — deliberately no join through memos.
+
+    `_edit_keys` above joins, which is right when the claim is "bound to that memo, owned by that
+    user". It is exactly wrong for the claim "the row is gone": against a schema that lost its
+    ON DELETE CASCADE the orphans would still be there, pointing at a memo that no longer exists,
+    and an INNER join through memos drops precisely those rows — reporting empty while the leak it
+    exists to catch accumulates."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        found = c.execute(
+            text("SELECT count(*) FROM memo_edit_keys WHERE edit_key = :k"), {"k": key}
+        ).scalar_one()
+    eng.dispose()
+    return int(found)
 
 
 def _edit_keys_of(memo_uid: str) -> list[str]:
@@ -212,7 +233,7 @@ def test_a_new_edit_naming_missing_uploads_still_gets_the_strict_409_and_records
         assert refused.status_code == 409, refused.text
         assert refused.json()["detail"]["code"] == "uploads_unlinkable"
         assert refused.json()["detail"]["missing_upload_uids"] == ["no-such-upload"]
-        assert _edit_keys(key) == []  # nothing recorded → the key is still free
+        assert _edit_key_row_count(key) == 0  # nothing recorded at all → the key is still free
         assert client.get(f"/api/memos/{uid}").json()["content"] == "unchanged"  # nothing applied
 
         # ...and the key still works afterwards, on the retry the client actually sends.
@@ -285,7 +306,9 @@ def test_deleting_the_memo_takes_its_edit_keys_with_it(logged_in_client):
     client.patch(f"/api/memos/{uid}", json={"content": "edited", "edit_key": key})
     assert _edit_keys(key) == [(uid, "test_session_user")]
     assert client.delete(f"/api/memos/{uid}").status_code == 204
-    assert _edit_keys(key) == []
+    # Counted straight off memo_edit_keys: an orphan left behind by a missing cascade is invisible
+    # to any query that reaches the row THROUGH the memo it no longer has.
+    assert _edit_key_row_count(key) == 0
 
 
 @pytest.mark.parametrize("key", ["short", "has spaces here", "x" * 65, "no/slashes/allowed"])
@@ -350,3 +373,190 @@ async def test_two_concurrent_edits_with_one_key_apply_exactly_one_of_them(pat_c
         assert first.json()["updated_at"] == second.json()["updated_at"]
     finally:
         _delete_memo(uid)
+
+
+# --- the replay path answers ONE conflict, and only that one --------------------------------------
+
+
+async def test_a_race_on_someone_elses_constraint_is_not_dressed_up_as_a_raced_edit(
+    pat_client, monkeypatch
+):
+    """Two edits with DISTINCT keys, colliding on the tags index — not on the edit key at all.
+
+    Both patches introduce the same brand-new hashtag, so `_get_or_create_tags` has them both
+    select nothing and both insert; one loses on `ix_tags_name`. That is the loser's OWN write
+    conflicting, not a lost race for an edit key: absorbing it would answer "retry with the same
+    edit_key" for a conflict retrying cannot fix, and would bury a fault that surfaced plainly
+    before this feature existed. It must propagate exactly as it always did.
+
+    The barrier holds each request between its tag SELECT and its tag INSERT until the other has
+    got there too, which is what makes both of them try the insert instead of one reusing the
+    other's committed tag.
+    """
+    bearer, _, _ = pat_client
+    first_uid = (await bearer.post("/api/memos", json={"content": "one"})).json()["uid"]
+    second_uid = (await bearer.post("/api/memos", json={"content": "two"})).json()["uid"]
+    tag = f"race{uuid.uuid4().hex[:12]}"
+    keys = (_key(), _key())  # DISTINCT: nothing here should ever touch the edit-key constraint
+    entered = 0
+    both_past_the_select = asyncio.Barrier(2)
+    real_get_or_create_tags = memo_svc._get_or_create_tags
+
+    async def barriered(db, names):
+        nonlocal entered
+        entered += 1
+        if entered <= 2:
+            await both_past_the_select.wait()
+        return await real_get_or_create_tags(db, names)
+
+    monkeypatch.setattr(memo_svc, "_get_or_create_tags", barriered)
+    try:
+        first, second = await asyncio.wait_for(
+            asyncio.gather(
+                bearer.patch(
+                    f"/api/memos/{first_uid}", json={"content": f"#{tag} a", "edit_key": keys[0]}
+                ),
+                bearer.patch(
+                    f"/api/memos/{second_uid}", json={"content": f"#{tag} b", "edit_key": keys[1]}
+                ),
+                return_exceptions=True,
+            ),
+            timeout=30,
+        )
+        assert entered == 2  # both really did reach the tag insert; nothing took a shortcut
+        codes = sorted(
+            r.status_code for r in (first, second) if not isinstance(r, BaseException)
+        )
+        # One edit lands. The loser's tag collision is NOT laundered into 503 edit_raced — the
+        # single answer this test exists to forbid.
+        outcomes = (codes, getattr(first, "text", first), getattr(second, "text", second))
+        assert 503 not in codes, outcomes
+        assert 200 in codes, codes
+    finally:
+        _delete_memo(first_uid)
+        _delete_memo(second_uid)
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM tags WHERE name = :n"), {"n": tag})
+        eng.dispose()
+
+
+class _FakeAsyncpgError(Exception):
+    """Stands in for asyncpg's UniqueViolationError: the driver dependency, not the unit."""
+
+    def __init__(self, constraint_name: str | None) -> None:
+        super().__init__("duplicate key value")
+        self.constraint_name = constraint_name
+
+
+class _FakeDiag:
+    def __init__(self, constraint_name: str | None) -> None:
+        self.constraint_name = constraint_name
+
+
+class _FakePsycopgError(Exception):
+    """Stands in for psycopg2's error, which carries the name on `diag` instead."""
+
+    def __init__(self, constraint_name: str | None) -> None:
+        super().__init__("duplicate key value")
+        self.diag = _FakeDiag(constraint_name)
+
+
+def _wrapped(orig: Exception, cause: Exception | None = None) -> IntegrityError:
+    """An IntegrityError shaped like the driver produces: SQLAlchemy's shim on top, the driver's own
+    exception on `__cause__` (verified against the live asyncpg stack, which puts the constraint
+    name there and NOT on `orig`)."""
+    if cause is not None:
+        orig.__cause__ = cause
+    return IntegrityError("INSERT INTO ...", {}, orig)
+
+
+def test_the_constraint_name_is_read_from_where_asyncpg_actually_puts_it():
+    exc = _wrapped(Exception("wrapper"), _FakeAsyncpgError(EDIT_KEY_CONSTRAINT))
+    assert violated_constraint(exc) == EDIT_KEY_CONSTRAINT
+    assert _is_edit_key_collision(exc)
+
+
+def test_the_psycopg_diag_shape_is_read_too():
+    exc = _wrapped(_FakePsycopgError(EDIT_KEY_CONSTRAINT))
+    assert violated_constraint(exc) == EDIT_KEY_CONSTRAINT
+    assert _is_edit_key_collision(exc)
+
+
+def test_a_foreign_constraint_is_not_mistaken_for_an_edit_key_collision():
+    # The real one this guards: `_get_or_create_tags` racing on the tags unique index.
+    exc = _wrapped(Exception("wrapper"), _FakeAsyncpgError("ix_tags_name"))
+    assert violated_constraint(exc) == "ix_tags_name"
+    assert not _is_edit_key_collision(exc)
+
+
+def test_an_error_that_names_no_constraint_is_not_ours():
+    # Fail closed: an unrecognised integrity error propagates rather than being absorbed into a
+    # retry path that cannot resolve it.
+    exc = _wrapped(Exception("duplicate key value"))
+    assert violated_constraint(exc) is None
+    assert not _is_edit_key_collision(exc)
+
+
+async def test_the_loop_reraises_what_the_discriminator_rejects():
+    """The wiring, at the level the router uses it: a rejected error never reaches rollback/lookup.
+
+    Driving this through the DB would need the tag race above; here the three injected dependencies
+    make the control flow itself visible — that the raise happens BEFORE any recovery is attempted
+    is the whole point of the narrowing.
+    """
+    calls: list[str] = []
+    boom = _wrapped(Exception("wrapper"), _FakeAsyncpgError("ix_tags_name"))
+
+    async def attempt() -> Memo:
+        calls.append("attempt")
+        raise boom
+
+    async def lookup() -> Memo | None:
+        calls.append("lookup")
+        return Memo(uid="never-read")
+
+    async def rollback() -> None:
+        calls.append("rollback")
+
+    with pytest.raises(IntegrityError) as raised:
+        await _apply_or_replay(
+            attempt=attempt,
+            lookup=lookup,
+            rollback=rollback,
+            tries=2,
+            replayable=_is_edit_key_collision,
+            exhausted=HTTPException(status_code=503, detail="unreachable"),
+        )
+    assert raised.value is boom  # the original error, not a 500-shaped substitute
+    assert calls == ["attempt"]  # no rollback, no read-back, no second try
+
+
+async def test_the_loop_still_recovers_from_its_own_constraint():
+    """The positive control for the test above: with the SAME loop and the same shapes, an edit-key
+    collision does take the replay path. Without this, a `replayable` that returned False for
+    everything would pass every assertion in the negative test."""
+    calls: list[str] = []
+    winner = Memo(uid="the-winner")
+
+    async def attempt() -> Memo:
+        calls.append("attempt")
+        raise _wrapped(Exception("wrapper"), _FakeAsyncpgError(EDIT_KEY_CONSTRAINT))
+
+    async def lookup() -> Memo | None:
+        calls.append("lookup")
+        return winner
+
+    async def rollback() -> None:
+        calls.append("rollback")
+
+    settled = await _apply_or_replay(
+        attempt=attempt,
+        lookup=lookup,
+        rollback=rollback,
+        tries=1,
+        replayable=_is_edit_key_collision,
+        exhausted=HTTPException(status_code=503, detail="unreachable"),
+    )
+    assert settled is winner
+    assert calls == ["attempt", "rollback", "lookup"]

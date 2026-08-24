@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.database import get_session
-from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
+from app.models import (
+    EDIT_KEY_CONSTRAINT,
+    Attachment,
+    AttachmentStatus,
+    Memo,
+    User,
+    Visibility,
+)
 from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
 from app.services import frame_share as frame_share_svc
@@ -382,12 +389,48 @@ async def list_memos(
     )
 
 
+def violated_constraint(exc: IntegrityError) -> str | None:
+    """The name of the database constraint a write was refused on, or None if the driver won't say.
+
+    Verified against the live stack rather than assumed: SQLAlchemy's asyncpg dialect wraps the
+    driver error in its own DBAPI shim, which carries NEITHER `constraint_name` nor psycopg's
+    `diag` — the asyncpg `UniqueViolationError`, and the name, are one level down on `__cause__`.
+    psycopg2 (the sync test/migration path) instead exposes `diag.constraint_name` on `orig` itself,
+    so both shapes are read and the first that answers wins.
+
+    None is the honest answer for a driver-agnostic or fabricated error, and callers must read it as
+    "not the constraint I am looking for" — the fail-closed direction, where an unrecognised error
+    keeps propagating instead of being absorbed into someone's retry path."""
+    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
+        if candidate is None:
+            continue
+        for name in (
+            getattr(candidate, "constraint_name", None),
+            getattr(getattr(candidate, "diag", None), "constraint_name", None),
+        ):
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
+def _is_edit_key_collision(exc: IntegrityError) -> bool:
+    """True only for a violation of the edit-key uniqueness constraint (MEMNG-124).
+
+    The replay path answers exactly ONE conflict: two patches racing with the same edit_key. A
+    keyed patch can raise IntegrityError for reasons that have nothing to do with the key — two
+    patches introducing the same new hashtag collide on the tags index — and absorbing those would
+    report "concurrent writes raced this edit, retry with the same edit_key" for a conflict that
+    retrying cannot fix, while hiding a real fault that surfaced plainly before this feature."""
+    return violated_constraint(exc) == EDIT_KEY_CONSTRAINT
+
+
 async def _apply_or_replay(
     *,
     attempt: Callable[[], Awaitable[Memo]],
     lookup: Callable[[], Awaitable[Memo | None]],
     rollback: Callable[[], Awaitable[None]],
     exhausted: HTTPException,
+    replayable: Callable[[IntegrityError], bool],
     tries: int = 2,
 ) -> Memo:
     """Perform a keyed memo write, resolving a lost race against its unique index.
@@ -404,6 +447,11 @@ async def _apply_or_replay(
     a create passes `tries=2` and takes one more run at it; an edit passes `tries=1`, because a
     freed edit key means the memo itself is gone and there is nothing left to edit.
 
+    `replayable` decides which IntegrityError is even a lost race. Not every integrity violation a
+    keyed write can raise is one — the caller's own work may collide on an unrelated constraint —
+    and absorbing one of those into "retry with the same key" would both answer a conflict retrying
+    cannot fix and hide a real fault. Anything it rejects is re-raised untouched.
+
     Bounded rather than looping until success: each extra round needs a concurrent write AND a
     concurrent delete of that write to land inside the same window, so more rounds buy nothing an
     unbounded retry could not turn into a hot loop. Exhausting them raises the caller's 503 — never
@@ -412,7 +460,9 @@ async def _apply_or_replay(
     for _ in range(tries):
         try:
             return await attempt()
-        except IntegrityError:
+        except IntegrityError as exc:
+            if not replayable(exc):
+                raise  # someone else's constraint — not a lost race, and not ours to absorb
             await rollback()
             winner = await lookup()
             if winner is not None:
@@ -437,6 +487,10 @@ async def _create_or_replay(
         lookup=lookup,
         rollback=rollback,
         tries=tries,
+        # Every IntegrityError, exactly as the shipped MEMNG-110 contract has always treated them.
+        # The same narrowing the edit path now does would fit here too, but changing what a shipped
+        # create does with a foreign constraint violation is not this ticket's to make.
+        replayable=lambda _: True,
         exhausted=HTTPException(
             status_code=503,
             detail=CreateRacedDetail(
@@ -651,6 +705,7 @@ async def patch_memo(
         lookup=read_back,
         rollback=db.rollback,
         tries=1,
+        replayable=_is_edit_key_collision,
         exhausted=HTTPException(
             status_code=503,
             detail=EditRacedDetail(
