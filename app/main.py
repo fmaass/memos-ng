@@ -66,6 +66,7 @@ from app.routers import assets as assets_router  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
 from app.routers import compat as compat_router  # noqa: E402
 from app.routers import export as export_router  # noqa: E402
+from app.routers import members as members_router  # noqa: E402
 from app.routers import memos as memos_router  # noqa: E402
 from app.routers import native as native_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
@@ -87,6 +88,7 @@ app.router.routes.extend(uploads_router.router.routes)
 app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
+app.router.routes.extend(members_router.router.routes)
 # Compat (/api/v1/*, /file/*) must precede the /api/* fallback and the SPA catch-all.
 app.router.routes.extend(compat_router.router.routes)
 # Likewise the two non-/api native-login URLs (/.well-known/apple-app-site-association,
