@@ -698,20 +698,51 @@ Each phase is independently shippable and ends in an objective verification gate
   (medium) → APPROVE.
 - **Status:** pending
 
-### Phase 5 — Share extension + background chunked upload (memos-ng-ios)
+### Phase 5 — Capture anywhere: offline outbox, share extension, media viewing (memos-ng-ios)
+
+**Reshaped 2026-08-24 (user direction):** capture must work ANYWHERE — memos with pictures and
+videos plus notes are created offline and upload themselves when the phone is back on usable
+wifi. VPN integration (NetBird) was considered and REJECTED: the capture outbox makes
+connectivity irrelevant for writing, and iOS's background `URLSession` natively provides
+"upload when a usable network returns" (cellular disallowed via `allowsCellularAccess=false`,
+so draining waits for wifi; tasks started offline are delivered by the OS when a path exists,
+without the app running). IMPORTANT nuance (user-corrected 2026-08-24): only the HOME wifi can
+reach the backend — on a foreign wifi an attempt starts and FAILS, and iOS does not auto-retry a
+failed task. The design therefore treats failure as a first-class state: a failing task wakes
+the app in the background (`handleEventsForBackgroundURLSession`), the outbox re-arms the job
+with capped, spaced retries paced by a `BGAppRefreshTask`, and the drainer sends one cheap
+`/health` probe before moving payloads so a foreign-wifi cycle costs one small request, not a
+video. A queued memo is never dropped — it leaves the outbox only on server confirmation.
+Remote READ access stays out of scope until explicitly decided. Two shipped-surface gaps join
+this phase (user-reported 2026-08-24): video attachments render nothing (MEMNG-107) and images
+cannot be opened full screen (MEMNG-108).
 - **Branch:** `feature/share-upload`
-- **Build:** `MemosShare` extension target + `MemosUpload` package (Core-level): accepts image/
-  video/text/URL from the share sheet, writes the payload file-based into the app-group
-  container, enqueues an `UploadJob` (persisted JSON in the shared container), and drives
+- **Build:** a `MemosOutbox` package used by BOTH the in-app composer and the `MemosShare`
+  extension: every capture (text, image, video + note) is written file-based into the app-group
+  container FIRST and enqueued as an `UploadJob` (persisted JSON); the composer shows queued
+  state honestly (a memo is "pending" until the server confirms). The outbox drives
   `POST /api/uploads` → `PATCH` chunks (5 MiB, `Upload-Offset`) → `finalize` → `POST /api/memos`
-  through a background `URLSession` whose configuration sets `sharedContainerIdentifier`; the
-  extension hands off and the app adopts the session on next launch (single-attach rule);
+  through a background `URLSession` whose configuration sets `sharedContainerIdentifier`,
+  `allowsCellularAccess=false` and relies on the OS's waits-for-connectivity behaviour for
+  background sessions (wifi-gated draining with zero polling); the extension hands off and the
+  app adopts the session on next launch (single-attach rule); on next launch the app also
+  reconciles the outbox against delivered jobs (reboot recovery);
   `HEAD` offset probe on resume. Memory: never load media into memory in the extension; file
   upload tasks only. Keychain shared via the app-group access group.
+  **Media viewing (MEMNG-107/108):** video attachments show their `poster` tier with a play
+  control and play the derived mp4 tier via `AVPlayer` over the signed URL (no original
+  download); images open full screen in a zoomable pinch/swipe viewer from timeline and detail
+  (the native counterpart of the SPA's lightbox, ADR-0014).
 - **Do NOT:** transcode/resize on device (the worker owns tiers; HEIC/HEVC originals are the
-  archive master per ADR-0008); background *downloads*; multiple parallel uploads in v1; push.
+  archive master per ADR-0008); background *downloads* beyond streaming playback; multiple
+  parallel uploads in v1; push; bidirectional offline SYNC (the outbox is outbound-only —
+  editing while offline stays out of scope).
 - **Verification:** Swift Testing for the upload state machine (chunk math on 0/1/5/5.5/1024 MiB
-  sizes, resume from a `HEAD` offset, finalize only after the last chunk, error → retry budget);
+  sizes, resume from a `HEAD` offset, finalize only after the last chunk, error → retry budget)
+  and for the outbox (enqueue offline → job persisted; reconcile after simulated relaunch;
+  cellular-disallowed configuration asserted); an airplane-mode capture on the device uploads by
+  itself after wifi returns with the app closed (named acceptance, DB read-back); video memo
+  plays on device (poster → playback within the app); an image opens full screen and zooms;
   `xcodebuild test` 0; device acceptance: share a photo from Photos.app, background the app
   immediately, and verify the `uploads`/`attachments` rows and a `thumb` rendition on prod via
   DB read-back within the worker's normal latency; Saturn host temperature stays < 70 °C during
