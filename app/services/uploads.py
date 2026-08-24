@@ -7,7 +7,7 @@ from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 import puremagic
 from anyio import to_thread
@@ -27,7 +27,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import storage
+from app.services import poster, storage
 from app.services.variants import ParsedName, parse_variant
 
 
@@ -66,6 +66,56 @@ class UploadsUnlinkable(Exception):
         )
         self.missing = missing
         self.incomplete = incomplete
+
+
+# Why a video poster override can be refused, as a closed machine-readable set. Each value is one
+# CATEGORY of reason, so a client can act on it without parsing prose: the `poster_missing` /
+# `poster_incomplete` pair means "send those bytes again", every other value means "this request is
+# wrong, do not repeat it". Exactly one is reported per rejected mapping — the first that applies,
+# checked video-side before poster-side.
+VideoPosterReason = Literal[
+    # the mapping names a video that this memo is not posting: no such entry in upload_uids
+    "video_not_uploaded",
+    # the named upload is in the batch but its BYTES are not a video (mime is sniffed, not trusted)
+    "video_not_a_video",
+    # the named upload's filename carries the ingest grammar's print suffix (`… - print.ext`), so it
+    # becomes a hidden print rendition of another photo rather than an attachment with a poster tier
+    "video_is_a_print_variant",
+    # no such poster upload for this caller — unknown, expired, or owned by somebody else (all one
+    # answer on purpose: fail-closed, and no cross-user existence oracle)
+    "poster_missing",
+    # the poster upload exists but its bytes are not all there yet (resume it, then retry)
+    "poster_incomplete",
+    # the poster's bytes are not a JPEG, which is what the uid-keyed poster tier is served as
+    "poster_not_a_jpeg",
+    # the poster uid is ALSO listed in upload_uids: it would become a visible attachment of its own
+    "poster_listed_as_attachment",
+    # the same poster upload is mapped to a second video; one upload is one file, consumed once
+    "poster_reused",
+]
+
+
+@dataclass(frozen=True)
+class VideoPosterProblem:
+    """One `video_posters` mapping that cannot be honoured, and why."""
+
+    video_upload_uid: str
+    poster_upload_uid: str
+    reason: VideoPosterReason
+
+
+class VideoPostersInvalid(Exception):
+    """Every `video_posters` mapping a memo write cannot honour, one problem per mapping.
+
+    Raised BEFORE the batch's first side effect, exactly like UploadsUnlinkable and for the same
+    reason: the refusal has to leave the caller's media untouched and the request re-postable once
+    the offending mapping is fixed. Reporting every offender in one answer (rather than the first)
+    is what keeps a client from discovering them one round-trip at a time.
+    """
+
+    def __init__(self, problems: list[VideoPosterProblem]) -> None:
+        super().__init__(f"{len(problems)} video poster override(s) cannot be consumed")
+        self.problems = problems
 
 
 # Blocking disk I/O runs off the event loop (anyio.to_thread) so large chunk writes /
@@ -125,6 +175,30 @@ def _concat_sync(spool: Path, part: Path, offset: int) -> None:
         dst.seek(offset)
         shutil.copyfileobj(src, dst, STREAM_CHUNK_SIZE)
         dst.truncate()
+
+
+# The bytes every JPEG opens with: SOI (FF D8) plus the FF that begins the next marker segment
+# (APP0/APP1/DQT/COM — all of them start FF). The same three-byte signature `file(1)` and puremagic
+# match on, and the only positive JPEG identification this module needs.
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+
+def _is_jpeg_sync(path: Path) -> bool:
+    """Whether these bytes ARE a JPEG — a positive identification, not an absence of doubt.
+
+    Deliberately NOT `_sniff_mime(...) == "image/jpeg"`. That helper answers with the CLIENT'S
+    declared mime whenever puremagic raises or recognises nothing (`guessed or declared`), which is
+    the right lenient default for an ordinary upload — the attachment merely carries a mime it may
+    be wrong about — and exactly the wrong one for a gate: arbitrary unrecognisable bytes declared
+    `image/jpeg` would pass it, land as the poster tier, and then be skipped by the worker (the
+    file exists) and fail its blurhash decode, leaving the video with a broken poster and no way
+    back. Anything this cannot read or does not recognise is refused.
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(JPEG_MAGIC)) == JPEG_MAGIC
+    except OSError:
+        return False
 
 
 def _sha256_sync(path: Path) -> str:
@@ -349,12 +423,147 @@ async def _memo_screen_sibling(
     return None
 
 
+async def _sniffed_mime(upload: Upload) -> str:
+    """What an upload's BYTES are — read the same way `finalize` reads them, so a poster override
+    is matched to the mime its attachment will actually be stored with.
+
+    Carries `_sniff_mime`'s fallback to the declared mime for bytes puremagic cannot place, which
+    is why it decides only the VIDEO side of a mapping (an unrecognisable file declared a video
+    becomes a video attachment here exactly as it does without an override). The poster side is
+    gated by `_is_jpeg_sync` instead, which refuses anything it cannot positively identify.
+    """
+    return await to_thread.run_sync(_sniff_mime, part_path(upload.upload_uid), upload.mime)
+
+
+async def _resolve_video_poster(
+    db: AsyncSession,
+    video_uid: str,
+    poster_uid: str,
+    pending: dict[str, tuple[Upload, ParsedName]],
+    claimed: set[str],
+    owner_id: int,
+) -> tuple[Upload | None, VideoPosterReason | None]:
+    """One mapping: the poster Upload it will consume, or the reason it cannot be honoured.
+
+    Video side first, poster side second, and the first failure is the answer — a mapping whose
+    video is not even in this memo says nothing useful about its poster.
+    """
+    entry = pending.get(video_uid)
+    if entry is None:  # not in upload_uids (every uid that IS has a complete row by now)
+        return None, "video_not_uploaded"
+    video, parsed = entry
+    if parsed.is_print:
+        # A print-suffixed name binds as a hidden rendition of another photo (see the pass 2 rules
+        # below) or is promoted as a still picture; either way this upload owns no poster tier.
+        return None, "video_is_a_print_variant"
+    if not (await _sniffed_mime(video)).startswith("video/"):
+        return None, "video_not_a_video"
+    if poster_uid in pending:
+        # Listed in upload_uids AND named as a poster: it cannot be both a visible attachment of
+        # this memo and the derived asset of one. Refusing beats guessing — silently dropping it
+        # from the attachments is how a memo loses media its author sent.
+        return None, "poster_listed_as_attachment"
+    if poster_uid in claimed:
+        return None, "poster_reused"
+    poster_upload = (
+        await db.execute(
+            select(Upload).where(Upload.upload_uid == poster_uid, Upload.owner_id == owner_id)
+        )
+    ).scalar_one_or_none()
+    if poster_upload is None:  # unknown, expired, or another user's — one fail-closed answer
+        return None, "poster_missing"
+    complete = await to_thread.run_sync(
+        _is_complete_sync, part_path(poster_uid), poster_upload.declared_size
+    )
+    if not complete:
+        return None, "poster_incomplete"
+    if not await to_thread.run_sync(_is_jpeg_sync, part_path(poster_uid)):
+        # A POSITIVE identification (see _is_jpeg_sync), never `_sniff_mime`'s declared-mime
+        # fallback: what the caller called these bytes cannot be what decides they may become a
+        # tier served to everyone as image/jpeg.
+        return None, "poster_not_a_jpeg"
+    return poster_upload, None
+
+
+async def _validate_video_posters(
+    db: AsyncSession,
+    video_posters: dict[str, str],
+    pending: dict[str, tuple[Upload, ParsedName]],
+    owner_id: int,
+) -> dict[str, Upload]:
+    """Resolve every video→poster mapping to the poster Upload it consumes, or refuse the batch.
+
+    Runs before pass 1 — before anything has moved — so a refusal costs the caller nothing: no part
+    file relocated, no attachment row inserted, no upload consumed, and the identical request
+    succeeds once the named mappings are fixed.
+
+    Mappings are checked in sorted order so a request carrying several offenders always reports the
+    same problems in the same order (the `poster_reused` loser included, which would otherwise
+    depend on JSON key order).
+    """
+    problems: list[VideoPosterProblem] = []
+    resolved: dict[str, Upload] = {}
+    claimed: set[str] = set()
+    for video_uid, poster_uid in sorted(video_posters.items()):
+        poster_upload, reason = await _resolve_video_poster(
+            db, video_uid, poster_uid, pending, claimed, owner_id
+        )
+        if reason is not None:
+            problems.append(VideoPosterProblem(video_uid, poster_uid, reason))
+            continue
+        assert poster_upload is not None  # no reason ⇒ a resolved row (mutually exclusive)
+        claimed.add(poster_uid)
+        resolved[video_uid] = poster_upload
+    if problems:
+        raise VideoPostersInvalid(problems)
+    return resolved
+
+
+async def attach_video_poster(
+    db: AsyncSession,
+    upload: Upload,
+    attachment: Attachment,
+    moved_out: list[tuple[str, str]] | None = None,
+) -> Path:
+    """Consume a validated poster upload as `attachment`'s poster tier; returns where it landed.
+
+    The bytes are moved into the exact path the worker would have written its hero frame to
+    (app/services/poster.py), so every consumer — the signed poster tier, the grid tile, the
+    lightbox, the export — picks the override up with no knowledge that it is one, and the worker
+    skips deriving a frame it would only overwrite (media.process_video_poster).
+
+    The poster is deliberately NOT an Attachment. It is a derived asset of the video, so it must
+    stay out of every surface that walks attachment rows — the feed, the library, the compat API,
+    an export listing, and above all the #curated frame-share queue, which mails every image
+    ATTACHMENT of a curated memo to a photo frame (app/services/frame_share.py).
+
+    Like `finalize`, the move is a non-transactional side effect performed before the caller's
+    commit, and the (source, destination) pair is recorded in `moved_out` so a write that rolls back
+    puts the bytes back in the part file the restored Upload row still names. The destination always
+    belongs to a brand-new attachment uid — a video carrying an override finalizes with dedup
+    disabled (see finalize_pending) — so this move can never displace a poster some other memo is
+    already showing.
+    """
+    part = part_path(upload.upload_uid)
+    actual = await to_thread.run_sync(_part_size_sync, part)
+    if actual != upload.declared_size:  # re-checked here, as finalize does for a master
+        raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
+    dest = poster.poster_path(attachment.uid)
+    await to_thread.run_sync(_move_into_sync, part, dest)  # mkdir + os.replace in one hop
+    if moved_out is not None:
+        moved_out.append((str(part), str(dest)))
+    await db.delete(upload)
+    await db.flush()
+    return dest
+
+
 async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
     owner_id: int,
     moved_out: list[tuple[str, str]] | None = None,
     memo: Memo | None = None,
+    video_posters: dict[str, str] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -385,7 +594,14 @@ async def finalize_pending(
     3. PROMOTE: anything still unbound — no screen anywhere, an in-batch (screen, variant_key)
        collision, or a sibling whose print slot already holds a different master — becomes a normal
        picture (decision: a print is never silently dropped, never silently hidden without a
-       screen)."""
+       screen).
+
+    `video_posters` maps a VIDEO upload_uid in this batch to a POSTER upload_uid that is NOT in it.
+    The poster never becomes an Attachment: it becomes that video's poster tier
+    (`attach_video_poster`), replacing the hero frame the worker would otherwise seek out. Every
+    mapping is validated before pass 1 and the batch is refused WHOLE (VideoPostersInvalid) if any
+    one of them cannot be honoured — the same all-or-nothing rule, for the same reason, as the
+    missing/incomplete refusal above."""
     pending: list[tuple[Upload, ParsedName]] = []
     missing: list[str] = []
     incomplete: list[str] = []
@@ -408,12 +624,37 @@ async def finalize_pending(
         # fail with the caller's media still intact and re-postable.
         raise UploadsUnlinkable(missing, incomplete)
 
+    # Keyed by uid for the poster validation below: every uid in upload_uids now has a complete,
+    # owner-scoped row, so a mapping whose video is absent here names a video this memo is not
+    # posting at all.
+    by_uid = {upload.upload_uid: (upload, parsed) for upload, parsed in pending}
+    posters = (
+        await _validate_video_posters(db, video_posters, by_uid, owner_id)
+        if video_posters
+        else {}
+    )
+
+    async def _finalize_one(upload: Upload) -> Attachment:
+        """Finalize one upload as an attachment and consume its poster override, if it has one.
+
+        Dedup is disabled for an upload that carries one. Reusing an unlinked twin of the same bytes
+        would point the override at an attachment this request did not create — one that may already
+        be showing a poster of its own, which the placement would then overwrite (and a rolled-back
+        write would restore as nothing at all). A fresh row costs one more copy of a video that was
+        never attached to anything and keeps the override's destination provably unused.
+        """
+        poster_upload = posters.get(upload.upload_uid)
+        att = await finalize(db, upload, owner_id, moved_out, dedup=poster_upload is None)
+        if poster_upload is not None:
+            await attach_video_poster(db, poster_upload, att, moved_out)
+        return att
+
     out: list[str] = []
     base_to_attachment: dict[str, Attachment] = {}
     for upload, parsed in pending:  # PASS 1 — screens become Attachments (first-wins per base)
         if parsed.is_print:
             continue
-        att = await finalize(db, upload, owner_id, moved_out)
+        att = await _finalize_one(upload)
         base_to_attachment.setdefault(parsed.base, att)
         out.append(att.uid)
 
@@ -444,7 +685,7 @@ async def finalize_pending(
             ):
                 bound_siblings.add(sibling.id)
                 continue
-        att = await finalize(db, upload, owner_id, moved_out)
+        att = await _finalize_one(upload)
         out.append(att.uid)
     return out
 
@@ -454,7 +695,16 @@ async def finalize(
     upload: Upload,
     owner_id: int,
     moved_out: list[tuple[str, str]] | None = None,
+    *,
+    dedup: bool = True,
 ) -> Attachment:
+    """Turn one fully-received upload into this owner's attachment (or, by dedup, hand back the
+    unlinked one that already holds these bytes).
+
+    `dedup=False` opts out of that reuse and always creates a new row. Its one caller is a video
+    carrying a client-supplied poster: the override is written to a path derived from the returned
+    attachment's uid, so that uid has to be one this request minted (see finalize_pending).
+    """
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:
@@ -471,22 +721,27 @@ async def finalize(
     # limit(1) since several memos may legitimately share identical bytes now.
     existing = (
         (
-            await db.execute(
-                select(Attachment)
-                .where(
-                    Attachment.sha256 == digest,
-                    Attachment.owner_id == owner_id,
-                    Attachment.memo_id.is_(None),
+            (
+                await db.execute(
+                    select(Attachment)
+                    .where(
+                        Attachment.sha256 == digest,
+                        Attachment.owner_id == owner_id,
+                        Attachment.memo_id.is_(None),
+                    )
+                    .limit(1)
+                    # FOR UPDATE so two concurrent posts can't both reuse the same unlinked row: the
+                    # loser blocks, then Postgres re-evaluates `memo_id IS NULL` against the
+                    # now-linked row, excludes it, and the loser creates its own attachment instead
+                    # of stealing.
+                    .with_for_update()
                 )
-                .limit(1)
-                # FOR UPDATE so two concurrent posts can't both reuse the same unlinked row: the
-                # loser blocks, then Postgres re-evaluates `memo_id IS NULL` against the now-linked
-                # row, excludes it, and the loser creates its own attachment instead of stealing.
-                .with_for_update()
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
+        if dedup
+        else None
     )
     if existing is not None:
         await to_thread.run_sync(_unlink_sync, part)

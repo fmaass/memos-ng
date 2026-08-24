@@ -233,6 +233,55 @@ def _unlinkable(exc: uploads_svc.UploadsUnlinkable) -> HTTPException:
     )
 
 
+# One sentence per refusal category (uploads_svc.VideoPosterReason), rendered into the `msg` of a
+# validation error. The categories themselves are the contract — a client switches on `type`, never
+# on this prose — so these exist to make a 422 readable in a log or a network tab.
+VIDEO_POSTER_MESSAGES: dict[uploads_svc.VideoPosterReason, str] = {
+    "video_not_uploaded": "no such upload in upload_uids: a poster belongs to a video this memo "
+    "is posting",
+    "video_not_a_video": "that upload is not a video, so it has no poster tier",
+    "video_is_a_print_variant": "that upload's filename marks it a print variant, so it becomes a "
+    "hidden print master rather than an attachment with a poster tier",
+    "poster_missing": "no such upload for this account (unknown, expired, or not yours)",
+    "poster_incomplete": "the poster upload is not fully received yet — resume it from its "
+    "Upload-Offset and retry",
+    "poster_not_a_jpeg": "the poster upload's bytes are not a JPEG, which is what the poster tier "
+    "is served as",
+    "poster_listed_as_attachment": "the poster upload is also listed in upload_uids — it is either "
+    "a visible attachment or a video's poster, never both",
+    "poster_reused": "that poster upload is already the poster of another video in this request; "
+    "upload the image once per video",
+}
+
+
+def _video_posters_invalid(exc: uploads_svc.VideoPostersInvalid) -> HTTPException:
+    """A 422 in FastAPI's OWN validation-error shape — `{"detail": [{loc, msg, type}]}` — rather
+    than a bespoke body under the same status.
+
+    These are request-shape complaints (this key names no video of this memo, that upload is not a
+    JPEG), which is what 422 already means here, and a second body shape under one status is what
+    makes a generated client unable to decode either. Reusing the shape also keeps the published
+    schema honest: declaring a model for 422 would REPLACE FastAPI's HTTPValidationError entry for
+    this operation (fastapi/openapi/utils.py only injects it when no 422 is declared), and the
+    schema would then describe ordinary pydantic failures as something they are not.
+
+    The machine-readable part is `type`, namespaced `video_poster.<reason>` — pydantic's `type` is
+    already the field a client switches on — and `loc` names the offending video upload_uid, which
+    is the key of the mapping the caller sent.
+    """
+    return HTTPException(
+        status_code=422,
+        detail=[
+            {
+                "loc": ["body", "video_posters", problem.video_upload_uid],
+                "msg": VIDEO_POSTER_MESSAGES[problem.reason],
+                "type": f"video_poster.{problem.reason}",
+            }
+            for problem in exc.problems
+        ],
+    )
+
+
 class MemoCreate(BaseModel):
     content: str
     visibility: RequestVisibility = None  # unset → the user's default_visibility setting
@@ -241,6 +290,20 @@ class MemoCreate(BaseModel):
     # an abandoned compose leaves only Uploads (which expire) — never an orphan attachment.
     upload_uids: list[str] = []
     attachment_uids: list[str] = []  # already-finalized attachments (back-compat)
+    video_posters: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Give a video its own poster frame: `{video upload_uid: poster upload_uid}`. The video "
+            "uid must appear in `upload_uids` (it becomes the attachment); the poster uid must NOT "
+            "— it is consumed as that video's poster tier and never becomes an attachment of its "
+            "own, so it stays out of the feed, the library and the export. Without one, the worker "
+            "picks a hero frame ~12% into the clip, which is the wrong frame for a video that "
+            "opens on a title card. The poster upload must be a finished JPEG belonging to the "
+            "caller. Consumed atomically with the memo: if the post fails, both uploads are still "
+            "there to retry with, and a replayed `idempotency_key` answers with the stored memo "
+            "without consuming anything a second time."
+        ),
+    )
     created_at: datetime | None = None  # custom display date (None → server now), parity w/ memos
     idempotency_key: IdempotencyKey | None = Field(
         default=None,
@@ -594,15 +657,24 @@ async def create_memo(
         moved: list[tuple[str, str]] = []
         try:
             try:
+                # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
+                # of this memo, and must be answered as the mistake it is rather than dropped in
+                # silence because the batch looked empty.
                 finalized = (
                     await uploads_svc.finalize_pending(
-                        db, body.upload_uids, owner_id, moved_out=moved
+                        db,
+                        body.upload_uids,
+                        owner_id,
+                        moved_out=moved,
+                        video_posters=body.video_posters,
                     )
-                    if body.upload_uids
+                    if body.upload_uids or body.video_posters
                     else []
                 )
             except uploads_svc.UploadsUnlinkable as exc:
                 raise _unlinkable(exc) from None
+            except uploads_svc.VideoPostersInvalid as exc:
+                raise _video_posters_invalid(exc) from None
             memo = await svc.create_memo(
                 db,
                 user,

@@ -652,6 +652,7 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "mine",
             "hasPrint",
             "hasLegacyPrint",
+            "hasPoster",  # added deliberately with the video poster override
             "renditions",
             "downloadUrl",
             "printUrl",

@@ -824,6 +824,8 @@ export interface components {
             duration: number | null;
             /** Haslegacyprint */
             hasLegacyPrint: boolean;
+            /** Hasposter */
+            hasPoster: boolean;
             /** Hasprint */
             hasPrint: boolean;
             /** Height */
@@ -1048,6 +1050,13 @@ export interface components {
              * @default []
              */
             upload_uids: string[];
+            /**
+             * Video Posters
+             * @description Give a video its own poster frame: `{video upload_uid: poster upload_uid}`. The video uid must appear in `upload_uids` (it becomes the attachment); the poster uid must NOT — it is consumed as that video's poster tier and never becomes an attachment of its own, so it stays out of the feed, the library and the export. Without one, the worker picks a hero frame ~12% into the clip, which is the wrong frame for a video that opens on a title card. The poster upload must be a finished JPEG belonging to the caller. Consumed atomically with the memo: if the post fails, both uploads are still there to retry with, and a replayed `idempotency_key` answers with the stored memo without consuming anything a second time.
+             */
+            video_posters?: {
+                [key: string]: string;
+            } | null;
             visibility?: components["schemas"]["Visibility"];
         };
         /** MemoList */
