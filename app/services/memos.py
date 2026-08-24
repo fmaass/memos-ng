@@ -51,6 +51,29 @@ def decode_cursor(cursor: str) -> tuple[datetime, int]:
     return datetime.fromisoformat(ts), int(mid)
 
 
+def owner_subjects(owner: str | Sequence[str] | None) -> list[str]:
+    """The `User.subject`s an owner filter names, as an OR-set — empty means "no owner filter".
+
+    Repeatable since MEMNG-133: the filter sheet asks for several household members at once, and
+    the answer is the UNION of their visible-to-caller memos. A single owner is still spelled the
+    old way (a bare string), and lands on the same one-element set, so nothing about a one-owner
+    request changes — including an empty string, which named nobody before and still filters
+    nothing rather than matching a user whose subject is "".
+
+    Deduplicated, order preserved: `owner=alice&owner=alice` is one member asked for twice, not a
+    reason to return their memos twice — the SQL `IN` would collapse it anyway, and doing it here
+    means the statement the database sees is the same one either way.
+    """
+    if owner is None:
+        return []
+    values = [owner] if isinstance(owner, str) else list(owner)
+    seen: dict[str, None] = {}
+    for value in values:
+        if value:
+            seen.setdefault(value, None)
+    return list(seen)
+
+
 def visible_clause(user: User):
     """A memo is visible to `user` if they own it OR it is not PRIVATE."""
     return or_(Memo.owner_id == user.id, Memo.visibility != Visibility.PRIVATE)
@@ -269,7 +292,7 @@ async def list_memos(
     created_after: datetime | None = None,
     tags: Sequence[str] | None = None,
     visibility: Visibility | None = None,
-    owner: str | None = None,
+    owner: str | Sequence[str] | None = None,
     q: str | None = None,
     include_archived: bool = False,
     archived_only: bool = False,
@@ -289,8 +312,9 @@ async def list_memos(
         conds.append(Memo.created_at > created_after)
     if visibility:
         conds.append(Memo.visibility == visibility)
-    if owner:
-        conds.append(Memo.owner_id.in_(select(User.id).where(User.subject == owner)))
+    subjects = owner_subjects(owner)
+    if subjects:
+        conds.append(Memo.owner_id.in_(select(User.id).where(User.subject.in_(subjects))))
     if q:
         conds.append(
             func.to_tsvector("simple", Memo.content).op("@@")(func.plainto_tsquery("simple", q))

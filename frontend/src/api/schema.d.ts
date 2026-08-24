@@ -350,6 +350,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Members
+         * @description Every member of the household, for the client-side "whose memos?" filter.
+         *
+         *     ASSUMPTION, and the reason this route needs no scoping argument: this is a single-household
+         *     instance — every row in `users` is a member of the one household, so membership needs no
+         *     column to express it. A multi-tenant deployment would have to add one and filter here; nothing
+         *     in the schema records tenancy today.
+         *
+         *     Everyone who can authenticate sees the whole roster, and it deliberately does NOT depend on
+         *     what the caller can read: a member who has posted nothing, or only PRIVATE memos, still appears
+         *     — a filter that silently omitted them would make an empty result indistinguishable from a
+         *     member who does not exist, and the roster leaks nothing beyond a display name the household
+         *     already sees on every shared memo.
+         *
+         *     Ordered by (display_name, subject) so the list is stable across calls and across pages of any
+         *     client that caches it; `subject` alone breaks the tie for the members with no display name,
+         *     whom Postgres would otherwise return in whatever order it liked.
+         */
+        get: operations["list_members_api_members_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/memos": {
         parameters: {
             query?: never;
@@ -963,6 +998,26 @@ export interface components {
             status: string;
             /** Version */
             version: string;
+        };
+        /**
+         * MemberOut
+         * @description One household member, in the field shapes `/api/auth/user` already uses for the caller.
+         *
+         *     A deliberate subset of `UserOut`: `email` and `role` are the account's own business and no
+         *     client needs them to draw a filter row, so they are not published about OTHER people here.
+         *     `avatar` is whatever the settings feature stores — a `data:image/…` URL (app/routers/settings.py
+         *     accepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the
+         *     path string that came with it (app/models.py) — and null for a member who never set one. It is
+         *     passed through verbatim rather than normalised, so the value a client renders for a member is
+         *     the same one `/api/auth/user` hands that member for themselves.
+         */
+        MemberOut: {
+            /** Avatar */
+            avatar?: string | null;
+            /** Display Name */
+            display_name: string | null;
+            /** Subject */
+            subject: string;
         };
         /** MemoCreate */
         MemoCreate: {
@@ -1910,6 +1965,26 @@ export interface operations {
             };
         };
     };
+    list_members_api_members_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemberOut"][];
+                };
+            };
+        };
+    };
     list_memos_api_memos_get: {
         parameters: {
             query?: {
@@ -1917,7 +1992,8 @@ export interface operations {
                 created_after?: string | null;
                 tag?: string[] | null;
                 visibility?: components["schemas"]["Visibility"];
-                owner?: string | null;
+                /** @description Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page — like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all. */
+                owner?: string[] | null;
                 q?: string | null;
                 include_archived?: boolean;
                 archived_only?: boolean;

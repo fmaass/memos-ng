@@ -562,6 +562,35 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "MemberOut": {
+        "description": "One household member, in the field shapes `/api/auth/user` already uses for the caller.\n\nA deliberate subset of `UserOut`: `email` and `role` are the account's own business and no\nclient needs them to draw a filter row, so they are not published about OTHER people here.\n`avatar` is whatever the settings feature stores \u2014 a `data:image/\u2026` URL (app/routers/settings.py\naccepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the\npath string that came with it (app/models.py) \u2014 and null for a member who never set one. It is\npassed through verbatim rather than normalised, so the value a client renders for a member is\nthe same one `/api/auth/user` hands that member for themselves.",
+        "properties": {
+          "avatar": {
+            "title": "Avatar",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "display_name"
+        ],
+        "title": "MemberOut",
+        "type": "object"
+      },
       "MemoCreate": {
         "properties": {
           "attachment_uids": {
@@ -2609,6 +2638,40 @@
         ]
       }
     },
+    "/api/members": {
+      "get": {
+        "description": "Every member of the household, for the client-side \"whose memos?\" filter.\n\nASSUMPTION, and the reason this route needs no scoping argument: this is a single-household\ninstance \u2014 every row in `users` is a member of the one household, so membership needs no\ncolumn to express it. A multi-tenant deployment would have to add one and filter here; nothing\nin the schema records tenancy today.\n\nEveryone who can authenticate sees the whole roster, and it deliberately does NOT depend on\nwhat the caller can read: a member who has posted nothing, or only PRIVATE memos, still appears\n\u2014 a filter that silently omitted them would make an empty result indistinguishable from a\nmember who does not exist, and the roster leaks nothing beyond a display name the household\nalready sees on every shared memo.\n\nOrdered by (display_name, subject) so the list is stable across calls and across pages of any\nclient that caches it; `subject` alone breaks the tie for the members with no display name,\nwhom Postgres would otherwise return in whatever order it liked.",
+        "operationId": "list_members_api_members_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MemberOut"
+                  },
+                  "title": "Response List Members Api Members Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Members",
+        "tags": [
+          "members"
+        ]
+      }
+    },
     "/api/memos": {
       "get": {
         "operationId": "list_memos_api_memos_get",
@@ -2663,13 +2726,18 @@
             }
           },
           {
+            "description": "Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all.",
             "in": "query",
             "name": "owner",
             "required": false,
             "schema": {
+              "description": "Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all.",
+              "items": {
+                "type": "string"
+              },
               "title": "Owner",
               "type": [
-                "string",
+                "array",
                 "null"
               ]
             }
