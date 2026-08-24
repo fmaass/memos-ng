@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.database import get_session
-from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
+from app.models import (
+    EDIT_KEY_CONSTRAINT,
+    Attachment,
+    AttachmentStatus,
+    Memo,
+    User,
+    Visibility,
+)
 from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
 from app.services import frame_share as frame_share_svc
@@ -110,6 +117,8 @@ class MemoOut(BaseModel):
 
 # Bounded and opaque: the shape gate only has to bound what the unique index stores and reject
 # junk, so a client is free to use a UUID, a ULID or a random token instead of one id library.
+# Shared by both retry handles — MemoCreate.idempotency_key and MemoPatch.edit_key — because the
+# storage and the junk-rejection are identical; only what the token NAMES differs.
 IdempotencyKey = Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
@@ -146,12 +155,59 @@ class CreateRacedError(BaseModel):
     detail: CreateRacedDetail
 
 
+class EditKeyConflictDetail(BaseModel):
+    """Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT
+    memo. Both alternatives to refusing are wrong — replaying would answer a PATCH of one memo with
+    another memo's body (a uid the client never asked about), and applying would leave one key
+    naming two edits, after which neither could be replayed. `memo_uid` names the memo the key is
+    bound to so a client can tell a stale key apart from a mis-generated one. Retrying is pointless:
+    the fix is a fresh key, which is why this is a 4xx and not the 503 a raced edit gets."""
+
+    code: Literal["edit_key_conflict"]  # required, not defaulted: generated clients switch on it
+    memo_uid: str
+    message: str
+
+
+class EditKeyConflictError(BaseModel):
+    detail: EditKeyConflictDetail
+
+
+class EditRacedDetail(BaseModel):
+    """Why a keyed edit could not be resolved (MEMNG-124): the write collided on the edit-key
+    constraint, and the edit it collided with was gone by the time it could be read back — the memo
+    itself was deleted, taking its recorded edits with it. Retrying with the same key is safe (that
+    is what the key is for) and self-correcting: the retry finds no memo and answers 404."""
+
+    code: Literal["edit_raced"]
+    message: str
+
+
+class EditRacedError(BaseModel):
+    detail: EditRacedDetail
+
+
 UNLINKABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
     409: {
         "model": UploadsUnlinkableError,
         "description": "A requested upload_uid is missing, expired or incomplete. No memo is "
         "created and no attachment is linked — resolve the named uploads and retry.",
     }
+}
+
+
+PATCH_RESPONSES: dict[int | str, dict[str, Any]] = {
+    409: {
+        "model": UploadsUnlinkableError | EditKeyConflictError,
+        "description": "Either a requested upload_uid is missing, expired or incomplete "
+        "(`uploads_unlinkable`), or the `edit_key` is already bound to a different memo "
+        "(`edit_key_conflict`). Switch on `detail.code`. Nothing is edited and no attachment is "
+        "linked in either case.",
+    },
+    503: {
+        "model": EditRacedError,
+        "description": "Concurrent writes raced this keyed edit and the edit they raced for is "
+        "gone. Retry the same request, edit_key included.",
+    },
 }
 
 
@@ -209,6 +265,20 @@ class MemoPatch(BaseModel):
     # Optional/nullable (not []) so PATCH stays a true partial update: callers that only change
     # content/archived/etc. omit it. (Removing an attachment is DELETE /api/attachments/{uid}.)
     upload_uids: list[str] | None = None
+    edit_key: IdempotencyKey | None = Field(
+        default=None,
+        description=(
+            "Optional client-generated retry token: a UUID, or any opaque 8-64 character token of "
+            "[A-Za-z0-9_-], unique per logical edit. Sending it a second time does NOT re-apply "
+            "the edit; it answers **200 with the memo's CURRENT state** — which is the state after "
+            "any later write, not a snapshot of what this edit produced. The token records that "
+            "the edit landed, not what the memo looked like afterwards. Crucially the replay is "
+            "answered BEFORE `upload_uids` are checked, so a retry whose uploads the first attempt "
+            "already consumed gets its memo instead of a 409. A key already used on a DIFFERENT "
+            "memo is refused (409 `edit_key_conflict`); two owners may reuse one token. Without a "
+            "key, a retried media edit is refused with 409 `uploads_unlinkable`."
+        ),
+    )
 
 
 class ReactionIn(BaseModel):
@@ -319,6 +389,87 @@ async def list_memos(
     )
 
 
+def violated_constraint(exc: IntegrityError) -> str | None:
+    """The name of the database constraint a write was refused on, or None if the driver won't say.
+
+    Verified against the live stack rather than assumed: SQLAlchemy's asyncpg dialect wraps the
+    driver error in its own DBAPI shim, which carries NEITHER `constraint_name` nor psycopg's
+    `diag` — the asyncpg `UniqueViolationError`, and the name, are one level down on `__cause__`.
+    psycopg2 (the sync test/migration path) instead exposes `diag.constraint_name` on `orig` itself,
+    so both shapes are read and the first that answers wins.
+
+    None is the honest answer for a driver-agnostic or fabricated error, and callers must read it as
+    "not the constraint I am looking for" — the fail-closed direction, where an unrecognised error
+    keeps propagating instead of being absorbed into someone's retry path."""
+    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
+        if candidate is None:
+            continue
+        for name in (
+            getattr(candidate, "constraint_name", None),
+            getattr(getattr(candidate, "diag", None), "constraint_name", None),
+        ):
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
+def _is_edit_key_collision(exc: IntegrityError) -> bool:
+    """True only for a violation of the edit-key uniqueness constraint (MEMNG-124).
+
+    The replay path answers exactly ONE conflict: two patches racing with the same edit_key. A
+    keyed patch can raise IntegrityError for reasons that have nothing to do with the key — two
+    patches introducing the same new hashtag collide on the tags index — and absorbing those would
+    report "concurrent writes raced this edit, retry with the same edit_key" for a conflict that
+    retrying cannot fix, while hiding a real fault that surfaced plainly before this feature."""
+    return violated_constraint(exc) == EDIT_KEY_CONSTRAINT
+
+
+async def _apply_or_replay(
+    *,
+    attempt: Callable[[], Awaitable[Memo]],
+    lookup: Callable[[], Awaitable[Memo | None]],
+    rollback: Callable[[], Awaitable[None]],
+    exhausted: HTTPException,
+    replayable: Callable[[IntegrityError], bool],
+    tries: int = 2,
+) -> Memo:
+    """Perform a keyed memo write, resolving a lost race against its unique index.
+
+    Shared by the two keyed writes because the control flow IS the contract and there is exactly
+    one of it: collide → roll back → read the winner back → answer with it. What differs between
+    create (MEMNG-110) and edit (MEMNG-124) is what the caller passes in — the work, the read-back,
+    and the error for an unresolvable race — never the resolution itself, which is why this is one
+    function and not two look-alikes drifting apart.
+
+    Losing the race normally means the winner is there to be read back and returned. It can also
+    mean the winner was DELETED in the moment between our write failing and our reading it back —
+    the key is then free again. Whether a fresh attempt is legitimate then depends on the caller:
+    a create passes `tries=2` and takes one more run at it; an edit passes `tries=1`, because a
+    freed edit key means the memo itself is gone and there is nothing left to edit.
+
+    `replayable` decides which IntegrityError is even a lost race. Not every integrity violation a
+    keyed write can raise is one — the caller's own work may collide on an unrelated constraint —
+    and absorbing one of those into "retry with the same key" would both answer a conflict retrying
+    cannot fix and hide a real fault. Anything it rejects is re-raised untouched.
+
+    Bounded rather than looping until success: each extra round needs a concurrent write AND a
+    concurrent delete of that write to land inside the same window, so more rounds buy nothing an
+    unbounded retry could not turn into a hot loop. Exhausting them raises the caller's 503 — never
+    a bare IntegrityError as a 500 — because the client's remedy is real: retrying with the same
+    key is safe by construction, and 5xx is the class our retry contract already says to repeat."""
+    for _ in range(tries):
+        try:
+            return await attempt()
+        except IntegrityError as exc:
+            if not replayable(exc):
+                raise  # someone else's constraint — not a lost race, and not ours to absorb
+            await rollback()
+            winner = await lookup()
+            if winner is not None:
+                return winner
+    raise exhausted
+
+
 async def _create_or_replay(
     *,
     attempt: Callable[[], Awaitable[Memo]],
@@ -328,33 +479,28 @@ async def _create_or_replay(
 ) -> Memo:
     """Insert a keyed memo, resolving a lost race against the partial unique index (MEMNG-110).
 
-    Losing that race normally means the winner is there to be read back and returned. It can also
-    mean the winner was DELETED in the moment between our insert failing and our reading it back —
-    the key is then free again, so a fresh insert is legitimate and we take one more run at it
-    rather than answering an error for a memo nobody has.
-
-    Two tries, not a loop until success: each round needs a concurrent create AND a concurrent
-    delete of that create to land inside the same window, so a third round buys nothing an
-    unbounded retry could not turn into a hot loop. Exhausting them raises 503 — never a bare
-    IntegrityError as a 500 — because the client's remedy is real: retrying with the same key is
-    safe by construction, and 5xx is the class our retry contract already says to repeat."""
-    for _ in range(tries):
-        try:
-            return await attempt()
-        except IntegrityError:
-            await rollback()
-            winner = await lookup()
-            if winner is not None:
-                return winner
-    raise HTTPException(
-        status_code=503,
-        detail=CreateRacedDetail(
-            code="create_raced",
-            message=(
-                "Concurrent writes raced this create and the memo they raced for was deleted "
-                "before it could be read back. Retry with the same idempotency_key."
-            ),
-        ).model_dump(),
+    The create half of `_apply_or_replay`: two tries (a deleted winner frees the key, so a fresh
+    insert is legitimate) and the create-flavoured 503, kept here with the create contract it
+    describes rather than pushed into the shared loop."""
+    return await _apply_or_replay(
+        attempt=attempt,
+        lookup=lookup,
+        rollback=rollback,
+        tries=tries,
+        # Every IntegrityError, exactly as the shipped MEMNG-110 contract has always treated them.
+        # The same narrowing the edit path now does would fit here too, but changing what a shipped
+        # create does with a foreign constraint violation is not this ticket's to make.
+        replayable=lambda _: True,
+        exhausted=HTTPException(
+            status_code=503,
+            detail=CreateRacedDetail(
+                code="create_raced",
+                message=(
+                    "Concurrent writes raced this create and the memo they raced for was deleted "
+                    "before it could be read back. Retry with the same idempotency_key."
+                ),
+            ).model_dump(),
+        ),
     )
 
 
@@ -458,7 +604,24 @@ async def get_memo(
     return _out(await _require_owned(db, user, uid), user.id)
 
 
-@router.patch("/memos/{uid}", response_model=MemoOut, responses=UNLINKABLE_RESPONSE)
+def _replayed_or_conflict(found: Memo, memo_id: int, key: str) -> Memo:
+    """The memo a known `edit_key` names — provided it is the memo this request addressed."""
+    if found.id == memo_id:
+        return found
+    raise HTTPException(
+        status_code=409,
+        detail=EditKeyConflictDetail(
+            code="edit_key_conflict",
+            memo_uid=found.uid,
+            message=(
+                f"edit_key {key} was already used on memo {found.uid}. An edit key names one edit "
+                "of one memo — use a fresh key for this one."
+            ),
+        ).model_dump(),
+    )
+
+
+@router.patch("/memos/{uid}", response_model=MemoOut, responses=PATCH_RESPONSES)
 async def patch_memo(
     uid: str,
     body: MemoPatch,
@@ -466,39 +629,95 @@ async def patch_memo(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
     memo = await _require_owned(db, user, uid)
-    if memo.owner_id != user.id:
+    # Read the ids off the ORM objects BEFORE anything can roll back: a rollback expires every
+    # object in the session, and a later `user.id` / `memo.id` would lazy-refresh — sync IO in an
+    # async context, i.e. a MissingGreenlet rather than a working attribute read (MEMNG-110).
+    owner_id, memo_id = user.id, memo.id
+    if memo.owner_id != owner_id:
         raise HTTPException(status_code=403, detail="Not your memo")
-    # Same finalize-on-post pattern as create: new uploads become attachments and link to this memo;
-    # if the patch rolls back, unlink the moved originals so they don't leak.
-    moved: list[tuple[str, str]] = []
-    committed = False
-    try:
-        fields = body.model_dump(exclude_unset=True, exclude={"upload_uids"})
-        memo = await svc.update_memo(db, memo, **fields)
-        if body.upload_uids:
-            # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto that
-            # screen instead of promoting a second visible copy of the same photo (MEMNG-79); on
-            # create there is no memo yet, so only this path can carry one.
-            try:
-                finalized = await uploads_svc.finalize_pending(
-                    db, body.upload_uids, user.id, moved_out=moved, memo=memo
-                )
-            except uploads_svc.UploadsUnlinkable as exc:
-                # The edits applied above are still uncommitted: this raise leaves the session to be
-                # rolled back by get_session, so a refused edit changes nothing at all.
-                raise _unlinkable(exc) from None
-            await svc.link_attachments(db, user.id, memo, finalized, moved_out=moved)
-        # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed tags,
-        # so both "added #curated on edit" and "added a new photo to a curated memo" are caught.
-        # Savepoint-isolated so a feature error can't fail the memo save.
-        await _enqueue_frame_shares_safe(db, memo, user)
-        await db.commit()
-        committed = True
-    finally:
-        if not committed and moved:
-            await to_thread.run_sync(_restore_moved, moved)
-    await db.refresh(memo)
-    return _out(memo, user.id)
+    key = body.edit_key
+    if key is not None:
+        # The replay lookup comes FIRST — ahead of the uploads (MEMNG-124 before MEMNG-113). By the
+        # time a retry arrives its upload_uids are gone: the first attempt finalized them, or they
+        # expired. Validating them first would answer 409 to precisely the client the key exists to
+        # protect, and the edit it is asking about is already applied, media included.
+        replayed = await svc.get_memo_by_edit_key(db, owner_id, key)
+        if replayed is not None:
+            return _out(_replayed_or_conflict(replayed, memo_id, key), owner_id)
+
+    async def attempt() -> Memo:
+        """One whole edit, from recording the key to commit. Owns its own `moved` list: if the write
+        does not land, every original it moved goes back where it came from."""
+        # Same finalize-on-post pattern as create: new uploads become attachments and link to this
+        # memo; if the patch rolls back, unlink the moved originals so they don't leak.
+        moved: list[tuple[str, str]] = []
+        committed = False
+        try:
+            if key is not None:
+                # Recorded BEFORE any work: the loser of a same-key race blocks on the unique
+                # constraint and fails here, having moved no bytes — so it has none to move back.
+                # It lands in the same transaction as the edit, so the two commit or roll back
+                # together and a recorded key never outlives the edit it names.
+                await svc.record_edit_key(db, memo, owner_id, key)
+            fields = body.model_dump(exclude_unset=True, exclude={"upload_uids", "edit_key"})
+            edited = await svc.update_memo(db, memo, **fields)
+            if body.upload_uids:
+                # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto
+                # that screen instead of promoting a second visible copy of the same photo
+                # (MEMNG-79); on create there is no memo yet, so only this path can carry one.
+                try:
+                    finalized = await uploads_svc.finalize_pending(
+                        db, body.upload_uids, owner_id, moved_out=moved, memo=edited
+                    )
+                except uploads_svc.UploadsUnlinkable as exc:
+                    # The edits applied above are still uncommitted: this raise leaves the session
+                    # to be rolled back by get_session, so a refused edit changes nothing at all —
+                    # the recorded key included, which keeps it free for the client's real retry.
+                    raise _unlinkable(exc) from None
+                await svc.link_attachments(db, owner_id, edited, finalized, moved_out=moved)
+            # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
+            # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
+            # caught. Savepoint-isolated so a feature error can't fail the memo save.
+            await _enqueue_frame_shares_safe(db, edited, user)
+            await db.commit()
+            committed = True
+            await db.refresh(edited)
+            return edited
+        finally:
+            if not committed and moved:
+                await to_thread.run_sync(_restore_moved, moved)
+
+    if key is None:
+        # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
+        # before this feature existed.
+        return _out(await attempt(), owner_id)
+
+    async def read_back() -> Memo | None:
+        found = await svc.get_memo_by_edit_key(db, owner_id, key)
+        return None if found is None else _replayed_or_conflict(found, memo_id, key)
+
+    # tries=1: unlike a create, a collision this read-back cannot resolve is NOT retryable here. The
+    # only way the key frees itself is the memo being deleted (the record cascades with it), and a
+    # second attempt would then be editing a memo that no longer exists. The 503 sends the client
+    # back with the same key, and that retry answers the honest 404.
+    settled = await _apply_or_replay(
+        attempt=attempt,
+        lookup=read_back,
+        rollback=db.rollback,
+        tries=1,
+        replayable=_is_edit_key_collision,
+        exhausted=HTTPException(
+            status_code=503,
+            detail=EditRacedDetail(
+                code="edit_raced",
+                message=(
+                    "Concurrent writes raced this edit and the edit they raced for is gone — the "
+                    "memo was deleted. Retry with the same edit_key."
+                ),
+            ).model_dump(),
+        ),
+    )
+    return _out(settled, owner_id)
 
 
 @router.delete("/memos/{uid}", status_code=204)
