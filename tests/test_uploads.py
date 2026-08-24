@@ -216,8 +216,10 @@ async def test_dedup_is_per_owner(adb, monkeypatch, tmp_path):
     assert att_a2.uid == att_a.uid  # same owner, same bytes → still dedups to A's row
 
 
-async def test_finalize_pending_skips_incomplete_and_missing(adb, monkeypatch, tmp_path):
-    # finalize-on-post: only fully-received uploads become attachments; incomplete/missing skip.
+async def test_finalize_pending_rejects_incomplete_and_missing(adb, monkeypatch, tmp_path):
+    # MEMNG-113: a batch naming an upload that is missing or not fully received is refused WHOLE,
+    # naming every offender by cause. Silently reducing the batch to its complete members is what
+    # turned "I posted my photo after the upload expired" into a 201 for a text-only memo.
     from app.models import User
 
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
@@ -232,10 +234,16 @@ async def test_finalize_pending_skips_incomplete_and_missing(adb, monkeypatch, t
     incomplete = await svc.create_upload(
         adb, owner_id=u.id, filename="b.png", mime="image/png", size=999999
     )
-    uids = await svc.finalize_pending(
-        adb, [done.upload_uid, incomplete.upload_uid, "nonexistent"], owner_id=u.id
-    )
-    assert len(uids) == 1  # only the complete upload finalized into an attachment
+    with pytest.raises(svc.UploadsUnlinkable) as raised:
+        await svc.finalize_pending(
+            adb, [done.upload_uid, incomplete.upload_uid, "nonexistent"], owner_id=u.id
+        )
+    assert raised.value.missing == ["nonexistent"]
+    assert raised.value.incomplete == [incomplete.upload_uid]
+    # the refusal costs the healthy member nothing: its session is untouched, so the caller can
+    # resolve the two offenders and re-post the same batch
+    assert await adb.get(Upload, done.upload_uid) is not None
+    assert len(await svc.finalize_pending(adb, [done.upload_uid], owner_id=u.id)) == 1
 
 
 def test_create_memo_finalizes_pending_uploads(logged_in_client, monkeypatch, tmp_path):
@@ -271,9 +279,13 @@ def test_abandoned_upload_leaves_no_attachment(logged_in_client, monkeypatch, tm
         _cleanup()
 
 
-def test_failed_post_cleans_up_moved_original(logged_in_client, monkeypatch, tmp_path):
-    # finalize moves the file to disk before the shared commit; if the post then fails, the
-    # compensating cleanup must unlink it (else it leaks with no DB row — the review's MED finding).
+def test_failed_post_puts_the_moved_original_back_where_it_came_from(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # finalize moves the file to disk before the shared commit; if the post then fails, the DB
+    # rollback returns the upload row to pending — so the bytes have to return to the part file
+    # that row names. Unlinking them instead leaves the row promising a file that is gone and
+    # destroys what may be the client's only copy.
     from app.services import memos as memo_svc
 
     client, _ = logged_in_client
@@ -292,8 +304,17 @@ def test_failed_post_cleans_up_moved_original(logged_in_client, monkeypatch, tmp
             "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
         ).status_code == 500
         originals = tmp_path / "originals"
-        leaked = [p for p in originals.rglob("*") if p.is_file()] if originals.exists() else []
-        assert leaked == []  # moved original was unlinked on the failed post
+        stranded = [p for p in originals.rglob("*") if p.is_file()] if originals.exists() else []
+        assert stranded == []  # nothing left half-filed under a memo that does not exist
+        assert svc.part_path(uid).read_bytes() == data  # ...because it went back, byte for byte
+
+        # and the session really is intact: the very same upload finalizes cleanly on a later post
+        monkeypatch.undo()
+        monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+        retried = client.post(
+            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
+        )
+        assert retried.status_code == 201 and len(retried.json()["attachments"]) == 1
     finally:
         _cleanup()
 
@@ -382,6 +403,158 @@ def test_edit_memo_attaches_new_upload(logged_in_client, monkeypatch, tmp_path):
         ).json()
         assert len(edited["attachments"]) == 1  # new image attached on edit
         assert client.head(f"/api/uploads/{uid}").status_code == 404  # upload consumed
+    finally:
+        _cleanup()
+
+
+# --- MEMNG-113: a memo write naming an unusable upload is refused, whole ------------------------
+# Every case below used to answer 201 with the media silently dropped, which is what let an outbox
+# client delete its only copy of a photo the server never stored.
+
+
+def _memo_uids(client) -> set[str]:
+    return {m["uid"] for m in client.get("/api/memos").json()["items"]}
+
+
+def _expect_unlinkable(response, *, missing=(), incomplete=()):
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == {
+        "code": "uploads_unlinkable",
+        "missing_upload_uids": list(missing),
+        "incomplete_upload_uids": list(incomplete),
+    }
+
+
+def test_create_memo_409s_when_an_upload_uid_never_existed(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        before = _memo_uids(client)
+        posted = client.post(
+            "/api/memos",
+            json={"content": "hi", "visibility": "PUBLIC", "upload_uids": ["no-such-uid"]},
+        )
+        _expect_unlinkable(posted, missing=["no-such-uid"])
+        assert _memo_uids(client) == before  # no memo at all — not even a text-only one
+    finally:
+        _cleanup()
+
+
+def test_create_memo_409s_when_the_upload_expired_and_was_reaped(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # The ticket's actual field report: everything uploaded fine, the client posted the memo more
+    # than UPLOAD_EXPIRY_HOURS later, and the reaper had already taken row and bytes.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"X" * 4000
+        uid = _start(client, "late.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(
+                text(
+                    "UPDATE uploads SET expires_at = now() - interval '1 hour'"
+                    " WHERE upload_uid = :u"
+                ),
+                {"u": uid},
+            )
+        eng.dispose()
+        _reap_expired_committed()
+        assert client.head(f"/api/uploads/{uid}").status_code == 404  # premise: it really is gone
+
+        before = _memo_uids(client)
+        _expect_unlinkable(
+            client.post(
+                "/api/memos",
+                json={"content": "my only copy", "visibility": "PUBLIC", "upload_uids": [uid]},
+            ),
+            missing=[uid],
+        )
+        assert _memo_uids(client) == before
+    finally:
+        _cleanup()
+
+
+def test_create_memo_409s_when_the_upload_is_short_of_its_declared_size(
+    logged_in_client, monkeypatch, tmp_path
+):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"H" * 4000
+        uid = _start(client, "half.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{uid}", content=data[:1000], headers={"Upload-Offset": "0"})
+
+        before = _memo_uids(client)
+        _expect_unlinkable(
+            client.post(
+                "/api/memos",
+                json={"content": "half a photo", "visibility": "PUBLIC", "upload_uids": [uid]},
+            ),
+            incomplete=[uid],
+        )
+        assert _memo_uids(client) == before
+        # the session survives the refusal, so the client can resume it from HEAD and post again
+        assert client.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == "1000"
+    finally:
+        _cleanup()
+
+
+def test_create_memo_names_only_the_offending_uid_and_finalizes_nothing(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # Mixed batch: the refusal must name ONLY what is wrong, and must not half-apply — the healthy
+    # upload stays a pending session (not an attachment, not consumed), so the retry can carry it.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        data = b"\x89PNG\r\n\x1a\n" + b"G" * 4000
+        good = _start(client, "good.png", "image/png", len(data))
+        client.patch(f"/api/uploads/{good}", content=data, headers={"Upload-Offset": "0"})
+
+        before = _memo_uids(client)
+        _expect_unlinkable(
+            client.post(
+                "/api/memos",
+                json={"content": "2 pics", "visibility": "PUBLIC", "upload_uids": [good, "ghost"]},
+            ),
+            missing=["ghost"],
+        )
+        assert _memo_uids(client) == before
+        assert not client.get("/api/attachments").json()  # nothing was finalized
+        assert client.head(f"/api/uploads/{good}").status_code == 200  # still pending, not consumed
+
+        retried = client.post(
+            "/api/memos", json={"content": "2 pics", "visibility": "PUBLIC", "upload_uids": [good]}
+        )
+        assert retried.status_code == 201 and len(retried.json()["attachments"]) == 1
+    finally:
+        _cleanup()
+
+
+def test_patch_memo_409s_and_leaves_the_memo_exactly_as_it_was(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # Atomicity on the edit path: the content/visibility edit is applied to the session BEFORE the
+    # uploads are finalized, so a refusal must take the whole transaction down with it.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = client.post(
+            "/api/memos", json={"content": "before", "visibility": "PUBLIC"}
+        ).json()
+        _expect_unlinkable(
+            client.patch(
+                f"/api/memos/{memo['uid']}",
+                json={"content": "after", "upload_uids": ["ghost-on-edit"]},
+            ),
+            missing=["ghost-on-edit"],
+        )
+        after = client.get(f"/api/memos/{memo['uid']}").json()
+        assert after["content"] == "before"  # the edit rolled back with the failed link
+        assert after["attachments"] == []
     finally:
         _cleanup()
 
@@ -843,8 +1016,16 @@ def test_cross_user_memo_create_and_edit_treat_a_foreign_upload_uid_as_unknown(
             )
             for x in (uid, ghost)
         )
-        assert stolen.status_code == stolen_ghost.status_code == 201
-        assert stolen.json()["attachments"] == stolen_ghost.json()["attachments"] == []
+        # Both are refused (MEMNG-113) and — the invariant that matters here — refused IDENTICALLY:
+        # same status, same code, same bucket. A foreign uid answering differently from one that
+        # never existed would make this endpoint an oracle for other users' in-flight sessions.
+        assert stolen.status_code == stolen_ghost.status_code == 409
+        for response, submitted in ((stolen, uid), (stolen_ghost, ghost)):
+            assert response.json()["detail"] == {
+                "code": "uploads_unlinkable",
+                "missing_upload_uids": [submitted],
+                "incomplete_upload_uids": [],
+            }
 
         target = attacker.post(
             "/api/memos", json={"content": "edit me", "visibility": "PUBLIC"}
@@ -853,8 +1034,10 @@ def test_cross_user_memo_create_and_edit_treat_a_foreign_upload_uid_as_unknown(
             attacker.patch(f"/api/memos/{target['uid']}", json={"upload_uids": [x]})
             for x in (uid, ghost)
         )
-        assert edited.status_code == edited_ghost.status_code == 200
-        assert edited.json()["attachments"] == edited_ghost.json()["attachments"] == []
+        assert edited.status_code == edited_ghost.status_code == 409
+        for response, submitted in ((edited, uid), (edited_ghost, ghost)):
+            assert response.json()["detail"]["missing_upload_uids"] == [submitted]
+        assert attacker.get(f"/api/memos/{target['uid']}").json()["attachments"] == []
         assert _attachment_owners() == {}  # no attachment was created for the submitter
 
         # the victim's completed session survived both attempts and still finalizes to the victim
@@ -903,7 +1086,8 @@ def test_pre_ownership_upload_row_fails_closed_on_every_verb(
         memo = client.post(
             "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
         )
-        assert memo.status_code == 201 and memo.json()["attachments"] == []
+        assert memo.status_code == 409  # reads as missing, exactly like a uid that never existed
+        assert memo.json()["detail"]["missing_upload_uids"] == [uid]
         assert _attachment_owners() == {}  # the orphaned bytes became nobody's attachment
 
         eng = create_engine(SYNC_URL)
@@ -956,7 +1140,8 @@ def test_deleting_a_user_nulls_their_upload_instead_of_stranding_its_bytes(
         memo = other.post(
             "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
         )
-        assert memo.status_code == 201 and memo.json()["attachments"] == []
+        assert memo.status_code == 409  # the departed owner's row is claimable by nobody
+        assert memo.json()["detail"]["missing_upload_uids"] == [uid]
         assert _attachment_owners() == {}
 
         # ...and the reaper still reclaims BOTH the row and the bytes once it expires

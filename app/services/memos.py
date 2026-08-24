@@ -76,10 +76,16 @@ async def create_memo(
     pinned: bool = False,
     attachment_uids: Sequence[str] | None = None,
     created_at: datetime | None = None,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
+    idempotency_key: str | None = None,
 ) -> Memo:
     memo = Memo(
-        uid=gen_uid(), owner_id=owner.id, content=content, visibility=visibility, pinned=pinned
+        uid=gen_uid(),
+        owner_id=owner.id,
+        content=content,
+        visibility=visibility,
+        pinned=pinned,
+        idempotency_key=idempotency_key,
     )
     if created_at is not None:
         memo.created_at = created_at  # custom display date (parity with old memos)
@@ -97,17 +103,22 @@ async def create_memo(
 
 
 async def _place_attachment_masters(
-    db: AsyncSession, att: Attachment, dest_dir: Path, data_root: Path, moved_out: list[str] | None
+    db: AsyncSession,
+    att: Attachment,
+    dest_dir: Path,
+    data_root: Path,
+    moved_out: list[tuple[str, str]] | None,
 ) -> None:
     """Move this attachment's still-staged masters (the screen original + each hidden rendition)
     into the memo folder under their real names. ONLY a master in _unfiled/ is moved — an existing
-    (committed) master is left in place (new-writes-only). Each moved path is tracked in `moved_out`
-    so a rolled-back post unlinks it."""
+    (committed) master is left in place (new-writes-only). Each move is tracked in `moved_out` as
+    (source, destination) so a rolled-back post can put it back where it came from."""
     if att.storage_path and storage.is_unfiled(att.storage_path, data_root):
-        new = await storage.place_master(Path(att.storage_path), dest_dir, att.filename)
+        staged = att.storage_path  # read before the reassignment: this is where it came FROM
+        new = await storage.place_master(Path(staged), dest_dir, att.filename)
         att.storage_path = str(new)
         if moved_out is not None:
-            moved_out.append(str(new))
+            moved_out.append((staged, str(new)))
     # Query renditions explicitly rather than via the lazy relationship — async lazy access on a
     # just-added child is fragile, and they were inserted in this same transaction.
     rends = (
@@ -121,10 +132,11 @@ async def _place_attachment_masters(
     )
     for r in rends:
         if storage.is_unfiled(r.storage_path, data_root):
-            new = await storage.place_master(Path(r.storage_path), dest_dir, r.filename)
+            staged = r.storage_path
+            new = await storage.place_master(Path(staged), dest_dir, r.filename)
             r.storage_path = str(new)
             if moved_out is not None:
-                moved_out.append(str(new))
+                moved_out.append((staged, str(new)))
 
 
 async def link_attachments(
@@ -132,7 +144,7 @@ async def link_attachments(
     owner_id: int,
     memo: Memo,
     uids: Sequence[str],
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> None:
     """Link the caller's OWN attachments to a memo. A uid belonging to another user is silently
     ignored so a memo can never claim someone else's media. Used on create and on edit. As each
@@ -165,6 +177,30 @@ async def link_attachments(
         att.memo_id = memo.id
         await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)
     await db.flush()
+
+
+async def get_by_idempotency_key(db: AsyncSession, owner_id: int, key: str) -> Memo | None:
+    """The memo this owner already stored under `key`, or None (MEMNG-110).
+
+    Scoped to the owner because the key is the CLIENT's name for a create, not a global one: two
+    users retrying with the same token must each get their own memo, which is also exactly what the
+    partial unique index enforces.
+
+    FOR SHARE on the memo row, because a replay must answer with the WHOLE memo. The relationships
+    are `selectin`, so reading one memo is several statements, and under READ COMMITTED each of
+    them sees a newer snapshot than the last: a DELETE committing midway through would otherwise
+    hand back a 201 carrying a memo with some or none of its attachments, tags and reactions — a
+    lie no client could detect. A share lock is enough to stop exactly that, and no more: deleting
+    the memo has to take a conflicting lock on this same parent row before its cascade can remove
+    any child, so a concurrent delete serializes behind this read instead of tearing it in half.
+    Two replays of one key still run concurrently, since share locks do not exclude each other."""
+    return (
+        await db.execute(
+            select(Memo)
+            .where(Memo.owner_id == owner_id, Memo.idempotency_key == key)
+            .with_for_update(read=True)
+        )
+    ).scalar_one_or_none()
 
 
 async def get_memo(db: AsyncSession, user: User, uid: str) -> Memo | None:

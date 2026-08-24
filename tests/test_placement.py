@@ -7,7 +7,7 @@ from pathlib import Path
 
 from app.config import settings
 from app.models import Attachment, AttachmentRendition, MediaJob, User, Visibility
-from app.routers.memos import _unlink_paths
+from app.routers.memos import _restore_moved
 from app.services import memos as memo_svc
 from app.services import storage
 from app.services import uploads as up_svc
@@ -16,6 +16,12 @@ from sqlalchemy import create_engine, select, text
 from tests.conftest import SYNC_URL
 
 PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def _destinations(moved: list[tuple[str, str]]) -> list[str]:
+    """Where each tracked move PUT the file — the pairs also carry where it came from, which is
+    what lets a rolled-back write walk the bytes back."""
+    return [dest for _, dest in moved]
 
 
 def _cleanup():
@@ -94,7 +100,7 @@ async def test_screen_and_print_land_in_memo_folder_under_real_names(adb, monkey
     o = await _owner(adb, "pl_basic")
     screen = await _upload(adb, o, "Holiday Sunset.png", PNG + b"s" * 2000)
     glossy = await _upload(adb, o, "Holiday Sunset - print (glossy).png", PNG + b"g" * 3000)
-    moved: list[str] = []
+    moved: list[tuple[str, str]] = []
     finalized = await up_svc.finalize_pending(
         adb, [screen.upload_uid, glossy.upload_uid], o.id, moved_out=moved
     )
@@ -127,7 +133,8 @@ async def test_screen_and_print_land_in_memo_folder_under_real_names(adb, monkey
     assert Path(rends[0].storage_path).name == "Holiday Sunset - print (glossy).png"
     assert Path(rends[0].storage_path).exists()
     # both placed paths are tracked for rollback-unlink
-    assert att.storage_path in moved and rends[0].storage_path in moved
+    assert att.storage_path in _destinations(moved)
+    assert rends[0].storage_path in _destinations(moved)
 
 
 async def test_finalized_but_unlinked_attachment_stays_in_unfiled(adb, monkeypatch, tmp_path):
@@ -176,7 +183,7 @@ async def test_rollback_unlinks_placed_file_but_never_a_prior_memos_master(
 
     # a new post that will "roll back"
     new = await _upload(adb, o, "new.png", PNG + b"n" * 2000)
-    moved: list[str] = []
+    moved: list[tuple[str, str]] = []
     new_uids = await up_svc.finalize_pending(adb, [new.upload_uid], o.id, moved_out=moved)
     await memo_svc.create_memo(
         adb,
@@ -189,9 +196,12 @@ async def test_rollback_unlinks_placed_file_but_never_a_prior_memos_master(
     new_att = await _att(adb, new_uids[0])
     assert Path(new_att.storage_path).exists()
 
-    _unlink_paths(moved)  # the router's finally-on-rollback
-    assert not Path(new_att.storage_path).exists()  # the placed file is gone
-    assert pre_path not in moved  # the prior master was never tracked
+    _restore_moved(moved)  # the router's undo-on-rollback
+    assert not Path(new_att.storage_path).exists()  # the placed file left the memo folder…
+    # …and went all the way home: the rollback restores the upload row, so the bytes belong back
+    # at the part file that row names, or a retry would find nothing left to finalize.
+    assert up_svc.part_path(new.upload_uid).read_bytes() == PNG + b"n" * 2000
+    assert pre_path not in _destinations(moved)  # the prior master was never tracked
     assert Path(pre_path).exists()  # …and is untouched
 
 
@@ -208,7 +218,7 @@ async def test_existing_master_is_not_moved_when_relinked(adb, monkeypatch, tmp_
     placed = att.storage_path
     assert not storage.is_unfiled(placed, Path(settings.DATA_ROOT))
 
-    moved: list[str] = []
+    moved: list[tuple[str, str]] = []
     await memo_svc.create_memo(
         adb,
         o,
@@ -337,14 +347,14 @@ async def test_patch_memo_adds_photo_and_places_it(adb, monkeypatch, tmp_path):
     o = await _owner(adb, "pl_patch")
     memo = await memo_svc.create_memo(adb, o, content="m", visibility=Visibility.PUBLIC)
     up = await _upload(adb, o, "added.png", PNG + b"p" * 2000)
-    moved: list[str] = []
+    moved: list[tuple[str, str]] = []
     fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id, moved_out=moved)
     await memo_svc.link_attachments(adb, o.id, memo, fin, moved_out=moved)
     att = await _att(adb, fin[0])
     folder = storage.memo_dir(Path(settings.DATA_ROOT), memo.created_at, memo.uid)
     assert Path(att.storage_path).parent == folder
     assert Path(att.storage_path).name == "added.png" and Path(att.storage_path).exists()
-    assert att.storage_path in moved
+    assert att.storage_path in _destinations(moved)
 
 
 def test_api_upload_post_places_masters_and_serves_them(logged_in_client, monkeypatch, tmp_path):

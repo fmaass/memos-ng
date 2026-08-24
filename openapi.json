@@ -423,6 +423,38 @@
         "title": "Body_upload_print_api_attachments__uid__print_post",
         "type": "object"
       },
+      "CreateRacedDetail": {
+        "description": "Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the\nmemo they raced for was deleted before it could be read back. Retrying with the same key is\nsafe \u2014 that is what the key is for \u2014 which is why this is a 5xx the client may repeat and not\na 4xx telling it to stop.",
+        "properties": {
+          "code": {
+            "const": "create_raced",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "CreateRacedDetail",
+        "type": "object"
+      },
+      "CreateRacedError": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/CreateRacedDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "CreateRacedError",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -478,6 +510,17 @@
           "created_at": {
             "format": "date-time",
             "title": "Created At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "idempotency_key": {
+            "description": "Optional client-generated retry token: a UUID, or any opaque 8-64 character token of [A-Za-z0-9_-], unique per logical create. Posting it a second time returns the memo the first call stored \u2014 same uid, same attachments \u2014 and returns it with **201, the same status as the original create**. The body is the whole answer (the uid tells a client which memo is now stored), so the status is not used as a second channel, and a safe retry looks exactly like the success it is repeating. Two owners may reuse one token. Without a key, a retry stores a SECOND memo.",
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Idempotency Key",
             "type": [
               "string",
               "null"
@@ -1317,6 +1360,49 @@
           "bytes_received"
         ],
         "title": "UploadOut",
+        "type": "object"
+      },
+      "UploadsUnlinkableDetail": {
+        "description": "Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).\n\nA dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed\nrequest \u2014 a retrying client has to tell \"that upload is gone, re-upload the bytes\" apart from\n\"this request is malformed, never send it again\", and a body it cannot classify is how an outbox\nloops forever. The two buckets carry different remedies: `missing` (never existed, or expired\nand reaped \u2014 an upload owned by another user reads as missing too) needs a fresh upload;\n`incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD.",
+        "properties": {
+          "code": {
+            "const": "uploads_unlinkable",
+            "title": "Code",
+            "type": "string"
+          },
+          "incomplete_upload_uids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Incomplete Upload Uids",
+            "type": "array"
+          },
+          "missing_upload_uids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Upload Uids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "code",
+          "missing_upload_uids",
+          "incomplete_upload_uids"
+        ],
+        "title": "UploadsUnlinkableDetail",
+        "type": "object"
+      },
+      "UploadsUnlinkableError": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/UploadsUnlinkableDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "UploadsUnlinkableError",
         "type": "object"
       },
       "UserOut": {
@@ -2643,6 +2729,16 @@
             },
             "description": "Successful Response"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadsUnlinkableError"
+                }
+              }
+            },
+            "description": "A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked \u2014 resolve the named uploads and retry."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2652,6 +2748,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRacedError"
+                }
+              }
+            },
+            "description": "Concurrent writes raced this keyed create. Nothing was stored under the key \u2014 retry the same request, idempotency_key included."
           }
         },
         "security": [
@@ -2791,6 +2897,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadsUnlinkableError"
+                }
+              }
+            },
+            "description": "A requested upload_uid is missing, expired or incomplete. No memo is created and no attachment is linked \u2014 resolve the named uploads and retry."
           },
           "422": {
             "content": {

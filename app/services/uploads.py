@@ -49,6 +49,25 @@ class UploadTooLarge(Exception):
         self.total = total
 
 
+class UploadsUnlinkable(Exception):
+    """Requested upload_uids that cannot become attachments, split by cause (MEMNG-113).
+
+    Raised BEFORE the batch's first side effect, so the caller's transaction still holds nothing to
+    undo: no part file moved, no attachment row inserted, no upload row consumed. Silently skipping
+    these instead is what let a client that uploaded everything, waited past the expiry and then
+    posted receive a 201 for a TEXT-ONLY memo — after which an outbox client deletes its only copy
+    of the media. `missing` deliberately also covers an upload owned by ANOTHER user: the lookup is
+    owner-scoped, so a foreign uid is indistinguishable from one that never existed (the same
+    fail-closed answer the direct upload routes give) and is no cross-user existence oracle."""
+
+    def __init__(self, missing: list[str], incomplete: list[str]) -> None:
+        super().__init__(
+            f"{len(missing)} missing and {len(incomplete)} incomplete upload(s) cannot be linked"
+        )
+        self.missing = missing
+        self.incomplete = incomplete
+
+
 # Blocking disk I/O runs off the event loop (anyio.to_thread) so large chunk writes /
 # sha256 reads don't stall the server.
 def _open_spool_sync(path: Path) -> BinaryIO:
@@ -334,23 +353,25 @@ async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
     owner_id: int,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
     memo: Memo | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
-    return their uids. A missing/expired or incomplete upload is skipped (it expires via
-    reap_expired) so an abandoned compose never creates an orphan attachment.
+    return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
+    offender, and the batch as a whole is refused (MEMNG-113) — an abandoned compose still creates
+    no orphan attachment, because a memo that never mentions an upload never reaches this function.
 
     The lookup is scoped to `owner_id`, so this second entry point (memo create/edit carrying
     upload_uids) binds sessions exactly as the direct upload routes do: another user's uid — or a
-    pre-ownership row with no owner — is INDISTINGUISHABLE from an unknown uid here and is simply
-    skipped. Without that scope, submitting a foreign uid would finalize the victim's bytes into an
-    attachment stamped with the SUBMITTER's owner_id.
+    pre-ownership row with no owner — is INDISTINGUISHABLE from an unknown uid here and lands in
+    `missing` exactly like one that never existed. Without that scope, submitting a foreign uid
+    would finalize the victim's bytes into an attachment stamped with the SUBMITTER's owner_id.
 
     finalize()/finalize_rendition() move the part file to its final path BEFORE the (now shared)
     memo transaction commits — a non-transactional side effect. Each genuinely-moved path is
-    appended to `moved_out` (inside those functions, new-file branch only) so the caller can
-    unlink it if the post rolls back. A dedup return moves nothing and appends nothing.
+    appended to `moved_out` as (source, destination) (inside those functions, new-file branch only)
+    so a caller whose post rolls back can move it BACK to where it came from, leaving the upload
+    pending and intact. A dedup return moves nothing and appends nothing.
 
     Screen/print grouping runs in three steps, in this order (MEMNG-79 — the in-batch-only rule of
     PLAN_2026-06-21_variant-renditions.md is superseded by the memo-sibling step):
@@ -366,6 +387,8 @@ async def finalize_pending(
        picture (decision: a print is never silently dropped, never silently hidden without a
        screen)."""
     pending: list[tuple[Upload, ParsedName]] = []
+    missing: list[str] = []
+    incomplete: list[str] = []
     for up_uid in upload_uids:
         upload = (
             await db.execute(
@@ -373,11 +396,17 @@ async def finalize_pending(
             )
         ).scalar_one_or_none()
         if upload is None:
+            missing.append(up_uid)
             continue
         part = part_path(up_uid)
         if not await to_thread.run_sync(_is_complete_sync, part, upload.declared_size):
-            continue  # incomplete — leave it to expire, don't half-finalize
+            incomplete.append(up_uid)
+            continue
         pending.append((upload, parse_variant(upload.filename)))
+    if missing or incomplete:
+        # Before pass 1 on purpose: nothing has moved or been written yet, so the whole request can
+        # fail with the caller's media still intact and re-postable.
+        raise UploadsUnlinkable(missing, incomplete)
 
     out: list[str] = []
     base_to_attachment: dict[str, Attachment] = {}
@@ -421,7 +450,10 @@ async def finalize_pending(
 
 
 async def finalize(
-    db: AsyncSession, upload: Upload, owner_id: int, moved_out: list[str] | None = None
+    db: AsyncSession,
+    upload: Upload,
+    owner_id: int,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> Attachment:
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
@@ -470,7 +502,7 @@ async def finalize(
     dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
     await to_thread.run_sync(_move_into_sync, part, dest)  # mkdir + os.replace in one hop
     if moved_out is not None:  # only a genuinely-moved file; the dedup return above appends nothing
-        moved_out.append(str(dest))
+        moved_out.append((str(part), str(dest)))
 
     is_video = mime.startswith("video/")
     attachment = Attachment(
@@ -505,7 +537,7 @@ async def finalize_rendition(
     upload: Upload,
     attachment: Attachment,
     parsed: ParsedName,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> AttachmentRendition | None:
     """Attach a hidden, download-only rendition (print master) to its screen `attachment`. Writes a
     UNIQUE uuid-named file (never a shared/deterministic path → safe to delete, never overwrites a
@@ -566,7 +598,7 @@ async def finalize_rendition(
 
     await to_thread.run_sync(os.replace, part, dest)
     if moved_out is not None:
-        moved_out.append(str(dest))
+        moved_out.append((str(part), str(dest)))
     await db.delete(upload)
     await db.flush()
     return rendition
@@ -665,7 +697,7 @@ async def bind_print_to_sibling(
     upload: Upload,
     attachment: Attachment,
     memo: Memo,
-    moved_out: list[str] | None = None,
+    moved_out: list[tuple[str, str]] | None = None,
 ) -> bool:
     """Bind a batch-orphan print onto an already-linked screen `attachment` of `memo`: fill its
     print slot (print_path/print_mime/print_size) and place the file beside the screen in the memo
@@ -713,7 +745,7 @@ async def bind_print_to_sibling(
     else:
         path = await storage.place_master(part, dest_dir, upload.filename)
         if moved_out is not None:
-            moved_out.append(str(path))
+            moved_out.append((str(part), str(path)))
     attachment.print_path = str(path)
     attachment.print_mime = mime
     attachment.print_size = actual
