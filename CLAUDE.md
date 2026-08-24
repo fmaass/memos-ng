@@ -132,6 +132,16 @@ met until its tests exist and pass.
   `docker compose -f compose.dev.yaml up -d` and export
   `DATABASE_URL_SYNC=postgresql+psycopg2://memosng:memosng@localhost:5433/memosng` (pytest and
   the app fall back to that DSN; `alembic check` reads it explicitly).
+- **Parallel runs get their own database** — the session fixture drops `public`, so two suites on
+  the shared `memosng` tear each other's tables down mid-run. A concurrent run (parallel agents, or
+  an agent alongside you) uses `memosng_test_<suffix>`, which `tests/db_guard.py` allowlists on the
+  local hosts: create it with
+  `docker exec memos-ng-dev-db-1 psql -U memosng -d memosng -c "CREATE DATABASE memosng_test_a"`
+  (the dev container's `memosng` role is its bootstrap superuser, so it may CREATE DATABASE; the
+  same-named prod role on postgres17 has neither SUPERUSER nor CREATEDB), export **both** `DATABASE_URL_SYNC=...` and
+  `DATABASE_URL=postgresql+asyncpg://memosng:memosng@localhost:5433/memosng_test_a` at it (the
+  app's async engine reads the latter; a mismatch is refused at collection), and
+  `DROP DATABASE memosng_test_a` when the run is done.
 - **Local gates can't see the slim image.** When a change touches `pyproject.toml` deps or the
   `Dockerfile`, run a local `docker build` BEFORE deploy — `python:3.13-slim` has no compiler, so
   C-extension wheels (e.g. blurhash-python) fail there but not on your dev machine.

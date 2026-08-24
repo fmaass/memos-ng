@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from tests.db_guard import assert_database_is_disposable
+from tests.db_guard import assert_database_is_disposable, assert_urls_target_one_database
 
 SYNC_URL = os.environ.get(
     "DATABASE_URL_SYNC", "postgresql+psycopg2://memosng:memosng@localhost:5433/memosng"
@@ -24,6 +24,8 @@ SYNC_URL = os.environ.get(
 # app's async engine, which API-driven tests commit real deletes through.
 assert_database_is_disposable(SYNC_URL)
 assert_database_is_disposable(async_engine.url)
+# A parallel run exports a scratch database; both engines have to have followed it there.
+assert_urls_target_one_database(SYNC_URL, async_engine.url)
 
 
 @pytest.fixture(scope="session")
