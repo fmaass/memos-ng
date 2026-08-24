@@ -729,10 +729,10 @@ cannot be opened full screen (MEMNG-108).
   reconciles the outbox against delivered jobs (reboot recovery);
   `HEAD` offset probe on resume. Memory: never load media into memory in the extension; file
   upload tasks only. Keychain shared via the app-group access group.
-  **Media viewing (MEMNG-107/108):** video attachments show their `poster` tier with a play
+  **Media viewing (MEMNG-107):** video attachments show their `poster` tier with a play
   control and play the derived mp4 tier via `AVPlayer` over the signed URL (no original
-  download); images open full screen in a zoomable pinch/swipe viewer from timeline and detail
-  (the native counterpart of the SPA's lightbox, ADR-0014).
+  download). (AMENDED 2026-08-24: the full-screen zoomable image viewer, MEMNG-108, MOVED to
+  Phase 5c in the parity annex — it is no longer this phase's deliverable.)
 - **Do NOT:** transcode/resize on device (the worker owns tiers; HEIC/HEVC originals are the
   archive master per ADR-0008); background *downloads* beyond streaming playback; multiple
   parallel uploads in v1; push; bidirectional offline SYNC (the outbox is outbound-only —
@@ -742,12 +742,135 @@ cannot be opened full screen (MEMNG-108).
   and for the outbox (enqueue offline → job persisted; reconcile after simulated relaunch;
   cellular-disallowed configuration asserted); an airplane-mode capture on the device uploads by
   itself after wifi returns with the app closed (named acceptance, DB read-back); video memo
-  plays on device (poster → playback within the app); an image opens full screen and zooms;
-  `xcodebuild test` 0; device acceptance: share a photo from Photos.app, background the app
+  plays on device (poster → playback within the app);   `xcodebuild test` 0; device acceptance: share a photo from Photos.app, background the app
   immediately, and verify the `uploads`/`attachments` rows and a `thumb` rendition on prod via
   DB read-back within the worker's normal latency; Saturn host temperature stays < 70 °C during
   the test (thermal coupling rule); Codex diff review (medium) → APPROVE.
 - **Status:** pending
+
+### Phase 5 parity annex (2026-08-24) — gap inventory and native-maximising phases 5c/5d/5e
+
+**Evidence base:** two read-only inventories taken 2026-08-24 against memos-ng main (433a3fe)
+and memos-ng-ios main (c9123be) — full briefs in session 29 records. Verified with positive-
+control greps, file:line cited per capability. Notable asymmetries: the SPA has NO pin UI and
+NO explicit sign-out (both exist on native); archive-SET has no UI in ANY client (restore-only
+on web); the export/photobook API has no client at all.
+
+**Parity debt (SPA has, native lacks):** search + filters (q/tags/visibility/date/archived) and
+tag browsing; SSE live updates (/api/events media-status patches) and blurhash placeholders
+(fetched, never decoded); full-screen zoomable image viewer (MEMNG-108); reactions (4 fixed
+emoji); archive/unarchive UI + archived view; edit-with-media; justified media gallery;
+calendar heatmap; print-master renditions; download original; backdate override on compose;
+profile display (identity from the already-loaded /api/auth/user model; /api/settings
+carries ONLY default_visibility); default-visibility setting. Blurhash: the SPA DOES decode
+and render it (lib/media.ts) — "fetched, never decoded" describes native only. Deliberately
+NOT parity goals: PAT management (stays web, stated in SignInView), theme pref (native
+follows system), avatar upload (web), web-push mechanics (native path is APNs, separate
+enabler). ACCEPTED RESIDUAL DEBT — explicitly not phased, tracked as backlog tickets and
+revisited post-TestFlight: the calendar heatmap and print-master renditions on native; with
+these named exceptions the annex phases out the remaining gap, not the whole list.
+AMENDMENT: MEMNG-108 (zoomable viewer) moves from Phase 5's Build/Verification into 5c —
+Phase 5's text above is edited accordingly.
+
+- **Phase 5c — Read parity core** (branch feature/read-parity): search bar + filter sheet
+  (q, tags, visibility, archived, created_before/created_after date range — all params
+  verified on /api/memos) driving the existing cursor query; tag browse (counts from
+  /api/tags); SSE /api/events subscription patching attachment status/blurhash/progress
+  live (URLSession bytes stream — no third-party dep; blurhash RENDERING is 5c-design's
+  deliverable — this phase only patches the value live); full-screen zoomable image viewer with swipe-between-attachments
+  (MEMNG-108). Do NOT: offline search index, saved searches. Verification: filter/search
+  round-trips against prod fixtures; SSE patch test via a scripted event stream; viewer
+  zoom/swipe presentation tests; mac-gate 0; Codex review APPROVE. Filter/search
+  verification is DETERMINISTIC: the test seeds N probe memos with known tags/dates/
+  visibility, asserts EXACT uid sets per filter combination, and deletes them (env-gated
+  live suite, LiveWriteTests pattern) — an ignored filter fails the set equality.
+- **Phase 5d — Interaction parity** (branch feature/interaction-parity): reactions (add/remove,
+  the SPA's fixed set); archive/unarchive actions + an Archived filter surface (native gets the
+  archive-SET control the web never built); edit-with-media FOREGROUND-ONLY (a direct online
+  PATCH with upload_uids — deliberately NOT through the outbox: PATCH consumes upload rows on
+  finalize, so a lost response is unrecoverable without a backend idempotency contract for
+  edits; the backend enabler is a filed ticket and offline media-edit stays out of scope until
+  it lands); justified media gallery view (all/image/video); download/share
+  original via share sheet; compose backdate override; profile header + default-visibility
+  setting (server-persisted, same /api/settings). Do NOT: print masters (backlog ticket),
+  avatar upload, heatmap (backlog). Verification: per-interaction store tests incl. rollback
+  paths; gallery projection tests; mac-gate 0; Codex review APPROVE.
+- **Phase 5e — Native-first surfaces** (branch feature/native-surfaces): WidgetKit (lock/home
+  quick-capture deep-link + recent-memos widget from an app-group snapshot the timeline store
+  refreshes); App Intents ("Capture Memo" intent writing STRAIGHT into the outbox — Siri/
+  Shortcuts/automation capture with zero UI); Core Spotlight indexing of memo content
+  with a DEFINED privacy lifecycle: index identifiers scoped per (server, account); private
+  memo bodies may be indexed on-device only; purge on sign-out (both outcomes), on 401 forced
+  sign-out, on account/server replacement, and on memo deletion or visibility loss discovered by an explicit index
+  reconciliation sweep (SSE carries attachment-processing events ONLY and a cursor-page
+  refresh cannot see older memos — so a scheduled/on-foreground full uid sweep over the
+  cursor API reconciles the index authoritatively; household scale keeps this cheap); widget snapshots live in the app group with lock-screen privacy redaction
+  (privacySensitive) and are purged on the same lifecycle events;
+  Live Activity for outbox drain progress (Dynamic Island/lock screen); universal links with
+  their FULL enabler chain (this consciously overrides the plan's earlier no-SPA-changes line):
+  a memos-ng branch adds an SPA route /m/{uid} (canonical web URL + browser fallback) and
+  extends the AASA service to applinks matching /m/* (today it serves webcredentials and an
+  applinks match for /ios/auth/callback only — native_auth.py:176), deployed BEFORE the app
+  change; the app entitlement gains applinks:memos.discomarder.live; in-app routing opens the
+  memo. Do NOT: APNs push (separate backend enabler ticket — the server already stores
+  web-push subscriptions, APNs is a new transport + key infra), multi-account/server (doctrine:
+  out of scope), watch/iPad idioms (post-TestFlight). Verification: intent-driven capture lands in the outbox with a test INCLUDING a cold/offline
+  invocation; widget snapshot pure-function tests + purge-on-sign-out test; privacy purging goes through ONE shared purge
+  coordinator that both surfaces (Spotlight index AND the app-group widget snapshot) register
+  with, and the purge tests cover EVERY declared trigger (sign-out both outcomes, 401 forced
+  sign-out, account/server replacement, deletion, visibility loss via the reconciliation
+  sweep) asserting BOTH surfaces are empty after each — index a probe + snapshot a widget
+  entry, trigger, prove both gone; universal-link
+  DEVICE acceptance (tap a /m/ URL: installed app opens the memo, uninstalled falls back to
+  the browser) — a pure routing unit test does not count as this acceptance; Live Activity
+  observed through one real drain (starts, progresses, ends); mac-gate 0; Codex review
+  APPROVE.
+
+Ordering (amended by 5c-design below): 5b (share extension) stays next as planned — it completes the capture story the
+household lives in daily; then 5c, 5d, 5e. Phase 6 (TestFlight) follows 5c at the earliest so
+the first TestFlight build already reads well. Tickets: one story per phase under MEMNG-94,
+plus backend enabler + backlog tickets filed at annex acceptance.
+
+### Phase 5c-design — Visual refresh to the iOS 26 language (precedes 5c)
+
+**Evidence base:** structured design review 2026-08-24 against the r3 screenshots + sources
+(session 29 records): chrome has zero design intent (0 repo hits for toolbarBackground/
+glassEffect/material/detents with positive control), timeline is a separator table, memo body
+hard-codes FontSize(16) (Dynamic Type ignored), no AccentColor asset (blue links vs green
+icon), blurhash fetched but neither decoded nor painted, 0 hits for any animation/haptic API, photos not
+tappable, icon is one flat PNG with no dark/tinted/layered variants, owner+visibility rendered
+nowhere. Direction: content-forward and calm — the photos are the interface, chrome recedes
+into materials, color comes from the family's own images (blurhash) plus ONE owned accent
+derived from the icon green.
+- **Branch:** `feature/design-refresh`
+- **Build:** a design-token layer in MemosFeatures (accent asset + semantic roles, spacing
+  scale, radius scale concentric with hardware, type = Dynamic Type roles only — kill
+  FontSize(16), ScaledMetric for tiles); timeline rebuilt as day-grouped content cards (no
+  separators, no chevron-in-strip — absorbs MEMNG-118 by making the whole card the target),
+  owner + visibility surfaced on rows; blurhash decoded AND painted under every thumbnail (sole owner of this deliverable —
+  today the value is fetched but neither decoded nor painted; 5c only live-patches it); compose sheet
+  redesigned (detents, placeholder prompt, picked-thumbnail row, visibility control that never
+  truncates); sign-in rebuilt as a branded first screen with the Advanced path de-emphasized;
+  glass/material chrome with scroll-edge effects; sensoryFeedback on post/pin/delete/toggle +
+  symbolEffect on compose; app icon re-cut LAYERED with dark + tinted appearances (motif
+  decision — keep green, evolve from checklist toward a memory/photo motif — is USER-GATED
+  before the icon lands; the rest of the phase does not wait on it).
+- **Do NOT:** the zoomable lightbox and tap-photo-to-open (5c owns the viewer; this phase only
+  removes the dead strip by card-wide targets); search/filters (5c); new features of any kind —
+  this phase changes how existing surfaces look and feel, not what they do; no third-party UI
+  dependencies.
+- **Verification:** presentation snapshot/projection tests updated for cards/type roles;
+  Dynamic Type: the compose visibility control and a timeline card render at
+  .accessibility5 with fitting ASSERTIONS (no truncated label, no clipped layout — the test
+  fails on truncation, not merely renders); accent: the asset exists AND a known markdown
+  link's resolved foreground equals the accent token (attribute assertion — a system-blue
+  fallback fails it); blurhash: a known-vector decode asserts exact pixel output AND a
+  thumbnail render with image loading deliberately stalled shows the decoded placeholder;
+  day grouping is defined on the user's current calendar in the local time zone, with tests
+  for a day spanning two cursor pages and a near-midnight boundary; haptic/symbol wiring unit-
+  tested where extractable; mac-gate exit 0; fresh r4 screenshot set for the user; Codex diff
+  review (medium) APPROVE.
+- **Status:** pending — ordering: 5b → 5c-design → 5c → 5d → 5e.
 
 ### Phase 6 — App Store Connect, Xcode Cloud → TestFlight internal
 - **Branch:** `feature/release-pipeline` (repo config only)
