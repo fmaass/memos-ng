@@ -98,6 +98,14 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# Named, and named ONCE, for the same reason as the edit key below: the router has to recognise
+# this constraint by name at runtime. When a keyed create runs out of retries, only a violation of
+# THIS constraint means "a same-key create kept getting there first" and may be answered with the
+# 503 that says to retry with the same key. A foreign constraint reaching that point is a real
+# conflict of the caller's own, and is re-raised instead of dressed up as retry advice.
+CREATE_KEY_CONSTRAINT = "uq_memos_owner_idempotency_key"
+
+
 class Memo(Base):
     __tablename__ = "memos"
 
@@ -109,7 +117,7 @@ class Memo(Base):
         # settlement: two racing creates with one key cannot both insert, so the loser reads the
         # winner back instead of a second memo existing.
         Index(
-            "uq_memos_owner_idempotency_key",
+            CREATE_KEY_CONSTRAINT,
             "owner_id",
             "idempotency_key",
             unique=True,

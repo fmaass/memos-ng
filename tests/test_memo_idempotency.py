@@ -9,11 +9,12 @@ refused outright. The key is what turns that retry back into the answer the clie
 
 import asyncio
 import hashlib
+import uuid
 from pathlib import Path
 
 import pytest
 from app.config import settings
-from app.models import Memo, User, Visibility
+from app.models import CREATE_KEY_CONSTRAINT, Memo, User, Visibility
 from app.routers.memos import _create_or_replay
 from app.services import memos as memo_svc
 from fastapi import HTTPException
@@ -21,6 +22,7 @@ from sqlalchemy import create_engine, delete, text
 from sqlalchemy.exc import IntegrityError
 
 from tests.conftest import SYNC_URL
+from tests.test_memo_edit_idempotency import _FakeAsyncpgError, _wrapped
 from tests.test_uploads import _cleanup, _drop_user, _login_as, _reap_expired_committed, _start
 
 KEY = "b3f1c2d4-5e6a-47b8-9c0d-1e2f3a4b5c6d"  # a canonical UUID, the shape a client will send
@@ -172,6 +174,67 @@ async def test_two_concurrent_creates_with_one_key_store_exactly_one_memo(pat_cl
         _delete_memos_with_key(KEY)
 
 
+async def test_a_foreign_conflict_that_self_heals_still_stores_both_memos(pat_client, monkeypatch):
+    """Two creates with DISTINCT keys, colliding on the tags index — not on the key at all.
+
+    Both posts invent the same brand-new hashtag, so `_get_or_create_tags` has them both select
+    nothing and both insert; one loses on `ix_tags_name`. That is the loser's OWN write
+    conflicting, and it is TRANSIENT: by the time the loser tries again the winner's tag is
+    committed, so the retry finds it and the memo lands. Both memos are stored.
+
+    This is the regression guard for MEMNG-131: narrowing `replayable` to the key constraint —
+    the obvious way to stop foreign conflicts being called a raced create — would delete that
+    self-heal and answer the loser with a bare IntegrityError, losing a memo a user did post.
+    The fix therefore leaves the retry alone and discriminates only where the retries run out.
+
+    The barrier holds each request between its tag SELECT and its tag INSERT until the other has
+    got there too, which is what makes both of them try the insert instead of one reusing the
+    other's committed tag.
+    """
+    bearer, _, _ = pat_client
+    tag = f"race{uuid.uuid4().hex[:12]}"
+    keys = (str(uuid.uuid4()), str(uuid.uuid4()))  # DISTINCT: nothing here touches the key index
+    entered = 0
+    both_past_the_select = asyncio.Barrier(2)
+    real_get_or_create_tags = memo_svc._get_or_create_tags
+
+    async def barriered(db, names):
+        nonlocal entered
+        entered += 1
+        if entered <= 2:  # only the first pair is held; the loser's retry must not wait for a peer
+            await both_past_the_select.wait()
+        return await real_get_or_create_tags(db, names)
+
+    monkeypatch.setattr(memo_svc, "_get_or_create_tags", barriered)
+    try:
+        first, second = await asyncio.wait_for(
+            asyncio.gather(
+                bearer.post(
+                    "/api/memos", json={"content": f"#{tag} a", "idempotency_key": keys[0]}
+                ),
+                bearer.post(
+                    "/api/memos", json={"content": f"#{tag} b", "idempotency_key": keys[1]}
+                ),
+                return_exceptions=True,
+            ),
+            timeout=30,
+        )
+        # entered == 3: both reached the insert, and the loser really did take a second run at it.
+        assert entered == 3, entered
+        raised = [r for r in (first, second) if isinstance(r, BaseException)]
+        assert raised == [], raised  # neither create may die on someone else's constraint
+        codes = sorted(r.status_code for r in (first, second))
+        assert codes == [201, 201], (codes, first.text, second.text)
+        assert _memo_uids_with_key(keys[0]) and _memo_uids_with_key(keys[1])  # both really stored
+    finally:
+        for k in keys:
+            _delete_memos_with_key(k)
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM tags WHERE name = :n"), {"n": tag})
+        eng.dispose()
+
+
 # --- the lost-race resolution, as control flow ---------------------------------------------------
 # Driving these through the DB would need a concurrent create AND a concurrent delete of that
 # create to land inside one microsecond-wide window, twice over. The loop's three dependencies are
@@ -181,7 +244,17 @@ async def test_two_concurrent_creates_with_one_key_store_exactly_one_memo(pat_cl
 
 
 def _collision() -> IntegrityError:
-    return IntegrityError("INSERT INTO memos ...", {}, Exception("duplicate key value"))
+    """A collision on the KEY — the one conflict a same-key retry can actually resolve.
+
+    Shaped the way the driver delivers it (the constraint name on the asyncpg error under
+    `__cause__`), because the loop reads that name when its retries run out to decide whether
+    "retry with the same idempotency_key" is honest advice."""
+    return _wrapped(Exception("wrapper"), _FakeAsyncpgError(CREATE_KEY_CONSTRAINT))
+
+
+def _foreign_collision() -> IntegrityError:
+    """Someone else's constraint — the tags index is the one this really happens on."""
+    return _wrapped(Exception("wrapper"), _FakeAsyncpgError("ix_tags_name"))
 
 
 class _Loop:
@@ -245,6 +318,8 @@ async def test_a_winner_that_appears_on_the_second_round_is_returned():
 
 
 async def test_exhausting_the_retries_is_a_503_the_client_may_repeat():
+    # The positive control for the two tests below: when the KEY is what kept colliding, the 503
+    # and its "retry with the same idempotency_key" are honest, and must survive the narrowing.
     loop = _Loop([_collision(), _collision()], [None, None])
     with pytest.raises(HTTPException) as raised:
         await loop.run()
@@ -252,6 +327,32 @@ async def test_exhausting_the_retries_is_a_503_the_client_may_repeat():
     assert raised.value.detail["code"] == "create_raced"
     assert "idempotency_key" in raised.value.detail["message"]
     assert loop.calls.count("attempt") == 2  # bounded: no hot loop on a pathological race
+
+
+async def test_a_foreign_conflict_that_never_heals_surfaces_instead_of_same_key_retry_advice():
+    """The mislabel MEMNG-131 removes: retries spent on someone ELSE's constraint.
+
+    A foreign conflict is still worth retrying — usually it self-heals, which the tags race above
+    proves end to end. What it must never do is run out of retries and be reported as a raced
+    create: "retry with the same idempotency_key" names a remedy that cannot work, and buries a
+    real fault that surfaced plainly before the key existed. When the retries are gone, the error
+    that actually kept happening is the answer."""
+    boom = _foreign_collision()
+    loop = _Loop([_foreign_collision(), boom], [None, None])
+    with pytest.raises(IntegrityError) as raised:
+        await loop.run()
+    assert raised.value is boom  # the real conflict, not a 503 telling the client to repeat itself
+    assert loop.calls.count("attempt") == 2  # the retry still happened — the self-heal is intact
+
+
+async def test_an_unnamed_integrity_error_at_exhaustion_surfaces_too():
+    # Fail closed: a driver that will not say what was violated cannot be claimed as the key, so
+    # the error propagates rather than becoming retry advice that may be nonsense.
+    boom = IntegrityError("INSERT INTO memos ...", {}, Exception("duplicate key value"))
+    loop = _Loop([boom, boom], [None, None])
+    with pytest.raises(IntegrityError) as raised:
+        await loop.run()
+    assert raised.value is boom
 
 
 async def test_any_other_failure_propagates_with_no_recovery_attempted():
