@@ -28,6 +28,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.add_column('memos', sa.Column('idempotency_key', sa.String(length=64), nullable=True))
     op.create_index(
         'uq_memos_owner_idempotency_key',
@@ -39,6 +40,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_index(
         'uq_memos_owner_idempotency_key',
         table_name='memos',
