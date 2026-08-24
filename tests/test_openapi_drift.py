@@ -155,3 +155,49 @@ def test_a_disagreeing_keyword_stops_the_schema_instead_of_dropping_one_side():
         )
     assert "#/properties/q" in str(raised.value)
     assert "maxLength" in str(raised.value)
+
+
+UPLOAD_PATH = "/api/uploads/{upload_uid}"
+
+
+def test_the_chunked_upload_patch_declares_its_octet_stream_body():
+    """The handler reads `request.stream()`, so FastAPI declares no requestBody and a generated
+    client cannot express the chunk at all (MEMNG-109)."""
+    from app.main import app
+
+    body = app.openapi()["paths"][UPLOAD_PATH]["patch"]["requestBody"]
+    assert body["required"] is True
+    assert body["content"]["application/octet-stream"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+
+def test_both_upload_operations_model_the_upload_offset_response_header():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    for method in ("patch", "head"):
+        header = paths[UPLOAD_PATH][method]["responses"]["200"]["headers"]["Upload-Offset"]
+        assert header["schema"] == {"type": "integer"}
+        assert header["description"]
+
+
+def test_the_upload_offset_request_header_is_declared_exactly_once():
+    """It already comes from the handler signature; the extra must not add a second one."""
+    from app.main import app
+
+    parameters = app.openapi()["paths"][UPLOAD_PATH]["patch"]["parameters"]
+    offsets = [p for p in parameters if p["name"] == "Upload-Offset"]
+    assert len(offsets) == 1
+    assert offsets[0]["in"] == "header"
+
+
+def test_the_offset_gap_conflict_is_part_of_the_upload_contract():
+    """tests/test_uploads.py drives the real 409; this is the schema saying the same thing."""
+    from app.main import app
+
+    conflict = app.openapi()["paths"][UPLOAD_PATH]["patch"]["responses"]["409"]
+    assert conflict["description"]
+    schema = conflict["content"]["application/json"]["schema"]
+    assert schema["properties"]["detail"] == {"type": "string"}

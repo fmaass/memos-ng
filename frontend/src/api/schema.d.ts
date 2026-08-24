@@ -2388,6 +2388,8 @@ export interface operations {
             /** @description Successful Response */
             200: {
                 headers: {
+                    /** @description Bytes the server now holds for this upload session — the offset the next chunk must start at. */
+                    "Upload-Offset"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2416,15 +2418,32 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
                 headers: {
+                    /** @description Bytes the server now holds for this upload session — the offset the next chunk must start at. */
+                    "Upload-Offset"?: number;
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["UploadOut"];
+                };
+            };
+            /** @description Offset gap — re-sync with HEAD and resend from the offset it reports. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
                 };
             };
             /** @description Validation Error */

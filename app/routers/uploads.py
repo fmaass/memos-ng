@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -13,6 +13,18 @@ from app.models import AttachmentStatus, Upload, User
 from app.services import uploads as svc
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
+
+
+def _upload_offset_header() -> dict[str, Any]:
+    """A fresh dict per call: FastAPI merges `openapi_extra` into the operation by reference, so a
+    shared constant would leave two operations aliasing the same node in the served document."""
+    return {
+        "Upload-Offset": {
+            "description": "Bytes the server now holds for this upload session — the offset the "
+            "next chunk must start at.",
+            "schema": {"type": "integer"},
+        }
+    }
 
 
 class UploadCreate(BaseModel):
@@ -81,7 +93,36 @@ async def start_upload(
     )
 
 
-@router.patch("/{upload_uid}", response_model=UploadOut)
+# The chunk arrives as a raw `request.stream()`, which FastAPI cannot see, so it declares no
+# request body at all and a generated client has no way to send one (MEMNG-109). The response
+# header and the offset-gap 409 are likewise invisible to FastAPI: both come from the handler.
+@router.patch(
+    "/{upload_uid}",
+    response_model=UploadOut,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+            },
+        },
+        "responses": {
+            "200": {"headers": _upload_offset_header()},
+            "409": {
+                "description": "Offset gap — re-sync with HEAD and resend from the offset it "
+                "reports.",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        }
+                    }
+                },
+            },
+        },
+    },
+)
 async def append_chunk(
     upload_uid: str,
     request: Request,
@@ -110,7 +151,10 @@ async def append_chunk(
     )
 
 
-@router.head("/{upload_uid}")
+@router.head(
+    "/{upload_uid}",
+    openapi_extra={"responses": {"200": {"headers": _upload_offset_header()}}},
+)
 async def upload_offset(
     upload_uid: str,
     user: Annotated[User, Depends(auth.require_user)],
