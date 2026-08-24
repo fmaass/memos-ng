@@ -28,7 +28,7 @@ from app.models import (
     MediaJob,
     MediaJobProgress,
 )
-from app.services import blurhash_pure, printready
+from app.services import blurhash_pure, poster, printready
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
@@ -81,6 +81,13 @@ class AttachmentGone(Exception):
     """
 
 
+def _poster_tmp(poster_file: Path) -> Path:
+    """The in-flight name a poster is encoded to before it is renamed into place. The real `.jpg`
+    extension has to survive (`.jpg.tmp` would leave ffmpeg unable to infer the muxer), so the
+    marker goes in front of it: `<uid>.poster.tmp.jpg`."""
+    return poster_file.with_name(f"{poster_file.stem}.tmp{poster_file.suffix}")
+
+
 def derived_outputs(uid: str) -> list[Path]:
     """Every file a media job writes for one attachment — final tiers AND their in-flight temps.
 
@@ -90,6 +97,7 @@ def derived_outputs(uid: str) -> list[Path]:
     """
     web = _assets("web")
     print_ready = printready.printready_path(uid)
+    poster_file = poster.poster_path(uid)
     return [
         _assets("thumbs") / f"{uid}.jpg",
         _assets("thumbs") / f"{uid}.jpg.tmp",  # _atomic_save
@@ -97,8 +105,8 @@ def derived_outputs(uid: str) -> list[Path]:
         _assets("mobile") / f"{uid}.jpg.tmp",
         print_ready,
         print_ready.with_suffix(print_ready.suffix + ".tmp"),  # _atomic_save
-        web / f"{uid}.poster.jpg",
-        web / f"{uid}.poster.tmp.jpg",  # process_video_poster
+        poster_file,  # the hero frame OR a client-supplied override (app/services/poster.py)
+        _poster_tmp(poster_file),  # process_video_poster
         web / f"{uid}.mp4",
         web / f"{uid}.tmp.mp4",  # process_slow
     ]
@@ -456,24 +464,33 @@ def poster_ffmpeg_cmd(src: str, dest: str, duration: float | None) -> list[str]:
 
 def process_video_poster(attachment: Attachment) -> dict:
     """Fast lane for video: probe dims/duration + extract a poster frame + blurhash.
-    The H.264 transcode (slow lane) lands in T2.3."""
+    The H.264 transcode (slow lane) lands in T2.3.
+
+    A poster ALREADY on disk is a client-supplied override placed with the memo
+    (`app/services/uploads.attach_video_poster`) and is never overwritten: the hero-frame heuristic
+    deliberately seeks past the intro, which is precisely the frame such a client picked, so
+    deriving one here would throw the chosen image away. Only the extraction is skipped — the probe
+    still runs (dimensions and duration are properties of the video, not of its poster) and the
+    blurhash is still computed from whichever poster is there, so the tile's placeholder always
+    matches the image it fades into.
+    """
     src = attachment.storage_path
     assert src is not None  # set at finalize
     meta = _ffprobe(src)
-    poster_path = _assets("web") / f"{attachment.uid}.poster.jpg"
-    poster_path.parent.mkdir(parents=True, exist_ok=True)
-    # keep the real extension so ffmpeg can infer the muxer (a .jpg.tmp suffix fails)
-    tmp = poster_path.with_name(f"{poster_path.stem}.tmp{poster_path.suffix}")
-    subprocess.run(
-        poster_ffmpeg_cmd(src, str(tmp), meta.get("duration")),
-        capture_output=True,
-        timeout=60,
-        check=True,
-    )
-    os.replace(tmp, poster_path)
-    _stamp_mtime(poster_path, attachment)
-    with Image.open(poster_path) as poster:
-        meta["blurhash"] = blurhash_pure.encode(poster)
+    poster_file = poster.poster_path(attachment.uid)
+    if not poster_file.exists():
+        poster_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _poster_tmp(poster_file)
+        subprocess.run(
+            poster_ffmpeg_cmd(src, str(tmp), meta.get("duration")),
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+        os.replace(tmp, poster_file)
+        _stamp_mtime(poster_file, attachment)
+    with Image.open(poster_file) as image:
+        meta["blurhash"] = blurhash_pure.encode(image)
     return meta
 
 

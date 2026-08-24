@@ -30,7 +30,7 @@ from app.models import (
     Upload,
     User,
 )
-from app.services import asset_urls, printready, storage, variants
+from app.services import asset_urls, poster, printready, storage, variants
 from app.services import uploads as up_svc
 from app.services.memos import visible_clause
 
@@ -60,7 +60,7 @@ def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
     if tier == "web":
         return assets / "web" / f"{uid}.mp4", "video/mp4"
     if tier == "poster":
-        return assets / "web" / f"{uid}.poster.jpg", "image/jpeg"
+        return poster.poster_path(uid), poster.MIME
     if tier == printready.TIER:
         return printready.printready_path(uid), "image/jpeg"
     return None
@@ -196,6 +196,11 @@ class AttachmentMeta(BaseModel):
     mine: bool
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
+    # Whether `posterUrl` has a file behind it. Always false for anything that is not a video (no
+    # other kind of attachment has a poster tier); for a video it is true once EITHER the fast lane
+    # extracted a hero frame OR the post supplied its own poster (MemoCreate.video_posters) — which
+    # is what makes it assertable straight after a create, before the worker has run at all.
+    hasPoster: bool
     renditions: list[RenditionItem]
     downloadUrl: str
     printUrl: str
@@ -283,6 +288,10 @@ async def attachment_meta(
 ) -> AttachmentMeta:
     att = await _viewable(db, user, uid)
     base = f"/api/attachments/{uid}"
+    # One stat, and only for a video: this route serves a single attachment, so the round-trip is
+    # affordable here in a way it would not be on AttachmentRef, which rides on every item of every
+    # feed page.
+    has_poster = await poster.has_poster(att.uid) if att.mime.startswith("video/") else False
     return AttachmentMeta(
         uid=att.uid,
         mime=att.mime,
@@ -296,6 +305,7 @@ async def attachment_meta(
         mine=att.owner_id == user.id,
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,
+        hasPoster=has_poster,
         renditions=rendition_items(att),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
