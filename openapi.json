@@ -1503,6 +1503,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Attachments",
         "tags": [
           "assets"
@@ -1539,6 +1547,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Delete Attachment",
         "tags": [
           "assets"
@@ -1579,6 +1595,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Attachment Meta",
         "tags": [
           "assets"
@@ -1632,6 +1656,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Upload Print",
         "tags": [
           "assets"
@@ -1677,6 +1709,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Delete Rendition",
         "tags": [
           "assets"
@@ -1725,6 +1765,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Serve Rendition",
         "tags": [
           "assets"
@@ -1772,6 +1820,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Renditions",
         "tags": [
           "assets"
@@ -1823,6 +1879,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Attach Rendition",
         "tags": [
           "assets"
@@ -1920,6 +1984,15 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {}
+        ],
         "summary": "Serve Asset",
         "tags": [
           "assets"
@@ -1996,6 +2069,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Native Logout",
         "tags": [
           "auth"
@@ -2039,6 +2120,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Whoami",
         "tags": [
           "auth"
@@ -2058,6 +2147,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Events",
         "tags": [
           "assets"
@@ -2191,6 +2288,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Export Memos",
         "tags": [
           "export"
@@ -2316,6 +2421,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Export Photobook",
         "tags": [
           "export"
@@ -2486,6 +2599,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Memos",
         "tags": [
           "memos"
@@ -2525,6 +2646,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Create Memo",
         "tags": [
           "memos"
@@ -2560,6 +2689,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Delete Memo",
         "tags": [
           "memos"
@@ -2600,6 +2737,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Get Memo",
         "tags": [
           "memos"
@@ -2650,6 +2795,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Patch Memo",
         "tags": [
           "memos"
@@ -2692,6 +2845,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Pin Memo",
         "tags": [
           "memos"
@@ -2744,6 +2905,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "React",
         "tags": [
           "memos"
@@ -2795,6 +2964,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Unreact",
         "tags": [
           "memos"
@@ -2837,6 +3014,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Unpin Memo",
         "tags": [
           "memos"
@@ -2862,6 +3047,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Pats",
         "tags": [
           "pats"
@@ -2901,6 +3091,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Create Pat",
         "tags": [
           "pats"
@@ -2936,6 +3131,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Revoke Pat",
         "tags": [
           "pats"
@@ -2970,6 +3170,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Unsubscribe",
         "tags": [
           "push"
@@ -3002,6 +3210,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Subscribe",
         "tags": [
           "push"
@@ -3045,6 +3261,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Get Settings",
         "tags": [
           "settings"
@@ -3084,6 +3308,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Update Settings",
         "tags": [
           "settings"
@@ -3109,6 +3341,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Stats Heatmap",
         "tags": [
           "memos"
@@ -3134,6 +3374,14 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "List Tags",
         "tags": [
           "memos"
@@ -3175,6 +3423,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Start Upload",
         "tags": [
           "uploads"
@@ -3223,6 +3479,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Upload Offset",
         "tags": [
           "uploads"
@@ -3307,6 +3571,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Append Chunk",
         "tags": [
           "uploads"
@@ -3349,6 +3621,14 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
         "summary": "Finalize Upload",
         "tags": [
           "uploads"
@@ -3414,6 +3694,12 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {}
+        ],
         "summary": "List Memos Compat",
         "tags": [
           "compat"
@@ -3454,6 +3740,12 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {}
+        ],
         "summary": "Get Memo Compat",
         "tags": [
           "compat"
@@ -3514,6 +3806,12 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {}
+        ],
         "summary": "Serve File Compat",
         "tags": [
           "compat"

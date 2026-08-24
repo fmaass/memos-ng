@@ -201,3 +201,88 @@ def test_the_offset_gap_conflict_is_part_of_the_upload_contract():
     assert conflict["description"]
     schema = conflict["content"]["application/json"]["schema"]
     assert schema["properties"]["detail"] == {"type": "string"}
+
+
+def _schema_operations():
+    """Every operation the document publishes, as (method, path, operation)."""
+    from app.main import app
+    from fastapi.routing import APIRoute
+
+    document = app.openapi()
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        for method in route.methods:
+            operation = document["paths"].get(route.path_format, {}).get(method.lower())
+            if operation is not None:
+                yield method, route.path_format, operation
+
+
+def test_every_published_operation_states_its_credential_or_is_a_declared_public_one():
+    """The drift guard for MEMNG-111: a route added later either carries an auth dependency the
+    schema pass understands, or its author has to say out loud that it is public."""
+    from app.main import PUBLIC_OPERATIONS
+
+    unstated = [
+        (method, path)
+        for method, path, operation in _schema_operations()
+        if "security" not in operation and (method, path) not in PUBLIC_OPERATIONS
+    ]
+    assert unstated == [], (
+        f"{unstated} reached the schema with no security requirement — give the route its auth "
+        "dependency, add it to INLINE_AUTH_SECURITY if it authenticates in the handler, or "
+        "declare it public in PUBLIC_OPERATIONS"
+    )
+
+
+def test_the_public_allow_list_names_only_live_operations():
+    from app.main import PUBLIC_OPERATIONS
+
+    published = {(method, path) for method, path, _ in _schema_operations()}
+    assert PUBLIC_OPERATIONS <= published, PUBLIC_OPERATIONS - published
+
+
+def test_a_declared_public_operation_carries_no_requirement():
+    from app.main import PUBLIC_OPERATIONS
+
+    for method, path, operation in _schema_operations():
+        if (method, path) in PUBLIC_OPERATIONS:
+            assert "security" not in operation, (method, path)
+
+
+def test_the_pat_surface_is_session_cookie_only():
+    """A PAT must not be able to mint or revoke PATs — /api/pats/* takes require_session_user."""
+    pat_operations = [
+        (method, path, operation)
+        for method, path, operation in _schema_operations()
+        if path.startswith("/api/pats")
+    ]
+    assert pat_operations
+    for method, path, operation in pat_operations:
+        assert operation["security"] == [{"sessionCookie": []}], (method, path)
+
+
+def test_a_bearer_route_states_both_credentials():
+    from app.main import app
+
+    assert app.openapi()["paths"]["/api/memos"]["get"]["security"] == [
+        {"bearerAuth": []},
+        {"sessionCookie": []},
+    ]
+
+
+def test_a_handler_that_authenticates_inline_is_not_published_as_public():
+    """/api/events opens its own session inside the handler, so nothing in the route signature
+    says it authenticates — the schema must say it anyway."""
+    from app.main import app
+
+    assert app.openapi()["paths"]["/api/events"]["get"]["security"] == [
+        {"bearerAuth": []},
+        {"sessionCookie": []},
+    ]
+
+
+def test_the_compat_reads_publish_their_optional_credential():
+    from app.main import app
+
+    assert app.openapi()["paths"]["/api/v1/memos"]["get"]["security"] == [{"bearerAuth": []}, {}]
