@@ -21,6 +21,18 @@ describe('redirectToLogin', () => {
     )
   })
 
+  it('preserves a memo permalink, so a signed-out deep link lands back on the memo', () => {
+    // The /m/:uid route is the URL shared out of the app and claimed by the AASA applinks
+    // document. A reader arriving signed-out is bounced through OIDC, and the memo they were
+    // sent is the place that round-trip has to end.
+    const assign = vi.spyOn(window.location, 'assign').mockImplementation(() => {})
+    window.history.pushState({}, '', '/m/01J8Z3K9QW7X2E5R6T7Y8U9I0P')
+    redirectToLogin()
+    expect(assign).toHaveBeenCalledWith(
+      `/api/auth/login?next=${encodeURIComponent('/m/01J8Z3K9QW7X2E5R6T7Y8U9I0P')}`,
+    )
+  })
+
   it('does not forward a protocol-relative path as next (open-redirect guard)', () => {
     const assign = vi.fn()
     const original = window.location

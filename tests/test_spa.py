@@ -27,3 +27,10 @@ def test_prefix_sibling_dir_is_not_served():
 
 def test_unknown_spa_path_returns_index():
     assert resolve_spa_file("explore/some/deep/route") == INDEX
+
+
+def test_memo_permalink_returns_index():
+    # /m/<uid> is the canonical memo URL (and the AASA applinks pattern the app claims). It is a
+    # SPA route with no file behind it, so the shell has to answer it — otherwise a cold open or a
+    # reload of a shared link 404s while in-app navigation to the same URL works.
+    assert resolve_spa_file("m/01J8Z3K9QW7X2E5R6T7Y8U9I0P") == INDEX

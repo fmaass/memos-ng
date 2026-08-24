@@ -626,9 +626,15 @@ def test_aasa_emits_applinks_when_the_switch_asks_for_it(client, monkeypatch):
     assert body["applinks"]["details"] == [
         {
             "appIDs": ["ABCDE12345.live.discomarder.memosng"],
-            "components": [{"/": "/ios/auth/callback*"}],
+            "components": [
+                {"/": "/ios/auth/callback*"},
+                {"/": "/m/*"},
+            ],
         }
     ]
+    # Claiming the permalink must not cost the credential claim: both sections travel in the one
+    # document Apple caches, so dropping either is a silent regression on the served file.
+    assert body["webcredentials"] == {"apps": ["ABCDE12345.live.discomarder.memosng"]}
 
 
 def test_the_exchange_is_documented_as_anonymous():
@@ -685,6 +691,21 @@ def test_aasa_document_emits_only_the_requested_sections():
         "webcredentials": {"apps": ["T.b"]}
     }
     assert set(native_auth.aasa_document("T", "b", ["applinks"])) == {"applinks"}
+
+
+def test_applinks_claims_both_the_callback_and_the_memo_permalink():
+    """Drift guard: the app is entitled to two URL families, and losing either is invisible until
+    a device stops opening one of them. The callback is what a device login lands on; /m/* is the
+    memo permalink shared out of the app. Both are claimed for the same app id."""
+    details = native_auth.aasa_document("T", "b", ["applinks"])["applinks"]["details"]
+
+    # One entry carrying both components — not two entries, where the second silently shadows.
+    assert len(details) == 1
+    assert details[0]["appIDs"] == ["T.b"]
+    assert [c["/"] for c in details[0]["components"]] == ["/ios/auth/callback*", "/m/*"]
+    # No component is an exclusion: an `"exclude": true` entry would claim the pattern and then
+    # hand it straight back to the browser.
+    assert all(set(c) == {"/"} for c in details[0]["components"])
 
 
 def test_verifier_matches_only_its_own_challenge():
