@@ -177,6 +177,30 @@ def _concat_sync(spool: Path, part: Path, offset: int) -> None:
         dst.truncate()
 
 
+# The bytes every JPEG opens with: SOI (FF D8) plus the FF that begins the next marker segment
+# (APP0/APP1/DQT/COM — all of them start FF). The same three-byte signature `file(1)` and puremagic
+# match on, and the only positive JPEG identification this module needs.
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+
+def _is_jpeg_sync(path: Path) -> bool:
+    """Whether these bytes ARE a JPEG — a positive identification, not an absence of doubt.
+
+    Deliberately NOT `_sniff_mime(...) == "image/jpeg"`. That helper answers with the CLIENT'S
+    declared mime whenever puremagic raises or recognises nothing (`guessed or declared`), which is
+    the right lenient default for an ordinary upload — the attachment merely carries a mime it may
+    be wrong about — and exactly the wrong one for a gate: arbitrary unrecognisable bytes declared
+    `image/jpeg` would pass it, land as the poster tier, and then be skipped by the worker (the
+    file exists) and fail its blurhash decode, leaving the video with a broken poster and no way
+    back. Anything this cannot read or does not recognise is refused.
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(JPEG_MAGIC)) == JPEG_MAGIC
+    except OSError:
+        return False
+
+
 def _sha256_sync(path: Path) -> str:
     sha = hashlib.sha256()
     with open(path, "rb") as f:
@@ -400,11 +424,13 @@ async def _memo_screen_sibling(
 
 
 async def _sniffed_mime(upload: Upload) -> str:
-    """What an upload's BYTES are, not what its client called them.
+    """What an upload's BYTES are — read the same way `finalize` reads them, so a poster override
+    is matched to the mime its attachment will actually be stored with.
 
-    The declared mime is caller-controlled, and both sides of a poster override turn on the answer:
-    the poster tier is served as a constant `image/jpeg` from a uid-keyed path with no row behind
-    it, and the whole point of the override is that the video it belongs to is a video.
+    Carries `_sniff_mime`'s fallback to the declared mime for bytes puremagic cannot place, which
+    is why it decides only the VIDEO side of a mapping (an unrecognisable file declared a video
+    becomes a video attachment here exactly as it does without an override). The poster side is
+    gated by `_is_jpeg_sync` instead, which refuses anything it cannot positively identify.
     """
     return await to_thread.run_sync(_sniff_mime, part_path(upload.upload_uid), upload.mime)
 
@@ -451,7 +477,10 @@ async def _resolve_video_poster(
     )
     if not complete:
         return None, "poster_incomplete"
-    if await _sniffed_mime(poster_upload) != poster.MIME:
+    if not await to_thread.run_sync(_is_jpeg_sync, part_path(poster_uid)):
+        # A POSITIVE identification (see _is_jpeg_sync), never `_sniff_mime`'s declared-mime
+        # fallback: what the caller called these bytes cannot be what decides they may become a
+        # tier served to everyone as image/jpeg.
         return None, "poster_not_a_jpeg"
     return poster_upload, None
 

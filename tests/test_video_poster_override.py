@@ -268,8 +268,19 @@ def _case_poster_incomplete(client):
 
 def _case_poster_not_a_jpeg(client):
     video_uid = _video(client)
-    # DECLARED image/jpeg, and the bytes say otherwise — the sniff is what decides.
+    # DECLARED image/jpeg, and the bytes say otherwise — what they ARE is what decides.
     poster_uid = _upload(client, "t.jpg", "image/jpeg", _png())
+    return {"upload_uids": [video_uid], "video_posters": {video_uid: poster_uid}}, video_uid
+
+
+def _case_poster_unidentifiable_bytes(client):
+    """The lenient-fallback hole: `_sniff_mime` answers with the CLIENT'S declared mime for bytes
+    puremagic cannot place, so these very bytes pass as a video when declared one (see the tests
+    above, which depend on exactly that). A poster has to be positively identified instead —
+    otherwise this file lands as the tier, the worker skips extraction because a poster exists,
+    and the blurhash decode fails on a video that can never get a poster again."""
+    video_uid = _video(client)
+    poster_uid = _upload(client, "t.jpg", "image/jpeg", VIDEO_BYTES)
     return {"upload_uids": [video_uid], "video_posters": {video_uid: poster_uid}}, video_uid
 
 
@@ -302,12 +313,17 @@ REFUSALS = [
     ("poster_missing", _case_poster_missing),
     ("poster_incomplete", _case_poster_incomplete),
     ("poster_not_a_jpeg", _case_poster_not_a_jpeg),
+    ("poster_not_a_jpeg", _case_poster_unidentifiable_bytes),
     ("poster_listed_as_attachment", _case_poster_listed_as_attachment),
     ("poster_reused", _case_poster_reused),
 ]
 
+# Named after the CASE, not the category: two cases share `poster_not_a_jpeg` (recognisably wrong
+# bytes, and bytes nothing recognises at all), and they must stay tellable apart in a failure line.
+REFUSAL_IDS = [build.__name__.removeprefix("_case_") for _, build in REFUSALS]
 
-@pytest.mark.parametrize(("reason", "build"), REFUSALS, ids=[r for r, _ in REFUSALS])
+
+@pytest.mark.parametrize(("reason", "build"), REFUSALS, ids=REFUSAL_IDS)
 def test_each_refusal_names_its_category_and_leaves_the_request_unfinalized(
     reason, build, logged_in_client, monkeypatch, tmp_path
 ):
@@ -332,6 +348,33 @@ def test_each_refusal_names_its_category_and_leaves_the_request_unfinalized(
         assert not (tmp_path / "assets").exists()
     finally:
         _cleanup()
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "expected"),
+    [
+        ("real.jpg", _jpeg(), True),  # the positive control: a genuine JPEG still passes
+        ("progressive.jpg", _jpeg(size=(8, 8)), True),  # a tiny one is still a JPEG
+        ("actually.png", _png(), False),
+        ("unidentifiable.bin", VIDEO_BYTES, False),  # what the declared-mime fallback let through
+        ("truncated.jpg", _jpeg()[:2], False),  # SOI alone is not the signature
+        ("empty.jpg", b"", False),
+    ],
+)
+def test_the_poster_gate_identifies_a_jpeg_positively(name, payload, expected, tmp_path):
+    """One case per input category (project convention for a classifier). The `unidentifiable`
+    row is the one that matters: `_sniff_mime` would answer those bytes with whatever the client
+    declared, and this gate must not."""
+    path = tmp_path / name
+    path.write_bytes(payload)
+    assert up_svc._is_jpeg_sync(path) is expected
+
+
+def test_the_poster_gate_refuses_a_file_it_cannot_read(tmp_path):
+    """A stat/read that fails is a refusal, never a pass — a gate that opened up when the disk
+    misbehaved would be a gate in name only."""
+    assert up_svc._is_jpeg_sync(tmp_path / "does-not-exist.jpg") is False
+    assert up_svc._is_jpeg_sync(tmp_path) is False  # a directory: OSError, not a JPEG
 
 
 def test_the_refusal_categories_and_their_messages_are_the_same_set():
