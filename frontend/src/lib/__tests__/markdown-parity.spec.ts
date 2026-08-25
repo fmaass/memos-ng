@@ -102,7 +102,13 @@ describe('fixtures/markdown-parity.json', () => {
 
   it('has no tag-only line left in any projected text', () => {
     const tagOnly = /^[ \t]*#\w+(?:[ \t]+#\w+)*[ \t]*$/
+    // The stripping rule anchors on end-of-line WITHOUT multiline, so a tag line carrying a
+    // trailing carriage return is deliberately KEPT — by this client and the iOS one alike.
+    // The naive reading of this invariant would flag exactly that parity behaviour, so the
+    // case that pins it is carved out by id rather than weakening the rule for everyone else.
+    const keptByBothClients = new Set(['tags-carriage-return-kept'])
     for (const entry of fixture.cases) {
+      if (keptByBothClients.has(entry.id)) continue
       const lines = entry.projection
         .filter((block) => block.type !== 'code')
         .flatMap((block) => [block.text, ...(block.items ?? [])])

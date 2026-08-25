@@ -41,6 +41,40 @@ const CASES: ParityCase[] = [
     markdown: '```js\nconst a = 1\n  indented\n<div>raw</div>\n```',
   },
   {
+    // Inside a code block markdown-it parses no inline at all, so a REFERENCE IMAGE written there
+    // survives character for character even though the label above it resolves. A consumer that
+    // drops a resolved `![alt][ref]` without asking whether the line is code deletes a line of
+    // the author's code, and nothing on screen says it did.
+    id: 'code-fenced-tilde-reference-image',
+    markdown: '[pic]: https://example.com/red.png\n\n~~~\n![alt][pic]\n~~~',
+  },
+  {
+    // The same barrier from the other side: a destination the sanitiser would strip is still just
+    // characters in a code block. A consumer that neutralises it there — by escaping the bracket,
+    // say — puts a backslash on screen that the SPA does not show.
+    id: 'code-fenced-tilde-unsafe-link',
+    markdown: '~~~\n[x](javascript:alert(1))\n~~~',
+  },
+  {
+    // A closing fence cannot carry a container prefix its opener did not have: `> ```` inside a
+    // top-level fence is CONTENT, and the block runs on past it. A consumer that reads it as the
+    // closer treats everything below as prose and rewrites bytes that are code.
+    id: 'code-fenced-quoted-closer-is-content',
+    markdown: '```\ncode one\n> ```\n[x](javascript:alert(1))\n```',
+  },
+  {
+    // A BACKTICK fence's info string may not contain a backtick, so this opens no code block at
+    // all — both lines are one paragraph, and the link in it is text the sanitiser never sees.
+    // (A tilde fence's info may hold anything, backticks included.)
+    id: 'code-fenced-backtick-in-info-string',
+    markdown: '```a`b\n[x](javascript:alert(1))',
+  },
+  {
+    // An INDENTED code block is a code block too, and it carries no fence to notice.
+    id: 'code-indented-reference-image',
+    markdown: '[pic]: https://example.com/red.png\n\n    ![alt][pic]',
+  },
+  {
     id: 'emphasis-and-inline-code',
     markdown: '**bold** and _italic_ and ~~struck~~ and `inline code` in one line.',
   },
@@ -64,6 +98,25 @@ const CASES: ParityCase[] = [
     id: 'link-reference-image',
     markdown:
       '![shot][pic]\n\nThe reference image above renders as nothing.\n\n[pic]: https://example.com/red.png',
+  },
+  {
+    // A definition markdown-it REFUSES is not a definition: `rules_block/reference.js` returns
+    // false when `validateLink` rejects the destination, the paragraph rule takes the line
+    // instead, and a link reference definition cannot interrupt a paragraph. So the duplicate
+    // directly below it never registers either, and the reference image that names the label is
+    // text a reader sees. A consumer that keeps its block-start state across a refused definition
+    // resolves the second one and deletes that image.
+    id: 'link-reference-duplicate-refused-first',
+    markdown:
+      '[pic]: javascript:alert(1)\n[pic]: https://example.com/red.png\n\n![alt][pic]',
+  },
+  {
+    // The same rule read from the other end: definition-shaped lines that follow prose are
+    // paragraph text, and so is the line after them — including the second one, which is where a
+    // scanner that resets its state per line goes wrong.
+    id: 'link-reference-in-paragraph',
+    markdown:
+      'prose\n[a]: https://example.com/a\n[pic]: https://example.com/red.png\n\n![alt][pic]',
   },
   {
     // CommonMark registers a definition written inside a LIST ITEM for the whole document, so a
@@ -162,6 +215,15 @@ const CASES: ParityCase[] = [
     id: 'table',
     markdown:
       '| tier | size | note |\n| --- | --- | --- |\n| thumb | 320 | **fast** |\n| mobile | 1080 | [docs](https://example.com/tiers) |',
+  },
+  {
+    // A tag-only line written on a device that ends its lines with CRLF is NOT stripped:
+    // `TAG_ONLY_LINE` ends in `[ \t]*$`, and JavaScript's `$` matches at the end of the string
+    // only — without `/m` it does not match before a line terminator. So the line keeps its
+    // carriage return, fails the test, and renders as body text. A consumer that treats `\r` as
+    // trailing whitespace drops a line the SPA shows.
+    id: 'tags-carriage-return-kept',
+    markdown: '#curated\r\nHello',
   },
   {
     id: 'tags-stripped-vs-inline',
