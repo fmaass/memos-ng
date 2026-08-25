@@ -31,6 +31,66 @@
       ]
     },
     {
+      "id": "code-fenced-backtick-in-info-string",
+      "markdown": "```a`b\n[x](javascript:alert(1))",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "```a`b\n[x](javascript:alert(1))",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "code-fenced-quoted-closer-is-content",
+      "markdown": "```\ncode one\n> ```\n[x](javascript:alert(1))\n```",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "code one\n> ```\n[x](javascript:alert(1))\n",
+          "type": "code"
+        }
+      ]
+    },
+    {
+      "id": "code-fenced-tilde-reference-image",
+      "markdown": "[pic]: https://example.com/red.png\n\n~~~\n![alt][pic]\n~~~",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "![alt][pic]\n",
+          "type": "code"
+        }
+      ]
+    },
+    {
+      "id": "code-fenced-tilde-unsafe-link",
+      "markdown": "~~~\n[x](javascript:alert(1))\n~~~",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "[x](javascript:alert(1))\n",
+          "type": "code"
+        }
+      ]
+    },
+    {
+      "id": "code-indented-reference-image",
+      "markdown": "[pic]: https://example.com/red.png\n\n    ![alt][pic]",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "![alt][pic]\n",
+          "type": "code"
+        }
+      ]
+    },
+    {
       "id": "emphasis-and-inline-code",
       "markdown": "**bold** and _italic_ and ~~struck~~ and `inline code` in one line.",
       "projection": [
@@ -237,6 +297,29 @@
       ]
     },
     {
+      "id": "link-reference-duplicate-refused-first",
+      "markdown": "[pic]: javascript:alert(1)\n[pic]: https://example.com/red.png\n\n![alt][pic]",
+      "projection": [
+        {
+          "inline": [],
+          "links": [
+            {
+              "href": "https://example.com/red.png",
+              "text": "https://example.com/red.png"
+            }
+          ],
+          "text": "[pic]: javascript:alert(1)\n[pic]: https://example.com/red.png",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "![alt][pic]",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
       "id": "link-reference-image",
       "markdown": "![shot][pic]\n\nThe reference image above renders as nothing.\n\n[pic]: https://example.com/red.png",
       "projection": [
@@ -273,6 +356,33 @@
           "inline": [],
           "links": [],
           "text": "[click][evil]",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-reference-in-paragraph",
+      "markdown": "prose\n[a]: https://example.com/a\n[pic]: https://example.com/red.png\n\n![alt][pic]",
+      "projection": [
+        {
+          "inline": [],
+          "links": [
+            {
+              "href": "https://example.com/a",
+              "text": "https://example.com/a"
+            },
+            {
+              "href": "https://example.com/red.png",
+              "text": "https://example.com/red.png"
+            }
+          ],
+          "text": "prose\n[a]: https://example.com/a\n[pic]: https://example.com/red.png",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "![alt][pic]",
           "type": "paragraph"
         }
       ]
@@ -652,6 +762,18 @@
           ],
           "text": "",
           "type": "table"
+        }
+      ]
+    },
+    {
+      "id": "tags-carriage-return-kept",
+      "markdown": "#curated\r\nHello",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "#curated\nHello",
+          "type": "paragraph"
         }
       ]
     },
