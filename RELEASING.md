@@ -10,18 +10,21 @@ Authority: `pyproject.toml` `[project].version`. Mirrors that must agree:
 `.packages[""].version` · `uv.lock` `[[package]]` entry for `memos-ng` · a `### v<version>`
 changelog section in `README.md`.
 
-Check (also run by CI): `python3 scripts/check_release_version.py [--tag vX.Y.Z]` —
+Check: `python3 scripts/check_release_version.py [--tag vX.Y.Z]` —
 **bare `python3`, never `uv run`**: `uv run` re-locks `uv.lock` before executing and silently
 repairs exactly the staleness the checker exists to catch.
 
-## Required CI
+## No CI — the local gate is the gate
 
-`.github/workflows/ci.yml` — jobs: `backend` (ruff, pyright, `alembic upgrade head` +
-`alembic check`, pytest, version check), `frontend` (lint, typecheck, vitest, build),
-`api-drift`, `image` (PR + main: production-image build, no push), `release` (main only:
-buildx → Trivy gate → push `ghcr.io/fmaass/memos-ng` `sha-<long>` + `latest`, with
-`APP_VERSION=<version>+<short-sha>` as build-arg). Tag pushes trigger **no** workflow —
-tag agreement is enforced *before* tagging via the checker's `--tag`.
+There is no GitHub Actions workflow (retired 2026-08-25 after every run had been refused at
+the billing layer for 40+ runs while the local gates did all the catching). The release gate
+is the LOCAL gate, run bare with each exit code cited:
+`uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q &&
+uv run alembic check`, plus the frontend suite (`npx vitest run`) and the version checker
+above. Images are never pulled from a registry — the deploy image is built locally (below),
+so there is no `ghcr.io` push and no Trivy gate; run the local `docker build` before deploy
+to catch slim-image/wheel breakage. Tag agreement is enforced *before* tagging via the
+checker's `--tag`.
 
 ## Migrations
 
