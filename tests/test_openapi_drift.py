@@ -7,6 +7,7 @@ never runs (CI is abandoned), which left this contract with no gate at all; this
 """
 
 import importlib.util
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -105,6 +106,18 @@ def test_a_nullable_field_reaches_the_client_as_a_type_array():
     assert archived_at["format"] == "date-time"
     assert archived_at["title"] == "Archived At"
     assert "anyOf" not in archived_at
+
+
+def test_the_committed_snapshot_publishes_the_attachment_content_digest():
+    """Read off the COMMITTED file, not the live app: a generated client (SPA `schema.d.ts`, the
+    Swift client) only ever sees this snapshot, and an external consumer verifying a delivered file
+    by digest needs the field on both attachment shapes — the single-attachment meta and the ref
+    inside a memo. Nullable, because most rows carry no digest (see AttachmentMeta.sha256)."""
+    schemas = json.loads((REPO_ROOT / "openapi.json").read_text())["components"]["schemas"]
+    for name in ("AttachmentMeta", "AttachmentRef"):
+        sha = schemas[name]["properties"]["sha256"]
+        assert sha["type"] == ["string", "null"], (name, sha)
+        assert "sha256" in schemas[name]["required"], name  # present-and-null, never absent
 
 
 def test_a_genuine_union_is_left_as_an_anyof():
