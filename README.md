@@ -111,11 +111,12 @@ it — `export DATABASE_URL_SYNC=postgresql+psycopg2://memosng:memosng@localhost
 before `alembic upgrade head` / `alembic check`. pytest and the app fall back to that same DSN
 on their own.
 
-CI (`.github/workflows/ci.yml`) runs five jobs on every push/PR: **backend** (version
-agreement, ruff, pyright, migrations + `alembic check`, pytest), **frontend**, **api-drift**
-(regenerates the OpenAPI schema + client and fails on any diff), **image** (builds the
-production Dockerfile — no push, no registry login — so a dependency that needs a compiler on
-`python:3.13-slim` fails the PR instead of `main`), and **release** (main only).
+There is no CI — the LOCAL gate is the gate (see `RELEASING.md`): pyright, ruff, pytest and
+`alembic check` run bare with their exit codes cited, plus the frontend suite and the
+api-drift check (`python3 scripts/gen-openapi.py` then `npm run gen:api` in `frontend/` must
+produce no diff). A change touching
+`pyproject.toml` or the `Dockerfile` additionally needs a local `docker build`, because a
+dependency that needs a compiler fails on `python:3.13-slim` but not on a dev machine.
 
 ## Build & deploy
 
