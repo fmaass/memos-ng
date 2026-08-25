@@ -179,6 +179,13 @@
             "title": "Renditions",
             "type": "array"
           },
+          "sha256": {
+            "title": "Sha256",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "size": {
             "title": "Size",
             "type": "integer"
@@ -210,6 +217,7 @@
           "uid",
           "mime",
           "size",
+          "sha256",
           "status",
           "width",
           "height",
@@ -358,6 +366,13 @@
             "title": "Renditions",
             "type": "array"
           },
+          "sha256": {
+            "title": "Sha256",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status": {
             "$ref": "#/components/schemas/AttachmentStatus"
           },
@@ -389,6 +404,7 @@
           "width",
           "height",
           "duration",
+          "sha256",
           "mine",
           "hasPrint",
           "hasLegacyPrint",

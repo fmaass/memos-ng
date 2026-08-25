@@ -842,6 +842,8 @@ export interface components {
             printUrl: string;
             /** Renditions */
             renditions: components["schemas"]["RenditionItem"][];
+            /** Sha256 */
+            sha256: string | null;
             /** Size */
             size: number;
             status: components["schemas"]["AttachmentStatus"];
@@ -903,6 +905,8 @@ export interface components {
             printUrl: string;
             /** Renditions */
             renditions: components["schemas"]["RenditionItem"][];
+            /** Sha256 */
+            sha256: string | null;
             status: components["schemas"]["AttachmentStatus"];
             /** Thumbnailurl */
             thumbnailUrl: string;

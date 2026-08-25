@@ -118,6 +118,11 @@ class AttachmentRef(BaseModel):
     width: int | None
     height: int | None
     duration: float | None
+    # Content identity of the original bytes, same field and same NULL story as
+    # AttachmentMeta.sha256 (app/routers/assets.py) — carried here too so a caller that already
+    # holds the memo does not need a per-attachment round trip to check it. Off the ORM row, no
+    # extra query.
+    sha256: str | None
     mine: bool  # the requesting user owns it (→ may delete); shared media is view-only
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
@@ -410,6 +415,7 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         width=att.width,
         height=att.height,
         duration=att.duration,
+        sha256=att.sha256,
         mine=att.owner_id == user_id,
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,

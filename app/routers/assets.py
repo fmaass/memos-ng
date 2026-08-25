@@ -187,6 +187,13 @@ class AttachmentMeta(BaseModel):
     uid: str
     mime: str
     size: int
+    # Hex sha256 of the stored ORIGINAL bytes, so a caller about to delete its own copy of a file it
+    # posted here can prove this attachment is still exactly that file — size equality is not
+    # identity. No new exposure: `_viewable` already lets this caller download the bytes.
+    # None for every row that has no digest: the column arrived nullable with no backfill
+    # (036cca35e101) and the old-memos import never computes one (migrate_from_memos.py), so only
+    # attachments finalized through the upload path carry it.
+    sha256: str | None
     status: AttachmentStatus
     width: int | None
     height: int | None
@@ -296,6 +303,7 @@ async def attachment_meta(
         uid=att.uid,
         mime=att.mime,
         size=att.size,
+        sha256=att.sha256,
         status=att.status,
         width=att.width,
         height=att.height,

@@ -26,6 +26,7 @@ def _seed_attachment(
     width=None,
     height=None,
     captured_at=None,
+    sha256=None,
 ):
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
@@ -36,9 +37,9 @@ def _seed_attachment(
             text(
                 "INSERT INTO attachments "
                 "(uid, owner_id, filename, mime, size, status, storage_path, blurhash, "
-                "width, height, captured_at) "
+                "width, height, captured_at, sha256) "
                 "VALUES (:u,:o,'x.jpg',:m,1,CAST(:st AS attachment_status),'/x',:bh,:w,:h,"
-                "CAST(:cap AS timestamptz)) "
+                "CAST(:cap AS timestamptz),:sha) "
                 "RETURNING id"
             ),
             {
@@ -50,6 +51,7 @@ def _seed_attachment(
                 "w": width,
                 "h": height,
                 "cap": captured_at,
+                "sha": sha256,
             },
         ).scalar_one()
     eng.dispose()
@@ -284,7 +286,9 @@ async def test_ready_meta_reads_back_the_owners_rows_only(logged_in_client):
         _rm("meta_other")
 
 
-def _seed_memo_with_attachment(memo_uid, att_uid, owner_subject, visibility, mime="image/jpeg"):
+def _seed_memo_with_attachment(
+    memo_uid, att_uid, owner_subject, visibility, mime="image/jpeg", sha256=None
+):
     """A memo (owner, visibility) + an attachment linked to it (same owner), thumb file separate."""
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
@@ -302,10 +306,10 @@ def _seed_memo_with_attachment(memo_uid, att_uid, owner_subject, visibility, mim
         aid = c.execute(
             text(
                 "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status, "
-                "storage_path, blurhash) VALUES (:u,:o,:m,'x.jpg',:mime,1,"
-                "CAST('ready' AS attachment_status),'/x','LKO2') RETURNING id"
+                "storage_path, blurhash, sha256) VALUES (:u,:o,:m,'x.jpg',:mime,1,"
+                "CAST('ready' AS attachment_status),'/x','LKO2',:sha) RETURNING id"
             ),
-            {"u": att_uid, "o": oid, "m": mid, "mime": mime},
+            {"u": att_uid, "o": oid, "m": mid, "mime": mime, "sha": sha256},
         ).scalar_one()
     eng.dispose()
     return mid, aid
@@ -649,6 +653,7 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "duration",
             "blurhash",
             "captured_at",
+            "sha256",  # added deliberately: content identity for a delete-after-verify caller
             "mine",
             "hasPrint",
             "hasLegacyPrint",
@@ -670,6 +675,69 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
         assert set(pat_body) == set(body)
     finally:
         _cleanup(aid)
+
+
+# --- Attachment.sha256 on the read surfaces. A caller that posted a file here and is about to let
+# --- something else delete its own copy has to prove the stored attachment is still exactly that
+# --- file; size equality is not identity. The digest is on the row already — these pin that it
+# --- reaches BOTH the single-attachment meta and the AttachmentRef inside a memo.
+
+DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def test_attachment_meta_exposes_the_stored_sha256(logged_in_client):
+    client, subject = logged_in_client
+    aid = _seed_attachment("att-sha-hex", subject, sha256=DIGEST)
+    try:
+        body = client.get("/api/attachments/att-sha-hex").json()
+        assert body["sha256"] == DIGEST
+        assert len(body["sha256"]) == 64  # the whole digest, not the truncated rendition `rev`
+    finally:
+        _cleanup(aid)
+
+
+def test_attachment_meta_sha256_is_null_when_the_row_has_no_digest(logged_in_client):
+    # The column arrived nullable with no backfill (036cca35e101) and the old-memos import writes
+    # no digest, so a null here is a real, live case — the field must be present and null, not
+    # absent, or a client cannot tell "no digest" from "old server".
+    client, subject = logged_in_client
+    aid = _seed_attachment("att-sha-null", subject)
+    try:
+        body = client.get("/api/attachments/att-sha-null").json()
+        assert "sha256" in body
+        assert body["sha256"] is None
+    finally:
+        _cleanup(aid)
+
+
+def test_memo_attachment_ref_carries_the_same_sha256(logged_in_client):
+    client, _ = logged_in_client
+    _mk_user("shasharer")
+    mid, aid = _seed_memo_with_attachment(
+        "sha-memo", "sha-ref", "shasharer", "PUBLIC", sha256=DIGEST
+    )
+    try:
+        ref = client.get("/api/memos/sha-memo").json()["attachments"][0]
+        assert ref["uid"] == "sha-ref"
+        assert ref["sha256"] == DIGEST
+        # and it is the same value the per-attachment route reports for that uid
+        assert ref["sha256"] == client.get("/api/attachments/sha-ref").json()["sha256"]
+    finally:
+        _cleanup(aid)
+        _rm("shasharer", mid)
+
+
+def test_memo_attachment_ref_sha256_is_null_when_the_row_has_no_digest(logged_in_client):
+    client, _ = logged_in_client
+    _mk_user("shasharer2")
+    mid, aid = _seed_memo_with_attachment("sha-memo-null", "sha-ref-null", "shasharer2", "PUBLIC")
+    try:
+        ref = client.get("/api/memos/sha-memo-null").json()["attachments"][0]
+        assert "sha256" in ref
+        assert ref["sha256"] is None
+    finally:
+        _cleanup(aid)
+        _rm("shasharer2", mid)
 
 
 # --- _negotiated_path_sync: the webp/original choice + existence check that MEMNG-42 batched into
