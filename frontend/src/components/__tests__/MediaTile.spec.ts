@@ -16,6 +16,7 @@ function att(status: Status, mime = 'image/jpeg', extra: Record<string, unknown>
     mime,
     status,
     blurhash: null,
+      sha256: null,
     width: null,
     height: null,
     duration: null,
