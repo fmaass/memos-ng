@@ -605,6 +605,12 @@ def test_the_native_callback_page_beats_the_spa_catch_all(client):
 
 RETURN_SCHEME_URL = "memosng://auth-callback"
 
+# The base64 sha256 of the return script's exact bytes, PINNED here rather than recomputed from
+# whatever the response happened to serve — a digest the test derives from its own subject can
+# never disagree with it. Editing the script (deliberately or otherwise) turns the case below red
+# until this constant is updated in the same diff, by someone who has read the new script.
+RETURN_SCRIPT_SHA256 = "n6uEoY7g/cUpU3IQ3/uJ7tUz+nOCM+QnDO/JQ5Gbd48="
+
 
 def _callback_page(client, **params: str):
     """GET the universal-link target the way the browser running the login would."""
@@ -700,17 +706,18 @@ def test_the_callback_page_offers_the_bare_scheme_url_when_given_nothing(client)
 def test_the_callback_pages_return_script_is_allowed_to_run(client):
     """The automatic attempt is an inline script and the app-wide policy is `script-src 'self'`,
     which a browser enforces by silently refusing it — leaving the button as the only lane that
-    ever works. So this response names that script's digest, computed here from the bytes that
-    were actually served.
+    ever works. So this response has to name that script's digest, and the script it names has to
+    be the one reviewed: both are checked against `RETURN_SCRIPT_SHA256`, never against each other.
     """
     page = _callback_page(client, code="handoff-abc")
     script = re.search(r"<script>(.*?)</script>", page.text, re.S)
     assert script is not None, page.text
     assert "location.href" in script.group(1)
-    digest = base64.b64encode(hashlib.sha256(script.group(1).encode()).digest()).decode()
+    served = base64.b64encode(hashlib.sha256(script.group(1).encode()).digest()).decode()
+    assert served == RETURN_SCRIPT_SHA256
 
     policy = page.headers["content-security-policy"]
-    assert f"script-src 'self' 'sha256-{digest}'" in policy
+    assert f"script-src 'self' 'sha256-{RETURN_SCRIPT_SHA256}'" in policy
     # Widened for one script, not weakened: every other directive is still the app-wide one.
     assert [d for d in policy.split("; ") if not d.startswith("script-src")] == [
         d for d in APP_CSP.split("; ") if not d.startswith("script-src")
