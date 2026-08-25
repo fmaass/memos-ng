@@ -61,6 +61,73 @@ const CASES: ParityCase[] = [
     markdown: '![A red square](https://example.com/red.png)\n\nThe image above renders as nothing.',
   },
   {
+    id: 'link-reference-image',
+    markdown:
+      '![shot][pic]\n\nThe reference image above renders as nothing.\n\n[pic]: https://example.com/red.png',
+  },
+  {
+    // CommonMark registers a definition written inside a LIST ITEM for the whole document, so a
+    // scanner that only knows about blockquote markers is one bullet away from being bypassed.
+    id: 'link-reference-in-list-item',
+    markdown: '- [evil]: javascript:alert(1)\n\n[click][evil]',
+  },
+  {
+    // An indented code block ends at the first line that is not indented, and a definition may
+    // sit on that line — the image below it is one the sanitiser drops, so no client should
+    // fetch it.
+    id: 'link-reference-after-indented-code',
+    markdown:
+      '    code line\n[pic]: https://example.com/red.png\n\n![shot][pic]',
+  },
+  {
+    // The same memo written on a device that ends its lines with CRLF. Both renderers normalise
+    // the endings before parsing; a consumer that compares a closing fence with the `\r` still
+    // on it treats everything below as code and stops checking it.
+    id: 'link-reference-crlf-fence',
+    markdown:
+      '```\r\ncode\r\n```\r\n\r\n[evil]: javascript:alert(1)\r\n\r\n[click][evil]',
+  },
+  {
+    // A tab is whitespace after a list marker exactly as a space is; the definition below it is
+    // still a definition, registered for the whole document.
+    id: 'link-reference-tab-after-marker',
+    markdown: '-\t[evil]: javascript:alert(1)\n\n[click][evil]',
+  },
+  {
+    // A lone carriage return is a line ending in CommonMark, and both renderers normalise it
+    // before they parse. A memo written on a device that ends its lines that way is the same memo.
+    id: 'link-reference-carriage-return-only',
+    markdown: '[evil]: javascript:alert(1)\r\r[click][evil]',
+  },
+  {
+    // Indented code INSIDE a blockquote: the container prefix has to come off before the
+    // indentation means anything, or the definition on the next quoted line is never seen.
+    id: 'link-reference-in-quoted-indented-code',
+    markdown:
+      '>     code line\n> [evil]: javascript:alert(1)\n\n[click][evil]',
+  },
+  {
+    // A list item may start with nothing at all, its content beginning on the following line.
+    id: 'link-reference-marker-only-item',
+    markdown: '-\n  [evil]: javascript:alert(1)\n\n[click][evil]',
+  },
+  {
+    id: 'link-reference-safe',
+    markdown: '[site][home] and a collapsed [home][].\n\n[home]: https://example.com/a?b=1',
+  },
+  {
+    // markdown-it validates a link reference definition where it is DEFINED and refuses to
+    // register an unsafe one, so the definition line and every reference that names it stay on
+    // screen as text. A consumer that only checks the inline form leaves this spelling live.
+    id: 'link-reference-unsafe',
+    markdown: '[click][evil] and [evil] and [evil][].\n\n[evil]: javascript:alert(1)',
+  },
+  {
+    // The destination may sit on the line after the label; it is validated the same way.
+    id: 'link-reference-unsafe-multiline',
+    markdown: '[evil]:\njavascript:alert(1)\n\n[click][evil]',
+  },
+  {
     id: 'link-schemes',
     markdown:
       '[site](https://example.com/a?b=1) and [mail](mailto:memo@example.com) are links;\n\n[js](javascript:alert(1)) and [data](data:text/html,hi) are not.',
