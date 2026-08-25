@@ -20,6 +20,7 @@ from app import auth
 from app.config import settings
 from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
+from app.security_headers import CSP
 from app.version import __version__
 
 logger = structlog.get_logger(__name__)
@@ -261,12 +262,6 @@ def custom_openapi() -> dict[str, Any]:
 
 app.openapi = custom_openapi  # type: ignore[method-assign]
 
-CSP = (
-    "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
-    "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; "
-    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-)
-
 
 class SecurityHeadersMiddleware:
     """Pure-ASGI response-header middleware. Deliberately NOT BaseHTTPMiddleware
@@ -289,7 +284,11 @@ class SecurityHeadersMiddleware:
                 headers["X-Content-Type-Options"] = "nosniff"
                 headers["X-Frame-Options"] = "DENY"
                 headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-                headers["Content-Security-Policy"] = CSP
+                # setdefault, not assignment: a route that has to serve a DERIVED policy of
+                # its own sets it on its response (app/routers/native.py widens script-src by one
+                # hash), and overwriting it here would silently put that page back under a policy
+                # its own markup cannot satisfy. Everything else gets the app-wide policy.
+                headers.setdefault("Content-Security-Policy", CSP)
                 if settings.is_production:
                     headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
             await send(message)

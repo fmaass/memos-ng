@@ -18,13 +18,18 @@ than changing which mock answers.
 """
 
 import asyncio
+import base64
+import hashlib
+import re
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from app import auth
 from app.config import settings
 from app.main import FRONTEND_DIR, app
+from app.security_headers import CSP as APP_CSP
 from app.services import native_auth
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
@@ -594,6 +599,137 @@ def test_the_native_callback_page_beats_the_spa_catch_all(client):
     assert SPA_ROOT_MARKER not in resp.text
     # The control for that absence: the marker really is what the SPA shell is identified by.
     assert SPA_ROOT_MARKER in (FRONTEND_DIR.parent / "index.html").read_text()
+
+
+# --- the callback page returns the browser to the app ------------------------------------------
+
+RETURN_SCHEME_URL = "memosng://auth-callback"
+
+# The base64 sha256 of the return script's exact bytes, PINNED here rather than recomputed from
+# whatever the response happened to serve — a digest the test derives from its own subject can
+# never disagree with it. Editing the script (deliberately or otherwise) turns the case below red
+# until this constant is updated in the same diff, by someone who has read the new script.
+RETURN_SCRIPT_SHA256 = "n6uEoY7g/cUpU3IQ3/uJ7tUz+nOCM+QnDO/JQ5Gbd48="
+
+
+def _callback_page(client, **params: str):
+    """GET the universal-link target the way the browser running the login would."""
+    query = urlencode(params)
+    return client.get("/ios/auth/callback" + (f"?{query}" if query else ""))
+
+
+def _return_url(html: str) -> str:
+    """The one memosng:// URL the page offers, read out of the rendered HTML and entity-decoded
+    the way a browser decodes an attribute — so the page's own escaping is what is under test
+    rather than re-implemented here.
+
+    Exactly one link, asserted: the automatic attempt reads the visible button's href, so the two
+    lanes back into the app cannot drift apart.
+    """
+    hrefs = re.findall(r'href="([^"]*)"', html)
+    assert len(hrefs) == 1, html
+    return unescape(hrefs[0])
+
+
+def test_the_callback_page_hands_a_real_login_back_to_the_app(native_oidc):
+    """Round-trip: the URL a real device login lands the browser on, fetched as that browser
+    fetches it, renders a page carrying THAT login's handoff code to the app's custom scheme.
+
+    The parameters are compared against the ones the BFF actually redirected to, not against a
+    list written here, so a page that forwarded a subset (or a rewritten set) goes red.
+    """
+    client, _ = native_oidc
+    _, state = _start_native_login(client)
+    landed = _callback(client, code="authelia-code", state=state)
+    assert landed.status_code == 302
+    handed = urlsplit(landed.headers["location"])
+
+    page = client.get(f"{handed.path}?{handed.query}")
+
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    url = urlsplit(_return_url(page.text))
+    assert url._replace(query="").geturl() == RETURN_SCHEME_URL
+    assert parse_qs(url.query) == parse_qs(handed.query)
+    assert parse_qs(url.query)["code"][0]  # the one-shot code really did travel
+    assert page.text.count("memosng://") == 1
+
+
+def test_the_callback_page_forwards_exactly_the_parameters_it_was_given(client):
+    page = _callback_page(client, code="handoff-abc", state="opaque-state")
+
+    url = urlsplit(_return_url(page.text))
+    assert url._replace(query="").geturl() == RETURN_SCHEME_URL
+    assert parse_qs(url.query) == {"code": ["handoff-abc"], "state": ["opaque-state"]}
+
+
+def test_the_callback_page_encodes_values_that_carry_delimiters(client):
+    """A value made of the characters that separate parameters has to arrive at the app as ONE
+    value: percent-encoded for the URL it sits in, entity-escaped for the attribute around it."""
+    hostile = "a&b=c d/e?f#g"
+    page = _callback_page(client, code="handoff-abc", state=hostile)
+
+    raw = re.findall(r'href="([^"]*)"', page.text)[0]
+    assert "&amp;" in raw  # the separator between the two parameters, escaped for HTML
+    assert hostile not in raw  # and the value's own & is encoded, so it starts no parameter
+    assert parse_qs(urlsplit(unescape(raw)).query) == {
+        "code": ["handoff-abc"],
+        "state": [hostile],
+    }
+
+
+def test_a_callback_parameter_cannot_write_markup_into_the_page(client):
+    """The values come off a URL anyone can type, and the page renders them into an attribute."""
+    hostile = 'x"><script>alert(1)</script>'
+    page = _callback_page(client, code=hostile)
+
+    assert "<script>alert(1)" not in page.text
+    assert len(re.findall(r"<script", page.text)) == 1  # the page's own return script, and only it
+    assert parse_qs(urlsplit(_return_url(page.text)).query) == {"code": [hostile]}
+
+
+def test_a_refused_login_reaches_the_app_through_the_same_page(client):
+    """The BFF sends a refusal to this URL too (`?error=…`) and the app reads the reason off the
+    scheme URL like any other outcome — so the page forwards it, and does not claim a sign-in."""
+    page = _callback_page(client, error="access_denied")
+
+    assert parse_qs(urlsplit(_return_url(page.text)).query) == {"error": ["access_denied"]}
+    assert "Signed in" not in page.text
+    # The control for that absence: a successful landing really is worded that way.
+    assert "Signed in" in _callback_page(client, code="handoff-abc").text
+
+
+def test_the_callback_page_offers_the_bare_scheme_url_when_given_nothing(client):
+    assert _return_url(_callback_page(client).text) == RETURN_SCHEME_URL
+
+
+def test_the_callback_pages_return_script_is_allowed_to_run(client):
+    """The automatic attempt is an inline script and the app-wide policy is `script-src 'self'`,
+    which a browser enforces by silently refusing it — leaving the button as the only lane that
+    ever works. So this response has to name that script's digest, and the script it names has to
+    be the one reviewed: both are checked against `RETURN_SCRIPT_SHA256`, never against each other.
+    """
+    page = _callback_page(client, code="handoff-abc")
+    script = re.search(r"<script>(.*?)</script>", page.text, re.S)
+    assert script is not None, page.text
+    assert "location.href" in script.group(1)
+    served = base64.b64encode(hashlib.sha256(script.group(1).encode()).digest()).decode()
+    assert served == RETURN_SCRIPT_SHA256
+
+    policy = page.headers["content-security-policy"]
+    assert f"script-src 'self' 'sha256-{RETURN_SCRIPT_SHA256}'" in policy
+    # Widened for one script, not weakened: every other directive is still the app-wide one.
+    assert [d for d in policy.split("; ") if not d.startswith("script-src")] == [
+        d for d in APP_CSP.split("; ") if not d.startswith("script-src")
+    ]
+    # And the widening belongs to this page alone, not to the app.
+    assert client.get("/health").headers["content-security-policy"] == APP_CSP
+
+
+def test_the_callback_page_is_never_stored(client):
+    """It now renders a live one-shot handoff code into its body; a cache holding that body would
+    hand the next reader a credential. The static page it replaced was cacheable."""
+    assert _callback_page(client, code="handoff-abc").headers["cache-control"] == "no-store"
 
 
 def test_aasa_is_404_while_no_app_claims_this_domain(client):
