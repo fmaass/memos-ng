@@ -54,6 +54,7 @@ vi.mock('@tanstack/vue-query', () => ({
         mime: 'image/jpeg',
         status: 'ready',
         blurhash: null,
+      sha256: null,
         width: 800,
         height: 600,
         mine: true,

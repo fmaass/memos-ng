@@ -46,6 +46,7 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     mime: 'image/jpeg',
     status: 'ready' as const,
     blurhash: null,
+      sha256: null,
     ...dims,
     duration: null,
     mine: true,

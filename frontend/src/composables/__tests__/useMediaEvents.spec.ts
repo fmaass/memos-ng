@@ -50,7 +50,7 @@ function client(): QueryClient {
 }
 
 function withMeta(
-  meta: Record<string, unknown> = { width: null, height: null, blurhash: null },
+  meta: Record<string, unknown> = { width: null, height: null, blurhash: null, sha256: null },
 ): TimelineData {
   return {
     pages: [{ items: [{ attachments: [{ uid: 'x', status: 'processing', ...meta }] }] }],
@@ -119,7 +119,7 @@ describe('applyMediaEvent', () => {
   })
 
   it('ignores a half dimension pair rather than mixing it with the stored one', () => {
-    const att = applyMediaEvent(withMeta({ width: 1200, height: 900, blurhash: null }), {
+    const att = applyMediaEvent(withMeta({ width: 1200, height: 900, blurhash: null, sha256: null }), {
       uid: 'x',
       status: 'ready',
       width: 7,

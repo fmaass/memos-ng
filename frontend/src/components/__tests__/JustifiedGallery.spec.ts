@@ -10,6 +10,7 @@ function item(uid = 'a1') {
     mime: 'image/jpeg',
     status: 'ready' as const,
     blurhash: null,
+      sha256: null,
     width: 400,
     height: 300,
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
