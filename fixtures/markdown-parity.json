@@ -315,6 +315,18 @@
       ]
     },
     {
+      "id": "link-reference-dangling",
+      "markdown": "[missing][nope] and ![alt][nope] stay text.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "[missing][nope] and ![alt][nope] stay text.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
       "id": "link-reference-duplicate-refused-first",
       "markdown": "[pic]: javascript:alert(1)\n[pic]: https://example.com/red.png\n\n![alt][pic]",
       "projection": [
@@ -338,6 +350,42 @@
       ]
     },
     {
+      "id": "link-reference-duplicate-stripped-first",
+      "markdown": "[f]: ftp://example.com/first\n[f]: https://example.com/second\n\n[the file][f]",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "the file",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-reference-ftp",
+      "markdown": "[the file][f], a collapsed [f][] and a bare [f].\n\n[f]: ftp://example.com/pub/readme.txt",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "the file, a collapsed f and a bare f.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-reference-ftp-inside-fence",
+      "markdown": "[pic]: ftp://example.com/chart.png\n\n~~~\n![alt][pic]\n~~~",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "![alt][pic]\n",
+          "type": "code"
+        }
+      ]
+    },
+    {
       "id": "link-reference-image",
       "markdown": "![shot][pic]\n\nThe reference image above renders as nothing.\n\n[pic]: https://example.com/red.png",
       "projection": [
@@ -351,6 +399,30 @@
           "inline": [],
           "links": [],
           "text": "The reference image above renders as nothing.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-reference-image-data-url",
+      "markdown": "![the chart][pic]\n\n[pic]: data:image/png;base64,iVBORw0KGgo=",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "the chart",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-reference-image-ftp",
+      "markdown": "![the chart][pic] and nothing else.\n\n[pic]: ftp://example.com/chart.png",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "the chart and nothing else.",
           "type": "paragraph"
         }
       ]
@@ -447,6 +519,18 @@
           "inline": [],
           "links": [],
           "text": "[click][evil]",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "link-reference-relative",
+      "markdown": "[the host][h] and [the page][p].\n\n[h]: //example.com/path\n[p]: /docs/readme.md",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "the host and the page.",
           "type": "paragraph"
         }
       ]

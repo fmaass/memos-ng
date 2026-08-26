@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -174,11 +175,18 @@ async def finalize_upload(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> AttachmentOut:
     upload = await _get_upload(db, upload_uid, user.id)
+    # A dedup hit hands back an attachment that already holds these bytes, and its part file is
+    # only reaped once the commit below makes the Upload row's deletion real. Unlinking it inside
+    # finalize would destroy the client's only copy if this commit then failed, leaving a restored
+    # upload row promising bytes that are gone (MEMNG-142).
+    consumed: list[str] = []
     try:
-        attachment = await svc.finalize(db, upload, owner_id=user.id)
+        attachment = await svc.finalize(db, upload, owner_id=user.id, consumed_out=consumed)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     await db.commit()
+    if consumed:
+        await to_thread.run_sync(svc.reap_consumed_sync, consumed)
     return AttachmentOut(
         uid=attachment.uid,
         filename=attachment.filename,

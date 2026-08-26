@@ -13,11 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.database import get_session
 from app.models import Attachment, Memo, User, Visibility
-from app.routers import assets
+from app.services import asset_paths, storage
 from app.services import export as export_svc
 from app.services import memos as svc
 from app.services import photobook as photobook_svc
-from app.services import storage
 
 router = APIRouter(prefix="/api", tags=["export"])
 
@@ -60,7 +59,7 @@ def _media_files(memo: Memo, tier: str) -> tuple[export_svc.MediaFile, ...]:
     used: set[str] = set()
     files = []
     for att in memo.attachments:
-        resolved = assets.tier_path(att, tier)
+        resolved = asset_paths.tier_path(att, tier)
         path = resolved[0] if resolved is not None else None
         name = _unique_name(used, _media_name(att, path))
         files.append(

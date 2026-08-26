@@ -1,4 +1,3 @@
-import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -28,6 +27,7 @@ from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
+from app.services import reclaim, storage
 from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
 
@@ -48,8 +48,8 @@ async def _enqueue_frame_shares_safe(db: AsyncSession, memo: Memo, user: User) -
         logger.warning("frame_share.enqueue_error", memo_id=memo.id, error=str(exc)[:200])
 
 
-def _restore_moved(moves: list[tuple[str, str]]) -> None:
-    """Put every original a failed write moved back where it came from (off-loop).
+def _restore_moved(moves: list[storage.TrackedMove]) -> None:
+    """Put every original a failed write moved back where it came from.
 
     The DB rollback returns each upload row to pending, so the bytes must return to the part file
     that row names — otherwise the row promises a file that is gone, and the client's only copy is
@@ -59,19 +59,20 @@ def _restore_moved(moves: list[tuple[str, str]]) -> None:
     Reversed, because a freshly finalized master moves TWICE — upload part → originals/_unfiled/ →
     the memo folder — and undoing the last hop first is what walks the bytes back to the part path.
     A restore that fails is logged and LEFT IN PLACE: a file in the wrong directory can still be
-    recovered by hand, an unlinked one cannot."""
-    for src, dest in reversed(moves):
-        try:
-            destination = Path(dest)
-            if not destination.exists():
-                continue  # never moved, or already restored
-            source = Path(src)
-            source.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(destination, source)
-        except OSError as exc:
-            logger.error(
-                "memo.write.restore_failed", src=src, dest=dest, error=str(exc)[:200]
-            )
+    recovered by hand, an unlinked one cannot.
+
+    Called INLINE rather than through `to_thread.run_sync`, for the same reason
+    `_discard_poster_copies` is: the caller may be unwinding a CANCELLED request, where an await is
+    not guaranteed to resume and this would simply be skipped, leaving the originals of a
+    rolled-back write scattered across `_unfiled/` and a memo folder that no longer exists
+    (MEMNG-145). Each move arbitrates with its own placement under a lock, so this is safe to call
+    while a worker thread is still mid-rename. The AST guard in tests/test_no_blocking_io.py cannot
+    see the filesystem work here — it is a method on a class imported from another module — so it
+    is named here instead of hidden behind a marker."""
+    for move in reversed(moves):
+        unrestored = move.restore()
+        if unrestored is not None:
+            logger.error("memo.write.restore_failed", src=move.src, dest=unrestored)
 
 
 def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
@@ -696,11 +697,16 @@ async def create_memo(
         # already-finalized attachment_uids (back-compat). Abandoned composes leave only Uploads.
         # finalize moves files to disk before the commit — if this try then fails, move those
         # originals BACK, so the rolled-back upload rows still name the bytes they promise.
-        moved: list[tuple[str, str]] = []
+        moved: list[storage.TrackedMove] = []
         # A poster override is COPIED into the derived-asset tree (a separate mount, so it cannot
         # be renamed there), which leaves BOTH files alive until this transaction settles: see
         # uploads.PosterCopy for which one each outcome removes. Per-attempt like `moved`.
         poster_copies: list[uploads_svc.PosterCopy] = []
+        # Part files this attempt CONSUMED without moving — a dedup hit hands back an attachment
+        # that already holds these bytes. Their upload rows are deleted transactionally, so the
+        # bytes may only be unlinked once the commit makes that deletion real; until then they are
+        # what a rolled-back row still promises (MEMNG-142). Per-attempt, like `moved`.
+        consumed: list[str] = []
         # The line between "this write may still be undone" and "this memo is stored". Everything
         # the failure path does — discarding posters, moving originals back — destroys files that
         # a COMMITTED memo owns, so it must never run once this is set.
@@ -718,6 +724,7 @@ async def create_memo(
                         moved_out=moved,
                         video_posters=body.video_posters,
                         poster_copies_out=poster_copies,
+                        consumed_out=consumed,
                     )
                     if body.upload_uids or body.video_posters
                     else []
@@ -745,12 +752,15 @@ async def create_memo(
             # cancellation cannot be delivered in that gap, so this flag can never be missing for
             # a memo that is stored.
             committed = True
-            # AFTER the commit, and only then: each consumed poster's part file is now bytes no
-            # row names, and nothing else will ever collect it (the expiry reaper walks `uploads`
-            # rows, and this one is gone). Best-effort by construction — the memo is already
-            # stored, so a file that will not delete must not fail the request.
-            if poster_copies:
-                await to_thread.run_sync(_unlink_all, [c.part for c in poster_copies])
+            # AFTER the commit, and only then: each consumed poster's part file — and each part
+            # a dedup hit consumed — is now bytes no row names, and nothing else will ever collect
+            # it (the expiry reaper walks `uploads` rows, and those are gone). Best-effort by
+            # construction — the memo is already stored, so a file that will not delete must not
+            # fail the request. The failure path deliberately reaps NEITHER: a part left behind by
+            # a write that did not land is exactly what its restored upload row promises.
+            reap = [c.part for c in poster_copies] + consumed
+            if reap:
+                await to_thread.run_sync(_unlink_all, reap)
             return memo
         except BaseException:
             if committed:
@@ -760,15 +770,15 @@ async def create_memo(
                 # out of the memo folder — which is far worse than the leak they would be tidying.
                 # The worst outcome here is an unreaped part file; the memo is complete without it.
                 raise
-            # Posters FIRST, and synchronously. The attachments they belong to are rolled back with
-            # this write, so the placed files would be orphans under uids nothing references —
-            # and the `await` below is not guaranteed to resume when this handler is unwinding a
-            # cancellation, so anything sequenced after it can be skipped entirely. Their part
-            # files stay untouched: that is what leaves the client's poster re-postable.
+            # Posters FIRST, and both of these synchronously. The attachments they belong to are
+            # rolled back with this write, so the placed files would be orphans under uids nothing
+            # references — and an `await` here is not guaranteed to resume when this handler is
+            # unwinding a cancellation, so anything sequenced behind one can be skipped entirely.
+            # Their part files stay untouched: that is what leaves the client's poster re-postable.
             if poster_copies:
                 _discard_poster_copies(poster_copies)
             if moved:
-                await to_thread.run_sync(_restore_moved, moved)
+                _restore_moved(moved)
             raise
 
     if key is None:
@@ -852,7 +862,10 @@ async def patch_memo(
         does not land, every original it moved goes back where it came from."""
         # Same finalize-on-post pattern as create: new uploads become attachments and link to this
         # memo; if the patch rolls back, unlink the moved originals so they don't leak.
-        moved: list[tuple[str, str]] = []
+        moved: list[storage.TrackedMove] = []
+        # Same reason as on create: a dedup hit's part file belongs to an upload row this edit may
+        # still roll back, so it is unlinked after the commit, never before (MEMNG-142).
+        consumed: list[str] = []
         committed = False
         try:
             if key is not None:
@@ -869,7 +882,12 @@ async def patch_memo(
                 # (MEMNG-79); on create there is no memo yet, so only this path can carry one.
                 try:
                     finalized = await uploads_svc.finalize_pending(
-                        db, body.upload_uids, owner_id, moved_out=moved, memo=edited
+                        db,
+                        body.upload_uids,
+                        owner_id,
+                        moved_out=moved,
+                        memo=edited,
+                        consumed_out=consumed,
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
@@ -883,11 +901,15 @@ async def patch_memo(
             await _enqueue_frame_shares_safe(db, edited, user)
             await db.commit()
             committed = True
+            if consumed:
+                await to_thread.run_sync(_unlink_all, consumed)
             await db.refresh(edited)
             return edited
         finally:
+            # Inline, like the create path: an unwinding cancellation would skip anything behind an
+            # await, leaving this edit's originals where the rollback cannot find them (MEMNG-145).
             if not committed and moved:
-                await to_thread.run_sync(_restore_moved, moved)
+                _restore_moved(moved)
 
     if key is None:
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
@@ -931,8 +953,27 @@ async def delete_memo(
     memo = await _require_owned(db, user, uid)
     if memo.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your memo")
-    await svc.delete_memo(db, memo)
+    # PHASE 1: the memo goes and its attachments are left ORPHANED, on purpose. Deleting their rows
+    # here would put this request one crash away from files that no row names any more; an orphan
+    # row is the durable journal that survives the crash and is reconcilable afterwards
+    # (app/services/reclaim.py states the principle in full).
+    orphaned = await svc.delete_memo(db, memo)
     await db.commit()
+    # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
+    # its files, then the row. Each id gets its own transaction, so a failure part way through
+    # leaves the rest as orphans the sweep will finish rather than rolling the memo delete back.
+    for attachment_id in orphaned:
+        result = await reclaim.reclaim_attachment(db, attachment_id, reclaim.Revalidate.ORPHANED)
+        if result.outcome != "reclaimed":
+            # The memo IS deleted — that is what the caller asked for and it has committed, so
+            # this cannot become an error response. A row left behind here is an orphan the
+            # reconcile sweep and the script both find; logged so it is visible before they run.
+            logger.warning(
+                "memo.delete.attachment_not_reclaimed",
+                attachment_id=attachment_id,
+                outcome=result.outcome,
+                failed_paths=list(result.failed_paths),
+            )
 
 
 @router.post("/memos/{uid}/pin", response_model=MemoOut)

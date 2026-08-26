@@ -189,6 +189,54 @@ const CASES: ParityCase[] = [
     markdown: '[evil]:\njavascript:alert(1)\n\n[click][evil]',
   },
   {
+    // The reference FORM of the schemes `link-schemes-ftp-and-relative` pins inline. markdown-it
+    // REGISTERS an `ftp:` definition (its own validator accepts the scheme), so every spelling
+    // that names the label — full, collapsed and shortcut — reaches the SPA's own refusal and
+    // renders as the label's text with no anchor. A consumer that only refuses the inline form
+    // leaves three live `ftp:` links on screen.
+    id: 'link-reference-ftp',
+    markdown:
+      '[the file][f], a collapsed [f][] and a bare [f].\n\n[f]: ftp://example.com/pub/readme.txt',
+  },
+  {
+    // The other half of that pair: a scheme-relative `//host` destination and a document-relative
+    // one, which markdown-it also registers and the SPA also declines to open.
+    id: 'link-reference-relative',
+    markdown: '[the host][h] and [the page][p].\n\n[h]: //example.com/path\n[p]: /docs/readme.md',
+  },
+  {
+    // A reference IMAGE whose definition is `ftp:` — the image is dropped, alt included, the same
+    // way `image-unsafe-scheme` drops an inline one. Nothing of the destination reaches the page.
+    id: 'link-reference-image-ftp',
+    markdown: '![the chart][pic] and nothing else.\n\n[pic]: ftp://example.com/chart.png',
+  },
+  {
+    // …and a `data:` one, which markdown-it registers as readily as any other scheme.
+    id: 'link-reference-image-data-url',
+    markdown: '![the chart][pic]\n\n[pic]: data:image/png;base64,iVBORw0KGgo=',
+  },
+  {
+    // The mirror of `link-reference-duplicate-refused-first`, and the case that separates
+    // "refused" from "stripped": markdown-it ACCEPTS the `ftp:` definition, so it wins the label
+    // and the safe duplicate below it never registers. A consumer that skips definitions its own
+    // policy dislikes resolves the second one and renders a live link the SPA does not.
+    id: 'link-reference-duplicate-stripped-first',
+    markdown: '[f]: ftp://example.com/first\n[f]: https://example.com/second\n\n[the file][f]',
+  },
+  {
+    // A definition registers for the whole document even when the only reference to it is inside
+    // a fence, where it is code and stays text — so the definition is consumed and invisible, and
+    // the fenced line is shown verbatim.
+    id: 'link-reference-ftp-inside-fence',
+    markdown: '[pic]: ftp://example.com/chart.png\n\n~~~\n![alt][pic]\n~~~',
+  },
+  {
+    // No definition at all: both spellings are ordinary text, brackets included. A consumer that
+    // treats an unresolved label as an empty destination would swallow them.
+    id: 'link-reference-dangling',
+    markdown: '[missing][nope] and ![alt][nope] stay text.',
+  },
+  {
     id: 'link-schemes',
     markdown:
       '[site](https://example.com/a?b=1) and [mail](mailto:memo@example.com) are links;\n\n[js](javascript:alert(1)) and [data](data:text/html,hi) are not.',

@@ -18,10 +18,10 @@ from tests.conftest import SYNC_URL
 PNG = b"\x89PNG\r\n\x1a\n"
 
 
-def _destinations(moved: list[tuple[str, str]]) -> list[str]:
-    """Where each tracked move PUT the file — the pairs also carry where it came from, which is
+def _destinations(moved: list[storage.TrackedMove]) -> list[str]:
+    """Where each tracked move PUT the file — the records also carry where it came from, which is
     what lets a rolled-back write walk the bytes back."""
-    return [dest for _, dest in moved]
+    return [m.dest for m in moved if m.dest is not None]
 
 
 def _cleanup():
@@ -100,7 +100,7 @@ async def test_screen_and_print_land_in_memo_folder_under_real_names(adb, monkey
     o = await _owner(adb, "pl_basic")
     screen = await _upload(adb, o, "Holiday Sunset.png", PNG + b"s" * 2000)
     glossy = await _upload(adb, o, "Holiday Sunset - print (glossy).png", PNG + b"g" * 3000)
-    moved: list[tuple[str, str]] = []
+    moved: list[storage.TrackedMove] = []
     finalized = await up_svc.finalize_pending(
         adb, [screen.upload_uid, glossy.upload_uid], o.id, moved_out=moved
     )
@@ -183,7 +183,7 @@ async def test_rollback_unlinks_placed_file_but_never_a_prior_memos_master(
 
     # a new post that will "roll back"
     new = await _upload(adb, o, "new.png", PNG + b"n" * 2000)
-    moved: list[tuple[str, str]] = []
+    moved: list[storage.TrackedMove] = []
     new_uids = await up_svc.finalize_pending(adb, [new.upload_uid], o.id, moved_out=moved)
     await memo_svc.create_memo(
         adb,
@@ -218,7 +218,7 @@ async def test_existing_master_is_not_moved_when_relinked(adb, monkeypatch, tmp_
     placed = att.storage_path
     assert not storage.is_unfiled(placed, Path(settings.DATA_ROOT))
 
-    moved: list[tuple[str, str]] = []
+    moved: list[storage.TrackedMove] = []
     await memo_svc.create_memo(
         adb,
         o,
@@ -347,7 +347,7 @@ async def test_patch_memo_adds_photo_and_places_it(adb, monkeypatch, tmp_path):
     o = await _owner(adb, "pl_patch")
     memo = await memo_svc.create_memo(adb, o, content="m", visibility=Visibility.PUBLIC)
     up = await _upload(adb, o, "added.png", PNG + b"p" * 2000)
-    moved: list[tuple[str, str]] = []
+    moved: list[storage.TrackedMove] = []
     fin = await up_svc.finalize_pending(adb, [up.upload_uid], o.id, moved_out=moved)
     await memo_svc.link_attachments(adb, o.id, memo, fin, moved_out=moved)
     att = await _att(adb, fin[0])

@@ -1,4 +1,3 @@
-import base64
 import re
 import secrets
 import time
@@ -23,6 +22,7 @@ from app.models import (
     memo_tags,
 )
 from app.services import storage
+from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 
 logger = structlog.get_logger(__name__)
 
@@ -41,14 +41,21 @@ def gen_uid() -> str:
 
 
 def encode_cursor(memo: Memo) -> str:
-    raw = f"{memo.created_at.isoformat()}|{memo.id}"
-    return base64.urlsafe_b64encode(raw.encode()).decode()
+    return encode_cursor_payload(f"{memo.created_at.isoformat()}|{memo.id}")
 
 
 def decode_cursor(cursor: str) -> tuple[datetime, int]:
-    raw = base64.urlsafe_b64decode(cursor.encode()).decode()
-    ts, mid = raw.rsplit("|", 1)
-    return datetime.fromisoformat(ts), int(mid)
+    """`InvalidCursor` (→ 422) for anything we did not mint — never an unhandled 500, and never a
+    silent restart from page 1, which would make a paging client loop over the first page for
+    ever. Both failure modes were live before MEMNG-163: the decode had no guard at all."""
+    raw = decode_cursor_payload(cursor)
+    ts, sep, mid = raw.rpartition("|")
+    if not sep:
+        raise InvalidCursor("cursor is not a keyset token")
+    try:
+        return datetime.fromisoformat(ts), int(mid)
+    except ValueError:
+        raise InvalidCursor("cursor is not a keyset token") from None
 
 
 def owner_subjects(owner: str | Sequence[str] | None) -> list[str]:
@@ -100,7 +107,7 @@ async def create_memo(
     pinned: bool = False,
     attachment_uids: Sequence[str] | None = None,
     created_at: datetime | None = None,
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
     idempotency_key: str | None = None,
 ) -> Memo:
     memo = Memo(
@@ -131,18 +138,21 @@ async def _place_attachment_masters(
     att: Attachment,
     dest_dir: Path,
     data_root: Path,
-    moved_out: list[tuple[str, str]] | None,
+    moved_out: list[storage.TrackedMove] | None,
 ) -> None:
     """Move this attachment's still-staged masters (the screen original + each hidden rendition)
     into the memo folder under their real names. ONLY a master in _unfiled/ is moved — an existing
-    (committed) master is left in place (new-writes-only). Each move is tracked in `moved_out` as
-    (source, destination) so a rolled-back post can put it back where it came from."""
+    (committed) master is left in place (new-writes-only). Each move is tracked in `moved_out` so a
+    rolled-back post can put it back where it came from — the record is appended BEFORE the move
+    starts and completed inside the worker thread, so a cancelled request cannot lose it
+    (MEMNG-145; see `storage.TrackedMove`)."""
     if att.storage_path and storage.is_unfiled(att.storage_path, data_root):
         staged = att.storage_path  # read before the reassignment: this is where it came FROM
-        new = await storage.place_master(Path(staged), dest_dir, att.filename)
-        att.storage_path = str(new)
+        track = storage.TrackedMove(src=staged)
         if moved_out is not None:
-            moved_out.append((staged, str(new)))
+            moved_out.append(track)
+        new = await storage.place_master(Path(staged), dest_dir, att.filename, track)
+        att.storage_path = str(new)
     # Query renditions explicitly rather than via the lazy relationship — async lazy access on a
     # just-added child is fragile, and they were inserted in this same transaction.
     rends = (
@@ -157,10 +167,11 @@ async def _place_attachment_masters(
     for r in rends:
         if storage.is_unfiled(r.storage_path, data_root):
             staged = r.storage_path
-            new = await storage.place_master(Path(staged), dest_dir, r.filename)
-            r.storage_path = str(new)
+            track = storage.TrackedMove(src=staged)
             if moved_out is not None:
-                moved_out.append((staged, str(new)))
+                moved_out.append(track)
+            new = await storage.place_master(Path(staged), dest_dir, r.filename, track)
+            r.storage_path = str(new)
 
 
 async def link_attachments(
@@ -168,7 +179,7 @@ async def link_attachments(
     owner_id: int,
     memo: Memo,
     uids: Sequence[str],
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
 ) -> None:
     """Link the caller's OWN attachments to a memo. A uid belonging to another user is silently
     ignored so a memo can never claim someone else's media. Used on create and on edit. As each
@@ -340,7 +351,10 @@ async def list_memos(
     count_ms = round((time.perf_counter() - t_count0) * 1000, 1)
 
     descending = not sort.lstrip("-") == sort  # "-created_at" → desc
-    if cursor:
+    # `is not None`, not truthiness: `?cursor=` (sent empty) used to fall through to page 1, which
+    # is the loop-for-ever failure MEMNG-163 is about — an empty token is a bad token, not "start
+    # over". Callers that page internally (the export walk) still pass None for the first page.
+    if cursor is not None:
         cdt, cid = decode_cursor(cursor)
         if descending:
             conds.append(or_(Memo.created_at < cdt, and_(Memo.created_at == cdt, Memo.id < cid)))
@@ -386,9 +400,36 @@ async def update_memo(db: AsyncSession, memo: Memo, **fields) -> Memo:
     return memo
 
 
-async def delete_memo(db: AsyncSession, memo: Memo) -> None:
+async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
+    """Delete a memo, ORPHANING its attachments; returns their ids for the caller to reclaim after
+    this transaction commits.
+
+    Two phases, and the split is the whole point. Deleting the memo alone was the MEMNG-170 bug —
+    the relationship carries no cascade and the FK is ON DELETE SET NULL, so every attachment
+    survived with `memo_id` NULL, kept appearing in the media library, and kept its files. Deleting
+    the rows HERE instead, in this transaction, trades that for something worse: a crash between
+    this commit and the caller's unlink leaves files with no row at all, and nothing can ever find
+    them again (`app/services/reclaim.py`).
+
+    So this phase deliberately leaves the rows behind, orphaned. That orphan IS the durable
+    journal: it names its own files, and it is exactly what `reclaim.leaked_orphans_stmt` selects,
+    so a create interrupted here is picked up by the worker sweep or the reconcile script rather
+    than lost. The caller then reclaims each id properly — locked, revalidated, files first.
+
+    Reclaim is unconditional, with no reference counting, because an attachment on a memo is
+    exclusively that memo's: `uploads.finalize` only ever dedups onto an UNLINKED attachment
+    (`memo_id IS NULL`), and `link_attachments` refuses to re-point one that already belongs to a
+    different memo. The same bytes posted to a second memo therefore get their own row and their
+    own file, which this delete does not touch.
+
+    The FK stays SET NULL rather than becoming CASCADE, and now for a second reason: CASCADE would
+    make a raw DELETE against the database take the attachment rows with it and leave their files
+    orphaned for ever — the forbidden outcome, reachable by hand from a psql prompt.
+    """
+    orphaned = [att.id for att in memo.attachments]
     await db.delete(memo)
     await db.flush()
+    return orphaned
 
 
 async def list_tags(db: AsyncSession, user: User) -> list[tuple[str, int]]:
