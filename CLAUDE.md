@@ -76,6 +76,17 @@ local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn con
 - SSH alias: **`ssh saturn.local`** (Host in `~/.ssh/config`, port 27022, user `fabian`).
   **merkur** (`ssh merkur.local`) is the Mac mini M1 **build host for the iOS client** — no app
   containers run there; **jupiter is the local machine** that runs the app and worker.
+- **The orchestrator drives merkur over SSH end-to-end — never hand iOS build/archive/upload
+  steps back to the user.** `git pull`, `./bin/generate.sh`, the gate, and the release all run via
+  `ssh merkur.local`; export `PATH=/opt/homebrew/bin:$PATH` and
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` first (neither `xcodegen` nor the real
+  `xcodebuild` is on the non-interactive PATH). The TestFlight release is **`fastlane beta`** (App
+  Store Connect API key + a dedicated `memosng-ci` keychain — codesign can't reach the GUI login
+  keychain over SSH, `errSecInternalComponent`); it archives and hand-assembles the IPA because
+  Xcode 26.6's `-exportArchive` fails with an opaque `Copy failed`. Distribution to the `household`
+  internal group is automatic. Full procedure: the iOS repo's `docs/TESTFLIGHT.md` §8b. (2026-08-26:
+  two bad TestFlight builds came from hand-driven archives — a checkout 6 commits behind main, then
+  a stale-DerivedData archive with the old avatar — before the build was taken over SSH.)
 - Non-interactive SSH needs **full paths + sudo** for docker/git:
   `sudo /usr/local/bin/docker …`, `/usr/local/bin/git …`. docker/git are in the sudo
   exclusion list (no password). Other commands (mkdir, tee) have **no** sudo — write via
