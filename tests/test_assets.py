@@ -516,6 +516,163 @@ def test_list_attachments_owner_scoped_and_type_filter(logged_in_client):
         eng.dispose()
 
 
+# --- keyset pagination on the library list (MEMNG-121) ---
+
+
+def _set_created_at(ts, *aids):
+    """Force a shared created_at on seeded rows — the timestamp tie the cursor must survive."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        for aid in aids:
+            c.execute(
+                text("UPDATE attachments SET created_at=CAST(:t AS timestamptz) WHERE id=:a"),
+                {"t": ts, "a": aid},
+            )
+    eng.dispose()
+
+
+def _walk(client, url, limit):
+    """Page the library to its end. Returns (uids in the order they arrived, pages fetched).
+
+    Follows ONLY what the server hands back — a walk that invented its own offsets could not
+    catch a cursor that skips or repeats.
+    """
+    uids, cursor, pages = [], None, 0
+    while True:
+        sep = "&" if "?" in url else "?"
+        query = f"{url}{sep}limit={limit}" + (f"&cursor={cursor}" if cursor else "")
+        r = client.get(query)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert isinstance(body, list)  # every page keeps the bare-list shape
+        assert len(body) <= limit
+        uids += [i["uid"] for i in body]
+        pages += 1
+        cursor = r.headers.get("x-next-cursor")
+        if not cursor:
+            return uids, pages
+        assert pages < 200, "cursor never terminated"
+
+
+def test_list_attachments_pages_by_cursor_across_a_timestamp_tie(logged_in_client):
+    """Five rows sharing one created_at, walked two at a time: every row exactly once, in the
+    same order the unpaged call returns. A non-strict comparison would repeat the boundary row;
+    an offset that ignored the tie would skip one."""
+    client, subject = logged_in_client
+    aids = [_seed_attachment(f"pg-{n}", subject) for n in range(5)]
+    _set_created_at("2026-01-01T00:00:00Z", *aids)
+    try:
+        unpaged = [i["uid"] for i in client.get("/api/attachments").json()]
+        newest_first = [f"pg-{n}" for n in reversed(range(5))]
+        assert [u for u in unpaged if u.startswith("pg-")] == newest_first
+
+        paged, pages = _walk(client, "/api/attachments", 2)
+        assert pages >= 3  # it really paged
+        assert len(paged) == len(set(paged))  # no row served twice
+        assert [u for u in paged if u.startswith("pg-")] == newest_first  # no gap, same order
+    finally:
+        _cleanup(*aids)
+
+
+def test_attachment_cursor_composes_with_the_type_filter(logged_in_client):
+    """?type is applied per page, not after paging: images and videos are interleaved by id, so a
+    filter that ran on an already-cut page would return short pages and lose images."""
+    client, subject = logged_in_client
+    aids = []
+    for n in range(3):
+        aids.append(_seed_attachment(f"tf-img-{n}", subject, mime="image/jpeg"))
+        aids.append(_seed_attachment(f"tf-vid-{n}", subject, mime="video/mp4"))
+    try:
+        paged, pages = _walk(client, "/api/attachments?type=image", 1)
+        assert pages >= 3
+        assert [u for u in paged if u.startswith("tf-")] == ["tf-img-2", "tf-img-1", "tf-img-0"]
+        assert not any(u.startswith("tf-vid") for u in paged)
+    finally:
+        _cleanup(*aids)
+
+
+def test_attachment_pagination_never_leaks_another_users_private_media(logged_in_client):
+    """The visibility rules hold on EVERY page, not just the first — walked one page at a time."""
+    client, subject = logged_in_client
+    _mk_user("pgsharer")
+    pub_m, pub_a = _seed_memo_with_attachment("pg-pubm", "pg-pub", "pgsharer", "PUBLIC")
+    priv_m, priv_a = _seed_memo_with_attachment("pg-privm", "pg-priv", "pgsharer", "PRIVATE")
+    orphan = _seed_attachment("pg-orph", "pgsharer")  # another user's unlinked media
+    mine = [_seed_attachment(f"pg-mine-{n}", subject) for n in range(2)]
+    try:
+        paged, pages = _walk(client, "/api/attachments", 2)
+        assert pages >= 2
+        assert {"pg-pub", "pg-mine-0", "pg-mine-1"} <= set(paged)
+        assert "pg-priv" not in paged  # another user's PRIVATE memo media
+        assert "pg-orph" not in paged  # another user's orphan
+    finally:
+        _cleanup(pub_a, priv_a, orphan, *mine)
+        _rm("pgsharer", pub_m, priv_m)
+
+
+def test_list_attachments_without_a_cursor_is_the_unchanged_bare_list(logged_in_client):
+    """The SPA's media library sends no cursor and reads the body as an array (ResourcesView) —
+    paging must not have wrapped it in an envelope or changed an item's keys."""
+    client, subject = logged_in_client
+    aids = [_seed_attachment(f"gold-{n}", subject) for n in range(3)]
+    try:
+        r = client.get("/api/attachments")
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body, list)
+        item = next(i for i in body if i["uid"] == "gold-2")
+        assert set(item) == {
+            "uid",
+            "mime",
+            "status",
+            "blurhash",
+            "width",
+            "height",
+            "mine",
+            "hasPrint",
+            "hasLegacyPrint",
+            "renditions",
+            "orphan",
+            "thumbnailUrl",
+            "previewUrl",
+            "webUrl",
+            "posterUrl",
+            "downloadUrl",
+            "printUrl",
+        }
+        assert "x-next-cursor" not in r.headers  # nothing left → no continuation offered
+
+        full = client.get("/api/attachments?limit=2")  # a full page says where to continue
+        assert isinstance(full.json(), list) and len(full.json()) == 2
+        assert full.headers["x-next-cursor"]
+    finally:
+        _cleanup(*aids)
+
+
+def test_an_unreadable_attachment_cursor_is_rejected(logged_in_client):
+    """A cursor the server did not mint is a client error, never a 500 and never a silent
+    full-library reset (which would make a paging client loop forever)."""
+    client, _ = logged_in_client
+    for bad in ("not base64 at all!", "Zm9v", ""):  # garbage, valid base64 of "foo", empty
+        assert client.get(f"/api/attachments?cursor={bad}").status_code == 422, bad
+
+
+def test_attachment_cursor_round_trips_and_refuses_junk():
+    from app.models import Attachment
+    from app.routers.assets import decode_attachment_cursor, encode_attachment_cursor
+    from fastapi import HTTPException
+
+    cursor = encode_attachment_cursor(Attachment(id=4711))
+    assert decode_attachment_cursor(cursor) == 4711
+    for bad in ("", "Zm9v", "%%%"):
+        try:
+            decode_attachment_cursor(bad)
+        except HTTPException as exc:
+            assert exc.status_code == 422
+        else:
+            raise AssertionError(f"{bad!r} was accepted as a cursor")
+
+
 # --- HMAC-signed asset URLs: the DB-free serve fast path ---
 import time as _time  # noqa: E402
 

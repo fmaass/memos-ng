@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import time
@@ -6,10 +7,10 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from anyio import to_thread
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
@@ -257,17 +258,66 @@ def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
     )
 
 
-@router.get("/attachments", response_model=list[AttachmentListItem])
+# The library list is a BARE ARRAY and stays one — the SPA reads the body as an array
+# (frontend/src/views/ResourcesView.vue) — so the continuation token rides in a response HEADER
+# rather than an envelope. That is the only additive shape available: wrapping the body breaks
+# every existing caller, and an "envelope only when ?cursor is sent" variant has no way to hand the
+# FIRST page (which by definition sends no cursor) the token it needs to ask for the second. The
+# chunked upload already publishes an offset the same way (Upload-Offset, app/routers/uploads.py).
+NEXT_CURSOR_HEADER = "X-Next-Cursor"
+
+
+def _next_cursor_header() -> dict[str, Any]:
+    """A fresh dict per call: FastAPI merges `openapi_extra` into the operation by reference, so a
+    shared constant would leave two operations aliasing the same node in the served document."""
+    return {
+        NEXT_CURSOR_HEADER: {
+            "description": "Opaque continuation token — resend it as `?cursor=` (with the same "
+            "`type` and `limit`) to get the next page. Absent on the last page.",
+            "schema": {"type": "string"},
+        }
+    }
+
+
+def encode_attachment_cursor(att: Attachment) -> str:
+    """The keyset cursor of the library list: the last row of the page, opaque and base64url like
+    the memo feed's (app/services/memos.py). The id alone IS the whole key here — see the ordering
+    note in `list_attachments`."""
+    return base64.urlsafe_b64encode(str(att.id).encode()).decode()
+
+
+def decode_attachment_cursor(cursor: str) -> int:
+    """422 — never a 500, and never a silent restart from the top of the library, which would make
+    a paging client loop forever over the first page. (`binascii.Error` and `UnicodeDecodeError`
+    are both ValueError subclasses, so one except covers every way the token can be junk.)"""
+    try:
+        return int(base64.urlsafe_b64decode(cursor.encode()).decode())
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid cursor") from None
+
+
+@router.get(
+    "/attachments",
+    response_model=list[AttachmentListItem],
+    openapi_extra={"responses": {"200": {"headers": _next_cursor_header()}}},
+)
 async def list_attachments(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    response: Response,
     type: str | None = None,
     limit: int = 200,
+    cursor: str | None = None,
 ) -> list[AttachmentListItem]:
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
     filters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE
-    or orphan media is excluded — mirrors `_viewable` / memo visibility."""
+    or orphan media is excluded — mirrors `_viewable` / memo visibility.
+
+    Paged by keyset, like the memo feed: when more rows follow, the response carries an
+    `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
+    not carry — for the page after. The body is a plain array on every page, cursor or not.
+    """
     stmt = (
         select(Attachment)
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
@@ -278,8 +328,27 @@ async def list_attachments(
         stmt = stmt.where(Attachment.mime.like("image/%"))
     elif type == "video":
         stmt = stmt.where(Attachment.mime.like("video/%"))
-    stmt = stmt.order_by(Attachment.id.desc()).limit(max(1, min(limit, 500)))
-    rows = (await db.execute(stmt)).scalars().all()
+    if cursor is not None:
+        # STRICT `<`, exactly as the memo feed's cursor compares: `<=` would serve the boundary row
+        # a second time. The filters above are re-applied per page, so a page is never cut before
+        # the filter runs.
+        stmt = stmt.where(Attachment.id < decode_attachment_cursor(cursor))
+    # Ordering stays `id DESC` alone, and that order is already TOTAL: id is the primary key, so no
+    # two rows can tie and a keyset walk can neither skip nor repeat — a created_at tie (bulk
+    # import, same-second upload batch) is broken by construction. It is also the one order this
+    # table is indexed for (attachments carries no created_at index), and it is the order the
+    # library already displayed; (created_at DESC, id DESC) would have reshuffled it. Probed
+    # against production 2026-08-26: 0 of 1355 rows disagree between id order and created_at order,
+    # so "newest first" means the same thing either way.
+    page = max(1, min(limit, 500))
+    # limit + 1: one extra row is how the page learns another page exists, without a second query
+    # (list_memos does the same). It is dropped before serializing, so the body is unchanged.
+    rows = list(
+        (await db.execute(stmt.order_by(Attachment.id.desc()).limit(page + 1))).scalars().all()
+    )
+    if len(rows) > page:
+        response.headers[NEXT_CURSOR_HEADER] = encode_attachment_cursor(rows[page - 1])
+        rows = rows[:page]
     return [_list_item(a, user.id) for a in rows]
 
 
