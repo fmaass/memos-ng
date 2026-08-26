@@ -701,6 +701,11 @@ async def create_memo(
         # be renamed there), which leaves BOTH files alive until this transaction settles: see
         # uploads.PosterCopy for which one each outcome removes. Per-attempt like `moved`.
         poster_copies: list[uploads_svc.PosterCopy] = []
+        # Part files this attempt CONSUMED without moving — a dedup hit hands back an attachment
+        # that already holds these bytes. Their upload rows are deleted transactionally, so the
+        # bytes may only be unlinked once the commit makes that deletion real; until then they are
+        # what a rolled-back row still promises (MEMNG-142). Per-attempt, like `moved`.
+        consumed: list[str] = []
         # The line between "this write may still be undone" and "this memo is stored". Everything
         # the failure path does — discarding posters, moving originals back — destroys files that
         # a COMMITTED memo owns, so it must never run once this is set.
@@ -718,6 +723,7 @@ async def create_memo(
                         moved_out=moved,
                         video_posters=body.video_posters,
                         poster_copies_out=poster_copies,
+                        consumed_out=consumed,
                     )
                     if body.upload_uids or body.video_posters
                     else []
@@ -745,12 +751,15 @@ async def create_memo(
             # cancellation cannot be delivered in that gap, so this flag can never be missing for
             # a memo that is stored.
             committed = True
-            # AFTER the commit, and only then: each consumed poster's part file is now bytes no
-            # row names, and nothing else will ever collect it (the expiry reaper walks `uploads`
-            # rows, and this one is gone). Best-effort by construction — the memo is already
-            # stored, so a file that will not delete must not fail the request.
-            if poster_copies:
-                await to_thread.run_sync(_unlink_all, [c.part for c in poster_copies])
+            # AFTER the commit, and only then: each consumed poster's part file — and each part
+            # a dedup hit consumed — is now bytes no row names, and nothing else will ever collect
+            # it (the expiry reaper walks `uploads` rows, and those are gone). Best-effort by
+            # construction — the memo is already stored, so a file that will not delete must not
+            # fail the request. The failure path deliberately reaps NEITHER: a part left behind by
+            # a write that did not land is exactly what its restored upload row promises.
+            reap = [c.part for c in poster_copies] + consumed
+            if reap:
+                await to_thread.run_sync(_unlink_all, reap)
             return memo
         except BaseException:
             if committed:
@@ -853,6 +862,9 @@ async def patch_memo(
         # Same finalize-on-post pattern as create: new uploads become attachments and link to this
         # memo; if the patch rolls back, unlink the moved originals so they don't leak.
         moved: list[tuple[str, str]] = []
+        # Same reason as on create: a dedup hit's part file belongs to an upload row this edit may
+        # still roll back, so it is unlinked after the commit, never before (MEMNG-142).
+        consumed: list[str] = []
         committed = False
         try:
             if key is not None:
@@ -869,7 +881,12 @@ async def patch_memo(
                 # (MEMNG-79); on create there is no memo yet, so only this path can carry one.
                 try:
                     finalized = await uploads_svc.finalize_pending(
-                        db, body.upload_uids, owner_id, moved_out=moved, memo=edited
+                        db,
+                        body.upload_uids,
+                        owner_id,
+                        moved_out=moved,
+                        memo=edited,
+                        consumed_out=consumed,
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
@@ -883,6 +900,8 @@ async def patch_memo(
             await _enqueue_frame_shares_safe(db, edited, user)
             await db.commit()
             committed = True
+            if consumed:
+                await to_thread.run_sync(_unlink_all, consumed)
             await db.refresh(edited)
             return edited
         finally:

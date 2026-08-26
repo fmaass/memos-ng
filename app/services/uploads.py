@@ -12,6 +12,7 @@ from threading import Lock
 from typing import BinaryIO, Literal
 
 import puremagic
+import structlog
 from anyio import to_thread
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +32,8 @@ from app.models import (
 )
 from app.services import poster, storage
 from app.services.variants import ParsedName, parse_variant
+
+logger = structlog.get_logger(__name__)
 
 
 def _data_root() -> Path:
@@ -199,6 +202,21 @@ def _unlink_many_sync(paths: list[Path]) -> None:
     against a bind-mounted share. Errors propagate exactly as a single unlink's would."""
     for path in paths:
         path.unlink(missing_ok=True)
+
+
+def reap_consumed_sync(paths: list[str]) -> None:
+    """Unlink the part files of a COMMITTED write's consumed uploads (off-loop; never raises).
+
+    Their Upload rows are gone for good now, and the expiry reaper only finds parts by walking
+    those rows — so a part left here is leaked permanently rather than collected later. It is
+    still only a leak: the write has landed, so a file that will not delete must be logged and
+    left rather than turned into a 500 on a request that already succeeded.
+    """
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.error("uploads.consumed_reap_failed", path=path, error=str(exc)[:200])
 
 
 def _create_part_sync(path: Path) -> None:
@@ -668,6 +686,29 @@ async def attach_video_poster(
     return dest
 
 
+async def _consume(part: Path, consumed_out: list[str] | None) -> None:
+    """Settle the part file of an upload this call consumed WITHOUT moving it — a dedup hit, a
+    write-once rendition re-dump, a lost rendition race. Each of those deletes the Upload row and
+    returns something that already exists on disk.
+
+    Deleting the bytes here was wrong (MEMNG-142): the row deletion is transactional and the
+    unlink is not, so a LATER failure in the same write — another upload's finalize, the memo
+    commit itself — rolls the row back to pending while its bytes are already gone. The retry the
+    client is entitled to then fails `uploads_incomplete` on a row the API says is consumable, and
+    nothing can put it right: the only copy was on the client.
+
+    So a caller that has a transaction to settle passes `consumed_out` and unlinks after its
+    commit (the same after-the-commit reap a consumed poster's part gets — see `PosterCopy`);
+    the record is appended with NO await between the decision and the append, so a cancellation
+    cannot leave a consumed part unrecorded. `None` keeps the old immediate unlink for a caller
+    with nothing to roll back to.
+    """
+    if consumed_out is not None:
+        consumed_out.append(str(part))
+        return
+    await to_thread.run_sync(_unlink_sync, part)
+
+
 async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
@@ -676,6 +717,7 @@ async def finalize_pending(
     memo: Memo | None = None,
     video_posters: dict[str, str] | None = None,
     poster_copies_out: list[PosterCopy] | None = None,
+    consumed_out: list[str] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -692,7 +734,9 @@ async def finalize_pending(
     memo transaction commits — a non-transactional side effect. Each genuinely-moved path is
     appended to `moved_out` as (source, destination) (inside those functions, new-file branch only)
     so a caller whose post rolls back can move it BACK to where it came from, leaving the upload
-    pending and intact. A dedup return moves nothing and appends nothing.
+    pending and intact. A dedup return moves nothing, and appends its part file to `consumed_out`
+    instead: those bytes are still promised by an Upload row this transaction may yet restore, so
+    they are unlinked by the CALLER after its commit, never here (MEMNG-142, see `_consume`).
 
     Screen/print grouping runs in three steps, in this order (MEMNG-79 — the in-batch-only rule of
     PLAN_2026-06-21_variant-renditions.md is superseded by the memo-sibling step):
@@ -760,7 +804,14 @@ async def finalize_pending(
         never attached to anything and keeps the override's destination provably unused.
         """
         poster_upload = posters.get(upload.upload_uid)
-        att = await finalize(db, upload, owner_id, moved_out, dedup=poster_upload is None)
+        att = await finalize(
+            db,
+            upload,
+            owner_id,
+            moved_out,
+            dedup=poster_upload is None,
+            consumed_out=consumed_out,
+        )
         if poster_upload is not None:
             assert poster_copies_out is not None  # guaranteed by the guard above
             await attach_video_poster(db, poster_upload, att, poster_copies_out)
@@ -786,7 +837,7 @@ async def finalize_pending(
         screen = base_to_attachment.get(parsed.base)
         vk = parsed.variant_key
         if screen is not None and vk is not None and (screen.id, vk) not in seen:
-            await finalize_rendition(db, upload, screen, parsed, moved_out)
+            await finalize_rendition(db, upload, screen, parsed, moved_out, consumed_out)
             seen.add((screen.id, vk))
             continue
         # No screen in THIS batch: before promoting, look for the screen on the memo being saved —
@@ -814,6 +865,7 @@ async def finalize(
     moved_out: list[tuple[str, str]] | None = None,
     *,
     dedup: bool = True,
+    consumed_out: list[str] | None = None,
 ) -> Attachment:
     """Turn one fully-received upload into this owner's attachment (or, by dedup, hand back the
     unlinked one that already holds these bytes).
@@ -821,6 +873,9 @@ async def finalize(
     `dedup=False` opts out of that reuse and always creates a new row. Its one caller is a video
     carrying a client-supplied poster: the override is written to a path derived from the returned
     attachment's uid, so that uid has to be one this request minted (see finalize_pending).
+
+    `consumed_out` collects the part files this call CONSUMED without moving — see
+    `finalize_pending` for why the caller has to unlink them after its commit rather than here.
     """
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
@@ -861,7 +916,7 @@ async def finalize(
         else None
     )
     if existing is not None:
-        await to_thread.run_sync(_unlink_sync, part)
+        await _consume(part, consumed_out)
         await db.delete(upload)
         await db.flush()
         return existing
@@ -910,6 +965,7 @@ async def finalize_rendition(
     attachment: Attachment,
     parsed: ParsedName,
     moved_out: list[tuple[str, str]] | None = None,
+    consumed_out: list[str] | None = None,
 ) -> AttachmentRendition | None:
     """Attach a hidden, download-only rendition (print master) to its screen `attachment`. Writes a
     UNIQUE uuid-named file (never a shared/deterministic path → safe to delete, never overwrites a
@@ -931,7 +987,7 @@ async def finalize_rendition(
         )
     ).scalar_one_or_none()
     if existing is not None:  # write-once — a re-dump of the same key changes nothing
-        await to_thread.run_sync(_unlink_sync, part)
+        await _consume(part, consumed_out)
         await db.delete(upload)
         await db.flush()
         return None
@@ -963,7 +1019,7 @@ async def finalize_rendition(
             db.add(rendition)
             await db.flush()
     except IntegrityError:  # lost a concurrent race for this (attachment, variant_key) → no-op
-        await to_thread.run_sync(_unlink_sync, part)
+        await _consume(part, consumed_out)
         await db.delete(upload)
         await db.flush()
         return None
