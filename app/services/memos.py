@@ -107,7 +107,7 @@ async def create_memo(
     pinned: bool = False,
     attachment_uids: Sequence[str] | None = None,
     created_at: datetime | None = None,
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
     idempotency_key: str | None = None,
 ) -> Memo:
     memo = Memo(
@@ -138,18 +138,21 @@ async def _place_attachment_masters(
     att: Attachment,
     dest_dir: Path,
     data_root: Path,
-    moved_out: list[tuple[str, str]] | None,
+    moved_out: list[storage.TrackedMove] | None,
 ) -> None:
     """Move this attachment's still-staged masters (the screen original + each hidden rendition)
     into the memo folder under their real names. ONLY a master in _unfiled/ is moved — an existing
-    (committed) master is left in place (new-writes-only). Each move is tracked in `moved_out` as
-    (source, destination) so a rolled-back post can put it back where it came from."""
+    (committed) master is left in place (new-writes-only). Each move is tracked in `moved_out` so a
+    rolled-back post can put it back where it came from — the record is appended BEFORE the move
+    starts and completed inside the worker thread, so a cancelled request cannot lose it
+    (MEMNG-145; see `storage.TrackedMove`)."""
     if att.storage_path and storage.is_unfiled(att.storage_path, data_root):
         staged = att.storage_path  # read before the reassignment: this is where it came FROM
-        new = await storage.place_master(Path(staged), dest_dir, att.filename)
-        att.storage_path = str(new)
+        track = storage.TrackedMove(src=staged)
         if moved_out is not None:
-            moved_out.append((staged, str(new)))
+            moved_out.append(track)
+        new = await storage.place_master(Path(staged), dest_dir, att.filename, track)
+        att.storage_path = str(new)
     # Query renditions explicitly rather than via the lazy relationship — async lazy access on a
     # just-added child is fragile, and they were inserted in this same transaction.
     rends = (
@@ -164,10 +167,11 @@ async def _place_attachment_masters(
     for r in rends:
         if storage.is_unfiled(r.storage_path, data_root):
             staged = r.storage_path
-            new = await storage.place_master(Path(staged), dest_dir, r.filename)
-            r.storage_path = str(new)
+            track = storage.TrackedMove(src=staged)
             if moved_out is not None:
-                moved_out.append((staged, str(new)))
+                moved_out.append(track)
+            new = await storage.place_master(Path(staged), dest_dir, r.filename, track)
+            r.storage_path = str(new)
 
 
 async def link_attachments(
@@ -175,7 +179,7 @@ async def link_attachments(
     owner_id: int,
     memo: Memo,
     uids: Sequence[str],
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
 ) -> None:
     """Link the caller's OWN attachments to a memo. A uid belonging to another user is silently
     ignored so a memo can never claim someone else's media. Used on create and on edit. As each

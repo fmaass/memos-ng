@@ -228,20 +228,22 @@ async def test_dedup_finalize_tracks_no_file_for_rollback(adb, monkeypatch, tmp_
     o = await _owner(adb, "vp_moved")
     data = b"dup-bytes" * 500
     up1 = await _upload(adb, o, "a.bin", data, mime="application/octet-stream")
-    moved1: list[tuple[str, str]] = []
+    moved1: list[storage.TrackedMove] = []
     att1 = await svc.finalize(adb, up1, o.id, moved1)
     # tracked as (where it came from, where it went) — the source is what a rollback restores it to
-    assert moved1 == [(str(svc.part_path(up1.upload_uid)), att1.storage_path)]
+    assert [(m.src, m.dest) for m in moved1] == [
+        (str(svc.part_path(up1.upload_uid)), att1.storage_path)
+    ]
     assert Path(att1.storage_path).exists()
 
     up2 = await _upload(adb, o, "b.bin", data, mime="application/octet-stream")
-    moved2: list[tuple[str, str]] = []
+    moved2: list[storage.TrackedMove] = []
     att2 = await svc.finalize(adb, up2, o.id, moved2)
     assert att2.uid == att1.uid  # deduped
     assert moved2 == []  # THE FIX: a dedup return tracks nothing for rollback
 
-    for _, dest in moved2:  # simulate the compose rolling back → undo tracked moves
-        Path(dest).unlink(missing_ok=True)
+    for move in moved2:  # simulate the compose rolling back → undo tracked moves
+        move.restore()
     assert Path(att1.storage_path).exists()  # the original survives
 
 
@@ -256,7 +258,7 @@ async def test_cross_batch_print_binds_to_the_memos_screen_sibling(adb, monkeypa
 
     body = PNG + b"p" * 3000
     pr = await _upload(adb, o, "_AR59988 - print.png", body)  # a batch of its own, 14 min later
-    moved: list[tuple[str, str]] = []
+    moved: list[storage.TrackedMove] = []
     out = await svc.finalize_pending(adb, [pr.upload_uid], o.id, moved_out=moved, memo=memo)
 
     assert out == []  # nothing promoted → nothing new for link_attachments to link
@@ -270,7 +272,7 @@ async def test_cross_batch_print_binds_to_the_memos_screen_sibling(adb, monkeypa
     assert Path(att.print_path).parent == folder  # placed beside the screen, under its real name
     assert Path(att.print_path).name == "_AR59988 - print.png"
     # freshly placed → moved back to its part file if the edit rolls back
-    assert att.print_path in [dest for _, dest in moved]
+    assert att.print_path in [m.dest for m in moved]
     assert await _renditions(adb, att.id) == []
     jobs = (await adb.execute(select(func.count()).select_from(MediaJob))).scalar_one()
     assert jobs == 1  # only the screen's; a bound print master gets no derivation job

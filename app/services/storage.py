@@ -9,8 +9,12 @@ an existing (committed) master is never moved — so no GC, lock, or migration i
 
 import os
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from anyio import to_thread
 
@@ -19,6 +23,80 @@ MAX_NAME_LEN = 200
 
 # The ` (n)` tail `_reserve` appends on a collision — n starts at 2, so ` (1)` is a literal name.
 _BUMPED = re.compile(r"^(?P<stem>.*) \((?:[2-9]|[1-9]\d+)\)$")
+
+
+class MoveAbandoned(Exception):
+    """The write that asked for this move has already unwound, so the move must not happen."""
+
+
+@dataclass
+class TrackedMove:
+    """One original on its way to a new path, and the arbitration that keeps a cancelled request
+    from leaving it somewhere nothing recorded.
+
+    Every one of these moves is a rename inside the data volume, made BEFORE the memo transaction
+    commits — so a write that does not land has to walk each of them back. The bookkeeping used to
+    be appended by the async caller AFTER awaiting the move, which is exactly where a cancellation
+    lands: anyio raises out of the await while the worker thread carries on renaming, so the file
+    moved and the append never ran, leaving an original in `originals/_unfiled/` or a memo folder
+    that no rollback could find (MEMNG-145).
+
+    So the record is appended to the write's move list BEFORE the worker starts, and it is the
+    WORKER — which nothing can interrupt — that performs the move and fills in `dest`, both under
+    this record's lock. `restore()` takes the same lock, so the two can only happen in one order or
+    the other, never interleaved: a restore that gets there first marks the move abandoned and
+    `perform` refuses (the file never moves); one that arrives after finds a destination to walk
+    back. There is no ordering in which an original ends up somewhere unrecorded.
+
+    `restore()` is synchronous for the same reason `PosterCopy.discard()` is: it runs while a
+    handler is unwinding, where an `await` is not guaranteed to resume at all and the cleanup would
+    simply be skipped.
+    """
+
+    src: str
+    dest: str | None = None
+    _lock: Lock = dataclass_field(default_factory=Lock, repr=False)
+    _abandoned: bool = False
+
+    def perform(self, move: Callable[[Path], Path]) -> Path:
+        """Move the bytes and record where they went, as one indivisible step.
+
+        Runs in a worker thread. `move` gets `src` and returns where it put the file — the two
+        shapes in this codebase are a rename onto a known path and a placement that reserves its
+        own collision-free name, and neither knows its destination early enough for the caller to
+        record it up front. That is why the record is filled in here rather than by the caller.
+        """
+        with self._lock:
+            if self._abandoned:
+                raise MoveAbandoned(self.src)
+            dest = move(Path(self.src))
+            self.dest = str(dest)
+            return dest
+
+    def restore(self) -> str | None:
+        """Put this original back where it came from; returns the path it could NOT restore.
+
+        Never raises: it runs while an exception is already unwinding, where an error of its own
+        would replace the outcome that got us here. A file it cannot move back is left in place and
+        reported — one in the wrong directory can still be recovered by hand, an unlinked one
+        cannot.
+        """
+        with self._lock:
+            self._abandoned = True
+            dest = self.dest
+            if dest is None:
+                return None  # never moved, or abandoned before the move began
+            try:
+                destination = Path(dest)
+                if not destination.exists():
+                    return None  # already restored, or the move failed after reserving the name
+                source = Path(self.src)
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, source)
+            except OSError:
+                return dest
+            self.dest = None
+            return None
 
 
 def _truncate_bytes(name: str, limit: int) -> str:
@@ -105,10 +183,22 @@ def _place_master_sync(src: Path, dest_dir: Path, name: str) -> Path:
     return reserved
 
 
-async def place_master(src: Path, dest_dir: Path, name: str) -> Path:
+def _tracked_place_master_sync(track: TrackedMove, dest_dir: Path, name: str) -> Path:
+    """`_place_master_sync` under the move's own arbitration — see `TrackedMove.perform`."""
+    return track.perform(lambda src: _place_master_sync(src, dest_dir, name))
+
+
+async def place_master(
+    src: Path, dest_dir: Path, name: str, track: TrackedMove | None = None
+) -> Path:
     """Atomically move a staged master `src` into `dest_dir` under a sanitized, collision-free
-    `name`. Returns the final path. Off-loop (blocking disk I/O)."""
-    return await to_thread.run_sync(_place_master_sync, src, dest_dir, name)
+    `name`. Returns the final path. Off-loop (blocking disk I/O).
+
+    `track` is the caller's already-appended rollback record: passing it moves the bookkeeping
+    into the worker thread, so a cancelled request cannot lose it (MEMNG-145)."""
+    if track is None:
+        return await to_thread.run_sync(_place_master_sync, src, dest_dir, name)
+    return await to_thread.run_sync(_tracked_place_master_sync, track, dest_dir, name)
 
 
 def is_placement_of(existing: str | Path, dest_dir: Path, name: str) -> bool:

@@ -252,6 +252,21 @@ def _move_into_sync(src: Path, dest: Path) -> None:
     os.replace(src, dest)
 
 
+def _tracked_move_into_sync(track: storage.TrackedMove, dest: Path) -> Path:
+    """`_move_into_sync` under the move's own arbitration — see `storage.TrackedMove.perform`.
+
+    The mkdir it carries is a no-op for a caller that already made the directory
+    (`finalize_rendition` has to, before its savepoint insert); one `exist_ok` mkdir is cheaper
+    than a second tracked-move shape to maintain.
+    """
+
+    def move(src: Path) -> Path:
+        _move_into_sync(src, dest)
+        return dest
+
+    return track.perform(move)
+
+
 def _copy_into_sync(src: Path, dest: Path, tmp: Path) -> None:
     """Publish `src`'s bytes at `dest` atomically, WITHOUT assuming the two share a filesystem.
 
@@ -713,7 +728,7 @@ async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
     owner_id: int,
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
     memo: Memo | None = None,
     video_posters: dict[str, str] | None = None,
     poster_copies_out: list[PosterCopy] | None = None,
@@ -862,7 +877,7 @@ async def finalize(
     db: AsyncSession,
     upload: Upload,
     owner_id: int,
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
     *,
     dedup: bool = True,
     consumed_out: list[str] | None = None,
@@ -927,9 +942,14 @@ async def finalize(
     # master is atomically moved into originals/YYYY/MM/<memo-folder>/ on link_attachments.
     dest_dir = storage.unfiled_dir(_data_root())
     dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
-    await to_thread.run_sync(_move_into_sync, part, dest)  # mkdir + os.replace in one hop
-    if moved_out is not None:  # only a genuinely-moved file; the dedup return above appends nothing
-        moved_out.append((str(part), str(dest)))
+    # Recorded BEFORE the move, not after it: a request cancelled during the await used to let the
+    # rename land with the bookkeeping skipped, stranding an original in _unfiled/ that no rollback
+    # could find (MEMNG-145). Only a genuinely-moved file is tracked — the dedup return above
+    # appends nothing.
+    track = storage.TrackedMove(src=str(part))
+    if moved_out is not None:
+        moved_out.append(track)
+    await to_thread.run_sync(_tracked_move_into_sync, track, dest)  # mkdir + os.replace in one hop
 
     is_video = mime.startswith("video/")
     attachment = Attachment(
@@ -964,7 +984,7 @@ async def finalize_rendition(
     upload: Upload,
     attachment: Attachment,
     parsed: ParsedName,
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
     consumed_out: list[str] | None = None,
 ) -> AttachmentRendition | None:
     """Attach a hidden, download-only rendition (print master) to its screen `attachment`. Writes a
@@ -1024,9 +1044,10 @@ async def finalize_rendition(
         await db.flush()
         return None
 
-    await to_thread.run_sync(os.replace, part, dest)
+    track = storage.TrackedMove(src=str(part))  # recorded before the move — see finalize above
     if moved_out is not None:
-        moved_out.append((str(part), str(dest)))
+        moved_out.append(track)
+    await to_thread.run_sync(_tracked_move_into_sync, track, dest)
     await db.delete(upload)
     await db.flush()
     return rendition
@@ -1125,7 +1146,7 @@ async def bind_print_to_sibling(
     upload: Upload,
     attachment: Attachment,
     memo: Memo,
-    moved_out: list[tuple[str, str]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
 ) -> bool:
     """Bind a batch-orphan print onto an already-linked screen `attachment` of `memo`: fill its
     print slot (print_path/print_mime/print_size) and place the file beside the screen in the memo
@@ -1171,9 +1192,10 @@ async def bind_print_to_sibling(
     if old_print is not None:  # exact stored-name match ⇒ a re-send of this very master
         path = await storage.replace_master(part, old_print)
     else:
-        path = await storage.place_master(part, dest_dir, upload.filename)
+        track = storage.TrackedMove(src=str(part))  # recorded before the move — see finalize above
         if moved_out is not None:
-            moved_out.append((str(part), str(path)))
+            moved_out.append(track)
+        path = await storage.place_master(part, dest_dir, upload.filename, track)
     attachment.print_path = str(path)
     attachment.print_mime = mime
     attachment.print_size = actual
