@@ -619,8 +619,12 @@ async def serve_asset(
     return await _serve_file(resolved[0], resolved[1], request, format, cache)
 
 
-def _all_asset_paths(att: Attachment) -> list[Path]:
-    """Every on-disk file for an attachment: the original + each derived tier (+ webp variant)."""
+def all_asset_paths(att: Attachment) -> list[Path]:
+    """Every on-disk file for an attachment: the original + each derived tier (+ webp variant).
+
+    Public alongside `tier_path`, and for the same reason: memo deletion reclaims its attachments
+    and has to sweep exactly this set (MEMNG-170). A second copy of the map would drift the moment
+    a tier is added, and the drift would show up as files nothing deletes."""
     paths: list[Path] = []
     if att.storage_path:
         paths.append(Path(att.storage_path))
@@ -668,7 +672,7 @@ async def delete_attachment(
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")
-    paths = _all_asset_paths(att)
+    paths = all_asset_paths(att)
     unlocked_jobs = (
         select(MediaJob.id)
         .where(MediaJob.attachment_id == att.id)

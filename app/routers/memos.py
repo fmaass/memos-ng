@@ -24,7 +24,7 @@ from app.models import (
     Visibility,
 )
 from app.routers import RequestVisibility
-from app.routers.assets import RenditionItem, has_print, rendition_items
+from app.routers.assets import RenditionItem, all_asset_paths, has_print, rendition_items
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
 from app.services import storage
@@ -953,8 +953,17 @@ async def delete_memo(
     memo = await _require_owned(db, user, uid)
     if memo.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your memo")
+    # Collected BEFORE the delete: an attachment's paths are read off the row and its renditions,
+    # and both are expired the moment it is deleted.
+    doomed = [str(path) for att in memo.attachments for path in all_asset_paths(att)]
     await svc.delete_memo(db, memo)
     await db.commit()
+    # After the commit, for the same reason the single-attachment delete waits: a worker that
+    # published a derived tier while this request was in flight published it BEFORE the row
+    # vanished, and `doomed` covers every uid-derived tier, so this sweep removes it too. Nothing
+    # the worker writes after this point survives — it re-reads the row and discards its output.
+    if doomed:
+        await to_thread.run_sync(_unlink_all, doomed)
 
 
 @router.post("/memos/{uid}/pin", response_model=MemoOut)

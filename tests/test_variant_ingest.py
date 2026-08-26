@@ -2,7 +2,7 @@ from pathlib import Path
 
 from app.config import settings
 from app.models import Attachment, AttachmentRendition, MediaJob, User, Visibility
-from app.routers.assets import _all_asset_paths
+from app.routers.assets import all_asset_paths
 from app.services import memos as memo_svc
 from app.services import storage
 from app.services import uploads as svc
@@ -482,7 +482,7 @@ async def test_delete_attachment_cascades_renditions_and_lists_files(adb, monkey
     await adb.refresh(att, ["renditions"])
     rpath = Path(att.renditions[0].storage_path)
     assert rpath.exists()
-    assert rpath in _all_asset_paths(att)  # the router's _unlink_all will remove it
+    assert rpath in all_asset_paths(att)  # the router's _unlink_all will remove it
 
     rid = att.renditions[0].id
     await adb.delete(att)
