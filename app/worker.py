@@ -32,7 +32,7 @@ from app.models import (
     JobState,
     MediaJob,
 )
-from app.services import frame_share, media, push
+from app.services import frame_share, media, push, reconcile
 from app.services.uploads import reap_expired_committed
 from app.version import __version__
 
@@ -416,6 +416,30 @@ async def sweep_job_progress_safe() -> int:
     return swept
 
 
+async def run_commit_race_reconcile_safe() -> int:
+    """Reconcile memo creates that raced their own commit (MEMNG-146), in their own committing
+    session with ALL errors isolated — the same boundary guard the other periodic sweeps get.
+
+    Returns the number of poster jobs re-enqueued (0 on error). Misplaced originals are reported by
+    the sweep itself rather than counted here: they are not something a worker can put right.
+    """
+    try:
+        async with async_session() as db:
+            report = await reconcile.reconcile_commit_races(db)
+            await db.commit()
+    except Exception:
+        logger.exception("reconcile.sweep_error")
+        return 0
+    if report.posters_requeued or report.misplaced_originals:
+        logger.info(
+            "commit_race_reconciled",
+            posters_requeued=len(report.posters_requeued),
+            misplaced_originals=len(report.misplaced_originals),
+            scanned=report.scanned,
+        )
+    return len(report.posters_requeued)
+
+
 async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
     """Atomically claim the next due frame-share job (queued AND next_attempt_at reached), skipping
     rows another worker holds. Sets state=claimed so a crash mid-send never re-runs it (at-most-once
@@ -571,6 +595,9 @@ async def run() -> None:
             # Same cadence for the progress side channel: a killed worker cannot clear its own
             # row, so the anti-join sweep keeps the table bounded by what is actually running.
             await sweep_job_progress_safe()
+            # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
+            # close: a stored video whose poster the unwind discarded gets its fast lane back.
+            await run_commit_race_reconcile_safe()
             last_reap = time.time()
         if status != "processed" and frame_status != "processed":  # idle/deferred → back off
             await asyncio.sleep(POLL_SECONDS)
