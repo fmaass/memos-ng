@@ -32,72 +32,43 @@ import os
 import sys
 from pathlib import Path
 
-from app.models import Attachment, MediaJob
+from app.models import Attachment
 
-# The tier map lives in exactly one place; a copy here would drift the moment a tier is added.
-from app.routers.assets import all_asset_paths
+# The predicate, the path set and the DELETE ORDER all come from the service — this script must
+# not carry a second opinion about which rows are garbage or how they are taken apart.
+from app.services.asset_paths import all_asset_paths
+from app.services.reclaim import leaked_orphans_stmt, reclaim_attachment_sync
 from sqlalchemy import create_engine, select
-from sqlalchemy import delete as sa_delete
 from sqlalchemy.orm import Session
-
-# A dated memo folder: `originals/YYYY/MM/…`. Deliberately NOT anchored — the stored path is
-# absolute and its prefix is the deployment's DATA_ROOT.
-LEAKED_PATH_RE = r"originals/[0-9]{4}/[0-9]{2}/"
-
-
-def leaked_orphans_stmt():
-    """The attachments a deleted memo left behind, and only those — see the module docstring."""
-    return (
-        select(Attachment)
-        .where(Attachment.memo_id.is_(None), Attachment.storage_path.op("~")(LEAKED_PATH_RE))
-        .order_by(Attachment.id)
-    )
 
 
 def leaked_orphans(session: Session) -> list[Attachment]:
     return list(session.execute(leaked_orphans_stmt()).scalars().all())
 
 
-def files_of(att: Attachment) -> list[Path]:
-    """Every file this attachment owns that is actually on disk right now."""
-    return [path for path in all_asset_paths(att) if path.exists()]
-
-
 def describe(att: Attachment) -> str:
-    files = files_of(att)
+    """What this row owns, as it looks right now. A dry run reports only what is ON DISK, because
+    that is what a human is deciding about; the reclaim itself unlinks the whole derivable set."""
+    files = [path for path in all_asset_paths(att) if path.exists()]
     total = sum(path.stat().st_size for path in files)
     head = f"  id={att.id} uid={att.uid} {att.mime} {att.filename!r} row_size={att.size}"
     body = "\n".join(f"      {path}  ({path.stat().st_size} bytes)" for path in files)
     return f"{head}\n      on disk: {len(files)} file(s), {total} bytes\n{body}".rstrip()
 
 
-def reclaim(session: Session, att: Attachment) -> tuple[int, list[Path]]:
-    """Delete one orphan's jobs and row, commit, then unlink its files. Returns (id, paths).
+def reclaim_one(session: Session, att_id: int) -> str:
+    """Reclaim one row through the shared seam and say what happened, in one line.
 
-    Rows first and files after the commit, the same order the app's own deletes use: a worker that
-    publishes a derived tier while this runs publishes it BEFORE the row disappears, so the sweep
-    below still covers it, and nothing it writes afterwards survives.
+    The row is re-selected FOR UPDATE and revalidated inside that transaction, so a row a
+    concurrent upload has dedup-claimed since this run listed it is SKIPPED rather than deleted —
+    the difference between tidying garbage and destroying a live memo's photo.
     """
-    att_id = att.id
-    paths = files_of(att)
-    unlocked = (
-        select(MediaJob.id)
-        .where(MediaJob.attachment_id == att_id)
-        .with_for_update(skip_locked=True)
-    )
-    session.execute(
-        sa_delete(MediaJob).where(MediaJob.id.in_(unlocked)).execution_options(
-            synchronize_session=False
-        )
-    )
-    session.delete(att)
-    session.commit()
-    for path in paths:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:  # reported, never fatal: the row is already gone
-            print(f"      ! could not unlink {path}: {exc}", file=sys.stderr)
-    return att_id, paths
+    outcome = reclaim_attachment_sync(session, att_id)
+    if outcome == "skipped_relinked":
+        print(f"      SKIPPED id={att_id}: re-linked to a memo since this run listed it")
+    elif outcome == "vanished":
+        print(f"      SKIPPED id={att_id}: already gone")
+    return outcome
 
 
 def read_back(session: Session, att_id: int, paths: list[Path]) -> bool:
@@ -148,17 +119,28 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 2
                 print(f"\nreclaiming ONE victim: id={chosen.id}")
-                att_id, paths = reclaim(session, chosen)
-                return 0 if read_back(session, att_id, paths) else 1
+                paths = all_asset_paths(chosen)
+                outcome = reclaim_one(session, chosen.id)
+                if outcome != "reclaimed":
+                    return 3  # nothing was touched; the row is not this run's to take
+                return 0 if read_back(session, chosen.id, paths) else 1
 
             if args.apply:
                 print(f"\nreclaiming all {len(found)}:")
-                failures = 0
+                failures = skipped = 0
                 for att in found:
                     print(f"  id={att.id}")
-                    att_id, paths = reclaim(session, att)
-                    if not read_back(session, att_id, paths):
+                    # Read the path set BEFORE the reclaim: the row is expired once it is deleted,
+                    # and the read-back needs to know what should be gone. The reclaim itself
+                    # re-reads it under its own lock — this copy is only for the report.
+                    paths = all_asset_paths(att)
+                    if reclaim_one(session, att.id) != "reclaimed":
+                        skipped += 1  # locked+revalidated away from us; not a failure
+                        continue
+                    if not read_back(session, att.id, paths):
                         failures += 1
+                print(f"\nreclaimed={len(found) - skipped - failures} skipped={skipped} "
+                      f"failed={failures}")
                 return 1 if failures else 0
 
             print("\nDRY RUN — nothing was changed. Re-run with --victim <id>, then --apply.")

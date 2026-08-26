@@ -24,10 +24,10 @@ from app.models import (
     Visibility,
 )
 from app.routers import RequestVisibility
-from app.routers.assets import RenditionItem, all_asset_paths, has_print, rendition_items
+from app.routers.assets import RenditionItem, has_print, rendition_items
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
-from app.services import storage
+from app.services import reclaim, storage
 from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
 
@@ -953,17 +953,17 @@ async def delete_memo(
     memo = await _require_owned(db, user, uid)
     if memo.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your memo")
-    # Collected BEFORE the delete: an attachment's paths are read off the row and its renditions,
-    # and both are expired the moment it is deleted.
-    doomed = [str(path) for att in memo.attachments for path in all_asset_paths(att)]
-    await svc.delete_memo(db, memo)
+    # PHASE 1: the memo goes and its attachments are left ORPHANED, on purpose. Deleting their rows
+    # here would put this request one crash away from files that no row names any more; an orphan
+    # row is the durable journal that survives the crash and is reconcilable afterwards
+    # (app/services/reclaim.py states the principle in full).
+    orphaned = await svc.delete_memo(db, memo)
     await db.commit()
-    # After the commit, for the same reason the single-attachment delete waits: a worker that
-    # published a derived tier while this request was in flight published it BEFORE the row
-    # vanished, and `doomed` covers every uid-derived tier, so this sweep removes it too. Nothing
-    # the worker writes after this point survives — it re-reads the row and discards its output.
-    if doomed:
-        await to_thread.run_sync(_unlink_all, doomed)
+    # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
+    # its files, then the row. Each id gets its own transaction, so a failure part way through
+    # leaves the rest as orphans the sweep will finish rather than rolling the memo delete back.
+    for attachment_id in orphaned:
+        await reclaim.reclaim_attachment(db, attachment_id)
 
 
 @router.post("/memos/{uid}/pin", response_model=MemoOut)

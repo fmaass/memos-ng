@@ -7,14 +7,12 @@ from pathlib import Path
 
 import structlog
 from sqlalchemy import String, and_, cast, exists, func, or_, select
-from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import (
     Attachment,
     AttachmentRendition,
-    MediaJob,
     Memo,
     MemoEditKey,
     Reaction,
@@ -402,46 +400,36 @@ async def update_memo(db: AsyncSession, memo: Memo, **fields) -> Memo:
     return memo
 
 
-async def delete_memo(db: AsyncSession, memo: Memo) -> list[Attachment]:
-    """Delete a memo AND reclaim the attachments it owns; returns those rows so the caller can
-    unlink their files after its commit.
+async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
+    """Delete a memo, ORPHANING its attachments; returns their ids for the caller to reclaim after
+    this transaction commits.
 
-    Deleting the memo alone left every attachment behind with `memo_id` NULL — the relationship
-    carries no cascade and the FK is ON DELETE SET NULL — so the rows kept showing up in the media
-    library and their files were never unlinked (MEMNG-170: memos deleted from the iOS app left
-    their images on the resources page).
+    Two phases, and the split is the whole point. Deleting the memo alone was the MEMNG-170 bug —
+    the relationship carries no cascade and the FK is ON DELETE SET NULL, so every attachment
+    survived with `memo_id` NULL, kept appearing in the media library, and kept its files. Deleting
+    the rows HERE instead, in this transaction, trades that for something worse: a crash between
+    this commit and the caller's unlink leaves files with no row at all, and nothing can ever find
+    them again (`app/services/reclaim.py`).
 
-    Reclaim is UNCONDITIONAL, with no reference counting, because an attachment on a memo is
+    So this phase deliberately leaves the rows behind, orphaned. That orphan IS the durable
+    journal: it names its own files, and it is exactly what `reclaim.leaked_orphans_stmt` selects,
+    so a create interrupted here is picked up by the worker sweep or the reconcile script rather
+    than lost. The caller then reclaims each id properly — locked, revalidated, files first.
+
+    Reclaim is unconditional, with no reference counting, because an attachment on a memo is
     exclusively that memo's: `uploads.finalize` only ever dedups onto an UNLINKED attachment
     (`memo_id IS NULL`), and `link_attachments` refuses to re-point one that already belongs to a
     different memo. The same bytes posted to a second memo therefore get their own row and their
     own file, which this delete does not touch.
 
-    The FK stays SET NULL rather than becoming CASCADE: a raw DELETE against the database would
-    then take attachment rows with it and leave their files behind for ever, which is the very
-    failure this fixes. SET NULL keeps such a row visible (and reconcilable) instead.
+    The FK stays SET NULL rather than becoming CASCADE, and now for a second reason: CASCADE would
+    make a raw DELETE against the database take the attachment rows with it and leave their files
+    orphaned for ever — the forbidden outcome, reachable by hand from a psql prompt.
     """
-    reclaimed = list(memo.attachments)
-    if reclaimed:
-        # Only the job rows we can lock right now, exactly as the single-attachment delete does:
-        # a worker holds its claimed row's lock for the whole run (a slow-lane transcode can be
-        # minutes), and waiting on it here would pin a request-serving connection for that long
-        # (MEMNG-41). The worker discards job and partial output on finding the attachment gone.
-        unlocked_jobs = (
-            select(MediaJob.id)
-            .where(MediaJob.attachment_id.in_([att.id for att in reclaimed]))
-            .with_for_update(skip_locked=True)
-        )
-        await db.execute(
-            sa_delete(MediaJob)
-            .where(MediaJob.id.in_(unlocked_jobs))
-            .execution_options(synchronize_session=False)
-        )
-        for att in reclaimed:
-            await db.delete(att)  # its hidden renditions cascade with it
+    orphaned = [att.id for att in memo.attachments]
     await db.delete(memo)
     await db.flush()
-    return reclaimed
+    return orphaned
 
 
 async def list_tags(db: AsyncSession, user: User) -> list[tuple[str, int]]:

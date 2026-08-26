@@ -13,7 +13,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Upload
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
-from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,8 +29,9 @@ from app.models import (
     Upload,
     User,
 )
-from app.services import asset_urls, poster, printready, storage, variants
+from app.services import asset_urls, poster, printready, reclaim, storage, variants
 from app.services import uploads as up_svc
+from app.services.asset_paths import derived_tier_path, tier_path
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 from app.services.memos import visible_clause
 
@@ -49,37 +49,6 @@ DEFAULT_PRINT_VARIANT_KEY = "print"
 # BYTES change (see RenditionItem.rev); 8 hex chars is 4 billion buckets over the handful of
 # masters one photo ever has.
 REV_LENGTH = 8
-
-
-def _derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
-    """Derived tiers resolve from the uid alone (no DB row) — used by the signed fast path."""
-    assets = Path(settings.DATA_ROOT) / "assets"
-    if tier == "thumb":
-        return assets / "thumbs" / f"{uid}.jpg", "image/jpeg"
-    if tier == "mobile":
-        return assets / "mobile" / f"{uid}.jpg", "image/jpeg"
-    if tier == "web":
-        return assets / "web" / f"{uid}.mp4", "video/mp4"
-    if tier == "poster":
-        return poster.poster_path(uid), poster.MIME
-    if tier == printready.TIER:
-        return printready.printready_path(uid), "image/jpeg"
-    return None
-
-
-def tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
-    """Resolve an attachment's file for a tier — public because the export builds its media
-    payloads from the same map (app/routers/export.py); a second copy would drift the moment a
-    rendition rung is added."""
-    if tier == "original":
-        return (Path(attachment.storage_path), attachment.mime) if attachment.storage_path else None
-    if tier == "print":  # separately-uploaded print master (download-only); None if absent
-        return (
-            (Path(attachment.print_path), attachment.print_mime or "application/octet-stream")
-            if attachment.print_path
-            else None
-        )
-    return _derived_tier_path(attachment.uid, tier)
 
 
 def _negotiated_path_sync(
@@ -590,7 +559,7 @@ async def serve_asset(
     if sig is not None and tier in asset_urls.DERIVED_TIERS:
         if not asset_urls.verify_asset_sig(uid, tier, exp, scope, sig, now=time.time()):
             raise HTTPException(status_code=403, detail="Bad or expired signature")
-        resolved = _derived_tier_path(uid, tier)
+        resolved = derived_tier_path(uid, tier)
         if resolved is None:
             raise HTTPException(status_code=404, detail="Unknown tier")
         # Cap the browser cache to the signature's remaining life so a now-revoked (e.g.
@@ -617,28 +586,6 @@ async def serve_asset(
     # immutable uid-keyed bytes, but private (one authed viewer) — never cached by a shared proxy.
     cache = f"private, max-age={settings.ASSET_CACHE_SECONDS}, immutable"
     return await _serve_file(resolved[0], resolved[1], request, format, cache)
-
-
-def all_asset_paths(att: Attachment) -> list[Path]:
-    """Every on-disk file for an attachment: the original + each derived tier (+ webp variant).
-
-    Public alongside `tier_path`, and for the same reason: memo deletion reclaims its attachments
-    and has to sweep exactly this set (MEMNG-170). A second copy of the map would drift the moment
-    a tier is added, and the drift would show up as files nothing deletes."""
-    paths: list[Path] = []
-    if att.storage_path:
-        paths.append(Path(att.storage_path))
-    if att.print_path:
-        paths.append(Path(att.print_path))
-    for rendition in att.renditions:  # hidden print masters (unique, unshared files)
-        paths.append(Path(rendition.storage_path))
-    for tier in ("thumb", "mobile", "web", "poster", printready.TIER):
-        resolved = tier_path(att, tier)
-        if resolved is not None:
-            p = resolved[0]
-            paths.append(p)
-            paths.append(p.with_suffix(".webp"))  # format-negotiated variant (may not exist)
-    return paths
 
 
 def _unlink_all(paths: list[Path]) -> None:
@@ -672,25 +619,18 @@ async def delete_attachment(
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")
-    paths = all_asset_paths(att)
-    unlocked_jobs = (
-        select(MediaJob.id)
-        .where(MediaJob.attachment_id == att.id)
-        .with_for_update(skip_locked=True)
-    )
-    await db.execute(
-        sa_delete(MediaJob)
-        .where(MediaJob.id.in_(unlocked_jobs))
-        .execution_options(synchronize_session=False)
-    )
-    await db.delete(att)
-    await db.commit()
-    # After the commit, so a worker that published a derived tier while this request was in flight
-    # published it BEFORE the row vanished (its publish holds the attachment row lock, which this
-    # delete waits on for those milliseconds) — and `paths` covers every uid-derived tier, so the
-    # sweep below removes it. Nothing the worker writes after this point survives: it re-reads the
-    # row under that lock and discards its output when the row is gone.
-    await to_thread.run_sync(_unlink_all, paths)
+    # One seam for every attachment deletion (app/services/reclaim.py): jobs, then the row locked
+    # and revalidated, then its files, then the row — all in one transaction. This route used to
+    # delete the row, commit, and unlink afterwards, so a crash in that gap left files that no row
+    # named any more and no sweep could ever find. The new order can only lose the other way: an
+    # interrupted delete leaves the row with its files already gone, which a retry of this very
+    # request finishes off. That is deliberately the recoverable half of the trade — the caller
+    # asked for this attachment to go.
+    #
+    # `require_leaked_path=False`: this deletes the attachment the caller NAMED, memo or no memo,
+    # so "is this row garbage" is not the question here. It is still re-read under its own lock,
+    # which is what makes two concurrent deletes resolve to one winner instead of one 500.
+    await reclaim.reclaim_attachment(db, att.id, require_leaked_path=False)
 
 
 def _save_print_sync(part_dir: Path, uid: str, staged: Path, suffix: str) -> str:

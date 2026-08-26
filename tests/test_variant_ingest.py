@@ -2,10 +2,10 @@ from pathlib import Path
 
 from app.config import settings
 from app.models import Attachment, AttachmentRendition, MediaJob, User, Visibility
-from app.routers.assets import all_asset_paths
 from app.services import memos as memo_svc
 from app.services import storage
 from app.services import uploads as svc
+from app.services.asset_paths import all_asset_paths
 from sqlalchemy import func, select
 
 PNG = b"\x89PNG\r\n\x1a\n"
