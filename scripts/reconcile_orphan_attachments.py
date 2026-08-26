@@ -37,7 +37,7 @@ from app.models import Attachment
 # The predicate, the path set and the DELETE ORDER all come from the service — this script must
 # not carry a second opinion about which rows are garbage or how they are taken apart.
 from app.services.asset_paths import all_asset_paths
-from app.services.reclaim import leaked_orphans_stmt, reclaim_attachment_sync
+from app.services.reclaim import Revalidate, leaked_orphans_stmt, reclaim_attachment_sync
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -63,12 +63,18 @@ def reclaim_one(session: Session, att_id: int) -> str:
     concurrent upload has dedup-claimed since this run listed it is SKIPPED rather than deleted —
     the difference between tidying garbage and destroying a live memo's photo.
     """
-    outcome = reclaim_attachment_sync(session, att_id)
-    if outcome == "skipped_relinked":
-        print(f"      SKIPPED id={att_id}: re-linked to a memo since this run listed it")
-    elif outcome == "vanished":
+    result = reclaim_attachment_sync(session, att_id, Revalidate.LEAKED_ORPHAN)
+    if result.outcome == "skipped_ineligible":
+        print(f"      SKIPPED id={att_id}: no longer a leaked orphan (re-linked, or moved)")
+    elif result.outcome == "vanished":
         print(f"      SKIPPED id={att_id}: already gone")
-    return outcome
+    elif result.outcome == "failed_unlink":
+        print(
+            f"      FAILED id={att_id}: could not remove {len(result.failed_paths)} file(s) — the "
+            f"row was KEPT so they stay findable: {list(result.failed_paths)}",
+            file=sys.stderr,
+        )
+    return result.outcome
 
 
 def read_back(session: Session, att_id: int, paths: list[Path]) -> bool:
@@ -121,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\nreclaiming ONE victim: id={chosen.id}")
                 paths = all_asset_paths(chosen)
                 outcome = reclaim_one(session, chosen.id)
+                if outcome == "failed_unlink":
+                    return 1  # the row was kept on purpose; its files are still on disk
                 if outcome != "reclaimed":
                     return 3  # nothing was touched; the row is not this run's to take
                 return 0 if read_back(session, chosen.id, paths) else 1
@@ -134,7 +142,11 @@ def main(argv: list[str] | None = None) -> int:
                     # and the read-back needs to know what should be gone. The reclaim itself
                     # re-reads it under its own lock — this copy is only for the report.
                     paths = all_asset_paths(att)
-                    if reclaim_one(session, att.id) != "reclaimed":
+                    outcome = reclaim_one(session, att.id)
+                    if outcome == "failed_unlink":
+                        failures += 1  # its files are still there and so is its row
+                        continue
+                    if outcome != "reclaimed":
                         skipped += 1  # locked+revalidated away from us; not a failure
                         continue
                     if not read_back(session, att.id, paths):

@@ -627,10 +627,20 @@ async def delete_attachment(
     # request finishes off. That is deliberately the recoverable half of the trade — the caller
     # asked for this attachment to go.
     #
-    # `require_leaked_path=False`: this deletes the attachment the caller NAMED, memo or no memo,
-    # so "is this row garbage" is not the question here. It is still re-read under its own lock,
-    # which is what makes two concurrent deletes resolve to one winner instead of one 500.
-    await reclaim.reclaim_attachment(db, att.id, require_leaked_path=False)
+    # `IDENTITY`: this deletes the attachment the caller NAMED, memo or no memo — being on a memo
+    # is this route's ORDINARY case (the memo keeps its text, the media goes), never a reason to
+    # stand down. Re-reading the row under its own lock is the whole revalidation here, and it is
+    # what makes two concurrent deletes resolve to one winner instead of one 500.
+    result = await reclaim.reclaim_attachment(db, att.id, reclaim.Revalidate.IDENTITY)
+    if result.outcome == "vanished":  # a concurrent delete won between the read above and the lock
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if result.outcome == "failed_unlink":
+        # The row was KEPT on purpose (app/services/reclaim.py): its files are still on disk and it
+        # is the only record of where they are. Answering 204 here would tell the caller their
+        # media was deleted when it is all still there.
+        raise HTTPException(
+            status_code=500, detail="Could not remove this attachment's files; nothing was deleted"
+        )
 
 
 def _save_print_sync(part_dir: Path, uid: str, staged: Path, suffix: str) -> str:

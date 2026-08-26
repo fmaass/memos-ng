@@ -49,8 +49,10 @@ the row gone, and discards its own output). Collecting the DERIVABLE set rather 
 happen to exist is the other half of it — a path that is empty now may not be by step 4.
 """
 
+import enum
 import re
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -73,7 +75,39 @@ logger = structlog.get_logger(__name__)
 LEAKED_PATH_RE = r"originals/[0-9]{4}/[0-9]{2}/"
 _LEAKED_PATH = re.compile(LEAKED_PATH_RE)
 
-Outcome = Literal["reclaimed", "vanished", "skipped_relinked"]
+
+class Revalidate(enum.StrEnum):
+    """WHAT the reclaim re-checks under the row lock — which is a different question per caller,
+    and getting it wrong is how a reclaim either destroys live media or silently does nothing.
+
+    The rule is: revalidate the premise the CALLER selected the row on, and nothing else.
+    """
+
+    IDENTITY = "identity"
+    """The caller named this exact row and wants it gone whether or not a memo shows it —
+    `DELETE /api/attachments/{uid}`. Its premise is 'this row exists', so that is the whole check;
+    linkage is not a reason to refuse, it is the route's ordinary case."""
+
+    ORPHANED = "orphaned"
+    """The caller just orphaned this row itself and is cleaning up after its own commit — the memo
+    delete. Its premise is 'no memo shows this any more', so a row that has since been claimed by a
+    concurrent upload is live media and must be left alone."""
+
+    LEAKED_ORPHAN = "leaked_orphan"
+    """A blind scan picked this row BECAUSE it looked like garbage — the reconcile script. Its
+    premise is both halves of that predicate, and its selection is the oldest thing anyone here
+    acts on, so both are re-checked."""
+
+
+Outcome = Literal["reclaimed", "vanished", "skipped_ineligible", "failed_unlink"]
+
+
+@dataclass(frozen=True)
+class ReclaimResult:
+    """What one reclaim did. `failed_paths` is non-empty only for `failed_unlink`."""
+
+    outcome: Outcome
+    failed_paths: tuple[str, ...] = field(default=())
 
 
 def leaked_orphans_stmt() -> Select[tuple[Attachment]]:
@@ -89,8 +123,10 @@ def leaked_orphans_stmt() -> Select[tuple[Attachment]]:
 def unlink_paths(paths: list[Path]) -> list[str]:
     """Remove every one of these files; returns the ones that could not be removed.
 
-    Absent is success: the set is derivable rather than observed, so most of it will not exist for
-    any given attachment, and a retry of an interrupted reclaim finds the rest already gone.
+    Absent is success (`missing_ok`): the set is derivable rather than observed, so most of it will
+    not exist for any given attachment, and a retry of an interrupted reclaim finds the rest
+    already gone. Anything this DOES return is therefore a real failure — a read-only mount, a
+    permission problem, an I/O error — never a file that was simply not there.
     """
     failed: list[str] = []
     for path in paths:
@@ -101,35 +137,32 @@ def unlink_paths(paths: list[Path]) -> list[str]:
     return failed
 
 
-def _relinked(att: Attachment, require_leaked_path: bool) -> bool:
-    """Whether this row stopped being garbage since it was selected.
-
-    `memo_id` is the whole test for a caller reclaiming rows it has just orphaned itself. A blind
-    scan revalidates the path predicate too: the row it picked may have been re-linked AND placed
-    into a memo folder in the meantime, and the selection it acted on is that much older.
-    """
-    if att.memo_id is not None:
-        return True
-    return require_leaked_path and not _has_leaked_path(att)
-
-
 def _has_leaked_path(att: Attachment) -> bool:
     return att.storage_path is not None and _LEAKED_PATH.search(att.storage_path) is not None
+
+
+def _ineligible(att: Attachment, mode: Revalidate) -> str | None:
+    """Why this row may no longer be reclaimed under `mode`, or None to go ahead."""
+    if mode is Revalidate.IDENTITY:
+        return None  # the row was named, and re-reading it under the lock IS the revalidation
+    if att.memo_id is not None:
+        return "relinked"
+    if mode is Revalidate.LEAKED_ORPHAN and not _has_leaked_path(att):
+        return "path_left_the_predicate"
+    return None
 
 
 async def reclaim_attachment(
     db: AsyncSession,
     attachment_id: int,
+    mode: Revalidate,
     *,
-    require_leaked_path: bool = False,
     unlink: Callable[[list[Path]], list[str]] | None = None,
-) -> Outcome:
-    """Reclaim ONE orphaned attachment in its own transaction, in the order this module documents.
+) -> ReclaimResult:
+    """Reclaim ONE attachment in its own transaction, in the order this module documents.
 
-    Returns what happened: `reclaimed`, `vanished` (someone else got there first), or
-    `skipped_relinked` (a concurrent write claimed it — its bytes belong to a live memo now and
-    MUST NOT be touched). The caller commits nothing; this commits its own transaction, because the
-    lock it holds has to be released before the next row is taken.
+    The caller commits nothing; this commits its own transaction, because the row lock it takes has
+    to be released before the next row is touched.
 
     `unlink` is the seam the crash-window tests inject at; production passes nothing.
     """
@@ -146,9 +179,7 @@ async def reclaim_attachment(
         .where(MediaJob.id.in_(unlocked_jobs))
         .execution_options(synchronize_session=False)
     )
-    # 2. …then the attachment row, locked and revalidated. Both halves matter: the lock is what
-    #    makes a publishing worker wait, and the revalidation is what keeps a row that has since
-    #    been claimed by a concurrent upload from having its live memo's media deleted.
+    # 2. …then the attachment row, locked and revalidated against the caller's own premise.
     att = (
         await db.execute(
             select(Attachment).where(Attachment.id == attachment_id).with_for_update()
@@ -156,35 +187,44 @@ async def reclaim_attachment(
     ).scalar_one_or_none()
     if att is None:
         await db.commit()
-        return "vanished"
-    if _relinked(att, require_leaked_path):
+        return ReclaimResult("vanished")
+    ineligible = _ineligible(att, mode)
+    if ineligible is not None:
+        uid = att.uid  # read BEFORE the rollback: it expires every instance, and reading an
+        # expired column would try to refresh it — blocking IO from a place the async session
+        # cannot await, i.e. MissingGreenlet instead of the warning this line is meant to emit.
         await db.rollback()  # give the job rows back too: this attachment is live again
-        logger.warning("reclaim.skipped_relinked", attachment_id=attachment_id, uid=att.uid)
-        return "skipped_relinked"
-    # 3-5. The derivable set, unlinked, and only then the row. A crash between 4 and 5 leaves a
-    #      dangling row — state (b) — which the next sweep finishes off.
+        logger.warning("reclaim.skipped", attachment_id=attachment_id, uid=uid, reason=ineligible)
+        return ReclaimResult("skipped_ineligible")
+    # 3-5. The derivable set, unlinked, and only then the row.
     paths = all_asset_paths(att)
     failed = remove(paths)
     if failed:
+        # FAIL CLOSED. Deleting the row now would leave these files with nothing naming them — the
+        # one outcome this module exists to prevent, arriving on the very failure the journal is
+        # for. The row stays, the whole transaction unwinds, and a retry re-derives the full set
+        # and tolerates the ones this attempt already removed.
+        await db.rollback()
         logger.error("reclaim.unlink_failed", attachment_id=attachment_id, paths=failed)
+        return ReclaimResult("failed_unlink", tuple(failed))
     await db.delete(att)
     await db.commit()
-    return "reclaimed"
+    return ReclaimResult("reclaimed")
 
 
 def reclaim_attachment_sync(
     session: Session,
     attachment_id: int,
+    mode: Revalidate,
     *,
-    require_leaked_path: bool = True,
     unlink: Callable[[list[Path]], list[str]] | None = None,
-) -> Outcome:
+) -> ReclaimResult:
     """The maintenance script's reclaim: same order, same guarantees, a synchronous Session.
 
     Deliberately a second implementation rather than a shared one — the script runs against a
     psycopg2 DSN it is handed explicitly, and bridging that to the app's async engine would give a
     row-deleting tool a second way to pick its database. The ORDER is the thing that must not
-    diverge, so the two live side by side here; a test drives both through the same crash windows.
+    diverge, so the two live side by side here; the crash-window tests drive both.
     """
     remove = unlink or unlink_paths
     unlocked_jobs = (
@@ -202,14 +242,17 @@ def reclaim_attachment_sync(
     ).scalar_one_or_none()
     if att is None:
         session.commit()
-        return "vanished"
-    if _relinked(att, require_leaked_path):
+        return ReclaimResult("vanished")
+    ineligible = _ineligible(att, mode)
+    if ineligible is not None:
         session.rollback()
-        return "skipped_relinked"
+        return ReclaimResult("skipped_ineligible")
     paths = all_asset_paths(att)
     failed = remove(paths)
     if failed:
+        session.rollback()  # fail closed — see reclaim_attachment
         logger.error("reclaim.unlink_failed", attachment_id=attachment_id, paths=failed)
+        return ReclaimResult("failed_unlink", tuple(failed))
     session.delete(att)
     session.commit()
-    return "reclaimed"
+    return ReclaimResult("reclaimed")

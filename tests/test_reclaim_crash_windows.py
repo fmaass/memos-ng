@@ -19,6 +19,7 @@ from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob
 from app.services import poster, reclaim
 from app.services.asset_paths import all_asset_paths
 from app.services.reclaim import (
+    Revalidate,
     leaked_orphans_stmt,
     reclaim_attachment,
     reclaim_attachment_sync,
@@ -147,7 +148,8 @@ def test_a_crash_between_the_unlink_and_the_row_delete_leaves_a_dangling_row(
         att_id = _rows("SELECT id FROM attachments")[0][0]
         eng = create_engine(SYNC_URL)
         with Session(eng) as session:
-            assert reclaim_attachment_sync(session, att_id) == "reclaimed"
+            retried = reclaim_attachment_sync(session, att_id, Revalidate.LEAKED_ORPHAN)
+        assert retried.outcome == "reclaimed"
         eng.dispose()
         assert _rows("SELECT id FROM attachments") == []
     finally:
@@ -208,7 +210,8 @@ def test_a_row_relinked_after_selection_is_skipped_not_deleted(db_engine, monkey
             claimer.commit()
 
         with Session(eng) as deleter:
-            assert reclaim_attachment_sync(deleter, att_id) == "skipped_relinked"
+            skipped = reclaim_attachment_sync(deleter, att_id, Revalidate.LEAKED_ORPHAN)
+        assert skipped.outcome == "skipped_ineligible"
 
         assert original.exists(), "a live memo's photo was deleted"
         assert _rows("SELECT memo_id FROM attachments WHERE id=:a", a=att_id) == [(memo_id,)]
@@ -236,13 +239,14 @@ def test_a_row_whose_path_left_the_predicate_is_also_skipped(db_engine, monkeypa
             )
             mover.commit()
         with Session(eng) as deleter:
-            assert reclaim_attachment_sync(deleter, att_id) == "skipped_relinked"
+            skipped = reclaim_attachment_sync(deleter, att_id, Revalidate.LEAKED_ORPHAN)
+        assert skipped.outcome == "skipped_ineligible"
         assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [(att_id,)]
 
         # The app's own reclaim does NOT ask that question: it reclaims rows it just orphaned
         # itself, by id, and their paths are not the evidence it is going on.
         with Session(eng) as deleter:
-            outcome = reclaim_attachment_sync(deleter, att_id, require_leaked_path=False)
+            outcome = reclaim_attachment_sync(deleter, att_id, Revalidate.ORPHANED).outcome
         assert outcome == "reclaimed"
     finally:
         eng.dispose()
@@ -282,11 +286,176 @@ async def test_a_tier_published_during_the_reclaim_is_still_unlinked(
         # reclaim commits its own transaction, and that commit has to actually release the row
         # locks it took, which is half of what this test is checking.
         async with async_session() as db:
-            outcome = await reclaim_attachment(db, att_id, unlink=publish_then_unlink)
-        assert outcome == "reclaimed"
+            result = await reclaim_attachment(
+                db, att_id, Revalidate.ORPHANED, unlink=publish_then_unlink
+            )
+        assert result.outcome == "reclaimed"
         assert not published.exists()  # taken with everything else
         assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == []
         assert _rows("SELECT id FROM media_jobs WHERE attachment_id=:a", a=att_id) == []
+    finally:
+        eng.dispose()
+        _cleanup()
+
+
+# --- the named delete route: linkage is its ordinary case, not a reason to stand down ----------
+
+
+def test_deleting_a_linked_attachment_by_name_really_removes_it(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """`DELETE /api/attachments/{uid}` on an attachment that IS on a memo — the route's everyday
+    case, and the one no test covered. It must remove the row and the bytes and leave the memo's
+    text alone; answering 204 while quietly keeping both is the worst of all outcomes, because
+    every retry looks just as successful."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = _memo_with_one_image(client)
+        uid = memo["attachments"][0]["uid"]
+        original = Path(_rows("SELECT storage_path FROM attachments WHERE uid=:u", u=uid)[0][0])
+        assert original.exists()
+        assert _rows("SELECT memo_id FROM attachments WHERE uid=:u", u=uid)[0][0] is not None
+
+        gone = client.delete(f"/api/attachments/{uid}")
+        assert gone.status_code == 204, gone.text
+
+        assert _rows("SELECT id FROM attachments WHERE uid=:u", u=uid) == []
+        assert not original.exists()
+        assert _rows("SELECT id FROM media_jobs") == []
+        kept = client.get(f"/api/memos/{memo['uid']}")
+        assert kept.status_code == 200 and kept.json()["attachments"] == []
+    finally:
+        _cleanup()
+
+
+def test_deleting_an_unlinked_attachment_by_name_still_works(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The other half of the route's contract, so the mode cannot be 'fixed' by inverting it."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        up = _upload(client, "loose.png", ONE)
+        finalized = client.post(f"/api/uploads/{up}/finalize")
+        assert finalized.status_code == 200, finalized.text
+        uid = finalized.json()["uid"]
+        original = Path(_rows("SELECT storage_path FROM attachments WHERE uid=:u", u=uid)[0][0])
+
+        assert client.delete(f"/api/attachments/{uid}").status_code == 204
+        assert _rows("SELECT id FROM attachments WHERE uid=:u", u=uid) == []
+        assert not original.exists()
+    finally:
+        _cleanup()
+
+
+async def test_the_async_skip_path_reports_instead_of_exploding(
+    db_engine, monkeypatch, tmp_path
+):
+    """The memo-delete reclaim meeting a row a concurrent upload has re-claimed: it must stand down
+    and SAY so. Reading anything off the row after the rollback that releases it would refresh an
+    expired column from an async session that cannot await here — MissingGreenlet, i.e. a 500,
+    on the very path built to avoid touching live media."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    eng = create_engine(SYNC_URL)
+    try:
+        with Session(eng) as seed:
+            owner = User(subject="asyncskip_owner", role="user")
+            seed.add(owner)
+            seed.flush()
+            memo = Memo(uid="asyncskip", owner_id=owner.id, content="x")
+            seed.add(memo)
+            seed.flush()
+            att = _seed_orphan(seed, tmp_path, "asyncskip", memo_id=memo.id)
+            seed.commit()
+            att_id = att.id
+            original = Path(att.storage_path)
+
+        async with async_session() as db:
+            result = await reclaim_attachment(db, att_id, Revalidate.ORPHANED)
+        assert result.outcome == "skipped_ineligible"
+        assert original.exists()
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [(att_id,)]
+    finally:
+        eng.dispose()
+        _cleanup()
+
+
+# --- an unlink that genuinely fails must not take the row with it -----------------------------
+
+
+def test_an_unlink_failure_keeps_the_row_and_reports_it(logged_in_client, monkeypatch, tmp_path):
+    """A read-only mount, EPERM, a transient I/O error: the files stay, so the row — the only
+    record of where they are — must stay too. Deleting it here would strand them on precisely the
+    failure the journal exists to survive."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = _memo_with_one_image(client)
+        uid = memo["attachments"][0]["uid"]
+        original = Path(_rows("SELECT storage_path FROM attachments WHERE uid=:u", u=uid)[0][0])
+
+        def refuse(paths):
+            return [str(p) for p in paths if p.exists()]  # every real file "cannot be removed"
+
+        monkeypatch.setattr(reclaim, "unlink_paths", refuse)
+        refused = client.delete(f"/api/attachments/{uid}")
+        assert refused.status_code == 500  # …and NOT a 204 claiming the media is gone
+
+        assert _rows("SELECT id FROM attachments WHERE uid=:u", u=uid) != []  # journal kept
+        assert original.exists()
+        assert _rows("SELECT id FROM media_jobs") != []  # the whole transaction unwound
+    finally:
+        _cleanup()
+
+
+async def test_a_partial_unlink_failure_keeps_the_row_and_the_retry_finishes_it(
+    db_engine, monkeypatch, tmp_path
+):
+    """Some files removed, one refused. The row stays, so the retry re-derives the FULL set and
+    ENOENT-tolerates everything the first attempt already took."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    eng = create_engine(SYNC_URL)
+    try:
+        with Session(eng) as seed:
+            seed.add(User(subject="partial_owner", role="user"))
+            seed.flush()
+            att = _seed_orphan(seed, tmp_path, "partial")
+            seed.commit()
+            att_id, att_uid = att.id, att.uid
+            original = Path(att.storage_path)
+
+        stubborn = poster.poster_path(att_uid)
+        stubborn.parent.mkdir(parents=True, exist_ok=True)
+        stubborn.write_bytes(b"this one will not go")
+
+        def unlink_all_but_one(paths: list[Path]) -> list[str]:
+            failed = []
+            for path in paths:
+                if path == stubborn:
+                    failed.append(str(path))
+                    continue
+                path.unlink(missing_ok=True)
+            return failed
+
+        async with async_session() as db:
+            first = await reclaim_attachment(
+                db, att_id, Revalidate.ORPHANED, unlink=unlink_all_but_one
+            )
+        assert first.outcome == "failed_unlink"
+        assert first.failed_paths == (str(stubborn),)
+        assert not original.exists()  # this one really did go
+        assert stubborn.exists()
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [(att_id,)]
+
+        # The retry: the already-gone paths are absent, which is success, and the stubborn one is
+        # removable this time. Nothing about the first attempt makes the second harder.
+        async with async_session() as db:
+            second = await reclaim_attachment(db, att_id, Revalidate.ORPHANED)
+        assert second.outcome == "reclaimed"
+        assert second.failed_paths == ()
+        assert not stubborn.exists()
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == []
     finally:
         eng.dispose()
         _cleanup()
@@ -296,27 +465,88 @@ async def test_a_tier_published_during_the_reclaim_is_still_unlinked(
 
 
 APP_DIR = Path(__file__).resolve().parent.parent / "app"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SEAM = ("app/services/reclaim.py",)
+
+
+def _attachment_deleters(root: Path, package: str, *, exempt: tuple[str, ...] = SEAM) -> list[str]:
+    """Every place a tree deletes an Attachment row, found by the ENTITY rather than by what the
+    variable happens to be called.
+
+    Two shapes count: `session.delete(x)` where `x` was bound from something naming `Attachment`
+    (a `select(Attachment)` result, an `Attachment(...)`, or a parameter annotated `Attachment`),
+    and a bulk `delete(Attachment)` statement. Matching the entity is what makes a rename — or a
+    bulk DELETE, or a new deleter under scripts/ — unable to slip past this.
+
+    Known bound: it matches the IDENTIFIER `Attachment`, so aliasing the import
+    (`from app.models import Attachment as A`) would evade it. Nothing in this codebase aliases a
+    model import, and the shape the advisory named — the same entity under a different local
+    variable — is caught.
+    """
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        rel = f"{package}/{path.relative_to(root)}"
+        if rel in exempt:
+            continue  # the seam itself
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for scope in [tree, *[n for n in ast.walk(tree) if isinstance(n, FUNCTION_NODES)]]:
+            bound = _names_bound_to_attachment(scope)
+            for node in ast.walk(scope):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                func, arg = node.func, node.args[0]
+                is_orm_delete = isinstance(func, ast.Attribute) and func.attr == "delete"
+                is_bulk_delete = isinstance(func, ast.Name) and func.id in {"delete", "sa_delete"}
+                names = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)}
+                if is_bulk_delete and "Attachment" in names:
+                    offenders.append(f"{rel}:{node.lineno}")
+                elif is_orm_delete and isinstance(arg, ast.Name) and arg.id in bound:
+                    offenders.append(f"{rel}:{node.lineno}")
+    return sorted(set(offenders))
+
+
+FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _names_bound_to_attachment(scope: ast.AST) -> set[str]:
+    """Local names that hold an Attachment: assigned from an expression naming `Attachment`, or a
+    parameter annotated with it. `AttachmentRendition` is a DIFFERENT entity and must not match, so
+    this compares identifiers rather than searching text."""
+    bound: set[str] = set()
+    if isinstance(scope, FUNCTION_NODES):
+        for arg in [*scope.args.args, *scope.args.kwonlyargs]:
+            names = {n.id for n in ast.walk(arg.annotation) if isinstance(n, ast.Name)} if (
+                arg.annotation is not None
+            ) else set()
+            if "Attachment" in names:
+                bound.add(arg.arg)
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Assign) and node.value is not None:
+            names = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+            if "Attachment" in names:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bound.add(target.id)
+    return bound
 
 
 def test_only_the_reclaim_seam_deletes_an_attachment_row():
-    """Every attachment-row deletion in the app goes through `reclaim`, so the ordering above is
-    the ONLY ordering in the codebase. A new `db.delete(some_attachment)` elsewhere is how the
-    forbidden state comes back, and it fails here rather than in production."""
-    offenders: list[str] = []
-    for path in sorted(APP_DIR.rglob("*.py")):
-        rel = str(path.relative_to(APP_DIR))
-        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "delete" and node.args:
-                target = node.args[0]
-                name = target.id if isinstance(target, ast.Name) else None
-                if name in {"att", "attachment"} and rel != "services/reclaim.py":
-                    offenders.append(f"{rel}:{node.lineno}")
+    """Every attachment-row deletion goes through `reclaim`, so the ordering it documents is the
+    ONLY ordering in the codebase — app AND the maintenance scripts. A new deleter elsewhere is how
+    the forbidden state comes back, and it fails here rather than in production."""
+    offenders = _attachment_deleters(APP_DIR, "app") + _attachment_deleters(SCRIPTS_DIR, "scripts")
     assert offenders == [], (
         f"attachment row deleted outside the reclaim seam: {offenders} — route it through "
         "app/services/reclaim.py so its files go first"
+    )
+
+
+def test_the_deleter_guard_actually_recognises_a_deletion():
+    """The positive control: without it, a guard that matched nothing would also pass. The seam's
+    own module contains exactly the deletions this scan is built to find."""
+    seam = _attachment_deleters(APP_DIR, "app", exempt=())  # the same scan, exemption removed
+    assert [line for line in seam if "reclaim.py" in line], (
+        "the scan no longer recognises the seam's own attachment deletes — it has stopped working"
     )
 
 
@@ -335,6 +565,7 @@ def test_reclaiming_a_row_that_is_already_gone_is_not_an_error(db_engine):
     eng = create_engine(SYNC_URL)
     try:
         with Session(eng) as session:
-            assert reclaim_attachment_sync(session, 987654321) == "vanished"
+            gone = reclaim_attachment_sync(session, 987654321, Revalidate.ORPHANED)
+        assert gone.outcome == "vanished"
     finally:
         eng.dispose()

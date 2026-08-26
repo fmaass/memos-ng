@@ -963,7 +963,17 @@ async def delete_memo(
     # its files, then the row. Each id gets its own transaction, so a failure part way through
     # leaves the rest as orphans the sweep will finish rather than rolling the memo delete back.
     for attachment_id in orphaned:
-        await reclaim.reclaim_attachment(db, attachment_id)
+        result = await reclaim.reclaim_attachment(db, attachment_id, reclaim.Revalidate.ORPHANED)
+        if result.outcome != "reclaimed":
+            # The memo IS deleted — that is what the caller asked for and it has committed, so
+            # this cannot become an error response. A row left behind here is an orphan the
+            # reconcile sweep and the script both find; logged so it is visible before they run.
+            logger.warning(
+                "memo.delete.attachment_not_reclaimed",
+                attachment_id=attachment_id,
+                outcome=result.outcome,
+                failed_paths=list(result.failed_paths),
+            )
 
 
 @router.post("/memos/{uid}/pin", response_model=MemoOut)

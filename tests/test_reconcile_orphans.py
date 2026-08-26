@@ -21,7 +21,7 @@ from app.models import (
     Visibility,
 )
 from app.services.asset_paths import all_asset_paths
-from app.services.reclaim import reclaim_attachment_sync
+from app.services.reclaim import Revalidate, reclaim_attachment_sync
 from scripts.reconcile_orphan_attachments import leaked_orphans, main, read_back
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
@@ -117,7 +117,8 @@ def test_reclaim_takes_the_row_its_jobs_and_its_files_and_reads_back(
 
         paths = all_asset_paths(leaked)
         assert seeded["paths"]["dated"] in paths
-        assert reclaim_attachment_sync(session, leaked_id) == "reclaimed"
+        done = reclaim_attachment_sync(session, leaked_id, Revalidate.LEAKED_ORPHAN)
+        assert done.outcome == "reclaimed"
         assert read_back(session, leaked_id, paths) is True
 
         assert not seeded["paths"]["dated"].exists()
