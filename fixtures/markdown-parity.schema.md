@@ -113,13 +113,20 @@ bulleted sublist inside a numbered list projects `ordered: false` at the deeper 
 
 Ordered `{href, text}` for every anchor in the block, in document order. **Only `http:`,
 `https:` and `mailto:` hrefs are ever listed** — those are the schemes
-`markdown.ts`'s `ALLOWED_URI_REGEXP` permits. Anything else renders as plain text and
-contributes to `text` only. There are three layers behind that, and the fixture shows the
-first one: markdown-it's own `validateLink` refuses `javascript:`/`data:` before a link is
-ever created, so `[js](javascript:alert(1))` stays **literal markdown text** in the output.
-DOMPurify (which strips such an `href` while keeping the element and its text) and the
-projection's own scheme filter are the second and third; the projection unit tests cover them
-with literal HTML.
+`markdown.ts`'s `ALLOWED_URI` permits. Anything else renders as plain text and contributes to
+`text` only, and which plain text depends on how far the destination got:
+
+- `javascript:`/`data:` are refused by markdown-it's own `validateLink` before a link is ever
+  created, so `[js](javascript:alert(1))` stays **literal markdown text**, brackets and
+  destination included.
+- A destination markdown-it accepts but the SPA will not open — `ftp:`, a scheme-relative
+  `//host`, a relative path — renders as the **label alone, with no anchor element at all**
+  (`memo_target_policy` drops the anchor; the destination appears nowhere). `[the file](ftp://…)`
+  is the text `the file`.
+
+DOMPurify (which would strip such an `href` while keeping the element and its text) and the
+projection's own scheme filter are the layers behind that policy, and the projection unit tests
+cover them with literal HTML.
 
 A table's `links` are those of all its cells in row-major order; a `list` block's are those of
 its items in order.
@@ -141,12 +148,16 @@ normalized like block text. A `code` block's `inline` is always empty — the `<
   the difference is the space after `#`.
 - **Raw HTML.** `html: false`, so `<script>alert('x')</script>` and `<b>tag</b>` are **literal
   text** in a paragraph, never markup.
-- **Images.** `img` is not in the DOMPurify allowlist, so an image is removed entirely —
-  **and its alt text with it**, since a removed void element leaves no children to keep.
-  `![A red square](https://example.com/red.png)` therefore projects as a paragraph with
-  `text: ""`. memos-ng does not render inline markdown images today (memo media is attachments,
-  rendered by the app, not by the markdown pipeline). A consumer that renders the image, or
-  that shows its alt text, will not match — matching the SPA means dropping it.
+- **Images.** `img` is not in the DOMPurify allowlist, so an image whose source is an allowed
+  scheme is removed entirely — **and its alt text with it**, since a removed void element leaves
+  no children to keep. `![A red square](https://example.com/red.png)` therefore projects as a
+  paragraph with `text: ""`. memos-ng does not render inline markdown images today (memo media is
+  attachments, rendered by the app, not by the markdown pipeline). A consumer that renders such an
+  image, or that shows its alt text, will not match — matching the SPA means dropping it.
+- **Images with a refused source.** The one exception: when the source is *not* an allowed scheme
+  (`javascript:`, `data:`, …) the image is dropped and **its alt text is kept as plain text**, so
+  the reader sees the words the author wrote instead of raw `![…](…)` markup.
+  `![A red square](javascript:alert(1))` projects as a paragraph with `text: "A red square"`.
 
 ## Limitations of schema 1
 
