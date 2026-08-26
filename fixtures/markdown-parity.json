@@ -237,6 +237,24 @@
       ]
     },
     {
+      "id": "image-unsafe-scheme",
+      "markdown": "![A red square](javascript:alert(1))\n\n![The chart](data:text/html,hi)",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "A red square",
+          "type": "paragraph"
+        },
+        {
+          "inline": [],
+          "links": [],
+          "text": "The chart",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
       "id": "link-reference-after-indented-code",
       "markdown": "    code line\n[pic]: https://example.com/red.png\n\n![shot][pic]",
       "projection": [
@@ -541,6 +559,18 @@
       ]
     },
     {
+      "id": "link-schemes-ftp-and-relative",
+      "markdown": "[the file](ftp://example.com/pub/readme.txt) and [the host](//example.com/path) are not links.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [],
+          "text": "the file and the host are not links.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
       "id": "linkify-bare",
       "markdown": "Bare https://example.com/a?b=1 and memo@example.com become links.",
       "projection": [
@@ -557,6 +587,23 @@
             }
           ],
           "text": "Bare https://example.com/a?b=1 and memo@example.com become links.",
+          "type": "paragraph"
+        }
+      ]
+    },
+    {
+      "id": "linkify-bare-domain",
+      "markdown": "Visit example.com for the docs.",
+      "projection": [
+        {
+          "inline": [],
+          "links": [
+            {
+              "href": "http://example.com",
+              "text": "example.com"
+            }
+          ],
+          "text": "Visit example.com for the docs.",
           "type": "paragraph"
         }
       ]
@@ -874,6 +921,43 @@
       ]
     },
     {
+      "id": "task-list-single-task-among-plain",
+      "markdown": "- plain one\n- [ ] the only task\n- plain two",
+      "projection": [
+        {
+          "inline": [],
+          "items": [
+            "plain one"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        },
+        {
+          "checked": false,
+          "inline": [],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "the only task",
+          "type": "task"
+        },
+        {
+          "inline": [],
+          "items": [
+            "plain two"
+          ],
+          "level": 0,
+          "links": [],
+          "ordered": false,
+          "text": "",
+          "type": "list"
+        }
+      ]
+    },
+    {
       "id": "unicode-nfc-nfd",
       "markdown": "caf\u00e9 vs cafe\u0301 \ud83d\ude80",
       "projection": [
@@ -898,6 +982,6 @@
       ]
     }
   ],
-  "generator": "markdown-it@14.2.0+markdown-it-task-lists@2.1.1+dompurify@3.4.11+renderer-sha256:647012201ad20b80",
+  "generator": "markdown-it@14.2.0+markdown-it-task-lists@2.1.1+dompurify@3.4.11+renderer-sha256:b1f0b0f6bafe63cf",
   "schema": 1
 }

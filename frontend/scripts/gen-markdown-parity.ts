@@ -95,6 +95,14 @@ const CASES: ParityCase[] = [
     markdown: '![A red square](https://example.com/red.png)\n\nThe image above renders as nothing.',
   },
   {
+    // An image whose source is not a scheme the SPA will open is DROPPED and its alt text shown as
+    // plain text — the reader sees the words, never the markup and never a fetch. (The safe case
+    // above stays as it is: the image goes, and its alt with it.) Canonical for both clients,
+    // owner decision 2026-08-26.
+    id: 'image-unsafe-scheme',
+    markdown: '![A red square](javascript:alert(1))\n\n![The chart](data:text/html,hi)',
+  },
+  {
     id: 'link-reference-image',
     markdown:
       '![shot][pic]\n\nThe reference image above renders as nothing.\n\n[pic]: https://example.com/red.png',
@@ -186,8 +194,23 @@ const CASES: ParityCase[] = [
       '[site](https://example.com/a?b=1) and [mail](mailto:memo@example.com) are links;\n\n[js](javascript:alert(1)) and [data](data:text/html,hi) are not.',
   },
   {
+    // `ftp:` and a scheme-relative `//host` are destinations markdown-it accepts and the SPA still
+    // refuses to open. They render as the LABEL as plain text: no anchor element, and the
+    // destination itself nowhere on screen. Canonical for both clients, owner decision 2026-08-26.
+    id: 'link-schemes-ftp-and-relative',
+    markdown:
+      '[the file](ftp://example.com/pub/readme.txt) and [the host](//example.com/path) are not links.',
+  },
+  {
     id: 'linkify-bare',
     markdown: 'Bare https://example.com/a?b=1 and memo@example.com become links.',
+  },
+  {
+    // A bare domain carrying NO scheme is auto-linked too, to the `http://` form linkify infers —
+    // a client that leaves it as text shows the same words with nothing to tap. Canonical for both
+    // clients, owner decision 2026-08-26.
+    id: 'linkify-bare-domain',
+    markdown: 'Visit example.com for the docs.',
   },
   {
     id: 'list-ordered',
@@ -236,6 +259,13 @@ const CASES: ParityCase[] = [
   {
     id: 'task-list-nested',
     markdown: '- [x] outer done\n  - [ ] inner todo\n  - [x] inner done\n- [ ] outer todo',
+  },
+  {
+    // One task item among plain ones: the checkbox belongs to THAT item only. A renderer that
+    // draws a checkbox on every item of a list containing one task projects three tasks here
+    // instead of list / task / list. Canonical for both clients, owner decision 2026-08-26.
+    id: 'task-list-single-task-among-plain',
+    markdown: '- plain one\n- [ ] the only task\n- plain two',
   },
   {
     id: 'unicode-nfc-nfd',
