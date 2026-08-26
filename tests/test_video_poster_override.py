@@ -12,9 +12,7 @@ while still extracting one when none was supplied, and a refusal costs the calle
 """
 
 import asyncio
-import errno
 import io
-import os
 import shutil
 import subprocess
 import threading
@@ -219,29 +217,8 @@ def test_a_failed_post_leaves_the_poster_retryable_and_no_orphan_tier_file(
         _cleanup()
 
 
-def _split_the_mounts(monkeypatch, tmp_path):
-    """Reproduce the deployed layout: `data/assets` (derived tiers, NVMe) is a SEPARATE filesystem
-    from `data/uploads` (parts, HDD share), so a rename between them fails with EXDEV.
-
-    Patching `os.replace` patches a DEPENDENCY of the placement, not the code under test — the
-    placement runs in full — and it is the only way to reproduce a two-mount layout no test box
-    has. Every other rename is delegated to the real one, so an over-broad patch cannot be what
-    makes this pass.
-    """
-    real_replace = os.replace
-    uploads_dir = str(tmp_path / "uploads")
-    assets_dir = str(tmp_path / "assets")
-
-    def guarded(src, dst, **kwargs):
-        if str(src).startswith(uploads_dir) and str(dst).startswith(assets_dir):
-            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
-        return real_replace(src, dst, **kwargs)
-
-    monkeypatch.setattr(os, "replace", guarded)
-
-
 def test_a_poster_override_lands_across_the_deployed_mount_split(
-    logged_in_client, monkeypatch, tmp_path
+    logged_in_client, monkeypatch, tmp_path, split_assets_mount
 ):
     """The production incident, pinned: the first real create through this feature 500'd because
     the poster was RENAMED from the upload parts onto the derived-asset mount. Publishing it has
@@ -250,7 +227,9 @@ def test_a_poster_override_lands_across_the_deployed_mount_split(
     """
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    _split_the_mounts(monkeypatch, tmp_path)
+    # The shared fixture (tests/conftest.py) guards the WHOLE assets directory in both directions
+    # — one definition of the deployed boundary, reused by tests/test_asset_mount_boundary.py.
+    split_assets_mount(tmp_path)
     try:
         title_card = _jpeg(color=(3, 33, 133))
         video_uid = _video(client)

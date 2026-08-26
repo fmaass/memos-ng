@@ -1,3 +1,4 @@
+import errno
 import os
 from pathlib import Path
 
@@ -83,6 +84,40 @@ def _reset_rate_limit():
     auth._RL.clear()
     yield
     auth._RL.clear()
+
+
+@pytest.fixture
+def split_assets_mount(monkeypatch):
+    """Reproduce the deployed storage layout, which no test box has: `<DATA_ROOT>/assets` (the
+    derived tiers, on NVMe) is a SEPARATE filesystem sitting inside `<DATA_ROOT>` (originals and
+    upload parts, on the HDD share). Any rename ACROSS that boundary fails with EXDEV in
+    production while passing every test environment — which is exactly how the first real poster
+    override 500'd in the field (MEMNG-143).
+
+    Call the returned function with the DATA_ROOT the test is using. Both directions are guarded,
+    and every rename that does NOT cross the boundary is delegated to the real one, so an
+    over-broad patch cannot be what makes a test pass. `os.replace`/`os.rename` are the two
+    primitives everything here goes through — `Path.rename`/`Path.replace` call them by module
+    attribute, so they are covered too.
+
+    Patching these patches a DEPENDENCY of the code under test: the placement itself runs in full.
+    """
+
+    def apply(data_root) -> None:
+        assets = str(Path(data_root) / "assets")
+
+        def guard(real):
+            def wrapped(src, dst, **kwargs):
+                if str(src).startswith(assets) != str(dst).startswith(assets):
+                    raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+                return real(src, dst, **kwargs)
+
+            return wrapped
+
+        monkeypatch.setattr(os, "replace", guard(os.replace))
+        monkeypatch.setattr(os, "rename", guard(os.rename))
+
+    return apply
 
 
 @pytest.fixture
