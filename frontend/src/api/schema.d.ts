@@ -17,6 +17,10 @@ export interface paths {
          *     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
          *     filters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE
          *     or orphan media is excluded — mirrors `_viewable` / memo visibility.
+         *
+         *     Paged by keyset, like the memo feed: when more rows follow, the response carries an
+         *     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
+         *     not carry — for the page after. The body is a plain array on every page, cursor or not.
          */
         get: operations["list_attachments_api_attachments_get"];
         put?: never;
@@ -1484,6 +1488,7 @@ export interface operations {
             query?: {
                 type?: string | null;
                 limit?: number;
+                cursor?: string | null;
             };
             header?: never;
             path?: never;
@@ -1494,6 +1499,8 @@ export interface operations {
             /** @description Successful Response */
             200: {
                 headers: {
+                    /** @description Opaque continuation token — resend it as `?cursor=` (with the same `type` and `limit`) to get the next page. Absent on the last page. */
+                    "X-Next-Cursor"?: string;
                     [name: string]: unknown;
                 };
                 content: {

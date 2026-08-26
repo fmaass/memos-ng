@@ -1678,7 +1678,7 @@
   "paths": {
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE\nor orphan media is excluded \u2014 mirrors `_viewable` / memo visibility.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE\nor orphan media is excluded \u2014 mirrors `_viewable` / memo visibility.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -1702,6 +1702,18 @@
               "title": "Limit",
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "title": "Cursor",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1717,7 +1729,15 @@
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful Response",
+            "headers": {
+              "X-Next-Cursor": {
+                "description": "Opaque continuation token \u2014 resend it as `?cursor=` (with the same `type` and `limit`) to get the next page. Absent on the last page.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "422": {
             "content": {
