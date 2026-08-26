@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import os
 import time
@@ -33,6 +32,7 @@ from app.models import (
 )
 from app.services import asset_urls, poster, printready, storage, variants
 from app.services import uploads as up_svc
+from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 from app.services.memos import visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
@@ -281,19 +281,20 @@ def _next_cursor_header() -> dict[str, Any]:
 
 def encode_attachment_cursor(att: Attachment) -> str:
     """The keyset cursor of the library list: the last row of the page, opaque and base64url like
-    the memo feed's (app/services/memos.py). The id alone IS the whole key here — see the ordering
-    note in `list_attachments`."""
-    return base64.urlsafe_b64encode(str(att.id).encode()).decode()
+    the memo feed's (app/services/cursors.py mints both). The id alone IS the whole key here — see
+    the ordering note in `list_attachments`."""
+    return encode_cursor_payload(str(att.id))
 
 
 def decode_attachment_cursor(cursor: str) -> int:
-    """422 — never a 500, and never a silent restart from the top of the library, which would make
-    a paging client loop forever over the first page. (`binascii.Error` and `UnicodeDecodeError`
-    are both ValueError subclasses, so one except covers every way the token can be junk.)"""
+    """`InvalidCursor` (→ 422) — never a 500, and never a silent restart from the top of the
+    library, which would make a paging client loop forever over the first page. Strict since
+    MEMNG-163: the old permissive base64 read junk like `M!Q==` as a valid id."""
+    raw = decode_cursor_payload(cursor)
     try:
-        return int(base64.urlsafe_b64decode(cursor.encode()).decode())
+        return int(raw)
     except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid cursor") from None
+        raise InvalidCursor("cursor is not an attachment id") from None
 
 
 @router.get(

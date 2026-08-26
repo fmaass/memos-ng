@@ -5,7 +5,7 @@ from typing import Any
 
 import structlog
 from anyio import to_thread
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
@@ -21,6 +21,7 @@ from app.config import settings
 from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
 from app.security_headers import CSP
+from app.services.cursors import InvalidCursor
 from app.version import __version__
 
 logger = structlog.get_logger(__name__)
@@ -294,6 +295,16 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
+
+
+# One translation point for every paged list (memo feed, media library, /api/v1 pageToken):
+# the decoders live in the service layer and stay HTTP-free, raising `InvalidCursor`, and this
+# turns it into the 422 a paging client can act on. A handler rather than a try/except per route
+# so that a list added later cannot reintroduce the 500 by forgetting to guard its own decode.
+@app.exception_handler(InvalidCursor)
+async def _invalid_cursor(request: Request, exc: InvalidCursor) -> JSONResponse:
+    logger.info("invalid_cursor", path=request.url.path, reason=str(exc))
+    return JSONResponse(status_code=422, content={"detail": "Invalid cursor"})
 
 
 # Order matters: `add_middleware` inserts at the OUTSIDE of the stack, so the last one added runs

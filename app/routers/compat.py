@@ -12,7 +12,6 @@ So a PUBLIC→PRIVATE flip, a memo deletion, or an attachment deletion revokes t
 next request, instead of leaving every derived tier world-readable by uid forever.
 """
 
-import base64
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +27,8 @@ from app import auth
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import Attachment, Memo, Tag, User, Visibility
-from app.services.memos import visible_clause
+from app.services.cursors import encode_cursor_payload
+from app.services.memos import decode_cursor, visible_clause
 
 router = APIRouter(tags=["compat"])
 
@@ -112,13 +112,13 @@ def _parse_filter(filter_str: str | None) -> list[str]:
 
 
 def _encode_token(memo: Memo) -> str:
-    return base64.urlsafe_b64encode(f"{memo.created_at.isoformat()}|{memo.id}".encode()).decode()
+    return encode_cursor_payload(f"{memo.created_at.isoformat()}|{memo.id}")
 
 
 def _decode_token(token: str) -> tuple[datetime, int]:
-    raw = base64.urlsafe_b64decode(token.encode()).decode()
-    ts, mid = raw.rsplit("|", 1)
-    return datetime.fromisoformat(ts), int(mid)
+    """Same keyset payload as the native feed's cursor, so it reuses that decode — a `pageToken`
+    the server did not mint is a 422 here too, not the 500 it was before MEMNG-163."""
+    return decode_cursor(token)
 
 
 @router.get("/api/v1/memos")

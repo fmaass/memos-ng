@@ -653,22 +653,26 @@ def test_an_unreadable_attachment_cursor_is_rejected(logged_in_client):
     """A cursor the server did not mint is a client error, never a 500 and never a silent
     full-library reset (which would make a paging client loop forever)."""
     client, _ = logged_in_client
-    for bad in ("not base64 at all!", "Zm9v", ""):  # garbage, valid base64 of "foo", empty
+    # garbage, valid base64 of "foo", empty, and junk the permissive decoder read as id 1
+    for bad in ("not base64 at all!", "Zm9v", "", "M!Q=="):
         assert client.get(f"/api/attachments?cursor={bad}").status_code == 422, bad
 
 
 def test_attachment_cursor_round_trips_and_refuses_junk():
+    """Since MEMNG-163 the decoder signals `InvalidCursor` (the app-wide handler in app/main.py
+    turns it into the 422 the test above pins) instead of raising HTTPException itself, and it is
+    STRICT: `M!Q==` used to decode to id 1 because urlsafe_b64decode discards junk characters."""
     from app.models import Attachment
     from app.routers.assets import decode_attachment_cursor, encode_attachment_cursor
-    from fastapi import HTTPException
+    from app.services.cursors import InvalidCursor
 
     cursor = encode_attachment_cursor(Attachment(id=4711))
     assert decode_attachment_cursor(cursor) == 4711
-    for bad in ("", "Zm9v", "%%%"):
+    for bad in ("", "Zm9v", "%%%", "M!Q==", "MQ"):
         try:
             decode_attachment_cursor(bad)
-        except HTTPException as exc:
-            assert exc.status_code == 422
+        except InvalidCursor:
+            pass
         else:
             raise AssertionError(f"{bad!r} was accepted as a cursor")
 

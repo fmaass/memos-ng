@@ -1,4 +1,3 @@
-import base64
 import re
 import secrets
 import time
@@ -23,6 +22,7 @@ from app.models import (
     memo_tags,
 )
 from app.services import storage
+from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 
 logger = structlog.get_logger(__name__)
 
@@ -41,14 +41,21 @@ def gen_uid() -> str:
 
 
 def encode_cursor(memo: Memo) -> str:
-    raw = f"{memo.created_at.isoformat()}|{memo.id}"
-    return base64.urlsafe_b64encode(raw.encode()).decode()
+    return encode_cursor_payload(f"{memo.created_at.isoformat()}|{memo.id}")
 
 
 def decode_cursor(cursor: str) -> tuple[datetime, int]:
-    raw = base64.urlsafe_b64decode(cursor.encode()).decode()
-    ts, mid = raw.rsplit("|", 1)
-    return datetime.fromisoformat(ts), int(mid)
+    """`InvalidCursor` (→ 422) for anything we did not mint — never an unhandled 500, and never a
+    silent restart from page 1, which would make a paging client loop over the first page for
+    ever. Both failure modes were live before MEMNG-163: the decode had no guard at all."""
+    raw = decode_cursor_payload(cursor)
+    ts, sep, mid = raw.rpartition("|")
+    if not sep:
+        raise InvalidCursor("cursor is not a keyset token")
+    try:
+        return datetime.fromisoformat(ts), int(mid)
+    except ValueError:
+        raise InvalidCursor("cursor is not a keyset token") from None
 
 
 def owner_subjects(owner: str | Sequence[str] | None) -> list[str]:
@@ -340,7 +347,10 @@ async def list_memos(
     count_ms = round((time.perf_counter() - t_count0) * 1000, 1)
 
     descending = not sort.lstrip("-") == sort  # "-created_at" → desc
-    if cursor:
+    # `is not None`, not truthiness: `?cursor=` (sent empty) used to fall through to page 1, which
+    # is the loop-for-ever failure MEMNG-163 is about — an empty token is a bad token, not "start
+    # over". Callers that page internally (the export walk) still pass None for the first page.
+    if cursor is not None:
         cdt, cid = decode_cursor(cursor)
         if descending:
             conds.append(or_(Memo.created_at < cdt, and_(Memo.created_at == cdt, Memo.id < cid)))
