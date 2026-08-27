@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
@@ -199,6 +199,7 @@ class AttachmentListItem(BaseModel):
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
     renditions: list[RenditionItem]
     orphan: bool  # not linked to a memo
+    memoUid: str | None  # the memo this hangs on, null for orphans (MEMNG-171)
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -207,7 +208,9 @@ class AttachmentListItem(BaseModel):
     printUrl: str
 
 
-def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
+def _list_item(att: Attachment, user_id: int, memo_uid: str | None) -> AttachmentListItem:
+    """`memo_uid` is passed IN, never read off `att` — there is no `Attachment.memo` relationship
+    and adding one would lazy-load per row. The caller selects it in the same statement."""
     base = f"/api/attachments/{att.uid}"
     return AttachmentListItem(
         uid=att.uid,
@@ -221,6 +224,7 @@ def _list_item(att: Attachment, user_id: int) -> AttachmentListItem:
         hasLegacyPrint=att.print_path is not None,
         renditions=rendition_items(att),
         orphan=att.memo_id is None,
+        memoUid=memo_uid,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
@@ -242,7 +246,7 @@ def _next_cursor_header() -> dict[str, Any]:
     return {
         NEXT_CURSOR_HEADER: {
             "description": "Opaque continuation token — resend it as `?cursor=` (with the same "
-            "`type` and `limit`) to get the next page. Absent on the last page.",
+            "`type`, `limit` and `order`) to get the next page. Absent on the last page.",
             "schema": {"type": "string"},
         }
     }
@@ -278,18 +282,24 @@ async def list_attachments(
     type: str | None = None,
     limit: int = 200,
     cursor: str | None = None,
+    order: Literal["desc", "asc"] = "desc",
 ) -> list[AttachmentListItem]:
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
-    filters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE
-    or orphan media is excluded — mirrors `_viewable` / memo visibility.
+    filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
+    memo it does hang on. Another user's PRIVATE or orphan media is excluded — mirrors `_viewable`
+    / memo visibility. ?order=asc walks the same library oldest-first.
 
     Paged by keyset, like the memo feed: when more rows follow, the response carries an
     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
     not carry — for the page after. The body is a plain array on every page, cursor or not.
     """
     stmt = (
-        select(Attachment)
+        # `Memo.uid` rides along on the row the join already produces: the memo is many-to-one
+        # from the attachment, so selecting it multiplies no rows, and it costs no statement — a
+        # relationship + per-item read would be one SELECT per tile (pinned by a statement-count
+        # test in tests/test_assets.py).
+        select(Attachment, Memo.uid)
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
         # own (incl. orphans, where Memo is NULL) OR on a memo the user can see (non-PRIVATE)
         .where((Attachment.owner_id == user.id) | visible_clause(user))
@@ -299,27 +309,35 @@ async def list_attachments(
     elif type == "video":
         stmt = stmt.where(Attachment.mime.like("video/%"))
     if cursor is not None:
-        # STRICT `<`, exactly as the memo feed's cursor compares: `<=` would serve the boundary row
-        # a second time. The filters above are re-applied per page, so a page is never cut before
-        # the filter runs.
-        stmt = stmt.where(Attachment.id < decode_attachment_cursor(cursor))
-    # Ordering stays `id DESC` alone, and that order is already TOTAL: id is the primary key, so no
-    # two rows can tie and a keyset walk can neither skip nor repeat — a created_at tie (bulk
-    # import, same-second upload batch) is broken by construction. It is also the one order this
-    # table is indexed for (attachments carries no created_at index), and it is the order the
-    # library already displayed; (created_at DESC, id DESC) would have reshuffled it. Probed
-    # against production 2026-08-26: 0 of 1355 rows disagree between id order and created_at order,
-    # so "newest first" means the same thing either way.
+        # STRICT comparison, exactly as the memo feed's cursor compares: `<=`/`>=` would serve the
+        # boundary row a second time. The filters above are re-applied per page, so a page is never
+        # cut before the filter runs. The direction follows `order`, and the cursor itself stays
+        # what it always was — an opaque id, carrying NO direction, so an already-issued cursor
+        # keeps working. Replaying one under the other order does not fail: it simply continues
+        # from that id the other way. Keeping order consistent across a walk is the client's job,
+        # exactly as it already is for `type` and `limit`, which the cursor does not carry either.
+        cursor_id = decode_attachment_cursor(cursor)
+        stmt = stmt.where(
+            Attachment.id > cursor_id if order == "asc" else Attachment.id < cursor_id
+        )
+    # Ordering is `id` alone in either direction, and that order is already TOTAL: id is the
+    # primary key, so no two rows can tie and a keyset walk can neither skip nor repeat — a
+    # created_at tie (bulk import, same-second upload batch) is broken by construction. It is also
+    # the one order this table is indexed for (attachments carries no created_at index), and it is
+    # the order the library already displayed; (created_at DESC, id DESC) would have reshuffled it.
+    # Probed against production 2026-08-26 and re-probed 2026-08-27: 0 of 1355 (resp. 1339) rows
+    # disagree between id order and created_at order, so "oldest/newest first" means the same thing
+    # either way and `order=asc` needs no created_at ordering, composite cursor, index or
+    # migration — it is this same keyset read backwards.
+    by_id = Attachment.id.asc() if order == "asc" else Attachment.id.desc()
     page = max(1, min(limit, 500))
     # limit + 1: one extra row is how the page learns another page exists, without a second query
     # (list_memos does the same). It is dropped before serializing, so the body is unchanged.
-    rows = list(
-        (await db.execute(stmt.order_by(Attachment.id.desc()).limit(page + 1))).scalars().all()
-    )
+    rows = list((await db.execute(stmt.order_by(by_id).limit(page + 1))).all())
     if len(rows) > page:
-        response.headers[NEXT_CURSOR_HEADER] = encode_attachment_cursor(rows[page - 1])
+        response.headers[NEXT_CURSOR_HEADER] = encode_attachment_cursor(rows[page - 1][0])
         rows = rows[:page]
-    return [_list_item(a, user.id) for a in rows]
+    return [_list_item(att, user.id, memo_uid) for att, memo_uid in rows]
 
 
 # PAT-or-session like the original-tier download below (not a docstring: FastAPI would publish it

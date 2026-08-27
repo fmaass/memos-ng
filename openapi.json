@@ -29,6 +29,13 @@
               "null"
             ]
           },
+          "memoUid": {
+            "title": "Memouid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mime": {
             "title": "Mime",
             "type": "string"
@@ -95,6 +102,7 @@
           "hasLegacyPrint",
           "renditions",
           "orphan",
+          "memoUid",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
@@ -1678,7 +1686,7 @@
   "paths": {
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE\nor orphan media is excluded \u2014 mirrors `_viewable` / memo visibility.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 mirrors `_viewable`\n/ memo visibility. ?order=asc walks the same library oldest-first.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -1714,6 +1722,20 @@
                 "null"
               ]
             }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "desc",
+              "enum": [
+                "desc",
+                "asc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1732,7 +1754,7 @@
             "description": "Successful Response",
             "headers": {
               "X-Next-Cursor": {
-                "description": "Opaque continuation token \u2014 resend it as `?cursor=` (with the same `type` and `limit`) to get the next page. Absent on the last page.",
+                "description": "Opaque continuation token \u2014 resend it as `?cursor=` (with the same `type`, `limit` and `order`) to get the next page. Absent on the last page.",
                 "schema": {
                   "type": "string"
                 }
