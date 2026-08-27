@@ -15,8 +15,9 @@ export interface paths {
          * List Attachments
          * @description The household media library the user can see, newest first: their own attachments
          *     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
-         *     filters by mime prefix; `orphan` flags media not attached to any memo. Another user's PRIVATE
-         *     or orphan media is excluded — mirrors `_viewable` / memo visibility.
+         *     filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
+         *     memo it does hang on. Another user's PRIVATE or orphan media is excluded — mirrors `_viewable`
+         *     / memo visibility. ?order=asc walks the same library oldest-first.
          *
          *     Paged by keyset, like the memo feed: when more rows follow, the response carries an
          *     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -789,6 +790,8 @@ export interface components {
             hasPrint: boolean;
             /** Height */
             height: number | null;
+            /** Memouid */
+            memoUid: string | null;
             /** Mime */
             mime: string;
             /** Mine */
@@ -1489,6 +1492,7 @@ export interface operations {
                 type?: string | null;
                 limit?: number;
                 cursor?: string | null;
+                order?: "desc" | "asc";
             };
             header?: never;
             path?: never;
@@ -1499,7 +1503,7 @@ export interface operations {
             /** @description Successful Response */
             200: {
                 headers: {
-                    /** @description Opaque continuation token — resend it as `?cursor=` (with the same `type` and `limit`) to get the next page. Absent on the last page. */
+                    /** @description Opaque continuation token — resend it as `?cursor=` (with the same `type`, `limit` and `order`) to get the next page. Absent on the last page. */
                     "X-Next-Cursor"?: string;
                     [name: string]: unknown;
                 };

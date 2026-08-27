@@ -188,6 +188,17 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.4.1
+
+Media library: the owning memo on each item, and oldest-first paging (2026-08-27).
+
+**Added**
+- `GET /api/attachments` items carry `memoUid` — the memo the attachment hangs on, `null` for
+  orphans. Read from the row the visibility join already produces, so a page costs no extra
+  query (MEMNG-171).
+- `GET /api/attachments?order=asc` walks the same keyset oldest-first; `order=desc` (the default)
+  is unchanged. The cursor is unchanged and direction-agnostic (MEMNG-190).
+
 ### v1.4.0
 
 Photo-book print tier, streaming export, and media-worker reliability (2026-08-17).

@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 
 from app.config import settings
+from app.database import engine as async_engine
 from app.main import app
 from app.routers.assets import (
     _negotiated_path_sync,
@@ -12,7 +13,7 @@ from app.routers.assets import (
 from app.services import uploads as up_svc
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from starlette.datastructures import UploadFile  # the class the multipart parser instantiates
 
 from tests.conftest import SYNC_URL
@@ -332,6 +333,16 @@ def _rm(subject, *mids):
     eng.dispose()
 
 
+def _rm_memos(*mids):
+    """Memos only — `_rm` also drops the user, which would cascade away the logged-in fixture's
+    own session and attachments mid-test."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        for mid in mids:
+            c.execute(text("DELETE FROM memos WHERE id=:m"), {"m": mid})
+    eng.dispose()
+
+
 def test_shared_memo_media_viewable_by_other_user(logged_in_client, monkeypatch, tmp_path):
     # Household-sharing fix: a memo you can SEE (non-PRIVATE) → you can fetch its media even
     # though ANOTHER user owns the attachment. Regression for "shared images don't load".
@@ -633,6 +644,7 @@ def test_list_attachments_without_a_cursor_is_the_unchanged_bare_list(logged_in_
             "hasLegacyPrint",
             "renditions",
             "orphan",
+            "memoUid",  # MEMNG-171: the ONE key added since; everything else is untouched
             "thumbnailUrl",
             "previewUrl",
             "webUrl",
@@ -676,6 +688,155 @@ def test_attachment_cursor_round_trips_and_refuses_junk():
         else:
             raise AssertionError(f"{bad!r} was accepted as a cursor")
 
+
+# --- the owning memo's uid on each library item (MEMNG-171) ---
+
+
+def test_list_attachments_carries_the_owning_memo_uid(logged_in_client):
+    """Each library item names the memo it hangs on, so a client can jump from the media grid to
+    the memo without a second round trip per tile. Orphans (unlinked media, which are designed —
+    app/routers/memos.py) carry null, which is what `orphan` already flags."""
+    client, subject = logged_in_client
+    _mk_user("muidsharer")
+    mine_m, mine_a = _seed_memo_with_attachment("muid-minem", "muid-mine", subject, "PRIVATE")
+    pub_m, pub_a = _seed_memo_with_attachment("muid-pubm", "muid-pub", "muidsharer", "PUBLIC")
+    orphan = _seed_attachment("muid-orph", subject)
+    try:
+        by_uid = {i["uid"]: i for i in client.get("/api/attachments").json()}
+        assert by_uid["muid-mine"]["memoUid"] == "muid-minem"  # own memo
+        assert by_uid["muid-pub"]["memoUid"] == "muid-pubm"  # another user's VISIBLE memo
+        assert by_uid["muid-orph"]["memoUid"] is None  # unlinked media
+        assert by_uid["muid-orph"]["orphan"] is True  # and the existing flag still agrees
+        assert by_uid["muid-mine"]["orphan"] is False
+    finally:
+        _cleanup(mine_a, pub_a, orphan)
+        _rm("muidsharer", pub_m)
+        _rm_memos(mine_m)
+
+
+def test_list_attachments_memo_uid_costs_no_extra_statement(logged_in_client):
+    """The no-N+1 pin: the memo uid rides on the row the list already joins, so a page of three
+    memo-linked attachments costs the SAME statements as before the field existed.
+
+    The number is MEASURED, not guessed — recorded on the untouched tree 2026-08-27, one
+    cookie-authenticated request for `?limit=3`:
+      1. the session lookup (app/auth.py)     3. the library SELECT (attachments [+ memos])
+      2. the user lookup (app/auth.py)        4. the `renditions` selectin load (app/models.py)
+    A per-row memo lookup would add one statement per row (7 here) and turn this red. Reading the
+    built statement text instead would pass against exactly that N+1, so the COUNT is the assert.
+    """
+    client, subject = logged_in_client
+    seeded = [
+        _seed_memo_with_attachment(f"n1-m-{n}", f"n1-a-{n}", subject, "PRIVATE") for n in range(3)
+    ]
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(" ".join(statement.split()))
+
+    try:
+        event.listen(async_engine.sync_engine, "before_cursor_execute", record)
+        try:
+            r = client.get("/api/attachments?limit=3")
+        finally:
+            event.remove(async_engine.sync_engine, "before_cursor_execute", record)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body) == 3  # a full page of three, all of them memo-linked
+        assert all(i["memoUid"] is not None for i in body)  # the field really was served
+        assert any("FROM attachments" in s for s in statements)  # positive control
+        assert len(statements) == 4, statements
+    finally:
+        _cleanup(*[a for _, a in seeded])
+        _rm_memos(*[m for m, _ in seeded])
+
+
+# --- oldest-first paging on the library list (MEMNG-190) ---
+
+
+def test_list_attachments_ascending_is_the_descending_walk_reversed(logged_in_client):
+    """`order=asc` walks the same keyset the other way: same rows, exactly once each, reversed.
+    A cursor comparison that stayed `<` under asc would return an empty second page."""
+    client, subject = logged_in_client
+    aids = [_seed_attachment(f"ord-{n}", subject) for n in range(5)]
+    try:
+        desc, desc_pages = _walk(client, "/api/attachments", 2)
+        asc, asc_pages = _walk(client, "/api/attachments?order=asc", 2)
+        assert desc_pages >= 3 and asc_pages >= 3  # it really paged, both ways
+        assert len(asc) == len(set(asc))  # no row served twice
+        mine_desc = [u for u in desc if u.startswith("ord-")]
+        mine_asc = [u for u in asc if u.startswith("ord-")]
+        assert mine_desc == [f"ord-{n}" for n in reversed(range(5))]
+        assert mine_asc == list(reversed(mine_desc))  # same set, opposite direction, no gap
+    finally:
+        _cleanup(*aids)
+
+
+def test_ascending_order_composes_with_the_type_filter(logged_in_client):
+    """?type is applied per page under asc too — the filter must not be dropped when the order
+    is flipped."""
+    client, subject = logged_in_client
+    aids = []
+    for n in range(3):
+        aids.append(_seed_attachment(f"otf-img-{n}", subject, mime="image/jpeg"))
+        aids.append(_seed_attachment(f"otf-vid-{n}", subject, mime="video/mp4"))
+    try:
+        paged, pages = _walk(client, "/api/attachments?type=image&order=asc", 1)
+        assert pages >= 3
+        assert [u for u in paged if u.startswith("otf-")] == ["otf-img-0", "otf-img-1", "otf-img-2"]
+        assert not any(u.startswith("otf-vid") for u in paged)
+    finally:
+        _cleanup(*aids)
+
+
+def test_ascending_pagination_never_leaks_another_users_private_media(logged_in_client):
+    """The visibility rules hold on every ASCENDING page too — mirrors the descending walk's
+    guard, because the `where` clause and the order clause are built in the same statement."""
+    client, subject = logged_in_client
+    _mk_user("ascsharer")
+    pub_m, pub_a = _seed_memo_with_attachment("asc-pubm", "asc-pub", "ascsharer", "PUBLIC")
+    priv_m, priv_a = _seed_memo_with_attachment("asc-privm", "asc-priv", "ascsharer", "PRIVATE")
+    orphan = _seed_attachment("asc-orph", "ascsharer")  # another user's unlinked media
+    mine = [_seed_attachment(f"asc-mine-{n}", subject) for n in range(2)]
+    try:
+        paged, pages = _walk(client, "/api/attachments?order=asc", 2)
+        assert pages >= 2
+        assert {"asc-pub", "asc-mine-0", "asc-mine-1"} <= set(paged)
+        assert "asc-priv" not in paged  # another user's PRIVATE memo media
+        assert "asc-orph" not in paged  # another user's orphan
+    finally:
+        _cleanup(pub_a, priv_a, orphan, *mine)
+        _rm("ascsharer", pub_m, priv_m)
+
+
+def test_an_unknown_order_is_rejected(logged_in_client):
+    """Only the two directions exist; anything else is a client error, never a silent fallback to
+    newest-first (which would hand a paging client a walk it did not ask for)."""
+    client, _ = logged_in_client
+    assert client.get("/api/attachments?order=sideways").status_code == 422
+    assert client.get("/api/attachments?order=ASC").status_code == 422  # exact tokens, not casefold
+    assert client.get("/api/attachments?order=asc").status_code == 200
+    assert client.get("/api/attachments?order=desc").status_code == 200
+
+
+def test_a_cursor_replayed_under_the_other_order_just_continues_from_that_id(logged_in_client):
+    """The cursor is an opaque id and carries NO direction — replaying a descending cursor under
+    `order=asc` must not crash; it continues from that id in the direction asked for. Keeping the
+    two consistent is the client's job, exactly as it already is for `type` and `limit`."""
+    client, subject = logged_in_client
+    aids = [_seed_attachment(f"flip-{n}", subject) for n in range(5)]
+    try:
+        first = client.get("/api/attachments?limit=2")
+        cursor = first.headers["x-next-cursor"]
+        boundary = [i["uid"] for i in first.json()][-1]  # the row the cursor was minted from
+
+        flipped = client.get(f"/api/attachments?order=asc&limit=10&cursor={cursor}")
+        assert flipped.status_code == 200  # no crash, no 422
+        uids = [i["uid"] for i in flipped.json() if i["uid"].startswith("flip-")]
+        newer = [f"flip-{n}" for n in range(int(boundary.split("-")[1]) + 1, 5)]
+        assert uids == newer  # strictly ABOVE the cursor id, ascending
+    finally:
+        _cleanup(*aids)
 
 # --- HMAC-signed asset URLs: the DB-free serve fast path ---
 import time as _time  # noqa: E402
