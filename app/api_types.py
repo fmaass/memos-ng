@@ -41,9 +41,19 @@ def to_rfc3339(value: datetime) -> str:
     is `timestamptz` and comes back aware, so naive only arrives from a caller that omitted the
     offset — and interpreting that in whatever zone the container happens to run in would move the
     instant, which is a worse failure than an ugly one.
+
+    Formatted field by field rather than with `strftime`, because `%Y` does NOT zero-pad to four
+    digits on this runtime — year 999 comes out as `999-…`, which is not RFC 3339's fixed-width
+    `date-fullyear` and is the same broken promise as a stray `.443210`. Nothing bounds how far
+    back a memo may be dated (`MemoCreate.created_at` takes any datetime), so that year is
+    reachable input, not a hypothetical. `datetime` caps the year at 9999, so four digits is
+    always exactly right and never truncates.
     """
     aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-    return aware.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        f"{aware.year:04d}-{aware.month:02d}-{aware.day:02d}"
+        f"T{aware.hour:02d}:{aware.minute:02d}:{aware.second:02d}Z"
+    )
 
 
 Rfc3339Datetime = Annotated[

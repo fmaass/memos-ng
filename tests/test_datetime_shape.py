@@ -82,6 +82,25 @@ def test_a_non_utc_offset_is_converted_rather_than_relabelled():
     assert to_rfc3339(berlin) == "2026-08-21T20:41:49Z"
 
 
+@pytest.mark.parametrize(
+    ("year", "expected"),
+    [
+        (1, "0001-01-02T03:04:05Z"),
+        (999, "0999-01-02T03:04:05Z"),
+        (1000, "1000-01-02T03:04:05Z"),
+        (2026, "2026-01-02T03:04:05Z"),
+    ],
+)
+def test_the_year_is_always_four_digits(year: int, expected: str):
+    """RFC 3339's `date-fullyear` is exactly four digits, and `strftime("%Y")` does not pad to
+    four on this runtime (glibc renders year 999 as `999`). Nothing bounds how far back a memo can
+    be dated — `MemoCreate.created_at` takes any datetime — so a year below 1000 is reachable
+    input, and a three-digit year is the same broken promise as a stray `.443210`."""
+    rendered = to_rfc3339(datetime(year, 1, 2, 3, 4, 5, 123456, tzinfo=UTC))
+    assert rendered == expected
+    assert CANONICAL.match(rendered)
+
+
 def test_a_naive_value_is_read_as_utc_not_as_the_servers_local_zone():
     """The store is `timestamptz` and every row comes back aware, so this is the defensive branch —
     but reading a naive value in the container's local zone would silently shift the timestamp,
@@ -119,6 +138,23 @@ def test_a_whole_second_memo_and_a_microsecond_memo_render_the_same_shape(logged
     found = _assert_all_canonical(items, at_least=4)
     lengths = {len(v) for _, v in found}
     assert lengths == {len("2026-08-20T20:36:00Z")}, f"more than one shape in one response: {found}"
+
+
+def test_a_memo_dated_before_the_year_1000_still_renders_a_four_digit_year(logged_in_client):
+    """The same guarantee through a real response model, not just the formatter: nothing between
+    the request and `MemoOut.created_at` bounds the year, so the rendered shape has to hold for a
+    backdate this far out."""
+    client, _ = logged_in_client
+    created = client.post(
+        "/api/memos", json={"content": "medieval", "created_at": "0999-01-02T03:04:05.123456Z"}
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["created_at"] == "0999-01-02T03:04:05Z"
+    _assert_all_canonical(created.json(), at_least=2)  # created_at + updated_at
+
+    fetched = client.get(f"/api/memos/{created.json()['uid']}")
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["created_at"] == "0999-01-02T03:04:05Z"
 
 
 def test_the_token_surface_publishes_the_same_shape(logged_in_client):
