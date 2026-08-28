@@ -188,6 +188,12 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.5.0
+
+- A device can read and rename its own token over the bearer lane (`GET`/`PATCH /api/auth/native/token`), strictly self-scoped through the presenting token's hash.
+- Step-up token management: a `purpose=manage` sign-on round trip mints a short-lived hashed grant that alone authenticates `/api/pats/*` (list, create, revoke). Login and manage codes cannot be cross-redeemed, and a grant presented beside a session cookie is refused outright.
+- One expand-only migration: `management_grants`, and `purpose` on `native_auth_codes` (existing rows read as login codes).
+
 ### v1.4.1
 
 Media library: the owning memo on each item, and oldest-first paging (2026-08-27).
