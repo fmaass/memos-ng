@@ -910,6 +910,59 @@
         "title": "NativeExchangeOut",
         "type": "object"
       },
+      "NativeTokenOut": {
+        "description": "What a device may learn about the credential it is already holding.\n\nNo `id`, no `hashed_token`, and never the plaintext: this row is the answer to \"how long does\nthis token have, and when did I last use it\", not a second copy of the secret. Withholding the\nid also keeps the shape honest about Decision 5 \u2014 there is no sibling here to act on, so there\nis no handle to act with.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_used": {
+            "format": "date-time",
+            "title": "Last Used",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "created_at",
+          "last_used",
+          "expires_at"
+        ],
+        "title": "NativeTokenOut",
+        "type": "object"
+      },
+      "NativeTokenRename": {
+        "properties": {
+          "name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "NativeTokenRename",
+        "type": "object"
+      },
       "PatCreate": {
         "properties": {
           "expires_in_days": {
@@ -2377,6 +2430,84 @@
           }
         ],
         "summary": "Native Renew",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/auth/native/token": {
+      "get": {
+        "description": "The presenting device token's own row, and only that one.\n\nA device knows its expiry from the mint response and nowhere else, which means an app that was\nreinstalled \u2014 or simply restarted after a year \u2014 cannot tell the owner how long this phone has\nleft or when it last spoke. This is the read that closes that, and it reaches no further than\nthe credential making the request: a leaked token learns nothing it does not already hold, so\nthe route carries no security decision at all (MEMNG-138, option 5).\n\nBearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a\nbrowser session (Decision 5 / ADR-0015) \u2014 `/api/pats` is where a credential that names another\ntoken lives; a bearer manages nothing but itself.",
+        "operationId": "native_token_api_auth_native_token_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeTokenOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Native Token",
+        "tags": [
+          "auth"
+        ]
+      },
+      "patch": {
+        "description": "Rename the presenting device token \u2014 the only field of it a device may change.\n\nThe name is what the owner reads in the token list, and today it is fixed at the mint from the\ndevice name the app sent; a phone that was renamed, or handed on, keeps the old label forever.\n\nScoped to the presenting row by the same WHERE the read uses, in ONE statement whose RETURNING\nis the response: nothing here can widen to a sibling, and a row that stopped existing between\nauthentication and the write matches nothing rather than renaming the wrong token.",
+        "operationId": "rename_native_token_api_auth_native_token_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NativeTokenRename"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeTokenOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Rename Native Token",
         "tags": [
           "auth"
         ]
