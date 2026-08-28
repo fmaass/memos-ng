@@ -13,7 +13,7 @@ next request, instead of leaving every derived tier world-readable by uid foreve
 """
 
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -24,6 +24,7 @@ from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
+from app.api_types import to_rfc3339
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import Attachment, Memo, Tag, User, Visibility
@@ -47,7 +48,11 @@ async def optional_user(request: Request, db: Annotated[AsyncSession, Depends(ge
 
 
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Second precision with a `Z`, which is what 0.29.1 emitted and what these captured fixtures
+    are pinned to. It is now the SAME formatter the clean API uses (MEMNG-106) — one dialect for
+    the whole server — so this is a de-duplication, not a contract change; the pin lives in
+    tests/test_datetime_shape.py."""
+    return to_rfc3339(dt)
 
 
 def _property(content: str) -> dict[str, Any]:

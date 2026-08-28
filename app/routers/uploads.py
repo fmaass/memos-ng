@@ -1,4 +1,3 @@
-from datetime import datetime
 from typing import Annotated, Any
 
 from anyio import to_thread
@@ -8,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
+from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import get_session
 from app.models import AttachmentStatus, Upload, User
@@ -47,7 +47,7 @@ class AttachmentOut(BaseModel):
     mime: str
     size: int
     status: AttachmentStatus
-    captured_at: datetime | None
+    captured_at: Rfc3339Datetime | None
     width: int | None
     height: int | None
     duration: float | None

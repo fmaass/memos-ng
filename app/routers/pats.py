@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
+from app.api_types import Rfc3339Datetime
 from app.database import get_session
 from app.models import Pat, User
 from app.services import pats as svc
@@ -31,9 +32,9 @@ class PatCreate(BaseModel):
 class PatOut(BaseModel):
     id: int
     name: str
-    last_used: datetime | None
-    created_at: datetime
-    expires_at: datetime | None
+    last_used: Rfc3339Datetime | None
+    created_at: Rfc3339Datetime
+    expires_at: Rfc3339Datetime | None
 
 
 class PatCreated(PatOut):

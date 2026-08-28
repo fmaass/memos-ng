@@ -4,7 +4,6 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -17,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
+from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import (
@@ -169,7 +169,7 @@ class AttachmentMeta(BaseModel):
     height: int | None
     duration: float | None
     blurhash: str | None
-    captured_at: datetime | None
+    captured_at: Rfc3339Datetime | None
     mine: bool
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies

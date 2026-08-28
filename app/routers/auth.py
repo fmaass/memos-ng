@@ -9,6 +9,7 @@ from sqlalchemy import Row, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
+from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import get_session
 from app.models import Pat, User
@@ -207,7 +208,7 @@ class NativeExchangeOut(BaseModel):
     # The plaintext token exists in exactly one response per mint — this one — whether the mint is
     # the first exchange or a renewal, which returns this same shape by design.
     token: str
-    expires_at: datetime
+    expires_at: Rfc3339Datetime
     user: UserOut
 
 
@@ -290,7 +291,7 @@ class ManageGrantOut(BaseModel):
     """
 
     grant: str
-    expires_at: datetime
+    expires_at: Rfc3339Datetime
 
 
 @router.post("/native/manage-grant", response_model=ManageGrantOut)
@@ -437,9 +438,9 @@ class NativeTokenOut(BaseModel):
     """
 
     name: str
-    created_at: datetime
-    last_used: datetime | None
-    expires_at: datetime | None
+    created_at: Rfc3339Datetime
+    last_used: Rfc3339Datetime | None
+    expires_at: Rfc3339Datetime | None
 
 
 class NativeTokenRename(BaseModel):
