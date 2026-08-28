@@ -25,8 +25,11 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import pytest
 from app import auth
 from app.config import settings
+from app.csrf import canonical_origin
+from app.main import app
 from app.models import ManagementGrant, User
 from app.services import management_grant, native_auth
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 
 from tests.conftest import SYNC_URL
@@ -486,3 +489,327 @@ def test_the_manage_grant_route_is_documented_as_anonymous():
     schema = app.openapi()
     assert "/api/auth/native/manage-grant" in schema["paths"]
     assert "security" not in schema["paths"]["/api/auth/native/manage-grant"]["post"]
+
+
+# --- B3: the management dependency --------------------------------------------------------------
+
+
+def _clean_client() -> TestClient:
+    """A client with an EMPTY cookie jar — the shape a native app has. Nothing but the header it is
+    handed can be answering for it, which is what every grant assertion below depends on."""
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _as_grant(grant: str) -> dict[str, str]:
+    return {"Authorization": f"Grant {grant}"}
+
+
+def _grant_for(subject: str, monkeypatch) -> str:
+    """A live grant for `subject`, minted the only way one can be: a real trip through the manage
+    lane, on its own clean client. The caller owns deleting the user afterwards."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    monkeypatch.setattr(auth, "exchange_code", AsyncMock(return_value={"id_token": "x"}))
+    monkeypatch.setattr(
+        auth,
+        "validate_id_token",
+        lambda t: {"preferred_username": subject, "name": "X", "email": "x@x", "groups": []},
+    )
+    http = _clean_client()
+    http.headers["Origin"] = canonical_origin()
+    resp = _manage_grant(http, _handoff_code(http, purpose="manage"))
+    assert resp.status_code == 200, resp.text
+    return resp.json()["grant"]
+
+
+async def test_authenticate_grant_answers_only_for_a_live_grant(adb):
+    """Expiry is enforced in the store, not in the caller, so every surface that ever accepts a
+    grant inherits the bound from one place."""
+    user = await _user(adb, "grant_authn_user")
+    grant, _ = await management_grant.mint_grant(adb, user)
+
+    got = await management_grant.authenticate_grant(adb, grant)
+    assert got is not None and got.id == user.id
+    assert await management_grant.authenticate_grant(adb, "not-a-grant-anyone-minted") is None
+
+    await adb.execute(
+        text(
+            "UPDATE management_grants SET expires_at = now() - interval '1 second' "
+            "WHERE hashed_grant = :h"
+        ),
+        {"h": management_grant.hash_grant(grant)},
+    )
+    assert await management_grant.authenticate_grant(adb, grant) is None
+
+
+def test_manage_grant_requires_a_fresh_login(grant_oidc):
+    """The grant is bought with an authentication and with nothing else. The schema check is the
+    drift guard on that: exactly one operation in the whole API hands a grant back, so a later
+    route that quietly minted one from a session or a token would turn this red."""
+    import json as _json
+
+    from app.main import app as fastapi_app
+
+    client, subject = grant_oidc
+    assert _manage_grant(client, "never-minted-by-anyone").status_code == 400
+    assert _grant_count(subject) == 0
+
+    schema = fastapi_app.openapi()
+    granting = {
+        f"#/components/schemas/{name}"
+        for name, node in schema["components"]["schemas"].items()
+        if "grant" in node.get("properties", {})
+    }
+    assert granting, schema["components"]["schemas"].keys()  # control: a grant shape exists at all
+    minting = [
+        (method.upper(), path)
+        for path, operations in schema["paths"].items()
+        for method, operation in operations.items()
+        if isinstance(operation, dict)
+        and any(ref in _json.dumps(operation.get("responses", {})) for ref in granting)
+    ]
+    assert minting == [("POST", "/api/auth/native/manage-grant")]
+
+    # And the lane itself really does work — without this the assertions above pass vacuously.
+    grant = _grant(client)
+    assert _clean_client().get("/api/pats", headers=_as_grant(grant)).status_code == 200
+
+
+async def test_device_pat_cannot_obtain_a_grant(pat_client):
+    """ADR-0015 from the other side: a token mints nothing but itself. It cannot buy a grant (it
+    holds no code), and it cannot BE one — presenting a PAT under the Grant scheme is refused, not
+    reinterpreted as the bearer it is."""
+    bearer, subject, token = pat_client
+
+    refused = await bearer.post(
+        "/api/auth/native/manage-grant", json={"code": token, "code_verifier": RFC_VERIFIER}
+    )
+    assert refused.status_code == 400
+    assert refused.json()["detail"] == "code_invalid"
+    assert _grant_count(subject) == 0
+
+    smuggled = _clean_client().get("/api/pats", headers=_as_grant(token))
+    assert smuggled.status_code == 401
+    assert (await bearer.get("/api/pats")).status_code == 401  # nor as the bearer it really is
+
+
+def test_grant_authenticates_pat_management(grant_oidc):
+    """The whole point of the phase: with a grant, the three token-management routes work for a
+    caller that holds no browser session at all."""
+    client, subject = grant_oidc
+    headers = _as_grant(_grant(client))
+    http = _clean_client()
+
+    created = http.post("/api/pats", json={"name": "minted-under-grant"}, headers=headers)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["token"].startswith(auth.PAT_PREFIX)
+
+    listed = http.get("/api/pats", headers=headers)
+    assert listed.status_code == 200
+    assert [p["name"] for p in listed.json()] == ["minted-under-grant"]
+
+    # The token it minted is a real one, not a shape that merely serialises like one.
+    assert (
+        _clean_client()
+        .get("/api/memos", headers={"Authorization": f"Bearer {body['token']}"})
+        .status_code
+        == 200
+    )
+
+    assert http.delete(f"/api/pats/{body['id']}", headers=headers).status_code == 204
+    assert http.get("/api/pats", headers=headers).json() == []
+    assert _sql("SELECT count(*) FROM pats WHERE name = 'minted-under-grant'")[0][0] == 0
+
+
+def test_grant_expires(grant_oidc):
+    """Three verdicts on ONE grant — usable, refused once its stored deadline is in the past,
+    usable again when it is moved back — so only the stored instant can be deciding it.
+
+    Backdated in PostgreSQL rather than with a frozen clock: `expires_at > now()` is evaluated by
+    the database, so only a real stored instant tests the real predicate.
+    """
+    client, subject = grant_oidc
+    grant = _grant(client)
+    headers = _as_grant(grant)
+    http = _clean_client()
+    hashed = management_grant.hash_grant(grant)
+    assert http.get("/api/pats", headers=headers).status_code == 200
+
+    stored = _sql("SELECT expires_at FROM management_grants WHERE hashed_grant = :h", h=hashed)[0][
+        0
+    ]
+    ttl = stored - datetime.now(UTC)
+    assert timedelta(seconds=settings.MANAGE_GRANT_TTL_S - 60) < ttl <= timedelta(
+        seconds=settings.MANAGE_GRANT_TTL_S
+    )
+
+    _sql(
+        "UPDATE management_grants SET expires_at = now() - interval '1 second' "
+        "WHERE hashed_grant = :h",
+        h=hashed,
+    )
+    assert http.get("/api/pats", headers=headers).status_code == 401
+
+    _sql(
+        "UPDATE management_grants SET expires_at = now() + interval '1 hour' "
+        "WHERE hashed_grant = :h",
+        h=hashed,
+    )
+    assert http.get("/api/pats", headers=headers).status_code == 200
+
+
+def test_expired_grant_is_401(grant_oidc):
+    """Expiry is authentication's answer, so no verb gets through and nothing happens on the way:
+    the token that was there before the attempt is still there, unrevoked, afterwards."""
+    client, subject = grant_oidc
+    grant = _grant(client)
+    headers = _as_grant(grant)
+    http = _clean_client()
+    existing = http.post("/api/pats", json={"name": "survives-the-expiry"}, headers=headers).json()
+    _sql(
+        "UPDATE management_grants SET expires_at = now() - interval '1 second' "
+        "WHERE hashed_grant = :h",
+        h=management_grant.hash_grant(grant),
+    )
+
+    assert http.get("/api/pats", headers=headers).status_code == 401
+    assert http.post("/api/pats", json={"name": "after"}, headers=headers).status_code == 401
+    assert http.delete(f"/api/pats/{existing['id']}", headers=headers).status_code == 401
+
+    names = [r[0] for r in _sql("SELECT name FROM pats WHERE user_id = (SELECT id FROM users "
+                                "WHERE subject = :s)", s=subject)]
+    assert names == ["survives-the-expiry"]
+
+
+def test_grant_is_refused_on_non_management_routes(grant_oidc):
+    """A grant buys token management and NOTHING else — it is not a general-purpose credential
+    standing in for a session. Every route outside /api/pats/* answers it as the stranger it is."""
+    client, _ = grant_oidc
+    headers = _as_grant(_grant(client))
+    http = _clean_client()
+
+    assert http.get("/api/memos", headers=headers).status_code == 401
+    assert http.post("/api/memos", json={"content": "x"}, headers=headers).status_code == 401
+    assert http.get("/api/settings", headers=headers).status_code == 401
+    assert http.get("/api/auth/user", headers=headers).status_code == 401
+    assert http.get("/api/auth/native/token", headers=headers).status_code == 401
+    # The control for those 401s: the same header on the surface it IS for.
+    assert http.get("/api/pats", headers=headers).status_code == 200
+
+
+def test_grant_is_scoped_to_its_own_user(grant_oidc, monkeypatch):
+    """Keyed on the grant's OWNER, not on "some authenticated caller": a second household account's
+    token is neither listed nor revocable, and comes out of the attempt still working."""
+    client, _ = grant_oidc
+    other = "test_grant_other_user"
+    try:
+        others_token = _exchange(
+            client, _handoff_code(client, device="OtherPhone")
+        ).json()["token"]
+        others_pat_id = _sql(
+            "SELECT id FROM pats WHERE hashed_token = :h", h=auth.hash_token(others_token)
+        )[0][0]
+        # The grant belongs to a DIFFERENT account than the token above.
+        headers = _as_grant(_grant_for(other, monkeypatch))
+        http = _clean_client()
+
+        listed = http.get("/api/pats", headers=headers)
+        assert listed.status_code == 200
+        assert listed.json() == []  # the other account's phone is not this account's business
+
+        assert http.delete(f"/api/pats/{others_pat_id}", headers=headers).status_code == 404
+        assert _sql(
+            "SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(others_token)
+        )[0][0] == 1
+        assert (
+            _clean_client()
+            .get("/api/memos", headers={"Authorization": f"Bearer {others_token}"})
+            .status_code
+            == 200
+        )
+    finally:
+        _sql("DELETE FROM users WHERE subject = :s", s=other)
+
+
+async def test_pat_management_still_refuses_a_plain_bearer(pat_client):
+    """The Option-5 refusal, re-pinned under the new dependency: widening /api/pats/* to a grant
+    must not have widened it to the bearer that was refused there before."""
+    bearer, _, _ = pat_client
+
+    assert (await bearer.get("/api/pats")).status_code == 401
+    assert (await bearer.post("/api/pats", json={"name": "successor"})).status_code == 401
+    assert (await bearer.delete("/api/pats/1")).status_code == 401
+
+
+def test_a_bearer_riding_a_valid_session_still_reaches_nothing(logged_in_client):
+    """The other half of that refusal: the bearer is judged BEFORE the cookie is read, so a device
+    token alongside a live browser session cannot reach token management by being ignored."""
+    client, _ = logged_in_client
+    own = client.post("/api/pats", json={"name": "laptop"})
+    assert own.status_code == 201
+    headers = {"Authorization": f"Bearer {own.json()['token']}"}
+
+    assert client.get("/api/pats", headers=headers).status_code == 401
+    assert client.post("/api/pats", json={"x": 1}, headers=headers).status_code == 401
+    assert client.delete(f"/api/pats/{own.json()['id']}", headers=headers).status_code == 401
+    assert client.delete(f"/api/pats/{own.json()['id']}").status_code == 204  # cookie alone: fine
+
+
+def test_an_invalid_grant_beats_a_valid_cookie(logged_in_client):
+    """THE fail-closed pin, and the mirror of `require_session_user`'s bearer rule: once a request
+    states a Grant credential, that credential decides the outcome. A grant this server never
+    issued must never quietly fall through to the session cookie riding alongside it — that is the
+    silent downgrade the whole precedence order exists to prevent.
+    """
+    client, _ = logged_in_client
+    headers = _as_grant("not-a-grant-this-server-ever-issued")
+    assert client.get("/api/pats").status_code == 200  # the cookie on its own is fine
+
+    assert client.get("/api/pats", headers=headers).status_code == 401
+    assert client.post("/api/pats", json={"name": "smuggled"}, headers=headers).status_code == 401
+    assert client.delete("/api/pats/1", headers=headers).status_code == 401
+    assert client.get("/api/pats").json() == []  # and nothing was created on the way through
+
+    # The same bad header with NO cookie is refused too — so the 401s above cannot be explained by
+    # the cookie having been the only thing under test.
+    assert _clean_client().get("/api/pats", headers=headers).status_code == 401
+
+
+def test_a_grant_and_a_session_cookie_together_are_refused(logged_in_client, monkeypatch):
+    """Two credentials naming two accounts is ambiguity, and ambiguity fails closed. Neither
+    identity may silently win: a grant minted for one household account must not be able to reach
+    another account's token list by riding that account's browser session (or the reverse).
+    """
+    client, subject = logged_in_client
+    other = "test_grant_ambiguous_user"
+    try:
+        headers = _as_grant(_grant_for(other, monkeypatch))
+        assert client.get("/api/pats").status_code == 200  # the cookie alone still works
+
+        assert client.get("/api/pats", headers=headers).status_code == 401
+        assert client.post("/api/pats", json={"name": "either"}, headers=headers).status_code == 401
+        assert client.delete("/api/pats/1", headers=headers).status_code == 401
+        assert _grant_count(other) == 1  # the grant itself is live; it is the pairing that is not
+        assert _sql("SELECT count(*) FROM pats WHERE name = 'either'")[0][0] == 0
+    finally:
+        _sql("DELETE FROM users WHERE subject = :s", s=other)
+
+
+def test_the_pat_surface_publishes_exactly_the_two_credentials_it_takes():
+    """The generated clients (ADR-0009) see only this document: /api/pats/* takes the session
+    cookie or a grant, and a bearer must not appear there in any form."""
+    from app.main import app as fastapi_app
+
+    paths = fastapi_app.openapi()["paths"]
+    pat_paths = [p for p in paths if p.startswith("/api/pats")]
+    assert pat_paths
+    for path in pat_paths:
+        for method, operation in paths[path].items():
+            if not isinstance(operation, dict) or "security" not in operation:
+                continue
+            assert operation["security"] == [{"sessionCookie": []}, {"grantAuth": []}], (
+                method,
+                path,
+            )

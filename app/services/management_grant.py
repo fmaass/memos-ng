@@ -15,7 +15,7 @@ import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -49,3 +49,27 @@ async def mint_grant(db: AsyncSession, user: User) -> tuple[str, datetime]:
     )
     await db.flush()
     return grant, expires_at
+
+
+async def authenticate_grant(db: AsyncSession, grant: str) -> User | None:
+    """The user a live grant speaks for — None for an unknown, expired or orphaned one alike.
+
+    Expiry is enforced HERE rather than in the caller, for the reason `auth.authenticate_pat`
+    enforces a token's: every surface that ever accepts a grant then inherits the bound from one
+    place instead of remembering to re-check it.
+
+    Nothing is stamped and nothing is consumed. A grant is a time-bounded capability, not a
+    one-shot: the management session it authorises lists, creates and revokes with the one value it
+    is holding, and a use counter would only end that session at an arbitrary point inside its TTL.
+    """
+    row = (
+        await db.execute(
+            select(ManagementGrant.user_id).where(
+                ManagementGrant.hashed_grant == hash_grant(grant),
+                ManagementGrant.expires_at > datetime.now(UTC),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()

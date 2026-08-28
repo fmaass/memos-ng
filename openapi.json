@@ -1739,8 +1739,13 @@
     "securitySchemes": {
       "bearerAuth": {
         "bearerFormat": "memos_pat",
-        "description": "A personal access token (`memos_pat_\u2026`). Accepted on every /api/* route except /api/pats/*, which is browser-session-only, and POST /api/auth/native/exchange, which is anonymous by construction \u2014 it is how a device obtains a token in the first place, so requiring one would be circular.",
+        "description": "A personal access token (`memos_pat_\u2026`). Accepted on every /api/* route except /api/pats/*, which takes a browser session or a management grant and never a token, and POST /api/auth/native/exchange, which is anonymous by construction \u2014 it is how a device obtains a token in the first place, so requiring one would be circular.",
         "scheme": "bearer",
+        "type": "http"
+      },
+      "grantAuth": {
+        "description": "A short-lived step-up management grant (`Authorization: Grant \u2026`), obtained from POST /api/auth/native/manage-grant with a handoff code minted by a fresh Authelia login. Accepted only on /api/pats/*, and never mintable from a token \u2014 a device PAT manages nothing but itself (ADR-0015).",
+        "scheme": "grant",
         "type": "http"
       },
       "sessionCookie": {
@@ -3607,6 +3612,9 @@
         "security": [
           {
             "sessionCookie": []
+          },
+          {
+            "grantAuth": []
           }
         ],
         "summary": "List Pats",
@@ -3651,6 +3659,9 @@
         "security": [
           {
             "sessionCookie": []
+          },
+          {
+            "grantAuth": []
           }
         ],
         "summary": "Create Pat",
@@ -3691,6 +3702,9 @@
         "security": [
           {
             "sessionCookie": []
+          },
+          {
+            "grantAuth": []
           }
         ],
         "summary": "Revoke Pat",

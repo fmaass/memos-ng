@@ -40,7 +40,7 @@ def test_generator_writes_where_the_frontend_reads_from():
     assert _generator().OUT == REPO_ROOT / "openapi.json"
 
 
-def test_schema_declares_the_two_credentials_the_api_accepts():
+def test_schema_declares_the_credentials_the_api_accepts():
     """FastAPI derives nothing here — authentication lives in plain dependencies — so the exported
     contract only mentions a credential because app.main.custom_openapi puts it there."""
     from app import auth
@@ -55,6 +55,12 @@ def test_schema_declares_the_two_credentials_the_api_accepts():
         "name": auth.SID_COOKIE,
         "description": schemes["sessionCookie"]["description"],
     }
+    # The step-up grant is its OWN scheme, not a second flavour of bearer: a generated client that
+    # sent it as a Bearer would be refused, and one that could not tell them apart would leak a
+    # device token onto the routes a token may never reach (MEMNG-138 option 2).
+    assert schemes["grantAuth"]["type"] == "http"
+    assert schemes["grantAuth"]["scheme"] == "grant"
+    assert schemes["grantAuth"]["scheme"] != schemes["bearerAuth"]["scheme"]
 
 
 def test_custom_openapi_still_describes_the_routes():
@@ -263,8 +269,10 @@ def test_a_declared_public_operation_carries_no_requirement():
             assert "security" not in operation, (method, path)
 
 
-def test_the_pat_surface_is_session_cookie_only():
-    """A PAT must not be able to mint or revoke PATs — /api/pats/* takes require_session_user."""
+def test_the_pat_surface_takes_a_session_or_a_grant_and_never_a_bearer():
+    """A PAT must not be able to mint or revoke PATs — /api/pats/* takes require_session_or_grant,
+    whose two arms are the browser session and a step-up management grant. `bearerAuth` appearing
+    here in any form would be the contract announcing exactly what ADR-0015 forbids."""
     pat_operations = [
         (method, path, operation)
         for method, path, operation in _schema_operations()
@@ -272,7 +280,7 @@ def test_the_pat_surface_is_session_cookie_only():
     ]
     assert pat_operations
     for method, path, operation in pat_operations:
-        assert operation["security"] == [{"sessionCookie": []}], (method, path)
+        assert operation["security"] == [{"sessionCookie": []}, {"grantAuth": []}], (method, path)
 
 
 def test_a_bearer_route_states_both_credentials():
