@@ -29,6 +29,13 @@ _CODE_CHALLENGE_RE = re.compile(r"\A[A-Za-z0-9_-]{43,128}\Z")
 
 DEVICE_NAME_MAX = 64
 
+# What a handoff code may be redeemed for. The login lane mints a device PAT; the management lane
+# mints a step-up grant for `/api/pats/*` (MEMNG-138 option 2). One code is redeemable for exactly
+# one of the two — see `consume_code`, where the purpose rides in the atomic consume's WHERE.
+PURPOSE_LOGIN = "login"
+PURPOSE_MANAGE = "manage"
+PURPOSES = (PURPOSE_LOGIN, PURPOSE_MANAGE)
+
 # Rows are kept for an hour past expiry so an app that comes back late still gets `code_expired`
 # rather than the indistinguishable `code_invalid`. Both are terminal for the client — the window
 # only buys a better diagnostic.
@@ -84,9 +91,16 @@ def hash_code(code: str) -> str:
 
 
 async def mint_code(
-    db: AsyncSession, user: User, code_challenge: str, device_name: str
+    db: AsyncSession,
+    user: User,
+    code_challenge: str,
+    device_name: str,
+    purpose: str = PURPOSE_LOGIN,
 ) -> str:
     """Insert a fresh one-shot code for `user`; return the plaintext, which exists only here.
+
+    `purpose` is stamped on the row because the transaction cookie that carried it through the
+    Authelia round trip is gone by the time the code is redeemed — see `NativeAuthCode.purpose`.
 
     Sweeps rows an hour past expiry on the way through — the volume is a handful of rows per device
     login, which does not justify a worker job, and doing it at mint time means the table is
@@ -103,6 +117,7 @@ async def mint_code(
             user_id=user.id,
             code_challenge=code_challenge,
             device_name=device_name,
+            purpose=purpose,
             expires_at=now + timedelta(seconds=settings.NATIVE_CODE_TTL_S),
         )
     )
@@ -110,7 +125,7 @@ async def mint_code(
     return code
 
 
-async def consume_code(db: AsyncSession, code: str) -> NativeCodeClaim:
+async def consume_code(db: AsyncSession, code: str, *, purpose: str) -> NativeCodeClaim:
     """Burn `code` and return its claim, or raise `NativeCodeRejected`.
 
     The burn is ONE statement. Reading the row, deciding it is usable and then marking it consumed
@@ -119,6 +134,13 @@ async def consume_code(db: AsyncSession, code: str) -> NativeCodeClaim:
     writer blocks on the row lock, re-evaluates the WHERE against the committed version, and
     matches nothing. The caller must COMMIT: the consumption has to outlive the request even when
     what follows it fails, or a wrong verifier would be retryable.
+
+    `purpose` has no default and rides in that same WHERE: a caller has to say what it is redeeming
+    for, and a code minted for the other lane matches nothing — so it is refused AND left unburned,
+    which is what keeps a cross-redemption attempt from costing the owner their real code. The
+    refusal reason deliberately does not distinguish it from an unknown code (see
+    `_rejection_reason`): a client acts on neither differently, and saying so would confirm that a
+    code exists for a lane the caller is not entitled to.
     """
     now = datetime.now(UTC)
     consumed = (
@@ -126,6 +148,7 @@ async def consume_code(db: AsyncSession, code: str) -> NativeCodeClaim:
             update(NativeAuthCode)
             .where(
                 NativeAuthCode.code_hash == hash_code(code),
+                NativeAuthCode.purpose == purpose,
                 NativeAuthCode.consumed_at.is_(None),
                 NativeAuthCode.expires_at > now,
             )
@@ -163,8 +186,11 @@ async def _rejection_reason(db: AsyncSession, code: str) -> str:
         return "code_consumed"
     if expires_at <= datetime.now(UTC):
         return "code_expired"
-    # The row is live and unconsumed, so the UPDATE lost a race that has since been rolled back.
-    # Terminal for this attempt either way; the client starts a new login.
+    # The row is live and unconsumed, so either it was minted for the OTHER lane (the purpose in
+    # the consume's WHERE did not match) or the UPDATE lost a race that has since been rolled back.
+    # Both are reported as `code_invalid`, indistinguishable from a code that never existed: a
+    # client acts on none of them differently, and a wrong-lane code that announced itself would
+    # confirm the existence of a credential the caller is not entitled to redeem.
     return "code_invalid"
 
 

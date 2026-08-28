@@ -454,8 +454,35 @@ class NativeAuthCode(Base):
     # started the login, so a code intercepted in flight cannot be exchanged by anyone else.
     code_challenge: Mapped[str] = mapped_column(String(128))
     device_name: Mapped[str] = mapped_column(String(64))
+    # What this code may be redeemed for: a device token ('login') or a management grant
+    # ('manage'). It lives on the ROW because the encrypted transaction cookie that carried it
+    # through the Authelia round trip is deleted at the callback — after that, the row is the only
+    # thing left that can tell the two exchange endpoints' codes apart. The server default is
+    # 'login', which is exactly what every code minted before this column existed was.
+    purpose: Mapped[str] = mapped_column(String(16), server_default="login")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ManagementGrant(Base):
+    """A short-lived step-up credential for token management, minted by a fresh Authelia login.
+
+    Modelled on `NativeAuthCode`: only the sha256 is stored, so a database read cannot be replayed
+    into a live credential, and rows are swept once expired.
+
+    Unlike a handoff code it carries no `consumed_at` and is deliberately MULTI-USE within its TTL:
+    it authenticates a management SESSION of minutes (list, create, revoke), not a single redemption
+    — the single-use property belongs to the CODE that was exchanged for it. The bound that keeps
+    it safe is time (`MANAGE_GRANT_TTL_S`), not use count.
+    """
+
+    __tablename__ = "management_grants"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hashed_grant: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

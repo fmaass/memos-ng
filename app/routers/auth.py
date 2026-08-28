@@ -215,7 +215,9 @@ async def native_exchange(
     than retrying, because a code is burned by the attempt whatever its outcome.
     """
     try:
-        claim = await native_auth.consume_code(db, body.code)
+        claim = await native_auth.consume_code(
+            db, body.code, purpose=native_auth.PURPOSE_LOGIN
+        )
     except native_auth.NativeCodeRejected as rejected:
         raise HTTPException(status_code=400, detail=rejected.reason) from rejected
     # Committed BEFORE the verifier is judged: one attempt per code is the property that makes a

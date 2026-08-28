@@ -182,6 +182,11 @@ class Settings(BaseSettings):
     # Lifetime of the PAT a device login mints. Bounds the blast radius of a lost phone that
     # nobody revokes; matches the /api/pats upper bound (PatCreate.expires_in_days le=365).
     NATIVE_TOKEN_DAYS: int = 365
+    # Seconds a step-up management grant stays usable (MEMNG-138 option 2). Long enough for the
+    # round trip through Authelia plus the management session it authorises (list, create, revoke),
+    # short enough that a stolen grant is worth about as much as a stolen live browser session —
+    # which is precisely the blast radius this design accepts. A device PAT can never become one.
+    MANAGE_GRANT_TTL_S: int = 600
     # Apple associated-domains identity. While APPLE_TEAM_ID is unset (no Developer Program
     # membership yet) the AASA route 404s, which is the correct answer for a domain that claims
     # no app. Settings are read ONCE at process start, so enabling this is an env change plus a
