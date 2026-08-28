@@ -95,8 +95,14 @@ def test_pat_lifetime_becomes_an_absolute_expiry(logged_in_client):
     created = client.post("/api/pats", json={"name": "device", "expires_in_days": 30})
     assert created.status_code == 201
     expires_at = datetime.fromisoformat(created.json()["expires_at"])
-    # 30 days from the moment of minting, not a duration the client has to re-derive.
-    assert timedelta(days=30) <= expires_at - before <= timedelta(days=30, seconds=60)
+    # 30 days from the moment of minting, not a duration the client has to re-derive. The lower
+    # bound allows one second because the API publishes second precision (MEMNG-106,
+    # app/api_types.py): the stored deadline keeps its microseconds and is what expiry is judged
+    # against, while the RENDERED one is floored, so a client can see up to a second less than it
+    # was granted — never more, which is the safe direction for a deadline.
+    assert (
+        timedelta(days=30, seconds=-1) <= expires_at - before <= timedelta(days=30, seconds=60)
+    )
     listed = client.get("/api/pats").json()
     assert datetime.fromisoformat(listed[0]["expires_at"]) == expires_at
 
