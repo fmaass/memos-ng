@@ -259,6 +259,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/native/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Native Token
+         * @description The presenting device token's own row, and only that one.
+         *
+         *     A device knows its expiry from the mint response and nowhere else, which means an app that was
+         *     reinstalled — or simply restarted after a year — cannot tell the owner how long this phone has
+         *     left or when it last spoke. This is the read that closes that, and it reaches no further than
+         *     the credential making the request: a leaked token learns nothing it does not already hold, so
+         *     the route carries no security decision at all (MEMNG-138, option 5).
+         *
+         *     Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
+         *     browser session (Decision 5 / ADR-0015) — `/api/pats` is where a credential that names another
+         *     token lives; a bearer manages nothing but itself.
+         */
+        get: operations["native_token_api_auth_native_token_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Rename Native Token
+         * @description Rename the presenting device token — the only field of it a device may change.
+         *
+         *     The name is what the owner reads in the token list, and today it is fixed at the mint from the
+         *     device name the app sent; a phone that was renamed, or handed on, keeps the old label forever.
+         *
+         *     Scoped to the presenting row by the same WHERE the read uses, in ONE statement whose RETURNING
+         *     is the response: nothing here can widen to a sibling, and a row that stopped existing between
+         *     authentication and the write matches nothing rather than renaming the wrong token.
+         */
+        patch: operations["rename_native_token_api_auth_native_token_patch"];
+        trace?: never;
+    };
     "/api/auth/user": {
         parameters: {
             query?: never;
@@ -1165,6 +1206,39 @@ export interface components {
             token: string;
             user: components["schemas"]["UserOut"];
         };
+        /**
+         * NativeTokenOut
+         * @description What a device may learn about the credential it is already holding.
+         *
+         *     No `id`, no `hashed_token`, and never the plaintext: this row is the answer to "how long does
+         *     this token have, and when did I last use it", not a second copy of the secret. Withholding the
+         *     id also keeps the shape honest about Decision 5 — there is no sibling here to act on, so there
+         *     is no handle to act with.
+         */
+        NativeTokenOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string | null;
+            /**
+             * Last Used
+             * Format: date-time
+             */
+            last_used: string | null;
+            /** Name */
+            name: string;
+        };
+        /** NativeTokenRename */
+        NativeTokenRename: {
+            /** Name */
+            name: string;
+        };
         /** PatCreate */
         PatCreate: {
             /** Expires In Days */
@@ -1869,6 +1943,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NativeExchangeOut"];
+                };
+            };
+        };
+    };
+    native_token_api_auth_native_token_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeTokenOut"];
+                };
+            };
+        };
+    };
+    rename_native_token_api_auth_native_token_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeTokenRename"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeTokenOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

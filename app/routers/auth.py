@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import Row, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
@@ -234,6 +234,22 @@ async def native_exchange(
     return _native_token_response(user, token, expires_at)
 
 
+def presenting_token_hash(request: Request) -> str:
+    """The sha256 of the bearer this request is speaking with — or a 401.
+
+    The one seam every self-service route reads its subject through. Each of them acts on the
+    credential that presented itself, so a session cookie — which names no token at all — is
+    refused here rather than four times over (Decision 5/6). Runs AFTER `require_user`, whose
+    `auth_kind` stamp is what this reads; on its own it authenticates nothing.
+    """
+    if getattr(request.state, "auth_kind", None) != "pat":
+        raise HTTPException(status_code=401, detail="Token authentication required")
+    credential = auth.bearer_credential(request)
+    if credential is None:  # unreachable while auth_kind == "pat"; refuse rather than act blind
+        raise HTTPException(status_code=401, detail="Token authentication required")
+    return auth.hash_token(credential)
+
+
 async def _renew_rejection(db: AsyncSession, hashed_token: str) -> HTTPException:
     """Why the conditional rotate matched nothing — read back, never inferred.
 
@@ -278,12 +294,7 @@ async def native_renew(
     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
     session cookie names no token at all.
     """
-    if getattr(request.state, "auth_kind", None) != "pat":
-        raise HTTPException(status_code=401, detail="Token authentication required")
-    credential = auth.bearer_credential(request)
-    if credential is None:  # unreachable while auth_kind == "pat"; refuse rather than rotate blind
-        raise HTTPException(status_code=401, detail="Token authentication required")
-    hashed_token = auth.hash_token(credential)
+    hashed_token = presenting_token_hash(request)
     now = datetime.now(UTC)
     # ONE statement, for the reason `native_auth.consume_code` is one: reading the row, judging it
     # renewable and then deleting it would let two concurrent renewals both find a live token and
@@ -327,15 +338,108 @@ async def native_logout(
     reason from the other side — the SPA revokes through `/api/pats/{id}`, which knows which token
     it is talking about.
     """
-    if getattr(request.state, "auth_kind", None) != "pat":
-        raise HTTPException(status_code=401, detail="Token authentication required")
-    credential = auth.bearer_credential(request)
-    if credential is None:  # unreachable while auth_kind == "pat"; refuse rather than delete blind
-        raise HTTPException(status_code=401, detail="Token authentication required")
+    hashed_token = presenting_token_hash(request)
     await db.execute(
-        delete(Pat).where(Pat.hashed_token == auth.hash_token(credential), Pat.user_id == user.id)
+        delete(Pat).where(Pat.hashed_token == hashed_token, Pat.user_id == user.id)
     )
     await db.commit()
+
+
+class NativeTokenOut(BaseModel):
+    """What a device may learn about the credential it is already holding.
+
+    No `id`, no `hashed_token`, and never the plaintext: this row is the answer to "how long does
+    this token have, and when did I last use it", not a second copy of the secret. Withholding the
+    id also keeps the shape honest about Decision 5 — there is no sibling here to act on, so there
+    is no handle to act with.
+    """
+
+    name: str
+    created_at: datetime
+    last_used: datetime | None
+    expires_at: datetime | None
+
+
+class NativeTokenRename(BaseModel):
+    # The bounds `/api/pats` mints under (PatCreate.name), deliberately identical: one rule for a
+    # token's name whichever surface set it, and `pats.name` is 255 wide either way.
+    name: str = Field(min_length=1, max_length=255)
+
+
+# Selected once and shared by both verbs, so the read and the rename cannot answer with different
+# shapes — the same reason `_native_token_response` exists for exchange and renewal.
+_SELF_ROW = (Pat.name, Pat.created_at, Pat.last_used, Pat.expires_at)
+
+_SelfRow = Row[tuple[str, datetime, datetime | None, datetime | None]]
+
+
+def _self_row_response(row: _SelfRow) -> NativeTokenOut:
+    return NativeTokenOut(
+        name=row.name,
+        created_at=row.created_at,
+        last_used=row.last_used,
+        expires_at=row.expires_at,
+    )
+
+
+@router.get("/native/token", response_model=NativeTokenOut)
+async def native_token(
+    request: Request,
+    user: User = Depends(auth.require_user),
+    db: AsyncSession = Depends(get_session),
+) -> NativeTokenOut:
+    """The presenting device token's own row, and only that one.
+
+    A device knows its expiry from the mint response and nowhere else, which means an app that was
+    reinstalled — or simply restarted after a year — cannot tell the owner how long this phone has
+    left or when it last spoke. This is the read that closes that, and it reaches no further than
+    the credential making the request: a leaked token learns nothing it does not already hold, so
+    the route carries no security decision at all (MEMNG-138, option 5).
+
+    Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
+    browser session (Decision 5 / ADR-0015) — `/api/pats` is where a credential that names another
+    token lives; a bearer manages nothing but itself.
+    """
+    hashed_token = presenting_token_hash(request)
+    row = (
+        await db.execute(
+            select(*_SELF_ROW).where(Pat.hashed_token == hashed_token, Pat.user_id == user.id)
+        )
+    ).one_or_none()
+    if row is None:  # revoked between authentication and this read; report it as the 401 it is
+        raise HTTPException(status_code=401, detail="Invalid or revoked token")
+    return _self_row_response(row)
+
+
+@router.patch("/native/token", response_model=NativeTokenOut)
+async def rename_native_token(
+    body: NativeTokenRename,
+    request: Request,
+    user: User = Depends(auth.require_user),
+    db: AsyncSession = Depends(get_session),
+) -> NativeTokenOut:
+    """Rename the presenting device token — the only field of it a device may change.
+
+    The name is what the owner reads in the token list, and today it is fixed at the mint from the
+    device name the app sent; a phone that was renamed, or handed on, keeps the old label forever.
+
+    Scoped to the presenting row by the same WHERE the read uses, in ONE statement whose RETURNING
+    is the response: nothing here can widen to a sibling, and a row that stopped existing between
+    authentication and the write matches nothing rather than renaming the wrong token.
+    """
+    hashed_token = presenting_token_hash(request)
+    row = (
+        await db.execute(
+            update(Pat)
+            .where(Pat.hashed_token == hashed_token, Pat.user_id == user.id)
+            .values(name=body.name)
+            .returning(*_SELF_ROW)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid or revoked token")
+    await db.commit()
+    return _self_row_response(row)
 
 
 @router.post("/logout")

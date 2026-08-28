@@ -10,6 +10,7 @@ The properties under test, in the order the flow exercises them:
 * a device token may revoke itself and nothing else;
 * that token renews itself on use — rotating rather than extending, and exactly once
   under a concurrent pair — so a year-old install never silently signs out;
+* that token can read and rename ITSELF, and learns nothing about any sibling;
 * the two anonymous URLs Apple and the authentication session need beat the SPA catch-all.
 
 Every case drives the real flow with only the OIDC network calls mocked (the seam `conftest`'s
@@ -585,6 +586,204 @@ def test_renew_refuses_a_browser_session(logged_in_client):
 
 def test_renew_refuses_an_unauthenticated_caller(client, db_engine):
     assert client.post("/api/auth/native/renew").status_code == 401
+
+
+# --- a device token may read and rename ITSELF, and nothing else ------------------------------
+
+SELF_FIELDS = {"name", "created_at", "last_used", "expires_at"}
+# Every column of a `pats` row, so "untouched" below means the whole row, not the fields the
+# assertion happened to think of.
+PAT_COLUMNS = "hashed_token, name, user_id, last_used, created_at, expires_at"
+
+
+def _pat_row(token: str):
+    return _sql(
+        f"SELECT {PAT_COLUMNS} FROM pats WHERE hashed_token = :h", h=auth.hash_token(token)
+    )
+
+
+def _bearer() -> TestClient:
+    """A clean client whose only credential is the bearer it is handed — the app's own shape."""
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _self_token(token: str):
+    return _bearer().get("/api/auth/native/token", headers={"Authorization": f"Bearer {token}"})
+
+
+def _rename(token: str, name):
+    return _bearer().patch(
+        "/api/auth/native/token",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": name},
+    )
+
+
+def test_native_token_returns_only_the_presenting_row(native_oidc):
+    """Keyed on the CREDENTIAL, not on the user: the same account holds both phones, so an
+    implementation that answered with "this user's token" would pass for one of them and fail here.
+
+    `last_used` is pinned to now() first — inside the stamp throttle window, so authentication
+    schedules no write of its own — which makes the served value the stored one rather than a
+    field that happens to read None on a token nobody has used twice.
+    """
+    client, _ = native_oidc
+    first = _exchange(client, _handoff_code(client, device="PhoneOne")).json()["token"]
+    second = _exchange(client, _handoff_code(client, device="PhoneTwo")).json()["token"]
+    _sql("UPDATE pats SET last_used = now() WHERE hashed_token = :h", h=auth.hash_token(first))
+
+    resp = _self_token(first)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The whole shape, not just the fields asserted below: a row that also carried `id`,
+    # `hashed_token` or a plaintext `token` would hand a leaked credential more than it holds.
+    assert set(body) == SELF_FIELDS
+    assert body["name"] == "PhoneOne"
+    assert abs(datetime.fromisoformat(body["last_used"]) - datetime.now(UTC)) < timedelta(
+        minutes=1
+    )
+    assert abs(datetime.fromisoformat(body["created_at"]) - datetime.now(UTC)) < timedelta(
+        minutes=1
+    )
+    lifetime = datetime.fromisoformat(body["expires_at"]) - datetime.now(UTC)
+    assert timedelta(days=364) < lifetime <= timedelta(days=settings.NATIVE_TOKEN_DAYS)
+
+    other = _self_token(second)
+    assert other.status_code == 200, other.text
+    assert other.json()["name"] == "PhoneTwo"
+
+
+async def test_the_self_row_of_a_token_that_never_expires_says_so(pat_client):
+    """An SPA-minted PAT carries no expiry, and the field has to come back present-and-null —
+    absent would be indistinguishable from a client that failed to decode it."""
+    bearer, _, _ = pat_client
+
+    resp = await bearer.get("/api/auth/native/token")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == SELF_FIELDS
+    assert body["name"] == "device"
+    assert body["expires_at"] is None
+
+
+def test_native_token_refuses_a_session_cookie(logged_in_client):
+    """A cookie names no token — the SPA reads its tokens from `/api/pats`, which says which one it
+    means. This route answers about whatever credential presented itself, so a session must not be
+    able to reach it at all (Decision 5/6), on either verb.
+    """
+    client, _ = logged_in_client
+    minted = client.post("/api/pats", json={"name": "cookie-minted"})
+    assert minted.status_code == 201
+
+    assert client.get("/api/auth/native/token").status_code == 401
+    assert client.patch("/api/auth/native/token", json={"name": "renamed"}).status_code == 401
+    assert [r[0] for r in _sql("SELECT name FROM pats WHERE name = 'cookie-minted'")] == [
+        "cookie-minted"
+    ]
+
+
+def test_native_token_refuses_an_unauthenticated_caller(client, db_engine):
+    assert client.get("/api/auth/native/token").status_code == 401
+    assert client.patch("/api/auth/native/token", json={"name": "x"}).status_code == 401
+
+
+def test_rename_touches_no_sibling(native_oidc):
+    """The rename is scoped to the presenting row; the other phone in the same account comes out
+    of it byte-identical, column for column."""
+    client, _ = native_oidc
+    first = _exchange(client, _handoff_code(client, device="PhoneOne")).json()["token"]
+    second = _exchange(client, _handoff_code(client, device="PhoneTwo")).json()["token"]
+    sibling_before = _pat_row(second)
+
+    resp = _rename(first, "Fabian's iPhone")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "Fabian's iPhone"
+
+    assert [r[1] for r in _pat_row(first)] == ["Fabian's iPhone"]
+    assert _pat_row(second) == sibling_before
+    # Renamed in place — never re-minted beside the old row.
+    assert _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(first))[0][
+        0
+    ] == 1
+
+
+def test_a_rename_is_visible_to_the_next_self_read(native_oidc):
+    """The write is committed, not left pending in the request's session (MEMNG-31's failure
+    mode): a second request on a fresh connection has to see it."""
+    client, _ = native_oidc
+    token = _exchange(client, _handoff_code(client, device="BeforeName")).json()["token"]
+
+    assert _rename(token, "AfterName").status_code == 200
+    assert _self_token(token).json()["name"] == "AfterName"
+
+
+@pytest.mark.parametrize("name", ["", "n" * 256])
+def test_a_rename_the_create_route_would_refuse_is_refused_here_too(native_oidc, name):
+    client, _ = native_oidc
+    token = _exchange(client, _handoff_code(client, device="KeepsItsName")).json()["token"]
+
+    assert _rename(token, name).status_code == 422
+    assert [r[1] for r in _pat_row(token)] == ["KeepsItsName"]
+
+
+def test_the_longest_name_the_column_holds_is_accepted(native_oidc):
+    """The boundary from the other side — 255 is `pats.name`'s width, so refusing it would be the
+    route inventing a limit the table does not have."""
+    client, _ = native_oidc
+    token = _exchange(client, _handoff_code(client, device="Boundary")).json()["token"]
+
+    assert _rename(token, "n" * 255).status_code == 200
+    assert [r[1] for r in _pat_row(token)] == ["n" * 255]
+
+
+def _name_bounds(model) -> dict[str, int]:
+    """The length constraints `model.name` publishes, as {constraint: value}."""
+    return {
+        type(c).__name__: getattr(c, "min_length", None) or getattr(c, "max_length", None)
+        for c in model.model_fields["name"].metadata
+    }
+
+
+def test_rename_validation_mirrors_the_create_route():
+    """Two models, one rule: a widened `PatCreate.name` that left this route behind would let a
+    device name a token the SPA could not, and the parametrised cases above would still pass."""
+    from app.routers.auth import NativeTokenRename
+    from app.routers.pats import PatCreate
+
+    assert _name_bounds(NativeTokenRename) == _name_bounds(PatCreate)
+    assert _name_bounds(PatCreate) == {"MinLen": 1, "MaxLen": 255}
+
+
+def test_expired_token_is_401_before_the_route(native_oidc):
+    """Expiry is authentication's answer, not the route's — so the row is still sitting there
+    afterwards under its old name, which is what proves the handler never ran.
+
+    Backdated in PostgreSQL rather than with a frozen clock: only a real stored instant tests the
+    predicate the running code evaluates.
+    """
+    client, _ = native_oidc
+    token = _exchange(client, _handoff_code(client, device="ExpiredSelfPhone")).json()["token"]
+    _sql(
+        "UPDATE pats SET expires_at = now() - interval '1 second' WHERE hashed_token = :h",
+        h=auth.hash_token(token),
+    )
+    before = _pat_row(token)
+
+    assert _self_token(token).status_code == 401
+    assert _rename(token, "RenamedByAnExpiredToken").status_code == 401
+    assert _pat_row(token) == before
+
+
+def test_a_revoked_token_cannot_read_or_rename_itself(native_oidc):
+    client, _ = native_oidc
+    token = _exchange(client, _handoff_code(client, device="GonePhone")).json()["token"]
+    assert _bearer().post(
+        "/api/auth/native/logout", headers={"Authorization": f"Bearer {token}"}
+    ).status_code == 204
+
+    assert _self_token(token).status_code == 401
+    assert _rename(token, "Resurrected").status_code == 401
+    assert _pat_row(token) == []
 
 
 # --- the two anonymous URLs, and their precedence over the SPA catch-all -----------------------
