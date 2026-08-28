@@ -12,7 +12,7 @@ from app import auth
 from app.config import settings
 from app.database import get_session
 from app.models import Pat, User
-from app.services import native_auth
+from app.services import management_grant, native_auth
 from app.services import pats as pats_svc
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -49,17 +49,30 @@ async def login(
     client: str | None = None,
     code_challenge: str | None = None,
     device: str | None = None,
+    purpose: str | None = None,
     _: None = Depends(auth.rate_limit()),
 ):
     """Start the OIDC login. `client=ios` brokers the result to a native app instead of the SPA.
 
-    The request sent to Authelia is the SAME one either way — same client, redirect_uri and scopes,
-    differing only in the per-request randoms. That is the whole point of the design (Decision 1):
-    no second Authelia client, no new redirect URI, and therefore no household SSO restart. The
-    app's own PKCE challenge and its device name are BFF state; they ride the encrypted transaction
-    cookie and are never forwarded to the IdP, which knows nothing about a device being involved.
+    The request sent to Authelia is the SAME one however this route is called — same client,
+    redirect_uri and scopes, differing only in the per-request randoms. That is the whole point of
+    the design (Decision 1): no second Authelia client, no new redirect URI, and therefore no
+    household SSO restart. The app's own PKCE challenge, its device name and the lane it is running
+    (`purpose`) are BFF state; they ride the encrypted transaction cookie and are never forwarded to
+    the IdP, which knows nothing about a device — or a step-up — being involved.
+
+    `purpose=manage` runs the same round trip for a management grant instead of a device token
+    (MEMNG-138 option 2). It is a native-lane parameter: the SPA already holds a session and has no
+    step-up to ask for, so naming it outside `client=ios` is refused rather than ignored, and so is
+    a purpose this build does not offer — a value that silently degraded to a plain login would mint
+    the wrong credential for a caller that asked for the other one.
     """
     native = client == NATIVE_CLIENT
+    if purpose is not None and not native:
+        raise HTTPException(status_code=422, detail="invalid_purpose")
+    purpose = purpose if purpose is not None else native_auth.PURPOSE_LOGIN
+    if purpose not in native_auth.PURPOSES:
+        raise HTTPException(status_code=422, detail="invalid_purpose")
     if native:
         if not native_auth.valid_code_challenge(code_challenge):
             raise HTTPException(status_code=422, detail="invalid_code_challenge")
@@ -80,7 +93,12 @@ async def login(
     if native:
         # `next` is a SPA route and means nothing to an app; the redirect target in this mode is
         # NATIVE_CALLBACK_URL, so accepting one here would only widen the open-redirect surface.
-        tx |= {"client": NATIVE_CLIENT, "code_challenge": code_challenge, "device": device}
+        tx |= {
+            "client": NATIVE_CLIENT,
+            "code_challenge": code_challenge,
+            "device": device,
+            "purpose": purpose,
+        }
     else:
         tx["next"] = _safe_next(next)
     resp = RedirectResponse(
@@ -140,7 +158,17 @@ async def callback(
         # authentication session owned by the app, and leaving a household-length cookie behind in
         # it would be a credential nobody is holding. The OIDC tokens are dropped with this scope —
         # the PAT the app is about to exchange for is the device's only credential (Decision 1).
-        handoff = await native_auth.mint_code(db, user, tx["code_challenge"], tx["device"])
+        # The lane is stamped on the code ROW here, read out of the transaction cookie that is
+        # about to be deleted: after this response nothing is left that could say what the login
+        # was for. A tx minted before this column existed carries no purpose and is a device login,
+        # which is what it was — a rolling deploy lands mid-flight logins on the new code.
+        handoff = await native_auth.mint_code(
+            db,
+            user,
+            tx["code_challenge"],
+            tx["device"],
+            purpose=tx.get("purpose", native_auth.PURPOSE_LOGIN),
+        )
         await db.commit()
         return _native_redirect(code=handoff)
     sid = await auth.create_session(db, user, tokens)
@@ -200,6 +228,35 @@ def _native_token_response(user: User, token: str, expires_at: datetime) -> Nati
     )
 
 
+async def _redeem_handoff_code(
+    db: AsyncSession, body: NativeExchangeIn, purpose: str
+) -> tuple[User, native_auth.NativeCodeClaim]:
+    """Burn a `purpose` handoff code and return who it was minted for, or raise the 400 saying why.
+
+    ONE implementation for both redemption lanes rather than two that look alike: the order here is
+    the security property — burn, commit, THEN judge the verifier — and a copy of it is a copy that
+    can drift. The purpose is a parameter of the atomic consume itself, so a code minted for the
+    other lane matches nothing and is refused without being burned.
+
+    Every failure is a 400 with a stable machine-readable `detail`; none of them distinguishes
+    "wrong" from "not yours", and all of them are terminal — the client starts a new login rather
+    than retrying, because a code that matched is burned by the attempt whatever its outcome.
+    """
+    try:
+        claim = await native_auth.consume_code(db, body.code, purpose=purpose)
+    except native_auth.NativeCodeRejected as rejected:
+        raise HTTPException(status_code=400, detail=rejected.reason) from rejected
+    # Committed BEFORE the verifier is judged: one attempt per code is the property that makes a
+    # leaked code worthless to a guesser, and it only holds if the burn survives the 400 below.
+    await db.commit()
+    if not native_auth.verifier_matches(body.code_verifier, claim.code_challenge):
+        raise HTTPException(status_code=400, detail="verifier_mismatch")
+    user = (await db.execute(select(User).where(User.id == claim.user_id))).scalar_one_or_none()
+    if user is None:  # the account was deleted between the login and this redemption
+        raise HTTPException(status_code=400, detail="code_invalid")
+    return user, claim
+
+
 @router.post("/native/exchange", response_model=NativeExchangeOut)
 async def native_exchange(
     body: NativeExchangeIn, db: AsyncSession = Depends(get_session)
@@ -210,28 +267,53 @@ async def native_exchange(
     would be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the
     request carries no ambient authority a browser could be tricked into attaching.
 
-    Every failure is a 400 with a stable machine-readable `detail`; none of them distinguishes
-    "wrong" from "not yours", and all of them are terminal — the client starts a new login rather
-    than retrying, because a code is burned by the attempt whatever its outcome.
+    Only a `login` code is redeemable here. A management code presented to this route is refused
+    like any unknown one (and left unburned): the two lanes ask Authelia for the same thing but buy
+    very different credentials, and a manage code spent here would hand a year-long device token to
+    a flow that asked for ten minutes of token management.
     """
-    try:
-        claim = await native_auth.consume_code(db, body.code)
-    except native_auth.NativeCodeRejected as rejected:
-        raise HTTPException(status_code=400, detail=rejected.reason) from rejected
-    # Committed BEFORE the verifier is judged: one attempt per code is the property that makes a
-    # leaked code worthless to a guesser, and it only holds if the burn survives the 400 below.
-    await db.commit()
-    if not native_auth.verifier_matches(body.code_verifier, claim.code_challenge):
-        raise HTTPException(status_code=400, detail="verifier_mismatch")
-    user = (await db.execute(select(User).where(User.id == claim.user_id))).scalar_one_or_none()
-    if user is None:  # the account was deleted between the login and this exchange
-        raise HTTPException(status_code=400, detail="code_invalid")
+    user, claim = await _redeem_handoff_code(db, body, native_auth.PURPOSE_LOGIN)
     # Bounded, unlike a PAT minted from the SPA with no expiry: a device token lives on hardware
     # that gets lost, and nobody revokes what they have not noticed is gone.
     expires_at = datetime.now(UTC) + timedelta(days=settings.NATIVE_TOKEN_DAYS)
     _, token = await pats_svc.create_pat(db, user, claim.device_name, expires_at=expires_at)
     await db.commit()
     return _native_token_response(user, token, expires_at)
+
+
+class ManageGrantOut(BaseModel):
+    """A step-up grant, returned once and stored only as a hash — like a PAT's plaintext.
+
+    `expires_at` is part of the contract rather than a client-side guess: the app has to know when
+    the management screen it is holding this for goes cold, and the server's deadline is the only
+    one that decides anything.
+    """
+
+    grant: str
+    expires_at: datetime
+
+
+@router.post("/native/manage-grant", response_model=ManageGrantOut)
+async def native_manage_grant(
+    body: NativeExchangeIn, db: AsyncSession = Depends(get_session)
+) -> ManageGrantOut:
+    """Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.
+
+    This is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was
+    minted by a fresh Authelia authentication minutes ago, and nothing a device already holds can
+    produce one — a PAT cannot, and neither can an existing browser session. That is the whole
+    point of a step-up: the capability to mint and revoke this account's tokens is bought with an
+    authentication, never with a token.
+
+    Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
+    authority, and the request carries no ambient authority a browser could be tricked into
+    attaching. A `login` code is refused here — see `_redeem_handoff_code` for why that refusal
+    does not burn it.
+    """
+    user, _ = await _redeem_handoff_code(db, body, native_auth.PURPOSE_MANAGE)
+    grant, expires_at = await management_grant.mint_grant(db, user)
+    await db.commit()
+    return ManageGrantOut(grant=grant, expires_at=expires_at)
 
 
 def presenting_token_hash(request: Request) -> str:

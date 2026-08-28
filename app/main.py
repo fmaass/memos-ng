@@ -21,6 +21,7 @@ from app.config import settings
 from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
 from app.security_headers import CSP
+from app.services import management_grant
 from app.services.cursors import InvalidCursor
 from app.version import __version__
 
@@ -108,9 +109,9 @@ SECURITY_SCHEMES = {
         "scheme": "bearer",
         "bearerFormat": "memos_pat",
         "description": "A personal access token (`memos_pat_…`). Accepted on every /api/* route "
-        "except /api/pats/*, which is browser-session-only, and POST /api/auth/native/exchange, "
-        "which is anonymous by construction — it is how a device obtains a token in the first "
-        "place, so requiring one would be circular.",
+        "except /api/pats/*, which takes a browser session or a management grant and never a "
+        "token, and POST /api/auth/native/exchange, which is anonymous by construction — it is how "
+        "a device obtains a token in the first place, so requiring one would be circular.",
     },
     "sessionCookie": {
         "type": "apiKey",
@@ -118,11 +119,22 @@ SECURITY_SCHEMES = {
         "name": auth.SID_COOKIE,
         "description": "The BFF session cookie set by the OIDC login flow.",
     },
+    "grantAuth": {
+        "type": "http",
+        "scheme": management_grant.GRANT_SCHEME,
+        "description": "A short-lived step-up management grant (`Authorization: Grant …`), "
+        "obtained from POST /api/auth/native/manage-grant with a handoff code minted by a fresh "
+        "Authelia login. Accepted only on /api/pats/*, and never mintable from a token — a device "
+        "PAT manages nothing but itself (ADR-0015).",
+    },
 }
 
 
 USER_SECURITY = [{"bearerAuth": []}, {"sessionCookie": []}]
 SESSION_SECURITY = [{"sessionCookie": []}]
+# Token management: the browser session as before, or a grant for a client that holds no session.
+# A bearer is in neither arm and reaches these routes under no circumstances.
+SESSION_OR_GRANT_SECURITY = [{"sessionCookie": []}, {"grantAuth": []}]
 # `{}` is the OAS spelling of "no credential also works": these surfaces answer an anonymous
 # caller with the PUBLIC-only slice (fixtures F1) and widen when a credential is presented, so
 # neither a hard requirement nor silence would describe them truthfully.
@@ -133,6 +145,7 @@ DEPENDENCY_SECURITY: dict[str, list[dict[str, list[str]]]] = {
     "require_user": USER_SECURITY,
     "require_pat_or_user": USER_SECURITY,
     "require_session_user": SESSION_SECURITY,
+    "require_session_or_grant": SESSION_OR_GRANT_SECURITY,
     "optional_user": OPTIONAL_PAT_SECURITY,
 }
 
@@ -157,6 +170,10 @@ PUBLIC_OPERATIONS: set[tuple[str, str]] = {
     ("GET", "/api/push/vapid-public-key"),
     ("POST", "/api/auth/logout"),
     ("POST", "/api/auth/native/exchange"),
+    # The code and its PKCE verifier ARE the authority here: the code was minted by a fresh
+    # Authelia authentication minutes ago (MEMNG-138 option 2), so requiring a credential on top
+    # would be circular in exactly the way the device exchange above is.
+    ("POST", "/api/auth/native/manage-grant"),
 }
 
 

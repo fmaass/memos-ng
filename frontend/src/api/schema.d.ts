@@ -184,9 +184,10 @@ export interface paths {
          *     would be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the
          *     request carries no ambient authority a browser could be tricked into attaching.
          *
-         *     Every failure is a 400 with a stable machine-readable `detail`; none of them distinguishes
-         *     "wrong" from "not yours", and all of them are terminal — the client starts a new login rather
-         *     than retrying, because a code is burned by the attempt whatever its outcome.
+         *     Only a `login` code is redeemable here. A management code presented to this route is refused
+         *     like any unknown one (and left unburned): the two lanes ask Authelia for the same thing but buy
+         *     very different credentials, and a manage code spent here would hand a year-long device token to
+         *     a flow that asked for ten minutes of token management.
          */
         post: operations["native_exchange_api_auth_native_exchange_post"];
         delete?: never;
@@ -215,6 +216,37 @@ export interface paths {
          *     it is talking about.
          */
         post: operations["native_logout_api_auth_native_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/native/manage-grant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Native Manage Grant
+         * @description Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.
+         *
+         *     This is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was
+         *     minted by a fresh Authelia authentication minutes ago, and nothing a device already holds can
+         *     produce one — a PAT cannot, and neither can an existing browser session. That is the whole
+         *     point of a step-up: the capability to mint and revoke this account's tokens is bought with an
+         *     authentication, never with a token.
+         *
+         *     Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
+         *     authority, and the request carries no ambient authority a browser could be tricked into
+         *     attaching. A `login` code is refused here — see `_redeem_handoff_code` for why that refusal
+         *     does not burn it.
+         */
+        post: operations["native_manage_grant_api_auth_native_manage_grant_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1052,6 +1084,23 @@ export interface components {
             status: string;
             /** Version */
             version: string;
+        };
+        /**
+         * ManageGrantOut
+         * @description A step-up grant, returned once and stored only as a hash — like a PAT's plaintext.
+         *
+         *     `expires_at` is part of the contract rather than a client-side guess: the app has to know when
+         *     the management screen it is holding this for goes cold, and the server's deadline is the only
+         *     one that decides anything.
+         */
+        ManageGrantOut: {
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Grant */
+            grant: string;
         };
         /**
          * MemberOut
@@ -1924,6 +1973,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    native_manage_grant_api_auth_native_manage_grant_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeExchangeIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManageGrantOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };

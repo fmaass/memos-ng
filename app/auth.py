@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import Pat, User, WebSession
+from app.services import management_grant
 
 TX_COOKIE = "memosng_oidc_tx"
 SID_COOKIE = "memosng_sid"
@@ -162,6 +163,19 @@ def rolling_refresh_due(last_seen: datetime, now: datetime) -> bool:
     return last_seen < now - timedelta(seconds=settings.SESSION_ROLLING_THROTTLE_S)
 
 
+def _scheme_credential(request: Request, scheme: str) -> str | None:
+    """The credential this request states under `scheme` (lowercase), else None.
+
+    None means "this request makes no claim in that scheme at all" — an empty or whitespace-only
+    credential is still a claim, and returns "" so it is judged (and refused) as one rather than
+    silently falling through to the cookie. A header in some other scheme states no claim here.
+    """
+    presented, _, credential = request.headers.get("Authorization", "").partition(" ")
+    if presented.lower() != scheme:
+        return None
+    return credential.strip()
+
+
 def bearer_credential(request: Request) -> str | None:
     """The credential of an `Authorization: Bearer …` header, else None.
 
@@ -170,10 +184,18 @@ def bearer_credential(request: Request) -> str | None:
     silently falling through to the cookie. Any other scheme (Basic, Negotiate) is not a bearer
     claim and leaves the caller on the cookie path.
     """
-    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
-    if scheme.lower() != "bearer":
-        return None
-    return credential.strip()
+    return _scheme_credential(request, "bearer")
+
+
+def grant_credential(request: Request) -> str | None:
+    """The credential of an `Authorization: Grant …` header, else None.
+
+    A DISTINCT scheme from Bearer, deliberately: a device PAT travels in a Bearer header, and the
+    two must never be confusable in either direction — a PAT presented as a Grant states a grant
+    claim and is refused as one (it is not a grant), and a grant presented as a Bearer states a
+    bearer claim and is refused as one (it is not a token). Neither is reinterpreted as the other.
+    """
+    return _scheme_credential(request, management_grant.GRANT_SCHEME)
 
 
 async def require_session_user(
@@ -214,6 +236,45 @@ async def require_session_user(
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
     request.state.auth_kind = "session"
+    return user
+
+
+async def require_session_or_grant(
+    request: Request, db: AsyncSession = Depends(get_session)
+) -> User:
+    """Authenticate the browser session OR a step-up management grant, and nothing else.
+
+    This is what `/api/pats/*` takes (MEMNG-138 option 2). The session cookie keeps the semantics it
+    had — a browser reaches token management exactly as before — and a native client, which holds
+    no session at all, reaches it with a grant it bought minutes ago with a fresh Authelia
+    authentication. A device PAT still reaches it with neither (ADR-0015).
+
+    The precedence is fail-closed at every step, and the order below IS the rule:
+
+    * A BEARER claim is refused first, before anything else is read — `require_session_user`'s
+      Decision-6 rule, unchanged: a device token riding alongside a valid session cookie must not
+      reach token management by having its header quietly ignored.
+    * A request that states no Grant claim is the ordinary cookie path, untouched.
+    * A Grant claim decides the outcome, and it decides it BEFORE any cookie is consulted: a grant
+      this server never issued, or one that has expired, is a 401 even with a valid session cookie
+      riding along. Falling through to the cookie there is the silent downgrade to a
+      differently-bound credential that this ordering exists to prevent.
+    * A Grant claim presented TOGETHER with a session cookie is ambiguous — two credentials that
+      can name two different accounts — and ambiguity fails closed rather than picking a winner.
+      Nothing legitimate does this: the app that holds a grant has no cookie jar, and the SPA that
+      holds a cookie never mints a grant.
+    """
+    if bearer_credential(request) is not None:
+        raise HTTPException(status_code=401, detail="Session or grant authentication required")
+    credential = grant_credential(request)
+    if credential is None:
+        return await require_session_user(request, db)
+    if SID_COOKIE in request.cookies:
+        raise HTTPException(status_code=401, detail="Ambiguous credentials")
+    user = await management_grant.authenticate_grant(db, credential)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired management grant")
+    request.state.auth_kind = "grant"
     return user
 
 
