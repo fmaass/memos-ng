@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
-import { nextTick, watchEffect } from 'vue'
+import { effectScope, nextTick, watchEffect } from 'vue'
 
 import { uploadFile, useUploadQueue } from '@/composables/useResumableUpload'
 
@@ -216,6 +216,39 @@ describe('useUploadQueue', () => {
     // still picked it up would dereference a released File. It must never be touched again.
     expect(started).toEqual(['first.png'])
     expect(later.status).toBe('queued') // never moved to 'uploading'/'error' by a stale pump
+  })
+
+  // MEMNG-87: release used to run only on explicit remove()/clear() — a component unmounted with
+  // items still staged (a MemoCard destroyed by a feed refresh mid-edit, a route change away from
+  // the editor) stranded its preview URLs and File references for the page's lifetime.
+  it('disposing the owning effect scope releases the queue like clear() would', () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonRes({ upload_uid: 'x', chunk_size: 100, bytes_received: 0 })))
+    const scope = effectScope()
+    const queue = scope.run(() => useUploadQueue())!
+    const staged = queue.add([fileOf(3, 'a.png', 'image/png'), fileOf(3, 'b.png', 'image/png')])
+    expect(queue.items).toHaveLength(2)
+
+    const deleted = spyMapDeletes(() => scope.stop())
+
+    expect(queue.items).toHaveLength(0) // torn down through the same per-item release path
+    expect(objectUrl.revoke.mock.calls.map((c) => c[0]).sort()).toEqual([
+      'blob:mock/a.png',
+      'blob:mock/b.png',
+    ])
+    for (const it of staged) expect(deleted).toContain(it.id) // every File reference dropped
+  })
+
+  it('a queue built outside any scope keeps working without a scope-lifecycle warning', () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonRes({ upload_uid: 'x', chunk_size: 100, bytes_received: 0 })))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { items, add, clear } = useUploadQueue()
+    add([fileOf(3, 'a.png', 'image/png')])
+    clear()
+    expect(items).toHaveLength(0) // explicit release still the contract outside a scope
+    // Vue warns "onScopeDispose() is called when there is no active effect scope" if the
+    // registration is unguarded — the composable must stay quiet where there is nothing to own it.
+    const scopeWarnings = warn.mock.calls.filter((c) => String(c[0]).includes('onScopeDispose'))
+    expect(scopeWarnings).toHaveLength(0)
   })
 
   it('clear() has the SAME in-flight semantics as remove(): the upload keeps running, neither aborts', async () => {

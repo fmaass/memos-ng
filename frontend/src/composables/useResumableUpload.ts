@@ -1,4 +1,4 @@
-import { reactive } from 'vue'
+import { getCurrentScope, onScopeDispose, reactive } from 'vue'
 
 import { redirectToLogin } from '@/api/client'
 
@@ -180,6 +180,13 @@ export function useUploadQueue(concurrency = 2) {
   function clear(): void {
     for (const it of items.splice(0, items.length)) release(it)
   }
+
+  // The owning scope's teardown is a release site too: a component unmounted with items still
+  // staged (a MemoCard destroyed by a feed refresh mid-edit, a route change away from the editor)
+  // would otherwise strand its preview URLs and File references for the page's lifetime
+  // (MEMNG-87). Guarded, because a queue built outside any scope has nothing to own its
+  // teardown — there the explicit remove()/clear() contract remains the whole story.
+  if (getCurrentScope()) onScopeDispose(clear)
 
   return { items, add, remove, clear }
 }
