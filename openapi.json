@@ -591,6 +591,26 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "ManageGrantOut": {
+        "description": "A step-up grant, returned once and stored only as a hash \u2014 like a PAT's plaintext.\n\n`expires_at` is part of the contract rather than a client-side guess: the app has to know when\nthe management screen it is holding this for goes cold, and the server's deadline is the only\none that decides anything.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "grant": {
+            "title": "Grant",
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant",
+          "expires_at"
+        ],
+        "title": "ManageGrantOut",
+        "type": "object"
+      },
       "MemberOut": {
         "description": "One household member, in the field shapes `/api/auth/user` already uses for the caller.\n\nA deliberate subset of `UserOut`: `email` and `role` are the account's own business and no\nclient needs them to draw a filter row, so they are not published about OTHER people here.\n`avatar` is whatever the settings feature stores \u2014 a `data:image/\u2026` URL (app/routers/settings.py\naccepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the\npath string that came with it (app/models.py) \u2014 and null for a member who never set one. It is\npassed through verbatim rather than normalised, so the value a client renders for a member is\nthe same one `/api/auth/user` hands that member for themselves.",
         "properties": {
@@ -2342,7 +2362,7 @@
     },
     "/api/auth/native/exchange": {
       "post": {
-        "description": "Trade a handoff code plus its PKCE verifier for a device PAT.\n\nAnonymous by construction \u2014 this is how a device gets its first credential, so requiring one\nwould be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the\nrequest carries no ambient authority a browser could be tricked into attaching.\n\nEvery failure is a 400 with a stable machine-readable `detail`; none of them distinguishes\n\"wrong\" from \"not yours\", and all of them are terminal \u2014 the client starts a new login rather\nthan retrying, because a code is burned by the attempt whatever its outcome.",
+        "description": "Trade a handoff code plus its PKCE verifier for a device PAT.\n\nAnonymous by construction \u2014 this is how a device gets its first credential, so requiring one\nwould be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the\nrequest carries no ambient authority a browser could be tricked into attaching.\n\nOnly a `login` code is redeemable here. A management code presented to this route is refused\nlike any unknown one (and left unburned): the two lanes ask Authelia for the same thing but buy\nvery different credentials, and a manage code spent here would hand a year-long device token to\na flow that asked for ten minutes of token management.",
         "operationId": "native_exchange_api_auth_native_exchange_post",
         "requestBody": {
           "content": {
@@ -2400,6 +2420,48 @@
           }
         ],
         "summary": "Native Logout",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/auth/native/manage-grant": {
+      "post": {
+        "description": "Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.\n\nThis is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was\nminted by a fresh Authelia authentication minutes ago, and nothing a device already holds can\nproduce one \u2014 a PAT cannot, and neither can an existing browser session. That is the whole\npoint of a step-up: the capability to mint and revoke this account's tokens is bought with an\nauthentication, never with a token.\n\nAnonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the\nauthority, and the request carries no ambient authority a browser could be tricked into\nattaching. A `login` code is refused here \u2014 see `_redeem_handoff_code` for why that refusal\ndoes not burn it.",
+        "operationId": "native_manage_grant_api_auth_native_manage_grant_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NativeExchangeIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManageGrantOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Native Manage Grant",
         "tags": [
           "auth"
         ]

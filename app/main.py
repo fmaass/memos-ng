@@ -157,6 +157,10 @@ PUBLIC_OPERATIONS: set[tuple[str, str]] = {
     ("GET", "/api/push/vapid-public-key"),
     ("POST", "/api/auth/logout"),
     ("POST", "/api/auth/native/exchange"),
+    # The code and its PKCE verifier ARE the authority here: the code was minted by a fresh
+    # Authelia authentication minutes ago (MEMNG-138 option 2), so requiring a credential on top
+    # would be circular in exactly the way the device exchange above is.
+    ("POST", "/api/auth/native/manage-grant"),
 }
 
 
