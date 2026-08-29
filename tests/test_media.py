@@ -203,6 +203,140 @@ def test_poster_cmd_uses_thumbnail_filter():
     assert cmd[-1] == "/out.jpg" and "/in.mov" in cmd
 
 
+# --- MEMNG-226: an HDR source is tone-mapped before its frame becomes a JPEG ---
+
+
+@pytest.mark.parametrize("transfer", ["arib-std-b67", "smpte2084"])
+def test_is_hdr_is_true_for_the_two_transfers_a_jpeg_cannot_carry(transfer):
+    assert media.is_hdr(transfer) is True
+
+
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        "bt709",  # the 111 SDR clips in the library
+        "unknown",  # ffprobe's spelling for a stream that states nothing
+        "bt2020-10",  # wide-gamut SDR: wide primaries are not an HDR transfer
+        "smpte170m",
+        "",
+        None,  # no video stream tags at all
+    ],
+)
+def test_is_hdr_is_false_for_everything_else(transfer):
+    assert media.is_hdr(transfer) is False
+
+
+def test_stream_colour_answers_four_keys_whatever_the_stream_says():
+    # Absent and non-string readings both have to come back as None, so no caller has to tell
+    # "the stream said nothing" apart from "ffprobe omitted the key".
+    assert media.stream_colour({}) == {
+        "color_transfer": None,
+        "color_primaries": None,
+        "color_space": None,
+        "pix_fmt": None,
+    }
+    assert media.stream_colour({"color_transfer": 18, "pix_fmt": "yuv420p"}) == {
+        "color_transfer": None,
+        "color_primaries": None,
+        "color_space": None,
+        "pix_fmt": "yuv420p",
+    }
+
+
+@pytest.mark.parametrize(
+    "colour",
+    [
+        None,  # no probe at all
+        {},  # a probe that returned nothing about colour
+        {"color_transfer": None},
+        {"color_transfer": "bt709", "color_primaries": "bt709", "color_space": "bt709"},
+        {"color_transfer": "unknown", "color_primaries": "unknown", "color_space": "unknown"},
+        {"color_primaries": "bt2020", "color_space": "bt2020nc"},  # wide gamut, SDR curve
+    ],
+)
+def test_poster_filter_for_a_non_hdr_source_is_the_frame_heuristic_alone(colour):
+    assert media.poster_video_filter(colour) == "thumbnail=100"
+
+
+def test_poster_filter_tone_maps_an_hlg_source_with_the_streams_own_tags():
+    chain = media.poster_video_filter(
+        {
+            "color_transfer": "arib-std-b67",
+            "color_primaries": "bt2020",
+            "color_space": "bt2020nc",
+            "pix_fmt": "yuv420p10le",
+        }
+    )
+    # The frame is chosen BEFORE the conversion, so the chain is paid once, not 100 times.
+    assert chain.startswith("thumbnail=100,")
+    assert "zscale=tin=arib-std-b67:pin=bt2020:min=bt2020nc:t=linear:npl=100" in chain
+    assert "format=gbrpf32le" in chain  # tonemap reads linear float RGB and nothing else
+    assert "tonemap=tonemap=hable:desat=0" in chain
+    assert chain.endswith("zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+
+
+def test_poster_filter_tone_maps_a_pq_source():
+    chain = media.poster_video_filter(
+        {"color_transfer": "smpte2084", "color_primaries": "bt2020", "color_space": "bt2020nc"}
+    )
+    assert "zscale=tin=smpte2084:pin=bt2020:min=bt2020nc:t=linear:npl=100" in chain
+
+
+def test_poster_filter_falls_back_to_the_bt2020_pair_when_only_the_transfer_is_stated():
+    # What a stream that carries the HLG curve and leaves the rest unsignalled must get: zimg can
+    # build no path from an unspecified primary or matrix, and bt2020/bt2020nc is what every
+    # HLG camera writes when it writes them at all.
+    for colour in (
+        {"color_transfer": "arib-std-b67"},
+        {"color_transfer": "arib-std-b67", "color_primaries": "unknown", "color_space": "unknown"},
+    ):
+        chain = media.poster_video_filter(colour)
+        assert "pin=bt2020:min=bt2020nc" in chain
+        assert "unknown" not in chain
+
+
+def test_poster_cmd_without_colour_is_the_command_this_repo_has_always_run():
+    # Ground truth, spelled out: every SDR video in the library must keep the byte-identical argv,
+    # so the tone-map cannot change a single one of the 111 bt709 posters.
+    assert media.poster_ffmpeg_cmd("/in.mov", "/out.jpg", 100.0) == [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        "12.00",
+        "-i",
+        "/in.mov",
+        "-map",
+        "0:V:0",
+        "-vf",
+        "thumbnail=100",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+        "/out.jpg",
+    ]
+
+
+def test_poster_cmd_carries_the_tone_map_chain_only_for_an_hdr_colour():
+    hlg = {
+        "color_transfer": "arib-std-b67",
+        "color_primaries": "bt2020",
+        "color_space": "bt2020nc",
+    }
+    hdr_cmd = media.poster_ffmpeg_cmd("/in.mov", "/out.jpg", 100.0, colour=hlg)
+    sdr = {"color_transfer": "bt709"}
+    sdr_cmd = media.poster_ffmpeg_cmd("/in.mov", "/out.jpg", 100.0, colour=sdr)
+
+    assert "tonemap" in hdr_cmd[hdr_cmd.index("-vf") + 1]
+    # An SDR probe reaches the same argv as no probe at all.
+    assert sdr_cmd == media.poster_ffmpeg_cmd("/in.mov", "/out.jpg", 100.0)
+    # ...and the filter is the ONLY thing the HDR command changes: same seek, same stream map,
+    # same encoder settings, same output path.
+    swapped = list(hdr_cmd)
+    swapped[swapped.index("-vf") + 1] = "thumbnail=100"
+    assert swapped == sdr_cmd
+
+
 # --- MEMNG-39: one poisoned job must never crash-loop the worker ---
 
 
@@ -530,6 +664,90 @@ def test_ffprobe_reports_displayed_dims_for_a_real_rotated_clip(tmp_path):
         320,
         240,
     )
+
+
+def _write_hlg_clip(path, size="320x240", duration=2):
+    """A 10-bit clip TAGGED as HLG/BT.2020, the way a phone writes one.
+
+    The tags are stamped with `setparams`, not with the encoder's `-color_trc/-color_primaries`
+    options: on this ffmpeg (7.1.5) those are overwritten by the filtergraph's own frame
+    properties, and the file comes out with `color_transfer` unset — which would make this
+    fixture an SDR clip wearing an HDR name and the test below vacuous. `setparams` sets the
+    properties on the frames themselves, so the encoder and the muxer carry them through.
+    Nothing about the PIXELS changes, which is the point: the plain and the tone-mapped
+    extraction below start from identical picture data and differ only by the filter chain.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=duration={duration}:size={size}:rate=5",
+            "-vf",
+            "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p10le",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_ffprobe_carries_the_colour_tags_of_a_real_clip(tmp_path):
+    hlg = tmp_path / "hlg.mp4"
+    _write_hlg_clip(hlg)
+    probed = media._ffprobe(str(hlg))
+    if probed["color_transfer"] != "arib-std-b67":
+        pytest.skip("this ffmpeg cannot stamp HLG colour tags (setparams)")
+
+    assert probed["color_primaries"] == "bt2020"
+    assert probed["color_space"] == "bt2020nc"
+    assert probed["pix_fmt"] == "yuv420p10le"
+    assert media.is_hdr(probed["color_transfer"]) is True
+
+    # The SDR control: an untagged clip must answer None for the tags it does not carry rather
+    # than raising or inventing one, and must stay out of the tone-mapping branch.
+    plain = tmp_path / "sdr.mp4"
+    _write_clip(plain)
+    sdr = media._ffprobe(str(plain))
+    assert sdr["color_transfer"] is None
+    assert media.is_hdr(sdr["color_transfer"]) is False
+    assert media.poster_video_filter(sdr) == "thumbnail=100"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_a_real_hlg_clip_gets_a_tone_mapped_poster(tmp_path):
+    # End-to-end proof that the chain is not just spelled but APPLIED: the same frame of the same
+    # clip, extracted twice, once with the probe's colour and once without. Both commands must
+    # succeed and produce the source's dimensions; the pictures must differ, which they can only
+    # do because the tone-map ran.
+    src = tmp_path / "hlg.mp4"
+    _write_hlg_clip(src)
+    probed = media._ffprobe(str(src))
+    if probed["color_transfer"] != "arib-std-b67":
+        pytest.skip("this ffmpeg cannot stamp HLG colour tags (setparams)")
+
+    plain, toned = tmp_path / "plain.jpg", tmp_path / "toned.jpg"
+    for dest, colour in ((plain, None), (toned, probed)):
+        subprocess.run(
+            media.poster_ffmpeg_cmd(str(src), str(dest), probed["duration"], colour=colour),
+            capture_output=True,
+            check=True,
+            timeout=60,
+        )
+
+    assert plain.exists() and toned.exists()
+    with Image.open(toned) as image:
+        assert image.size == (probed["width"], probed["height"]) == (320, 240)
+    assert toned.read_bytes() != plain.read_bytes()
 
 
 # --- stream selection (MEMNG-40 micro-round) -----------------------------------------------
