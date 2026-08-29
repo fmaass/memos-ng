@@ -50,6 +50,8 @@ DISPOSITIONS = {
     ("scripts/backfill_hdr_posters.py", "publish"): "sibling tmp — poster.poster_tmp_path, the "
     "same in-flight name process_video_poster renames from; the backup it takes first is a COPY "
     "out of assets, never a rename into it",
+    ("scripts/backfill_hdr_posters.py", "mark_done"): "sibling tmp — the marker renamed beside "
+    "its own destination inside data/backfill, outside assets entirely",
 }
 
 

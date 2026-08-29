@@ -45,7 +45,7 @@ Safety sequence, per attachment, in this order and never rearranged:
 
 Completion is that marker, not the backup: a run that dies between the backup and the commit leaves
 a backup with no marker, and the retry redoes the work while keeping the original backup untouched.
-A uid whose marker exists is counted ``already_done`` and skipped — which is what makes the runbook
+A uid whose marker parses is counted ``already_done`` and skipped — which is what makes the runbook
 (dry run, then one victim with ``--uid``, then the rest) safe to finish with a bare ``--execute``.
 
 A video with NO poster on disk is counted ``missing_poster`` and skipped. Deriving one here would
@@ -68,6 +68,7 @@ import argparse
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -218,8 +219,20 @@ def back_up(uid: str, poster_file: Path, variants: list[Path]) -> None:
         (poster_file, backup_path(uid)),
         *((variant, backup_dir() / variant.name) for variant in variants),
     ]:
-        if not destination.exists():
-            shutil.copy2(source, destination)
+        if destination.exists():
+            continue
+        # The copy lands under a private name and is LINKED into place: a copy interrupted
+        # halfway must never be readable at the final name, because the next run would keep the
+        # truncated file as "the original" for ever. link publishes whole-or-not-at-all, and it
+        # refuses to clobber — a complete backup another run just published wins over this copy.
+        tmp = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
+        shutil.copy2(source, tmp)
+        try:
+            os.link(tmp, destination)
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def extract(uid: str, src: str, duration: float | None, colour: dict[str, Any]) -> Path:
@@ -261,8 +274,28 @@ def mark_done(uid: str) -> Path:
     """
     marker = done_path(uid)
     digest = _sha256(poster.poster_path(uid))
-    marker.write_text(f"sha256={digest}\nreplaced_at={to_rfc3339(datetime.now(UTC))}\n")
+    # Written aside and renamed in: a marker interrupted mid-write would otherwise sit at the
+    # final name, and `is_done` would believe it. The rename is the only way it appears at all.
+    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    tmp.write_text(f"sha256={digest}\nreplaced_at={to_rfc3339(datetime.now(UTC))}\n")
+    os.replace(tmp, marker)
     return marker
+
+
+_DONE_LINE = re.compile(r"^sha256=[0-9a-f]{64}$")
+
+
+def is_done(uid: str) -> bool:
+    """Only a marker that PARSES counts: it must open and its first line must be the sha256.
+
+    Existence alone is not completion — a truncated or empty file at the marker's name (a crash,
+    a full disk) would otherwise turn a half-finished uid into one no retry ever repairs.
+    """
+    try:
+        first = done_path(uid).read_text().splitlines()[0]
+    except (OSError, IndexError):
+        return False
+    return bool(_DONE_LINE.match(first))
 
 
 async def still_publishable(db: AsyncSession, attachment_id: int) -> bool:
@@ -349,7 +382,7 @@ async def run_backfill(
             continue
         stats.hdr += 1
 
-        if await to_thread.run_sync(done_path(item.uid).exists):
+        if await to_thread.run_sync(is_done, item.uid):
             stats.already_done += 1
             logger.info(
                 "hdr_backfill.item",

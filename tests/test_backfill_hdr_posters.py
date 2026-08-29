@@ -395,6 +395,54 @@ async def test_execute_backs_up_replaces_restamps_and_updates_the_blurhash(
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+async def test_a_failed_commit_leaves_no_marker_and_keeps_the_backup(
+    published, monkeypatch, tmp_path
+):
+    """The marker may only ever mean "the blurhash commit went through".
+
+    This is the ordering pinned for real: the commit is made to fail, and the assertion that no
+    marker exists afterwards goes red the moment `mark_done` moves in front of `db.commit()`.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    src = _write_hlg_clip(tmp_path / "originals" / "hlg.mp4")
+    if media._ffprobe(str(src))["color_transfer"] != "arib-std-b67":
+        pytest.skip("this ffmpeg cannot stamp HLG colour tags (setparams)")
+    await published.seed("hdrbf-nocommit", src)
+    old_poster = _write_poster("hdrbf-nocommit").read_bytes()
+
+    async def refused() -> None:
+        raise RuntimeError("commit refused by the test")
+
+    monkeypatch.setattr(published.db, "commit", refused)
+    stats = await bf.run_backfill(published.db, execute=True, uid="hdrbf-nocommit")
+
+    assert (stats.hdr, stats.replaced, stats.failed) == (1, 0, 1)
+    assert bf.exit_code(stats) != 0
+    assert not bf.done_path("hdrbf-nocommit").exists()
+    assert bf.backup_path("hdrbf-nocommit").read_bytes() == old_poster
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+async def test_a_marker_that_does_not_parse_is_not_completion(published, monkeypatch, tmp_path):
+    """An empty file at the marker's name — a crash mid-write, a full disk — is retried, not
+    believed; and the run leaves no temporary names behind in the backup directory."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    src = _write_hlg_clip(tmp_path / "originals" / "hlg.mp4")
+    if media._ffprobe(str(src))["color_transfer"] != "arib-std-b67":
+        pytest.skip("this ffmpeg cannot stamp HLG colour tags (setparams)")
+    await published.seed("hdrbf-truncated", src)
+    _write_poster("hdrbf-truncated")
+    bf.ensure_backup_dir()
+    bf.done_path("hdrbf-truncated").write_text("")
+
+    stats = await bf.run_backfill(published.db, execute=True, uid="hdrbf-truncated")
+
+    assert (stats.already_done, stats.replaced, stats.failed) == (0, 1, 0)
+    assert bf.is_done("hdrbf-truncated")
+    assert not list(bf.backup_dir().glob("*.tmp"))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 async def test_a_second_run_skips_what_is_marked_done_and_keeps_the_first_backup(
     published, monkeypatch, tmp_path
 ):
