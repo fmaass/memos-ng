@@ -188,6 +188,10 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.5.2
+
+- The HDR poster tone-map uses the hable operator: mobius, shipped hours earlier in 1.5.1, blew ~7% of pixels past Y=250 on a real clip and read as an overdone HDR look on the device; hable restores the same chroma and clips essentially nothing on either test clip.
+
 ### v1.5.1
 
 - An HDR video's poster frame is tone-mapped to BT.709 SDR at derivation: HLG and PQ sources are linearised, tone-mapped and written back as SDR, so the still on the tile matches the clip that plays instead of looking flat and washed out. SDR sources keep the byte-identical extraction command.

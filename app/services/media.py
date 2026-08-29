@@ -520,12 +520,13 @@ def poster_video_filter(colour: Mapping[str, Any] | None = None) -> str:
     * `format=gbrpf32le` — `tonemap` reads linear floating-point RGB and refuses anything else.
     * `zscale=p=bt709` moves the gamut to BT.709 first, so the operator compresses in the space
       the JPEG will be displayed in rather than in one the file cannot describe.
-    * `tonemap=tonemap=mobius:desat=0` compresses the highlights. Mobius rather than the filmic
-      hable: compared frame-by-frame on a real HLG clip from this library, hable pulled the
-      midtones ~50/255 below how the scene reads and left the picture perceptibly dim, while
-      mobius holds the lower range nearly linear and compresses only against the ceiling —
-      0.05% of pixels touched 250+, against hable's none, and blacks stayed put. `desat=0`
-      stops the filter from washing bright pixels towards white either way.
+    * `tonemap=tonemap=hable:desat=0` compresses the highlights. Hable, after trying both ways
+      on two real HLG clips from this library: mobius held the midtones brighter but BLEW the
+      highlights on the second clip — 6.6% of pixels above Y=250, a wall gone cream-yellow —
+      which read on the device as an overdone HDR look, and no saturation trim touches luma.
+      Hable clips essentially nothing on either clip (0.000%/0.001%) while restoring the same
+      chroma, and that is the complaint this chain exists to fix. `desat=0` stops the filter
+      from washing bright pixels towards white.
     * `zscale=t=bt709:m=bt709:r=tv` writes the BT.709 curve and matrix back at limited range —
       the signalling a JPEG viewer assumes anyway, now true of the pixels as well.
     * `format=yuv420p` is what the JPEG encoder takes.
@@ -541,7 +542,7 @@ def poster_video_filter(colour: Mapping[str, Any] | None = None) -> str:
         f"zscale=tin={transfer}:pin={primaries}:min={matrix}:t=linear:npl={HDR_NOMINAL_PEAK_NITS},"
         "format=gbrpf32le,"
         "zscale=p=bt709,"
-        "tonemap=tonemap=mobius:desat=0,"
+        "tonemap=tonemap=hable:desat=0,"
         "zscale=t=bt709:m=bt709:r=tv,"
         "format=yuv420p"
     )
