@@ -47,6 +47,11 @@ DISPOSITIONS = {
     ("services/media.py", "process_video_poster"): "sibling tmp — poster.poster_tmp_path",
     ("services/media.py", "process_slow"): "sibling tmp — the web mp4 beside its own destination",
     ("routers/assets.py", "_save_print_sync"): "data/print, not assets — a spooled print master",
+    ("scripts/backfill_hdr_posters.py", "publish"): "sibling tmp — poster.poster_tmp_path, the "
+    "same in-flight name process_video_poster renames from; the backup it takes first is a COPY "
+    "out of assets, never a rename into it",
+    ("scripts/backfill_hdr_posters.py", "mark_done"): "sibling tmp — the marker renamed beside "
+    "its own destination inside data/backfill, outside assets entirely",
 }
 
 

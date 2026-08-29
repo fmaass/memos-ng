@@ -4,6 +4,8 @@ import os
 import signal
 import subprocess
 from collections import deque
+from collections.abc import Mapping
+from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -173,10 +175,21 @@ def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: A
     os.replace(tmp, dest)
 
 
-def _stamp_mtime(path: Path, attachment: Attachment) -> None:
-    if attachment.captured_at:
-        ts = attachment.captured_at.timestamp()
+def stamp_mtime(path: Path, captured_at: datetime | None) -> None:
+    """Give a derived file the capture date of the photo or clip it was derived from.
+
+    Takes the VALUE, not the row: a caller that is not the worker (app.scripts.backfill_hdr_posters)
+    holds plain columns rather than a live ORM instance, and reading an attribute off an expired
+    one is lazy IO in a place that cannot await it. One definition either way — _stamp_mtime is
+    the row-shaped spelling of exactly this.
+    """
+    if captured_at:
+        ts = captured_at.timestamp()
         os.utime(path, (ts, ts))
+
+
+def _stamp_mtime(path: Path, attachment: Attachment) -> None:
+    stamp_mtime(path, attachment.captured_at)
 
 
 def process_image(attachment: Attachment) -> dict:
@@ -417,6 +430,7 @@ def _ffprobe(path: str) -> dict:
         "width": width,
         "height": height,
         "duration": float(duration) if duration else None,
+        **stream_colour(stream),
     }
 
 
@@ -428,14 +442,124 @@ def poster_seek_seconds(duration: float | None) -> float:
     return max(0.5, min(duration * 0.12, duration - 1.0))
 
 
-def poster_ffmpeg_cmd(src: str, dest: str, duration: float | None) -> list[str]:
+# The two transfer curves a JPEG cannot carry, spelled the way ffprobe reports them and zimg
+# accepts them (`ffmpeg -h filter=zscale` lists both under `transfer`: arib-std-b67 = 18,
+# smpte2084 = 16). HLG is what every iPhone records by default; PQ is the other HDR curve.
+HDR_TRANSFERS = frozenset({"arib-std-b67", "smpte2084"})
+# What a camera writes alongside either curve when it states the rest of the triplet at all. Used
+# only as the fallback for a stream that carries the HDR transfer and nothing else — never to
+# DECIDE that a stream is HDR (see is_hdr).
+HDR_FALLBACK_PRIMARIES = "bt2020"
+HDR_FALLBACK_MATRIX = "bt2020nc"
+# HLG's nominal peak luminance in cd/m2, handed to zscale for the linear-light stage. The value
+# the reference HLG system is graded against; it is what makes the tone-map's input scale mean
+# something rather than being read off an unsignalled default.
+HDR_NOMINAL_PEAK_NITS = 100
+# The colour tags read off the SELECTED video stream (select_video_stream) — the same stream both
+# ffmpeg lanes render. `pix_fmt` is carried for the record and for logs: 10-bit is a strong HDR
+# hint but never the decision.
+COLOUR_FIELDS = ("color_transfer", "color_primaries", "color_space", "pix_fmt")
+# ffprobe SPELLS an unsignalled tag rather than omitting it, and zimg can build no conversion path
+# from an unspecified primary or matrix — so these three readings all mean "this stream does not
+# say", and the HDR fallback above is used instead.
+_UNSTATED_COLOUR = frozenset({"", "unknown", "reserved"})
+# The frame heuristic, alone, is the whole SDR filter chain — the command as it has always been.
+POSTER_FRAME_FILTER = "thumbnail=100"
+
+
+def stream_colour(stream: dict) -> dict[str, str | None]:
+    """The colour tags of one probed stream, every field present and every value a str or None.
+
+    Always the same four keys, so a caller never has to distinguish "absent" from "unstated": the
+    probe's answer for a stream that says nothing about its colour is four Nones, which is exactly
+    how an SDR clip and an untagged one have to read.
+    """
+    colour: dict[str, str | None] = {}
+    for field in COLOUR_FIELDS:
+        value = stream.get(field)
+        colour[field] = value if isinstance(value, str) else None
+    return colour
+
+
+def is_hdr(transfer: str | None) -> bool:
+    """Whether a stream's transfer characteristic has to be tone-mapped before it becomes a JPEG.
+
+    Decided by the TRANSFER alone. HLG (`arib-std-b67`) and PQ (`smpte2084`) are the two curves a
+    still image cannot carry: JPEG signals no transfer function, so a viewer applies sRGB to
+    whatever code words it finds, and HLG/PQ values land far from where they were authored —
+    lifted blacks, flat contrast, washed-out colour, while the clip itself plays correctly because
+    its container kept the tags. Everything else (`bt709`, `unknown`, missing) is already
+    display-referred and is left alone.
+
+    Wide primaries are deliberately NOT part of the test: bt2020 SDR exists, and tone-mapping a
+    picture that was never HDR would darken it for nothing.
+    """
+    return transfer in HDR_TRANSFERS
+
+
+def _colour_tag(colour: Mapping[str, Any], field: str, fallback: str) -> str:
+    value = colour.get(field)
+    if isinstance(value, str) and value not in _UNSTATED_COLOUR:
+        return value
+    return fallback
+
+
+def poster_video_filter(colour: Mapping[str, Any] | None = None) -> str:
+    """The poster's `-vf` chain: the frame heuristic, plus a tone-map when the source is HDR.
+
+    `colour` is the probe's dict (extra keys are ignored, so `_ffprobe`'s whole answer can be
+    handed over as it is). SDR, unstated and absent colour all return exactly
+    `POSTER_FRAME_FILTER`, so nothing changes for a library of bt709 clips.
+
+    For HLG/PQ the conversion runs AFTER `thumbnail=100`, so it is paid for the ONE frame that
+    becomes the poster and not for the hundred it was chosen from:
+
+    * `zscale=tin=..:pin=..:min=..:t=linear:npl=..` decodes the source's own curve, primaries and
+      matrix to linear light. The tags come from the probe; a stream that states the HDR transfer
+      and nothing else gets the bt2020 pair every HLG/PQ camera writes.
+    * `format=gbrpf32le` — `tonemap` reads linear floating-point RGB and refuses anything else.
+    * `zscale=p=bt709` moves the gamut to BT.709 first, so the operator compresses in the space
+      the JPEG will be displayed in rather than in one the file cannot describe.
+    * `tonemap=tonemap=mobius:desat=0` compresses the highlights. Mobius rather than the filmic
+      hable: compared frame-by-frame on a real HLG clip from this library, hable pulled the
+      midtones ~50/255 below how the scene reads and left the picture perceptibly dim, while
+      mobius holds the lower range nearly linear and compresses only against the ceiling —
+      0.05% of pixels touched 250+, against hable's none, and blacks stayed put. `desat=0`
+      stops the filter from washing bright pixels towards white either way.
+    * `zscale=t=bt709:m=bt709:r=tv` writes the BT.709 curve and matrix back at limited range —
+      the signalling a JPEG viewer assumes anyway, now true of the pixels as well.
+    * `format=yuv420p` is what the JPEG encoder takes.
+    """
+    colour = colour or {}
+    transfer = _colour_tag(colour, "color_transfer", "")
+    if not is_hdr(transfer):
+        return POSTER_FRAME_FILTER
+    primaries = _colour_tag(colour, "color_primaries", HDR_FALLBACK_PRIMARIES)
+    matrix = _colour_tag(colour, "color_space", HDR_FALLBACK_MATRIX)
+    return (
+        f"{POSTER_FRAME_FILTER},"
+        f"zscale=tin={transfer}:pin={primaries}:min={matrix}:t=linear:npl={HDR_NOMINAL_PEAK_NITS},"
+        "format=gbrpf32le,"
+        "zscale=p=bt709,"
+        "tonemap=tonemap=mobius:desat=0,"
+        "zscale=t=bt709:m=bt709:r=tv,"
+        "format=yuv420p"
+    )
+
+
+def poster_ffmpeg_cmd(
+    src: str, dest: str, duration: float | None, colour: Mapping[str, Any] | None = None
+) -> list[str]:
     """Pick a representative 'hero' frame: seek past the intro, then ffmpeg's `thumbnail`
     filter selects the frame most different from its neighbours' average over a 100-frame
     window — the industry-standard cheap heuristic, instead of the odd first frame.
 
     `-map 0:V:0` pins the poster to the SAME stream the probe measured (see
     select_video_stream); without it ffmpeg auto-selects by resolution and a multi-stream
-    container gets a poster whose shape contradicts the stored dimensions."""
+    container gets a poster whose shape contradicts the stored dimensions.
+
+    `colour` is the probe's reading of that same stream and decides the filter chain alone (see
+    poster_video_filter). Omitted, the argv is the one this command has always produced."""
     return [
         "ffmpeg",
         "-y",
@@ -446,7 +570,7 @@ def poster_ffmpeg_cmd(src: str, dest: str, duration: float | None) -> list[str]:
         "-map",
         VIDEO_STREAM_MAP,
         "-vf",
-        "thumbnail=100",
+        poster_video_filter(colour),
         "-frames:v",
         "1",
         "-q:v",
@@ -466,6 +590,11 @@ def process_video_poster(attachment: Attachment) -> dict:
     still runs (dimensions and duration are properties of the video, not of its poster) and the
     blurhash is still computed from whichever poster is there, so the tile's placeholder always
     matches the image it fades into.
+
+    The probe's answer is handed to the extraction whole, because an HDR source needs its own
+    frame tone-mapped before it can be a JPEG (see poster_video_filter). An HDR clip whose poster
+    was already on disk therefore keeps its untouched frame — that file is a client's choice, and
+    replacing it is app.scripts.backfill_hdr_posters' job, not this lane's.
     """
     src = attachment.storage_path
     assert src is not None  # set at finalize
@@ -475,7 +604,7 @@ def process_video_poster(attachment: Attachment) -> dict:
         poster_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = poster.poster_tmp_path(attachment.uid)
         subprocess.run(
-            poster_ffmpeg_cmd(src, str(tmp), meta.get("duration")),
+            poster_ffmpeg_cmd(src, str(tmp), meta.get("duration"), colour=meta),
             capture_output=True,
             timeout=60,
             check=True,

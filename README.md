@@ -188,6 +188,14 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.5.1
+
+- An HDR video's poster frame is tone-mapped to BT.709 SDR at derivation: HLG and PQ sources are linearised, tone-mapped and written back as SDR, so the still on the tile matches the clip that plays instead of looking flat and washed out. SDR sources keep the byte-identical extraction command.
+- `app.scripts.backfill_hdr_posters` re-derives the posters of HDR videos already on disk — dry run by default, one attachment at a time with `--uid`, the file it replaces copied aside first, the blurhash and the capture-date mtime restamped, and a completion marker that makes a rerun a no-op.
+- Every API datetime is serialized in one canonical shape, `YYYY-MM-DDTHH:MM:SSZ` in UTC, with no sub-second part.
+- A memo permalink resolves to the memo again: the route is ordered so a literal path segment can no longer shadow it.
+- The upload queue is released when the scope that owns it goes away, not only on an explicit clear.
+
 ### v1.5.0
 
 - A device can read and rename its own token over the bearer lane (`GET`/`PATCH /api/auth/native/token`), strictly self-scoped through the presenting token's hash.
