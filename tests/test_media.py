@@ -271,7 +271,7 @@ def test_poster_filter_tone_maps_an_hlg_source_with_the_streams_own_tags():
     assert chain.startswith("thumbnail=100,")
     assert "zscale=tin=arib-std-b67:pin=bt2020:min=bt2020nc:t=linear:npl=100" in chain
     assert "format=gbrpf32le" in chain  # tonemap reads linear float RGB and nothing else
-    assert "tonemap=tonemap=hable:desat=0" in chain
+    assert "tonemap=tonemap=mobius:desat=0" in chain
     assert chain.endswith("zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
 
 
