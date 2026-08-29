@@ -30,6 +30,19 @@ def derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
     return None
 
 
+def variant_paths(path: Path) -> list[Path]:
+    """The format-negotiated siblings of one derived tier file.
+
+    One definition, because two callers have to agree about it and they fail in opposite
+    directions: everything that DELETES an attachment unlinks these alongside the tier itself
+    (`all_asset_paths`), and anything that REPLACES a tier in place has to remove them
+    (`app.scripts.backfill_hdr_posters`) — otherwise the serving path keeps handing the stale
+    variant to every client that accepts webp (`app/routers/assets.py:_negotiated_path_sync`),
+    and a replaced JPEG goes on being served as the picture it used to be.
+    """
+    return [path.with_suffix(".webp")]
+
+
 def tier_path(attachment: Attachment, tier: str) -> tuple[Path, str] | None:
     """Resolve an attachment's file for a tier — the export builds its media payloads from the
     same map (app/routers/export.py); a second copy would drift the moment a rendition rung is
@@ -64,5 +77,5 @@ def all_asset_paths(att: Attachment) -> list[Path]:
         resolved = derived_tier_path(att.uid, tier)
         if resolved is not None:
             paths.append(resolved[0])
-            paths.append(resolved[0].with_suffix(".webp"))  # format-negotiated variant
+            paths.extend(variant_paths(resolved[0]))  # format-negotiated variants
     return paths
