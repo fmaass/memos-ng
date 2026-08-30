@@ -239,6 +239,29 @@ async def require_session_user(
     return user
 
 
+async def require_admin(request: Request, db: AsyncSession = Depends(get_session)) -> User:
+    """Authenticate the browser session AND require the `admin` role (MEMNG-233).
+
+    Built ON `require_session_user` rather than beside it, and that is load-bearing twice over:
+
+    * A request carrying a bearer header is refused THERE, before any cookie is read (Decision 6),
+      so "an access token never reaches an admin route" is true by construction here instead of
+      being a rule this function has to remember. A device PAT riding alongside a valid admin
+      session cannot borrow the session's role.
+    * There is exactly one session-authentication implementation, so the rolling-refresh and
+      session-expiry behaviour of an admin route cannot drift from every other cookie route's.
+
+    `role` is assigned at OIDC login from the Authelia `admins` group (see `upsert_user` above) and
+    has been published on `UserOut` since then, but this is the first place it is read for
+    AUTHORIZATION. 403, not 404: the caller is authenticated and the route exists — it is the
+    account that is not permitted, and saying so is what lets the SPA hide the panel honestly.
+    """
+    user = await require_session_user(request, db)
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Administrator role required")
+    return user
+
+
 async def require_session_or_grant(
     request: Request, db: AsyncSession = Depends(get_session)
 ) -> User:

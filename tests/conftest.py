@@ -169,6 +169,50 @@ def logged_in_client(client, db_engine, monkeypatch):
         eng.dispose()
 
 
+@pytest.fixture
+def admin_client(client, db_engine, monkeypatch):
+    """A TestClient whose session belongs to an ADMIN account.
+
+    A separate fixture rather than a parameter on `logged_in_client`, so every existing test keeps
+    the ordinary (non-admin) session it was written against and the 403 cases below have a genuine
+    counterpart to be refused next to. The role is not set by hand: it comes out of the real login
+    flow from the Authelia `admins` group claim, which is the one place `User.role` is ever
+    assigned (app/auth.py `upsert_user`) — so a change that stopped mapping the group would fail
+    the admin tests instead of silently granting everyone.
+    """
+    from unittest.mock import AsyncMock
+
+    from app import auth
+    from app.config import settings
+
+    subject = "test_admin_user"
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    monkeypatch.setattr(auth, "exchange_code", AsyncMock(return_value={"id_token": "x"}))
+    monkeypatch.setattr(
+        auth,
+        "validate_id_token",
+        lambda t: {
+            "preferred_username": subject,
+            "name": "Admin",
+            "email": "admin@x",
+            "groups": ["admins"],
+        },
+    )
+    login = client.get("/api/auth/login", follow_redirects=False)
+    tx = login.cookies[auth.TX_COOKIE]
+    state = auth.decrypt(tx)["state"]
+    client.cookies.set(auth.TX_COOKIE, tx)
+    cb = client.get(f"/api/auth/callback?code=abc&state={state}", follow_redirects=False)
+    client.cookies.set(auth.SID_COOKIE, cb.cookies[auth.SID_COOKIE])
+    try:
+        yield client, subject
+    finally:
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
+        eng.dispose()
+
+
 @pytest_asyncio.fixture
 async def pat_client(logged_in_client):
     """`(bearer_client, subject, token)` — an httpx client that carries a PAT and nothing else.

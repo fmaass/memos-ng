@@ -138,6 +138,17 @@ class Settings(BaseSettings):
     # real send (30s upload timeout) or a live job would be re-queued under itself.
     FRAME_CLAIM_STALE_MINUTES: int = 15
 
+    # Daily digest media hosting (Dropbox). The digest's recipients are outside the household and
+    # have no memos-ng account, so a mail never links back here: oversized media is uploaded to
+    # Dropbox and linked from there. These three are the Dropbox APP credentials and are SECRETS —
+    # set via the stack .env in prod, never logged (repr=False keeps them out of a settings dump).
+    # Empty disables hosting globally, the same empty-default-disables switch SMTP/VAPID/FRAME use;
+    # `GET /api/admin/digest/hosting` reports that state, and the pipeline degrades to an
+    # inline-only mail rather than failing.
+    DROPBOX_APP_KEY: str = Field(default="", repr=False)
+    DROPBOX_APP_SECRET: str = Field(default="", repr=False)
+    DROPBOX_REFRESH_TOKEN: str = Field(default="", repr=False)
+
     # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
     OIDC_CLIENT_ID: str = "memos-ng"

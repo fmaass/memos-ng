@@ -4,6 +4,111 @@
  */
 
 export interface paths {
+    "/api/admin/digest/hosting": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Digest Hosting
+         * @description Report whether Dropbox hosting is configured, from the env keys alone.
+         *
+         *     Presence, never the value: the three keys are secrets and nothing about them is echoed back —
+         *     `configured` is the whole answer. All three are required, because two out of three cannot
+         *     refresh a token, and an empty key is the switch that disables hosting globally.
+         */
+        get: operations["get_digest_hosting_api_admin_digest_hosting_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/digest/recipients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Digest Recipients */
+        get: operations["list_digest_recipients_api_admin_digest_recipients_get"];
+        put?: never;
+        /** Add Digest Recipient */
+        post: operations["add_digest_recipient_api_admin_digest_recipients_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/digest/recipients/{recipient_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove Digest Recipient */
+        delete: operations["remove_digest_recipient_api_admin_digest_recipients__recipient_id__delete"];
+        options?: never;
+        head?: never;
+        /** Update Digest Recipient */
+        patch: operations["update_digest_recipient_api_admin_digest_recipients__recipient_id__patch"];
+        trace?: never;
+    };
+    "/api/admin/digest/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Digest Runs
+         * @description The most recent runs, newest first — the panel's Runs table.
+         *
+         *     Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import
+         *     row is stamped by the same `now()` as anything else committed in that transaction), and an
+         *     unstable order would make the table shuffle between refreshes.
+         */
+        get: operations["list_digest_runs_api_admin_digest_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/digest/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Digest Settings */
+        get: operations["get_digest_settings_api_admin_digest_settings_get"];
+        /**
+         * Put Digest Settings
+         * @description Update the one settings row. There is no create path here, deliberately — see SETTINGS_ID.
+         */
+        put: operations["put_digest_settings_api_admin_digest_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/attachments": {
         parameters: {
             query?: never;
@@ -1028,6 +1133,202 @@ export interface components {
             detail: components["schemas"]["CreateRacedDetail"];
         };
         /**
+         * DigestHostingOut
+         * @description Whether media hosting can work at all, as the panel's status line reads it.
+         *
+         *     Phase 1 answers from the PRESENCE of the three `DROPBOX_*` env keys and nothing else — no
+         *     network call is made and `account` is therefore always null here. The live account lookup that
+         *     fills it in arrives with the hosting service in Phase 2; a caller reading `configured` alone
+         *     gets the same answer either way, which is what the "Not configured — mails go out inline-only"
+         *     line needs.
+         */
+        DigestHostingOut: {
+            /** Account */
+            account?: string | null;
+            /** Configured */
+            configured: boolean;
+        };
+        /** DigestRecipientCreate */
+        DigestRecipientCreate: {
+            /** Display Name */
+            display_name?: string | null;
+            /** Email */
+            email: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+        };
+        /** DigestRecipientOut */
+        DigestRecipientOut: {
+            /**
+             * Added At
+             * Format: date-time
+             */
+            added_at: string;
+            /** Added By */
+            added_by: string | null;
+            /** Display Name */
+            display_name: string | null;
+            /** Email */
+            email: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Id */
+            id: number;
+        };
+        /**
+         * DigestRecipientPatch
+         * @description Partial by design — the panel toggles `enabled` on its own, without resending the name.
+         *
+         *     An omitted field is "leave it alone" and is told apart from an explicit `null` (which clears
+         *     the display name) by `model_fields_set`, not by the value.
+         */
+        DigestRecipientPatch: {
+            /** Display Name */
+            display_name?: string | null;
+            /** Enabled */
+            enabled?: boolean | null;
+        };
+        /** DigestRunOut */
+        DigestRunOut: {
+            /** Error */
+            error: string | null;
+            /**
+             * Finished At
+             * Format: date-time
+             */
+            finished_at: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Local Date
+             * Format: date
+             */
+            local_date: string;
+            /** Memos Sent */
+            memos_sent: number;
+            /** Parts */
+            parts: number;
+            /** Parts Claimed */
+            parts_claimed: number;
+            /** Parts Sent */
+            parts_sent: number;
+            /** Recipients */
+            recipients: number;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Status */
+            status: string | null;
+            /** Trigger */
+            trigger: string;
+        };
+        /** DigestSettingsOut */
+        DigestSettingsOut: {
+            /** Dropbox Folder */
+            dropbox_folder: string;
+            /** Enabled */
+            enabled: boolean;
+            /** From Email */
+            from_email: string;
+            /** From Name */
+            from_name: string;
+            /** Grace Minutes */
+            grace_minutes: number;
+            /** Hosting Enabled */
+            hosting_enabled: boolean;
+            /** Link Images Full */
+            link_images_full: boolean;
+            /** Mail Title */
+            mail_title: string;
+            /** Max Email Bytes */
+            max_email_bytes: number;
+            /** Max Memos Per Run */
+            max_memos_per_run: number;
+            /** Max Videos Per Memo */
+            max_videos_per_memo: number;
+            /** Retention Days */
+            retention_days: number;
+            /**
+             * Send Time
+             * Format: time
+             */
+            send_time: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Timezone */
+            timezone: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Updated By */
+            updated_by: string | null;
+            visibility_scope: components["schemas"]["DigestVisibilityScope"];
+        };
+        /**
+         * DigestSettingsPut
+         * @description The WHOLE settings row, not a patch.
+         *
+         *     The panel edits these fields behind one Save bar (design 3285 §6), so the request that Save
+         *     sends IS the new state — which also means a field the client omits is a client bug rather than
+         *     "leave it alone", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:
+         *     they exist so a typo cannot arm something absurd, and the admin stays free inside them.
+         */
+        DigestSettingsPut: {
+            /** Dropbox Folder */
+            dropbox_folder: string;
+            /** Enabled */
+            enabled: boolean;
+            /** From Email */
+            from_email: string;
+            /** From Name */
+            from_name: string;
+            /** Grace Minutes */
+            grace_minutes: number;
+            /** Hosting Enabled */
+            hosting_enabled: boolean;
+            /** Link Images Full */
+            link_images_full: boolean;
+            /** Mail Title */
+            mail_title: string;
+            /** Max Email Bytes */
+            max_email_bytes: number;
+            /** Max Memos Per Run */
+            max_memos_per_run: number;
+            /** Max Videos Per Memo */
+            max_videos_per_memo: number;
+            /** Retention Days */
+            retention_days: number;
+            /**
+             * Send Time
+             * Format: time
+             */
+            send_time: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Timezone */
+            timezone: string;
+            visibility_scope: components["schemas"]["DigestVisibilityScope"];
+        };
+        /**
+         * DigestVisibilityScope
+         * @description Which memos a digest may mail. `PUBLIC_PROTECTED` is the default (design 3285 §9).
+         * @enum {string}
+         */
+        DigestVisibilityScope: "PUBLIC" | "PUBLIC_PROTECTED";
+        /**
          * EditKeyConflictDetail
          * @description Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT
          *     memo. Both alternatives to refusing are wrong — replaying would answer a PATCH of one memo with
@@ -1609,6 +1910,227 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_digest_hosting_api_admin_digest_hosting_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestHostingOut"];
+                };
+            };
+        };
+    };
+    list_digest_recipients_api_admin_digest_recipients_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestRecipientOut"][];
+                };
+            };
+        };
+    };
+    add_digest_recipient_api_admin_digest_recipients_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DigestRecipientCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestRecipientOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_digest_recipient_api_admin_digest_recipients__recipient_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                recipient_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_digest_recipient_api_admin_digest_recipients__recipient_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                recipient_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DigestRecipientPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestRecipientOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_digest_runs_api_admin_digest_runs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestRunOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_digest_settings_api_admin_digest_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestSettingsOut"];
+                };
+            };
+        };
+    };
+    put_digest_settings_api_admin_digest_settings_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DigestSettingsPut"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestSettingsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_attachments_api_attachments_get: {
         parameters: {
             query?: {
