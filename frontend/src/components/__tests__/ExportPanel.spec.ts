@@ -17,6 +17,7 @@ const SERVER: ExportSettings = {
   mail_jpeg_quality: 80,
   mail_subsampling: '4:2:0',
   mail_progressive: false,
+  print_profile_key: 'p4096-q92-strip-mono',
   updated_at: '2026-08-30T10:00:00Z',
   updated_by: 'fabian',
 }
@@ -142,6 +143,23 @@ describe('ExportPanel', () => {
     await wrapper.find('[data-test="export-print-save"]').trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-test="export-print-save-bar"]').exists()).toBe(false)
+  })
+
+  it('announces a refusal that names the other profile on the alert line', async () => {
+    // The store refuses before the request when the row's OTHER half is out of band; the bar the
+    // admin pressed is where that has to be said.
+    store.saveMail.mockResolvedValue(false)
+    store.mailError = ref('The Print profile holds a value outside its bands — open it and fix it first.')
+    const wrapper = mountPanel()
+    selectBy(wrapper, 'export-mail-long-edge').vm.$emit('update:modelValue', 2048)
+    await flushPromises()
+    await wrapper.find('[data-test="export-mail-save"]').trigger('click')
+    await flushPromises()
+
+    const error = wrapper.find('[data-test="export-mail-error"]')
+    expect(error.attributes('role')).toBe('alert')
+    expect(error.text()).toMatch(/Print profile holds a value outside its bands/)
+    expect(wrapper.find('[data-test="export-mail-save-bar"]').exists()).toBe(true)
   })
 
   it('keeps the bar up and sends nothing when the save is refused', async () => {

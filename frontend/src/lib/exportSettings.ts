@@ -3,68 +3,59 @@
 // a draft changed, whether a draft is legal, what the PUT body is, and what the "how to query"
 // command reads. Nothing in this file talks to the network — that is `useExportSettings.ts`, and
 // only that.
-//
-// THE ROW IS HAND-DECLARED, DELIBERATELY. `GET/PUT /api/admin/export/settings` is not in
-// `openapi.json` yet (it lands in a sibling change), so `ExportSettings` and `ExportSettingsPut`
-// below mirror the agreed column set by hand. When the endpoint reaches the schema, these two
-// aliases become `components['schemas'][…]` from '@/api/schema' and nothing else here moves.
 
+import type { components } from '@/api/schema'
 // `isCalendarDate` is the Mail tab's, unchanged and reused rather than re-written: one answer to
 // "is this a day that exists" is the only way both tabs can stay agreed on it.
 import { isCalendarDate } from '@/lib/digest'
 
 // --- the row --------------------------------------------------------------------------------
 
-/** How a print-quality JPEG is derived. `0` for the long edge means "the master's own size". */
-export type PrintLongEdge = 4096 | 5000 | 0
-export type MetadataPolicy = 'strip' | 'keep_dates'
-/** The digest's inline CID images. 1200/1600/2048 px are the three sizes the design names:
- * 2× a 600 px and an 800 px rendered width, and the 2048 px `mobile` tier the digest embeds today. */
-export type MailLongEdge = 1200 | 1600 | 2048
-export type Subsampling = '4:2:0' | '4:4:4'
-
-/** The whole settings row as the API answers it. */
-export interface ExportSettings {
-  print_long_edge: PrintLongEdge
-  print_jpeg_quality: number
-  print_metadata_policy: MetadataPolicy
-  print_grayscale_single_channel: boolean
-  mail_long_edge: MailLongEdge
-  mail_jpeg_quality: number
-  mail_subsampling: Subsampling
-  mail_progressive: boolean
-  updated_at: string
-  updated_by: string | null
-}
+/** The whole settings row as the API answers it — including `print_profile_key`, the derived cache
+ * key the panel never edits. */
+export type ExportSettings = components['schemas']['ExportSettingsOut']
 
 /** The whole settings row as the API takes it back. PUT replaces everything, so this is every
  * writable column and not a patch — the two Save bars each build one from the freshest server row. */
-export interface ExportSettingsPut {
-  print_long_edge: PrintLongEdge
-  print_jpeg_quality: number
-  print_metadata_policy: MetadataPolicy
-  print_grayscale_single_channel: boolean
-  mail_long_edge: MailLongEdge
-  mail_jpeg_quality: number
-  mail_subsampling: Subsampling
-  mail_progressive: boolean
-}
+export type ExportSettingsPut = components['schemas']['ExportSettingsPut']
+
+/** How a print-quality JPEG is derived. `0` for the long edge means "the master's own size".
+ *
+ * These come off the PUT body rather than the answer: the API publishes the exact rungs it accepts
+ * only on the way IN (`ExportSettingsOut` widens both long edges to `number`), and what the panel
+ * must offer is precisely what a save may carry. */
+export type PrintLongEdge = ExportSettingsPut['print_long_edge']
+export type MetadataPolicy = ExportSettingsPut['print_metadata_policy']
+/** The digest's inline CID images: 2× a 600 px and an 800 px rendered width, and the 2048 px
+ * `mobile` tier the digest embeds today. */
+export type MailLongEdge = ExportSettingsPut['mail_long_edge']
+export type Subsampling = ExportSettingsPut['mail_subsampling']
 
 // --- the two drafts -------------------------------------------------------------------------
 
-export interface PrintProfileDraft {
-  print_long_edge: PrintLongEdge
-  print_jpeg_quality: number
-  print_metadata_policy: MetadataPolicy
-  print_grayscale_single_channel: boolean
-}
+// A draft IS half the PUT body, so it is taken from it rather than restated. A writable column
+// added to the row therefore breaks `printDraftFromSettings`/`mailDraftFromSettings` at compile
+// time instead of quietly falling outside the Save bars.
+// The long edge is WIDENED back to `number`: `ExportSettingsOut` publishes it that way, so a row
+// holding a value outside the published rungs must reach the panel AS IT IS — shown, and refused by
+// name — rather than be cast into a type that claims it is legal. Quality is already `number` for
+// the same reason (an emptied field is NaN). Narrowing to the PUT body happens once, in
+// `exportPutBody`, and only on the far side of validation.
+export type PrintProfileDraft = Omit<
+  Pick<
+    ExportSettingsPut,
+    | 'print_long_edge'
+    | 'print_jpeg_quality'
+    | 'print_metadata_policy'
+    | 'print_grayscale_single_channel'
+  >,
+  'print_long_edge'
+> & { print_long_edge: number }
 
-export interface MailProfileDraft {
-  mail_long_edge: MailLongEdge
-  mail_jpeg_quality: number
-  mail_subsampling: Subsampling
-  mail_progressive: boolean
-}
+export type MailProfileDraft = Omit<
+  Pick<ExportSettingsPut, 'mail_long_edge' | 'mail_jpeg_quality' | 'mail_subsampling' | 'mail_progressive'>,
+  'mail_long_edge'
+> & { mail_long_edge: number }
 
 export const PRINT_FIELDS = [
   'print_long_edge',
@@ -115,21 +106,78 @@ export function dirtyMailFields(
   return MAIL_FIELDS.filter((field) => draft[field] !== server[field])
 }
 
+/** Either the row to send, or the reason nothing may be sent. */
+export type ExportPutBody =
+  | { ok: true; body: ExportSettingsPut }
+  | { ok: false; blockedBy: ExportGroup; message: string }
+
+export type ExportGroup = 'print' | 'mail'
+
+const GROUP_NAME: Record<ExportGroup, string> = { print: 'Print', mail: 'Mail' }
+
+/** The whole outgoing row, validated as a WHOLE — both profiles, on either group's save.
+ *
+ * A save replaces the entire row, so it carries the other profile's stored values verbatim. If the
+ * row already holds a value outside the published bands, this save would re-assert it and the API
+ * would answer 422 about a field the admin never touched, on a bar that cannot explain it. So the
+ * carried half is validated too, and a bad one refuses the save by naming the group to go and fix
+ * — never silently defaulted, and never sent.
+ */
+function exportPutBody(
+  saving: ExportGroup,
+  print: PrintProfileDraft,
+  mail: MailProfileDraft,
+): ExportPutBody {
+  const bad = Object.keys(validatePrintDraft(print)).length
+    ? 'print'
+    : Object.keys(validateMailDraft(mail)).length
+      ? 'mail'
+      : null
+  if (bad) return { ok: false, blockedBy: bad, message: refusal(saving, bad) }
+
+  // Validation has just established both rungs are in their published sets; the guards are how that
+  // fact reaches the TYPE, instead of a bare `as` asserting it a second time and unchecked.
+  if (!isPrintLongEdge(print.print_long_edge))
+    return { ok: false, blockedBy: 'print', message: refusal(saving, 'print') }
+  if (!isMailLongEdge(mail.mail_long_edge))
+    return { ok: false, blockedBy: 'mail', message: refusal(saving, 'mail') }
+
+  return {
+    ok: true,
+    body: {
+      print_long_edge: print.print_long_edge,
+      print_jpeg_quality: print.print_jpeg_quality,
+      print_metadata_policy: print.print_metadata_policy,
+      print_grayscale_single_channel: print.print_grayscale_single_channel,
+      mail_long_edge: mail.mail_long_edge,
+      mail_jpeg_quality: mail.mail_jpeg_quality,
+      mail_subsampling: mail.mail_subsampling,
+      mail_progressive: mail.mail_progressive,
+    },
+  }
+}
+
+function refusal(saving: ExportGroup, bad: ExportGroup): string {
+  return saving === bad
+    ? 'This profile has a value outside its bands — fix the fields above first.'
+    : `The ${GROUP_NAME[bad]} profile holds a value outside its bands — open it and fix it first.`
+}
+
 /** The PUT body for a Print save: the WHOLE row, with every Mail field taken from the server's
  * current values. A Mail edit the admin has not saved cannot ride along on the Print bar, and the
  * mirror of that is true of `putBodyFromMailDraft`. */
 export function putBodyFromPrintDraft(
   draft: PrintProfileDraft,
   current: ExportSettings,
-): ExportSettingsPut {
-  return { ...mailDraftFromSettings(current), ...draft }
+): ExportPutBody {
+  return exportPutBody('print', draft, mailDraftFromSettings(current))
 }
 
 export function putBodyFromMailDraft(
   draft: MailProfileDraft,
   current: ExportSettings,
-): ExportSettingsPut {
-  return { ...printDraftFromSettings(current), ...draft }
+): ExportPutBody {
+  return exportPutBody('mail', printDraftFromSettings(current), draft)
 }
 
 // --- validating a draft ---------------------------------------------------------------------
@@ -139,33 +187,41 @@ export type MailErrors = Partial<Record<keyof MailProfileDraft, string>>
 
 /** Long edge 4096 keeps the existing print cache valid; 5000 is Blurb's published full-bleed rule;
  * 0 hands over the master's own size. (Design /link/3291, decision 2.) */
-export const PRINT_LONG_EDGE_OPTIONS = [
-  { label: '4096 px', value: 4096 as PrintLongEdge },
-  { label: '5000 px', value: 5000 as PrintLongEdge },
-  { label: 'Original', value: 0 as PrintLongEdge },
+export const PRINT_LONG_EDGE_OPTIONS: { label: string; value: PrintLongEdge }[] = [
+  { label: '4096 px', value: 4096 },
+  { label: '5000 px', value: 5000 },
+  { label: 'Original', value: 0 },
 ]
 
 /** 90–95 is the vendor-documented band; 100 is weight without visible gain. */
 export const PRINT_QUALITY_RANGE = [90, 95] as const
 
-export const METADATA_POLICY_OPTIONS = [
-  { label: 'Strip', value: 'strip' as MetadataPolicy },
-  { label: 'Keep dates', value: 'keep_dates' as MetadataPolicy },
+export const METADATA_POLICY_OPTIONS: { label: string; value: MetadataPolicy }[] = [
+  { label: 'Strip', value: 'strip' },
+  { label: 'Keep dates', value: 'keep_dates' },
 ]
 
-export const MAIL_LONG_EDGE_OPTIONS = [
-  { label: '1200 px', value: 1200 as MailLongEdge },
-  { label: '1600 px', value: 1600 as MailLongEdge },
-  { label: '2048 px', value: 2048 as MailLongEdge },
+export const MAIL_LONG_EDGE_OPTIONS: { label: string; value: MailLongEdge }[] = [
+  { label: '1200 px', value: 1200 },
+  { label: '1600 px', value: 1600 },
+  { label: '2048 px', value: 2048 },
 ]
 
 /** q≈80 (77–83) is the documented target for inline mail images. */
 export const MAIL_QUALITY_RANGE = [77, 83] as const
 
-export const SUBSAMPLING_OPTIONS = [
-  { label: '4:2:0', value: '4:2:0' as Subsampling },
-  { label: '4:4:4', value: '4:4:4' as Subsampling },
+export const SUBSAMPLING_OPTIONS: { label: string; value: Subsampling }[] = [
+  { label: '4:2:0', value: '4:2:0' },
+  { label: '4:4:4', value: '4:4:4' },
 ]
+
+/** The check and the narrowing are one expression, so the type can only claim what was tested. */
+function isPrintLongEdge(value: number): value is PrintLongEdge {
+  return PRINT_LONG_EDGES.includes(value)
+}
+function isMailLongEdge(value: number): value is MailLongEdge {
+  return MAIL_LONG_EDGES.includes(value)
+}
 
 function inRange(value: number, [min, max]: readonly [number, number]): string | null {
   if (!Number.isInteger(value)) return 'A whole number is required.'

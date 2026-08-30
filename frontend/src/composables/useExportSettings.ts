@@ -1,15 +1,13 @@
-// EVERY request the Export tab makes, and nothing else makes them. `GET/PUT
-// /api/admin/export/settings` is not in `openapi.json` yet — the API lands in a sibling change —
-// so this file is the one seam that knows the endpoint at all: it reads the hand-declared row from
-// `@/lib/exportSettings` through the local `ExportApiClient` shape below, and every component above
-// it deals in drafts. WIRED TO schema.d.ts AFTER THE API LANDS: replace the cast on `useApi()` with
-// the generated client and delete `ExportApiClient`; no other file changes.
+// EVERY request the Export tab makes, and nothing else makes them: this file is the one seam that
+// knows the endpoint, and every component above it deals in drafts.
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { type Ref, computed, ref } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { apiErrorMessage } from '@/lib/digest'
 import {
+  type ExportGroup,
+  type ExportPutBody,
   type ExportSettings,
   type ExportSettingsPut,
   type MailProfileDraft,
@@ -18,27 +16,15 @@ import {
   putBodyFromPrintDraft,
 } from '@/lib/exportSettings'
 
+
 export const exportKeys = {
   settings: ['export', 'settings'] as const,
-}
-
-type ApiResult<T> = { data?: T; error?: unknown; response?: { status: number } }
-
-/** The two calls, in the shape openapi-fetch answers them. Structural on purpose: the runtime object
- * IS the app's one client — same base URL, same 401-to-login middleware — and only its TYPES are
- * narrowed here, because the generated `paths` does not carry this endpoint yet. */
-interface ExportApiClient {
-  GET(path: '/api/admin/export/settings'): Promise<ApiResult<ExportSettings>>
-  PUT(
-    path: '/api/admin/export/settings',
-    init: { body: ExportSettingsPut },
-  ): Promise<ApiResult<ExportSettings>>
 }
 
 export const EXPORT_SETTINGS_PATH = '/api/admin/export/settings'
 
 export function useExportSettings() {
-  const api = useApi() as unknown as ExportApiClient
+  const api = useApi()
   const queryClient = useQueryClient()
 
   const settingsQuery = useQuery({
@@ -76,7 +62,7 @@ export function useExportSettings() {
   //
   // The second writer is REFUSED, not queued: a queued save would re-send a draft the server has
   // already moved past. The refusal says so on the bar the write would have used.
-  const settingsWriter = ref<'print' | 'mail' | null>(null)
+  const settingsWriter = ref<ExportGroup | null>(null)
   const savingPrint = computed(() => settingsWriter.value === 'print')
   const savingMail = computed(() => settingsWriter.value === 'mail')
   const writerBusy = computed(() => settingsWriter.value !== null)
@@ -89,8 +75,8 @@ export function useExportSettings() {
   /** Run one settings write behind the gate. `build` is called AFTER the gate is taken, so its body
    * is built from the row the previous write's response installed rather than from a stale copy. */
   async function writeSettings(
-    kind: 'print' | 'mail',
-    build: (current: ExportSettings) => ExportSettingsPut,
+    kind: ExportGroup,
+    build: (current: ExportSettings) => ExportPutBody,
     confirmation: string,
     errorRef: Ref<string | null>,
   ): Promise<boolean> {
@@ -101,7 +87,15 @@ export function useExportSettings() {
     settingsWriter.value = kind
     errorRef.value = null
     try {
-      await putSettings.mutateAsync(build(currentSettings()))
+      // The body is the WHOLE row, so it carries the other profile's stored values. If those are
+      // outside the published bands the request is refused HERE, on the bar that was pressed, and
+      // nothing goes out — a 422 naming a field the admin did not touch explains nothing.
+      const assembled = build(currentSettings())
+      if (!assembled.ok) {
+        errorRef.value = assembled.message
+        return false
+      }
+      await putSettings.mutateAsync(assembled.body)
       notice.value = confirmation
       return true
     } catch (error) {
