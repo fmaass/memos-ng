@@ -19,12 +19,13 @@ slow lane, one at a time — never 238 times over because someone opened the lib
 """
 
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from anyio import to_thread
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -36,18 +37,145 @@ TIER = "printready"
 SUBDIR = "printready"  # assets/<SUBDIR>/<uid>.jpg, the layout thumb/mobile use
 IMAGE_PREFIX = "image/"
 
-# The rung: 4096 px on the long edge, never upscaled. It lives here rather than beside the encoder
-# in app/services/media.py because it is tier IDENTITY, not an encoder setting — the photo-book
-# manifest runs in the APP process (which must not import an image library to learn how big a
-# rendition will be) and projects a not-yet-generated size from it. media.py re-exports it as
-# PRINTREADY_MAX, so there is exactly one definition.
+# The default rung: 4096 px on the long edge, never upscaled. It lives here rather than beside the
+# encoder in app/services/media.py because it is tier IDENTITY, not an encoder setting — the
+# photo-book manifest runs in the APP process (which must not import an image library to learn how
+# big a rendition will be) and projects a not-yet-generated size from it. Settings can name a
+# different rung per profile (MEMNG-238); this one is what the shipped tier on disk was built at,
+# and what `DEFAULT_PROFILE` below therefore has to keep saying.
 MAX_EDGE = 4096
 
+# The encode settings the shipped tier was built with (MEMNG-49). They are the DEFAULT profile
+# below, and the reason they are named here rather than only in media.py is that a profile is
+# tier identity: the app process has to know which cache a request resolves to without importing
+# an image library.
+DEFAULT_QUALITY = 92
+METADATA_STRIP = "strip"  # no EXIF at all — what the shipped encoder writes
+METADATA_KEEP_DATES = "keep_dates"  # a REBUILT whitelist of date tags, never a pass-through
+METADATA_POLICIES = (METADATA_STRIP, METADATA_KEEP_DATES)
+DEFAULT_METADATA_POLICY = METADATA_STRIP
+DEFAULT_GRAYSCALE_SINGLE_CHANNEL = True
+ORIGINAL_LONG_EDGE = 0  # "no cap": the source's own size, never upscaled anyway
+LONG_EDGES = (ORIGINAL_LONG_EDGE, 4096, 5000)
 
-def printready_path(uid: str) -> Path:
-    """Where this attachment's print rendition lives. Resolves from the uid alone, like every
-    other derived tier — read at call time so DATA_ROOT stays overridable in tests."""
-    return Path(settings.DATA_ROOT) / "assets" / SUBDIR / f"{uid}.jpg"
+# The key the shipped tier already answers to, and the ONLY key whose files live at the legacy
+# path. Every other profile derives into `assets/printready/<key>/<uid>.jpg`, which is what keeps
+# a settings change from ever invalidating — or silently rewriting — the tier that is on disk.
+DEFAULT_KEY = "print-4096"
+_ORIGINAL_TOKEN = "orig"
+_METADATA_TOKENS = {METADATA_STRIP: "strip", METADATA_KEEP_DATES: "dates"}
+_TOKEN_METADATA = {token: policy for policy, token in _METADATA_TOKENS.items()}
+_KEY_RE = re.compile(r"^print-(orig|[1-9]\d{1,4})-q(\d{2})-(strip|dates)-(gray|rgb)$")
+
+
+@dataclass(frozen=True, slots=True)
+class PrintProfile:
+    """Every byte-affecting decision the print encoder makes, as one value.
+
+    It is a VALUE and not a settings row on purpose: a rendition is derived once and then read for
+    as long as it survives, so what produced its bytes has to be carryable — into the job row that
+    will run minutes later, into the path the file lands at, and into the manifest that names it.
+    Reading the settings again at any of those points would let a change between the request and
+    the encode decide the bytes, and nothing would say which profile the file on disk actually is.
+
+    `long_edge = ORIGINAL_LONG_EDGE` means "no cap"; the downscale never upscales either way.
+    """
+
+    long_edge: int
+    jpeg_quality: int
+    metadata_policy: str
+    grayscale_single_channel: bool
+
+    @property
+    def key(self) -> str:
+        """The canonical, path-safe name of this profile — one spelling per profile, both ways.
+
+        The default answers to `print-4096` and nothing else, because that string is already the
+        name of the shipped tier and its files already sit at the legacy path. Every other profile
+        spells out each field that changes the bytes — `grayscale_single_channel` included, since
+        toggling it is the difference between a 3-channel and a 1-channel JPEG and a key that
+        omitted it would go on serving the wrong one from cache.
+        """
+        if self == DEFAULT_PROFILE:
+            return DEFAULT_KEY
+        edge = _ORIGINAL_TOKEN if self.long_edge == ORIGINAL_LONG_EDGE else str(self.long_edge)
+        gray = "gray" if self.grayscale_single_channel else "rgb"
+        return f"print-{edge}-q{self.jpeg_quality}-{_METADATA_TOKENS[self.metadata_policy]}-{gray}"
+
+    @property
+    def subdir(self) -> str | None:
+        """The directory under `assets/printready/` this profile derives into, or None for the
+        default — whose files stay exactly where they have always been, byte for byte."""
+        return None if self == DEFAULT_PROFILE else self.key
+
+
+DEFAULT_PROFILE = PrintProfile(
+    long_edge=MAX_EDGE,
+    jpeg_quality=DEFAULT_QUALITY,
+    metadata_policy=DEFAULT_METADATA_POLICY,
+    grayscale_single_channel=DEFAULT_GRAYSCALE_SINGLE_CHANNEL,
+)
+
+
+def profile_from_key(key: str) -> PrintProfile | None:
+    """Parse a profile key back into the profile that produced it, or None if it is not one.
+
+    The WORKER is why this exists rather than a lookup table of the profiles settings currently
+    name: a job enqueued under one settings row may not run until after that row has changed, and
+    it still has to write the bytes that were asked for. So the key is a lossless encoding and the
+    job carries it — never a pointer back into settings.
+
+    Canonicality is enforced by re-deriving: a key that parses but is not what `PrintProfile.key`
+    would produce for the result (`print-4096-q92-strip-gray`, a leading zero, a second spelling of
+    the default) is refused. One profile, one name, in both directions.
+    """
+    if key == DEFAULT_KEY:
+        return DEFAULT_PROFILE
+    match = _KEY_RE.match(key)
+    if match is None:
+        return None
+    edge_token, quality, metadata_token, gray_token = match.groups()
+    profile = PrintProfile(
+        long_edge=ORIGINAL_LONG_EDGE if edge_token == _ORIGINAL_TOKEN else int(edge_token),
+        jpeg_quality=int(quality),
+        metadata_policy=_TOKEN_METADATA[metadata_token],
+        grayscale_single_channel=gray_token == "gray",
+    )
+    return profile if profile.key == key else None
+
+
+def printready_path(uid: str, profile: PrintProfile | None = None) -> Path:
+    """Where this attachment's print rendition lives, for the DEFAULT profile unless told
+    otherwise. Resolves from the uid alone, like every other derived tier — read at call time so
+    DATA_ROOT stays overridable in tests.
+
+    `profile=None` is the default profile and the legacy path, which is what keeps every caller
+    that serves or sweeps "the printready tier" (the asset routes, the export's tier map) pointed
+    at exactly the file they have always been pointed at.
+    """
+    root = Path(settings.DATA_ROOT) / "assets" / SUBDIR
+    subdir = (profile or DEFAULT_PROFILE).subdir
+    return (root / subdir / f"{uid}.jpg") if subdir else (root / f"{uid}.jpg")
+
+
+def profile_variant_paths_sync(uid: str) -> list[Path]:
+    """Every NON-default profile's rendition of this uid that is on disk right now, sorted.
+
+    Enumerated rather than derived, and that is the whole difficulty: the set of profiles that
+    ever existed is unbounded (any settings the admin has passed through), and nothing records
+    which ones were used, so a deletion path that only unlinked the profiles settings name TODAY
+    would leave a file behind for every profile the admin has since moved away from — bytes that
+    no row names any more, which is the one outcome app/services/reclaim.py exists to prevent.
+
+    The legacy path is deliberately NOT included: it is `printready_path(uid)` and every caller
+    already has it. Blocking I/O — callers on the request loop hop off it first.
+    """
+    root = Path(settings.DATA_ROOT) / "assets" / SUBDIR
+    try:
+        subdirs = sorted(entry for entry in root.iterdir() if entry.is_dir())
+    except OSError:  # no tier directory yet, or it is unreadable — nothing to enumerate
+        return []
+    return [candidate for sub in subdirs if (candidate := sub / f"{uid}.jpg").exists()]
 
 
 def is_print_variant(variant_key: str) -> bool:
@@ -141,8 +269,10 @@ def _probe_sync(pairs: list[tuple[int, Path, Path]]) -> dict[int, SourceProbe]:
     return probes
 
 
-async def probe_renditions(attachments: Iterable[Attachment]) -> dict[int, SourceProbe]:
-    """Each attachment's print-rendition freshness, in ONE batched off-loop stat pass.
+async def probe_renditions(
+    attachments: Iterable[Attachment], *, profile: PrintProfile | None = None
+) -> dict[int, SourceProbe]:
+    """Each attachment's print-rendition freshness IN ONE PROFILE, in ONE batched off-loop pass.
 
     Exactly the two facts `enqueue_printready` decides on, exposed as a READ-ONLY query. The
     photo-book manifest needs them for members it deliberately does not enqueue (one whose last
@@ -159,7 +289,7 @@ async def probe_renditions(attachments: Iterable[Attachment]) -> dict[int, Sourc
         if source is None:
             absent[attachment.id] = SourceProbe(source_present=False, current=False)
             continue
-        pairs.append((attachment.id, source, printready_path(attachment.uid)))
+        pairs.append((attachment.id, source, printready_path(attachment.uid, profile)))
     probes = await to_thread.run_sync(_probe_sync, pairs) if pairs else {}
     return absent | probes
 
@@ -179,14 +309,35 @@ class EnqueueResult:
     ineligible: tuple[int, ...]  # no such attachment, not an image, or no source file on disk
 
 
-async def enqueue_printready(db: AsyncSession, attachment_ids: Iterable[int]) -> EnqueueResult:
+def job_profile_predicate(profile: PrintProfile | None = None):
+    """The `media_jobs` predicate that selects the jobs belonging to ONE profile.
+
+    A NULL `profile_key` is the DEFAULT profile, not "any profile": every printready job written
+    before this column existed produced the shipped 4096/q92 tier at the legacy path, so reading
+    NULL as anything else would either resurrect those rows against a profile they never ran, or
+    lose them entirely and let a duplicate 60 MP encode be queued for work already in flight.
+    """
+    key = (profile or DEFAULT_PROFILE).key
+    if key == DEFAULT_KEY:
+        return or_(MediaJob.profile_key.is_(None), MediaJob.profile_key == key)
+    return MediaJob.profile_key == key
+
+
+async def enqueue_printready(
+    db: AsyncSession, attachment_ids: Iterable[int], *, profile: PrintProfile | None = None
+) -> EnqueueResult:
     """Queue print renditions for existing attachments, skipping every attachment that needs none.
 
     Idempotent by three independent rules, because the expensive thing (a 60 MP re-encode on a
     thermally-bound host) must not happen twice for one photo:
 
+    Everything below is scoped to ONE profile: its own cache file, and its own jobs. Two profiles
+    of one photo are two different renditions with two different sets of bytes, so a job for one
+    must neither satisfy nor block the other.
+
     * a rendition that is already current is left alone (see `_effective_mtime`);
-    * an attachment whose printready job is still queued/claimed/processing gets no second job —
+    * an attachment whose printready job FOR THIS PROFILE is still queued/claimed/processing gets
+      no second job —
       `done`/`failed` are terminal, so a finished job never blocks a legitimate regeneration and a
       failed one can be retried by asking again;
     * non-images, unknown ids, and attachments whose source file is missing are refused outright
@@ -210,6 +361,7 @@ async def enqueue_printready(db: AsyncSession, attachment_ids: Iterable[int]) ->
                 select(MediaJob.attachment_id).where(
                     MediaJob.attachment_id.in_(ids),
                     MediaJob.kind == JobKind.printready,
+                    job_profile_predicate(profile),
                     MediaJob.state.notin_((JobState.done, JobState.failed)),
                 )
             )
@@ -227,7 +379,7 @@ async def enqueue_printready(db: AsyncSession, attachment_ids: Iterable[int]) ->
         if source is None:
             disposition[attachment_id] = "ineligible"
             continue
-        pairs.append((attachment_id, source, printready_path(attachment.uid)))
+        pairs.append((attachment_id, source, printready_path(attachment.uid, profile)))
 
     probes = await to_thread.run_sync(_probe_sync, pairs) if pairs else {}
     for attachment_id, _source, _dest in pairs:
@@ -246,6 +398,10 @@ async def enqueue_printready(db: AsyncSession, attachment_ids: Iterable[int]) ->
                     attachment_id=attachment_id,
                     lane=JobLane.slow,
                     kind=JobKind.printready,
+                    # The profile is SNAPSHOT onto the job, never looked up again: the worker may
+                    # not reach this row until after the settings that produced it have changed,
+                    # and it still has to write the bytes that were asked for.
+                    profile_key=(profile or DEFAULT_PROFILE).key,
                     state=JobState.queued,
                 )
             )

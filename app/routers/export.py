@@ -15,6 +15,7 @@ from app.database import get_session
 from app.models import Attachment, Memo, User, Visibility
 from app.services import asset_paths, storage
 from app.services import export as export_svc
+from app.services import export_settings as export_settings_svc
 from app.services import memos as svc
 from app.services import photobook as photobook_svc
 
@@ -216,8 +217,11 @@ class PhotobookTotalsOut(BaseModel):
 class PhotobookManifestOut(BaseModel):
     """The book's manifest: the question that was asked, the tally, and every photo in it."""
 
-    profile: photobook_svc.Profile
-    tag: str
+    # The RESOLVED profile key, not an enum: the admissible set is two keys that depend on the
+    # deployment's current export settings (app/services/export_settings.py), so freezing it into
+    # the schema would publish a contract the server stops honouring the moment they change.
+    profile: str
+    tag: str | None  # null = the untagged selection: every image memo in the range
     page_cm: str
     max_pages: float
     dpi: int
@@ -231,18 +235,25 @@ async def export_photobook(
     db: Annotated[AsyncSession, Depends(get_session)],
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
-    tag: str = photobook_svc.DEFAULT_TAG,
-    profile: photobook_svc.Profile = photobook_svc.PROFILE,
+    tag: str | None = None,
+    profile: str | None = None,
     format: Literal["manifest", "zip"] = "manifest",
     page_cm: str = photobook_svc.DEFAULT_PAGE_CM,
     max_pages: float = photobook_svc.DEFAULT_MAX_PAGES,
     dpi: int = photobook_svc.DEFAULT_DPI,
 ) -> Response:
-    """The photo book for a tag and date range: a print-readiness manifest, or the archive itself.
+    """The photo book for a date range: a print-readiness manifest, or the archive itself.
 
-    Selection is `tag` (default `curated`) joined to the owner's image attachments, in memo-date
-    order; `from`/`to` bound the memo date and are inclusive whole days. `profile` names the single
-    rung the book is printed at.
+    Selection is the owner's image attachments in memo-date order; `from`/`to` bound the memo date
+    and are inclusive whole days. `tag` NARROWS that to the memos carrying it — omitting it selects
+    every image memo in the range, which is what "give me all my photos between two dates" means.
+
+    `profile` names the print profile the book is derived at. Omitting it follows this
+    deployment's export settings, so an admin changing the print profile changes what an export
+    produces without any client being told; naming one pins the request to it. Two keys are
+    accepted — the permanent default `print-4096`, whose renditions are the shipped tier, and
+    whatever the settings currently name; anything else is 422. A non-default profile derives into
+    its own cache directory, so requesting one never rewrites or invalidates the default tier.
 
     **Requesting a book schedules it.** Both formats enqueue a print rendition for every member
     that lacks a current one, so the first request starts the work and later requests report on it;
@@ -262,11 +273,22 @@ async def export_photobook(
         geom = photobook_svc.geometry(page_cm, max_pages, dpi)
     except photobook_svc.GeometryError as exc:
         # 422, not 400: these are malformed query parameters, so they answer in the same shape as
-        # the ones FastAPI rejects itself (a bad `format`, a bad `profile`).
+        # the ones FastAPI rejects itself (a bad `format`).
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        resolved = await export_settings_svc.resolve_print_profile(db, profile)
+    except export_settings_svc.UnknownProfile as exc:
+        # Same 422 family as the geometry above — a query parameter naming something that is not a
+        # profile. It used to be FastAPI's own enum rejection; the admissible set now depends on
+        # the settings row, so the check moved into the handler and the status code did not.
+        raise HTTPException(
+            status_code=422, detail=f"unknown print profile {profile!r}"
+        ) from exc
+    except export_settings_svc.SettingsMissing as exc:
+        raise HTTPException(status_code=500, detail="export settings row is missing") from exc
 
     book = await photobook_svc.build(
-        db, user.id, tag=tag, date_from=date_from, date_to=date_to, geom=geom
+        db, user.id, tag=tag, date_from=date_from, date_to=date_to, geom=geom, profile=resolved
     )
     if format == "manifest":
         # Validated against the declared model rather than passed through: the service owns the

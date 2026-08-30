@@ -36,15 +36,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Attachment, JobKind, JobState, MediaJob, Memo, Tag, memo_tags
 from app.services import export as export_svc
 from app.services import printready
-from app.services.frame_share import CURATED_TAG, is_frame_image
+from app.services.frame_share import is_frame_image
 
-# The single profile. It names the rung (printready.MAX_EDGE) and nothing else — the plan measured
-# per-image rung snapping at a 6% saving over 238 photos and rejected it, so there is deliberately
-# no ladder to choose from. A second profile would be a second rung, i.e. a second tier.
-PROFILE = "print-4096"
-Profile = Literal["print-4096"]
+# The profile a book is printed at is no longer a constant (MEMNG-238): it is resolved per request
+# from `export_settings` — or from an explicit `?profile=` — and carried through this module as a
+# value (app/services/printready.py:PrintProfile). The DEFAULT profile is still `print-4096`, the
+# rung the plan measured, and its renditions still live at the legacy path, so a deployment that
+# never touches the settings sees exactly the tier it had.
+DEFAULT_PROFILE = printready.DEFAULT_PROFILE
 
-DEFAULT_TAG = CURATED_TAG  # "curated" — the set the plan's 238-photo measurement was taken over
 DEFAULT_PAGE_CM = "21x21"  # the 21x21 cm layflat the rung was sized for
 DEFAULT_MAX_PAGES = 1.5  # a 3:2 photo at full page height spans exactly this
 DEFAULT_DPI = 300  # the print service's stated minimum; the bar `meets_dpi` reports against
@@ -137,7 +137,9 @@ def effective_dpi(px_w: int | None, px_h: int | None, geom: Geometry) -> float |
     return px_w * CM_PER_INCH / printed_w_cm
 
 
-def rung_px(width: int | None, height: int | None) -> tuple[int, int] | None:
+def rung_px(
+    width: int | None, height: int | None, profile: printready.PrintProfile | None = None
+) -> tuple[int, int] | None:
     """The size a printready rendition WILL have, projected from its source's size.
 
     The rung is a long-edge cap applied with `Image.thumbnail`, which never upscales — so a source
@@ -145,10 +147,17 @@ def rung_px(width: int | None, height: int | None) -> tuple[int, int] | None:
     only for a photo whose rendition does not exist yet; a real measurement replaces it the moment
     one does, which is why every projected number is flagged as such in the manifest (Pillow's
     rounding of the short edge can differ from this by a pixel).
+
+    The cap is the requested PROFILE's, because the projection has to describe the file the worker
+    is queued to write: projecting 4096 for a book being derived at 5000 would report a dpi the
+    printer never gets, and the effective-dpi column is the one field this endpoint exists for. A
+    profile with no cap at all (`long_edge = 0`) projects the source's own size.
     """
     if not width or not height or width <= 0 or height <= 0:
         return None
-    edge = printready.MAX_EDGE
+    edge = (profile or DEFAULT_PROFILE).long_edge
+    if edge == printready.ORIGINAL_LONG_EDGE:
+        return (width, height)
     if max(width, height) <= edge:
         return (width, height)
     if width >= height:
@@ -189,11 +198,11 @@ async def select_photos(
     db: AsyncSession,
     owner_id: int,
     *,
-    tag: str,
+    tag: str | None,
     date_from: date | None,
     date_to: date | None,
 ) -> list[Selected]:
-    """Every (tagged memo, image attachment) pair this owner has, in book order.
+    """Every (memo, image attachment) pair this owner has in the range, in book order.
 
     Mirrors the shipped curated filter exactly (app/scripts/backfill_frame_album.py: the same join
     and the same `is_frame_image`), which matters because the plan's measured set — 238 photos,
@@ -209,15 +218,25 @@ async def select_photos(
     `date_from`/`date_to` bound the MEMO's created_at and are inclusive whole UTC calendar days on
     both ends — `to=2026-06-30` includes everything posted that day, which is what a person typing
     a date range means.
+
+    `tag=None` is "every image memo in the range" (MEMNG-238), and it OMITS the two tag joins
+    rather than making them outer joins. That is not a style choice: a memo carrying three tags
+    matches an outer-joined `memo_tags` three times, and each of its attachments would then appear
+    three times in the book — three identical pages with three sequence numbers. Omitting the
+    joins asks the question that was actually asked, and gives each attachment exactly one row.
     """
     stmt = (
         select(Memo.uid, Memo.created_at, Attachment)
-        .join(memo_tags, memo_tags.c.memo_id == Memo.id)
-        .join(Tag, Tag.id == memo_tags.c.tag_id)
         .join(Attachment, Attachment.memo_id == Memo.id)
-        .where(Tag.name == tag, Memo.owner_id == owner_id)
+        .where(Memo.owner_id == owner_id)
         .order_by(Memo.created_at, Attachment.id)
     )
+    if tag is not None:
+        stmt = (
+            stmt.join(memo_tags, memo_tags.c.memo_id == Memo.id)
+            .join(Tag, Tag.id == memo_tags.c.tag_id)
+            .where(Tag.name == tag)
+        )
     if date_from is not None:
         stmt = stmt.where(Memo.created_at >= _day_start(date_from))
     if date_to is not None:
@@ -230,8 +249,13 @@ async def select_photos(
     ]
 
 
-async def terminally_failed(db: AsyncSession, attachment_ids: Sequence[int]) -> dict[int, datetime]:
-    """Attachments whose LATEST print job failed for good, mapped to WHEN it failed.
+async def terminally_failed(
+    db: AsyncSession,
+    attachment_ids: Sequence[int],
+    *,
+    profile: printready.PrintProfile | None = None,
+) -> dict[int, datetime]:
+    """Attachments whose LATEST print job FOR THIS PROFILE failed for good, mapped to WHEN.
 
     `JobState.failed` is only ever reached at MEDIA_MAX_ATTEMPTS (app/worker.py) — a transient
     failure goes back to `queued` and retries itself — so membership here means "tried to the
@@ -247,16 +271,24 @@ async def terminally_failed(db: AsyncSession, attachment_ids: Sequence[int]) -> 
     transaction's start, not the statement's), which biases toward treating a failure as stale and
     retrying — the safe direction, since a needless retry costs one encode while a stuck failure
     costs the photo its page forever.
+
+    Scoped to one profile in BOTH halves — the "latest job" subquery as well as the failure test.
+    A photo that failed to encode at 5000 px and then succeeded at 4096 must not read as failed at
+    4096, and just as importantly the 4096 success must not hide the 5000 failure by being the
+    later job: one profile's verdict says nothing about another's. A NULL `profile_key` is the
+    default profile (see `printready.job_profile_predicate`), so jobs recorded before the column
+    existed keep condemning — and clearing — exactly the tier they ran against.
     """
     ids = list(attachment_ids)
     if not ids:
         return {}
+    scoped = printready.job_profile_predicate(profile)
     latest = (
         select(
             MediaJob.attachment_id.label("attachment_id"),
             func.max(MediaJob.id).label("job_id"),
         )
-        .where(MediaJob.attachment_id.in_(ids), MediaJob.kind == JobKind.printready)
+        .where(MediaJob.attachment_id.in_(ids), MediaJob.kind == JobKind.printready, scoped)
         .group_by(MediaJob.attachment_id)
         .subquery()
     )
@@ -387,7 +419,8 @@ class PhotoEntry:
 class Photobook:
     """A resolved book: the question that was asked and the answer for every photo in it."""
 
-    tag: str
+    tag: str | None  # None = every image memo in the range, the untagged selection
+    profile: printready.PrintProfile
     geometry: Geometry
     entries: tuple[PhotoEntry, ...]
 
@@ -404,6 +437,7 @@ def _entry(
     *,
     status: Readiness,
     geom: Geometry,
+    profile: printready.PrintProfile,
     real: tuple[int, int] | None,
     source_px: tuple[int, int] | None,
 ) -> PhotoEntry:
@@ -422,7 +456,7 @@ def _entry(
     if real is not None:
         width, height, projected = real[0], real[1], False
     else:
-        px = rung_px(source_px[0], source_px[1]) if source_px else None
+        px = rung_px(source_px[0], source_px[1], profile) if source_px else None
         width, height = (px[0], px[1]) if px else (None, None)
         projected = px is not None
     dpi = effective_dpi(width, height, geom)
@@ -440,7 +474,7 @@ def _entry(
         effective_dpi=dpi,
         meets_dpi=None if dpi is None else dpi >= geom.min_dpi,
         captured_at=attachment.captured_at,
-        path=printready.printready_path(attachment.uid) if status == "ready" else None,
+        path=printready.printready_path(attachment.uid, profile) if status == "ready" else None,
     )
 
 
@@ -448,10 +482,11 @@ async def build(
     db: AsyncSession,
     owner_id: int,
     *,
-    tag: str,
+    tag: str | None,
     date_from: date | None,
     date_to: date | None,
     geom: Geometry,
+    profile: printready.PrintProfile | None = None,
 ) -> Photobook:
     """Resolve the book: select it, read what is already on disk, queue what is missing, describe
     all of it.
@@ -475,14 +510,20 @@ async def build(
     Order of operations matters and is not arbitrary: the FILE is probed before the job history is
     consulted, so a photo that has a good rendition on disk reads `ready` even if some later job
     failed against it. Judging by job state alone would hide a file that is sitting right there.
+
+    ONE profile decides all of it, and it is passed in rather than read here: the cache probed,
+    the jobs consulted and enqueued, the file each ready entry names, and the size projected for
+    each one that is not. `profile=None` is the default profile — the shipped 4096/q92 tier at the
+    legacy path.
     """
+    resolved = profile or DEFAULT_PROFILE
     selected = await select_photos(db, owner_id, tag=tag, date_from=date_from, date_to=date_to)
     if not selected:
-        return Photobook(tag=tag, geometry=geom, entries=())
+        return Photobook(tag=tag, profile=resolved, geometry=geom, entries=())
 
     attachments = [s.attachment for s in selected]
-    probes = await printready.probe_renditions(attachments)
-    failed = await terminally_failed(db, [a.id for a in attachments])
+    probes = await printready.probe_renditions(attachments, profile=resolved)
+    failed = await terminally_failed(db, [a.id for a in attachments], profile=resolved)
 
     status: dict[int, Readiness] = {}
     to_enqueue: list[int] = []
@@ -505,7 +546,7 @@ async def build(
         # to nothing on a book that is already built. Its buckets are the authority for what it was
         # given: `fresh` means the file appeared between our probe and its own, and `ineligible`
         # means the source went away in the same window — both are races we take its answer for.
-        result = await printready.enqueue_printready(db, to_enqueue)
+        result = await printready.enqueue_printready(db, to_enqueue, profile=resolved)
         for attachment_id in result.fresh:
             status[attachment_id] = "ready"
         for attachment_id in (*result.enqueued, *result.in_flight):
@@ -518,7 +559,7 @@ async def build(
     by_uid = {a.id: a.uid for a in attachments}
     real = (
         await to_thread.run_sync(
-            _dims_sync, [(i, printready.printready_path(by_uid[i])) for i in ready_ids]
+            _dims_sync, [(i, printready.printready_path(by_uid[i], resolved)) for i in ready_ids]
         )
         if ready_ids
         else {}
@@ -535,18 +576,24 @@ async def build(
             item,
             status=status[item.attachment.id],
             geom=geom,
+            profile=resolved,
             real=real.get(item.attachment.id),
             source_px=source_px.get(item.attachment.id),
         )
         for index, item in enumerate(selected, start=1)
     )
-    return Photobook(tag=tag, geometry=geom, entries=entries)
+    return Photobook(tag=tag, profile=resolved, geometry=geom, entries=entries)
 
 
 def manifest(book: Photobook, *, page_cm: str, max_pages: float, dpi: int) -> dict[str, object]:
-    """The manifest response: the question asked, the totals, and one record per photo."""
+    """The manifest response: the question asked, the totals, and one record per photo.
+
+    `profile` is the RESOLVED profile's key, not a constant: when the parameter was omitted it is
+    what settings named at the moment the book was built, which is the only way a client can tell
+    which cache the files it just downloaded came out of.
+    """
     return {
-        "profile": PROFILE,
+        "profile": book.profile.key,
         "tag": book.tag,
         "page_cm": page_cm,
         "max_pages": max_pages,

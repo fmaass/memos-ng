@@ -575,9 +575,15 @@ def test_the_downgrade_refuses_while_an_ownership_tombstone_exists(db_engine):
     )
     cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
     try:
+        # Named target, NOT `-1`: this test is about ONE revision's refusal, and a relative step
+        # points at whichever migration happens to be head — so `-1` silently stops testing this
+        # revision (and downgrades an unrelated one) the day another migration lands on top.
+        # `8be790506cff` is the revision below the ledger, so the walk down reaches it and refuses.
         with pytest.raises(RuntimeError, match="refusing to downgrade"):
-            command.downgrade(cfg, "-1")
-        # The refusal is a REFUSAL: the schema is untouched, so the row is still readable.
+            command.downgrade(cfg, "8be790506cff")
+        # The refusal is a REFUSAL: alembic runs the whole walk in one transaction (env.py takes no
+        # `transaction_per_migration`), so nothing any later revision's downgrade did survives it
+        # either — the schema is untouched and the row is still readable.
         assert [row["id"] for row in _rows_now()] == [ledger_id]
     finally:
         engine = create_engine(SYNC_URL)

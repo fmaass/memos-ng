@@ -266,6 +266,7 @@ EXPECTED_DATETIME_FIELDS = {
     ("DigestRunOut", "finished_at"),
     ("DigestRunOut", "started_at"),
     ("DigestSettingsOut", "updated_at"),
+    ("ExportSettingsOut", "updated_at"),
     ("ManageGrantOut", "expires_at"),
     ("MemoOut", "archived_at"),
     ("MemoOut", "created_at"),

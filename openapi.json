@@ -1154,6 +1154,132 @@
         "title": "EditRacedError",
         "type": "object"
       },
+      "ExportSettingsOut": {
+        "properties": {
+          "mail_jpeg_quality": {
+            "title": "Mail Jpeg Quality",
+            "type": "integer"
+          },
+          "mail_long_edge": {
+            "title": "Mail Long Edge",
+            "type": "integer"
+          },
+          "mail_progressive": {
+            "title": "Mail Progressive",
+            "type": "boolean"
+          },
+          "mail_subsampling": {
+            "$ref": "#/components/schemas/MailSubsampling"
+          },
+          "print_grayscale_single_channel": {
+            "title": "Print Grayscale Single Channel",
+            "type": "boolean"
+          },
+          "print_jpeg_quality": {
+            "title": "Print Jpeg Quality",
+            "type": "integer"
+          },
+          "print_long_edge": {
+            "title": "Print Long Edge",
+            "type": "integer"
+          },
+          "print_metadata_policy": {
+            "$ref": "#/components/schemas/PrintMetadataPolicy"
+          },
+          "print_profile_key": {
+            "title": "Print Profile Key",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "title": "Updated By",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "print_long_edge",
+          "print_jpeg_quality",
+          "print_metadata_policy",
+          "print_grayscale_single_channel",
+          "print_profile_key",
+          "mail_long_edge",
+          "mail_jpeg_quality",
+          "mail_subsampling",
+          "mail_progressive",
+          "updated_at",
+          "updated_by"
+        ],
+        "title": "ExportSettingsOut",
+        "type": "object"
+      },
+      "ExportSettingsPut": {
+        "description": "The WHOLE settings row, not a patch \u2014 the panel saves both profiles behind one Save bar, so\nthe request IS the new state and an omitted field is a client bug (pydantic answers 422).\n\nEvery band here is the vendor-documented envelope, not a plausibility limit, and each is the\nexact set the Export panel offers: print quality below 90 shows on gloss paper and above 95\ncosts bytes for nothing; the print long edge is the measured set of useful rungs (4096 covers a\n1.5-page spread of the 21x21 layflat at 300 dpi, 5000 is Blurb's published full-bleed rule,\n0 keeps the source's own size); the mail long edge is 2x a 600-800 px rendered width; mail\nquality 77-83 is the band mail-client practice puts an inline photo in. The API and the panel\nadmit exactly the same values, so a request the panel could not have produced is a 422 rather\nthan a state no UI can show.",
+        "properties": {
+          "mail_jpeg_quality": {
+            "maximum": 83.0,
+            "minimum": 77.0,
+            "title": "Mail Jpeg Quality",
+            "type": "integer"
+          },
+          "mail_long_edge": {
+            "enum": [
+              1200,
+              1600,
+              2048
+            ],
+            "title": "Mail Long Edge",
+            "type": "integer"
+          },
+          "mail_progressive": {
+            "title": "Mail Progressive",
+            "type": "boolean"
+          },
+          "mail_subsampling": {
+            "$ref": "#/components/schemas/MailSubsampling"
+          },
+          "print_grayscale_single_channel": {
+            "title": "Print Grayscale Single Channel",
+            "type": "boolean"
+          },
+          "print_jpeg_quality": {
+            "maximum": 95.0,
+            "minimum": 90.0,
+            "title": "Print Jpeg Quality",
+            "type": "integer"
+          },
+          "print_long_edge": {
+            "enum": [
+              0,
+              4096,
+              5000
+            ],
+            "title": "Print Long Edge",
+            "type": "integer"
+          },
+          "print_metadata_policy": {
+            "$ref": "#/components/schemas/PrintMetadataPolicy"
+          }
+        },
+        "required": [
+          "print_long_edge",
+          "print_jpeg_quality",
+          "print_metadata_policy",
+          "print_grayscale_single_channel",
+          "mail_long_edge",
+          "mail_jpeg_quality",
+          "mail_subsampling",
+          "mail_progressive"
+        ],
+        "title": "ExportSettingsPut",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1191,6 +1317,15 @@
         ],
         "title": "HealthResponse",
         "type": "object"
+      },
+      "MailSubsampling": {
+        "description": "Chroma subsampling for the mail profile, in the notation the vendor guidance uses.\n\n`4:2:0` is the mail default and is deliberately NOT what print uses: an inline mail image is\nread at a few hundred pixels on a phone, where the halved chroma resolution is invisible and\nthe bytes it saves are the difference between a message that arrives and one that bounces off\na provider's part cap. `4:4:4` is the only alternative offered \u2014 an escape hatch for an image\nwhose fine coloured detail the subsampling visibly eats. There is no `4:2:2`: it is a\ncompromise between the two that saves little and is not worth a third answer in a panel.",
+        "enum": [
+          "4:2:0",
+          "4:4:4"
+        ],
+        "title": "MailSubsampling",
+        "type": "string"
       },
       "ManageGrantOut": {
         "description": "A step-up grant, returned once and stored only as a hash \u2014 like a PAT's plaintext.\n\n`expires_at` is part of the contract rather than a client-side guess: the app has to know when\nthe management screen it is holding this for goes cold, and the server's deadline is the only\none that decides anything.",
@@ -1720,13 +1855,15 @@
             "type": "array"
           },
           "profile": {
-            "const": "print-4096",
             "title": "Profile",
             "type": "string"
           },
           "tag": {
             "title": "Tag",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "totals": {
             "$ref": "#/components/schemas/PhotobookTotalsOut"
@@ -1868,6 +2005,15 @@
         ],
         "title": "PhotobookTotalsOut",
         "type": "object"
+      },
+      "PrintMetadataPolicy": {
+        "description": "What of the source's metadata survives into a print rendition.\n\n`strip` is what the shipped encoder does by writing no EXIF at all. `keep_dates` REBUILDS a\nwhitelist of date tags into fresh EXIF rather than passing the source's through \u2014 a\npass-through would carry GPS coordinates, camera serial numbers and a stale Orientation (which\nis already baked into the pixels) into a file that leaves the household for a print service.\nNeither policy touches the ICC profile or the baked orientation: those are print correctness,\nnot metadata.",
+        "enum": [
+          "strip",
+          "keep_dates"
+        ],
+        "title": "PrintMetadataPolicy",
+        "type": "string"
       },
       "PushKeys": {
         "properties": {
@@ -2857,6 +3003,77 @@
         "summary": "Test Send Digest",
         "tags": [
           "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/export/settings": {
+      "get": {
+        "operationId": "get_export_settings_api_admin_export_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportSettingsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Get Export Settings",
+        "tags": [
+          "admin-export"
+        ]
+      },
+      "put": {
+        "description": "Update the one settings row.\n\nThe row is taken FOR UPDATE for the whole request. Not for a fresh read: two overlapping saves\nwould otherwise interleave field by field and commit a profile that is neither of the two the\nadmins pressed Save on \u2014 a mixture of print quality from one and grayscale from the other,\nwhich is a cache key nobody chose. One row, taken in one order by the one writer, so the\nsecond request waits and overwrites a complete state rather than half of one.",
+        "operationId": "put_export_settings_api_admin_export_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportSettingsPut"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportSettingsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Put Export Settings",
+        "tags": [
+          "admin-export"
         ]
       }
     },
@@ -3877,7 +4094,7 @@
     },
     "/api/exports/photobook": {
       "get": {
-        "description": "The photo book for a tag and date range: a print-readiness manifest, or the archive itself.\n\nSelection is `tag` (default `curated`) joined to the owner's image attachments, in memo-date\norder; `from`/`to` bound the memo date and are inclusive whole days. `profile` names the single\nrung the book is printed at.\n\n**Requesting a book schedules it.** Both formats enqueue a print rendition for every member\nthat lacks a current one, so the first request starts the work and later requests report on it;\nthe enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).\n\n`format=manifest` (the default) answers with one record per photo \u2014 the name it will carry in\nthe archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,\nand the **effective dpi** it will print at for the given `page_cm`/`max_pages` geometry, judged\nagainst `dpi`. That is the field worth having: it names the photos a layout program will flag,\nbefore the import rather than after it. Re-fetching it is also how progress is followed.\n\n`format=zip` streams the ready renditions as `0001_<date>_<uid>.jpg`, numbered in book order so\na folder import lands in sequence. Photos that are not ready yet are left out and recorded in\nthe archive's manifest.json, exactly as the generic export treats a rendition that is missing.",
+        "description": "The photo book for a date range: a print-readiness manifest, or the archive itself.\n\nSelection is the owner's image attachments in memo-date order; `from`/`to` bound the memo date\nand are inclusive whole days. `tag` NARROWS that to the memos carrying it \u2014 omitting it selects\nevery image memo in the range, which is what \"give me all my photos between two dates\" means.\n\n`profile` names the print profile the book is derived at. Omitting it follows this\ndeployment's export settings, so an admin changing the print profile changes what an export\nproduces without any client being told; naming one pins the request to it. Two keys are\naccepted \u2014 the permanent default `print-4096`, whose renditions are the shipped tier, and\nwhatever the settings currently name; anything else is 422. A non-default profile derives into\nits own cache directory, so requesting one never rewrites or invalidates the default tier.\n\n**Requesting a book schedules it.** Both formats enqueue a print rendition for every member\nthat lacks a current one, so the first request starts the work and later requests report on it;\nthe enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).\n\n`format=manifest` (the default) answers with one record per photo \u2014 the name it will carry in\nthe archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,\nand the **effective dpi** it will print at for the given `page_cm`/`max_pages` geometry, judged\nagainst `dpi`. That is the field worth having: it names the photos a layout program will flag,\nbefore the import rather than after it. Re-fetching it is also how progress is followed.\n\n`format=zip` streams the ready renditions as `0001_<date>_<uid>.jpg`, numbered in book order so\na folder import lands in sequence. Photos that are not ready yet are left out and recorded in\nthe archive's manifest.json, exactly as the generic export treats a rendition that is missing.",
         "operationId": "export_photobook_api_exports_photobook_get",
         "parameters": [
           {
@@ -3911,9 +4128,11 @@
             "name": "tag",
             "required": false,
             "schema": {
-              "default": "curated",
               "title": "Tag",
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -3921,10 +4140,11 @@
             "name": "profile",
             "required": false,
             "schema": {
-              "const": "print-4096",
-              "default": "print-4096",
               "title": "Profile",
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {

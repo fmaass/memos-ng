@@ -8,6 +8,7 @@ none of them re-derives an expected value with the code under test.
 
 import asyncio
 import os
+import random
 import secrets
 import struct
 import time
@@ -29,7 +30,8 @@ from app.models import (
     MediaJob,
 )
 from app.services import asset_urls, media, printready
-from PIL import Image, ImageCms, JpegImagePlugin
+from PIL import Image, ImageCms, ImageStat, JpegImagePlugin
+from PIL.TiffImagePlugin import IFDRational
 from sqlalchemy import create_engine, select, text
 from structlog.testing import capture_logs
 
@@ -733,3 +735,548 @@ async def test_the_upload_pipeline_never_generates_the_print_tier(adb, monkeypat
     assert not printready.printready_path(att.uid).exists()
     kinds = [j.kind for j in await _jobs_for(adb, att.id)]
     assert JobKind.printready not in kinds  # and it enqueues no print work either
+
+
+# --- profile identity (MEMNG-238) -------------------------------------------------------------
+
+
+def test_the_default_profile_is_the_shipped_tier():
+    """Every literal here is what the tier ON DISK was built with. If any of them moves, every
+    existing print rendition silently becomes a file for a profile nobody asked for."""
+    profile = printready.DEFAULT_PROFILE
+
+    assert profile.long_edge == 4096
+    assert profile.jpeg_quality == 92
+    assert profile.metadata_policy == "strip"
+    assert profile.grayscale_single_channel is True
+    assert profile.key == "print-4096"
+    assert profile.subdir is None
+
+
+@pytest.mark.parametrize(
+    ("profile", "key"),
+    [
+        (printready.PrintProfile(5000, 92, "strip", True), "print-5000-q92-strip-gray"),
+        (printready.PrintProfile(4096, 90, "strip", True), "print-4096-q90-strip-gray"),
+        (printready.PrintProfile(4096, 92, "keep_dates", True), "print-4096-q92-dates-gray"),
+        (printready.PrintProfile(4096, 92, "strip", False), "print-4096-q92-strip-rgb"),
+        (printready.PrintProfile(0, 95, "keep_dates", False), "print-orig-q95-dates-rgb"),
+    ],
+)
+def test_every_byte_affecting_field_is_in_the_key(profile, key):
+    """Spelled out rather than re-derived: a test that called `.key` to predict `.key` would pass
+    with any encoding at all, including one that dropped a field."""
+    assert profile.key == key
+    assert profile.subdir == key
+    assert printready.profile_from_key(key) == profile
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "print-4096-q92-strip-gray",  # a second spelling of the default
+        "print-04096-q92-strip-gray",  # leading zero
+        "print-5000-q92-strip",  # a field missing
+        "print-5000-q92-strip-gray-extra",
+        "print-5000-q92-keep_dates-gray",  # the stored value, not the key token
+        "print-2560",
+        "printready/../../etc",
+        "",
+    ],
+)
+def test_a_key_that_is_not_canonical_parses_to_nothing(key):
+    assert printready.profile_from_key(key) is None
+
+
+def test_a_profile_derives_into_its_own_directory_and_the_default_stays_put(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    other = printready.PrintProfile(5000, 90, "strip", True)
+
+    assert printready.printready_path("u1") == tmp_path / "assets" / "printready" / "u1.jpg"
+    assert printready.printready_path("u1", printready.DEFAULT_PROFILE) == (
+        tmp_path / "assets" / "printready" / "u1.jpg"
+    )
+    assert printready.printready_path("u1", other) == (
+        tmp_path / "assets" / "printready" / "print-5000-q90-strip-gray" / "u1.jpg"
+    )
+
+
+def test_profile_variant_paths_enumerate_what_is_on_disk(monkeypatch, tmp_path):
+    """Enumerated, not derived: the set of profiles that ever existed is unbounded, so a deletion
+    path that listed only the configured ones would leak a file per abandoned profile."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    root = tmp_path / "assets" / "printready"
+    (root / "print-5000-q90-strip-gray").mkdir(parents=True)
+    (root / "print-orig-q95-dates-rgb").mkdir(parents=True)
+    (root / "print-5000-q90-strip-gray" / "u1.jpg").write_bytes(b"x")
+    (root / "print-orig-q95-dates-rgb" / "u1.jpg").write_bytes(b"y")
+    (root / "print-orig-q95-dates-rgb" / "u2.jpg").write_bytes(b"z")
+    (root / "u1.jpg").write_bytes(b"legacy")
+
+    found = printready.profile_variant_paths_sync("u1")
+
+    assert found == [
+        root / "print-5000-q90-strip-gray" / "u1.jpg",
+        root / "print-orig-q95-dates-rgb" / "u1.jpg",
+    ]
+    assert root / "u1.jpg" not in found  # the legacy path is every caller's own
+    assert printready.profile_variant_paths_sync("nobody") == []
+
+
+def test_no_tier_directory_at_all_enumerates_nothing(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    assert printready.profile_variant_paths_sync("u1") == []
+
+
+def test_a_deleted_photo_takes_every_profiles_rendition_with_it(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The leak this closes: a rendition in a profile directory outliving the row that named it.
+
+    Driven through the real DELETE endpoint, and the abandoned profile is one settings no longer
+    name — which is exactly the case a derived (rather than enumerated) list would miss.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    att_id = _seed_attachment("pr-prof-del", subject)
+    legacy = printready.printready_path("pr-prof-del")
+    abandoned = printready.printready_path(
+        "pr-prof-del", printready.PrintProfile(5000, 90, "keep_dates", False)
+    )
+    for path in (legacy, abandoned):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"rendition")
+    try:
+        assert client.delete("/api/attachments/pr-prof-del").status_code == 204
+    finally:
+        _delete_attachments(att_id)
+
+    assert not legacy.exists()
+    assert not abandoned.exists(), "a profile directory's rendition outlived its attachment"
+
+
+def test_a_jobs_sweep_finds_every_profiles_rendition_too(monkeypatch, tmp_path):
+    """The worker's own cleanup (media.derived_outputs) has to enumerate the same set: a job that
+    discovers its attachment was deleted mid-encode sweeps its output through this list."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    abandoned = printready.printready_path(
+        "pr-sweep", printready.PrintProfile(0, 95, "strip", False)
+    )
+    abandoned.parent.mkdir(parents=True, exist_ok=True)
+    abandoned.write_bytes(b"rendition")
+
+    outputs = media.derived_outputs("pr-sweep")
+
+    assert abandoned in outputs
+    assert abandoned.with_suffix(abandoned.suffix + ".tmp") in outputs
+    assert printready.printready_path("pr-sweep") in outputs  # the legacy one, still
+
+
+# --- the encoder follows the profile ----------------------------------------------------------
+
+
+def test_a_profile_decides_the_long_edge_the_quality_and_the_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(5000, 90, "strip", False)
+    att = _attachment(_png(tmp_path / "big.png", size=(6000, 3000)), uid="pr-prof-enc")
+
+    dest = media.process_printready(att, profile)
+
+    assert dest == (
+        tmp_path / "assets" / "printready" / "print-5000-q90-strip-rgb" / "pr-prof-enc.jpg"
+    )
+    out = _decode(dest)
+    assert out.size == (5000, 2500)
+    assert out.info.get("dpi") == (300, 300)  # print correctness, true of every profile
+    assert JpegImagePlugin.get_sampling(out) == 0
+    # ...and nothing was written at the default profile's path.
+    assert not printready.printready_path("pr-prof-enc").exists()
+
+
+def test_a_profile_with_no_cap_keeps_the_sources_own_size(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(printready.ORIGINAL_LONG_EDGE, 92, "strip", False)
+    att = _attachment(_png(tmp_path / "orig.png", size=(6000, 3000)), uid="pr-prof-orig")
+
+    assert _decode(media.process_printready(att, profile)).size == (6000, 3000)
+
+
+def test_a_higher_quality_profile_writes_a_bigger_file(monkeypatch, tmp_path):
+    """The quality really reaches the encoder, measured off the two files rather than trusted."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = _photo(tmp_path / "detail.png", _colour_pixels)
+    low = media.process_printready(
+        _attachment(source, uid="pr-q90"), printready.PrintProfile(4096, 90, "strip", False)
+    )
+    high = media.process_printready(
+        _attachment(source, uid="pr-q95"), printready.PrintProfile(4096, 95, "strip", False)
+    )
+
+    assert high.stat().st_size > low.stat().st_size
+
+
+# --- monochrome detection ---------------------------------------------------------------------
+
+
+def _photo(path: Path, shade, size=(400, 300)) -> Path:
+    """A synthetic photograph: a luminance ramp with per-pixel noise, coloured by `shade`.
+
+    Noise is deliberate — a flat field compresses to nothing and would make the size comparison
+    below meaningless, and a real photograph's chroma noise is what a neutrality threshold has to
+    survive. Built here rather than committed as a binary (repo convention).
+    """
+    rng = random.Random(20260830)
+    img = Image.new("RGB", size)
+    pixels = img.load()
+    assert pixels is not None
+    for y in range(size[1]):
+        for x in range(size[0]):
+            luma = max(0, min(255, (x * 255) // size[0] + rng.randint(-10, 10)))
+            pixels[x, y] = shade(luma, x, y, rng)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path, "PNG")
+    return path
+
+
+def _neutral_pixels(luma, _x, _y, _rng):
+    return (luma, luma, luma)
+
+
+def _sepia_pixels(luma, _x, _y, _rng):
+    """A uniform warm tone over the same luminance — non-zero chroma, one hue everywhere."""
+    return (
+        min(255, int(luma * 1.07) + 18),
+        int(luma * 0.90),
+        int(luma * 0.62),
+    )
+
+
+def _colour_pixels(luma, _x, y, rng):
+    """Two independent ramps and an inverted one: chroma everywhere, and its HUE varies across the
+    frame — which is the property that tells a colour photograph from a toned one."""
+    return (
+        luma,
+        max(0, min(255, y * 255 // 300 + rng.randint(-10, 10))),
+        max(0, min(255, 255 - luma + rng.randint(-10, 10))),
+    )
+
+
+def _warm_cool_delta(img: Image.Image) -> float:
+    """Mean red minus mean blue: how warm the whole frame is. A grey image scores ~0."""
+    red, _, blue = img.convert("RGB").split()
+    return ImageStat.Stat(red).mean[0] - ImageStat.Stat(blue).mean[0]
+
+
+def test_the_three_way_classification(tmp_path):
+    """Each input category gets its own case: a single-category test lets a classifier that answers
+    one thing for everything pass."""
+    with Image.open(_photo(tmp_path / "n.png", _neutral_pixels)) as neutral:
+        assert media.classify_chromaticity(neutral.convert("RGB")) == "neutral"
+    with Image.open(_photo(tmp_path / "s.png", _sepia_pixels)) as sepia:
+        assert media.classify_chromaticity(sepia.convert("RGB")) == "toned"
+    with Image.open(_photo(tmp_path / "c.png", _colour_pixels)) as colour:
+        assert media.classify_chromaticity(colour.convert("RGB")) == "color"
+
+
+def test_a_neutral_photo_is_encoded_single_channel_and_smaller_at_the_same_quality(
+    monkeypatch, tmp_path
+):
+    """AC: the size win is the ABSENT CHROMA, never a quality drop.
+
+    Both files come out of the same source at the same quality — only the toggle differs — so the
+    difference is exactly the two chroma planes and the sRGB profile that a one-component JPEG
+    cannot carry.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = _photo(tmp_path / "bw.png", _neutral_pixels)
+    on = printready.PrintProfile(4096, 92, "strip", True)
+    off = printready.PrintProfile(4096, 92, "strip", False)
+
+    single = media.process_printready(_attachment(source, uid="pr-mono-on"), on)
+    rgb = media.process_printready(_attachment(source, uid="pr-mono-off"), off)
+
+    assert _decode(single).mode == "L"
+    assert _decode(rgb).mode == "RGB"
+    assert single.stat().st_size < rgb.stat().st_size
+    # A single-component JPEG carries no three-component profile — see process_printready.
+    assert not _decode(single).info.get("icc_profile")
+    assert _decode(rgb).info.get("icc_profile")
+
+
+def test_a_sepia_photo_stays_rgb_with_its_toning_intact(monkeypatch, tmp_path):
+    """The verdict that has to be right: sepia is monochrome to the eye, and encoding it
+    single-channel would hand back a grey image with the toning thrown away.
+
+    The channel deltas are read out of the DECODED rendition and compared against the source's own —
+    averaged over the whole frame rather than sampled at one pixel, because q92 smooths per-pixel
+    noise and a single sample would be measuring the encoder. A regression that greyed the image
+    collapses both deltas to ~0; one that shifted the hue moves them apart.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = _photo(tmp_path / "sepia.png", _sepia_pixels)
+    att = _attachment(source, uid="pr-sepia")
+
+    out = _decode(media.process_printready(att, printready.PrintProfile(4096, 92, "strip", True)))
+
+    assert out.mode == "RGB"
+    with Image.open(source) as raw:
+        before = _warm_cool_delta(raw.convert("RGB"))
+    after = _warm_cool_delta(out)
+    assert before > 25, before  # positive control: the fixture really is toned
+    assert after > 25, f"the toning was flattened: {after}"
+    assert abs(after - before) <= 3, (before, after)
+
+
+def test_a_colour_photo_stays_rgb(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = _attachment(_photo(tmp_path / "colour.png", _colour_pixels), uid="pr-colour")
+
+    out = _decode(media.process_printready(att, printready.PrintProfile(4096, 92, "strip", True)))
+
+    assert out.mode == "RGB"
+    assert out.info.get("icc_profile")
+
+
+@pytest.mark.parametrize("shade", [_neutral_pixels, _sepia_pixels, _colour_pixels])
+def test_the_toggle_off_disables_the_whole_path(monkeypatch, tmp_path, shade):
+    """AC: with the toggle off nothing is ever single-channel, the neutral photo included."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = _attachment(_photo(tmp_path / f"{shade.__name__}.png", shade), uid=f"pr-off{id(shade)}")
+
+    out = _decode(media.process_printready(att, printready.PrintProfile(4096, 92, "strip", False)))
+
+    assert out.mode == "RGB"
+    assert out.info.get("icc_profile")
+
+
+def test_detection_runs_on_the_managed_pixels_not_the_raw_ones(monkeypatch, tmp_path):
+    """Order, asserted through behaviour: a neutral image TAGGED with a wide-gamut profile is still
+    neutral after the transform, and would only look otherwise if the statistics were taken before
+    the colour management or the 16-bit/alpha normalisation."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = _photo(tmp_path / "wide-bw.png", _neutral_pixels)
+    with Image.open(source) as raw:
+        raw.convert("RGB").save(source, "PNG", icc_profile=wide_gamut_icc())
+    att = _attachment(source, uid="pr-wide-bw")
+
+    assert _decode(media.process_printready(att)).mode == "L"
+
+
+def test_a_16_bit_source_is_normalised_rather_than_clipped(monkeypatch, tmp_path):
+    """Pillow's `convert("RGB")` reads an `I;16` sample as 8-bit and CLIPS: everything above 255
+    comes back white, so a 16-bit scan would print as a blown-out field. Measured on the rendition:
+    a full-range 16-bit ramp has to come back as a ramp, not as a flat 255."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = tmp_path / "deep.png"
+    ramp = Image.new("I;16", (256, 8))
+    ramp.putdata([column * 257 for _row in range(8) for column in range(256)])
+    ramp.save(source, "PNG")
+    att = _attachment(source, uid="pr-16bit")
+
+    out = _decode(media.process_printready(att))
+
+    dark, mid, light = out.getpixel((4, 4)), out.getpixel((128, 4)), out.getpixel((250, 4))
+    assert isinstance(dark, int) and isinstance(mid, int) and isinstance(light, int)
+    assert dark < 20 and 100 < mid < 160 and light > 230, (dark, mid, light)
+
+
+def test_a_transparent_source_is_composited_onto_white(monkeypatch, tmp_path):
+    """A transparent PNG can carry any colour in its invisible pixels; `convert("RGB")` keeps that
+    colour and prints it. Paper is white, so that is what they are composited onto — and detection
+    then measures the pixels that will actually be printed."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = tmp_path / "alpha.png"
+    rgba = Image.new("RGBA", (40, 30), (255, 0, 0, 0))  # fully transparent red
+    rgba.save(source, "PNG")
+    att = _attachment(source, uid="pr-alpha")
+
+    out = _decode(media.process_printready(att))
+    pixel = out.getpixel((10, 10))
+
+    assert pixel == 255 if out.mode == "L" else pixel == (255, 255, 255)
+
+
+# --- metadata policy --------------------------------------------------------------------------
+
+
+def _source_with_metadata(path: Path) -> Path:
+    """A JPEG carrying everything a camera writes and a print service must not receive."""
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation — already baked into the pixels by the time it is encoded
+    exif[0x010F] = "ACME"  # Make
+    exif[0x0110] = "Model X"  # Model
+    exif.get_ifd(0x8769).update({0x9003: "2019:07:04 12:30:00", 0x9004: "2019:07:04 12:31:00"})
+    exif.get_ifd(0x8825).update(
+        {
+            1: "N",
+            2: (IFDRational(47, 1), IFDRational(22, 1), IFDRational(0, 1)),
+            3: "E",
+            4: (IFDRational(8, 1), IFDRational(32, 1), IFDRational(0, 1)),
+        }
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (60, 40), (200, 90, 40)).save(path, "JPEG", exif=exif.tobytes())
+    return path
+
+
+def test_the_default_policy_writes_no_metadata_at_all(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = _attachment(_source_with_metadata(tmp_path / "strip.jpg"), uid="pr-strip")
+
+    out = _decode(media.process_printready(att))
+
+    assert dict(out.getexif()) == {}
+
+
+def test_keep_dates_rebuilds_the_dates_and_leaves_the_gps_behind(monkeypatch, tmp_path):
+    """A whitelist that is CONSTRUCTED cannot leak a tag nobody thought to remove.
+
+    The source carries GPS coordinates, the camera's make and model and an Orientation that is
+    already baked into the pixels; the rendition is about to be uploaded to a print service. The
+    dates survive because they were named; nothing else survives because nothing else was.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(4096, 92, "keep_dates", True)
+    source = _source_with_metadata(tmp_path / "dates.jpg")
+    att = _attachment(source, uid="pr-dates")
+
+    out = _decode(media.process_printready(att, profile))
+
+    exif = out.getexif()
+    assert exif.get_ifd(0x8769) == {
+        0x9003: "2019:07:04 12:30:00",
+        0x9004: "2019:07:04 12:31:00",
+    }
+    assert exif.get_ifd(0x8825) == {}, "GPS coordinates survived into a print rendition"
+    assert 0x010F not in exif and 0x0110 not in exif  # camera make/model
+    assert 0x0112 not in exif  # a stale Orientation would re-rotate an already-baked image
+    # Positive control: the source really did carry all of it.
+    with Image.open(source) as raw:
+        assert raw.getexif().get_ifd(0x8825)
+        assert raw.getexif()[0x0112] == 6
+
+
+def test_keep_dates_on_a_source_with_no_dates_writes_no_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(4096, 92, "keep_dates", True)
+    att = _attachment(_png(tmp_path / "bare.png"), uid="pr-nodates")
+
+    assert dict(_decode(media.process_printready(att, profile)).getexif()) == {}
+
+
+# --- the worker encodes what the job asked for ------------------------------------------------
+
+
+def _set_job_key(job_id: int, key: str) -> None:
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text("UPDATE media_jobs SET profile_key = :k WHERE id = :j"), {"k": key, "j": job_id}
+        )
+    eng.dispose()
+
+
+def test_the_worker_encodes_the_profile_the_job_names_not_the_current_settings(
+    monkeypatch, tmp_path
+):
+    """The snapshot is the point: minutes or hours separate the request from the encode, and the
+    settings may have moved in between. The bytes have to be the ones that were asked for, at the
+    path the request already told the client about."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    src = _png(tmp_path / "worker-profile.png", size=(6000, 3000))
+    aid, jid, uid = _seed_job("image/png", str(src), JobKind.printready)
+    _set_job_key(jid, "print-5000-q90-strip-rgb")
+    try:
+
+        async def _go() -> str:
+            async with async_session() as db:
+                return await worker.run_once(db)
+
+        assert asyncio.run(_go()) == "processed"
+        assert _read_job(jid)[0] == "done"
+    finally:
+        _delete_attachments(aid)
+
+    derived = tmp_path / "assets" / "printready" / "print-5000-q90-strip-rgb" / f"{uid}.jpg"
+    assert derived.exists()
+    assert _decode(derived).size == (5000, 2500)
+    # The default tier was never written: a book at one profile must not publish another's file.
+    assert not printready.printready_path(uid).exists()
+
+
+def test_a_job_with_no_profile_key_still_writes_the_shipped_tier(monkeypatch, tmp_path):
+    """The rolling-deploy case: a job row enqueued by the old code, drained by the new worker."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    src = _png(tmp_path / "legacy-job.png", size=(4200, 2100))
+    aid, jid, uid = _seed_job("image/png", str(src), JobKind.printready)  # writes no profile_key
+    try:
+
+        async def _go() -> str:
+            async with async_session() as db:
+                return await worker.run_once(db)
+
+        assert asyncio.run(_go()) == "processed"
+    finally:
+        _delete_attachments(aid)
+
+    assert _decode(printready.printready_path(uid)).size == (4096, 2048)
+
+
+def test_a_job_naming_a_profile_that_is_not_one_fails_loudly(monkeypatch, tmp_path):
+    """Only a hand-made row can get here — enqueue writes a canonical key. Guessing a profile would
+    publish bytes nobody asked for at a path nobody will look at."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MEDIA_MAX_ATTEMPTS", 1)
+    src = _png(tmp_path / "bad-job.png")
+    aid, jid, uid = _seed_job("image/png", str(src), JobKind.printready)
+    _set_job_key(jid, "print-9999-nonsense")
+    try:
+
+        async def _go() -> str:
+            async with async_session() as db:
+                return await worker.run_once(db)
+
+        asyncio.run(_go())
+        assert _read_job(jid)[0] == "failed"
+    finally:
+        _delete_attachments(aid)
+
+    assert not printready.printready_path(uid).exists()
+
+
+def test_the_deletion_sweep_enumerates_profile_directories_off_the_loop(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """A directory listing on this deployment's data volume is a network round-trip, and this one
+    happens on the REQUEST loop — so it has to be off it, or every in-flight request stalls behind
+    a delete (MEMNG-42).
+
+    Asserted from INSIDE the call: the enumeration asks whether an event loop is running on the
+    thread it finds itself on. On the loop, `get_running_loop` returns one and the call is
+    blocking it; in a worker thread it raises, which is the whole property. Comparing thread ids
+    with the test's own would prove nothing — Starlette's TestClient already runs the app on a
+    thread of its own, so they differ either way.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    att_id = _seed_attachment("pr-offloop", subject)
+    on_the_loop: list[bool] = []
+    real = printready.profile_variant_paths_sync
+
+    def recording(uid: str):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_the_loop.append(False)
+        else:
+            on_the_loop.append(True)
+        return real(uid)
+
+    monkeypatch.setattr(printready, "profile_variant_paths_sync", recording)
+    try:
+        assert client.delete("/api/attachments/pr-offloop").status_code == 204
+    finally:
+        _delete_attachments(att_id)
+
+    assert on_the_loop, "the deletion path never enumerated the profile directories at all"
+    assert not any(on_the_loop), "the enumeration blocked the request loop"
