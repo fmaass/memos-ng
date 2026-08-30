@@ -87,10 +87,16 @@ describe('drafts', () => {
   })
 })
 
+/** The body, or a loud failure — a test that quietly accepted a refusal here would prove nothing. */
+function unwrap(result: ReturnType<typeof putBodyFromPrintDraft>) {
+  if (!result.ok) throw new Error(`expected a body, got a refusal: ${result.message}`)
+  return result.body
+}
+
 describe('the PUT body', () => {
   it('is the whole row: a print save takes the mail fields from the server', () => {
     const server = settings({ mail_long_edge: 2048, mail_progressive: true })
-    expect(putBodyFromPrintDraft(printDraft({ print_long_edge: 5000 }), server)).toEqual({
+    expect(unwrap(putBodyFromPrintDraft(printDraft({ print_long_edge: 5000 }), server))).toEqual({
       print_long_edge: 5000,
       print_jpeg_quality: 92,
       print_metadata_policy: 'strip',
@@ -104,7 +110,7 @@ describe('the PUT body', () => {
 
   it('and a mail save takes the print fields from the server', () => {
     const server = settings({ print_long_edge: 0, print_jpeg_quality: 95 })
-    expect(putBodyFromMailDraft(mailDraft({ mail_jpeg_quality: 77 }), server)).toEqual({
+    expect(unwrap(putBodyFromMailDraft(mailDraft({ mail_jpeg_quality: 77 }), server))).toEqual({
       print_long_edge: 0,
       print_jpeg_quality: 95,
       print_metadata_policy: 'strip',
@@ -120,7 +126,7 @@ describe('the PUT body', () => {
     // The mail draft on screen says 2048; the server row still says 1600. A print save must send
     // the server's value, or saving one bar would silently commit the other bar's draft.
     const server = settings()
-    const body = putBodyFromPrintDraft(printDraft({ print_jpeg_quality: 90 }), server)
+    const body = unwrap(putBodyFromPrintDraft(printDraft({ print_jpeg_quality: 90 }), server))
     expect(body.mail_long_edge).toBe(1600)
   })
 })
@@ -279,5 +285,53 @@ describe('the how-to-query block', () => {
         }),
       ),
     ).toBe('the original size, JPEG quality 92, capture dates kept, every image in colour')
+  })
+})
+describe('the whole row is validated, not just the half being edited', () => {
+  // A save replaces the entire row, so it carries the other profile's STORED values. A row that
+  // already holds an out-of-band value would have the save re-assert it, and the API would answer
+  // 422 about a field the admin never touched.
+  it('refuses a Mail save when the stored print long edge is off the published rungs', () => {
+    const server = settings({ print_long_edge: 3000 })
+    const result = putBodyFromMailDraft(mailDraft({ mail_jpeg_quality: 77 }), server)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.blockedBy).toBe('print')
+    expect(result.message).toBe(
+      'The Print profile holds a value outside its bands — open it and fix it first.',
+    )
+  })
+
+  it('refuses a Mail save when the stored print quality is outside its band', () => {
+    const result = putBodyFromMailDraft(mailDraft(), settings({ print_jpeg_quality: 40 }))
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.blockedBy).toBe('print')
+  })
+
+  it('refuses a Print save when the stored mail values are out of band, naming Mail', () => {
+    const result = putBodyFromPrintDraft(printDraft(), settings({ mail_long_edge: 999 }))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.blockedBy).toBe('mail')
+    expect(result.message).toBe(
+      'The Mail profile holds a value outside its bands — open it and fix it first.',
+    )
+  })
+
+  it('points at the fields above when it is the edited profile that is broken', () => {
+    const result = putBodyFromPrintDraft(printDraft({ print_jpeg_quality: 200 }), settings())
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.message).toMatch(/fix the fields above/)
+  })
+
+  it('sends both groups as before when the whole row is in band', () => {
+    const server = settings()
+    const print = putBodyFromPrintDraft(printDraft({ print_long_edge: 5000 }), server)
+    const mail = putBodyFromMailDraft(mailDraft({ mail_progressive: true }), server)
+    expect(print.ok).toBe(true)
+    expect(mail.ok).toBe(true)
+    if (print.ok) expect(print.body.print_long_edge).toBe(5000)
+    if (mail.ok) expect(mail.body.mail_progressive).toBe(true)
+    if (print.ok) expect(Object.keys(print.body).length).toBe(8)
   })
 })

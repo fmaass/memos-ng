@@ -6,6 +6,8 @@ import { type Ref, computed, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 import { apiErrorMessage } from '@/lib/digest'
 import {
+  type ExportGroup,
+  type ExportPutBody,
   type ExportSettings,
   type ExportSettingsPut,
   type MailProfileDraft,
@@ -60,7 +62,7 @@ export function useExportSettings() {
   //
   // The second writer is REFUSED, not queued: a queued save would re-send a draft the server has
   // already moved past. The refusal says so on the bar the write would have used.
-  const settingsWriter = ref<'print' | 'mail' | null>(null)
+  const settingsWriter = ref<ExportGroup | null>(null)
   const savingPrint = computed(() => settingsWriter.value === 'print')
   const savingMail = computed(() => settingsWriter.value === 'mail')
   const writerBusy = computed(() => settingsWriter.value !== null)
@@ -73,8 +75,8 @@ export function useExportSettings() {
   /** Run one settings write behind the gate. `build` is called AFTER the gate is taken, so its body
    * is built from the row the previous write's response installed rather than from a stale copy. */
   async function writeSettings(
-    kind: 'print' | 'mail',
-    build: (current: ExportSettings) => ExportSettingsPut,
+    kind: ExportGroup,
+    build: (current: ExportSettings) => ExportPutBody,
     confirmation: string,
     errorRef: Ref<string | null>,
   ): Promise<boolean> {
@@ -85,7 +87,15 @@ export function useExportSettings() {
     settingsWriter.value = kind
     errorRef.value = null
     try {
-      await putSettings.mutateAsync(build(currentSettings()))
+      // The body is the WHOLE row, so it carries the other profile's stored values. If those are
+      // outside the published bands the request is refused HERE, on the bar that was pressed, and
+      // nothing goes out — a 422 naming a field the admin did not touch explains nothing.
+      const assembled = build(currentSettings())
+      if (!assembled.ok) {
+        errorRef.value = assembled.message
+        return false
+      }
+      await putSettings.mutateAsync(assembled.body)
       notice.value = confirmation
       return true
     } catch (error) {

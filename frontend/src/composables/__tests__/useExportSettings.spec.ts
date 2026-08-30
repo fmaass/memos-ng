@@ -251,4 +251,38 @@ describe('useExportSettings', () => {
     store.clearNotice()
     expect(store.notice.value).toBeNull()
   })
+  describe('a row that already holds an out-of-band value', () => {
+    it('blocks a Mail save, names the Print profile, and puts nothing on the wire', async () => {
+      seedSettings({ print_long_edge: 3000 }) // e.g. written before the bands existed
+      const store = useExportSettings()
+
+      expect(await store.saveMail(mailDraft({ mail_jpeg_quality: 77 }))).toBe(false)
+      expect(store.mailError.value).toBe(
+        'The Print profile holds a value outside its bands — open it and fix it first.',
+      )
+      expect(PUT).not.toHaveBeenCalled() // never sent, so no 422 about a field nobody touched
+      expect(store.notice.value).toBeNull()
+    })
+
+    it('blocks a Print save on a bad stored mail value, naming Mail', async () => {
+      seedSettings({ mail_jpeg_quality: 40 })
+      const store = useExportSettings()
+      expect(await store.savePrint(printDraft())).toBe(false)
+      expect(store.printError.value).toMatch(/Mail profile holds a value outside its bands/)
+      expect(PUT).not.toHaveBeenCalled()
+    })
+
+    it('releases the writer gate, so the fix can be saved straight after', async () => {
+      seedSettings({ print_long_edge: 3000 })
+      const store = useExportSettings()
+      expect(await store.saveMail(mailDraft())).toBe(false)
+      expect(store.writerBusy.value).toBe(false)
+
+      // the admin opens Print and saves a legal value: that save carries the mail half and goes
+      seedSettings()
+      const fixed = useExportSettings()
+      expect(await fixed.savePrint(printDraft({ print_long_edge: 4096 }))).toBe(true)
+      expect(PUT).toHaveBeenCalledTimes(1)
+    })
+  })
 })
