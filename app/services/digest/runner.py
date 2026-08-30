@@ -88,9 +88,13 @@ FAILED = DigestRunStatus.failed
 # this bar, and unrelated to how long the whole run takes.
 STALE_RUN_MINUTES = 15
 
-# How long a hosted-media row may sit `pending` before the sweep asks Dropbox what actually
-# happened. Comfortably above the longest single upload (one 600 s upload-session operation per
-# 48 MB chunk), so a live upload is never reconciled out from under itself.
+# The settling floor before the sweep asks Dropbox what happened to a `pending` row. It is the
+# SECOND of two conditions, never the only one: the row's owning run must also be provably not
+# alive (terminal, or silent past `STALE_RUN_MINUTES`). Age alone cannot tell a dead process from
+# a slow upload — one upload-session operation allows 600 s and a whole run can legitimately last
+# hours — and reconciling a row out from under a live upload is how the sweep would invent the
+# very orphan it exists to prevent: the row would be stamped `swept` while the bytes were still
+# arriving, and the upload's own `mark_uploaded` CAS would then find nothing to advance.
 PENDING_RECONCILE_MINUTES = 60
 
 ERROR_SMTP_UNCONFIGURED = "smtp not configured"
@@ -478,43 +482,49 @@ class SessionLedger:
     commits and closes.
     """
 
-    def __init__(self, session_factory: SessionFactory = async_session) -> None:
+    def __init__(
+        self, session_factory: SessionFactory = async_session, *, run_id: int | None = None
+    ) -> None:
         self._session_factory = session_factory
+        self._run_id = run_id
 
     async def claim(self, *, attachment_id: int, kind: str, dropbox_path: str) -> int:
-        """Commit `dropbox_path` as `pending` and return its ledger row id.
+        """Commit `dropbox_path` as `pending`, owned by this run, and return its ledger row id.
 
-        Idempotent on the path, which is the natural key of the remote object. A conflicting row
-        that is still `pending` is RE-OPENED (a previous attempt died mid-upload; this attempt now
-        owns the intention and its clock restarts), while one that is already `uploaded` is left
-        exactly as it is — a row that promises a live object must not be talked back into
-        promising nothing.
+        Idempotent on the path, which is the natural key of the remote object — and idempotent in
+        ONE direction only. The lifecycle is write-once forward, `pending → uploaded → swept`, so
+        the only row a claim may re-open is one that is still `pending` (a previous attempt died
+        mid-upload; this attempt takes over the intention, and its clock and its owning run
+        restart with it). A row that has reached `uploaded` or `swept` is left exactly as it
+        stands: an `uploaded` row promises a live object and must not be talked back into
+        promising nothing, and a `swept` row is the record that a file was DELETED — reopening it
+        would erase the only evidence that the deletion happened.
         """
         async with self._session_factory() as db:
             row_id = await db.scalar(
                 sa_text(
                     "INSERT INTO digest_hosted_media "
-                    "(attachment_id, kind, dropbox_path, status, created_at) "
-                    "VALUES (:attachment_id, :kind, :dropbox_path, :pending, now()) "
+                    "(attachment_id, run_id, kind, dropbox_path, status, created_at) "
+                    "VALUES (:attachment_id, :run_id, :kind, :dropbox_path, :pending, now()) "
                     "ON CONFLICT (dropbox_path) DO UPDATE SET "
-                    "attachment_id = EXCLUDED.attachment_id, kind = EXCLUDED.kind, "
-                    "status = :pending, created_at = now(), uploaded_at = NULL, "
-                    "shared_link = NULL, swept_at = NULL "
-                    "WHERE digest_hosted_media.status <> :uploaded "
+                    "attachment_id = EXCLUDED.attachment_id, run_id = EXCLUDED.run_id, "
+                    "kind = EXCLUDED.kind, created_at = now() "
+                    "WHERE digest_hosted_media.status = :pending "
                     "RETURNING id"
                 ),
                 {
                     "attachment_id": attachment_id,
+                    "run_id": self._run_id,
                     "kind": kind,
                     "dropbox_path": dropbox_path,
                     "pending": HostedMediaStatus.pending,
-                    "uploaded": HostedMediaStatus.uploaded,
                 },
             )
             if row_id is None:
-                # The conflicting row is already `uploaded`, so the DO UPDATE's WHERE excluded it
-                # and RETURNING yielded nothing. The row still IS the claim on this path; read its
-                # id so the caller has something to mark, and let `mark_uploaded`'s CAS decline.
+                # The conflicting row has already moved past `pending`, so the DO UPDATE's WHERE
+                # excluded it and RETURNING yielded nothing. The row still IS the claim on this
+                # path; read its id so the caller has something to mark, and let
+                # `mark_uploaded`'s CAS decline rather than rewriting a settled row.
                 row_id = await db.scalar(
                     sa_text("SELECT id FROM digest_hosted_media WHERE dropbox_path = :path"),
                     {"path": dropbox_path},
@@ -548,6 +558,10 @@ class SessionLedger:
             )
             await db.commit()
         if updated is None:
+            # The row is not `pending` any more — it was settled by another actor (a
+            # reconciliation that found the object, or a sweep that deleted it). Logged rather
+            # than raised: the bytes are on Dropbox either way, and failing the run here would
+            # help nobody.
             logger.warning("digest.hosted_media_transition_lost", ledger_id=ledger_id)
 
 
@@ -819,7 +833,7 @@ async def _execute_run(
             settings,
             candidates,
             host=host,
-            ledger=SessionLedger(session_factory),
+            ledger=SessionLedger(session_factory, run_id=run_id),
         )
     finally:
         # Every path, not just the happy one: the host owns an httpx client, and a run that raised
@@ -1037,21 +1051,43 @@ async def sweep_hosted_media_safe(
         return 0
 
 
-async def _due_hosted_media(db: AsyncSession, *, retention_days: int) -> list[_DueMedia]:
+async def _due_hosted_media(
+    db: AsyncSession, *, retention_days: int, stale_minutes: int = STALE_RUN_MINUTES
+) -> list[_DueMedia]:
+    """Every row the sweep may act on, and — for a `pending` one — only if nobody is still using it.
+
+    The `pending` predicate has TWO halves and both are load-bearing:
+
+    * the intention has been sitting for `PENDING_RECONCILE_MINUTES`, a settling floor; and
+    * its OWNING RUN is provably not alive — no run recorded, or a run that reached a terminal
+      status, or one that has been silent past the same bar the stale-run sweep uses.
+
+    The second half is what age alone cannot express. A run legitimately lasts hours and one
+    upload-session operation allows 600 s, so a rule that reconciled every hour-old `pending` row
+    would stamp a live upload `swept` while its bytes were still arriving; the upload's own
+    `mark_uploaded` would then find no `pending` row to advance and would decline, leaving a file
+    on Dropbox that the ledger says was deleted. That is precisely the permanent orphan this
+    ledger exists to make impossible, arrived at from the other side.
+    """
     rows = await db.execute(
         sa_text(
-            "SELECT id, dropbox_path, status FROM digest_hosted_media "
-            "WHERE (status = :uploaded "
-            "       AND uploaded_at < now() - make_interval(days => :days)) "
-            "   OR (status = :pending "
-            "       AND created_at < now() - make_interval(mins => :mins)) "
-            "ORDER BY id ASC"
+            "SELECT m.id, m.dropbox_path, m.status FROM digest_hosted_media AS m "
+            "LEFT JOIN digest_runs AS r ON r.id = m.run_id "
+            "WHERE (m.status = :uploaded "
+            "       AND m.uploaded_at < now() - make_interval(days => :days)) "
+            "   OR (m.status = :pending "
+            "       AND m.created_at < now() - make_interval(mins => :mins) "
+            "       AND (r.id IS NULL OR r.status IS NOT NULL "
+            "            OR COALESCE(r.heartbeat_at, r.started_at) "
+            "               < now() - make_interval(mins => :stale))) "
+            "ORDER BY m.id ASC"
         ),
         {
             "uploaded": HostedMediaStatus.uploaded,
             "pending": HostedMediaStatus.pending,
             "days": retention_days,
             "mins": PENDING_RECONCILE_MINUTES,
+            "stale": stale_minutes,
         },
     )
     return [_DueMedia(id=row[0], dropbox_path=row[1], status=row[2]) for row in rows]
@@ -1078,11 +1114,20 @@ async def _resolve_due(
     """Delete or reconcile each due row. Returns how many objects are now gone from Dropbox."""
     swept = 0
     for row in due:
-        try:
-            if row.status == HostedMediaStatus.pending:
-                if await _reconcile_pending(session_factory, host, row):
-                    swept += 1
+        if row.status == HostedMediaStatus.pending:
+            try:
+                reconciled_away = await _reconcile_pending(session_factory, host, row)
+            except (hosting.DropboxError, httpx.HTTPError):
+                # The probe could not answer — a 409 with a tag other than `not_found`, a 5xx, a
+                # timeout. "Unknown" is not "absent": the row is left exactly as it is and the
+                # next pass asks again, because stamping it either way on a guess is how a live
+                # object stops being findable.
+                logger.warning("digest.hosted_media_probe_failed", ledger_id=row.id)
                 continue
+            if reconciled_away:
+                swept += 1
+            continue
+        try:
             await host.delete(row.dropbox_path)
         except (hosting.DropboxError, httpx.HTTPError):
             logger.warning("digest.retention_delete_failed", ledger_id=row.id)

@@ -824,9 +824,11 @@ class DigestHostedMedia(Base):
 
     `swept_at` is stamped only after the remote delete has actually succeeded — it is the claim
     that the file IS gone, and stamping it for a failed delete would leave a live file no sweep
-    ever looks at again. A `pending` row older than the reconciliation threshold is judged by
-    probing the remote path: present means the upload landed and the process died before it could
-    say so, absent means it never landed.
+    ever looks at again. A `pending` row is judged by probing the remote path — present means the
+    upload landed and the process died before it could say so, absent means it never landed — but
+    ONLY once its owning run is provably not alive: an upload-session operation may legitimately
+    run for ten minutes and a whole run for hours, and reconciling a row out from under a live
+    upload is how the sweep would invent the very orphan it exists to prevent.
     """
 
     __tablename__ = "digest_hosted_media"
@@ -842,6 +844,13 @@ class DigestHostedMedia(Base):
     # locator of a file that still exists on Dropbox.
     attachment_id: Mapped[int | None] = mapped_column(
         ForeignKey("attachments.id", ondelete="SET NULL"), index=True
+    )
+    # WHICH run committed this intention — the liveness the reconciliation sweep judges a
+    # `pending` row by. Without it "stuck" can only be measured as elapsed time, and elapsed time
+    # cannot tell a dead process from a slow upload. Nullable and `ON DELETE SET NULL` for the
+    # same reason `attachment_id` is: the tombstone must outlive everything it references.
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("digest_runs.id", ondelete="SET NULL"), index=True
     )
     kind: Mapped[str] = mapped_column(String(16))
     # The natural key of the remote OBJECT, committed before the upload runs. Unique, so a retry

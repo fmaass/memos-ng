@@ -201,8 +201,8 @@ def hosted_rows() -> list[dict]:
     with engine.begin() as conn:
         rows = conn.execute(
             text(
-                "SELECT id, attachment_id, kind, dropbox_path, status, shared_link, bytes, "
-                "created_at, uploaded_at, swept_at FROM digest_hosted_media ORDER BY id"
+                "SELECT id, attachment_id, run_id, kind, dropbox_path, status, shared_link, "
+                "bytes, created_at, uploaded_at, swept_at FROM digest_hosted_media ORDER BY id"
             )
         ).mappings()
         result = [dict(row) for row in rows]
@@ -239,6 +239,21 @@ def age_hosted_media(attachment_id: int, *, days: int) -> None:
     engine.dispose()
 
 
+def insert_run(*, trigger: str = "manual", status: str | None = None, local_date=None) -> int:
+    """One `digest_runs` row written directly, for the owner states a ledger test needs."""
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        run_id = conn.execute(
+            text(
+                "INSERT INTO digest_runs (trigger, status, local_date, heartbeat_at) "
+                "VALUES (:trigger, :status, :day, now()) RETURNING id"
+            ),
+            {"trigger": trigger, "status": status, "day": local_date or date(2026, 7, 1)},
+        ).scalar_one()
+    engine.dispose()
+    return int(run_id)
+
+
 def age_hosted_claim(ledger_id: int, *, minutes: int) -> None:
     """Push a PENDING row's `created_at` into the past — how a test says "this intention has been
     sitting unresolved long enough for the sweep to go and ask Dropbox about it"."""
@@ -259,6 +274,7 @@ def insert_hosted_row(**columns: object) -> int:
     engine = create_engine(SYNC_URL)
     values = {
         "attachment_id": None,
+        "run_id": None,
         "kind": "video",
         "status": "uploaded",
         "shared_link": None,

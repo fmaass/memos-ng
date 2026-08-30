@@ -28,15 +28,28 @@ outlives both the process and the attachment:
   reconciliation sweep measures a stuck pending row from it, while retention keeps measuring from
   `uploaded_at`.
 
-Expand-and-backfill, and every existing row is representable. Rows written by the old code were
-only ever inserted AFTER a successful upload, so they are `uploaded` — or `swept` where the
-retention sweep had already stamped `swept_at`. `created_at` is backfilled from `uploaded_at`,
-which is the closest true statement about a row whose intention was never separately recorded.
+**The premise of the rekey, stated because a re-key is not ordinarily an expand-only change.**
+`digest_hosted_media` is EMPTY in production: the feature that writes it has never run there, and
+the two migrations that created it shipped in the same undeployed series as this one. Deploys of
+this stack are single-host and atomic (`docker compose up -d --force-recreate` replaces app and
+worker together, and the worker waits for the migrated schema before its loop starts), so old and
+new code never run against this table concurrently. Those two facts are what make dropping and
+re-adding the primary key safe here; neither would hold for a populated table under a rolling
+deploy, and this migration must not be used as a precedent for one.
 
-The downgrade is lossy and says so rather than pretending otherwise: the old shape cannot hold a
-row whose attachment is gone, nor two rows for one attachment. It deletes the rows the old primary
-key cannot represent (attachment_id NULL, and all but the newest row per attachment) and restores
-the cascade. Nothing outside this table references it, so that is contained.
+Expand-and-backfill all the same, so the statements are correct for any rows that DO exist. Rows
+written by the old code were only ever inserted AFTER a successful upload, so they are `uploaded` —
+or `swept` where the retention sweep had already stamped `swept_at`. `created_at` is backfilled
+from `uploaded_at`, which is the closest true statement about a row whose intention was never
+separately recorded.
+
+The downgrade REFUSES rather than being lossy where loss would matter. The old shape cannot hold a
+row whose attachment is gone, and such a row is an ownership tombstone: the only record that a file
+exists on Dropbox. Deleting it to fit the old primary key would strand that file for ever, silently,
+during a rollback — so the downgrade raises instead and names what has to be dealt with first. Rows
+that merely duplicate an attachment (a second remote object for one attachment) ARE collapsed to the
+newest, because the old shape had no way to express the others and they are recoverable from the
+run history. Nothing outside this table references it, so that is contained.
 """
 
 from collections.abc import Sequence
@@ -76,6 +89,26 @@ def upgrade() -> None:
         'digest_hosted_media',
         ['attachment_id'],
         unique=False,
+    )
+
+    # WHICH run committed each intention. The reconciliation sweep judges a `pending` row by its
+    # owning run's LIVENESS rather than by elapsed time — a legitimate upload-session operation
+    # allows 600 s and a whole run can last hours, so an age-only rule reconciles live uploads out
+    # from under themselves. Nullable, and `ON DELETE SET NULL` like `attachment_id`: the
+    # tombstone outlives everything it points at.
+    op.add_column(
+        'digest_hosted_media', sa.Column('run_id', sa.Integer(), nullable=True)
+    )
+    op.create_foreign_key(
+        'digest_hosted_media_run_id_fkey',
+        'digest_hosted_media',
+        'digest_runs',
+        ['run_id'],
+        ['id'],
+        ondelete='SET NULL',
+    )
+    op.create_index(
+        op.f('ix_digest_hosted_media_run_id'), 'digest_hosted_media', ['run_id'], unique=False
     )
     op.create_index(
         op.f('ix_digest_hosted_media_dropbox_path'),
@@ -134,9 +167,28 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Lossy by necessity — see the module docstring. The old primary key cannot hold a tombstone
-    # whose attachment is gone, nor a second object for one attachment.
-    op.execute(sa.text("DELETE FROM digest_hosted_media WHERE attachment_id IS NULL"))
+    # REFUSE before touching anything. A row with no attachment is an ownership tombstone — the
+    # only record that a file exists on Dropbox — and the old shape has nowhere to put it. Deleting
+    # it to make the old primary key fit would strand that file permanently, during a rollback,
+    # with nothing to notice it. The rollback stops here and says what to do instead.
+    orphans = op.get_bind().execute(
+        sa.text("SELECT count(*) FROM digest_hosted_media WHERE attachment_id IS NULL")
+    ).scalar_one()
+    if orphans:
+        raise RuntimeError(
+            f"refusing to downgrade: {orphans} digest_hosted_media row(s) have no attachment. "
+            "Each one is the ONLY record of a file on Dropbox, and the pre-ledger shape cannot "
+            "hold it — this rollback would delete the file's sole locator. Sweep them first "
+            "(retention deletes the remote object and stamps the row), or export them, then "
+            "delete the rows deliberately and re-run the downgrade."
+        )
+    op.drop_index(op.f('ix_digest_hosted_media_run_id'), table_name='digest_hosted_media')
+    op.drop_constraint(
+        'digest_hosted_media_run_id_fkey', 'digest_hosted_media', type_='foreignkey'
+    )
+    op.drop_column('digest_hosted_media', 'run_id')
+    # A second remote object for ONE attachment has no expression in the old shape either, but it
+    # is recoverable from the run history rather than being a sole locator, so the newest wins.
     op.execute(
         sa.text(
             "DELETE FROM digest_hosted_media WHERE id NOT IN ("

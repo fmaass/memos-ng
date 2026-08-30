@@ -248,10 +248,18 @@ def test_the_raw_rewrite_turns_a_preview_url_into_the_bytes():
 
 
 async def test_delete_treats_an_already_missing_file_as_done():
-    """The retention sweep stamps `swept_at` only on success; a 409 (`path_lookup/not_found`) IS
-    the state it wants, and raising would re-attempt the same file every hour forever."""
+    """The retention sweep stamps `swept_at` only on success; a 409 TAGGED `path_lookup/not_found`
+    IS the state it wants, and raising would re-attempt the same file every hour forever.
+
+    The tag is what is read, not the status — see the 409-family tests at the end of this file.
+    """
     script = _Script(
-        {hosting.TOKEN_URL: _token_ok(), hosting.DELETE_URL: httpx.Response(409, json={})}
+        {
+            hosting.TOKEN_URL: _token_ok(),
+            hosting.DELETE_URL: httpx.Response(
+                409, json={"error_summary": "path_lookup/not_found/..."}
+            ),
+        }
     )
     host = _host(script)
     await host.refresh()
@@ -596,3 +604,81 @@ async def test_current_account_makes_no_request_at_all_without_all_three_keys(mo
 
     monkeypatch.setattr(httpx, "AsyncClient", _refuse)
     assert await hosting.current_account(app_key="", app_secret="s", refresh_token="r") is None
+
+
+# --- a 409 is a family of answers, not one ------------------------------------------------------
+
+
+def _conflict(summary: str) -> httpx.Response:
+    """A Dropbox route error, in the shape Dropbox actually sends: HTTP 409 plus a TAGGED body."""
+    return httpx.Response(
+        409,
+        json={
+            "error_summary": summary,
+            "error": {".tag": summary.split("/")[0]},
+        },
+    )
+
+
+async def test_only_a_not_found_tagged_409_means_the_object_is_absent():
+    """Dropbox answers 409 for EVERY route-level error, not only for a missing path.
+
+    Reading the status alone as "absent" turns a restricted path, a write lock or a rate limit
+    into the claim that a file is gone — the sweep then stamps the row `swept` while the object is
+    still on Dropbox, and nothing can ever find it again. The TAG is the answer.
+    """
+    absent = _Script(
+        {
+            hosting.TOKEN_URL: _token_ok(),
+            hosting.GET_METADATA_URL: _conflict("path/not_found/..."),
+        }
+    )
+    host = _host(absent)
+    await host.refresh()
+    assert await host.remote_exists("/memos-mail/run/a.mp4") is False
+
+    for summary in ("path/restricted_content/...", "too_many_write_operations/..."):
+        other = _Script(
+            {hosting.TOKEN_URL: _token_ok(), hosting.GET_METADATA_URL: _conflict(summary)}
+        )
+        host = _host(other)
+        await host.refresh()
+        with pytest.raises(hosting.DropboxError, match="metadata"):
+            await host.remote_exists("/memos-mail/run/a.mp4")
+
+
+async def test_only_a_not_found_tagged_409_counts_as_already_deleted():
+    """The same discrimination on the delete side, where the tag is `path_lookup/not_found`.
+
+    Already-gone is the state the sweep wants and must be stamped. Any other 409 is not that, and
+    stamping `swept` on it would record a deletion that never happened.
+    """
+    gone = _Script(
+        {hosting.TOKEN_URL: _token_ok(), hosting.DELETE_URL: _conflict("path_lookup/not_found/..")}
+    )
+    host = _host(gone)
+    await host.refresh()
+    await host.delete("/memos-mail/run/a.mp4")  # returns: nothing left to delete
+
+    for summary in ("path_write/conflict/file", "too_many_write_operations/.."):
+        refused = _Script(
+            {hosting.TOKEN_URL: _token_ok(), hosting.DELETE_URL: _conflict(summary)}
+        )
+        host = _host(refused)
+        await host.refresh()
+        with pytest.raises(hosting.DropboxError, match="delete failed"):
+            await host.delete("/memos-mail/run/a.mp4")
+
+
+async def test_a_409_with_an_unreadable_body_is_unknown_rather_than_absent():
+    """An untagged or non-JSON 409 tells us nothing, and "nothing" must not resolve a ledger row."""
+    script = _Script(
+        {
+            hosting.TOKEN_URL: _token_ok(),
+            hosting.GET_METADATA_URL: httpx.Response(409, content=b"<html>nope</html>"),
+        }
+    )
+    host = _host(script)
+    await host.refresh()
+    with pytest.raises(hosting.DropboxError, match="metadata"):
+        await host.remote_exists("/memos-mail/run/a.mp4")

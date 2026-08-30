@@ -598,6 +598,24 @@ def test_the_total_is_published_only_when_it_is_asked_for(admin_client):
     assert client.get(f"{PREFIX}/runs?limit=1&with_total=true").json()["totalCount"] == 3
 
 
+def test_the_total_counts_the_whole_list_and_not_the_page_after_the_cursor(admin_client):
+    """`totalCount` is a property of the COLLECTION, not of the page.
+
+    Applying the keyset predicate to it would make the number shrink with every page turned, and a
+    client showing it beside a paginator would count down towards zero as the user walked forward.
+    """
+    client, _ = admin_client
+    _insert_runs()
+    first = client.get(f"{PREFIX}/runs?limit=1&with_total=true").json()
+    assert first["totalCount"] == 3
+    second = client.get(
+        f"{PREFIX}/runs?limit=1&with_total=true&cursor={first['nextCursor']}"
+    ).json()
+    # Control: it really is the next page, and the total did not follow it down.
+    assert second["items"][0]["local_date"] != first["items"][0]["local_date"]
+    assert second["totalCount"] == 3
+
+
 def test_one_run_is_readable_by_id_and_a_missing_one_is_404(admin_client):
     """What the `Location` of a 202 from `POST /run` points at: a claim is only useful if its
     progress can be read back without paging the whole list to find it."""

@@ -162,6 +162,33 @@ def _existing_sync(paths: list[Path]) -> set[Path]:
     return {p for p in paths if p.exists()}
 
 
+# The 409 error families that mean "there is no object at that path", as Dropbox spells them in
+# `error_summary`: `path/not_found/…` from `/2/files/get_metadata`, `path_lookup/not_found/…` from
+# `/2/files/delete_v2`. Every OTHER 409 — `path/restricted_content`, `too_many_write_operations`,
+# a lock, an unexpected new tag — is a different condition entirely and must not be read as
+# absence: see `_is_not_found`.
+NOT_FOUND_FAMILIES = ("path", "path_lookup")
+NOT_FOUND_TAG = "not_found"
+
+
+def _is_not_found(response: httpx.Response) -> bool:
+    """Whether a 409 says "no object at that path" — and nothing looser.
+
+    Dropbox answers 409 for EVERY route-level error, not only for a missing path: restricted
+    content, a write-lock conflict, rate limiting and any tag it adds in future all arrive with the
+    same status. Reading the status alone as "absent" therefore turns an unrelated refusal into a
+    claim that a file is gone — which stamps a ledger row `swept` while its object is still on
+    Dropbox, unfindable for ever after. The TAG is the answer, so it is what is read; an
+    unparseable or unrecognised body is "unknown", never "absent".
+    """
+    try:
+        summary = response.json().get("error_summary") or ""
+    except ValueError:  # a 409 whose body is not JSON tells us nothing
+        return False
+    parts = [part for part in str(summary).split("/") if part]
+    return bool(parts) and parts[0] in NOT_FOUND_FAMILIES and NOT_FOUND_TAG in parts
+
+
 def raw_link(url: str) -> str:
     """Dropbox's share URL rewritten to serve the FILE rather than its preview page.
 
@@ -362,8 +389,11 @@ class DropboxHost:
     async def remote_exists(self, dropbox_path: str) -> bool:
         """Whether the remote object is there — the reconciliation probe for a `pending` row.
 
-        409 is Dropbox's `path/not_found`, which is a real ANSWER ("it never landed") and not an
-        error; anything else raises, because a ledger row must not be resolved on a guess.
+        A 409 tagged `path/not_found` is a real ANSWER ("it never landed") and not an error. Any
+        OTHER 409 is a different condition — restricted content, a lock, a tag Dropbox adds later —
+        and raises, because it says nothing about whether the object exists and a ledger row must
+        never be resolved on a guess: the caller leaves the row exactly as it is and the next pass
+        asks again.
         """
         response = await self._client.post(
             GET_METADATA_URL,
@@ -374,7 +404,7 @@ class DropboxHost:
         await self._beat()
         if response.status_code == 200:
             return True
-        if response.status_code == 409:
+        if response.status_code == 409 and _is_not_found(response):
             return False
         raise DropboxError(f"metadata lookup failed with HTTP {response.status_code}")
 
@@ -403,11 +433,17 @@ class DropboxHost:
             timeout=LINK_TIMEOUT_S,
         )
         await self._beat()
-        # 409 is `path_lookup/not_found`: the file is already gone, which is the state the sweep
-        # wants. Treating it as an error would leave `swept_at` unstamped and re-attempt it every
-        # hour forever.
-        if response.status_code not in (200, 409):
-            raise DropboxError(f"delete failed with HTTP {response.status_code}")
+        # A 409 tagged `path_lookup/not_found` means the file is already gone, which is the state
+        # the sweep wants; treating that as an error would leave the row unstamped and re-attempt
+        # it every hour for ever. Any other 409 is NOT that — a restricted or locked path answers
+        # 409 too — and stamping `swept` on one would claim a live file had been deleted, leaving
+        # it on Dropbox with nothing naming it. Those raise, and the sweep leaves the row for the
+        # next pass.
+        if response.status_code == 200:
+            return
+        if response.status_code == 409 and _is_not_found(response):
+            return
+        raise DropboxError(f"delete failed with HTTP {response.status_code}")
 
 
 def video_source_path(uid: str) -> Path | None:

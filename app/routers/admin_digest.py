@@ -557,9 +557,11 @@ async def list_digest_runs(
         )
     total: int | None = None
     if with_total:
-        total = await db.scalar(
-            select(func.count()).select_from(DigestRun).where(*conditions)
-        )
+        # The WHOLE list, never the tail after the cursor — `totalCount` answers "how many runs are
+        # there?", which is a property of the collection and not of the page. Applying the keyset
+        # predicate here would make the number shrink with every page turned, and a client showing
+        # it beside a paginator would count down towards zero as the user walked forward.
+        total = await db.scalar(select(func.count()).select_from(DigestRun))
     rows = list(
         (
             await db.execute(

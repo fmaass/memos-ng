@@ -34,9 +34,11 @@ from tests.digest_support import (
     TrackingSessionFactory,
     add_recipients,
     age_hosted_claim,
+    age_run,
     host_factory_for,
     hosted_rows,
     insert_hosted_row,
+    insert_run,
     reset_digest_state,
     seed_attachment,
     seed_memo,
@@ -340,6 +342,248 @@ async def test_a_pending_row_is_re_opened_by_a_later_claim_on_the_same_path(env)
         await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     )
     assert host.probes == []  # the re-claim reset the clock; nothing is stale
+
+
+async def test_a_swept_row_is_never_re_opened_by_a_later_claim(env):
+    """The lifecycle is write-once FORWARD: `pending → uploaded → swept`, and only a `pending` row
+    may be retried.
+
+    A `swept` row is the record that a file was DELETED from Dropbox. Re-opening it would erase the
+    only evidence that the deletion happened — the retention history stops being auditable, and a
+    row that says "pending" for an object nobody is uploading is exactly the state the
+    reconciliation sweep then has to go and probe about.
+    """
+    ledger = digest_runner.SessionLedger(async_session)
+    ledger_id = await ledger.claim(
+        attachment_id=None, kind="video", dropbox_path="/memos-mail/run/gone.mp4"
+    )
+    await ledger.mark_uploaded(ledger_id, shared_link="https://gone", size=7)
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE digest_hosted_media SET status = 'swept', swept_at = now() "
+                "WHERE id = :id"
+            ),
+            {"id": ledger_id},
+        )
+    engine.dispose()
+
+    again = await ledger.claim(
+        attachment_id=None, kind="video", dropbox_path="/memos-mail/run/gone.mp4"
+    )
+    assert again == ledger_id  # the same row: it is still the claim on that path
+    row = _rows_now()[0]
+    assert row["status"] == "swept"
+    assert row["swept_at"] is not None
+    assert row["shared_link"] == "https://gone"
+
+
+# --- a pending row is judged by its owning run, not by the clock --------------------------------
+
+
+async def test_a_pending_row_under_a_live_run_is_never_reconciled(env):
+    """The failure this closes: an upload that legitimately takes longer than the settling floor.
+
+    One upload-session operation allows 600 s and a whole run can last hours. An age-only rule
+    would probe this row mid-upload, find nothing there yet, stamp it `swept` — and the upload's
+    own `mark_uploaded` CAS would then find no `pending` row to advance and decline. The bytes
+    would land on Dropbox with the ledger claiming they had been deleted: a permanent orphan,
+    created by the sweep that exists to prevent them.
+    """
+    run_id = insert_run(status=None)  # in flight, and beating as of now
+    ledger_id = insert_hosted_row(
+        kind="video",
+        dropbox_path="/memos-mail/run/slow.mp4",
+        status="pending",
+        run_id=run_id,
+    )
+    age_hosted_claim(ledger_id, minutes=180)  # far past the settling floor
+    host = FakeHost()
+    assert (
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
+    )
+    assert host.probes == []  # not even asked about
+    assert _rows_now()[0]["status"] == "pending"
+
+
+async def test_a_pending_row_under_a_dead_run_is_reconciled(env):
+    """The same row, with its owner silent past the stale bar the run sweep uses. Nobody is
+    uploading it any more, so the remote is now the only authority on what happened."""
+    run_id = insert_run(status=None)
+    age_run(run_id, heartbeat_minutes=digest_runner.STALE_RUN_MINUTES + 5, started_minutes=200)
+    ledger_id = insert_hosted_row(
+        kind="video",
+        dropbox_path="/memos-mail/run/dead.mp4",
+        status="pending",
+        run_id=run_id,
+    )
+    age_hosted_claim(ledger_id, minutes=180)
+    host = FakeHost(absent={"/memos-mail/run/dead.mp4"})
+    assert (
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
+    )
+    assert host.probes == ["/memos-mail/run/dead.mp4"]
+    assert _rows_now()[0]["status"] == "swept"
+
+
+async def test_a_pending_row_under_a_finished_run_is_reconciled(env):
+    """A run that reached a terminal status is not going to upload anything else, whatever its
+    heartbeat says — so a row it left `pending` is genuinely stuck rather than in progress."""
+    run_id = insert_run(status="sent")
+    ledger_id = insert_hosted_row(
+        kind="video",
+        dropbox_path="/memos-mail/run/left.mp4",
+        status="pending",
+        run_id=run_id,
+    )
+    age_hosted_claim(ledger_id, minutes=180)
+    host = FakeHost()
+    assert (
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
+    )
+    assert host.probes == ["/memos-mail/run/left.mp4"]
+    assert _rows_now()[0]["status"] == "uploaded"  # the object was there after all
+
+
+async def test_a_probe_that_cannot_answer_leaves_the_row_exactly_as_it_was(env):
+    """"Unknown" is not "absent". A 409 with some other tag, a 5xx or a timeout says nothing about
+    whether the object exists, and resolving the row on that guess is how a live file stops being
+    findable. The row is left for the next pass, and the failure is logged once."""
+    from structlog.testing import capture_logs
+
+    run_id = insert_run(status="sent")
+    ledger_id = insert_hosted_row(
+        kind="video",
+        dropbox_path="/memos-mail/run/unknown.mp4",
+        status="pending",
+        run_id=run_id,
+    )
+    age_hosted_claim(ledger_id, minutes=180)
+
+    class _UnknownProbe(FakeHost):
+        async def remote_exists(self, dropbox_path: str) -> bool:
+            from app.services.digest.hosting import DropboxError
+
+            self.probes.append(dropbox_path)
+            raise DropboxError("metadata lookup failed with HTTP 409")
+
+    host = _UnknownProbe()
+    with capture_logs() as logs:
+        assert (
+            await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host))
+            == 0
+        )
+    assert host.probes == ["/memos-mail/run/unknown.mp4"]
+    assert _rows_now()[0]["status"] == "pending"
+    probe_failures = [
+        entry for entry in logs if entry["event"] == "digest.hosted_media_probe_failed"
+    ]
+    assert len(probe_failures) == 1
+
+
+async def test_the_run_a_ledger_row_names_is_the_run_that_claimed_it(env):
+    """Positive control on the join: without the FK being written, every liveness test above would
+    pass for the wrong reason (a NULL owner is treated as "not alive")."""
+    subject, data_root = env
+    await _seed_video_memo(subject, data_root)
+    result = await digest_runner.run_digest(
+        transport=FakeTransport(), host_factory=host_factory_for(FakeHost()), now_utc=NOW
+    )
+    assert result is not None
+    assert [row["run_id"] for row in _rows_now()] == [result.run_id]
+
+
+# --- the interruption between the bytes and the record ------------------------------------------
+
+
+async def test_a_crash_between_the_upload_and_the_mark_is_reconciled_without_re_uploading(env):
+    """The exact window the ledger exists for, end to end.
+
+    The upload SUCCEEDS and the process dies before `mark_uploaded` — so Dropbox holds an object
+    and the ledger holds a `pending` row naming its path. Nothing is lost: once the owning run is
+    no longer alive, the sweep asks Dropbox, finds the object, and records it. No orphan, and no
+    second upload of a file that is already there.
+    """
+    subject, data_root = env
+    await _seed_video_memo(subject, data_root)
+
+    class _DiesAfterTheUpload(FakeHost):
+        async def upload(self, local_path, dropbox_path):
+            await super().upload(local_path, dropbox_path)
+            raise RuntimeError("simulated process death between the upload and the mark")
+
+    crashing = _DiesAfterTheUpload()
+    with pytest.raises(RuntimeError):
+        await digest_runner.run_digest(
+            transport=FakeTransport(), host_factory=host_factory_for(crashing), now_utc=NOW
+        )
+    stranded = _rows_now()
+    assert [row["status"] for row in stranded] == ["pending"]
+    assert len(crashing.uploads) == 1  # the bytes DID land
+    dropbox_path = stranded[0]["dropbox_path"]
+
+    # The run that died is still in flight, so nothing is reconciled while it might be alive…
+    quiet = FakeHost()
+    assert (
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(quiet)) == 0
+    )
+    assert quiet.probes == []
+
+    # …until the stale-run sweep closes it, which is the same 15 minutes of silence.
+    age_run(
+        stranded[0]["run_id"],
+        heartbeat_minutes=digest_runner.STALE_RUN_MINUTES + 5,
+        started_minutes=60,
+    )
+    age_hosted_claim(stranded[0]["id"], minutes=90)
+    assert await digest_runner.sweep_stale_runs() == 1
+
+    recovering = FakeHost()  # `remote_exists` answers True: the object is there
+    assert (
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(recovering))
+        == 0
+    )
+    assert recovering.probes == [dropbox_path]
+    assert recovering.uploads == []  # nothing is uploaded a second time
+    row = _rows_now()[0]
+    assert row["status"] == "uploaded"
+    assert row["shared_link"] and row["uploaded_at"] is not None
+
+
+# --- the rollback refuses to destroy a tombstone ------------------------------------------------
+
+
+def test_the_downgrade_refuses_while_an_ownership_tombstone_exists(db_engine):
+    """A rollback must never silently delete the sole record of a file on Dropbox.
+
+    The pre-ledger shape keyed the row on `attachment_id`, so it has nowhere to put a row whose
+    attachment is gone — and that row is exactly the tombstone the retention sweep still needs.
+    The downgrade therefore refuses, before it touches anything, and names what to do first.
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    ledger_id = insert_hosted_row(
+        kind="video",
+        dropbox_path="/memos-mail/run/tombstone.mp4",
+        status="uploaded",
+        shared_link="https://dropbox.example/tombstone.mp4?raw=1",
+        uploaded_at=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+    try:
+        with pytest.raises(RuntimeError, match="refusing to downgrade"):
+            command.downgrade(cfg, "-1")
+        # The refusal is a REFUSAL: the schema is untouched, so the row is still readable.
+        assert [row["id"] for row in _rows_now()] == [ledger_id]
+    finally:
+        engine = create_engine(SYNC_URL)
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM digest_hosted_media WHERE id = :id"), {"id": ledger_id})
+        engine.dispose()
 
 
 # --- no transaction crosses an external boundary ------------------------------------------------
