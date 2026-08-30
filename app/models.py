@@ -1,10 +1,12 @@
 import enum
-from datetime import datetime
+from datetime import date, datetime, time
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -13,11 +15,12 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    Time,
     UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.database import Base
 
@@ -507,3 +510,270 @@ class PushSubscription(Base):
     p256dh: Mapped[str] = mapped_column(String(255))
     auth: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# --- Daily digest (MEMNG-233) -----------------------------------------------------------------
+#
+# The digest's state used to live in a satellite's `state.json` plus its `.env`. These five tables
+# ARE that state, so the admin panel and the send pipeline read one authority instead of two.
+
+
+class DigestTrigger(enum.StrEnum):
+    """What started a run. A plain string column, for the reason `JobKind` is one: the member set
+    grows (this one already gained `import` after the Story was written) and a free string costs no
+    `ALTER TYPE`, which cannot run in a transaction alongside its own use."""
+
+    scheduled = "scheduled"
+    manual = "manual"
+    test = "test"
+    # `import` is a Python keyword, so the MEMBER is spelled with a trailing underscore while the
+    # VALUE — the only thing the database and the API ever see — is exactly `import`.
+    import_ = "import"
+
+
+class DigestRunStatus(enum.StrEnum):
+    """A run's TERMINAL outcome. NULL means "still in flight", which is a state this enum
+    deliberately cannot spell: see `DigestRun.status`."""
+
+    sent = "sent"
+    nothing_to_send = "nothing_to_send"
+    deferred = "deferred"
+    failed = "failed"
+
+
+class DigestVisibilityScope(enum.StrEnum):
+    """Which memos a digest may mail. `PUBLIC_PROTECTED` is the default (design 3285 §9)."""
+
+    PUBLIC = "PUBLIC"
+    PUBLIC_PROTECTED = "PUBLIC_PROTECTED"
+
+
+class HostedMediaKind(enum.StrEnum):
+    video = "video"
+    image_full = "image_full"
+
+
+class StatusAlreadyTerminal(ValueError):
+    """A second write to a `digest_runs.status` that already holds a terminal value."""
+
+
+class DigestSettings(Base):
+    """The ONE row (id=1) that configures the digest.
+
+    A singleton rather than a generic `system_settings(key, value_json)` table, deliberately: the
+    twenty fields are typed, defaulted at the migration level and bound straight to a form. What
+    makes a second row impossible is two things together — the `CHECK (id = 1)` below, and a router
+    that only ever UPDATEs (app/routers/admin_digest.py has no INSERT path). Either alone would be
+    a convention; together they are a constraint.
+
+    Every non-nullable column carries a `server_default`, `id` included, so the seeded row can be
+    written by naming no column at all and so a column added by a later expand-only migration has
+    a defined value for the row that already exists. `updated_by` is the one nullable column: the
+    seed was written by the migration, not by a person.
+    """
+
+    __tablename__ = "digest_settings"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_digest_settings_singleton"),)
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=False, server_default=text("1"), default=1
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    send_time: Mapped[time] = mapped_column(
+        Time, default=time(7, 0), server_default=text("'07:00'")
+    )
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Europe/Zurich", server_default="Europe/Zurich"
+    )
+    visibility_scope: Mapped[str] = mapped_column(
+        String(32),
+        default=DigestVisibilityScope.PUBLIC_PROTECTED,
+        server_default=DigestVisibilityScope.PUBLIC_PROTECTED,
+    )
+    start_date: Mapped[date] = mapped_column(
+        Date, default=date(2026, 6, 1), server_default=text("'2026-06-01'")
+    )
+    # Minutes after send_time within which a late worker pass may still run today's digest.
+    grace_minutes: Mapped[int] = mapped_column(Integer, default=30, server_default=text("30"))
+    max_email_bytes: Mapped[int] = mapped_column(
+        Integer, default=18874368, server_default=text("18874368")
+    )
+    max_videos_per_memo: Mapped[int] = mapped_column(Integer, default=2, server_default=text("2"))
+    # Plausibility cap: a wrong scope or start_date must not mail the whole corpus to six external
+    # recipients in one morning. A selection above this fails the run instead of sending it.
+    max_memos_per_run: Mapped[int] = mapped_column(Integer, default=40, server_default=text("40"))
+    mail_title: Mapped[str] = mapped_column(
+        String(255),
+        default="The Daily Dami Memos Mail",
+        server_default="The Daily Dami Memos Mail",
+    )
+    from_name: Mapped[str] = mapped_column(
+        String(255),
+        default="The Daily Dami Memos Mail",
+        server_default="The Daily Dami Memos Mail",
+    )
+    # Empty means "bind to SMTP_USERNAME at send time" — the address that actually authenticates.
+    from_email: Mapped[str] = mapped_column(String(320), default="", server_default="")
+    hosting_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    dropbox_folder: Mapped[str] = mapped_column(
+        String(255), default="/memos-mail", server_default="/memos-mail"
+    )
+    retention_days: Mapped[int] = mapped_column(Integer, default=30, server_default=text("30"))
+    link_images_full: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    updated_by: Mapped[str | None] = mapped_column(String(255))
+
+
+class DigestRecipient(Base):
+    """One mailbox the digest goes to. Recipients are OUTSIDE the household and hold no account
+    here, so this is a list of addresses and not a join onto `users`.
+
+    `email` is stored lower-cased and UNIQUE. The lower-casing happens in the router (the only
+    writer), which is what makes the plain unique index a case-INSENSITIVE one: two spellings of
+    the same address normalise to the same stored string and the second insert conflicts."""
+
+    __tablename__ = "digest_recipients"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(255))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    added_by: Mapped[str | None] = mapped_column(String(255))
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DigestRun(Base):
+    """One attempt at a digest — and, while `status` is NULL, the single-flight LOCK itself.
+
+    The runner INSERTs and COMMITs this row before any other work, and two unique partial indexes
+    turn that commit into the lock:
+
+    * `uq_digest_runs_scheduled_local_date` — one `scheduled` row per local day (the day ledger).
+    * `uq_digest_runs_single_inflight` — `UNIQUE ((1)) WHERE status IS NULL`, a constant-expression
+      index, so at most ONE in-flight run of ANY trigger exists at a time. This is what covers a
+      manual run, which sits outside the day ledger by design; without it "refuse while an
+      in-flight run exists" would be a check-then-insert race that two concurrent callers both win.
+    * `uq_digest_runs_import` — the one-shot import owns exactly one row, so a re-run of the import
+      updates its aggregates instead of adding a second run.
+
+    A committed row is durable and self-fencing: unlike a session-scoped advisory lock, no
+    connection death, reap or crash releases it, so there is nothing to fence against.
+
+    `status` is NULLABLE and written EXACTLY ONCE, terminally, in the same transaction that sets
+    `finished_at`. `memosng_digest_runs_total{status}` is a DB-derived Counter and a Counter may
+    not move backwards: a row that carried a status before its outcome was known would either have
+    to be corrected later (decrementing a label) or would publish a false terminal result. The one
+    NULL→terminal write a runner does not make itself is the worker's stale-run sweep, which marks
+    a run that outlived its process `failed`; that is still exactly one write.
+    """
+
+    __tablename__ = "digest_runs"
+    __table_args__ = (
+        Index(
+            "uq_digest_runs_scheduled_local_date",
+            "local_date",
+            unique=True,
+            postgresql_where=text("trigger = 'scheduled'"),
+        ),
+        Index(
+            "uq_digest_runs_single_inflight",
+            text("(1)"),
+            unique=True,
+            postgresql_where=text("status IS NULL"),
+        ),
+        Index(
+            "uq_digest_runs_import",
+            "trigger",
+            unique=True,
+            postgresql_where=text("trigger = 'import'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trigger: Mapped[str] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str | None] = mapped_column(String(32))
+    memos_sent: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    parts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Claim-before-send fencing (user decision 1, per-accepted-part commit): a part is CLAIMED with
+    # a CAS on parts_claimed before it touches SMTP, and parts_sent advances after acceptance.
+    parts_sent: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    parts_claimed: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    recipients: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    error: Mapped[str | None] = mapped_column(Text)
+    local_date: Mapped[date] = mapped_column(Date)
+
+    @validates("status")
+    def _status_is_written_once(self, _key: str, value: str | None) -> str | None:
+        """Refuse any assignment to a `status` that already holds a terminal value.
+
+        The Counter monotonicity above is a property of the DATA, so it is guarded where the data
+        is written rather than in one caller. This guards ORM assignment — the only path Phase 1
+        and the pipeline use; a hand-written `UPDATE digest_runs SET status = …` bypasses it, and
+        no code in this repo writes that statement.
+        """
+        if self.status is not None:
+            raise StatusAlreadyTerminal(
+                f"digest_runs.status is already {self.status!r} and is written exactly once; "
+                f"refusing to overwrite it with {value!r}"
+            )
+        return value
+
+
+class DigestDelivery(Base):
+    """The registry of what has already been mailed: one row per memo, forever. It is what stops a
+    memo being sent twice across runs, so `memo_id` is the primary key and not merely indexed.
+
+    `run_id` is NOT NULL and carries NO server default, deliberately. It is a required FK, and a
+    default would let an insert that forgot it either fail obscurely on the FK or — worse — attach
+    the delivery to an arbitrary run and destroy exactly the audit relationship the column exists
+    for. An omitted `run_id` fails loudly at the NOT NULL instead. There is no `ondelete` on it
+    either: a run that produced deliveries cannot be deleted out from under them.
+
+    `part_index` records WHICH accepted SMTP part carried this memo — the commit boundary moved to
+    per-part (user decision 1), so a run's deliveries land in several transactions and the part
+    they belong to is the only way to read that history back.
+    """
+
+    __tablename__ = "digest_deliveries"
+
+    memo_id: Mapped[int] = mapped_column(
+        ForeignKey("memos.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("digest_runs.id"), index=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    part_index: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    # The memo went out with some of its media left off (shed to stay under max_email_bytes).
+    incomplete: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+
+
+class DigestHostedMedia(Base):
+    """A file uploaded to Dropbox for one mail, and the shared link that mail points at — the
+    table that replaces the satellite's `state.json["hosted_media"]`.
+
+    `swept_at` is stamped by the retention sweep when the file is deleted from Dropbox; the row is
+    KEPT so a later run can tell "never hosted" from "hosted and since swept" (links in older mails
+    die, which is today's behaviour and an accepted consequence of retention)."""
+
+    __tablename__ = "digest_hosted_media"
+
+    attachment_id: Mapped[int] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    dropbox_path: Mapped[str] = mapped_column(Text)
+    shared_link: Mapped[str] = mapped_column(Text)
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
+    swept_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

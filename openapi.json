@@ -484,6 +484,422 @@
         "title": "CreateRacedError",
         "type": "object"
       },
+      "DigestHostingOut": {
+        "description": "Whether media hosting can work at all, as the panel's status line reads it.\n\nPhase 1 answers from the PRESENCE of the three `DROPBOX_*` env keys and nothing else \u2014 no\nnetwork call is made and `account` is therefore always null here. The live account lookup that\nfills it in arrives with the hosting service in Phase 2; a caller reading `configured` alone\ngets the same answer either way, which is what the \"Not configured \u2014 mails go out inline-only\"\nline needs.",
+        "properties": {
+          "account": {
+            "title": "Account",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "title": "DigestHostingOut",
+        "type": "object"
+      },
+      "DigestRecipientCreate": {
+        "properties": {
+          "display_name": {
+            "maxLength": 255,
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "DigestRecipientCreate",
+        "type": "object"
+      },
+      "DigestRecipientOut": {
+        "properties": {
+          "added_at": {
+            "format": "date-time",
+            "title": "Added At",
+            "type": "string"
+          },
+          "added_by": {
+            "title": "Added By",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "display_name",
+          "enabled",
+          "added_by",
+          "added_at"
+        ],
+        "title": "DigestRecipientOut",
+        "type": "object"
+      },
+      "DigestRecipientPatch": {
+        "description": "Partial by design \u2014 the panel toggles `enabled` on its own, without resending the name.\n\nAn omitted field is \"leave it alone\" and is told apart from an explicit `null` (which clears\nthe display name) by `model_fields_set`, not by the value.",
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "title": "DigestRecipientPatch",
+        "type": "object"
+      },
+      "DigestRunOut": {
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "title": "Finished At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "local_date": {
+            "format": "date",
+            "title": "Local Date",
+            "type": "string"
+          },
+          "memos_sent": {
+            "title": "Memos Sent",
+            "type": "integer"
+          },
+          "parts": {
+            "title": "Parts",
+            "type": "integer"
+          },
+          "parts_claimed": {
+            "title": "Parts Claimed",
+            "type": "integer"
+          },
+          "parts_sent": {
+            "title": "Parts Sent",
+            "type": "integer"
+          },
+          "recipients": {
+            "title": "Recipients",
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trigger": {
+            "title": "Trigger",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "trigger",
+          "started_at",
+          "finished_at",
+          "status",
+          "memos_sent",
+          "parts",
+          "parts_sent",
+          "parts_claimed",
+          "recipients",
+          "error",
+          "local_date"
+        ],
+        "title": "DigestRunOut",
+        "type": "object"
+      },
+      "DigestSettingsOut": {
+        "properties": {
+          "dropbox_folder": {
+            "title": "Dropbox Folder",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "from_email": {
+            "title": "From Email",
+            "type": "string"
+          },
+          "from_name": {
+            "title": "From Name",
+            "type": "string"
+          },
+          "grace_minutes": {
+            "title": "Grace Minutes",
+            "type": "integer"
+          },
+          "hosting_enabled": {
+            "title": "Hosting Enabled",
+            "type": "boolean"
+          },
+          "link_images_full": {
+            "title": "Link Images Full",
+            "type": "boolean"
+          },
+          "mail_title": {
+            "title": "Mail Title",
+            "type": "string"
+          },
+          "max_email_bytes": {
+            "title": "Max Email Bytes",
+            "type": "integer"
+          },
+          "max_memos_per_run": {
+            "title": "Max Memos Per Run",
+            "type": "integer"
+          },
+          "max_videos_per_memo": {
+            "title": "Max Videos Per Memo",
+            "type": "integer"
+          },
+          "retention_days": {
+            "title": "Retention Days",
+            "type": "integer"
+          },
+          "send_time": {
+            "format": "time",
+            "title": "Send Time",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "title": "Updated By",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visibility_scope": {
+            "$ref": "#/components/schemas/DigestVisibilityScope"
+          }
+        },
+        "required": [
+          "enabled",
+          "send_time",
+          "timezone",
+          "visibility_scope",
+          "start_date",
+          "grace_minutes",
+          "max_email_bytes",
+          "max_videos_per_memo",
+          "max_memos_per_run",
+          "mail_title",
+          "from_name",
+          "from_email",
+          "hosting_enabled",
+          "dropbox_folder",
+          "retention_days",
+          "link_images_full",
+          "updated_at",
+          "updated_by"
+        ],
+        "title": "DigestSettingsOut",
+        "type": "object"
+      },
+      "DigestSettingsPut": {
+        "description": "The WHOLE settings row, not a patch.\n\nThe panel edits these fields behind one Save bar (design 3285 \u00a76), so the request that Save\nsends IS the new state \u2014 which also means a field the client omits is a client bug rather than\n\"leave it alone\", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:\nthey exist so a typo cannot arm something absurd, and the admin stays free inside them.",
+        "properties": {
+          "dropbox_folder": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Dropbox Folder",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "from_email": {
+            "maxLength": 320,
+            "title": "From Email",
+            "type": "string"
+          },
+          "from_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "From Name",
+            "type": "string"
+          },
+          "grace_minutes": {
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Grace Minutes",
+            "type": "integer"
+          },
+          "hosting_enabled": {
+            "title": "Hosting Enabled",
+            "type": "boolean"
+          },
+          "link_images_full": {
+            "title": "Link Images Full",
+            "type": "boolean"
+          },
+          "mail_title": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Mail Title",
+            "type": "string"
+          },
+          "max_email_bytes": {
+            "maximum": 104857600.0,
+            "minimum": 1048576.0,
+            "title": "Max Email Bytes",
+            "type": "integer"
+          },
+          "max_memos_per_run": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Max Memos Per Run",
+            "type": "integer"
+          },
+          "max_videos_per_memo": {
+            "maximum": 50.0,
+            "minimum": 0.0,
+            "title": "Max Videos Per Memo",
+            "type": "integer"
+          },
+          "retention_days": {
+            "maximum": 3650.0,
+            "minimum": 1.0,
+            "title": "Retention Days",
+            "type": "integer"
+          },
+          "send_time": {
+            "format": "time",
+            "title": "Send Time",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "timezone": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Timezone",
+            "type": "string"
+          },
+          "visibility_scope": {
+            "$ref": "#/components/schemas/DigestVisibilityScope"
+          }
+        },
+        "required": [
+          "enabled",
+          "send_time",
+          "timezone",
+          "visibility_scope",
+          "start_date",
+          "grace_minutes",
+          "max_email_bytes",
+          "max_videos_per_memo",
+          "max_memos_per_run",
+          "mail_title",
+          "from_name",
+          "from_email",
+          "hosting_enabled",
+          "dropbox_folder",
+          "retention_days",
+          "link_images_full"
+        ],
+        "title": "DigestSettingsPut",
+        "type": "object"
+      },
+      "DigestVisibilityScope": {
+        "description": "Which memos a digest may mail. `PUBLIC_PROTECTED` is the default (design 3285 \u00a79).",
+        "enum": [
+          "PUBLIC",
+          "PUBLIC_PROTECTED"
+        ],
+        "title": "DigestVisibilityScope",
+        "type": "string"
+      },
       "EditKeyConflictDetail": {
         "description": "Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT\nmemo. Both alternatives to refusing are wrong \u2014 replaying would answer a PATCH of one memo with\nanother memo's body (a uid the client never asked about), and applying would leave one key\nnaming two edits, after which neither could be replayed. `memo_uid` names the memo the key is\nbound to so a client can tell a stale key apart from a mis-generated one. Retrying is pointless:\nthe fix is a fresh key, which is why this is a 4xx and not the 503 a raced edit gets.",
         "properties": {
@@ -1762,6 +2178,328 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/admin/digest/hosting": {
+      "get": {
+        "description": "Report whether Dropbox hosting is configured, from the env keys alone.\n\nPresence, never the value: the three keys are secrets and nothing about them is echoed back \u2014\n`configured` is the whole answer. All three are required, because two out of three cannot\nrefresh a token, and an empty key is the switch that disables hosting globally.",
+        "operationId": "get_digest_hosting_api_admin_digest_hosting_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestHostingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Get Digest Hosting",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/digest/recipients": {
+      "get": {
+        "operationId": "list_digest_recipients_api_admin_digest_recipients_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DigestRecipientOut"
+                  },
+                  "title": "Response List Digest Recipients Api Admin Digest Recipients Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Digest Recipients",
+        "tags": [
+          "admin-digest"
+        ]
+      },
+      "post": {
+        "operationId": "add_digest_recipient_api_admin_digest_recipients_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DigestRecipientCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestRecipientOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add Digest Recipient",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/digest/recipients/{recipient_id}": {
+      "delete": {
+        "operationId": "remove_digest_recipient_api_admin_digest_recipients__recipient_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "recipient_id",
+            "required": true,
+            "schema": {
+              "title": "Recipient Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove Digest Recipient",
+        "tags": [
+          "admin-digest"
+        ]
+      },
+      "patch": {
+        "operationId": "update_digest_recipient_api_admin_digest_recipients__recipient_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "recipient_id",
+            "required": true,
+            "schema": {
+              "title": "Recipient Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DigestRecipientPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestRecipientOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Update Digest Recipient",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/digest/runs": {
+      "get": {
+        "description": "The most recent runs, newest first \u2014 the panel's Runs table.\n\nOrdered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import\nrow is stamped by the same `now()` as anything else committed in that transaction), and an\nunstable order would make the table shuffle between refreshes.",
+        "operationId": "list_digest_runs_api_admin_digest_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DigestRunOut"
+                  },
+                  "title": "Response List Digest Runs Api Admin Digest Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Digest Runs",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/digest/settings": {
+      "get": {
+        "operationId": "get_digest_settings_api_admin_digest_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestSettingsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Get Digest Settings",
+        "tags": [
+          "admin-digest"
+        ]
+      },
+      "put": {
+        "description": "Update the one settings row. There is no create path here, deliberately \u2014 see SETTINGS_ID.",
+        "operationId": "put_digest_settings_api_admin_digest_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DigestSettingsPut"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestSettingsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Put Digest Settings",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
     "/api/attachments": {
       "get": {
         "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 mirrors `_viewable`\n/ memo visibility. ?order=asc walks the same library oldest-first.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
