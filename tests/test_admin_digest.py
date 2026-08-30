@@ -556,3 +556,164 @@ def test_hosting_never_echoes_a_credential(admin_client, monkeypatch):
     body = client.get(f"{PREFIX}/hosting").text
     assert "sup3rsecret" not in body
     assert '"configured":true' in body.replace(" ", "")  # control: the request really was served
+
+
+# --- the guard serializes, it does not merely count --------------------------------------------
+
+
+def _seed_enabled_recipients(*emails: str) -> list[int]:
+    engine = create_engine(SYNC_URL)
+    ids: list[int] = []
+    with engine.begin() as conn:
+        for email in emails:
+            ids.append(
+                conn.execute(
+                    text(
+                        "INSERT INTO digest_recipients (email, enabled) "
+                        "VALUES (:e, true) RETURNING id"
+                    ),
+                    {"e": email},
+                ).scalar_one()
+            )
+        conn.execute(text("UPDATE digest_settings SET enabled = true"))
+    engine.dispose()
+    return ids
+
+
+def _enabled_recipient_count() -> int:
+    engine = create_engine(SYNC_URL)
+    with engine.connect() as conn:
+        count = conn.execute(
+            text("SELECT count(*) FROM digest_recipients WHERE enabled")
+        ).scalar_one()
+    engine.dispose()
+    return count
+
+
+async def test_two_overlapping_disables_cannot_empty_an_armed_digest(db_engine, monkeypatch):
+    """The A2 guard counts, and a count is a check-then-act — so it has to be SERIALIZED.
+
+    Two requests, two real database sessions on two real connections, driving the REAL handlers
+    (`remove_digest_recipient` and `update_digest_recipient`) against the last two enabled
+    recipients of an armed digest. The interleave is forced with events rather than sleeps: the
+    first request is held open at its COMMIT (its own session's `commit` is wrapped, which patches
+    a dependency of the handler and not the handler), the second then enters the guard while the
+    first still holds the row lock, and `wait_for` proves it is genuinely BLOCKED rather than
+    merely losing a race — on the unserialized code it sails through in milliseconds, counts the
+    other recipient as still enabled, and both disables succeed, leaving zero.
+    """
+    import asyncio
+
+    from app.database import async_session
+    from app.models import DigestRecipient, User
+    from app.routers.admin_digest import (
+        DigestRecipientPatch,
+        remove_digest_recipient,
+        update_digest_recipient,
+    )
+    from fastapi import HTTPException
+    from sqlalchemy import select
+
+    first_id, second_id = _seed_enabled_recipients("first@example.com", "second@example.com")
+    admin = User(subject="race_admin", role="admin")
+    first_holds_the_lock = asyncio.Event()
+    second_has_entered = asyncio.Event()
+    let_the_first_commit = asyncio.Event()
+    outcomes: dict[str, object] = {}
+
+    async def first_request() -> None:
+        async with async_session() as db:
+            real_commit = db.commit
+
+            async def held_commit() -> None:
+                first_holds_the_lock.set()
+                await let_the_first_commit.wait()
+                await real_commit()
+
+            monkeypatch.setattr(db, "commit", held_commit)
+            await remove_digest_recipient(first_id, admin, db)
+            outcomes["first"] = 204
+
+    async def second_request() -> None:
+        async with async_session() as db:
+            target = (
+                await db.execute(
+                    select(DigestRecipient).where(DigestRecipient.id == second_id)
+                )
+            ).scalar_one()
+            assert target.enabled is True  # control: it really is an enabled recipient
+            await first_holds_the_lock.wait()
+            second_has_entered.set()
+            try:
+                await update_digest_recipient(
+                    second_id, DigestRecipientPatch(enabled=False), admin, db
+                )
+            except HTTPException as refused:
+                await db.rollback()
+                outcomes["second"] = refused.status_code
+            else:
+                outcomes["second"] = 200
+
+    first_task = asyncio.create_task(first_request())
+    second_task = asyncio.create_task(second_request())
+    try:
+        await first_holds_the_lock.wait()
+        await second_has_entered.wait()
+        with pytest.raises(TimeoutError):
+            # Blocked on the singleton's row lock, which the first request holds until it commits.
+            # Unserialized, this returns almost immediately and the assertion fails.
+            await asyncio.wait_for(asyncio.shield(second_task), timeout=3.0)
+    finally:
+        let_the_first_commit.set()
+        await asyncio.gather(first_task, second_task)
+
+    assert outcomes == {"first": 204, "second": 422}
+    assert _enabled_recipient_count() == 1
+
+
+async def test_two_overlapping_disables_both_succeed_when_a_third_recipient_remains(db_engine):
+    """Control for the test above: serialization must not turn a legitimate pair of disables into
+    a refusal. With three enabled recipients both requests are allowed and one is left."""
+    import asyncio
+
+    from app.database import async_session
+    from app.models import User
+    from app.routers.admin_digest import remove_digest_recipient
+
+    ids = _seed_enabled_recipients("a@example.com", "b@example.com", "c@example.com")
+    admin = User(subject="race_admin", role="admin")
+
+    async def remove(recipient_id: int) -> None:
+        async with async_session() as db:
+            await remove_digest_recipient(recipient_id, admin, db)
+
+    await asyncio.gather(remove(ids[0]), remove(ids[1]))
+    assert _enabled_recipient_count() == 1
+
+
+def test_an_over_long_display_name_is_refused_rather_than_500(admin_client):
+    """A 256-character name used to pass request validation and die at the VARCHAR(255) on commit,
+    which reaches the caller as a 500 for what is an ordinary input error."""
+    client, _ = admin_client
+    recipient_id = client.post(f"{PREFIX}/recipients", json={"email": "long@example.com"}).json()[
+        "id"
+    ]
+    refused = client.patch(
+        f"{PREFIX}/recipients/{recipient_id}", json={"display_name": "x" * 256}
+    )
+    assert refused.status_code == 422, refused.text
+    # Control: one character shorter is stored, so the bound is the bound and not a blanket refusal.
+    accepted = client.patch(
+        f"{PREFIX}/recipients/{recipient_id}", json={"display_name": "x" * 255}
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["display_name"] == "x" * 255
+
+
+def test_an_over_long_display_name_is_refused_on_create_too(admin_client):
+    client, _ = admin_client
+    response = client.post(
+        f"{PREFIX}/recipients", json={"email": "long2@example.com", "display_name": "x" * 256}
+    )
+    assert response.status_code == 422, response.text
+    assert client.get(f"{PREFIX}/recipients").json() == []

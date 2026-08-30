@@ -582,6 +582,7 @@
         "description": "Partial by design \u2014 the panel toggles `enabled` on its own, without resending the name.\n\nAn omitted field is \"leave it alone\" and is told apart from an explicit `null` (which clears\nthe display name) by `model_fields_set`, not by the value.",
         "properties": {
           "display_name": {
+            "maxLength": 255,
             "title": "Display Name",
             "type": [
               "string",

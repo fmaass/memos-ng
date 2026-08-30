@@ -149,7 +149,10 @@ class DigestRecipientPatch(BaseModel):
     the display name) by `model_fields_set`, not by the value.
     """
 
-    display_name: str | None = None
+    # Bounded like `DigestRecipientCreate.display_name`, and for a reason a request schema must
+    # carry rather than leave to the column: without it a 256-character name passes validation and
+    # dies at the VARCHAR(255) on COMMIT, which the caller sees as a 500 for what is plainly a 422.
+    display_name: str | None = Field(default=None, max_length=255)
     enabled: bool | None = None
 
 
@@ -188,10 +191,16 @@ class DigestHostingOut(BaseModel):
 # --- helpers ----------------------------------------------------------------------------------
 
 
-async def _settings_row(db: AsyncSession) -> DigestSettings:
-    row = (
-        await db.execute(select(DigestSettings).where(DigestSettings.id == SETTINGS_ID))
-    ).scalar_one_or_none()
+async def _settings_row(db: AsyncSession, *, for_update: bool = False) -> DigestSettings:
+    """The singleton, optionally LOCKED for the rest of this transaction.
+
+    `for_update=True` is not about reading a fresh value — it is a mutex. See
+    `_refuse_leaving_nobody_to_send_to`, the only caller that asks for it.
+    """
+    statement = select(DigestSettings).where(DigestSettings.id == SETTINGS_ID)
+    if for_update:
+        statement = statement.with_for_update()
+    row = (await db.execute(statement)).scalar_one_or_none()
     if row is None:
         # The migration seeds it, so its absence is a broken install rather than a caller error —
         # and creating one here would be the INSERT path that makes a second row possible.
@@ -242,10 +251,25 @@ async def _refuse_leaving_nobody_to_send_to(db: AsyncSession, target: DigestReci
 
     422 rather than 409: it is the same family as the settings guard that refuses to arm a digest
     with no recipients, and the two must not answer the same mistake with two different codes.
+
+    **The count below is a check-then-act, so it is serialized rather than merely careful.** A
+    disabled button is never the guard: two overlapping disables of the last TWO enabled recipients
+    would each count the other as still enabled, both pass, and the digest would be left armed with
+    nobody to send to — the exact state this refusal exists to prevent. So every recipient mutation
+    that can lower the enabled count takes a row lock on the `digest_settings` singleton FIRST and
+    holds it to COMMIT. The singleton is the natural mutex: there is exactly one row, every such
+    mutation is already interested in it (it is what says whether the digest is armed), and one row
+    taken in one order by one code path cannot deadlock. The second request therefore does not read
+    a stale count — it waits, and then counts the first one's committed effect.
+
+    The lock is taken before the early returns on purpose: a request that turns out not to need the
+    guard has still declared its interest, and the alternative (decide, then lock) is the
+    check-then-act this exists to close.
     """
+    settings_row = await _settings_row(db, for_update=True)
     if not target.enabled:
         return  # already disabled — removing it cannot lower the enabled count
-    if not (await _settings_row(db)).enabled:
+    if not settings_row.enabled:
         return  # the digest is off; leaving it with no recipients breaks no delivery
     others = await db.scalar(
         select(func.count())
