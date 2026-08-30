@@ -593,7 +593,11 @@ class DigestSettings(Base):
     start_date: Mapped[date] = mapped_column(
         Date, default=date(2026, 6, 1), server_default=text("'2026-06-01'")
     )
-    # Minutes after send_time within which a late worker pass may still run today's digest.
+    # MEDIA-readiness grace, not a scheduling window: how long selection waits for a memo's
+    # derived tiers (thumb, web mp4) before giving up on them. Inside the grace the memo is
+    # deferred and the scan STOPS there, so a later memo can never overtake an earlier one; past
+    # the grace it goes out flagged `incomplete`. The scheduling window is a different thing
+    # entirely and is not configurable — it runs from `send_time` to local midnight.
     grace_minutes: Mapped[int] = mapped_column(Integer, default=30, server_default=text("30"))
     max_email_bytes: Mapped[int] = mapped_column(
         Integer, default=18874368, server_default=text("18874368")
@@ -671,6 +675,14 @@ class DigestRun(Base):
     to be corrected later (decrementing a label) or would publish a false terminal result. The one
     NULL→terminal write a runner does not make itself is the worker's stale-run sweep, which marks
     a run that outlived its process `failed`; that is still exactly one write.
+
+    Two writers is also why the once-only rule cannot live in the ORM alone. The pipeline's own
+    claims, progress updates and terminal write are hand-written UPDATEs carrying `AND status IS
+    NULL` in the SQL (`app/services/digest/runner.py`), because a validator on a mapped instance
+    guards ONE session's object and knows nothing about the sweep committing from another
+    connection. The predicate in the statement is the real guard; the validator below catches the
+    in-session second assignment the predicate alone would let through inside one uncommitted
+    transaction.
     """
 
     __tablename__ = "digest_runs"
@@ -711,15 +723,27 @@ class DigestRun(Base):
     recipients: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     error: Mapped[str | None] = mapped_column(Text)
     local_date: Mapped[date] = mapped_column(Date)
+    # LIVENESS, which is what the stale-run sweep must test — never elapsed time. A legitimate run
+    # can exceed two hours (up to `max_memos_per_run` memos, several videos each, Dropbox upload
+    # sessions that allow 600 s PER OPERATION), so a sweep measuring from `started_at` would
+    # declare a healthy run dead, drop it out of `uq_digest_runs_single_inflight`, and let a second
+    # run send the same memos beside it. The runner stamps this before and after every part send
+    # and after every Dropbox upload-session operation, so the longest gap a healthy run leaves is
+    # one operation; the sweep's bar is 15 minutes of silence. NULL means "has not beaten yet", and
+    # the sweep judges such a run on `started_at` (COALESCE) at the same bar.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     @validates("status")
     def _status_is_written_once(self, _key: str, value: str | None) -> str | None:
         """Refuse any assignment to a `status` that already holds a terminal value.
 
         The Counter monotonicity above is a property of the DATA, so it is guarded where the data
-        is written rather than in one caller. This guards ORM assignment — the only path Phase 1
-        and the pipeline use; a hand-written `UPDATE digest_runs SET status = …` bypasses it, and
-        no code in this repo writes that statement.
+        is written rather than in one caller. This guards ORM assignment — the admin API's and the
+        import's path. It is NOT the only guard and must not be read as one: the pipeline writes
+        its terminal status as a fenced `UPDATE … WHERE id = :id AND status IS NULL`, which loads
+        no instance and so never reaches this validator. Cross-session protection is that
+        predicate; this is what catches a second assignment inside one uncommitted transaction,
+        which the predicate alone would let through.
         """
         if self.status is not None:
             raise StatusAlreadyTerminal(

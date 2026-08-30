@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +11,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import REGISTRY
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
@@ -23,6 +25,7 @@ from app.database import async_session
 from app.security_headers import CSP
 from app.services import management_grant
 from app.services.cursors import InvalidCursor
+from app.services.digest import metrics as digest_metrics
 from app.version import __version__
 
 logger = structlog.get_logger(__name__)
@@ -48,8 +51,15 @@ async def lifespan(app: FastAPI):
     settings.validate_runtime_secrets()  # fail fast if prod is on the dev-default key
     data_root = Path(settings.DATA_ROOT)
     await to_thread.run_sync(_create_data_dirs_sync, data_root)
+    # The digest metrics snapshot: a supervised task refreshes it every 60 s and the custom
+    # collector below reads ONLY that, so a /metrics scrape does zero database work (ADR-0009 —
+    # the constraint the pool-exhaustion fix left behind). The task is exception-isolated inside
+    # `digest_metrics.refresher`; if it dies anyway the collector's own staleness check makes the
+    # metrics go ABSENT rather than freeze, which is what the alerting needs to see.
+    digest_refresher = asyncio.create_task(digest_metrics.refresher())
     logger.info("app_started", data_root=str(data_root), version=__version__)
     yield
+    digest_refresher.cancel()
     # PAT last_used stamps run as background tasks (MEMNG-81), so shutdown can catch one in
     # flight. Give it a bounded moment to land; anything slower is cancelled deliberately here
     # rather than being torn down mid-write by the loop with the engine already going away.
@@ -103,6 +113,12 @@ app.router.routes.extend(native_router.router.routes)
 
 # Instrument AFTER all routers are registered so route resolution stays consistent.
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+# The digest's own families, on the SAME default registry the instrumentator exposes — one
+# /metrics endpoint, one scrape job, no listening socket in the worker (which has no HTTP server
+# at all). Registration is guarded because this module is re-imported by the test suite's app
+# fixtures, and prometheus_client refuses a duplicate collector by raising.
+digest_metrics.register_once(REGISTRY)
 
 
 SECURITY_SCHEMES = {

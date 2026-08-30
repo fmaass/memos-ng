@@ -261,6 +261,7 @@ def _datetime_fields() -> list[tuple[str, str, Any]]:
 EXPECTED_DATETIME_FIELDS = {
     ("AttachmentMeta", "captured_at"),
     ("AttachmentOut", "captured_at"),
+    ("DigestPreviewMemo", "created_at"),
     ("DigestRecipientOut", "added_at"),
     ("DigestRunOut", "finished_at"),
     ("DigestRunOut", "started_at"),

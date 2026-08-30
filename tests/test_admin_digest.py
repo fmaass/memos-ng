@@ -127,16 +127,23 @@ def test_normalise_email_decides_shape_and_stored_form_together(raw, expected):
 
 
 def test_the_sweep_below_covers_every_route_this_router_publishes():
-    """Positive control: an empty parametrisation passes for the wrong reason."""
-    assert len(ADMIN_ROUTES) == 8, ADMIN_ROUTES
+    """Positive control: an empty parametrisation passes for the wrong reason.
+
+    Phase 2 adds three ACTION routes (preview, test-send, run) and they are covered by the same
+    sweeps automatically — which is the point of reading the route table off the app rather than
+    typing it out."""
+    assert len(ADMIN_ROUTES) == 11, ADMIN_ROUTES
     assert (
         sorted({path for _, path in ADMIN_ROUTES})
         == [
             f"{PREFIX}/hosting",
+            f"{PREFIX}/preview",
             f"{PREFIX}/recipients",
             f"{PREFIX}/recipients/{{recipient_id}}",
+            f"{PREFIX}/run",
             f"{PREFIX}/runs",
             f"{PREFIX}/settings",
+            f"{PREFIX}/test-send",
         ]
     )
 
@@ -211,6 +218,8 @@ def test_an_admin_reads_the_seeded_settings(admin_client):
 
 def test_a_put_updates_the_row_and_stamps_who_did_it(admin_client):
     client, subject = admin_client
+    # Arming needs somebody to send to (the Phase-2 guard), so give it one first.
+    assert client.post(f"{PREFIX}/recipients", json={"email": "a@b.co"}).status_code == 201
     response = client.put(
         f"{PREFIX}/settings",
         json=_settings_payload(
@@ -281,11 +290,59 @@ def test_a_from_email_is_stored_normalised_and_may_be_emptied(admin_client):
     assert cleared.json()["from_email"] == ""
 
 
-def test_arming_the_digest_with_no_recipients_is_allowed_in_phase_1(admin_client):
-    """Explicit: the "enabled with zero enabled recipients" refusal is Phase 2's PUT guard. Phase 1
-    must NOT reject it, or the panel could not be built against this contract."""
+def test_arming_the_digest_with_no_recipients_is_refused(admin_client):
+    """Phase 1 deliberately allowed this so the panel could be built against a contract that did
+    not yet exist. Phase 2's pipeline is what makes it a real failure: an armed digest with zero
+    enabled recipients writes a `failed` run every morning and can never do anything else."""
     client, _ = admin_client
-    assert client.put(f"{PREFIX}/settings", json=_settings_payload(enabled=True)).status_code == 200
+    refused = client.put(f"{PREFIX}/settings", json=_settings_payload(enabled=True))
+    assert refused.status_code == 422, refused.text
+    assert "no enabled recipients" in refused.json()["detail"]
+    # …and nothing was persisted: the row is still disabled.
+    assert client.get(f"{PREFIX}/settings").json()["enabled"] is False
+
+
+def test_arming_the_digest_is_allowed_once_a_recipient_is_enabled(admin_client):
+    client, _ = admin_client
+    assert client.post(f"{PREFIX}/recipients", json={"email": "a@b.co"}).status_code == 201
+    assert client.put(
+        f"{PREFIX}/settings", json=_settings_payload(enabled=True)
+    ).status_code == 200
+
+
+def test_a_disabled_recipient_does_not_count_as_someone_to_send_to(admin_client):
+    client, _ = admin_client
+    assert (
+        client.post(
+            f"{PREFIX}/recipients", json={"email": "a@b.co", "enabled": False}
+        ).status_code
+        == 201
+    )
+    assert client.put(
+        f"{PREFIX}/settings", json=_settings_payload(enabled=True)
+    ).status_code == 422
+
+
+@pytest.mark.parametrize("zone", ["Europe/Zurichh", "Not/AZone", "UTC+2"])
+def test_a_timezone_zoneinfo_cannot_load_is_refused(admin_client, zone):
+    """`digest_due` converts UTC to this zone to decide whether today's run is due, so a zone it
+    cannot resolve makes the digest permanently not-due. The gate defends against a value already
+    in the row; 422 at the door is what keeps one from ever being persisted."""
+    client, _ = admin_client
+    refused = client.put(f"{PREFIX}/settings", json=_settings_payload(timezone=zone))
+    assert refused.status_code == 422, refused.text
+    assert client.get(f"{PREFIX}/settings").json()["timezone"] == "Europe/Zurich"
+
+
+def test_a_valid_non_default_timezone_is_accepted(admin_client):
+    """The Phase-1 suite only ever exercised Europe/Zurich; a validator that accepted only that
+    would pass every one of those tests."""
+    client, _ = admin_client
+    accepted = client.put(
+        f"{PREFIX}/settings", json=_settings_payload(timezone="America/New_York")
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert client.get(f"{PREFIX}/settings").json()["timezone"] == "America/New_York"
 
 
 # --- recipients -------------------------------------------------------------------------------

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{{ subject }}</title>
+<style>
+  /* Mobile */
+  @media only screen and (max-width:600px){
+    .container{ width:100% !important; }
+    .px{ padding-left:18px !important; padding-right:18px !important; }
+    .gcell{ display:block !important; width:100% !important; padding:0 0 10px 0 !important; }
+    .h1{ font-size:22px !important; }
+  }
+  /* Dark mode */
+  @media (prefers-color-scheme: dark){
+    .page{ background:#16181c !important; }
+    .container{ background:#1f2329 !important; }
+    .text{ color:#e6e8eb !important; }
+    .muted{ color:#9aa3ad !important; }
+    .dayhead{ background:#2a2f37 !important; color:#e6e8eb !important; }
+    .divider{ border-color:#2a2f37 !important; }
+    .chip{ background:#2a2f37 !important; color:#cfd6de !important; }
+    .footer{ background:#1a1d22 !important; color:#9aa3ad !important; }
+    .note{ background:#3a2f12 !important; color:#f0d68a !important; }
+  }
+</style>
+</head>
+<body class="page" style="margin:0;padding:0;background:#f4f4f5;-webkit-text-size-adjust:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#f4f4f5" class="page" style="background:#f4f4f5;">
+<tr><td align="center" style="padding:24px 12px;">
+
+<table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" class="container" style="width:600px;max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.06);">
+
+  <!-- Header -->
+  <tr><td style="background:#1f3a44;padding:26px 30px;text-align:center;">
+    <div class="h1" style="color:#ffffff;font-size:25px;font-weight:700;letter-spacing:0.2px;">{{ mail_title }}</div>
+    <div style="color:#a9c4cc;font-size:14px;margin-top:5px;">{{ date_range }}</div>
+    {% if part_total > 1 %}
+    <div style="color:#a9c4cc;font-size:13px;margin-top:4px;">Part {{ part_index }} of {{ part_total }}</div>
+    {% endif %}
+  </td></tr>
+
+  {% if not day_groups %}
+  <tr><td class="px" style="padding:22px 30px;">
+    <div class="text" style="color:#33373d;font-size:16px;line-height:1.6;">No memos selected.</div>
+  </td></tr>
+  {% endif %}
+
+  {% for day in day_groups %}
+  <!-- Day header -->
+  <tr><td class="px" style="padding:22px 30px 0 30px;">
+    <span class="dayhead" style="display:inline-block;background:#fbeae3;color:#c2562f;font-size:14px;font-weight:600;padding:6px 14px;border-radius:999px;">{{ day.date_label }}</span>
+  </td></tr>
+
+  {% for card in day.cards %}
+  <tr><td class="px" style="padding:14px 30px 14px 30px;">
+
+    {% if card.content_html %}
+    <div class="text" style="color:#33373d;font-size:16px;line-height:1.6;margin-bottom:12px;">{{ card.content_html | safe }}</div>
+    {% endif %}
+
+    {% if card.images|length == 1 %}
+      {% set img = card.images[0] %}
+      {% if img.link_url %}
+      <a href="{{ img.link_url }}" style="text-decoration:none;"><img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="540" style="width:100%;max-width:540px;height:auto;display:block;border-radius:10px;" /></a>
+      {% else %}
+      <img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="540" style="width:100%;max-width:540px;height:auto;display:block;border-radius:10px;" />
+      {% endif %}
+    {% elif card.images|length > 1 %}
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>
+      {% for img in card.images %}
+        <td class="gcell" width="50%" valign="top" style="width:50%;padding:0 {% if loop.index is odd %}5px{% else %}0{% endif %} 10px {% if loop.index is even %}5px{% else %}0{% endif %};">
+          {% if img.link_url %}
+          <a href="{{ img.link_url }}" style="text-decoration:none;"><img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="262" style="width:100%;max-width:262px;height:auto;display:block;border-radius:10px;" /></a>
+          {% else %}
+          <img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="262" style="width:100%;max-width:262px;height:auto;display:block;border-radius:10px;" />
+          {% endif %}
+        </td>
+        {% if loop.index is even and not loop.last %}</tr><tr>{% endif %}
+      {% endfor %}
+      </tr></table>
+    {% endif %}
+
+    {% for v in card.videos %}
+      {% if v.status == "hosted" %}
+      <div style="margin-top:10px;text-align:center;">
+        {% if v.poster_cid %}
+        <a href="{{ v.url }}" style="text-decoration:none;display:inline-block;position:relative;">
+          <img src="cid:{{ v.poster_cid }}" alt="Video" width="540" style="width:100%;max-width:540px;height:auto;display:block;border-radius:10px;" />
+          <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;background:rgba(0,0,0,0.55);border-radius:50%;display:flex;align-items:center;justify-content:center;">
+            <div style="width:0;height:0;border-top:15px solid transparent;border-bottom:15px solid transparent;border-left:26px solid #ffffff;margin-left:5px;"></div>
+          </div>
+        </a>
+        {% else %}
+        <a href="{{ v.url }}" style="text-decoration:none;display:inline-block;background:#1f3a44;color:#ffffff;font-size:16px;font-weight:600;padding:14px 28px;border-radius:10px;">&#9654;&#xFE0E; Play video</a>
+        {% endif %}
+      </div>
+      {% elif v.status == "processing" %}
+      <div class="chip" style="display:inline-block;margin-top:10px;background:#eef2f4;color:#42525c;font-size:14px;padding:8px 14px;border-radius:10px;">&#127916; {{ v.filename }} <span style="opacity:0.7;">&mdash; video still processing</span></div>
+      {% elif v.status == "no_uploader" %}
+      <div class="chip" style="display:inline-block;margin-top:10px;background:#eef2f4;color:#42525c;font-size:14px;padding:8px 14px;border-radius:10px;">&#127916; {{ v.filename }} <span style="opacity:0.7;">&mdash; video hosting not configured</span></div>
+      {% endif %}
+    {% endfor %}
+
+    {% for shed in card.shed_links %}
+    <div style="margin-top:8px;"><a href="{{ shed.url }}" style="color:#1f3a44;font-size:14px;">Open full size &mdash; {{ shed.alt }}</a></div>
+    {% endfor %}
+
+    {% if card.media_incomplete %}
+    <div class="note" style="margin-top:10px;padding:8px 12px;background:#fef3cd;border-radius:8px;color:#856404;font-size:13px;">Not all media could be sent inline.</div>
+    {% endif %}
+
+    {% if card.is_incomplete %}
+    <div class="note" style="margin-top:10px;padding:8px 12px;background:#fef3cd;border-radius:8px;color:#856404;font-size:13px;">Some images weren't ready at send time.</div>
+    {% endif %}
+
+    {% if card.overflow_count and card.overflow_count > 0 %}
+    <div class="muted" style="margin-top:8px;color:#9aa3ad;font-size:13px;">+{{ card.overflow_count }} more (not shown)</div>
+    {% endif %}
+
+  </td></tr>
+  {% endfor %}
+
+  {% if not loop.last %}
+  <tr><td class="px" style="padding:8px 30px;"><div class="divider" style="border-top:1px solid #ececee;font-size:0;line-height:0;">&nbsp;</div></td></tr>
+  {% endif %}
+  {% endfor %}
+
+  <!-- Footer -->
+  <tr><td class="footer" style="background:#f7f8f9;padding:18px 30px;text-align:center;color:#8a929b;font-size:13px;">
+    {{ memo_count }} new memo{{ "s" if memo_count != 1 else "" }} across {{ day_groups|length }} day{{ "s" if day_groups|length != 1 else "" }}
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>

@@ -33,6 +33,8 @@ from app.models import (
     MediaJob,
 )
 from app.services import frame_share, media, push, reconcile
+from app.services.digest import gate as digest_gate
+from app.services.digest import runner as digest_runner
 from app.services.uploads import reap_expired_committed
 from app.version import __version__
 
@@ -529,6 +531,72 @@ async def run_frame_share_recover_safe() -> int:
     return recovered
 
 
+# The digest task currently in flight in THIS process, or None. Single-flight is two-layered and
+# both layers are needed: this handle refuses a second spawn inside one worker (cheap, immediate),
+# and the committed `digest_runs` row refuses one across processes (durable, authoritative). The
+# handle alone would not survive a restart; the row alone would let one worker spawn a second task
+# that then wasted a database round trip to be told no.
+_digest_task: asyncio.Task[object] | None = None
+
+
+def digest_task_in_flight() -> bool:
+    return _digest_task is not None and not _digest_task.done()
+
+
+def _clear_digest_task(task: asyncio.Task[object]) -> None:
+    global _digest_task
+    if _digest_task is task:
+        _digest_task = None
+
+
+async def digest_is_due() -> bool:
+    """Read the two facts the pure gate needs, and ask it. All errors isolated.
+
+    An error here answers "not due" rather than propagating: this runs on every poll, and a
+    database hiccup must not be able to halt media processing (the same boundary guard every other
+    periodic concern in this loop gets).
+    """
+    try:
+        async with async_session() as db:
+            settings_row = await digest_runner.load_settings(db)
+            last = await digest_runner.last_ledger_local_date(db)
+        return digest_gate.digest_due(datetime.now(UTC), settings_row, last)
+    except Exception:
+        logger.exception("digest.gate_error")
+        return False
+
+
+def spawn_digest() -> bool:
+    """Start a digest run as a SUPERVISED BACKGROUND TASK. Returns whether one was started.
+
+    Never awaited inline, and that is the whole point. This loop is serial — it drains a media job,
+    drains a frame-share job and stamps the heartbeat in one pass — while a digest run makes SMTP
+    sessions and Dropbox calls whose upload-session operations alone allow 600 s each. Awaiting it
+    would stall media and frame drains for minutes and starve the heartbeat, and the worker
+    healthcheck's 30-minute staleness bar plus `autoheal=true` would eventually kill the container
+    MID-SEND — which is exactly the crash window the delivery guarantee is about. Every blocking
+    call inside the task goes through `to_thread.run_sync`, so the loop keeps beating for the whole
+    run.
+    """
+    global _digest_task
+    if digest_task_in_flight():
+        return False
+    task = asyncio.create_task(digest_runner.run_scheduled_digest_safe())
+    task.add_done_callback(_clear_digest_task)
+    _digest_task = task
+    return True
+
+
+async def sweep_digest_safe() -> None:
+    """The two periodic digest sweeps, on the existing reap cadence and in their own tasks.
+
+    Both are already error-isolated inside `runner`; this is the one place the worker names them,
+    so the reap block stays readable.
+    """
+    await digest_runner.sweep_stale_runs()
+    await digest_runner.sweep_hosted_media_safe()
+
+
 class _DrainHealth:
     """Heartbeat honesty for the media loop (MEMNG-90). The loop stamps a liveness file every pass,
     which stayed green even while every drain failed — the wedge hid for ~5 h. An ordinary job
@@ -583,6 +651,11 @@ async def run() -> None:
         frame_status = await run_frame_share_drain()
         if health.healthy:
             beat()  # blocking-ok: the liveness stamp itself — see beat()
+        # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues draining
+        # immediately — see spawn_digest for why this is never awaited here.
+        if not digest_task_in_flight() and await digest_is_due():
+            if spawn_digest():
+                logger.info("digest_run_spawned")
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             reaped = await reap_expired_committed()
             if reaped:
@@ -598,6 +671,10 @@ async def run() -> None:
             # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
             # close: a stored video whose poster the unwind discarded gets its fast lane back.
             await run_commit_race_reconcile_safe()
+            # The digest's two sweeps ride the same cadence: a run whose process died is marked
+            # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
+            # is deleted from Dropbox.
+            await sweep_digest_safe()
             last_reap = time.time()
         if status != "processed" and frame_status != "processed":  # idle/deferred → back off
             await asyncio.sleep(POLL_SECONDS)
