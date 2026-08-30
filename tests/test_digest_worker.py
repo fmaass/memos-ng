@@ -333,3 +333,86 @@ async def test_a_failing_stale_sweep_leaves_the_loop_running(env, monkeypatch):
             await loop_task
         except asyncio.CancelledError:
             pass
+
+
+# --- the manual run the admin API only CLAIMS --------------------------------------------------
+
+
+async def test_the_worker_adopts_and_executes_a_manual_run_the_api_committed(env, monkeypatch):
+    """The other half of the 202 contract.
+
+    `POST /api/admin/digest/run` commits the row and answers; nothing has executed it. This is the
+    worker picking that row up through exactly the same supervised spawn a scheduled run uses —
+    without which a claim would sit in flight until the stale sweep failed it, and "Run now" would
+    never send anything.
+    """
+    subject, data_root = env
+    await _seed_one_memo(subject, data_root)
+    set_digest_settings(enabled=True, start_date="2026-06-01")
+    async with async_session() as db:
+        run_id = await digest_runner.open_run(
+            db, trigger="manual", local_date=datetime.now(UTC).date()
+        )
+
+    adopted = await worker.adopt_manual_digest()
+    assert adopted == run_id
+    # Adoption is a CAS on `heartbeat_at IS NULL`, so a SECOND worker gets nothing — the committed
+    # row no longer protects itself with the INSERT's unique index.
+    assert await worker.adopt_manual_digest() is None
+
+    transport = FakeTransport()
+    result = await digest_runner.run_claimed_digest_safe(run_id, transport=transport)
+    assert result is not None and result.status == digest_runner.SENT
+    assert len(transport.sent) == 1
+    row = next(row for row in run_rows() if row["id"] == run_id)
+    assert row["trigger"] == "manual"
+    assert row["status"] == digest_runner.SENT
+    assert row["memos_sent"] == 1
+
+
+async def test_the_loop_gate_spawns_a_claimed_manual_run(env, monkeypatch):
+    """The gate STEP, not the pieces: the loop's one digest decision must reach a manual row.
+
+    Driven through `spawn_claimed_digest` with the runner substituted, because what is under test
+    is which entry point the loop chooses and with which id — the run itself is exercised above.
+    """
+    async with async_session() as db:
+        run_id = await digest_runner.open_run(
+            db, trigger="manual", local_date=datetime.now(UTC).date()
+        )
+    seen: list[int] = []
+    done = asyncio.Event()
+
+    async def fake_claimed(claimed_id: int):
+        seen.append(claimed_id)
+        done.set()
+
+    monkeypatch.setattr(digest_runner, "run_claimed_digest_safe", fake_claimed)
+    adopted = await worker.adopt_manual_digest()
+    assert adopted == run_id
+    assert worker.spawn_claimed_digest(adopted) is True
+    await asyncio.wait_for(done.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    assert seen == [run_id]
+    assert worker.digest_task_in_flight() is False
+
+
+async def test_a_manual_row_already_being_run_is_not_adopted_a_second_time(env):
+    """A heartbeat is what "somebody is running this" means, so a row that has one is somebody
+    else's — including one the stale sweep has not yet judged."""
+    async with async_session() as db:
+        run_id = await digest_runner.open_run(
+            db, trigger="manual", local_date=datetime.now(UTC).date()
+        )
+        assert await digest_runner.claim_run(db, run_id) is True
+    assert await worker.adopt_manual_digest() is None
+
+
+async def test_a_scheduled_row_is_never_adopted_as_a_manual_one(env):
+    """Positive control on the trigger predicate: a scheduled run belongs to the gate, and
+    adopting it here would run today's digest twice through two different entry points."""
+    async with async_session() as db:
+        await digest_runner.open_run(
+            db, trigger="scheduled", local_date=datetime.now(UTC).date()
+        )
+    assert await worker.adopt_manual_digest() is None

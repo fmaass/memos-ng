@@ -27,6 +27,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import async_session
+from app.models import DigestRunStatus, DigestTrigger
 
 logger = structlog.get_logger(__name__)
 
@@ -43,10 +44,14 @@ RUNS = "memosng_digest_runs"
 SNAPSHOT_AGE = "memosng_digest_snapshot_age_seconds"
 
 # A run that did not actually mail the household: an import writes history and a test-send goes to
-# one admin address. Neither may read as an SMTP success, or the 26 h stale alert would be silenced
-# by an import (B5, B7).
-NON_DELIVERING_TRIGGERS = ("test", "import")
-SUCCESS_STATUSES = ("sent", "nothing_to_send")
+# one admin address. Neither may read as an SMTP success, or an import on the morning of
+# enablement would silence the 26 h stale alert while nothing had been delivered at all.
+#
+# Spelled with the enums that DEFINE this vocabulary rather than with literals: `metrics` and
+# `runner` both decide what "a success" is, and two copies of a status string are two places for
+# it to be spelled differently once.
+NON_DELIVERING_TRIGGERS = (DigestTrigger.test, DigestTrigger.import_)
+SUCCESS_STATUSES = (DigestRunStatus.sent, DigestRunStatus.nothing_to_send)
 
 
 @dataclass(frozen=True)

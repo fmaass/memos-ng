@@ -38,6 +38,8 @@ UPLOAD_SESSION_FINISH_URL = "https://content.dropboxapi.com/2/files/upload_sessi
 SHARED_LINK_URL = "https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings"
 LIST_SHARED_LINKS_URL = "https://api.dropboxapi.com/2/sharing/list_shared_links"
 DELETE_URL = "https://api.dropboxapi.com/2/files/delete_v2"
+GET_METADATA_URL = "https://api.dropboxapi.com/2/files/get_metadata"
+ACCOUNT_URL = "https://api.dropboxapi.com/2/users/get_current_account"
 
 # Dropbox refuses a single-shot /2/files/upload above 150 MB. Strictly above this goes through an
 # upload session; at or below it the one-request path is used unchanged (satellite parity).
@@ -91,19 +93,49 @@ class MediaHost(Protocol):
     """What the pipeline needs from a media host, and the whole seam a fake replaces.
 
     A fake host substitutes the DEPENDENCY (Dropbox), never the unit under test: which files a run
-    decides to upload, which links reach which card, and what `digest_hosted_media` records are all
-    still exercised. `DropboxHost` satisfies this structurally — there is no base class to forget
-    to inherit.
+    decides to upload, which links reach which card, and what the hosted-media ledger records are
+    all still exercised. `DropboxHost` satisfies this structurally — there is no base class to
+    forget to inherit.
+
+    `dropbox_path_for` is part of the protocol because the PATH must be decidable — and therefore
+    committable to the ledger — before any byte is sent. `upload` is handed that path rather than
+    computing one of its own, so the row that is committed first and the object that is written
+    second can never name two different places.
     """
 
-    async def upload(self, local_path: Path, filename: str) -> tuple[str, str, int]: ...
+    def dropbox_path_for(self, filename: str) -> str: ...
+
+    async def upload(self, local_path: Path, dropbox_path: str) -> tuple[str, int]: ...
 
     async def delete(self, dropbox_path: str) -> None: ...
+
+    # The reconciliation probe: a `pending` ledger row is judged by asking the remote whether its
+    # object is actually there, which is the only authority on a crash that happened mid-upload.
+    async def remote_exists(self, dropbox_path: str) -> bool: ...
+
+    async def shared_link(self, dropbox_path: str) -> str: ...
 
     # Part of the protocol so that CLOSING is not optional. A host that owns a connection pool
     # (`DropboxHost` owns an `httpx.AsyncClient`) leaks it otherwise, once per run, in a process
     # that runs for weeks — and a caller cannot close what the type does not promise.
     async def aclose(self) -> None: ...
+
+
+class HostedLedger(Protocol):
+    """The two ledger writes an upload is wrapped in, as the hosting layer needs them.
+
+    A protocol rather than a session: every call here COMMITS in its own short-lived transaction,
+    because the whole point is that no transaction is open while bytes are on the wire. The
+    implementation lives in `runner`, which is the only module that writes to the database.
+    """
+
+    async def claim(self, *, attachment_id: int, kind: str, dropbox_path: str) -> int:
+        """Commit the INTENTION to write `dropbox_path`, returning the ledger row id."""
+        ...
+
+    async def mark_uploaded(self, ledger_id: int, *, shared_link: str, size: int) -> None:
+        """Record that the upload this row claimed has succeeded."""
+        ...
 
 
 def _size_sync(path: Path) -> int:
@@ -314,15 +346,54 @@ class DropboxHost:
                     return raw_link(links[0]["url"])
         raise DropboxError(f"shared link failed with HTTP {response.status_code}")
 
-    async def upload(self, local_path: Path, filename: str) -> tuple[str, str, int]:
-        """Upload one file and return `(dropbox_path, shared_link, bytes)`."""
+    async def upload(self, local_path: Path, dropbox_path: str) -> tuple[str, int]:
+        """Upload one file to an ALREADY-DECIDED path and return `(shared_link, bytes)`.
+
+        The path is an argument rather than something derived here: the caller commits it to the
+        ledger before this runs, and a path computed twice is a path that can differ once.
+        """
         size = await to_thread.run_sync(_size_sync, local_path)
-        dropbox_path = self.dropbox_path_for(filename)
         if size > CHUNK_THRESHOLD_BYTES:
             await self._upload_session(local_path, dropbox_path, size)
         else:
             await self._upload_single(local_path, dropbox_path)
-        return dropbox_path, await self.shared_link(dropbox_path), size
+        return await self.shared_link(dropbox_path), size
+
+    async def remote_exists(self, dropbox_path: str) -> bool:
+        """Whether the remote object is there — the reconciliation probe for a `pending` row.
+
+        409 is Dropbox's `path/not_found`, which is a real ANSWER ("it never landed") and not an
+        error; anything else raises, because a ledger row must not be resolved on a guess.
+        """
+        response = await self._client.post(
+            GET_METADATA_URL,
+            headers={**self._auth(), "Content-Type": "application/json"},
+            json={"path": dropbox_path},
+            timeout=LINK_TIMEOUT_S,
+        )
+        await self._beat()
+        if response.status_code == 200:
+            return True
+        if response.status_code == 409:
+            return False
+        raise DropboxError(f"metadata lookup failed with HTTP {response.status_code}")
+
+    async def account(self) -> str:
+        """The account these keys authenticate as, for the admin panel's hosting status line.
+
+        Read-only and identifying only — an address or a display name, never a token and never a
+        quota or a file listing. `/2/users/get_current_account` takes no arguments, so the request
+        carries no body and no `Content-Type` (Dropbox refuses one on an argument-less RPC).
+        """
+        response = await self._client.post(
+            ACCOUNT_URL, headers=self._auth(), timeout=LINK_TIMEOUT_S
+        )
+        await self._beat()
+        if response.status_code != 200:
+            raise DropboxError(f"account lookup failed with HTTP {response.status_code}")
+        payload = response.json()
+        name = payload.get("name") or {}
+        return payload.get("email") or name.get("display_name") or ""
 
     async def delete(self, dropbox_path: str) -> None:
         response = await self._client.post(
@@ -349,10 +420,43 @@ def image_full_source_path(uid: str) -> Path | None:
     return None if resolved is None else resolved[0]
 
 
+async def current_account(
+    *, app_key: str, app_secret: str, refresh_token: str
+) -> str | None:
+    """The Dropbox account the configured keys authenticate as, or None when it cannot be read.
+
+    None on EVERY failure — unset keys, a refused refresh, a malformed payload, a timeout: this
+    answers one line of an admin status panel, and a panel that 500s because Dropbox is slow is
+    worse than a panel that says it does not know. The client is closed on every path, this one
+    included, because the failure paths are exactly where a leaked connection pool accumulates.
+    """
+    if not (app_key and app_secret and refresh_token):
+        return None
+    client = httpx.AsyncClient()
+    host = DropboxHost(
+        app_key=app_key,
+        app_secret=app_secret,
+        refresh_token=refresh_token,
+        base_folder="",
+        run_folder="",
+        client=client,
+    )
+    try:
+        await host.refresh()
+        label = await host.account()
+    except Exception:
+        logger.warning("digest.hosting_account_lookup_failed")
+        return None
+    finally:
+        await client.aclose()
+    return label or None
+
+
 async def resolve_links(
     candidates: list[Candidate],
     *,
     host: MediaHost | None,
+    ledger: HostedLedger | None = None,
     existing: dict[int, str],
     max_videos_per_memo: int,
     link_images_full: bool,
@@ -365,8 +469,15 @@ async def resolve_links(
     because a link recorded by an earlier run is still live and still points at the right file.
 
     A test-send and a preview reach this with `host=None` BY CONTRACT, not by configuration: a
-    probe must never create a Dropbox file the registry does not know about, or one the retention
-    sweep would later have to guess at (A6).
+    probe must never create a Dropbox file the ledger does not know about, or one the retention
+    sweep would later have to guess at.
+
+    **Every upload is bracketed by the ledger, one file at a time.** The intention is committed
+    first, the bytes go second, the success is committed third — so the only state a crash can
+    leave is a `pending` row naming a path that either holds an object or does not, which is a
+    question the reconciliation sweep can ask Dropbox. Accumulating the successes in memory and
+    writing them once at the end (the shape this replaces) leaves an object no row names, and
+    nothing can ever find it again.
     """
     links = MediaLinks(by_attachment=dict(existing))
     videos: list[tuple[int, str, Path]] = []
@@ -392,18 +503,27 @@ async def resolve_links(
     if host is None:
         return links
 
+    if ledger is None:
+        raise ValueError("a host without a ledger would upload an object nothing owns")
+
     for kind, group in ((VIDEO, videos), (IMAGE_FULL, images)):
         for attachment_id, filename, path in group:
             if path not in present or attachment_id in links.by_attachment:
                 continue
+            dropbox_path = host.dropbox_path_for(filename)
+            ledger_id = await ledger.claim(
+                attachment_id=attachment_id, kind=kind, dropbox_path=dropbox_path
+            )
             try:
-                dropbox_path, link, size = await host.upload(path, filename)
+                link, size = await host.upload(path, dropbox_path)
             except (DropboxError, httpx.HTTPError):
                 # One failed upload degrades ONE card, never the run: the card falls back to the
                 # "not hosted" chip and the rest of the mail goes out. The exception carries no
-                # token and the log line names only the attachment.
+                # token and the log line names only the attachment. The ledger row stays `pending`
+                # — the reconciliation sweep, not this code path, decides whether anything landed.
                 logger.warning("digest.hosting_upload_failed", attachment_id=attachment_id)
                 continue
+            await ledger.mark_uploaded(ledger_id, shared_link=link, size=size)
             links.by_attachment[attachment_id] = link
             links.uploaded.append(
                 HostedUpload(

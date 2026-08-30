@@ -38,7 +38,7 @@ def _url(path: str) -> str:
     id up; an id that does not exist proves exactly that (a 404 here would mean the credential
     check was skipped).
     """
-    return path.replace("{recipient_id}", "999999")
+    return path.replace("{recipient_id}", "999999").replace("{run_id}", "999999")
 
 
 @pytest.fixture(autouse=True)
@@ -129,10 +129,10 @@ def test_normalise_email_decides_shape_and_stored_form_together(raw, expected):
 def test_the_sweep_below_covers_every_route_this_router_publishes():
     """Positive control: an empty parametrisation passes for the wrong reason.
 
-    Phase 2 adds three ACTION routes (preview, test-send, run) and they are covered by the same
-    sweeps automatically — which is the point of reading the route table off the app rather than
-    typing it out."""
-    assert len(ADMIN_ROUTES) == 11, ADMIN_ROUTES
+    Every route this router publishes is swept for authorization automatically, because the sweeps
+    read the route table off the app rather than being typed out. This assertion is what stops a
+    route being ADDED without being swept."""
+    assert len(ADMIN_ROUTES) == 12, ADMIN_ROUTES
     assert (
         sorted({path for _, path in ADMIN_ROUTES})
         == [
@@ -142,6 +142,7 @@ def test_the_sweep_below_covers_every_route_this_router_publishes():
             f"{PREFIX}/recipients/{{recipient_id}}",
             f"{PREFIX}/run",
             f"{PREFIX}/runs",
+            f"{PREFIX}/runs/{{run_id}}",
             f"{PREFIX}/settings",
             f"{PREFIX}/test-send",
         ]
@@ -536,20 +537,77 @@ def test_runs_come_back_newest_first_with_their_bookkeeping(admin_client):
     response = client.get(f"{PREFIX}/runs")
     assert response.status_code == 200, response.text
     body = response.json()
-    assert [r["local_date"] for r in body] == ["2026-08-30", "2026-08-29", "2026-08-28"]
-    assert body[0]["status"] == "failed"
-    assert body[0]["trigger"] == "scheduled"
-    assert body[0]["parts_claimed"] == 1
-    assert body[0]["recipients"] == 6
-    assert body[0]["started_at"] == "2026-08-30T05:00:00Z"
+    items = body["items"]
+    assert [r["local_date"] for r in items] == ["2026-08-30", "2026-08-29", "2026-08-28"]
+    assert items[0]["status"] == "failed"
+    assert items[0]["trigger"] == "scheduled"
+    assert items[0]["parts_claimed"] == 1
+    assert items[0]["recipients"] == 6
+    assert items[0]["started_at"] == "2026-08-30T05:00:00Z"
+    # One page held everything, so there is nothing after it — and the total is opt-in.
+    assert body["nextCursor"] is None
+    assert body["totalCount"] is None
 
 
 def test_the_runs_list_honours_its_limit(admin_client):
     client, _ = admin_client
     _insert_runs()
-    assert len(client.get(f"{PREFIX}/runs?limit=2").json()) == 2
+    assert len(client.get(f"{PREFIX}/runs?limit=2").json()["items"]) == 2
     assert client.get(f"{PREFIX}/runs?limit=0").status_code == 422
     assert client.get(f"{PREFIX}/runs?limit=201").status_code == 422
+
+
+def test_the_runs_cursor_walks_the_whole_history_without_repeating_or_skipping(admin_client):
+    """A `limit` alone can only ever reach the first N rows, and a run row is written every day
+    for ever — so the history behind that window would be permanently unreachable. Walking it one
+    row at a time is what proves the cursor is a POSITION and not a page number."""
+    client, _ = admin_client
+    _insert_runs()
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(4):
+        query = f"?limit=1&cursor={cursor}" if cursor else "?limit=1"
+        body = client.get(f"{PREFIX}/runs{query}").json()
+        seen.extend(row["local_date"] for row in body["items"])
+        cursor = body["nextCursor"]
+        if cursor is None:
+            break
+    assert seen == ["2026-08-30", "2026-08-29", "2026-08-28"]
+    assert cursor is None
+
+
+def test_a_cursor_this_server_did_not_mint_is_refused_rather_than_restarting_the_list(
+    admin_client,
+):
+    """A junk token that silently decoded to "the beginning" would make a paging client loop for
+    ever over the first page — the failure the strict decoder exists to end. The empty string is
+    the same case: it is a bad token, not page one."""
+    client, _ = admin_client
+    _insert_runs()
+    assert client.get(f"{PREFIX}/runs?cursor=M!Q==").status_code == 422
+    assert client.get(f"{PREFIX}/runs?cursor=").status_code == 422
+    # Positive control: a cursor this server DID mint is accepted by the same handler.
+    minted = client.get(f"{PREFIX}/runs?limit=1").json()["nextCursor"]
+    assert client.get(f"{PREFIX}/runs?limit=1&cursor={minted}").status_code == 200
+
+
+def test_the_total_is_published_only_when_it_is_asked_for(admin_client):
+    client, _ = admin_client
+    _insert_runs()
+    assert client.get(f"{PREFIX}/runs?limit=1").json()["totalCount"] is None
+    assert client.get(f"{PREFIX}/runs?limit=1&with_total=true").json()["totalCount"] == 3
+
+
+def test_one_run_is_readable_by_id_and_a_missing_one_is_404(admin_client):
+    """What the `Location` of a 202 from `POST /run` points at: a claim is only useful if its
+    progress can be read back without paging the whole list to find it."""
+    client, _ = admin_client
+    _insert_runs()
+    listed = client.get(f"{PREFIX}/runs").json()["items"][0]
+    one = client.get(f"{PREFIX}/runs/{listed['id']}")
+    assert one.status_code == 200, one.text
+    assert one.json() == listed
+    assert client.get(f"{PREFIX}/runs/999999").status_code == 404
 
 
 def test_an_in_flight_run_is_published_with_a_null_status(admin_client):
@@ -568,7 +626,7 @@ def test_an_in_flight_run_is_published_with_a_null_status(admin_client):
         )
     engine.dispose()
 
-    body = client.get(f"{PREFIX}/runs").json()
+    body = client.get(f"{PREFIX}/runs").json()["items"]
     assert len(body) == 1
     assert body[0]["status"] is None
     assert body[0]["finished_at"] is None
@@ -585,12 +643,66 @@ def test_hosting_reports_not_configured_when_the_keys_are_absent(admin_client):
     assert response.json() == {"configured": False, "account": None}
 
 
-def test_hosting_reports_configured_once_all_three_keys_are_present(admin_client, monkeypatch):
-    client, _ = admin_client
+def _configure_dropbox(monkeypatch, account: str | None = None) -> list[tuple[str, str, str]]:
+    """Three present keys, and the live account lookup replaced by a recorder.
+
+    The lookup is a real HTTP call to Dropbox, so leaving it in place would put a network request
+    in the test suite; substituting it here keeps the seam — which keys the handler passes down —
+    visible and asserted.
+    """
+    from app.routers import admin_digest as router_module
+
     monkeypatch.setattr(app_settings, "DROPBOX_APP_KEY", "key")
     monkeypatch.setattr(app_settings, "DROPBOX_APP_SECRET", "secret")
     monkeypatch.setattr(app_settings, "DROPBOX_REFRESH_TOKEN", "refresh")
+    calls: list[tuple[str, str, str]] = []
+
+    async def _fake(*, app_key: str, app_secret: str, refresh_token: str) -> str | None:
+        calls.append((app_key, app_secret, refresh_token))
+        return account
+
+    monkeypatch.setattr(router_module.digest_hosting, "current_account", _fake)
+    return calls
+
+
+def test_hosting_reports_configured_once_all_three_keys_are_present(admin_client, monkeypatch):
+    client, _ = admin_client
+    _configure_dropbox(monkeypatch)
     assert client.get(f"{PREFIX}/hosting").json()["configured"] is True
+
+
+def test_hosting_reports_the_account_the_keys_actually_authenticate_as(
+    admin_client, monkeypatch
+):
+    """`configured` says the keys are SET; only a live lookup says they WORK. A revoked refresh
+    token leaves `configured` true for ever while every upload silently falls back to
+    inline-only — which is the failure this line exists to expose."""
+    client, _ = admin_client
+    calls = _configure_dropbox(monkeypatch, account="household@example.com")
+    body = client.get(f"{PREFIX}/hosting").json()
+    assert body == {"configured": True, "account": "household@example.com"}
+    assert calls == [("key", "secret", "refresh")]
+
+
+def test_hosting_reports_a_null_account_when_the_lookup_cannot_answer(admin_client, monkeypatch):
+    """Refused, unreachable, malformed — all one answer. An admin status line must never be the
+    reason a page 500s."""
+    client, _ = admin_client
+    _configure_dropbox(monkeypatch, account=None)
+    assert client.get(f"{PREFIX}/hosting").json() == {"configured": True, "account": None}
+
+
+def test_an_unconfigured_hosting_status_makes_no_network_call_at_all(admin_client, monkeypatch):
+    """With no keys there is nothing to authenticate as, so the lookup is not attempted — the
+    endpoint answers from presence alone."""
+    client, _ = admin_client
+    from app.routers import admin_digest as router_module
+
+    async def _refuse(**_kwargs: object) -> str | None:
+        raise AssertionError("the account lookup ran with no keys configured")
+
+    monkeypatch.setattr(router_module.digest_hosting, "current_account", _refuse)
+    assert client.get(f"{PREFIX}/hosting").json() == {"configured": False, "account": None}
 
 
 @pytest.mark.parametrize(
@@ -606,10 +718,21 @@ def test_two_keys_out_of_three_is_not_configured(admin_client, monkeypatch, miss
 
 
 def test_hosting_never_echoes_a_credential(admin_client, monkeypatch):
+    """Presence is the whole answer for the keys themselves. The account label is a different
+    thing — it is an identity Dropbox hands back, not a secret this process holds — and it is
+    checked against the credential strings here too, so a lookup that ever returned one would be
+    caught rather than published."""
+    from app.routers import admin_digest as router_module
+
     client, _ = admin_client
     monkeypatch.setattr(app_settings, "DROPBOX_APP_KEY", "sup3rsecretkey")
     monkeypatch.setattr(app_settings, "DROPBOX_APP_SECRET", "sup3rsecretsecret")
     monkeypatch.setattr(app_settings, "DROPBOX_REFRESH_TOKEN", "sup3rsecretrefresh")
+
+    async def _account(**_kwargs: object) -> str:
+        return "household@example.com"
+
+    monkeypatch.setattr(router_module.digest_hosting, "current_account", _account)
     body = client.get(f"{PREFIX}/hosting").text
     assert "sup3rsecret" not in body
     assert '"configured":true' in body.replace(" ", "")  # control: the request really was served

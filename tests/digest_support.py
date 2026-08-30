@@ -14,11 +14,20 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
-from app.models import Attachment, AttachmentStatus, Memo, User, Visibility
+from app.models import (
+    Attachment,
+    AttachmentStatus,
+    DigestVisibilityScope,
+    Memo,
+    User,
+    Visibility,
+)
+from app.services.digest.domain import DigestConfig
+from app.services.digest.hosting import DropboxError
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +41,84 @@ DIGEST_TABLES = (
     "digest_runs",
     "digest_recipients",
 )
+
+
+def digest_config(**overrides) -> DigestConfig:
+    """A settings snapshot carrying the migration's own defaults, with named overrides.
+
+    The pipeline reads `DigestConfig`, never a mapped row, so this is the honest input for every
+    test that does not need the database to have an opinion.
+    """
+    values = {
+        "enabled": True,
+        "send_time": time(7, 0),
+        "timezone": "Europe/Zurich",
+        "visibility_scope": DigestVisibilityScope.PUBLIC_PROTECTED,
+        "start_date": date(2026, 6, 1),
+        "grace_minutes": 30,
+        "max_email_bytes": 18874368,
+        "max_videos_per_memo": 2,
+        "max_memos_per_run": 40,
+        "mail_title": "The Daily Dami Memos Mail",
+        "from_name": "The Daily Dami Memos Mail",
+        "from_email": "",
+        "hosting_enabled": False,
+        "dropbox_folder": "/memos-mail",
+        "retention_days": 30,
+        "link_images_full": False,
+    }
+    values.update(overrides)
+    return DigestConfig(**values)  # pyright: ignore[reportArgumentType]
+
+
+class BorrowedSession:
+    """Hands an EXISTING session to code that opens its own, without closing it.
+
+    The `adb` fixture binds its session to a transaction the test rolls back, so a second real
+    session would not see anything the test seeded. This lets such a test drive a function that
+    takes a session factory while keeping the fixture's isolation.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> AsyncSession:
+        return self._session
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
+def borrowed_session_factory(session: AsyncSession):
+    return lambda: BorrowedSession(session)
+
+
+class TrackingSessionFactory:
+    """`async_session`, plus a count of how many of ITS sessions currently hold a transaction.
+
+    This is the mechanism behind "no transaction is open across an external boundary": the fakes
+    that stand in for Dropbox and SMTP ask it, at the moment they are called, how many sessions the
+    code under test is holding a transaction in. A SQLAlchemy `SELECT` autobegins one, so a session
+    merely left open after a read still answers True — which is exactly the state being ruled out.
+    """
+
+    def __init__(self, factory=None) -> None:
+        from app.database import async_session
+
+        self._factory = factory or async_session
+        self._sessions: list[AsyncSession] = []
+
+    def __call__(self) -> AsyncSession:
+        session = self._factory()
+        self._sessions.append(session)
+        return session
+
+    def live_transactions(self) -> int:
+        return sum(1 for session in self._sessions if session.in_transaction())
+
+    def assert_no_transaction(self, where: str) -> None:
+        live = self.live_transactions()
+        assert live == 0, f"{live} database transaction(s) open across {where}"
 
 
 def reset_digest_state(**settings_columns: object) -> None:
@@ -114,8 +201,8 @@ def hosted_rows() -> list[dict]:
     with engine.begin() as conn:
         rows = conn.execute(
             text(
-                "SELECT attachment_id, kind, dropbox_path, shared_link, bytes, swept_at, "
-                "uploaded_at FROM digest_hosted_media ORDER BY attachment_id"
+                "SELECT id, attachment_id, kind, dropbox_path, status, shared_link, bytes, "
+                "created_at, uploaded_at, swept_at FROM digest_hosted_media ORDER BY id"
             )
         ).mappings()
         result = [dict(row) for row in rows]
@@ -150,6 +237,43 @@ def age_hosted_media(attachment_id: int, *, days: int) -> None:
             {"id": attachment_id, "d": days},
         )
     engine.dispose()
+
+
+def age_hosted_claim(ledger_id: int, *, minutes: int) -> None:
+    """Push a PENDING row's `created_at` into the past — how a test says "this intention has been
+    sitting unresolved long enough for the sweep to go and ask Dropbox about it"."""
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE digest_hosted_media SET created_at = now() - make_interval(mins => :m) "
+                "WHERE id = :id"
+            ),
+            {"id": ledger_id, "m": minutes},
+        )
+    engine.dispose()
+
+
+def insert_hosted_row(**columns: object) -> int:
+    """One ledger row written directly, for the states a test needs to START in."""
+    engine = create_engine(SYNC_URL)
+    values = {
+        "attachment_id": None,
+        "kind": "video",
+        "status": "uploaded",
+        "shared_link": None,
+        "bytes": 0,
+        **columns,
+    }
+    names = ", ".join(values)
+    binds = ", ".join(f":{name}" for name in values)
+    with engine.begin() as conn:
+        row_id = conn.execute(
+            text(f"INSERT INTO digest_hosted_media ({names}) VALUES ({binds}) RETURNING id"),
+            values,
+        ).scalar_one()
+    engine.dispose()
+    return int(row_id)
 
 
 # --- seeding ------------------------------------------------------------------------------------
@@ -256,17 +380,21 @@ class FakeTransport:
     `refusals_by_part` maps a 1-based part number to the refusal dict smtplib would return;
     `raise_on_part` makes that part's send fail outright (a connection error), which is a
     different case and has a different outcome. `delay` lets a test hold a send open while it
-    checks that something else is still making progress.
+    checks that something else is still making progress. `sessions`, when set, is asked at the
+    moment of the send whether the caller is holding a database transaction open across it.
     """
 
     sent: list[SentMail] = field(default_factory=list)
     refusals_by_part: dict[int, dict[str, tuple[int, bytes]]] = field(default_factory=dict)
     raise_on_part: int | None = None
     delay: float = 0.0
+    sessions: TrackingSessionFactory | None = None
 
     async def send(
         self, message: MIMEMultipart, sender: str, recipients: list[str]
     ) -> dict[str, tuple[int, bytes]]:
+        if self.sessions is not None:
+            self.sessions.assert_no_transaction("an SMTP send")
         if self.delay:
             import asyncio
 
@@ -282,25 +410,82 @@ class FakeTransport:
 
 @dataclass
 class FakeHost:
-    """Dropbox, and nothing else. Records what a run asked it to upload and delete."""
+    """Dropbox, and nothing else. Records what a run asked it to upload, probe and delete.
+
+    `sessions`, when set, is asked at the moment of every remote call whether the caller is
+    holding a database transaction open across it — which is how "no transaction crosses an
+    external boundary" is asserted rather than asserted-about.
+
+    `raise_on_upload` fails the upload of a named file the way Dropbox would, which is what leaves
+    a ledger row `pending`; `absent` names paths the reconciliation probe should not find.
+    """
 
     uploads: list[tuple[str, str]] = field(default_factory=list)
     deletes: list[str] = field(default_factory=list)
+    probes: list[str] = field(default_factory=list)
     base_folder: str = "/memos-mail/run"
     closed: int = 0
+    sessions: TrackingSessionFactory | None = None
+    raise_on_upload: set[str] = field(default_factory=set)
+    absent: set[str] = field(default_factory=set)
+    # Shared with a ledger fake when a test cares about the ORDER of the two.
+    events: list[str] = field(default_factory=list)
 
-    async def upload(self, local_path: Path, filename: str) -> tuple[str, str, int]:
+    def dropbox_path_for(self, filename: str) -> str:
+        return f"{self.base_folder}/{filename}"
+
+    async def upload(self, local_path: Path, dropbox_path: str) -> tuple[str, int]:
+        if self.sessions is not None:
+            self.sessions.assert_no_transaction("a Dropbox upload")
+        filename = dropbox_path.rsplit("/", 1)[-1]
+        self.events.append(f"upload:{dropbox_path}")
+        if filename in self.raise_on_upload:
+            raise DropboxError(f"simulated upload failure for {filename}")
         self.uploads.append((str(local_path), filename))
-        dropbox_path = f"{self.base_folder}/{filename}"
-        return dropbox_path, f"https://dropbox.example/{filename}?raw=1", 1234
+        return f"https://dropbox.example/{filename}?raw=1", 1234
 
     async def delete(self, dropbox_path: str) -> None:
+        if self.sessions is not None:
+            self.sessions.assert_no_transaction("a Dropbox delete")
         self.deletes.append(dropbox_path)
+
+    async def remote_exists(self, dropbox_path: str) -> bool:
+        if self.sessions is not None:
+            self.sessions.assert_no_transaction("a Dropbox metadata probe")
+        self.probes.append(dropbox_path)
+        return dropbox_path not in self.absent
+
+    async def shared_link(self, dropbox_path: str) -> str:
+        filename = dropbox_path.rsplit("/", 1)[-1]
+        return f"https://dropbox.example/{filename}?raw=1"
 
     async def aclose(self) -> None:
         # Counted, not ignored: "the client is released on every path" is an assertion, and a
         # no-op here would make it unfalsifiable.
         self.closed += 1
+
+
+@dataclass
+class RecordingLedger:
+    """The hosted-media ledger as the hosting layer sees it — in memory.
+
+    These tests are about the ORDER of the three steps (claim, upload, mark) and about which files
+    each one names; the SQL behind the real ledger is exercised against a real database elsewhere.
+    Sharing `events` with a `FakeHost` is what makes the order assertable rather than assumed.
+    """
+
+    claims: list[tuple[int, str, str]] = field(default_factory=list)
+    marked: list[tuple[int, str, int]] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
+
+    async def claim(self, *, attachment_id: int, kind: str, dropbox_path: str) -> int:
+        self.claims.append((attachment_id, kind, dropbox_path))
+        self.events.append(f"claim:{dropbox_path}")
+        return len(self.claims)
+
+    async def mark_uploaded(self, ledger_id: int, *, shared_link: str, size: int) -> None:
+        self.marked.append((ledger_id, shared_link, size))
+        self.events.append(f"mark:{ledger_id}")
 
 
 def forbid_real_smtp(monkeypatch) -> None:

@@ -13,11 +13,13 @@ export interface paths {
         };
         /**
          * Get Digest Hosting
-         * @description Report whether Dropbox hosting is configured, from the env keys alone.
+         * @description Report whether Dropbox hosting is configured, and who the keys authenticate as.
          *
-         *     Presence, never the value: the three keys are secrets and nothing about them is echoed back —
-         *     `configured` is the whole answer. All three are required, because two out of three cannot
-         *     refresh a token, and an empty key is the switch that disables hosting globally.
+         *     The account lookup is made once per request and only when the keys are present — there is no
+         *     process-wide cache, deliberately: a cached identity would keep reporting a working channel
+         *     after a token was revoked, which is the exact failure this line exists to expose. It is
+         *     read-only (`/2/users/get_current_account`) and answers None on any failure, so a slow or angry
+         *     Dropbox costs the panel a null, not an error.
          */
         get: operations["get_digest_hosting_api_admin_digest_hosting_get"];
         put?: never;
@@ -39,8 +41,12 @@ export interface paths {
          * Preview Digest
          * @description Render what would go out now. Persists nothing and performs NO Dropbox call.
          *
-         *     `selected` is the list MEMNG-236 AC2 and the Phase 5 one-victim read-back are checked against,
-         *     so it names the memos rather than counting them.
+         *     `selected` NAMES the memos rather than counting them: a preview whose answer is a number
+         *     cannot be checked against what a run then actually mails.
+         *
+         *     No request-scoped session is taken. The render walks the filesystem for every card's media,
+         *     and the reads it needs are taken in short sessions that close before that walk starts — a
+         *     request session would be an idle transaction held across all of it.
          */
         get: operations["preview_digest_api_admin_digest_preview_get"];
         put?: never;
@@ -98,7 +104,15 @@ export interface paths {
         put?: never;
         /**
          * Run Digest Now
-         * @description Perform a real run through the same `runner.py` the worker uses, with `trigger = 'manual'`.
+         * @description CLAIM a manual run and answer 202. The worker executes it.
+         *
+         *     This endpoint commits exactly one thing — the `digest_runs` row, which IS the single-flight
+         *     lock — and returns. It does not send, upload or render, and that split is the point: a run can
+         *     legitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox
+         *     upload-session operations that allow 600 s EACH), and a contract that awaited it would tie the
+         *     household's mail to a browser tab, a proxy read timeout and a reload. The same repository
+         *     already backgrounds the scheduled run for exactly this reason; a manual one is not different
+         *     work, only differently triggered.
          *
          *     A manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day
          *     that already had one. Its 409 is derived from the INSERT conflicting with
@@ -106,9 +120,10 @@ export interface paths {
          *     would be exactly the TOCTOU race that index exists to close and which two concurrent callers
          *     would both pass.
          *
-         *     No request-scoped session is taken: the run opens and commits its own, repeatedly, and holding
-         *     a pooled connection idle for the minutes a real run takes would be pressure on a pool the app
-         *     deliberately caps at ten (ADR-0009).
+         *     `Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its
+         *     outcome are read back. Until the worker adopts the row it stays `status: null` with no
+         *     heartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than
+         *     leaving it in flight for ever.
          */
         post: operations["run_digest_now_api_admin_digest_run_post"];
         delete?: never;
@@ -126,13 +141,45 @@ export interface paths {
         };
         /**
          * List Digest Runs
-         * @description The most recent runs, newest first — the panel's Runs table.
+         * @description The runs, newest first — the panel's Runs table, paged by keyset.
+         *
+         *     Unbounded lists in this API page by cursor rather than by a bare `limit`, and this one is
+         *     unbounded: a run row is written every day for ever, so a caller that can only ask for "the
+         *     first N" can never reach the rest of the history. When more rows follow, `nextCursor` is
+         *     non-null; resend it as `?cursor=` for the page after.
          *
          *     Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import
          *     row is stamped by the same `now()` as anything else committed in that transaction), and an
-         *     unstable order would make the table shuffle between refreshes.
+         *     unstable order would make the table shuffle between refreshes — and would make a keyset cursor
+         *     skip or repeat rows, which is worse than shuffling.
+         *
+         *     `totalCount` is null unless `?with_total=true`, the same opt-in the memo feed uses: a COUNT is
+         *     the most expensive part of a page and the table that reads this does not show one.
          */
         get: operations["list_digest_runs_api_admin_digest_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/digest/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Digest Run
+         * @description One run by id — what the `Location` of a 202 from `POST /run` points at.
+         *
+         *     A claim is only useful if its progress can be read back, and paging the whole list to find one
+         *     row is not that.
+         */
+        get: operations["get_digest_run_api_admin_digest_runs__run_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -152,7 +199,8 @@ export interface paths {
         get: operations["get_digest_settings_api_admin_digest_settings_get"];
         /**
          * Put Digest Settings
-         * @description Update the one settings row. There is no create path here, deliberately — see SETTINGS_ID.
+         * @description Update the one settings row. There is no create path here, deliberately: `CHECK (id = 1)`
+         *     plus a router that only ever UPDATEs is what makes a second row impossible.
          *
          *     The row is taken FOR UPDATE for the whole request, not because a fresh read is needed but
          *     because arming is a check-then-act: two overlapping requests, one arming the digest and one
@@ -183,8 +231,12 @@ export interface paths {
          *
          *     The destination comes from the authenticated session, never from a request field: an endpoint
          *     that took an address would be an open relay for anyone who reached it, and it would let a probe
-         *     reach `digest_recipients`. It performs no Dropbox upload either (A6) — it renders with whatever
+         *     reach `digest_recipients`. It performs no Dropbox upload either — it renders with whatever
          *     hosted links already exist, and a video with none carries the "not hosted" chip.
+         *
+         *     It stays SYNCHRONOUS, unlike a run, and the reason is that it is bounded by construction: no
+         *     uploads, one recipient, one message. Its database reads still happen in short sessions that
+         *     close before SMTP is contacted, which is why it takes no request session of its own.
          */
         post: operations["test_send_digest_api_admin_digest_test_send_post"];
         delete?: never;
@@ -1227,15 +1279,20 @@ export interface components {
          * DigestHostingOut
          * @description Whether media hosting can work at all, as the panel's status line reads it.
          *
-         *     Phase 1 answers from the PRESENCE of the three `DROPBOX_*` env keys and nothing else — no
-         *     network call is made and `account` is therefore always null here. The live account lookup that
-         *     fills it in arrives with the hosting service in Phase 2; a caller reading `configured` alone
-         *     gets the same answer either way, which is what the "Not configured — mails go out inline-only"
-         *     line needs.
+         *     Two independent facts, and the difference between them is the whole value of the endpoint:
+         *
+         *     * `configured` is the PRESENCE of the three `DROPBOX_*` env keys — never their value, which is
+         *       secret and is echoed nowhere. It answers "could this work?" without touching the network.
+         *     * `account` is who those keys actually authenticate as, read live from Dropbox. It is the only
+         *       thing that distinguishes keys that are set from keys that WORK — a rotated refresh token
+         *       leaves `configured` true forever while every upload silently falls back to inline-only.
+         *
+         *     `account` is null whenever that answer cannot be had — unconfigured, refused, unreachable —
+         *     because an admin status line must never be the reason a page 500s.
          */
         DigestHostingOut: {
             /** Account */
-            account?: string | null;
+            account: string | null;
             /** Configured */
             configured: boolean;
         };
@@ -1320,6 +1377,36 @@ export interface components {
             display_name?: string | null;
             /** Enabled */
             enabled?: boolean | null;
+        };
+        /**
+         * DigestRunClaimOut
+         * @description The answer to `POST /run`: a run row exists and nothing has executed it yet.
+         *
+         *     Three fields and no aggregates, because at this instant there are none to report — the row is
+         *     the CLAIM, and everything else about it is read back from `GET /runs/{id}` (which the response
+         *     `Location` header names). `status` is always null here: NULL means "in flight", and a run that
+         *     already had an outcome would not be something this endpoint could have just opened.
+         */
+        DigestRunClaimOut: {
+            /** Id */
+            id: number;
+            /** Status */
+            status: string | null;
+            /** Trigger */
+            trigger: string;
+        };
+        /**
+         * DigestRunList
+         * @description One page of runs, in the shape every unbounded list in this API uses (`MemoList`): the
+         *     items, the token for the page after, and a total the caller has to ask for.
+         */
+        DigestRunList: {
+            /** Items */
+            items: components["schemas"]["DigestRunOut"][];
+            /** Nextcursor */
+            nextCursor: string | null;
+            /** Totalcount */
+            totalCount: number | null;
         };
         /** DigestRunOut */
         DigestRunOut: {
@@ -1455,7 +1542,7 @@ export interface components {
         /**
          * DigestTestSendIn
          * @description `{"empty": true}` renders the "no memos selected" body directly, without consulting the
-         *     selection at all — the pure SMTP probe, with no settings write anywhere in it (R3).
+         *     selection at all — the pure SMTP probe, and one that writes no settings anywhere in it.
          */
         DigestTestSendIn: {
             /**
@@ -2226,12 +2313,14 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            200: {
+            202: {
                 headers: {
+                    /** @description The claimed run: `GET /api/admin/digest/runs/{id}`. Poll it for the run's progress and its terminal status — the work happens in the worker, not in this request. */
+                    Location?: string;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DigestRunOut"];
+                    "application/json": components["schemas"]["DigestRunClaimOut"];
                 };
             };
         };
@@ -2239,7 +2328,9 @@ export interface operations {
     list_digest_runs_api_admin_digest_runs_get: {
         parameters: {
             query?: {
+                cursor?: string | null;
                 limit?: number;
+                with_total?: boolean;
             };
             header?: never;
             path?: never;
@@ -2253,7 +2344,38 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DigestRunOut"][];
+                    "application/json": components["schemas"]["DigestRunList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_digest_run_api_admin_digest_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestRunOut"];
                 };
             };
             /** @description Validation Error */

@@ -525,6 +525,11 @@ class DigestTrigger(enum.StrEnum):
 
     scheduled = "scheduled"
     manual = "manual"
+    # `test` names a trigger no ROW ever carries: a test-send persists nothing — no run row, no
+    # hosted media, no delivery — because its job is to prove the SMTP channel, not to consume the
+    # day's ledger slot. It stays in the vocabulary because the metrics snapshot excludes it from
+    # "a run that delivered" by NAME (`NON_DELIVERING_TRIGGERS`), and a policy that excludes a
+    # value the enum cannot spell is a policy nothing can check.
     test = "test"
     # `import` is a Python keyword, so the MEMBER is spelled with a trailing underscore while the
     # VALUE — the only thing the database and the API ever see — is exactly `import`.
@@ -551,6 +556,21 @@ class DigestVisibilityScope(enum.StrEnum):
 class HostedMediaKind(enum.StrEnum):
     video = "video"
     image_full = "image_full"
+
+
+class HostedMediaStatus(enum.StrEnum):
+    """The lifecycle of ONE external object, and the only three states it can be in.
+
+    `pending` is written BEFORE the upload starts, so an object that reaches Dropbox always has a
+    row naming it; `uploaded` is written immediately after that one upload succeeds; `swept` is
+    written only after the remote delete has actually succeeded. Transitions are one-way and are
+    enforced by a CAS predicate in the statement (`WHERE status = :expected`), never by reading
+    first — the same rule `digest_runs.status` follows and for the same reason.
+    """
+
+    pending = "pending"
+    uploaded = "uploaded"
+    swept = "swept"
 
 
 class StatusAlreadyTerminal(ValueError):
@@ -781,23 +801,64 @@ class DigestDelivery(Base):
 
 
 class DigestHostedMedia(Base):
-    """A file uploaded to Dropbox for one mail, and the shared link that mail points at — the
-    table that replaces the satellite's `state.json["hosted_media"]`.
+    """The OWNERSHIP LEDGER for every file the digest puts on Dropbox — one row per remote object.
 
-    `swept_at` is stamped by the retention sweep when the file is deleted from Dropbox; the row is
-    KEPT so a later run can tell "never hosted" from "hosted and since swept" (links in older mails
-    die, which is today's behaviour and an accepted consequence of retention)."""
+    It is a ledger of an EXTERNAL resource, not a cache keyed by an attachment, and three
+    properties follow from that and are the reason the table has this shape rather than its first
+    one (`attachment_id` as the primary key, written in one batch after the whole hosting pass):
+
+    * **The row is written BEFORE the upload, not after it.** The path a file will occupy is
+      deterministic, so it can be committed as `pending` first. A crash between Dropbox accepting
+      a file and this process writing anything would otherwise leave an object that no row names
+      and no sweep can ever find — an orphan nothing can clean up, because the only locator lived
+      in the memory of a process that died.
+    * **The row OUTLIVES the attachment.** `attachment_id` is nullable and its FK is
+      `ON DELETE SET NULL`, never CASCADE: Dropbox cannot participate in a database cascade, so
+      deleting the row when the attachment is reclaimed deletes the sole locator of a file that is
+      still there. The tombstone survives, `attachment_id` goes NULL, and the retention sweep
+      still deletes the object it names.
+    * **`id` is a surrogate key.** One attachment can be hosted more than once (a later run writes
+      a new run folder, so a new path), and each remote object needs its own row. `dropbox_path`
+      is the natural key of the OBJECT and is UNIQUE, which is what makes committing the intention
+      idempotent across a retry.
+
+    `swept_at` is stamped only after the remote delete has actually succeeded — it is the claim
+    that the file IS gone, and stamping it for a failed delete would leave a live file no sweep
+    ever looks at again. A `pending` row older than the reconciliation threshold is judged by
+    probing the remote path: present means the upload landed and the process died before it could
+    say so, absent means it never landed.
+    """
 
     __tablename__ = "digest_hosted_media"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'uploaded', 'swept')",
+            name="ck_digest_hosted_media_status",
+        ),
+    )
 
-    attachment_id: Mapped[int] = mapped_column(
-        ForeignKey("attachments.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # NULLABLE and ON DELETE SET NULL. See the class docstring: a cascade here deletes the only
+    # locator of a file that still exists on Dropbox.
+    attachment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("attachments.id", ondelete="SET NULL"), index=True
     )
     kind: Mapped[str] = mapped_column(String(16))
-    dropbox_path: Mapped[str] = mapped_column(Text)
-    shared_link: Mapped[str] = mapped_column(Text)
-    uploaded_at: Mapped[datetime] = mapped_column(
+    # The natural key of the remote OBJECT, committed before the upload runs. Unique, so a retry
+    # of the same intention updates one row instead of adding a second claim on one file.
+    dropbox_path: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default=HostedMediaStatus.pending, server_default=HostedMediaStatus.pending
+    )
+    # NULL until the upload succeeds: a link is what an `uploaded` row promises.
+    shared_link: Mapped[str | None] = mapped_column(Text)
+    # When the INTENTION was committed. The reconciliation threshold for a stuck `pending` row is
+    # measured from here, because such a row has no `uploaded_at` to be measured from.
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # NULL until the upload succeeds. Retention age is measured from it, so a pending row is never
+    # swept on age alone — it is reconciled against the remote first.
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
     swept_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

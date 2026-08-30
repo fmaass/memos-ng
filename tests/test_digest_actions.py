@@ -8,8 +8,10 @@ left is behaviour, and three contracts carry real risk:
 * **test-send goes to the calling admin's own address**, resolved from the authenticated session
   and never from a request field. An endpoint that took an address would be an open relay for
   anyone who reached it, and would let a probe reach `digest_recipients`;
-* **run-now's 409 comes from the INSERT conflicting**, never from a pre-flight "is anything
-  running?" read — a check-then-insert is the TOCTOU race the unique index exists to close.
+* **run-now CLAIMS and does not execute** — it commits the run row (which IS the single-flight
+  lock), answers 202 with a `Location`, and leaves the pipeline to the worker. Its 409 comes from
+  the INSERT conflicting, never from a pre-flight "is anything running?" read — a check-then-insert
+  is the TOCTOU race the unique index exists to close.
 """
 
 import secrets
@@ -239,21 +241,34 @@ async def test_a_test_send_never_takes_its_destination_from_the_request(
 # --- run now ---------------------------------------------------------------------------------
 
 
-async def test_run_now_performs_a_real_run_and_returns_its_row(env, admin_client, capture_sends):
+async def test_run_now_claims_the_run_and_sends_nothing_itself(env, admin_client, capture_sends):
+    """The request commits the LOCK and returns. Nothing is rendered, uploaded or mailed inside
+    it: a run legitimately lasts minutes to hours, and a contract that awaited it would put a
+    browser tab and a proxy read timeout in charge of whether the household gets its mail."""
     subject, data_root = env
-    memo_id = await _seed_memo_with_photo(subject, data_root)
+    await _seed_memo_with_photo(subject, data_root)
     client, _ = admin_client
     response = client.post(f"{PREFIX}/run")
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
     assert body["trigger"] == DigestTrigger.manual
-    assert body["status"] == digest_runner.SENT
-    assert body["parts"] == 1 and body["parts_sent"] == 1 and body["memos_sent"] == 1
-    assert len(capture_sends.sent) == 1
-    assert capture_sends.sent[0].recipients == ["a@example.com", "b@example.com"]
+    assert body["status"] is None
+    assert set(body) == {"id", "status", "trigger"}
+    assert response.headers["location"] == f"{PREFIX}/runs/{body['id']}"
+
+    # The row is in flight and UNADOPTED — no heartbeat, because nothing has started it yet.
+    assert [
+        (row["trigger"], row["status"], row["heartbeat_at"]) for row in run_rows()
+    ] == [(DigestTrigger.manual, None, None)]
+    assert capture_sends.sent == []
     from tests.digest_support import delivery_rows
 
-    assert [row["memo_id"] for row in delivery_rows()] == [memo_id]
+    assert delivery_rows() == []
+
+    # …and it is readable at the URL the response pointed at.
+    followed = client.get(f"{PREFIX}/runs/{body['id']}")
+    assert followed.status_code == 200, followed.text
+    assert followed.json()["status"] is None
 
 
 async def test_run_now_answers_409_while_a_run_is_in_flight(env, admin_client, capture_sends):
@@ -284,36 +299,55 @@ async def test_run_now_succeeds_once_the_in_flight_run_ends(env, admin_client, c
     assert client.post(f"{PREFIX}/run").status_code == 409
     async with async_session() as db:
         await digest_runner.finish_run(db, run_id, status=digest_runner.FAILED)
-    assert client.post(f"{PREFIX}/run").status_code == 200
-    assert len(capture_sends.sent) == 1
+    assert client.post(f"{PREFIX}/run").status_code == 202
+    assert capture_sends.sent == []  # the claim sends nothing; the worker does
 
 
-async def test_run_now_writes_a_failed_row_rather_than_a_500_when_a_guard_bites(
+async def test_a_guard_that_bites_writes_a_failed_row_rather_than_refusing_the_claim(
     env, admin_client, capture_sends, monkeypatch
 ):
-    """The guards are part of the RUN, not of the request: the admin sees the failure in the Runs
-    table and in the metrics, which is where an operator looks."""
+    """The guards are part of the RUN, not of the request. The claim succeeds — it is only a lock —
+    and the failure appears where an operator looks for it: the run row, the Runs table and the
+    metrics. Answering the CLAIM 422 would put the failure only in a response body nobody keeps.
+    """
     monkeypatch.setattr(app_settings, "SMTP_PASSWORD", "")
     client, _ = admin_client
-    response = client.post(f"{PREFIX}/run")
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == digest_runner.FAILED
-    assert response.json()["error"] == digest_runner.ERROR_SMTP_UNCONFIGURED
+    claimed = client.post(f"{PREFIX}/run")
+    assert claimed.status_code == 202, claimed.text
+    run_id = claimed.json()["id"]
+
+    result = await digest_runner.run_claimed_digest_safe(run_id, transport=capture_sends)
+    assert result is not None and result.status == digest_runner.FAILED
+    assert result.error == digest_runner.ERROR_SMTP_UNCONFIGURED
     assert capture_sends.sent == []
+    row = client.get(f"{PREFIX}/runs/{run_id}").json()
+    assert row["status"] == digest_runner.FAILED
+    assert row["error"] == digest_runner.ERROR_SMTP_UNCONFIGURED
 
 
-async def test_the_action_handlers_refresh_the_metrics_snapshot(
+async def test_the_test_send_handler_refreshes_the_metrics_snapshot(
     env, admin_client, capture_sends
 ):
-    """"The metrics change after a run" has to be probeable without a 60-second wait, which is what
-    `refresh_now()` at the end of these handlers is for."""
+    """"The metrics change after a send" has to be probeable without a 60-second wait, which is
+    what `refresh_now()` at the end of the test-send handler is for.
+
+    Run-now no longer refreshes anything, and that is correct rather than an omission: at the
+    moment it answers, nothing has happened yet — the row it committed is in flight, contributes
+    to no terminal label, and the worker's outcome reaches the app through the ordinary 60 s
+    refresher.
+    """
     from app.services.digest import metrics as digest_metrics
 
     subject, data_root = env
     await _seed_memo_with_photo(subject, data_root)
+    async with async_session() as db:
+        run_id = await digest_runner.open_run(
+            db, trigger=DigestTrigger.scheduled, local_date=datetime.now(UTC).date()
+        )
+        await digest_runner.finish_run(db, run_id, status=digest_runner.SENT, memos_sent=1)
     digest_metrics.set_snapshot(None)
     client, _ = admin_client
-    assert client.post(f"{PREFIX}/run").status_code == 200
+    assert client.post(f"{PREFIX}/test-send", json={"empty": True}).status_code == 200
     snapshot = digest_metrics.current()
     assert snapshot is not None
     assert snapshot.runs_by_status == {digest_runner.SENT: 1}

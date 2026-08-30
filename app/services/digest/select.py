@@ -16,6 +16,7 @@ the one filesystem hop is a single offloaded `Path.exists()` sweep rather than o
 over a bind-mounted share.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,12 +27,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     DigestDelivery,
-    DigestSettings,
     DigestVisibilityScope,
     Memo,
     Visibility,
 )
 from app.services.asset_paths import derived_tier_path
+from app.services.digest.domain import DigestConfig
 from app.services.digest.gate import start_of_local_day_utc
 
 # Which memo visibilities each scope admits. PRIVATE is in neither, in any configuration: the
@@ -158,7 +159,7 @@ def _existing_paths_sync(paths: list[Path]) -> set[Path]:
     return {p for p in paths if p.exists()}
 
 
-async def load_candidates(db: AsyncSession, settings: DigestSettings) -> list[Candidate]:
+async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Candidate]:
     """Every memo eligible by scope, archive state, start date and the delivery registry, oldest
     first.
 
@@ -201,10 +202,18 @@ async def load_candidates(db: AsyncSession, settings: DigestSettings) -> list[Ca
 
 
 async def select_for_run(
-    db: AsyncSession, settings: DigestSettings, now_utc: datetime
+    session_factory: Callable[[], AsyncSession], settings: DigestConfig, now_utc: datetime
 ) -> Selection:
-    """Load the candidates and apply the readiness rule — the whole selection step of a run."""
-    candidates = await load_candidates(db, settings)
+    """Load the candidates and apply the readiness rule — the whole selection step of a run.
+
+    The database read and the filesystem scan are deliberately NOT in one another's company: the
+    session is opened, read from and CLOSED, and only then does the readiness scan stat hundreds of
+    paths across a network bind mount. A `SELECT` autobegins a transaction, so holding the session
+    over that scan would pin a pooled connection for the whole of it — the bounded-pool rule this
+    service shares with the rest of the app (ADR-0009).
+    """
+    async with session_factory() as db:
+        candidates = await load_candidates(db, settings)
     if not candidates:
         return Selection(included=[], deferred=[])
     paths: list[Path] = []

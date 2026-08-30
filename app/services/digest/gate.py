@@ -11,7 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 
-from app.models import DigestSettings, DigestTrigger
+from app.models import DigestTrigger
+from app.services.digest.domain import DigestConfig
 
 logger = structlog.get_logger(__name__)
 
@@ -90,7 +91,7 @@ def start_of_local_day_utc(day: date, timezone: str) -> datetime:
 
 def digest_due(
     now_utc: datetime,
-    settings: DigestSettings,
+    settings: DigestConfig,
     last_run_local_date: date | None,
 ) -> bool:
     """Whether the scheduled digest should start now.

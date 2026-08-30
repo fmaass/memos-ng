@@ -12,26 +12,28 @@ from pathlib import Path
 
 import pytest
 from app.config import settings as app_settings
-from app.models import DigestSettings, DigestVisibilityScope, Visibility
+from app.models import DigestVisibilityScope, Visibility
 from app.services.digest import select as digest_select
+from app.services.digest.domain import DigestConfig
 from sqlalchemy import text
 
-from tests.digest_support import seed_attachment, seed_memo, seed_user, write_thumb, write_web_mp4
+from tests.digest_support import (
+    borrowed_session_factory,
+    digest_config,
+    seed_attachment,
+    seed_memo,
+    seed_user,
+    write_thumb,
+    write_web_mp4,
+)
 
 NOW = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 
 
-def _settings(**overrides) -> DigestSettings:
-    row = DigestSettings(id=1)
-    row.visibility_scope = overrides.pop(
-        "visibility_scope", DigestVisibilityScope.PUBLIC_PROTECTED
-    )
-    row.start_date = overrides.pop("start_date", datetime(2026, 6, 1).date())
-    row.timezone = overrides.pop("timezone", "Europe/Zurich")
-    row.grace_minutes = overrides.pop("grace_minutes", 30)
-    for key, value in overrides.items():
-        setattr(row, key, value)
-    return row
+def _settings(**overrides) -> DigestConfig:
+    """The settings SNAPSHOT the selection reads — a frozen value, not a mapped row, because that
+    is what the pipeline is handed once its session has closed."""
+    return digest_config(**overrides)
 
 
 def _candidate(uid: str, *, minutes_old: int = 120, images=(), videos=()):
@@ -229,7 +231,9 @@ async def test_select_for_run_reads_the_real_filesystem(adb, tmp_path, monkeypat
     await seed_attachment(adb, user, pending, mime="image/jpeg")  # no thumb on disk
     await adb.flush()
 
-    selection = await digest_select.select_for_run(adb, _settings(), datetime.now(UTC))
+    selection = await digest_select.select_for_run(
+        borrowed_session_factory(adb), _settings(), datetime.now(UTC)
+    )
     assert [c.memo_id for c in selection.included] == [ready.id, with_video.id]
     assert [d.uid for d in selection.deferred] == [pending.uid]
 

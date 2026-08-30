@@ -347,3 +347,38 @@ def test_the_empty_body_says_so_in_both_alternatives():
     assert "No memos selected." in html
     assert "Household Post" in html
     assert render.EMPTY_BODY_NOTE in plain
+
+
+def test_the_template_is_compiled_once_and_never_re_read():
+    """Every render used to construct a fresh Jinja `Environment` and load the template off the
+    filesystem — on the deployed host that is a network bind mount, inside the event loop, once per
+    PART of every mail. Caching the compiled template is what makes a render pure CPU, which is
+    also why it can stay synchronous: there is no filesystem call left in it to offload.
+
+    Asserted by counting loader reads rather than by reading the source, because the manifest of a
+    cache is that the second read does not happen.
+    """
+    from app.services.digest import render as render_module
+    from jinja2 import FileSystemLoader
+
+    render_module._template.cache_clear()
+    reads: list[str] = []
+    real_get_source = FileSystemLoader.get_source
+
+    def _counting_get_source(self, environment, template):
+        reads.append(template)
+        return real_get_source(self, environment, template)
+
+    FileSystemLoader.get_source = _counting_get_source
+    try:
+        first = render_module.render_html(
+            [], subject="s", mail_title="t", date_range="", memo_count=0
+        )
+        second = render_module.render_html(
+            [], subject="s", mail_title="t", date_range="", memo_count=0
+        )
+    finally:
+        FileSystemLoader.get_source = real_get_source
+        render_module._template.cache_clear()
+    assert first == second  # control: both calls really rendered the same template
+    assert reads == [render_module.TEMPLATE_NAME]

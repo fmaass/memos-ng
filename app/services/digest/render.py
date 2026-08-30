@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -25,7 +26,7 @@ from zoneinfo import ZoneInfo
 import bleach
 import markdown
 from anyio import to_thread
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from jinja2 import Environment, FileSystemLoader, Template, select_autoescape
 
 from app.config import settings as app_settings
 from app.services.asset_paths import derived_tier_path
@@ -331,11 +332,28 @@ def build_cards(
     return cards, inline
 
 
-def _environment() -> Environment:
-    return Environment(
+@lru_cache(maxsize=1)
+def _template() -> Template:
+    """The compiled mail template, built and loaded ONCE per process.
+
+    Both halves matter and both used to happen on every single render: constructing an
+    `Environment` compiles nothing but does set up a fresh loader and an empty template cache, and
+    `get_template` then reads and compiles the template off the filesystem — on the deployed
+    host, off a network bind mount, inside the event loop, once per PART of every mail. Caching
+    the compiled template makes every render after the first one pure CPU over an in-memory
+    object, which is why this stays synchronous rather than being offloaded: there is no
+    filesystem call left in it to offload.
+
+    `auto_reload=False` is what keeps that true — Jinja otherwise stats the source file on every
+    lookup to decide whether to recompile. The template is shipped inside the image and cannot
+    change under a running process.
+    """
+    environment = Environment(
         loader=FileSystemLoader(str(TEMPLATE_DIR)),
         autoescape=select_autoescape(["html"]),
+        auto_reload=False,
     )
+    return environment.get_template(TEMPLATE_NAME)
 
 
 def render_html(
@@ -348,7 +366,7 @@ def render_html(
     part_index: int = 1,
     part_total: int = 1,
 ) -> str:
-    return _environment().get_template(TEMPLATE_NAME).render(
+    return _template().render(
         day_groups=day_groups,
         subject=subject,
         mail_title=mail_title,
@@ -406,7 +424,7 @@ EMPTY_BODY_NOTE = "No memos selected."
 
 def render_empty(mail_title: str) -> tuple[str, str]:
     """The "no memos selected" body a test-send falls back to, so it is always a usable SMTP probe
-    (and so the Phase 4 probe needs no settings write anywhere in it)."""
+    (and so the probe needs no settings write anywhere in it)."""
     html = render_html(
         [],
         subject=mail_title,

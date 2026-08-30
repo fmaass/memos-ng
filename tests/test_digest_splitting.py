@@ -7,9 +7,11 @@ not fit. Every rung has a test, and the last assertion of the suite is the invar
 divergence exists for: **no emitted part exceeds the cap.**
 """
 
+import secrets
 from datetime import UTC, datetime
 
 from app.services.digest import splitting
+from app.services.digest.mailer import build_message
 from app.services.digest.render import Card, CardImage, CardVideo, DayGroup, InlineImage
 
 DAY = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
@@ -201,3 +203,67 @@ def test_shed_to_fit_reports_failure_rather_than_lying():
     card, sizes = _card("m", photos=[("p1", 10_000_000)])
     assert splitting.shed_to_fit(card, sizes, 1000) is False
     assert len(card.images) == 1  # the first photo is never shed
+
+
+# --- an independent oracle ----------------------------------------------------------------------
+
+
+def _serialised_size(part: splitting.Part, payloads: dict[str, bytes]) -> int:
+    """The bytes an SMTP server would actually receive for this part.
+
+    Deliberately built with the REAL message builder and measured with `as_bytes()`: base64
+    expansion, the MIME boundaries, the per-part headers and both alternative bodies are all in
+    the number, and none of them comes from the estimator under test.
+    """
+    message = build_message(
+        subject="The Daily Dami Memos Mail",
+        from_email="sender@example.com",
+        from_name="The Daily Dami Memos Mail",
+        html_body="<html><body><p>a card</p></body></html>",
+        plain_body="a card",
+        inline_images=[
+            InlineImage(cid=cid, data=payloads[cid]) for cid in sorted(part.inline_image_cids)
+        ],
+    )
+    return len(message.as_bytes())
+
+
+def test_the_serialised_bytes_of_every_part_fit_under_the_cap():
+    """The invariant measured by something OTHER than the thing being tested.
+
+    Every other assertion in this file about "no part exceeds the cap" runs the part back through
+    `estimate_mime_size` — the same production estimator the splitter used to decide. That check
+    can only ever agree with itself: an estimator that under-counted by a factor of two would keep
+    it green while every message went out over the cap. This one serialises the real MIME message
+    and counts its bytes, so the estimator has to be CONSERVATIVE rather than merely
+    self-consistent.
+
+    The payloads are incompressible random bytes, which is the honest case: base64 expands them by
+    4/3 with no encoder able to win any of it back.
+    """
+    cap = 200_000
+    payloads = {f"p{index}": secrets.token_bytes(40_000) for index in range(6)}
+    cards: list[Card] = []
+    sizes: dict[str, int] = {}
+    for index, (cid, data) in enumerate(payloads.items()):
+        card, card_sizes = _card(f"m{index}", photos=[(cid, len(data))])
+        cards.append(card)
+        sizes.update(card_sizes)
+
+    result = splitting.split_into_parts([_day(cards)], sizes, cap)
+    # Control: a single part would prove nothing about a SPLIT, and an empty result nothing at all.
+    assert len(result.parts) > 1
+    assert result.deferred == []
+    assert sum(len(part.inline_image_cids) for part in result.parts) == len(payloads)
+    for part in result.parts:
+        assert _serialised_size(part, payloads) <= cap
+
+
+def test_the_independent_oracle_can_actually_fail():
+    """Positive control on the oracle itself: a part the splitter would never emit — every photo
+    in one message — must be measured as over the cap. Without this, a `_serialised_size` that
+    returned 0 would leave the test above green for ever."""
+    cap = 200_000
+    payloads = {f"p{index}": secrets.token_bytes(40_000) for index in range(6)}
+    oversized = splitting.Part(day_groups=[], inline_image_cids=set(payloads))
+    assert _serialised_size(oversized, payloads) > cap

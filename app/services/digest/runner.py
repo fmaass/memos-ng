@@ -1,6 +1,6 @@
 """One digest run: the row that IS the lock, the claim CAS, the per-part commit, and the sweeps.
 
-Three rules run through everything here and each was bought by a named failure mode.
+Five rules run through everything here and each was bought by a named failure mode.
 
 **The run row is the single-flight lock.** It is INSERTed and COMMITted before any other work,
 under two unique partial indexes (`uq_digest_runs_scheduled_local_date`,
@@ -25,6 +25,21 @@ part's commit — at most one part per attempt, repeated on every attempt for as
 recurs at exactly that point. It is alarmed rather than silent: the crashed run leaves a
 `status IS NULL` row the sweep marks `failed`, so `memosng_digest_last_success_timestamp_seconds`
 never advances and the 26 h stale alert fires.
+
+**No transaction is ever open across an external boundary.** Every database read here is taken in
+a short session that is CLOSED before the first filesystem, Dropbox or SMTP call, and every write
+reopens one of its own. A SQLAlchemy `SELECT` autobegins a transaction, so a session merely held
+open pins a pooled connection and an idle transaction for the whole of a run that legitimately
+lasts hours — against a bounded pool shared with production (ADR-0009), and against this worker's
+own commit-before-long-work rule. The settings are therefore read once into a frozen
+`DigestConfig` snapshot rather than carried as a mapped instance, which could not be read after
+its session closed anyway.
+
+**Every hosted file is owned by a committed row BEFORE it exists.** The upload path is claim →
+upload → mark, one file at a time (`hosting.resolve_links`), so a crash can leave a `pending` row
+whose remote object may or may not be there — a question the retention sweep resolves by asking
+Dropbox — but can never leave an object that no row names. That is the difference between a
+cleanable orphan and an unfindable one.
 """
 
 from collections.abc import Awaitable, Callable
@@ -36,15 +51,16 @@ import httpx
 import structlog
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as app_settings
 from app.database import async_session
-from app.models import DigestSettings, DigestTrigger
-from app.services.digest import hosting, render
+from app.models import DigestRunStatus, DigestTrigger, HostedMediaStatus
+from app.services.digest import domain, hosting, render
 from app.services.digest import select as selection_mod
-from app.services.digest.gate import FALLBACK_TIMEZONE, local_date_of, resolve_zone
-from app.services.digest.hosting import DropboxHost, MediaHost, MediaLinks
+from app.services.digest.domain import DigestConfig, sender_address
+from app.services.digest.gate import FALLBACK_TIMEZONE, LEDGER_TRIGGERS, local_date_of, resolve_zone
+from app.services.digest.hosting import DropboxHost, HostedLedger, MediaHost, MediaLinks
 from app.services.digest.mailer import (
     MailTransport,
     SmtplibTransport,
@@ -59,10 +75,12 @@ from app.services.digest.splitting import Part, build_cid_to_bytes, split_into_p
 
 logger = structlog.get_logger(__name__)
 
-SENT = "sent"
-NOTHING_TO_SEND = "nothing_to_send"
-DEFERRED = "deferred"
-FAILED = "failed"
+# The run vocabulary, aliased from the ONE enum that defines it (`app.models`). Aliases rather
+# than string literals: a status spelled twice is a status that can be spelled differently twice.
+SENT = DigestRunStatus.sent
+NOTHING_TO_SEND = DigestRunStatus.nothing_to_send
+DEFERRED = DigestRunStatus.deferred
+FAILED = DigestRunStatus.failed
 
 # Fifteen minutes of SILENCE, not of elapsed time. A healthy run stamps `heartbeat_at` before and
 # after every part send and after every Dropbox upload-session operation, so the longest gap it
@@ -70,12 +88,21 @@ FAILED = "failed"
 # this bar, and unrelated to how long the whole run takes.
 STALE_RUN_MINUTES = 15
 
+# How long a hosted-media row may sit `pending` before the sweep asks Dropbox what actually
+# happened. Comfortably above the longest single upload (one 600 s upload-session operation per
+# 48 MB chunk), so a live upload is never reconciled out from under itself.
+PENDING_RECONCILE_MINUTES = 60
+
 ERROR_SMTP_UNCONFIGURED = "smtp not configured"
 ERROR_NO_RECIPIENTS = "no enabled recipients"
 ERROR_SENDER_IS_RECIPIENT = "the sender address is also a recipient"
 ERROR_RUNNER_DIED = "runner died"
 
-SessionFactory = async_sessionmaker[AsyncSession]
+# A plain callable, not `async_sessionmaker`: every caller here uses it the same way — call it,
+# get a session, close the session — and typing it structurally is what lets a test hand in a
+# factory that COUNTS the transactions its sessions hold open (which is how "no transaction is
+# open during an upload" becomes an assertion rather than a claim).
+SessionFactory = Callable[[], AsyncSession]
 HostFactory = Callable[[hosting.Operation], Awaitable[MediaHost | None]]
 
 
@@ -118,18 +145,32 @@ class RenderedDigest:
     links: MediaLinks = field(default_factory=MediaLinks)
 
 
+def _sql_values(values: tuple[str, ...]) -> str:
+    """`('a', 'b')` for an IN list built from CONSTANTS of this module.
+
+    Never from caller input: these are enum members, so the rendered literal is a constant of the
+    ledger and not a parameter. It is rendered rather than bound because the same list has to sit
+    inside a `NOT EXISTS` sub-select the INSERT re-evaluates, where a bound array would change the
+    statement's shape for no gain.
+    """
+    return "(" + ", ".join(f"'{value}'" for value in sorted(values)) + ")"
+
+
+_LEDGER_TRIGGER_SQL = _sql_values(tuple(LEDGER_TRIGGERS))
+
+
 # --- the run row, and every fenced write against it ---------------------------------------------
 
 
 # A scheduled run's INSERT re-checks the day ledger inside the statement. `local_date` is bound
-# twice (the row it writes and the ledger it tests), which is why the trigger list is a literal:
-# it is a constant of the ledger, not a caller's input.
+# twice (the row it writes and the ledger it tests), which is why the trigger list is rendered
+# from `gate.LEDGER_TRIGGERS`: it is a constant of the ledger, not a caller's input.
 _INSERT_SCHEDULED = (
     "INSERT INTO digest_runs (trigger, local_date) "
     "SELECT :trigger, :local_date "
     "WHERE NOT EXISTS ("
     "  SELECT 1 FROM digest_runs "
-    "  WHERE local_date = :local_date AND trigger IN ('scheduled', 'manual')"
+    f"  WHERE local_date = :local_date AND trigger IN {_LEDGER_TRIGGER_SQL}"
     ") RETURNING id"
 )
 _INSERT_PLAIN = (
@@ -169,6 +210,42 @@ async def open_run(db: AsyncSession, *, trigger: str, local_date: date) -> int:
         # invariant.
         raise RunSkipped(f"{local_date} already has a scheduled or manual run")
     return int(run_id)
+
+
+async def claim_run(db: AsyncSession, run_id: int) -> bool:
+    """Adopt an already-committed, not-yet-started run — the manual `run` endpoint's row.
+
+    The endpoint COMMITS the row and returns; the worker executes it. Between those two moments
+    the row is in flight but unowned, and `heartbeat_at IS NULL` is exactly what "nobody has
+    started it" means (a running run stamps liveness before it does anything else). Making the
+    adoption a CAS on that column is what keeps a second worker from executing the same row
+    beside the first: the INSERT's unique index no longer separates them, because the row they
+    would race over already exists.
+
+    A row nobody adopts is not lost: the stale-run sweep judges it on `COALESCE(heartbeat_at,
+    started_at)` and marks it `failed` after the same 15 minutes of silence, which is the right
+    answer when there is no worker to run it.
+    """
+    adopted = await db.scalar(
+        sa_text(
+            "UPDATE digest_runs SET heartbeat_at = now() "
+            "WHERE id = :id AND status IS NULL AND heartbeat_at IS NULL RETURNING id"
+        ),
+        {"id": run_id},
+    )
+    await db.commit()
+    return adopted is not None
+
+
+async def pending_manual_run_id(db: AsyncSession) -> int | None:
+    """The oldest manual run row that is in flight and has not been started by anyone."""
+    return await db.scalar(
+        sa_text(
+            "SELECT id FROM digest_runs WHERE status IS NULL AND trigger = :trigger "
+            "AND heartbeat_at IS NULL ORDER BY id ASC LIMIT 1"
+        ),
+        {"trigger": DigestTrigger.manual},
+    )
 
 
 async def heartbeat(db: AsyncSession, run_id: int) -> bool:
@@ -319,7 +396,8 @@ async def sweep_stale_runs(
     it, dropping it out of `uq_digest_runs_single_inflight` while it was still sending.
 
     `COALESCE(heartbeat_at, started_at)` is what judges a run that has not beaten yet — every run
-    predating the Phase-2 migration, and every run still in its first upload — on the same bar.
+    predating the Phase-2 migration, every run still in its first upload, and a manual row no
+    worker has adopted — on the same bar.
     """
     async with session_factory() as db:
         result = await db.execute(
@@ -341,11 +419,9 @@ async def sweep_stale_runs(
 # --- reading the state a run needs ---------------------------------------------------------------
 
 
-async def load_settings(db: AsyncSession) -> DigestSettings:
-    row = await db.get(DigestSettings, 1)
-    if row is None:
-        raise RuntimeError("digest settings row is missing — the migration seeds it")
-    return row
+async def load_settings(db: AsyncSession) -> DigestConfig:
+    """The settings singleton as a frozen snapshot — see `domain.DigestConfig`."""
+    return await domain.load_config(db)
 
 
 async def enabled_recipients(db: AsyncSession) -> list[str]:
@@ -365,7 +441,7 @@ async def last_ledger_local_date(db: AsyncSession) -> date | None:
     """
     return await db.scalar(
         sa_text(
-            "SELECT max(local_date) FROM digest_runs WHERE trigger IN ('scheduled', 'manual')"
+            f"SELECT max(local_date) FROM digest_runs WHERE trigger IN {_LEDGER_TRIGGER_SQL}"
         )
     )
 
@@ -373,69 +449,135 @@ async def last_ledger_local_date(db: AsyncSession) -> date | None:
 async def existing_hosted_links(db: AsyncSession, attachment_ids: list[int]) -> dict[int, str]:
     """Links already recorded for these attachments and not yet swept.
 
-    A test-send and a preview render from these and upload nothing (A6): a probe must never create
-    a Dropbox file the registry does not know about.
+    A test-send and a preview render from these and upload nothing: a probe must never create a
+    Dropbox file the ledger does not know about.
+
+    `uploaded` only, and the NEWEST per attachment: a `pending` row promises no link at all, a
+    `swept` row's object is gone, and one attachment can carry several rows because a later run
+    hosts it again under a new run folder.
     """
     if not attachment_ids:
         return {}
     rows = await db.execute(
         sa_text(
-            "SELECT attachment_id, shared_link FROM digest_hosted_media "
-            "WHERE attachment_id = ANY(:ids) AND swept_at IS NULL"
+            "SELECT DISTINCT ON (attachment_id) attachment_id, shared_link "
+            "FROM digest_hosted_media "
+            "WHERE attachment_id = ANY(:ids) AND status = :status AND shared_link IS NOT NULL "
+            "ORDER BY attachment_id, uploaded_at DESC, id DESC"
         ),
-        {"ids": attachment_ids},
+        {"ids": attachment_ids, "status": HostedMediaStatus.uploaded},
     )
     return {row[0]: row[1] for row in rows}
 
 
-async def record_hosted_media(db: AsyncSession, uploads: list[hosting.HostedUpload]) -> None:
-    for upload in uploads:
-        await db.execute(
-            sa_text(
-                "INSERT INTO digest_hosted_media "
-                "(attachment_id, kind, dropbox_path, shared_link, bytes) "
-                "VALUES (:attachment_id, :kind, :dropbox_path, :shared_link, :bytes) "
-                "ON CONFLICT (attachment_id) DO UPDATE SET "
-                "kind = EXCLUDED.kind, dropbox_path = EXCLUDED.dropbox_path, "
-                "shared_link = EXCLUDED.shared_link, bytes = EXCLUDED.bytes, "
-                "uploaded_at = now(), swept_at = NULL"
-            ),
-            {
-                "attachment_id": upload.attachment_id,
-                "kind": upload.kind,
-                "dropbox_path": upload.dropbox_path,
-                "shared_link": upload.shared_link,
-                "bytes": upload.bytes,
-            },
-        )
-    await db.commit()
+class SessionLedger:
+    """The hosted-media ledger, one short committing transaction per write.
+
+    Not a session held by the hosting pass: the whole reason this exists is that the upload
+    between the two writes must happen with NO transaction open, so each write opens its own,
+    commits and closes.
+    """
+
+    def __init__(self, session_factory: SessionFactory = async_session) -> None:
+        self._session_factory = session_factory
+
+    async def claim(self, *, attachment_id: int, kind: str, dropbox_path: str) -> int:
+        """Commit `dropbox_path` as `pending` and return its ledger row id.
+
+        Idempotent on the path, which is the natural key of the remote object. A conflicting row
+        that is still `pending` is RE-OPENED (a previous attempt died mid-upload; this attempt now
+        owns the intention and its clock restarts), while one that is already `uploaded` is left
+        exactly as it is — a row that promises a live object must not be talked back into
+        promising nothing.
+        """
+        async with self._session_factory() as db:
+            row_id = await db.scalar(
+                sa_text(
+                    "INSERT INTO digest_hosted_media "
+                    "(attachment_id, kind, dropbox_path, status, created_at) "
+                    "VALUES (:attachment_id, :kind, :dropbox_path, :pending, now()) "
+                    "ON CONFLICT (dropbox_path) DO UPDATE SET "
+                    "attachment_id = EXCLUDED.attachment_id, kind = EXCLUDED.kind, "
+                    "status = :pending, created_at = now(), uploaded_at = NULL, "
+                    "shared_link = NULL, swept_at = NULL "
+                    "WHERE digest_hosted_media.status <> :uploaded "
+                    "RETURNING id"
+                ),
+                {
+                    "attachment_id": attachment_id,
+                    "kind": kind,
+                    "dropbox_path": dropbox_path,
+                    "pending": HostedMediaStatus.pending,
+                    "uploaded": HostedMediaStatus.uploaded,
+                },
+            )
+            if row_id is None:
+                # The conflicting row is already `uploaded`, so the DO UPDATE's WHERE excluded it
+                # and RETURNING yielded nothing. The row still IS the claim on this path; read its
+                # id so the caller has something to mark, and let `mark_uploaded`'s CAS decline.
+                row_id = await db.scalar(
+                    sa_text("SELECT id FROM digest_hosted_media WHERE dropbox_path = :path"),
+                    {"path": dropbox_path},
+                )
+            await db.commit()
+        if row_id is None:  # pragma: no cover — the row was committed a statement ago
+            raise RuntimeError(f"hosted-media claim for {dropbox_path} vanished")
+        return int(row_id)
+
+    async def mark_uploaded(self, ledger_id: int, *, shared_link: str, size: int) -> None:
+        """`pending` → `uploaded`, immediately after THIS file's upload succeeded.
+
+        A CAS on the previous status, so the transition is write-once: a row that is already
+        `uploaded` or has been `swept` is not rewritten, and the mismatch is logged rather than
+        raised — the bytes are on Dropbox either way and failing the run here would help nobody.
+        """
+        async with self._session_factory() as db:
+            updated = await db.scalar(
+                sa_text(
+                    "UPDATE digest_hosted_media SET status = :uploaded, shared_link = :link, "
+                    "bytes = :bytes, uploaded_at = now() "
+                    "WHERE id = :id AND status = :pending RETURNING id"
+                ),
+                {
+                    "id": ledger_id,
+                    "link": shared_link,
+                    "bytes": size,
+                    "pending": HostedMediaStatus.pending,
+                    "uploaded": HostedMediaStatus.uploaded,
+                },
+            )
+            await db.commit()
+        if updated is None:
+            logger.warning("digest.hosted_media_transition_lost", ledger_id=ledger_id)
 
 
 # --- building the mail ---------------------------------------------------------------------------
 
 
-def sender_address(settings: DigestSettings) -> str:
-    """`from_email`, or the address that actually authenticates when it is empty (the seeded
-    value's documented meaning)."""
-    return settings.from_email or app_settings.SMTP_USERNAME
-
-
 def smtp_configured() -> bool:
-    return bool(app_settings.SMTP_USERNAME and app_settings.SMTP_PASSWORD)
+    """Re-exported from `domain` so callers of this module keep one import."""
+    return domain.smtp_configured()
+
+
+def dropbox_configured() -> bool:
+    return domain.dropbox_configured()
 
 
 async def build_digest(
-    db: AsyncSession,
-    settings: DigestSettings,
+    session_factory: SessionFactory,
+    settings: DigestConfig,
     selection: selection_mod.Selection,
     *,
     host: MediaHost | None,
-    upload: bool,
+    ledger: HostedLedger | None = None,
 ) -> RenderedDigest:
     """Host, render and split an already-made selection — everything up to (not including) SMTP.
 
-    `upload=False` is the probe contract: links are resolved from `digest_hosted_media` alone and
+    `host=None` is the probe contract: links are resolved from the hosted-media ledger alone and
     no Dropbox call is made, so a preview or a test-send can never leave a hosted file behind.
+
+    The one database read it needs — which attachments already have a live link — happens in a
+    session that is closed again before any upload or file read starts.
 
     The selection is TRUNCATED at `max_memos_per_run` here, which is how a preview and a test-send
     "honour max_memos_per_run like every run" while still always producing a body. A real run never
@@ -449,16 +591,16 @@ async def build_digest(
     attachment_ids = selection_mod.unresolved_attachment_ids(
         selection_mod.Selection(included=included, deferred=[])
     )
-    existing = await existing_hosted_links(db, attachment_ids)
+    async with session_factory() as db:
+        existing = await existing_hosted_links(db, attachment_ids)
     rendered.links = await hosting.resolve_links(
         included,
-        host=host if upload else None,
+        host=host,
+        ledger=ledger,
         existing=existing,
         max_videos_per_memo=settings.max_videos_per_memo,
         link_images_full=settings.link_images_full,
     )
-    if upload and rendered.links.uploaded:
-        await record_hosted_media(db, rendered.links.uploaded)
 
     files = await render.read_card_files(
         render.card_source_paths(included, rendered.links, settings.max_videos_per_memo)
@@ -483,7 +625,7 @@ async def build_digest(
 
 
 def part_payload(
-    rendered: RenderedDigest, part_index: int, settings: DigestSettings
+    rendered: RenderedDigest, part_index: int, settings: DigestConfig
 ) -> tuple[str, str, str, list[InlineImage], list[int], set[int]]:
     """`(subject, html, plain, inline images, memo ids, incomplete memo ids)` for one part."""
     part = rendered.parts[part_index - 1]
@@ -520,16 +662,6 @@ def part_payload(
 # --- the Dropbox host a real run builds -----------------------------------------------------------
 
 
-def dropbox_configured() -> bool:
-    return all(
-        (
-            app_settings.DROPBOX_APP_KEY,
-            app_settings.DROPBOX_APP_SECRET,
-            app_settings.DROPBOX_REFRESH_TOKEN,
-        )
-    )
-
-
 def run_folder_name(now_utc: datetime, timezone: str) -> str:
     """`YYYY-MM-DD_HHMM` in the configured zone — the satellite's folder naming, kept so the two
     tools' uploads read as one history in the Dropbox folder they share."""
@@ -537,21 +669,19 @@ def run_folder_name(now_utc: datetime, timezone: str) -> str:
     return now_utc.astimezone(zone).strftime("%Y-%m-%d_%H%M")
 
 
-def make_dropbox_host_factory(
-    settings: DigestSettings, now_utc: datetime
-) -> HostFactory:
+def make_dropbox_host_factory(settings: DigestConfig, now_utc: datetime) -> HostFactory:
     """A factory that builds and authenticates a `DropboxHost`, or returns None.
 
     None is the inline-only path, and three causes reach it: hosting off in the settings, the env
     keys unset, and a token refresh that failed. The run continues in all three rather than failing
-    (AC 8) and says so in one line of its own — see `_execute_run`. Only the surprising causes log
-    here, because "hosting is switched off" is a decision, not an incident.
+    and says so in one line of its own — see `_execute_run`. Only the surprising causes log here,
+    because "hosting is switched off" is a decision, not an incident.
     """
 
     async def factory(on_operation: hosting.Operation) -> MediaHost | None:
         if not settings.hosting_enabled:
             return None
-        if not dropbox_configured():
+        if not domain.dropbox_configured():
             logger.warning("digest.hosting_keys_missing")
             return None
         client = httpx.AsyncClient()
@@ -566,7 +696,10 @@ def make_dropbox_host_factory(
         )
         try:
             await host.refresh()
-        except (hosting.DropboxError, httpx.HTTPError):
+        except Exception:
+            # ANY failure, not only a Dropbox or transport error: a malformed token response
+            # raises `KeyError`/`JSONDecodeError` out of `refresh()`, and a client left unclosed
+            # on that path leaks a connection pool once per run in a process that lives for weeks.
             await client.aclose()
             # The CAUSE, under its own event name: the per-run "inline-only" line is emitted by
             # the run itself, so that one stays exactly one per run whatever brought hosting down.
@@ -599,10 +732,10 @@ async def run_digest(
     host_factory: HostFactory | None = None,
     now_utc: datetime | None = None,
 ) -> RunResult | None:
-    """Perform one digest run. Returns None when the run was aborted by a lost claim.
+    """Open a run row and perform it. Returns None when the run was aborted by a lost claim.
 
     Raises `RunSkipped` when another run already owns the slot — the caller decides whether that
-    is "skip" (the worker) or 409 (the manual endpoint).
+    is "skip" (the worker) or a refusal (the manual endpoint).
     """
     moment = now_utc or datetime.now(UTC)
     async with session_factory() as db:
@@ -610,30 +743,26 @@ async def run_digest(
         run_id = await open_run(
             db, trigger=trigger, local_date=local_date_of(moment, settings.timezone)
         )
-
-    # A SECOND session for the run itself. The first one's only job was to commit the lock, and a
-    # run holds its session for minutes across SMTP and Dropbox calls — keeping those apart means
-    # the lock is committed and durable before anything long-running starts.
-    async with session_factory() as db:
-        return await _execute_run(
-            db,
-            run_id=run_id,
-            moment=moment,
-            transport=transport,
-            host_factory=host_factory,
-        )
+    return await _execute_run(
+        run_id=run_id,
+        moment=moment,
+        session_factory=session_factory,
+        transport=transport,
+        host_factory=host_factory,
+    )
 
 
 async def _execute_run(
-    db: AsyncSession,
     *,
     run_id: int,
     moment: datetime,
+    session_factory: SessionFactory,
     transport: MailTransport | None,
     host_factory: HostFactory | None,
 ) -> RunResult | None:
-    settings = await load_settings(db)
-    recipients = await enabled_recipients(db)
+    async with session_factory() as db:
+        settings = await load_settings(db)
+        recipients = await enabled_recipients(db)
     sender = sender_address(settings)
 
     # Capability and plausibility guards, all BEFORE any render or upload work (LSN-0022: never
@@ -641,31 +770,34 @@ async def _execute_run(
     # silent, so the failure is visible in the Runs table, in the metrics and to the 26 h alert —
     # the silent-failure class this whole feature exists to end.
     for condition, message in (
-        (not smtp_configured(), ERROR_SMTP_UNCONFIGURED),
+        (not domain.smtp_configured(), ERROR_SMTP_UNCONFIGURED),
         (not recipients, ERROR_NO_RECIPIENTS),
         (sender.lower() in {r.lower() for r in recipients}, ERROR_SENDER_IS_RECIPIENT),
     ):
         if condition:
-            await finish_run(db, run_id, status=FAILED, error=message)
+            async with session_factory() as db:
+                await finish_run(db, run_id, status=FAILED, error=message)
             logger.warning("digest.run_refused", run_id=run_id, reason=message)
             return RunResult(
                 run_id=run_id, status=FAILED, parts=0, parts_sent=0, memos_sent=0, error=message
             )
 
-    candidates = await selection_mod.select_for_run(db, settings, moment)
+    candidates = await selection_mod.select_for_run(session_factory, settings, moment)
     if len(candidates.included) > settings.max_memos_per_run:
         message = (
             f"selection {len(candidates.included)} exceeds max_memos_per_run "
             f"{settings.max_memos_per_run}"
         )
-        await finish_run(db, run_id, status=FAILED, error=message)
+        async with session_factory() as db:
+            await finish_run(db, run_id, status=FAILED, error=message)
         logger.warning("digest.run_refused", run_id=run_id, reason=message)
         return RunResult(
             run_id=run_id, status=FAILED, parts=0, parts_sent=0, memos_sent=0, error=message
         )
 
     async def beat() -> None:
-        await heartbeat(db, run_id)
+        async with session_factory() as db:
+            await heartbeat(db, run_id)
 
     host = None
     if host_factory is not None:
@@ -682,7 +814,13 @@ async def _execute_run(
             detail="hosting is enabled but no media host is available; sending inline-only",
         )
     try:
-        rendered = await build_digest(db, settings, candidates, host=host, upload=True)
+        rendered = await build_digest(
+            session_factory,
+            settings,
+            candidates,
+            host=host,
+            ledger=SessionLedger(session_factory),
+        )
     finally:
         # Every path, not just the happy one: the host owns an httpx client, and a run that raised
         # between here and the end would leak it once per day for as long as the fault lasted.
@@ -691,17 +829,21 @@ async def _execute_run(
 
     if not rendered.parts:
         status = DEFERRED if rendered.deferred else NOTHING_TO_SEND
-        await finish_run(db, run_id, status=status)
+        async with session_factory() as db:
+            await finish_run(db, run_id, status=status)
         return RunResult(run_id=run_id, status=status, parts=0, parts_sent=0, memos_sent=0)
 
-    await record_progress(db, run_id, parts=len(rendered.parts), recipients=len(recipients))
+    async with session_factory() as db:
+        await record_progress(db, run_id, parts=len(rendered.parts), recipients=len(recipients))
     active_transport = transport or default_transport()
 
     errors: list[str] = []
     parts_sent = 0
     memos_sent = 0
     for part_index in range(1, len(rendered.parts) + 1):
-        if not await claim_part(db, run_id, part_index):
+        async with session_factory() as db:
+            claimed = await claim_part(db, run_id, part_index)
+        if not claimed:
             logger.warning("digest.claim_lost", run_id=run_id, part=part_index)
             return None
         subject, html, plain, images, memo_ids, incomplete = part_payload(
@@ -729,13 +871,14 @@ async def _execute_run(
             logger.warning("digest.part_refused_by_all", run_id=run_id, part=part_index)
             break
         try:
-            await commit_part(
-                db,
-                run_id,
-                part_index=part_index,
-                memo_ids=memo_ids,
-                incomplete_ids=incomplete,
-            )
+            async with session_factory() as db:
+                await commit_part(
+                    db,
+                    run_id,
+                    part_index=part_index,
+                    memo_ids=memo_ids,
+                    incomplete_ids=incomplete,
+                )
         except RunLost:
             logger.warning("digest.commit_lost", run_id=run_id, part=part_index)
             return None
@@ -746,7 +889,8 @@ async def _execute_run(
 
     status = SENT if parts_sent == len(rendered.parts) else FAILED
     error = "\n".join(errors) if errors else None
-    await finish_run(db, run_id, status=status, memos_sent=memos_sent, error=error)
+    async with session_factory() as db:
+        await finish_run(db, run_id, status=status, memos_sent=memos_sent, error=error)
     logger.info(
         "digest.run_finished",
         run_id=run_id,
@@ -771,7 +915,7 @@ async def run_scheduled_digest_safe(
     transport: MailTransport | None = None,
     now_utc: datetime | None = None,
 ) -> RunResult | None:
-    """The worker's entry point: a scheduled run with EVERY error isolated.
+    """The worker's entry point for a SCHEDULED run, with EVERY error isolated.
 
     The same boundary guard `run_frame_share_drain` and `run_media_recover_safe` already apply —
     a digest failure must never be able to halt media processing. `RunSkipped` is the ordinary
@@ -781,7 +925,7 @@ async def run_scheduled_digest_safe(
         moment = now_utc or datetime.now(UTC)
         async with session_factory() as db:
             settings = await load_settings(db)
-            factory = make_dropbox_host_factory(settings, moment)
+        factory = make_dropbox_host_factory(settings, moment)
         return await run_digest(
             trigger=DigestTrigger.scheduled,
             session_factory=session_factory,
@@ -797,7 +941,48 @@ async def run_scheduled_digest_safe(
         return None
 
 
+async def run_claimed_digest_safe(
+    run_id: int,
+    *,
+    session_factory: SessionFactory = async_session,
+    transport: MailTransport | None = None,
+    now_utc: datetime | None = None,
+) -> RunResult | None:
+    """Execute a run row somebody else committed — the manual endpoint's, adopted by this worker.
+
+    The API COMMITS the claim and answers 202; the pipeline runs HERE, in the worker, because the
+    work takes minutes to hours (Dropbox upload-session operations alone allow 600 s each) and a
+    request lifetime is not the right lock for it. Errors are isolated for the same reason
+    `run_scheduled_digest_safe` isolates them: the digest is optional, the media pipeline is not.
+    """
+    try:
+        moment = now_utc or datetime.now(UTC)
+        async with session_factory() as db:
+            settings = await load_settings(db)
+        factory = make_dropbox_host_factory(settings, moment)
+        return await _execute_run(
+            run_id=run_id,
+            moment=moment,
+            session_factory=session_factory,
+            transport=transport,
+            host_factory=factory,
+        )
+    except Exception:
+        logger.exception("digest.run_error", run_id=run_id)
+        return None
+
+
 # --- the retention sweep ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _DueMedia:
+    """One ledger row the sweep has to resolve, read out as a plain value so the session that read
+    it can be closed before Dropbox is contacted."""
+
+    id: int
+    dropbox_path: str
+    status: str
 
 
 async def sweep_hosted_media_safe(
@@ -805,90 +990,151 @@ async def sweep_hosted_media_safe(
     session_factory: SessionFactory = async_session,
     host_factory: HostFactory | None = None,
 ) -> int:
-    """Delete hosted files past `retention_days` and stamp `swept_at`. Errors isolated.
+    """Resolve every hosted-media row that is due, and stamp each one in its own transaction.
 
-    Age is measured from `uploaded_at`, which is safe because deliveries are one-shot: a memo is
-    selected at most once, so no LATER day's mail can reference an older upload. The one exception
-    is the duplicate window in the delivery guarantee, which re-references uploads a few days old
-    at most — harmless at a 30-day retention.
+    Two kinds of row are due, and the sweep is the only thing that closes either:
+
+    * `uploaded` past `retention_days` — delete the remote object, then stamp `swept`. Age is
+      measured from `uploaded_at`, which is safe because deliveries are one-shot: a memo is
+      selected at most once, so no LATER day's mail can reference an older upload. The one
+      exception is the duplicate window in the delivery guarantee, which re-references uploads a
+      few days old at most — harmless at a 30-day retention.
+    * `pending` past `PENDING_RECONCILE_MINUTES` — a process died between committing the intention
+      and recording the result, so the remote is the only authority on what happened: present
+      means the upload landed (record it, and let ordinary retention sweep it later), absent means
+      it never did (stamp it `swept`, because there is nothing to delete).
+
+    The rows are read in a session that is CLOSED before the first Dropbox call, and each stamp
+    reopens its own — nothing here holds a transaction across the network. Errors are isolated:
+    returns the number of rows whose remote object is now gone, 0 on error.
     """
     try:
         async with session_factory() as db:
             settings = await load_settings(db)
-            retention_days = settings.retention_days
-            rows = await db.execute(
-                sa_text(
-                    "SELECT attachment_id, dropbox_path FROM digest_hosted_media "
-                    "WHERE swept_at IS NULL "
-                    "AND uploaded_at < now() - make_interval(days => :days)"
-                ),
-                {"days": retention_days},
+            due = await _due_hosted_media(db, retention_days=settings.retention_days)
+        if not due:
+            return 0
+        factory = host_factory or make_dropbox_host_factory(settings, datetime.now(UTC))
+
+        async def beat() -> None:
+            return None
+
+        host = await factory(beat)
+        if host is None:
+            logger.info("digest.retention_sweep_skipped", reason="hosting unavailable")
+            return 0
+        try:
+            swept = await _resolve_due(session_factory, host, due)
+        finally:
+            await host.aclose()  # every path: the sweep owns this host's client
+        if swept:
+            logger.info(
+                "digest.retention_swept", count=swept, retention_days=settings.retention_days
             )
-            due = [(row[0], row[1]) for row in rows]
-            if not due:
-                return 0
-            factory = host_factory or make_dropbox_host_factory(settings, datetime.now(UTC))
-
-            async def beat() -> None:
-                return None
-
-            host = await factory(beat)
-            if host is None:
-                logger.info("digest.retention_sweep_skipped", reason="hosting unavailable")
-                return 0
-            swept = 0
-            try:
-                swept = await _delete_due(db, host, due)
-                await db.commit()
-            finally:
-                await host.aclose()  # every path: the sweep owns this host's client
-            if swept:
-                logger.info(
-                    "digest.retention_swept", count=swept, retention_days=retention_days
-                )
-            return swept
+        return swept
     except Exception:
         logger.exception("digest.retention_sweep_error")
         return 0
 
 
-async def _delete_due(
-    db: AsyncSession, host: MediaHost, due: list[tuple[int, str]]
-) -> int:
-    """Delete each due file and stamp `swept_at`. Returns how many actually went."""
-    swept = 0
-    for attachment_id, dropbox_path in due:
-        try:
-            await host.delete(dropbox_path)
-        except (hosting.DropboxError, httpx.HTTPError):
-            logger.warning("digest.retention_delete_failed", attachment_id=attachment_id)
-            continue
-        # Stamped only after the file is actually gone from Dropbox — `swept_at` is the claim
-        # that it IS gone, and stamping it for a failed delete would leave a live file no sweep
-        # ever looks at again.
+async def _due_hosted_media(db: AsyncSession, *, retention_days: int) -> list[_DueMedia]:
+    rows = await db.execute(
+        sa_text(
+            "SELECT id, dropbox_path, status FROM digest_hosted_media "
+            "WHERE (status = :uploaded "
+            "       AND uploaded_at < now() - make_interval(days => :days)) "
+            "   OR (status = :pending "
+            "       AND created_at < now() - make_interval(mins => :mins)) "
+            "ORDER BY id ASC"
+        ),
+        {
+            "uploaded": HostedMediaStatus.uploaded,
+            "pending": HostedMediaStatus.pending,
+            "days": retention_days,
+            "mins": PENDING_RECONCILE_MINUTES,
+        },
+    )
+    return [_DueMedia(id=row[0], dropbox_path=row[1], status=row[2]) for row in rows]
+
+
+async def _stamp_swept(session_factory: SessionFactory, row: _DueMedia) -> None:
+    """`swept_at` is the claim that the object IS gone, so it is stamped only after the remote
+    delete (or the probe that found nothing) has actually answered. A CAS on the row's previous
+    status keeps the transition write-once."""
+    async with session_factory() as db:
         await db.execute(
-            sa_text("UPDATE digest_hosted_media SET swept_at = now() WHERE attachment_id = :id"),
-            {"id": attachment_id},
+            sa_text(
+                "UPDATE digest_hosted_media SET status = :swept, swept_at = now() "
+                "WHERE id = :id AND status = :previous"
+            ),
+            {"id": row.id, "swept": HostedMediaStatus.swept, "previous": row.status},
         )
+        await db.commit()
+
+
+async def _resolve_due(
+    session_factory: SessionFactory, host: MediaHost, due: list[_DueMedia]
+) -> int:
+    """Delete or reconcile each due row. Returns how many objects are now gone from Dropbox."""
+    swept = 0
+    for row in due:
+        try:
+            if row.status == HostedMediaStatus.pending:
+                if await _reconcile_pending(session_factory, host, row):
+                    swept += 1
+                continue
+            await host.delete(row.dropbox_path)
+        except (hosting.DropboxError, httpx.HTTPError):
+            logger.warning("digest.retention_delete_failed", ledger_id=row.id)
+            continue
+        await _stamp_swept(session_factory, row)
         swept += 1
     return swept
+
+
+async def _reconcile_pending(
+    session_factory: SessionFactory, host: MediaHost, row: _DueMedia
+) -> bool:
+    """Ask Dropbox what happened to a stuck `pending` row. Returns whether it ended up `swept`."""
+    if not await host.remote_exists(row.dropbox_path):
+        await _stamp_swept(session_factory, row)
+        logger.info("digest.hosted_media_reconciled", ledger_id=row.id, outcome="absent")
+        return True
+    link = await host.shared_link(row.dropbox_path)
+    async with session_factory() as db:
+        await db.execute(
+            sa_text(
+                "UPDATE digest_hosted_media SET status = :uploaded, shared_link = :link, "
+                "uploaded_at = now() WHERE id = :id AND status = :pending"
+            ),
+            {
+                "id": row.id,
+                "link": link,
+                "uploaded": HostedMediaStatus.uploaded,
+                "pending": HostedMediaStatus.pending,
+            },
+        )
+        await db.commit()
+    logger.info("digest.hosted_media_reconciled", ledger_id=row.id, outcome="uploaded")
+    return False
 
 
 # --- the probes the admin panel drives ------------------------------------------------------------
 
 
 async def preview(
-    db: AsyncSession, *, now_utc: datetime | None = None
-) -> tuple[RenderedDigest, DigestSettings]:
+    session_factory: SessionFactory = async_session, *, now_utc: datetime | None = None
+) -> tuple[RenderedDigest, DigestConfig]:
     """Render what would go out now. Persists nothing and uploads nothing."""
-    settings = await load_settings(db)
+    async with session_factory() as db:
+        settings = await load_settings(db)
     moment = now_utc or datetime.now(UTC)
-    selection = await selection_mod.select_for_run(db, settings, moment)
-    return await build_digest(db, settings, selection, host=None, upload=False), settings
+    selection = await selection_mod.select_for_run(session_factory, settings, moment)
+    return await build_digest(session_factory, settings, selection, host=None), settings
 
 
 async def test_send(
-    db: AsyncSession,
+    session_factory: SessionFactory = async_session,
     *,
     address: str,
     empty: bool = False,
@@ -903,8 +1149,14 @@ async def test_send(
     It ALWAYS sends, even with an empty selection (the body then says so), because its job is to
     be a usable SMTP probe. `empty=True` renders that body directly without consulting the
     selection at all, which is the probe Phase 4 needs with no settings write anywhere in it.
+
+    Bounded on purpose — no uploads, one recipient — so it stays synchronous and answers the admin
+    in the request that asked. Its database reads are still taken in short sessions that are
+    CLOSED before SMTP is contacted: "bounded" is about how long the work takes, not a licence to
+    hold a connection through it.
     """
-    settings = await load_settings(db)
+    async with session_factory() as db:
+        settings = await load_settings(db)
     moment = now_utc or datetime.now(UTC)
     active_transport = transport or default_transport()
     sender = sender_address(settings)
@@ -927,8 +1179,8 @@ async def test_send(
         await active_transport.send(message, sender, [address])
         return 0
 
-    selection = await selection_mod.select_for_run(db, settings, moment)
-    rendered = await build_digest(db, settings, selection, host=None, upload=False)
+    selection = await selection_mod.select_for_run(session_factory, settings, moment)
+    rendered = await build_digest(session_factory, settings, selection, host=None)
     if not rendered.parts:
         html, plain = render.render_empty(settings.mail_title)
         message = build_message(
