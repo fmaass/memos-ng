@@ -116,11 +116,19 @@ const curl = computed(() => exportCurlCommand(query.value, origin.value))
 const profileLine = computed(() => (settings.value ? describePrintProfile(settings.value) : ''))
 
 const copied = ref(false)
-/** Best effort, and honest when it is not available: a browser without the async clipboard (or a
- * page without permission) leaves the command on screen to select, and says nothing it cannot do. */
+/** Best effort, and honest when it is not available: a browser without the async clipboard (an
+ * insecure origin, an older engine) or a page denied permission leaves the command on screen to
+ * select, and claims nothing. The absent-clipboard branch is checked BEFORE the await and not
+ * through `?.`, because `navigator.clipboard?.writeText(…)` resolves `undefined` rather than
+ * throwing — awaiting it succeeds, and "Copied." would be a lie about an empty clipboard. */
 async function copyCommand() {
+  const clipboard = navigator.clipboard as Clipboard | undefined
+  if (!clipboard) {
+    copied.value = false
+    return
+  }
   try {
-    await navigator.clipboard?.writeText(curl.value)
+    await clipboard.writeText(curl.value)
     copied.value = true
   } catch {
     copied.value = false

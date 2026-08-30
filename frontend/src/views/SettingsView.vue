@@ -17,7 +17,7 @@ import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
 import { useSession } from '@/composables/useSession'
 import { type SettingsPatch, useSettings } from '@/composables/useSettings'
-import { type SettingsTab, tabFromQuery } from '@/lib/digest'
+import { ADMIN_TABS, type SettingsTab, tabFromQuery } from '@/lib/digest'
 
 const version = __APP_VERSION__
 const { data: user } = useSession()
@@ -40,12 +40,21 @@ const router = useRouter()
 // The tab lives in the URL, so it is linkable and survives a reload. The session arrives
 // asynchronously, so `?tab=mail` and `?tab=export` are re-resolved once the role is known — before
 // that an admin looks like a non-admin and would otherwise be dropped onto General for good.
-const activeTab = ref<SettingsTab>('general')
+//
+// `null` while a `?tab=` naming an admin tab is still unanswerable: the role is merely UNKNOWN, not
+// absent, so resolving it now would render General and flip to the admin tab a tick later. That
+// flash is the whole reason the roleKnown guard exists, and correcting the URL was only half of it
+// — showing the wrong panel is the half a reader actually sees. No panel at all is the smaller
+// claim, and it lasts exactly as long as the session query does.
+const activeTab = ref<SettingsTab | null>('general')
 watch(
   [() => route.query.tab, isAdmin, roleKnown],
   ([raw, admin, known]) => {
     const tab = tabFromQuery(raw, admin)
-    activeTab.value = tab
+    // `tabFromQuery(raw, true)` asks what this URL would mean FOR an admin — the only way to tell
+    // "General, because that is what was asked for" from "General, because we do not know yet".
+    const undecided = !known && ADMIN_TABS.includes(tabFromQuery(raw, true))
+    activeTab.value = undecided ? null : tab
     // A `?tab=` the view will not honour — an unknown value, or an admin tab for a non-admin — is written
     // back as the tab actually rendered, so the address bar never states something the page is not
     // showing (and a link shared from here cannot pass the same wrong value on). `replace`, never
@@ -55,6 +64,12 @@ watch(
   },
   { immediate: true },
 )
+
+// PrimeVue keeps every TabPanel MOUNTED and merely marks one active, so an inactive panel is
+// hidden, not absent. Hidden is not good enough here: the undecided window must render no panel's
+// content at all, and leaning on a library's hiding mechanism for that is a guarantee a version
+// bump can take away. The admin panels are already behind `isAdmin`; General needs this.
+const tabDecided = computed(() => activeTab.value !== null)
 
 function selectTab(value: string | number) {
   const tab = tabFromQuery(String(value), isAdmin.value)
@@ -99,7 +114,7 @@ function setTheme(value: string) {
       <h1 class="text-2xl font-semibold">Settings</h1>
     </div>
 
-    <Tabs :value="activeTab" data-test="settings-tabs" @update:value="selectTab">
+    <Tabs :value="activeTab ?? ''" data-test="settings-tabs" @update:value="selectTab">
       <TabList>
         <Tab value="general" data-test="settings-tab-general">General</Tab>
         <Tab v-if="isAdmin" value="mail" data-test="settings-tab-mail">Mail</Tab>
@@ -108,7 +123,7 @@ function setTheme(value: string) {
 
       <TabPanels>
         <TabPanel value="general">
-          <div class="flex flex-col gap-8 pt-2">
+          <div v-if="tabDecided" class="flex flex-col gap-8 pt-2">
             <div data-test="profile">
               <h2 class="text-lg font-medium">Profile</h2>
               <div class="flex items-center gap-3 mt-2">

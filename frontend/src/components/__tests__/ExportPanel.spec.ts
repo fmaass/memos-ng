@@ -231,4 +231,40 @@ describe('ExportPanel', () => {
     expect(error.attributes('role')).toBe('alert')
     expect(error.text()).toMatch(/before/)
   })
+  describe('the Copy button', () => {
+    const setClipboard = (value: unknown) =>
+      Object.defineProperty(navigator, 'clipboard', { value, configurable: true, writable: true })
+
+    it('copies the command and says so', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      setClipboard({ writeText })
+      const wrapper = mountPanel()
+      await wrapper.find('[data-test="export-copy"]').trigger('click')
+      await flushPromises()
+
+      expect(writeText).toHaveBeenCalledWith(wrapper.find('[data-test="export-curl"]').text())
+      expect(wrapper.find('[data-test="export-copied"]').exists()).toBe(true)
+    })
+
+    it('claims nothing when the browser has no clipboard at all', async () => {
+      // `navigator.clipboard?.writeText(…)` RESOLVES undefined here rather than throwing, so an
+      // awaited optional call would report a copy that never happened and leave the reader
+      // pasting whatever was on the clipboard before.
+      setClipboard(undefined)
+      const wrapper = mountPanel()
+      await wrapper.find('[data-test="export-copy"]').trigger('click')
+      await flushPromises()
+
+      expect(wrapper.find('[data-test="export-copied"]').exists()).toBe(false)
+      expect(wrapper.find('[data-test="export-curl"]').text()).toContain('$MEMOS_PAT')
+    })
+
+    it('claims nothing when the write is refused', async () => {
+      setClipboard({ writeText: vi.fn().mockRejectedValue(new Error('denied')) })
+      const wrapper = mountPanel()
+      await wrapper.find('[data-test="export-copy"]').trigger('click')
+      await flushPromises()
+      expect(wrapper.find('[data-test="export-copied"]').exists()).toBe(false)
+    })
+  })
 })

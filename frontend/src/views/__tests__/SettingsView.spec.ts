@@ -212,7 +212,10 @@ describe('SettingsView', () => {
     route.query = { tab: 'mail' }
     const wrapper = mountSettings()
     await nextTick()
-    expect(activeTab(wrapper)).toBe('general')
+    // NOT General: rendering it here and flipping a tick later is the flash the guard exists to
+    // stop. While the answer is unknown the view shows no panel at all.
+    expect(activeTab(wrapper)).toBe('')
+    expect(wrapper.find('[data-test="profile"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="settings-tab-mail"]').exists()).toBe(false)
 
     session.value = { ...ADMIN } // the same ref the view is watching
@@ -259,7 +262,7 @@ describe('SettingsView', () => {
     route.query = { tab: 'export' }
     const wrapper = mountSettings()
     await nextTick()
-    expect(activeTab(wrapper)).toBe('general')
+    expect(activeTab(wrapper)).toBe('')
     expect(wrapper.find('[data-test="settings-tab-export"]').exists()).toBe(false)
     expect(replace).not.toHaveBeenCalled() // an unknown role must not correct the URL
 
@@ -269,5 +272,43 @@ describe('SettingsView', () => {
     expect(wrapper.find('[data-test="settings-tab-export"]').exists()).toBe(true)
     expect(activeTab(wrapper)).toBe('export')
     expect(route.query.tab).toBe('export') // the deep link survived the wait
+  })
+  it('renders no panel content at all while an admin deep link is still unanswerable', async () => {
+    // The whole point of the pending window: an admin following ?tab=export must not be shown
+    // General's Profile/Preferences/tokens for a tick and then have them replaced.
+    session.value = undefined
+    route.query = { tab: 'export' }
+    const wrapper = mountSettings()
+    await nextTick()
+
+    expect(wrapper.find('[data-test="profile"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="preferences"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="pat-manager"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="digest-panel-stub"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="export-panel-stub"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="settings-tab-general"]').exists()).toBe(true) // the strip stays
+
+    session.value = { ...ADMIN }
+    await nextTick()
+    await nextTick()
+    expect(wrapper.find('[data-test="export-panel-stub"]').exists()).toBe(true)
+    // General's content comes back with the rest — PrimeVue mounts every panel — but it was never
+    // the ACTIVE one, which is what a reader would have seen.
+    expect(activeTab(wrapper)).toBe('export')
+  })
+
+  it('still shows General immediately when the URL asks for no admin tab', async () => {
+    // The neutral state is only for an unanswerable question. A plain /settings, or ?tab=general,
+    // is answerable without the role, and waiting there would be its own regression.
+    session.value = undefined
+    const wrapper = mountSettings()
+    await nextTick()
+    expect(activeTab(wrapper)).toBe('general')
+    expect(wrapper.find('[data-test="profile"]').exists()).toBe(true)
+
+    route.query = { tab: 'billing' } // unknown, and unknown means General for everyone
+    await nextTick()
+    expect(activeTab(wrapper)).toBe('general')
+    expect(wrapper.find('[data-test="profile"]').exists()).toBe(true)
   })
 })
