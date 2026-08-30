@@ -22,6 +22,24 @@ dependencies = [
     "pillow>=11",
     "pillow-heif>=0.18",
     "pywebpush>=2.0",
+    # --- daily digest (MEMNG-234). memos-ng had no server-side Markdown renderer and no template
+    # engine; the digest's mail body is the satellite's Jinja2 template rendering memo Markdown,
+    # so all three arrive together and the versions are the satellite's proven ones as a FLOOR
+    # (uv.lock is what actually pins; the local gate checks it).
+    "jinja2>=3.1.6",
+    "markdown>=3.7",
+    "bleach>=6.2",
+    # Imported DIRECTLY by app/services/digest/metrics.py (CounterMetricFamily, GaugeMetricFamily,
+    # REGISTRY). It reached the graph only transitively through prometheus-fastapi-instrumentator
+    # until now, and a transitive dependency is not a contract: a future instrumentator release
+    # could drop it and this import would break at runtime, not at resolve time.
+    "prometheus-client>=0.21",
+    # The digest is the first feature whose CORRECTNESS depends on a named IANA zone resolving:
+    # `digest_due` converts UTC to the configured zone to decide whether today's run is due, and
+    # python:3.13-slim's zone availability rides on whatever the Debian package graph happens to
+    # pull. Declaring it makes ZoneInfo("Europe/Zurich") a resolved fact rather than an
+    # observation of one image build.
+    "tzdata>=2024.2",
 ]
 
 [dependency-groups]

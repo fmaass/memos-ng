@@ -484,6 +484,24 @@
         "title": "CreateRacedError",
         "type": "object"
       },
+      "DigestDeferralOut": {
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "reason"
+        ],
+        "title": "DigestDeferralOut",
+        "type": "object"
+      },
       "DigestHostingOut": {
         "description": "Whether media hosting can work at all, as the panel's status line reads it.\n\nPhase 1 answers from the PRESENCE of the three `DROPBOX_*` env keys and nothing else \u2014 no\nnetwork call is made and `account` is therefore always null here. The live account lookup that\nfills it in arrives with the hosting service in Phase 2; a caller reading `configured` alone\ngets the same answer either way, which is what the \"Not configured \u2014 mails go out inline-only\"\nline needs.",
         "properties": {
@@ -503,6 +521,81 @@
           "configured"
         ],
         "title": "DigestHostingOut",
+        "type": "object"
+      },
+      "DigestPreviewMemo": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "local_day": {
+            "format": "date",
+            "title": "Local Day",
+            "type": "string"
+          },
+          "memo_id": {
+            "title": "Memo Id",
+            "type": "integer"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "memo_id",
+          "created_at",
+          "local_day"
+        ],
+        "title": "DigestPreviewMemo",
+        "type": "object"
+      },
+      "DigestPreviewOut": {
+        "description": "What a run would send right now, rendered but persisted nowhere.\n\n`html`/`plain` are PART ONE. A preview that concatenated every part would misrepresent the\nthing it is previewing \u2014 the household receives separate messages \u2014 and `parts` says how many\nthere would be.",
+        "properties": {
+          "deferred": {
+            "items": {
+              "$ref": "#/components/schemas/DigestDeferralOut"
+            },
+            "title": "Deferred",
+            "type": "array"
+          },
+          "html": {
+            "title": "Html",
+            "type": "string"
+          },
+          "memo_count": {
+            "title": "Memo Count",
+            "type": "integer"
+          },
+          "parts": {
+            "title": "Parts",
+            "type": "integer"
+          },
+          "plain": {
+            "title": "Plain",
+            "type": "string"
+          },
+          "selected": {
+            "items": {
+              "$ref": "#/components/schemas/DigestPreviewMemo"
+            },
+            "title": "Selected",
+            "type": "array"
+          }
+        },
+        "required": [
+          "html",
+          "plain",
+          "memo_count",
+          "parts",
+          "selected",
+          "deferred"
+        ],
+        "title": "DigestPreviewOut",
         "type": "object"
       },
       "DigestRecipientCreate": {
@@ -890,6 +983,36 @@
           "link_images_full"
         ],
         "title": "DigestSettingsPut",
+        "type": "object"
+      },
+      "DigestTestSendIn": {
+        "description": "`{\"empty\": true}` renders the \"no memos selected\" body directly, without consulting the\nselection at all \u2014 the pure SMTP probe, with no settings write anywhere in it (R3).",
+        "properties": {
+          "empty": {
+            "default": false,
+            "title": "Empty",
+            "type": "boolean"
+          }
+        },
+        "title": "DigestTestSendIn",
+        "type": "object"
+      },
+      "DigestTestSendOut": {
+        "properties": {
+          "memo_count": {
+            "title": "Memo Count",
+            "type": "integer"
+          },
+          "sent_to": {
+            "title": "Sent To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sent_to",
+          "memo_count"
+        ],
+        "title": "DigestTestSendOut",
         "type": "object"
       },
       "DigestVisibilityScope": {
@@ -2206,6 +2329,33 @@
         ]
       }
     },
+    "/api/admin/digest/preview": {
+      "get": {
+        "description": "Render what would go out now. Persists nothing and performs NO Dropbox call.\n\n`selected` is the list MEMNG-236 AC2 and the Phase 5 one-victim read-back are checked against,\nso it names the memos rather than counting them.",
+        "operationId": "preview_digest_api_admin_digest_preview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestPreviewOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Preview Digest",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
     "/api/admin/digest/recipients": {
       "get": {
         "operationId": "list_digest_recipients_api_admin_digest_recipients_get",
@@ -2375,6 +2525,33 @@
         ]
       }
     },
+    "/api/admin/digest/run": {
+      "post": {
+        "description": "Perform a real run through the same `runner.py` the worker uses, with `trigger = 'manual'`.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 is derived from the INSERT conflicting with\n`uq_digest_runs_single_inflight` \u2014 never from a pre-flight \"is anything running?\" read, which\nwould be exactly the TOCTOU race that index exists to close and which two concurrent callers\nwould both pass.\n\nNo request-scoped session is taken: the run opens and commits its own, repeatedly, and holding\na pooled connection idle for the minutes a real run takes would be pressure on a pool the app\ndeliberately caps at ten (ADR-0009).",
+        "operationId": "run_digest_now_api_admin_digest_run_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestRunOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Run Digest Now",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
     "/api/admin/digest/runs": {
       "get": {
         "description": "The most recent runs, newest first \u2014 the panel's Runs table.\n\nOrdered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import\nrow is stamped by the same `now()` as anything else committed in that transaction), and an\nunstable order would make the table shuffle between refreshes.",
@@ -2456,7 +2633,7 @@
         ]
       },
       "put": {
-        "description": "Update the one settings row. There is no create path here, deliberately \u2014 see SETTINGS_ID.",
+        "description": "Update the one settings row. There is no create path here, deliberately \u2014 see SETTINGS_ID.\n\nThe row is taken FOR UPDATE for the whole request, not because a fresh read is needed but\nbecause arming is a check-then-act: two overlapping requests, one arming the digest and one\ndisabling the last recipient, would each see the other's pre-state and both pass, leaving an\narmed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row\nin the same order, so the two paths serialize against each other and cannot deadlock.",
         "operationId": "put_digest_settings_api_admin_digest_settings_put",
         "requestBody": {
           "content": {
@@ -2496,6 +2673,53 @@
           }
         ],
         "summary": "Put Digest Settings",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/digest/test-send": {
+      "post": {
+        "description": "Send ONE real mail to the calling admin's own address, and persist nothing.\n\nThe destination comes from the authenticated session, never from a request field: an endpoint\nthat took an address would be an open relay for anyone who reached it, and it would let a probe\nreach `digest_recipients`. It performs no Dropbox upload either (A6) \u2014 it renders with whatever\nhosted links already exist, and a video with none carries the \"not hosted\" chip.",
+        "operationId": "test_send_digest_api_admin_digest_test_send_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DigestTestSendIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestTestSendOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Test Send Digest",
         "tags": [
           "admin-digest"
         ]

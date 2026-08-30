@@ -28,6 +28,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/digest/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview Digest
+         * @description Render what would go out now. Persists nothing and performs NO Dropbox call.
+         *
+         *     `selected` is the list MEMNG-236 AC2 and the Phase 5 one-victim read-back are checked against,
+         *     so it names the memos rather than counting them.
+         */
+        get: operations["preview_digest_api_admin_digest_preview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/digest/recipients": {
         parameters: {
             query?: never;
@@ -62,6 +85,36 @@ export interface paths {
         head?: never;
         /** Update Digest Recipient */
         patch: operations["update_digest_recipient_api_admin_digest_recipients__recipient_id__patch"];
+        trace?: never;
+    };
+    "/api/admin/digest/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Digest Now
+         * @description Perform a real run through the same `runner.py` the worker uses, with `trigger = 'manual'`.
+         *
+         *     A manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day
+         *     that already had one. Its 409 is derived from the INSERT conflicting with
+         *     `uq_digest_runs_single_inflight` — never from a pre-flight "is anything running?" read, which
+         *     would be exactly the TOCTOU race that index exists to close and which two concurrent callers
+         *     would both pass.
+         *
+         *     No request-scoped session is taken: the run opens and commits its own, repeatedly, and holding
+         *     a pooled connection idle for the minutes a real run takes would be pressure on a pool the app
+         *     deliberately caps at ten (ADR-0009).
+         */
+        post: operations["run_digest_now_api_admin_digest_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/admin/digest/runs": {
@@ -100,9 +153,40 @@ export interface paths {
         /**
          * Put Digest Settings
          * @description Update the one settings row. There is no create path here, deliberately — see SETTINGS_ID.
+         *
+         *     The row is taken FOR UPDATE for the whole request, not because a fresh read is needed but
+         *     because arming is a check-then-act: two overlapping requests, one arming the digest and one
+         *     disabling the last recipient, would each see the other's pre-state and both pass, leaving an
+         *     armed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row
+         *     in the same order, so the two paths serialize against each other and cannot deadlock.
          */
         put: operations["put_digest_settings_api_admin_digest_settings_put"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/digest/test-send": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test Send Digest
+         * @description Send ONE real mail to the calling admin's own address, and persist nothing.
+         *
+         *     The destination comes from the authenticated session, never from a request field: an endpoint
+         *     that took an address would be an open relay for anyone who reached it, and it would let a probe
+         *     reach `digest_recipients`. It performs no Dropbox upload either (A6) — it renders with whatever
+         *     hosted links already exist, and a video with none carries the "not hosted" chip.
+         */
+        post: operations["test_send_digest_api_admin_digest_test_send_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1132,6 +1216,13 @@ export interface components {
         CreateRacedError: {
             detail: components["schemas"]["CreateRacedDetail"];
         };
+        /** DigestDeferralOut */
+        DigestDeferralOut: {
+            /** Reason */
+            reason: string;
+            /** Uid */
+            uid: string;
+        };
         /**
          * DigestHostingOut
          * @description Whether media hosting can work at all, as the panel's status line reads it.
@@ -1147,6 +1238,45 @@ export interface components {
             account?: string | null;
             /** Configured */
             configured: boolean;
+        };
+        /** DigestPreviewMemo */
+        DigestPreviewMemo: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Local Day
+             * Format: date
+             */
+            local_day: string;
+            /** Memo Id */
+            memo_id: number;
+            /** Uid */
+            uid: string;
+        };
+        /**
+         * DigestPreviewOut
+         * @description What a run would send right now, rendered but persisted nowhere.
+         *
+         *     `html`/`plain` are PART ONE. A preview that concatenated every part would misrepresent the
+         *     thing it is previewing — the household receives separate messages — and `parts` says how many
+         *     there would be.
+         */
+        DigestPreviewOut: {
+            /** Deferred */
+            deferred: components["schemas"]["DigestDeferralOut"][];
+            /** Html */
+            html: string;
+            /** Memo Count */
+            memo_count: number;
+            /** Parts */
+            parts: number;
+            /** Plain */
+            plain: string;
+            /** Selected */
+            selected: components["schemas"]["DigestPreviewMemo"][];
         };
         /** DigestRecipientCreate */
         DigestRecipientCreate: {
@@ -1321,6 +1451,25 @@ export interface components {
             /** Timezone */
             timezone: string;
             visibility_scope: components["schemas"]["DigestVisibilityScope"];
+        };
+        /**
+         * DigestTestSendIn
+         * @description `{"empty": true}` renders the "no memos selected" body directly, without consulting the
+         *     selection at all — the pure SMTP probe, with no settings write anywhere in it (R3).
+         */
+        DigestTestSendIn: {
+            /**
+             * Empty
+             * @default false
+             */
+            empty: boolean;
+        };
+        /** DigestTestSendOut */
+        DigestTestSendOut: {
+            /** Memo Count */
+            memo_count: number;
+            /** Sent To */
+            sent_to: string;
         };
         /**
          * DigestVisibilityScope
@@ -1930,6 +2079,26 @@ export interface operations {
             };
         };
     };
+    preview_digest_api_admin_digest_preview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestPreviewOut"];
+                };
+            };
+        };
+    };
     list_digest_recipients_api_admin_digest_recipients_get: {
         parameters: {
             query?: never;
@@ -2047,6 +2216,26 @@ export interface operations {
             };
         };
     };
+    run_digest_now_api_admin_digest_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestRunOut"];
+                };
+            };
+        };
+    };
     list_digest_runs_api_admin_digest_runs_get: {
         parameters: {
             query?: {
@@ -2118,6 +2307,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DigestSettingsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    test_send_digest_api_admin_digest_test_send_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DigestTestSendIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestTestSendOut"];
                 };
             };
             /** @description Validation Error */

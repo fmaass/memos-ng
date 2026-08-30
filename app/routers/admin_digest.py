@@ -5,14 +5,19 @@ access token never reaches these routes (the bearer is refused before the cookie
 non-admin session is answered 403. That is the whole authorization story for the feature: the
 Mail panel hides itself for a non-admin as a courtesy, but the refusal happens here, at the sink.
 
-Phase 1 is state only. The three ACTION endpoints the panel also needs — preview, test-send and
-run-now — render or send, so they arrive with the pipeline in Phase 2 and are deliberately absent.
+Phase 2 adds the three ACTION endpoints the panel also needs — preview, test-send and run-now.
+Each of them renders or sends, so each sits behind the same `require_admin` as everything above,
+and each is deliberately explicit about what it persists: preview and test-send persist NOTHING
+(not a run row, not a `digest_hosted_media` row, not a Dropbox file), while run-now performs a real
+run through the very same `runner.py` the worker uses.
 """
 
 import re
 from datetime import date, time
 from typing import Annotated
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
@@ -23,7 +28,19 @@ from app import auth
 from app.api_types import Rfc3339Datetime
 from app.config import settings as app_settings
 from app.database import get_session
-from app.models import DigestRecipient, DigestRun, DigestSettings, DigestVisibilityScope, User
+from app.models import (
+    DigestRecipient,
+    DigestRun,
+    DigestSettings,
+    DigestTrigger,
+    DigestVisibilityScope,
+    User,
+)
+from app.services.digest import metrics as digest_metrics
+from app.services.digest import runner as digest_runner
+from app.services.digest.gate import local_date_of
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/admin/digest", tags=["admin-digest"])
 
@@ -115,6 +132,24 @@ class DigestSettingsPut(BaseModel):
     dropbox_folder: str = Field(min_length=1, max_length=255)
     retention_days: int = Field(ge=1, le=3650)
     link_images_full: bool
+
+    @field_validator("timezone")
+    @classmethod
+    def _loadable_iana_zone(cls, value: str) -> str:
+        """The zone must be one `ZoneInfo` can actually LOAD, not merely a string of the right
+        length.
+
+        Enforced here because this is the only writer: `digest_due` converts UTC to this zone to
+        decide whether today's run is due, and a zone it cannot resolve makes the digest
+        permanently not-due. The gate defends against a value already in the row (it answers
+        not-due and logs once), but a defence is not a contract — 422 at the door is what keeps
+        an unusable zone from ever being persisted in the first place.
+        """
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"{value!r} is not a loadable IANA time zone") from exc
+        return value
 
     @field_validator("from_email")
     @classmethod
@@ -286,6 +321,31 @@ async def _refuse_leaving_nobody_to_send_to(db: AsyncSession, target: DigestReci
         )
 
 
+async def _refuse_arming_with_no_recipients(db: AsyncSession) -> None:
+    """Refuse to arm a digest that has nobody to send to (Phase 2 guard).
+
+    Phase 1 deliberately allowed it so the panel could be built against a contract that did not yet
+    exist; the pipeline is what makes it a real failure — an armed digest with zero enabled
+    recipients writes a `failed` run every morning and can never do anything else. 422, the same
+    code and the same family as `_refuse_leaving_nobody_to_send_to`, because it is the same mistake
+    approached from the other side and answering it two different ways would be a worse API than
+    either answer.
+
+    The caller holds the `digest_settings` row lock, which is what makes this count trustworthy.
+    """
+    enabled = await db.scalar(
+        select(func.count()).select_from(DigestRecipient).where(DigestRecipient.enabled.is_(True))
+    )
+    if not enabled:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "the digest cannot be enabled with no enabled recipients — add one first, or "
+                "leave it disabled"
+            ),
+        )
+
+
 # --- settings ---------------------------------------------------------------------------------
 
 
@@ -303,8 +363,17 @@ async def put_digest_settings(
     admin: Annotated[User, Depends(auth.require_admin)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> DigestSettingsOut:
-    """Update the one settings row. There is no create path here, deliberately — see SETTINGS_ID."""
-    row = await _settings_row(db)
+    """Update the one settings row. There is no create path here, deliberately — see SETTINGS_ID.
+
+    The row is taken FOR UPDATE for the whole request, not because a fresh read is needed but
+    because arming is a check-then-act: two overlapping requests, one arming the digest and one
+    disabling the last recipient, would each see the other's pre-state and both pass, leaving an
+    armed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row
+    in the same order, so the two paths serialize against each other and cannot deadlock.
+    """
+    row = await _settings_row(db, for_update=True)
+    if body.enabled:
+        await _refuse_arming_with_no_recipients(db)
     for field, value in body.model_dump().items():
         setattr(row, field, value)
     row.updated_by = admin.subject
@@ -463,3 +532,187 @@ async def get_digest_hosting(
         )
     )
     return DigestHostingOut(configured=configured)
+
+
+# --- actions: preview, test-send, run now ------------------------------------------------------
+
+
+class DigestPreviewMemo(BaseModel):
+    uid: str
+    memo_id: int
+    created_at: Rfc3339Datetime
+    # The LOCAL day this memo groups under in the mail, which is what the reader sees — not the
+    # UTC date of `created_at`, which differs for anything posted late in the evening.
+    local_day: date
+
+
+class DigestDeferralOut(BaseModel):
+    uid: str
+    reason: str
+
+
+class DigestPreviewOut(BaseModel):
+    """What a run would send right now, rendered but persisted nowhere.
+
+    `html`/`plain` are PART ONE. A preview that concatenated every part would misrepresent the
+    thing it is previewing — the household receives separate messages — and `parts` says how many
+    there would be.
+    """
+
+    html: str
+    plain: str
+    memo_count: int
+    parts: int
+    selected: list[DigestPreviewMemo]
+    deferred: list[DigestDeferralOut]
+
+
+class DigestTestSendIn(BaseModel):
+    """`{"empty": true}` renders the "no memos selected" body directly, without consulting the
+    selection at all — the pure SMTP probe, with no settings write anywhere in it (R3)."""
+
+    empty: bool = False
+
+
+class DigestTestSendOut(BaseModel):
+    sent_to: str
+    memo_count: int
+
+
+async def _run_out(run_id: int) -> DigestRunOut:
+    """Read one run row back in its own short session."""
+    from app.database import async_session
+
+    async with async_session() as db:
+        row = await db.get(DigestRun, run_id)
+        if row is None:  # pragma: no cover — the row was committed a moment ago
+            raise HTTPException(status_code=500, detail="the run row vanished")
+        return DigestRunOut(
+            id=row.id,
+            trigger=row.trigger,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            status=row.status,
+            memos_sent=row.memos_sent,
+            parts=row.parts,
+            parts_sent=row.parts_sent,
+            parts_claimed=row.parts_claimed,
+            recipients=row.recipients,
+            error=row.error,
+            local_date=row.local_date,
+        )
+
+
+@router.get("/preview", response_model=DigestPreviewOut)
+async def preview_digest(
+    _: Annotated[User, Depends(auth.require_admin)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> DigestPreviewOut:
+    """Render what would go out now. Persists nothing and performs NO Dropbox call.
+
+    `selected` is the list MEMNG-236 AC2 and the Phase 5 one-victim read-back are checked against,
+    so it names the memos rather than counting them.
+    """
+    rendered, settings_row = await digest_runner.preview(db)
+    if rendered.parts:
+        payload = digest_runner.part_payload(rendered, 1, settings_row)
+        html, plain = payload[1], payload[2]
+    else:
+        from app.services.digest import render as digest_render
+
+        html, plain = digest_render.render_empty(settings_row.mail_title)
+    return DigestPreviewOut(
+        html=html,
+        plain=plain,
+        memo_count=len(rendered.selected),
+        parts=len(rendered.parts),
+        selected=[
+            DigestPreviewMemo(
+                uid=candidate.uid,
+                memo_id=candidate.memo_id,
+                created_at=candidate.created_at,
+                local_day=local_date_of(candidate.created_at, settings_row.timezone),
+            )
+            for candidate in rendered.selected
+        ],
+        deferred=[
+            DigestDeferralOut(uid=item.uid, reason=item.reason) for item in rendered.deferred
+        ],
+    )
+
+
+@router.post("/test-send", response_model=DigestTestSendOut)
+async def test_send_digest(
+    body: DigestTestSendIn,
+    admin: Annotated[User, Depends(auth.require_admin)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> DigestTestSendOut:
+    """Send ONE real mail to the calling admin's own address, and persist nothing.
+
+    The destination comes from the authenticated session, never from a request field: an endpoint
+    that took an address would be an open relay for anyone who reached it, and it would let a probe
+    reach `digest_recipients`. It performs no Dropbox upload either (A6) — it renders with whatever
+    hosted links already exist, and a video with none carries the "not hosted" chip.
+    """
+    if not admin.email:
+        raise HTTPException(
+            status_code=422,
+            detail="your account has no e-mail address, so there is nowhere to send the test",
+        )
+    if not digest_runner.smtp_configured():
+        raise HTTPException(status_code=422, detail=digest_runner.ERROR_SMTP_UNCONFIGURED)
+    try:
+        memo_count = await digest_runner.test_send(db, address=admin.email, empty=body.empty)
+    except digest_runner.SenderIsRecipient as exc:
+        # The same refusal a real run applies (AC 7). Answered 422 rather than sent-and-hoped:
+        # iCloud drops From == To with attachments, so the probe would report success and deliver
+        # nothing — and a probe that lies is worse than no probe.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await digest_metrics.refresh_now()
+    logger.info("digest.test_send", subject=admin.subject, memos=memo_count)
+    return DigestTestSendOut(sent_to=admin.email, memo_count=memo_count)
+
+
+@router.post("/run", response_model=DigestRunOut)
+async def run_digest_now(
+    admin: Annotated[User, Depends(auth.require_admin)],
+) -> DigestRunOut:
+    """Perform a real run through the same `runner.py` the worker uses, with `trigger = 'manual'`.
+
+    A manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day
+    that already had one. Its 409 is derived from the INSERT conflicting with
+    `uq_digest_runs_single_inflight` — never from a pre-flight "is anything running?" read, which
+    would be exactly the TOCTOU race that index exists to close and which two concurrent callers
+    would both pass.
+
+    No request-scoped session is taken: the run opens and commits its own, repeatedly, and holding
+    a pooled connection idle for the minutes a real run takes would be pressure on a pool the app
+    deliberately caps at ten (ADR-0009).
+    """
+    from datetime import UTC, datetime
+
+    from app.database import async_session
+
+    async with async_session() as db:
+        settings_row = await digest_runner.load_settings(db)
+        host_factory = digest_runner.make_dropbox_host_factory(settings_row, datetime.now(UTC))
+    try:
+        result = await digest_runner.run_digest(
+            trigger=DigestTrigger.manual, host_factory=host_factory
+        )
+    except digest_runner.RunSkipped as exc:
+        raise HTTPException(
+            status_code=409, detail="a digest run is already in flight"
+        ) from exc
+    await digest_metrics.refresh_now()
+    logger.info(
+        "digest.manual_run",
+        subject=admin.subject,
+        run_id=None if result is None else result.run_id,
+        status=None if result is None else result.status,
+    )
+    if result is None:  # pragma: no cover — the claim was lost to a sweep mid-run
+        raise HTTPException(
+            status_code=409, detail="the run lost its claim and was abandoned before sending"
+        )
+    return await _run_out(result.run_id)

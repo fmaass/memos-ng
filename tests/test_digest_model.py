@@ -33,6 +33,13 @@ DIGEST_TABLES = {
     "digest_hosted_media",
 }
 
+# The revision immediately BELOW the first digest migration — i.e. the schema as it stood before
+# this feature existed. Named rather than expressed as `-1`, because the digest now owns more than
+# one migration (Phase 2 added `digest_runs.heartbeat_at`) and a relative target would silently
+# stop testing the table-creating one. A LATER digest migration must not change this constant: the
+# round trip below is meant to unwind the whole feature and build it again.
+BEFORE_DIGEST_REVISION = "e4a91c07b5d2"
+
 
 def _alembic_config() -> Config:
     from pathlib import Path
@@ -344,6 +351,9 @@ def test_downgrade_and_upgrade_round_trip_on_a_populated_database(db_engine):
     `alembic upgrade head`). This proves the other one against a database that holds real rows in
     the tables the migration does NOT own: they must still be there afterwards, and the five digest
     tables must come back with exactly one settings row.
+
+    It unwinds EVERY digest migration, not the newest one — the whole feature comes out and goes
+    back in, which is what a rollback of this feature would actually do.
     """
     config = _alembic_config()
     engine = create_engine(SYNC_URL)
@@ -356,7 +366,7 @@ def test_downgrade_and_upgrade_round_trip_on_a_populated_database(db_engine):
             before = conn.execute(text("SELECT count(*) FROM users")).scalar_one()
             assert before >= 1
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, BEFORE_DIGEST_REVISION)
         with engine.connect() as conn:
             remaining = set(
                 conn.execute(
