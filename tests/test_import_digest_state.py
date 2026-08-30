@@ -13,10 +13,14 @@ The fixtures under ``tests/fixtures/`` are SYNTHETIC: uids the tests seed themse
 database deliberately lacks), and ``example.test`` addresses. Nothing here reads a production path.
 """
 
+import argparse
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from app.database import engine as async_engine
 from app.models import (
     DigestDelivery,
     DigestRecipient,
@@ -30,7 +34,9 @@ from app.models import (
     Visibility,
 )
 from app.scripts import import_digest_state as importer
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select, text, update
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 STATE_FIXTURE = FIXTURES / "digest-state.json"
@@ -73,9 +79,23 @@ async def _seed_memos(adb, uids: tuple[str, ...] = MAPPED_UIDS) -> dict[str, int
 
 
 async def _import_run(adb) -> DigestRun | None:
+    """The import run row, re-read from the database.
+
+    `expire_all` first: the run and settings rows are written with SQL-side UPDATEs, which leave
+    any instance already in the identity map holding the values it was loaded with. Without this
+    the assertions would be reading this session's memory instead of the row.
+    """
+    adb.expire_all()
     return (
         await adb.execute(select(DigestRun).where(DigestRun.trigger == DigestTrigger.import_))
     ).scalar_one_or_none()
+
+
+async def _settings(adb) -> DigestSettings:
+    adb.expire_all()
+    row = await adb.get(DigestSettings, importer.SETTINGS_ID)
+    assert row is not None
+    return row
 
 
 async def _count(adb, model) -> int:
@@ -263,8 +283,7 @@ async def test_a_dry_run_writes_nothing_at_all(adb, registry, env):
     assert await _count(adb, DigestRun) == 0
     assert await _count(adb, DigestDelivery) == 0
     assert await _count(adb, DigestRecipient) == 0
-    settings = await adb.get(DigestSettings, importer.SETTINGS_ID)
-    assert settings is not None
+    settings = await _settings(adb)
     assert settings.updated_by is None
     assert settings.hosting_enabled is False
 
@@ -300,8 +319,7 @@ async def test_execute_imports_registry_recipients_and_settings(adb, registry, e
     assert sorted(r.email for r in recipients) == sorted(RECIPIENT_ADDRESSES)
     assert all(r.added_by == importer.IMPORTED_BY for r in recipients)
 
-    settings = await adb.get(DigestSettings, importer.SETTINGS_ID)
-    assert settings is not None
+    settings = await _settings(adb)
     assert settings.from_name == "The Test Digest Mail"
     assert settings.from_email == "digest@example.test"
     assert settings.grace_minutes == 45
@@ -328,7 +346,9 @@ async def test_a_second_execute_inserts_nothing_and_writes_no_settings(adb, regi
     assert second.recipients.already_present == 3
     assert second.settings.written is False
     assert second.settings.skipped_reason is not None
-    assert importer.IMPORTED_BY in second.settings.skipped_reason
+    # B4b: the stored `updated_by` is never quoted back, not even the import's own latch value.
+    assert "modified by this import at" in second.settings.skipped_reason
+    assert importer.IMPORTED_BY not in second.settings.skipped_reason
     # Exactly one import run row, ever — the partial unique index makes it a find-or-create.
     assert (
         await adb.execute(
@@ -397,20 +417,21 @@ async def test_limit_considers_only_the_first_entries(adb, registry, env):
 
 async def test_settings_are_skipped_once_a_person_has_modified_the_row(adb, registry, env):
     await _seed_memos(adb)
-    settings = await adb.get(DigestSettings, importer.SETTINGS_ID)
-    assert settings is not None
-    settings.updated_by = "alice"
-    settings.grace_minutes = 11
-    await adb.flush()
+    await adb.execute(
+        update(DigestSettings)
+        .where(DigestSettings.id == importer.SETTINGS_ID)
+        .values(updated_by="alice", grace_minutes=11)
+    )
 
     report = await importer.run_import(adb, registry=registry, env=env, execute=True)
     await adb.flush()
 
     assert report.settings.written is False
     assert report.settings.skipped_reason is not None
-    assert "alice" in report.settings.skipped_reason
-    refreshed = await adb.get(DigestSettings, importer.SETTINGS_ID)
-    assert refreshed is not None
+    # B4b: who touched the row is a value out of the database and is masked.
+    assert "modified by an admin at" in report.settings.skipped_reason
+    assert "alice" not in report.settings.skipped_reason
+    refreshed = await _settings(adb)
     assert refreshed.grace_minutes == 11  # the deliberate change survived the import
     assert refreshed.hosting_enabled is False
     # The registry and recipients are NOT gated by the settings latch.
@@ -420,11 +441,11 @@ async def test_settings_are_skipped_once_a_person_has_modified_the_row(adb, regi
 
 async def test_force_settings_overrides_the_modified_guard(adb, registry, env):
     await _seed_memos(adb)
-    settings = await adb.get(DigestSettings, importer.SETTINGS_ID)
-    assert settings is not None
-    settings.updated_by = "alice"
-    settings.grace_minutes = 11
-    await adb.flush()
+    await adb.execute(
+        update(DigestSettings)
+        .where(DigestSettings.id == importer.SETTINGS_ID)
+        .values(updated_by="alice", grace_minutes=11)
+    )
 
     report = await importer.run_import(
         adb, registry=registry, env=env, execute=True, force_settings=True
@@ -432,8 +453,7 @@ async def test_force_settings_overrides_the_modified_guard(adb, registry, env):
     await adb.flush()
 
     assert report.settings.written is True
-    refreshed = await adb.get(DigestSettings, importer.SETTINGS_ID)
-    assert refreshed is not None
+    refreshed = await _settings(adb)
     assert refreshed.grace_minutes == 45
     assert refreshed.updated_by == importer.IMPORTED_BY
 
@@ -496,3 +516,317 @@ async def test_the_dry_run_report_says_it_wrote_nothing(adb, registry, env):
     assert "DRY RUN — nothing written" in printed
     assert "would write" in printed
     assert "id=none (dry run)" in printed
+
+
+# --- the run's record of unmapped uids (B3) ------------------------------------------------------
+
+
+def test_parse_unmapped_reads_back_what_merge_wrote():
+    written = importer.merge_unmapped(None, ["a", "b"], authoritative=True)
+    assert written == "2 unmapped uid(s): a, b"
+    assert importer.parse_unmapped(written) == ["a", "b"]
+
+
+@pytest.mark.parametrize("recorded", [None, "", "a run failure that is not a uid record"])
+def test_parse_unmapped_finds_nothing_in_text_it_did_not_write(recorded):
+    assert importer.parse_unmapped(recorded) == []
+
+
+def test_an_unrestricted_pass_replaces_the_record_because_it_saw_everything():
+    assert (
+        importer.merge_unmapped("1 unmapped uid(s): old", ["new"], authoritative=True)
+        == "1 unmapped uid(s): new"
+    )
+    assert importer.merge_unmapped("1 unmapped uid(s): old", [], authoritative=True) is None
+
+
+def test_a_restricted_pass_adds_to_the_record_and_never_clears_or_repeats_it():
+    assert (
+        importer.merge_unmapped("1 unmapped uid(s): old", ["new"], authoritative=False)
+        == "2 unmapped uid(s): old, new"
+    )
+    # met nothing: the record of what it did not look at survives
+    assert (
+        importer.merge_unmapped("1 unmapped uid(s): old", [], authoritative=False)
+        == "1 unmapped uid(s): old"
+    )
+    # met the same one again: named once
+    assert (
+        importer.merge_unmapped("1 unmapped uid(s): old", ["old"], authoritative=False)
+        == "1 unmapped uid(s): old"
+    )
+
+
+async def test_a_restricted_pass_records_the_unmapped_uid_it_met(adb, registry, env):
+    await _seed_memos(adb)
+    report = await importer.run_import(adb, registry=registry, env=env, execute=True, limit=5)
+    assert report.registry.unmapped == 1
+
+    run = await _import_run(adb)
+    assert run is not None and run.error is not None
+    assert UNMAPPED_UID in run.error
+
+    # a restricted pass that meets none of them keeps the record, and meeting it again never
+    # names it twice
+    await importer.run_import(
+        adb, registry=registry, env=env, execute=True, only_uid=MAPPED_UIDS[0]
+    )
+    await importer.run_import(adb, registry=registry, env=env, execute=True, limit=5)
+    run = await _import_run(adb)
+    assert run is not None and run.error is not None
+    assert run.error.count(UNMAPPED_UID) == 1
+    assert run.error.startswith("1 unmapped uid(s):")
+
+
+# --- memos_sent is the database's count, not this process's (B2) ---------------------------------
+
+
+async def test_two_sequential_restricted_passes_leave_the_union_count(adb, registry, env):
+    await _seed_memos(adb)
+    await importer.run_import(
+        adb, registry=registry, env=env, execute=True, only_uid=MAPPED_UIDS[0]
+    )
+    await importer.run_import(
+        adb, registry=registry, env=env, execute=True, only_uid=MAPPED_UIDS[1]
+    )
+    run = await _import_run(adb)
+    assert run is not None
+    assert run.memos_sent == 2
+    assert await _count(adb, DigestDelivery) == 2
+
+    # a third pass whose slice OVERLAPS the first two adds only what is new, and the aggregate is
+    # the union rather than the last pass's own tally.
+    await importer.run_import(adb, registry=registry, env=env, execute=True, limit=3)
+    run = await _import_run(adb)
+    assert run is not None
+    assert run.memos_sent == 3
+    assert await _count(adb, DigestDelivery) == 3
+
+
+async def test_memos_sent_matches_the_delivery_count_the_database_holds(adb, registry, env):
+    await _seed_memos(adb)
+    await importer.run_import(adb, registry=registry, env=env, execute=True)
+    run = await _import_run(adb)
+    assert run is not None
+    counted = (
+        await adb.execute(
+            select(func.count()).select_from(DigestDelivery).where(DigestDelivery.run_id == run.id)
+        )
+    ).scalar_one()
+    assert run.memos_sent == counted == 4
+
+
+# --- the settings write is serialised and conditional (B1) ---------------------------------------
+
+
+async def _commit_in_another_session(statement) -> None:
+    """Run one statement on a SEPARATE connection and COMMIT it — a genuinely concurrent writer,
+    not this test's own transaction."""
+    async with async_engine.begin() as conn:
+        await conn.execute(statement)
+
+
+async def _restore_settings() -> None:
+    await _commit_in_another_session(
+        update(DigestSettings)
+        .where(DigestSettings.id == importer.SETTINGS_ID)
+        .values(updated_by=None, grace_minutes=30)
+    )
+
+
+async def test_a_save_that_lands_between_the_read_and_the_write_is_not_overwritten(
+    db_engine, registry, env
+):
+    """The check-then-write window, closed.
+
+    The import reads the latch, an admin saves and COMMITS from another connection, and only then
+    does the import write. The write must find nothing to write: the refusal is in the WHERE
+    clause, so there is no instant at which a decision made earlier can still be acted on.
+
+    This one runs its transaction by hand rather than on the `adb` fixture: the import holds the
+    settings row FOR UPDATE until its transaction ends, so the restore at the end would block on a
+    lock the fixture only releases during teardown. Rolling back here, in the test, is what makes
+    the cleanup deterministic instead of a deadlock.
+    """
+    async with async_engine.connect() as conn:
+        transaction = await conn.begin()
+        session = AsyncSession(bind=conn)
+        try:
+            await _seed_memos(session)
+            latch = await importer.read_settings_latch(session)
+            assert latch is not None and latch[0] is None  # the read a naive import would act on
+
+            await _commit_in_another_session(
+                update(DigestSettings)
+                .where(DigestSettings.id == importer.SETTINGS_ID)
+                .values(updated_by="alice", grace_minutes=11)
+            )
+
+            report = await importer.run_import(session, registry=registry, env=env, execute=True)
+
+            assert report.settings.written is False
+            assert report.settings.skipped_reason is not None
+            assert "modified by an admin at" in report.settings.skipped_reason
+            assert "alice" not in report.settings.skipped_reason
+            survived = await importer.read_settings_latch(session)
+            assert survived is not None and survived[0] == "alice"
+            assert (
+                await session.execute(
+                    select(DigestSettings.grace_minutes).where(
+                        DigestSettings.id == importer.SETTINGS_ID
+                    )
+                )
+            ).scalar_one() == 11
+            # The registry and the recipients are not gated by the settings latch and still landed.
+            assert report.registry.inserted == 4
+        finally:
+            await session.close()
+            await transaction.rollback()
+    await _restore_settings()
+
+
+PROBE = text("SELECT 1 FROM digest_settings WHERE id = :id FOR UPDATE NOWAIT")
+PROBE_PARAMS = {"id": importer.SETTINGS_ID}
+
+
+async def _settings_row_is_free() -> bool:
+    """Ask another connection whether the settings row can be locked, without ever waiting.
+
+    NOWAIT is what makes this a test and not a race: it answers immediately instead of blocking,
+    so no sleep and no timeout is involved in either outcome.
+    """
+    async with async_engine.connect() as conn:
+        try:
+            await conn.execute(PROBE, PROBE_PARAMS)
+        except DBAPIError:
+            return False
+        finally:
+            await conn.rollback()
+    return True
+
+
+async def test_the_import_holds_the_settings_row_even_on_a_pass_that_writes_nothing(
+    db_engine, registry, env
+):
+    """The mutex, isolated from the write.
+
+    An UPDATE takes its own row lock, so a pass that writes proves nothing about the explicit
+    lock. This one runs against a row an admin already claimed: the conditional write matches no
+    rows and therefore locks nothing, so the row is held for the rest of the transaction only if
+    the import took it FOR UPDATE on purpose.
+    """
+    await _commit_in_another_session(
+        update(DigestSettings)
+        .where(DigestSettings.id == importer.SETTINGS_ID)
+        .values(updated_by="alice")
+    )
+    try:
+        async with async_engine.connect() as conn:
+            transaction = await conn.begin()
+            session = AsyncSession(bind=conn)
+            try:
+                await _seed_memos(session)
+                assert await _settings_row_is_free()  # positive control: free before the import
+
+                report = await importer.run_import(
+                    session, registry=registry, env=env, execute=True
+                )
+                assert report.settings.written is False  # no write, so no write-taken lock
+
+                assert not await _settings_row_is_free()
+            finally:
+                await session.close()
+                await transaction.rollback()
+        assert await _settings_row_is_free()  # and released when the transaction ends
+    finally:
+        await _restore_settings()
+
+
+async def test_the_conditional_write_reports_how_many_rows_it_claimed(adb):
+    """`claim_settings` is the whole decision: one row when the latch is open, none when it is
+    not, and `force` overrides."""
+    assert await importer.claim_settings(adb, {"grace_minutes": 45}, force=False) == 1
+    assert await importer.claim_settings(adb, {"grace_minutes": 46}, force=False) == 0
+    assert await importer.claim_settings(adb, {"grace_minutes": 47}, force=True) == 1
+    latched = await _settings(adb)
+    assert latched.grace_minutes == 47
+
+
+# --- --limit is a count (B5) ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-99", "abc", ""])
+def test_limit_below_one_is_a_usage_error(raw: str):
+    with pytest.raises(argparse.ArgumentTypeError):
+        importer.positive_int(raw)
+
+
+def test_positive_int_accepts_a_count():
+    assert importer.positive_int("3") == 3
+
+
+async def test_run_import_refuses_a_limit_below_one_rather_than_slicing(adb, registry, env):
+    for bad in (0, -1):
+        with pytest.raises(importer.ImportInputError, match="must be 1 or more"):
+            await importer.run_import(adb, registry=registry, env=env, execute=True, limit=bad)
+    assert await _count(adb, DigestDelivery) == 0
+
+
+def _cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "app.scripts.import_digest_state", *args],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_the_cli_exits_2_on_a_limit_below_one(limit: str):
+    result = _cli("--state", str(STATE_FIXTURE), "--env", str(ENV_FIXTURE), "--limit", limit)
+    assert result.returncode == 2
+    assert "1 or more" in result.stderr
+
+
+def test_the_cli_runs_at_all():
+    """Positive control for the two exit-2 assertions above: the same invocation path succeeds."""
+    assert _cli("--help").returncode == 0
+
+
+@pytest.fixture
+def emitted_sql():
+    """Every statement the app's engine actually sends, captured at the cursor.
+
+    Not a mock of anything: the real import runs against the real database and this only watches
+    what went over the wire — the one place a lock request and a SQL-side aggregate are visible.
+    """
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):  # noqa: PLR0913
+        statements.append(statement)
+
+    event.listen(async_engine.sync_engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(async_engine.sync_engine, "before_cursor_execute", record)
+
+
+async def test_the_run_row_is_locked_and_its_total_is_counted_in_sql(
+    adb, registry, env, emitted_sql
+):
+    await _seed_memos(adb)
+    await importer.run_import(adb, registry=registry, env=env, execute=True)
+
+    # Positive control: the capture really saw this import's work.
+    assert any("INSERT INTO digest_deliveries" in one for one in emitted_sql)
+
+    locking = [one for one in emitted_sql if "digest_runs" in one and "FOR UPDATE" in one]
+    assert locking, "the run row must be locked before its aggregate is rewritten"
+
+    rewrites = [one for one in emitted_sql if one.lstrip().upper().startswith("UPDATE DIGEST_RUNS")]
+    assert rewrites, "the run row must be rewritten with an UPDATE"
+    assert any("count(" in one.lower() for one in rewrites), (
+        "memos_sent must be counted in the UPDATE itself, never handed in from this process"
+    )

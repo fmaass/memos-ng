@@ -58,7 +58,7 @@ import asyncio
 import json
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -76,8 +76,9 @@ from app.models import (
     DigestVisibilityScope,
     Memo,
 )
-from app.routers.admin_digest import SETTINGS_ID, normalise_email
-from sqlalchemy import func, select, text
+from app.routers.admin_digest import SETTINGS_ID, _settings_row, normalise_email
+from fastapi import HTTPException
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -375,13 +376,107 @@ def _local_date(timezone: str | None) -> date:
     return datetime.now(zone).date()
 
 
-async def ensure_import_run(db: AsyncSession, *, local_date: date) -> DigestRun:
-    """The one ``trigger='import'`` run row, found or created.
+# The run's record of what the registry named and the database lacks, written in this shape so a
+# later pass can read its own earlier passes back and add to them rather than overwrite them.
+_UNMAPPED_RE = re.compile(r"unmapped uid\(s\):\s*(?P<uids>.*)\Z", re.DOTALL)
+
+
+def parse_unmapped(recorded: str | None) -> list[str]:
+    """The uids a previous pass recorded in ``digest_runs.error``, in the order it wrote them."""
+    if not recorded:
+        return []
+    match = _UNMAPPED_RE.search(recorded)
+    if match is None:
+        return []
+    return [uid for uid in (part.strip() for part in match["uids"].split(",")) if uid]
+
+
+def merge_unmapped(
+    recorded: str | None, found: Sequence[str], *, authoritative: bool
+) -> str | None:
+    """What ``digest_runs.error`` should say after a pass that met ``found``.
+
+    An UNRESTRICTED pass looked at the whole registry, so what it found IS the set and it may
+    replace what is there. A restricted pass (``--only-uid`` / ``--limit``) saw a slice: it must
+    still record what it met — an unmapped uid is the one thing an operator has to act on — but it
+    may only ADD, never clear the record of a uid it did not look at, and never name one twice.
+    """
+    uids = list(found) if authoritative else [*parse_unmapped(recorded), *found]
+    unique = list(dict.fromkeys(uids))
+    return f"{len(unique)} unmapped uid(s): {', '.join(unique)}" if unique else None
+
+
+def format_settings_skip(updated_by: str | None, updated_at: datetime) -> str:
+    """Why the settings write was refused, WITHOUT quoting the stored `updated_by`.
+
+    Who last touched the row is a person's name out of the database; the operator needs to know
+    that someone did and when, not to have the value echoed into a terminal. The one distinction
+    worth drawing is between an earlier pass of this same import and anybody else — reporting the
+    import's own latch as "an admin" would be false.
+    """
+    who = "this import" if updated_by == IMPORTED_BY else "an admin"
+    return f"modified by {who} at {updated_at.isoformat()}"
+
+
+def positive_int(raw: str) -> int:
+    """``--limit`` as a count. Zero and negatives are a usage error, not a silent slice: Python
+    would read ``[:0]`` as "nothing" and ``[:-1]`` as "all but the last", and neither is what an
+    operator typing a limit meant."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a whole number") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
+async def claim_settings(db: AsyncSession, values: dict[str, object], *, force: bool) -> int:
+    """Write the settings columns and claim the row, CONDITIONALLY, in one statement.
+
+    The refusal lives in the WHERE clause rather than in a preceding read, so there is no window
+    between deciding and writing for an admin's save to fall into: a row somebody else has already
+    claimed simply matches nothing. Returns the number of rows affected — 0 means refused.
+    """
+    statement = (
+        update(DigestSettings)
+        .where(DigestSettings.id == SETTINGS_ID)
+        .values(**values, updated_by=IMPORTED_BY, updated_at=func.now())
+    )
+    if not force:
+        statement = statement.where(DigestSettings.updated_by.is_(None))
+    # RETURNING rather than `rowcount`: the ids come back typed, and "which rows did this write"
+    # is the question being asked.
+    return len((await db.execute(statement.returning(DigestSettings.id))).scalars().all())
+
+
+async def read_settings_latch(db: AsyncSession) -> tuple[str | None, datetime] | None:
+    """``(updated_by, updated_at)`` read straight off the row, or None when there is no row.
+
+    Read as COLUMNS rather than off a loaded object: `updated_at` carries an `onupdate`, so any
+    earlier write in this session leaves the attribute expired, and touching it would then be a
+    lazy load in async code (MissingGreenlet).
+    """
+    row = (
+        await db.execute(
+            select(DigestSettings.updated_by, DigestSettings.updated_at).where(
+                DigestSettings.id == SETTINGS_ID
+            )
+        )
+    ).one_or_none()
+    return None if row is None else (row.updated_by, row.updated_at)
+
+
+async def ensure_import_run(db: AsyncSession, *, local_date: date) -> int:
+    """The id of the one ``trigger='import'`` run row, found or created.
 
     ``uq_digest_runs_import`` is a partial unique index, so the INSERT infers it and does nothing
     when the row already exists — find-or-create in one statement rather than a check-then-insert
     two callers could both win. ``status`` is written terminally IN the insert; see the module
     docstring for why a status-less import row must never be committed.
+
+    It returns the ID and not the row: every later write to this run goes through a locked,
+    SQL-side UPDATE, which would leave a loaded ORM object silently stale.
     """
     now = datetime.now(UTC)
     await db.execute(
@@ -398,7 +493,7 @@ async def ensure_import_run(db: AsyncSession, *, local_date: date) -> DigestRun:
         )
     )
     return (
-        await db.execute(select(DigestRun).where(DigestRun.trigger == IMPORT_TRIGGER))
+        await db.execute(select(DigestRun.id).where(DigestRun.trigger == IMPORT_TRIGGER))
     ).scalar_one()
 
 
@@ -422,12 +517,18 @@ async def run_import(
 ) -> ImportReport:
     """Perform (or, without ``execute``, project) the three imports. Does not commit."""
     report = ImportReport()
-    settings_row = await db.get(DigestSettings, SETTINGS_ID)
+    timezone = (
+        await db.execute(select(DigestSettings.timezone).where(DigestSettings.id == SETTINGS_ID))
+    ).scalar_one_or_none()
 
     # --- 1. registry ---------------------------------------------------------------------------
     uids = list(registry.sent_uids)
     report.registry.entries_in_file = len(uids)
     report.registry.hosted_media_entries = len(registry.hosted_media)
+    if limit is not None and limit < 1:
+        # The CLI refuses this at parse time; a caller reaching run_import directly gets the same
+        # answer rather than a negative slice quietly importing "all but the last".
+        raise ImportInputError("--limit must be 1 or more")
     if only_uid is not None:
         if only_uid not in registry.sent_uids:
             raise ImportInputError("the uid given to --only-uid is not in the registry")
@@ -445,9 +546,8 @@ async def run_import(
         logger.debug("digest_import.unmapped_uid", uid=uid)
 
     if execute:
-        timezone = settings_row.timezone if settings_row is not None else None
-        run = await ensure_import_run(db, local_date=_local_date(timezone))
-        report.run_id = run.id
+        run_id = await ensure_import_run(db, local_date=_local_date(timezone))
+        report.run_id = run_id
         if mapping:
             inserted = (
                 await db.execute(
@@ -456,7 +556,7 @@ async def run_import(
                         [
                             {
                                 "memo_id": memo_id,
-                                "run_id": run.id,
+                                "run_id": run_id,
                                 "part_index": IMPORT_PART_INDEX,
                                 "incomplete": False,
                             }
@@ -469,23 +569,35 @@ async def run_import(
             ).all()
             report.registry.inserted = len(inserted)
         report.registry.already_present = report.registry.mapped - report.registry.inserted
-        # Read the aggregate BACK rather than accumulating it, so a repeat pass, a --limit pass and
-        # a --only-uid pass all leave the same true total behind.
-        run.memos_sent = (
+        # The run row aggregates rows another pass may be inserting at the same time, so it is
+        # LOCKED before it is read and rewritten, and the count is computed IN the UPDATE. A total
+        # that travelled through this process's memory could be written back over a larger one by
+        # whichever pass committed last.
+        recorded_error = (
             await db.execute(
-                select(func.count())
-                .select_from(DigestDelivery)
-                .where(DigestDelivery.run_id == run.id)
+                select(DigestRun.error).where(DigestRun.id == run_id).with_for_update()
             )
         ).scalar_one()
-        run.finished_at = datetime.now(UTC)
-        if only_uid is None and limit is None:
-            # Only a pass that looked at the WHOLE registry may state what it did not find; a
-            # restricted pass would otherwise erase the full pass's record of the unmapped uids.
-            run.error = (
-                f"{len(unmapped)} unmapped uid(s): {', '.join(unmapped)}" if unmapped else None
+        delivered = (
+            select(func.count())
+            .select_from(DigestDelivery)
+            .where(DigestDelivery.run_id == run_id)
+            .scalar_subquery()
+        )
+        await db.execute(
+            update(DigestRun)
+            .where(DigestRun.id == run_id)
+            .values(
+                memos_sent=delivered,
+                finished_at=func.now(),
+                error=merge_unmapped(
+                    recorded_error, unmapped, authoritative=only_uid is None and limit is None
+                ),
             )
-        report.run_memos_sent = run.memos_sent
+        )
+        report.run_memos_sent = (
+            await db.execute(select(DigestRun.memos_sent).where(DigestRun.id == run_id))
+        ).scalar_one()
     else:
         report.registry.already_present = 0
 
@@ -510,30 +622,32 @@ async def run_import(
     values, unusable = plan_settings(env)
     report.settings.columns = tuple(values)
     report.settings.unusable_keys = unusable
-    # The latch is read with an explicit SELECT rather than off the loaded object: `updated_at`
-    # carries an `onupdate`, so any earlier flush in this session leaves the attribute EXPIRED, and
-    # touching it would then be a lazy load in async code (MissingGreenlet). Reading the columns is
-    # also the authoritative answer to "has anyone touched this row", which is what the guard asks.
-    latch = (
-        await db.execute(
-            select(DigestSettings.updated_by, DigestSettings.updated_at).where(
-                DigestSettings.id == SETTINGS_ID
-            )
-        )
-    ).one_or_none()
-    if settings_row is None or latch is None:
-        report.settings.skipped_reason = f"no digest_settings row {SETTINGS_ID}"
-    elif latch.updated_by is not None and not force_settings:
-        report.settings.skipped_reason = (
-            f"modified by {latch.updated_by} at {latch.updated_at.isoformat()}"
-        )
-    elif execute:
-        for column, value in values.items():
-            setattr(settings_row, column, value)
-        # Claiming the row is what makes the guard one-shot: the next pass reads a non-NULL
-        # updated_by and refuses, so a deliberate change made between two passes survives.
-        settings_row.updated_by = IMPORTED_BY
-        report.settings.written = True
+    if execute:
+        try:
+            # The API's own helper, and its `for_update` is a mutex rather than a fresh read: it
+            # holds the singleton for the rest of this transaction, so an admin's save cannot land
+            # between this decision and the write below.
+            await _settings_row(db, for_update=True)
+        except HTTPException:
+            # The migration seeds the row; its absence is a broken install, not something an
+            # import may repair by INSERTing the second row the CHECK exists to forbid.
+            report.settings.skipped_reason = f"no digest_settings row {SETTINGS_ID}"
+        else:
+            if await claim_settings(db, values, force=force_settings):
+                report.settings.written = True
+            else:
+                latch = await read_settings_latch(db)
+                report.settings.skipped_reason = (
+                    format_settings_skip(*latch)
+                    if latch is not None
+                    else f"no digest_settings row {SETTINGS_ID}"
+                )
+    else:
+        latch = await read_settings_latch(db)
+        if latch is None:
+            report.settings.skipped_reason = f"no digest_settings row {SETTINGS_ID}"
+        elif latch[0] is not None and not force_settings:
+            report.settings.skipped_reason = format_settings_skip(*latch)
     return report
 
 
@@ -574,7 +688,9 @@ def main() -> int:  # pragma: no cover
         "--execute", action="store_true", help="write; the default reads and reports only"
     )
     parser.add_argument(
-        "--limit", type=int, help="map only the first N registry entries (the registry only)"
+        "--limit",
+        type=positive_int,
+        help="map only the first N registry entries, N >= 1 (the registry only)",
     )
     parser.add_argument(
         "--only-uid",
