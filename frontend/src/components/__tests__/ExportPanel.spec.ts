@@ -17,6 +17,7 @@ const SERVER: ExportSettings = {
   mail_jpeg_quality: 80,
   mail_subsampling: '4:2:0',
   mail_progressive: false,
+  print_profile_key: 'p4096-q92-strip-mono',
   updated_at: '2026-08-30T10:00:00Z',
   updated_by: 'fabian',
 }

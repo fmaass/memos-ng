@@ -3,68 +3,51 @@
 // a draft changed, whether a draft is legal, what the PUT body is, and what the "how to query"
 // command reads. Nothing in this file talks to the network — that is `useExportSettings.ts`, and
 // only that.
-//
-// THE ROW IS HAND-DECLARED, DELIBERATELY. `GET/PUT /api/admin/export/settings` is not in
-// `openapi.json` yet (it lands in a sibling change), so `ExportSettings` and `ExportSettingsPut`
-// below mirror the agreed column set by hand. When the endpoint reaches the schema, these two
-// aliases become `components['schemas'][…]` from '@/api/schema' and nothing else here moves.
 
+import type { components } from '@/api/schema'
 // `isCalendarDate` is the Mail tab's, unchanged and reused rather than re-written: one answer to
 // "is this a day that exists" is the only way both tabs can stay agreed on it.
 import { isCalendarDate } from '@/lib/digest'
 
 // --- the row --------------------------------------------------------------------------------
 
-/** How a print-quality JPEG is derived. `0` for the long edge means "the master's own size". */
-export type PrintLongEdge = 4096 | 5000 | 0
-export type MetadataPolicy = 'strip' | 'keep_dates'
-/** The digest's inline CID images. 1200/1600/2048 px are the three sizes the design names:
- * 2× a 600 px and an 800 px rendered width, and the 2048 px `mobile` tier the digest embeds today. */
-export type MailLongEdge = 1200 | 1600 | 2048
-export type Subsampling = '4:2:0' | '4:4:4'
-
-/** The whole settings row as the API answers it. */
-export interface ExportSettings {
-  print_long_edge: PrintLongEdge
-  print_jpeg_quality: number
-  print_metadata_policy: MetadataPolicy
-  print_grayscale_single_channel: boolean
-  mail_long_edge: MailLongEdge
-  mail_jpeg_quality: number
-  mail_subsampling: Subsampling
-  mail_progressive: boolean
-  updated_at: string
-  updated_by: string | null
-}
+/** The whole settings row as the API answers it — including `print_profile_key`, the derived cache
+ * key the panel never edits. */
+export type ExportSettings = components['schemas']['ExportSettingsOut']
 
 /** The whole settings row as the API takes it back. PUT replaces everything, so this is every
  * writable column and not a patch — the two Save bars each build one from the freshest server row. */
-export interface ExportSettingsPut {
-  print_long_edge: PrintLongEdge
-  print_jpeg_quality: number
-  print_metadata_policy: MetadataPolicy
-  print_grayscale_single_channel: boolean
-  mail_long_edge: MailLongEdge
-  mail_jpeg_quality: number
-  mail_subsampling: Subsampling
-  mail_progressive: boolean
-}
+export type ExportSettingsPut = components['schemas']['ExportSettingsPut']
+
+/** How a print-quality JPEG is derived. `0` for the long edge means "the master's own size".
+ *
+ * These come off the PUT body rather than the answer: the API publishes the exact rungs it accepts
+ * only on the way IN (`ExportSettingsOut` widens both long edges to `number`), and what the panel
+ * must offer is precisely what a save may carry. */
+export type PrintLongEdge = ExportSettingsPut['print_long_edge']
+export type MetadataPolicy = ExportSettingsPut['print_metadata_policy']
+/** The digest's inline CID images: 2× a 600 px and an 800 px rendered width, and the 2048 px
+ * `mobile` tier the digest embeds today. */
+export type MailLongEdge = ExportSettingsPut['mail_long_edge']
+export type Subsampling = ExportSettingsPut['mail_subsampling']
 
 // --- the two drafts -------------------------------------------------------------------------
 
-export interface PrintProfileDraft {
-  print_long_edge: PrintLongEdge
-  print_jpeg_quality: number
-  print_metadata_policy: MetadataPolicy
-  print_grayscale_single_channel: boolean
-}
+// A draft IS half the PUT body, so it is taken from it rather than restated. A writable column
+// added to the row therefore breaks `printDraftFromSettings`/`mailDraftFromSettings` at compile
+// time instead of quietly falling outside the Save bars.
+export type PrintProfileDraft = Pick<
+  ExportSettingsPut,
+  | 'print_long_edge'
+  | 'print_jpeg_quality'
+  | 'print_metadata_policy'
+  | 'print_grayscale_single_channel'
+>
 
-export interface MailProfileDraft {
-  mail_long_edge: MailLongEdge
-  mail_jpeg_quality: number
-  mail_subsampling: Subsampling
-  mail_progressive: boolean
-}
+export type MailProfileDraft = Pick<
+  ExportSettingsPut,
+  'mail_long_edge' | 'mail_jpeg_quality' | 'mail_subsampling' | 'mail_progressive'
+>
 
 export const PRINT_FIELDS = [
   'print_long_edge',
@@ -82,7 +65,11 @@ export const MAIL_FIELDS = [
 
 export function printDraftFromSettings(settings: ExportSettings): PrintProfileDraft {
   return {
-    print_long_edge: settings.print_long_edge,
+    // The answer widens the long edge to `number` while a save names the exact rungs, so this is
+    // the one place the narrow set is asserted — asserted, not trusted. A stored value outside the
+    // set reaches `validatePrintDraft`, which refuses it by name: the admin sees what is actually
+    // stored and cannot save it back, rather than having it silently rewritten to a default.
+    print_long_edge: settings.print_long_edge as PrintLongEdge,
     print_jpeg_quality: settings.print_jpeg_quality,
     print_metadata_policy: settings.print_metadata_policy,
     print_grayscale_single_channel: settings.print_grayscale_single_channel,
@@ -91,7 +78,7 @@ export function printDraftFromSettings(settings: ExportSettings): PrintProfileDr
 
 export function mailDraftFromSettings(settings: ExportSettings): MailProfileDraft {
   return {
-    mail_long_edge: settings.mail_long_edge,
+    mail_long_edge: settings.mail_long_edge as MailLongEdge, // as above
     mail_jpeg_quality: settings.mail_jpeg_quality,
     mail_subsampling: settings.mail_subsampling,
     mail_progressive: settings.mail_progressive,
