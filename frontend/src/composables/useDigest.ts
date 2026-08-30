@@ -51,6 +51,9 @@ export function useDigest() {
     },
   })
 
+  // The runs list is the repo's cursor-paged shape (`{items, nextCursor, totalCount}`, like
+  // `MemoList`). The panel shows one page and nothing else, so it asks for `limit` alone — no
+  // `cursor`, and no `with_total`, which the API only computes when a caller asks for it.
   const runsQuery = useQuery({
     queryKey: digestKeys.runs,
     queryFn: async () => {
@@ -61,6 +64,9 @@ export function useDigest() {
       return data
     },
   })
+  // `undefined` until the page arrives, deliberately: an empty array would say "no runs" and make
+  // the status row promise a send today that a run today may already have taken.
+  const runs = computed(() => runsQuery.data.value?.items)
 
   const hostingQuery = useQuery({
     queryKey: digestKeys.hosting,
@@ -238,7 +244,7 @@ export function useDigest() {
   return {
     settings: settingsQuery.data,
     recipients: recipientsQuery.data,
-    runs: runsQuery.data,
+    runs,
     hosting: hostingQuery.data,
     isPending: settingsQuery.isPending,
     settingsError: settingsQuery.error,

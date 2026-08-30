@@ -105,6 +105,19 @@ describe('useDigest', () => {
     expect(GET).toHaveBeenCalledWith('/api/admin/digest/hosting')
   })
 
+  it('reads the Runs table out of the cursor-paged list, not the envelope', () => {
+    state.data.set(
+      JSON.stringify(['digest', 'runs']),
+      ref({ items: [{ id: 9 }], nextCursor: 'cursor-for-the-page-after', totalCount: null }),
+    )
+    const digest = useDigest()
+    expect(digest.runs.value).toEqual([{ id: 9 }])
+  })
+
+  it('shows no runs at all — not an empty list — before the page arrives', () => {
+    expect(useDigest().runs.value).toBeUndefined()
+  })
+
   it('surfaces a failed read as a thrown error rather than empty data', async () => {
     GET.mockResolvedValueOnce({ data: undefined, error: { detail: 'nope' } })
     useDigest()

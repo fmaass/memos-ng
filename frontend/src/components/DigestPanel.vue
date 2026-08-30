@@ -55,7 +55,9 @@ const {
   loadPreview,
   sendTest,
   runNow,
-} = useDigestActions()
+  // `POST /run` only CLAIMS the row — the worker executes it — so the table is refreshed twice:
+  // once when the claim lands (it shows as running) and once when the watch settles on a status.
+} = useDigestActions({ onRunChanged: () => refreshRuns() })
 
 // The grouped draft is seeded ONCE, when the settings first arrive, and re-seeded only by Save and
 // Discard. A background refetch must not silently overwrite what the admin is typing.
@@ -118,11 +120,6 @@ async function openPreview() {
   clearActionMessages()
   setPreviewOpen(true)
   await loadPreview()
-}
-
-async function onRunNow() {
-  const started = await runNow()
-  if (started) await refreshRuns()
 }
 
 const scopeOptions = [
@@ -191,7 +188,7 @@ const scopeOptions = [
             severity="secondary"
             :loading="runningNow"
             data-test="digest-run-now"
-            @click="onRunNow"
+            @click="runNow"
           />
         </div>
 

@@ -1,22 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  PREVIEW_PATH,
-  RUN_PATH,
-  TEST_SEND_PATH,
-  useDigestActions,
-} from '@/composables/useDigestActions'
+import { useDigestActions } from '@/composables/useDigestActions'
+import type { DigestRun } from '@/composables/useDigestActions'
 
-const { redirectToLogin } = vi.hoisted(() => ({ redirectToLogin: vi.fn() }))
-vi.mock('@/api/client', () => ({ redirectToLogin }))
+const { GET, POST } = vi.hoisted(() => ({ GET: vi.fn(), POST: vi.fn() }))
+vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET, POST }) }))
 
-function json(body: unknown, status = 200): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  } as unknown as Response
-}
+const ok = (data: unknown, status = 200) => ({ data, error: undefined, response: { status } })
+const fail = (detail: unknown, status: number) => ({
+  data: undefined,
+  error: { detail },
+  response: { status },
+})
 
 const PREVIEW = {
   html: '<p>hello</p>',
@@ -27,46 +22,61 @@ const PREVIEW = {
   deferred: [{ uid: 'def', reason: 'card exceeds max_email_bytes after shedding' }],
 }
 
+function run(over: Partial<DigestRun> = {}): DigestRun {
+  return {
+    id: 12,
+    trigger: 'manual',
+    started_at: '2026-08-30T05:00:00Z',
+    finished_at: null,
+    status: null,
+    memos_sent: 0,
+    parts: 0,
+    parts_sent: 0,
+    parts_claimed: 0,
+    recipients: 0,
+    error: null,
+    local_date: '2026-08-30',
+    ...over,
+  }
+}
+
+// No real backoff in a unit test — the delays are injected, and their LENGTH is still the budget.
+const fast = (attempts = 3) => ({ pollDelays: new Array(attempts).fill(0) })
+
 describe('useDigestActions', () => {
   beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn())
+    GET.mockReset()
+    POST.mockReset()
   })
-  afterEach(() => {
-    vi.clearAllMocks()
-    vi.unstubAllGlobals()
-  })
+  afterEach(() => vi.clearAllMocks())
 
   it('renders a preview and keeps its selected and deferred lists', async () => {
-    vi.mocked(fetch).mockResolvedValue(json(PREVIEW))
+    GET.mockResolvedValue(ok(PREVIEW))
     const actions = useDigestActions()
 
     const result = await actions.loadPreview()
-    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(PREVIEW_PATH)
+    expect(GET).toHaveBeenCalledWith('/api/admin/digest/preview')
     expect(result?.memo_count).toBe(2)
     expect(actions.preview.value?.deferred[0].reason).toMatch(/max_email_bytes/)
     expect(actions.previewError.value).toBeNull()
   })
 
   it('refuses a second preview while one is still rendering', async () => {
-    let release: (r: Response) => void = () => {}
-    vi.mocked(fetch).mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        release = resolve
-      }),
-    )
+    let release: (r: unknown) => void = () => {}
+    GET.mockReturnValueOnce(new Promise((resolve) => (release = resolve)))
     const actions = useDigestActions()
 
     const first = actions.loadPreview()
     const second = await actions.loadPreview()
-    release(json(PREVIEW))
+    release(ok(PREVIEW))
 
     expect(second).toBeNull()
     expect((await first)?.memo_count).toBe(2)
-    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(GET).toHaveBeenCalledTimes(1)
   })
 
-  it('reports a failed preview with the API\'s own words and clears the stale render', async () => {
-    vi.mocked(fetch).mockResolvedValue(json({ detail: 'rendering failed' }, 500))
+  it("reports a failed preview with the API's own words and clears the stale render", async () => {
+    GET.mockResolvedValue(fail('rendering failed', 500))
     const actions = useDigestActions()
 
     expect(await actions.loadPreview()).toBeNull()
@@ -75,55 +85,99 @@ describe('useDigestActions', () => {
   })
 
   it('sends a test to the caller, and an explicitly empty one for the SMTP probe', async () => {
-    vi.mocked(fetch).mockResolvedValue(json({}))
+    POST.mockResolvedValue(ok({ sent_to: 'admin@example.test', memo_count: 3 }))
     const actions = useDigestActions()
 
-    expect(await actions.sendTest(false)).toBe(true)
-    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(TEST_SEND_PATH)
-    expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ method: 'POST', body: '{}' })
+    expect((await actions.sendTest(false))?.memo_count).toBe(3)
+    expect(POST).toHaveBeenCalledWith('/api/admin/digest/test-send', { body: { empty: false } })
+    expect(actions.actionNotice.value).toMatch(/3 memos/)
 
-    expect(await actions.sendTest(true)).toBe(true)
-    expect(vi.mocked(fetch).mock.calls[1][1]).toMatchObject({ body: '{"empty":true}' })
+    await actions.sendTest(true)
+    expect(POST).toHaveBeenLastCalledWith('/api/admin/digest/test-send', { body: { empty: true } })
     expect(actions.actionNotice.value).toMatch(/empty test mail/i)
   })
 
-  it('starts a run and reports a 409 as a run already in flight, not as a fault', async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(json({ id: 12, status: null }))
+  it('reports a refused test send rather than claiming it went out', async () => {
+    POST.mockResolvedValue(fail('SMTP is not configured', 422))
     const actions = useDigestActions()
 
-    expect((await actions.runNow())?.id).toBe(12)
-    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(RUN_PATH)
-    expect(actions.actionNotice.value).toMatch(/run has started/i)
+    expect(await actions.sendTest()).toBeNull()
+    expect(actions.actionError.value).toBe('SMTP is not configured')
+    expect(actions.actionNotice.value).toBeNull()
+  })
 
-    vi.mocked(fetch).mockResolvedValueOnce(json({ detail: 'a run is already in flight' }, 409))
+  it('claims a run, refreshes the table on the claim, then watches it to its terminal status', async () => {
+    const onRunChanged = vi.fn()
+    POST.mockResolvedValue(ok({ id: 12, status: null, trigger: 'manual' }, 202))
+    GET.mockResolvedValueOnce(ok(run())) // still in flight
+      .mockResolvedValueOnce(ok(run({ status: 'sent', memos_sent: 7, recipients: 2 })))
+    const actions = useDigestActions({ onRunChanged, ...fast() })
+
+    const claim = await actions.runNow()
+
+    expect(claim?.id).toBe(12)
+    expect(POST).toHaveBeenCalledWith('/api/admin/digest/run')
+    expect(GET).toHaveBeenCalledWith('/api/admin/digest/runs/{run_id}', {
+      params: { path: { run_id: 12 } },
+    })
+    expect(actions.actionNotice.value).toMatch(/7 memos to 2 recipients/)
+    expect(actions.runningNow.value).toBe(false)
+    expect(onRunChanged).toHaveBeenCalledTimes(2) // once on the claim, once when it landed
+  })
+
+  it("reports a run that ended badly with the row's own reason", async () => {
+    POST.mockResolvedValue(ok({ id: 13, status: null, trigger: 'manual' }, 202))
+    GET.mockResolvedValue(ok(run({ id: 13, status: 'failed', error: 'SMTP is not configured' })))
+    const actions = useDigestActions(fast())
+
+    await actions.runNow()
+    expect(actions.actionError.value).toBe('The run failed: SMTP is not configured')
+    expect(actions.actionNotice.value).toBeNull()
+  })
+
+  it('gives up after its budget without pretending the run failed', async () => {
+    POST.mockResolvedValue(ok({ id: 14, status: null, trigger: 'manual' }, 202))
+    GET.mockResolvedValue(ok(run({ id: 14 }))) // never leaves NULL
+    const actions = useDigestActions(fast(3))
+
+    await actions.runNow()
+    expect(GET).toHaveBeenCalledTimes(3) // bounded by the delay list, not by the run
+    expect(actions.actionNotice.value).toMatch(/still going/)
+    expect(actions.actionError.value).toBeNull()
+  })
+
+  it('keeps watching through a transient read failure', async () => {
+    POST.mockResolvedValue(ok({ id: 15, status: null, trigger: 'manual' }, 202))
+    GET.mockResolvedValueOnce(fail('gateway timeout', 504)).mockResolvedValueOnce(
+      ok(run({ id: 15, status: 'sent', memos_sent: 1, recipients: 1 })),
+    )
+    const actions = useDigestActions(fast())
+
+    await actions.runNow()
+    expect(actions.actionNotice.value).toMatch(/1 memo to 1 recipient/)
+  })
+
+  it('reports a 409 as a run already in flight, not as a fault, and watches nothing', async () => {
+    POST.mockResolvedValue(fail('a run is already in flight', 409))
+    const actions = useDigestActions(fast())
+
     expect(await actions.runNow()).toBeNull()
     expect(actions.actionError.value).toMatch(/already in flight/i)
+    expect(GET).not.toHaveBeenCalled()
   })
 
-  it('bounces a dead session to the login the way the API client does', async () => {
-    vi.mocked(fetch).mockResolvedValue(json({ detail: 'unauthenticated' }, 401))
-    const actions = useDigestActions()
+  it('refuses a second run while one is still being watched', async () => {
+    let release: (r: unknown) => void = () => {}
+    POST.mockReturnValueOnce(new Promise((resolve) => (release = resolve)))
+    GET.mockResolvedValue(ok(run({ status: 'sent' })))
+    const actions = useDigestActions(fast())
 
-    expect(await actions.sendTest()).toBe(false)
-    expect(redirectToLogin).toHaveBeenCalledTimes(1)
-    expect(actions.actionError.value).toMatch(/session has expired/i)
-  })
+    const first = actions.runNow()
+    const second = await actions.runNow()
+    release(ok({ id: 12, status: null, trigger: 'manual' }, 202))
+    await first
 
-  it('refuses a second run and a second test while one is on the wire', async () => {
-    let release: (r: Response) => void = () => {}
-    vi.mocked(fetch).mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        release = resolve
-      }),
-    )
-    const actions = useDigestActions()
-
-    const first = actions.sendTest()
-    const second = await actions.sendTest()
-    release(json({}))
-
-    expect(second).toBe(false)
-    expect(await first).toBe(true)
-    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(second).toBeNull()
+    expect(POST).toHaveBeenCalledTimes(1)
   })
 })

@@ -80,6 +80,7 @@ const actions = vi.hoisted(() => ({
   sendTest: vi.fn(),
   runNow: vi.fn(),
   preview: undefined as unknown,
+  options: undefined as { onRunChanged?: () => unknown } | undefined,
 }))
 
 vi.mock('@/composables/useDigest', () => ({
@@ -106,19 +107,23 @@ vi.mock('@/composables/useDigest', () => ({
 }))
 
 vi.mock('@/composables/useDigestActions', () => ({
-  useDigestActions: () => ({
-    preview: actions.preview,
-    previewing: ref(false),
-    previewError: ref(null),
-    sendingTest: ref(false),
-    runningNow: ref(false),
-    actionError: ref(null),
-    actionNotice: ref(null),
-    clearActionMessages: vi.fn(),
-    loadPreview: actions.loadPreview,
-    sendTest: actions.sendTest,
-    runNow: actions.runNow,
-  }),
+  useDigestActions: (options: { onRunChanged?: () => unknown }) => {
+    actions.options = options
+    return {
+      preview: actions.preview,
+      previewing: ref(false),
+      previewError: ref(null),
+      sendingTest: ref(false),
+      runningNow: ref(false),
+      watchedRun: ref(null),
+      actionError: ref(null),
+      actionNotice: ref(null),
+      clearActionMessages: vi.fn(),
+      loadPreview: actions.loadPreview,
+      sendTest: actions.sendTest,
+      runNow: actions.runNow,
+    }
+  },
 }))
 
 const DrawerStub = {
@@ -342,7 +347,7 @@ describe('DigestPanel', () => {
     expect(wrapper.find('[data-test="drawer-stub"]').attributes('data-visible')).toBe('true')
   })
 
-  it('sends a test to the admin and starts a run, refreshing the runs table afterwards', async () => {
+  it('sends a test to the admin and claims a run', async () => {
     const wrapper = mountPanel()
     await wrapper.find('[data-test="digest-test-send"]').trigger('click')
     await flushPromises()
@@ -351,14 +356,15 @@ describe('DigestPanel', () => {
     await wrapper.find('[data-test="digest-run-now"]').trigger('click')
     await flushPromises()
     expect(actions.runNow).toHaveBeenCalledTimes(1)
-    expect(digest.refreshRuns).toHaveBeenCalledTimes(1)
   })
 
-  it('leaves the runs table alone when the run was refused', async () => {
-    actions.runNow.mockResolvedValue(null)
-    const wrapper = mountPanel()
-    await wrapper.find('[data-test="digest-run-now"]').trigger('click')
-    await flushPromises()
+  it('refreshes the Runs table whenever the claimed run changes', async () => {
+    // `POST /run` only claims the row; the worker finishes it. So the panel does not refresh once
+    // after the click — it hands the composable a callback that fires on the claim AND on the
+    // terminal status.
+    mountPanel()
     expect(digest.refreshRuns).not.toHaveBeenCalled()
+    await actions.options?.onRunChanged?.()
+    expect(digest.refreshRuns).toHaveBeenCalledTimes(1)
   })
 })
