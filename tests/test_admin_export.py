@@ -185,33 +185,73 @@ def test_a_put_updates_the_row_and_stamps_who_did_it(admin_client):
     assert client.get(f"{PREFIX}/settings").json()["print_long_edge"] == 5000
 
 
-def test_the_profile_key_follows_every_byte_affecting_field(admin_client):
-    """One key per set of bytes, including the grayscale toggle.
+def _key_for(client, **overrides) -> str:
+    response = client.put(f"{PREFIX}/settings", json=_payload(**overrides))
+    assert response.status_code == 200, response.text
+    return response.json()["print_profile_key"]
 
-    The toggle is the one that is easy to leave out — it changes a 3-channel JPEG into a 1-channel
-    one without touching size, quality or metadata — and leaving it out would go on serving cached
-    grayscale files after it was switched off. So each field is moved on its own and the key must
-    move with it, and no two of the five keys may collide.
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("print_long_edge", 5000),
+        ("print_jpeg_quality", 90),
+        ("print_metadata_policy", "keep_dates"),
+        ("print_grayscale_single_channel", False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("base_label", "base"),
+    [
+        ("the default profile", {}),
+        # A base that is already non-default, so neither side of the comparison can be the special
+        # `print-4096` spelling: a field dropped from the key collides HERE even when the default's
+        # own name happens to keep the two apart.
+        ("a non-default profile", {"print_long_edge": 5000, "print_jpeg_quality": 95}),
+    ],
+)
+def test_changing_one_byte_affecting_field_changes_the_key(
+    admin_client, field, value, base_label, base
+):
+    """ONE field moves, everything else is held identical, and the key must move with it.
+
+    The isolation is the point. The grayscale toggle is the field easiest to leave out — it turns a
+    3-channel JPEG into a 1-channel one without touching size, quality or metadata — and a key that
+    omitted it would go on serving cached grayscale renditions after it was switched off. A test
+    that only counted distinct keys across four different edits could not tell that apart from a
+    key that simply happens to differ for another reason.
     """
+    if base.get(field) == value:  # the non-default base already holds it — move it somewhere else
+        value = {"print_long_edge": 4096, "print_jpeg_quality": 92}[field]
     client, _ = admin_client
-    keys = {}
-    for label, overrides in (
-        ("default", {}),
-        ("edge", {"print_long_edge": 5000}),
-        ("quality", {"print_jpeg_quality": 90}),
-        ("metadata", {"print_metadata_policy": "keep_dates"}),
-        ("grayscale", {"print_grayscale_single_channel": False}),
-    ):
-        response = client.put(f"{PREFIX}/settings", json=_payload(**overrides))
-        assert response.status_code == 200, response.text
-        keys[label] = response.json()["print_profile_key"]
+    before = _key_for(client, **base)
+    after = _key_for(client, **{**base, field: value})
 
-    assert keys["default"] == "print-4096"
-    assert len(set(keys.values())) == 5, keys
-    assert keys["grayscale"] != keys["default"]
-    # Path-safe: the key becomes a directory name under assets/printready/.
-    for key in keys.values():
-        assert "/" not in key and ".." not in key
+    assert before != after, (base_label, field, before, after)
+
+
+@pytest.mark.parametrize(
+    "base",
+    [{}, {"print_long_edge": 5000, "print_grayscale_single_channel": False}],
+)
+def test_the_same_four_fields_always_name_the_same_key(admin_client, base):
+    """The control the comparison above needs: the key is a pure function of the four print fields,
+    so "the keys differ" can only ever mean "a field differs" — never that a PUT perturbs it."""
+    client, _ = admin_client
+    first = _key_for(client, **base)
+    # A round trip through an unrelated profile, and through the MAIL fields, which affect no key.
+    _key_for(client, print_jpeg_quality=91)
+    again = _key_for(client, **base, mail_progressive=True, mail_jpeg_quality=83)
+
+    assert first == again
+
+
+def test_the_key_is_path_safe(admin_client):
+    """It becomes a directory name under assets/printready/."""
+    client, _ = admin_client
+    for overrides in ({}, {"print_long_edge": 0, "print_metadata_policy": "keep_dates"}):
+        key = _key_for(client, **overrides)
+        assert "/" not in key and ".." not in key and key == key.strip()
 
 
 @pytest.mark.parametrize(

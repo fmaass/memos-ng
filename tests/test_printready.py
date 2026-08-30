@@ -813,19 +813,142 @@ def test_profile_variant_paths_enumerate_what_is_on_disk(monkeypatch, tmp_path):
     (root / "print-orig-q95-dates-rgb" / "u2.jpg").write_bytes(b"z")
     (root / "u1.jpg").write_bytes(b"legacy")
 
+    (root / "print-5000-q90-strip-gray" / "u1.jpg.tmp").write_bytes(b"half-written")
+    (root / "print-5000-q90-strip-gray" / "u10.jpg").write_bytes(b"a different uid")
+
     found = printready.profile_variant_paths_sync("u1")
 
     assert found == [
         root / "print-5000-q90-strip-gray" / "u1.jpg",
+        root / "print-5000-q90-strip-gray" / "u1.jpg.tmp",
         root / "print-orig-q95-dates-rgb" / "u1.jpg",
     ]
     assert root / "u1.jpg" not in found  # the legacy path is every caller's own
+    # The trailing dot in the prefix is what keeps `u10.jpg` out of `u1`'s set.
+    assert root / "print-5000-q90-strip-gray" / "u10.jpg" not in found
     assert printready.profile_variant_paths_sync("nobody") == []
 
 
 def test_no_tier_directory_at_all_enumerates_nothing(monkeypatch, tmp_path):
+    """The ONE absence that may be answered "nothing": the tier has never been written."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     assert printready.profile_variant_paths_sync("u1") == []
+
+
+@pytest.mark.parametrize("unreadable", ["the tier root", "a profile directory"])
+def test_an_unreadable_directory_raises_rather_than_reporting_nothing(
+    monkeypatch, tmp_path, unreadable
+):
+    """The distinction this whole contract exists for: "I looked and there is nothing" versus "I
+    could not look". Answering the second like the first is how a transiently unreadable mount
+    would let a reclaim delete the row while the renditions survive with nothing naming them.
+
+    BOTH listings are covered, because they are two separate `except` clauses: the tier root's and
+    each profile directory's. Either one widened to bare OSError re-opens the hole on its own.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    root = tmp_path / "assets" / "printready"
+    profile_dir = root / "print-5000-q90-strip-gray"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "u1.jpg").write_bytes(b"rendition")
+    # Positive control: it IS found while both directories can be read.
+    assert printready.profile_variant_paths_sync("u1") == [profile_dir / "u1.jpg"]
+
+    blocked = root if unreadable == "the tier root" else profile_dir
+    blocked.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            printready.profile_variant_paths_sync("u1")
+    finally:
+        blocked.chmod(0o755)
+
+
+def _attachment_rows(uid: str) -> int:
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        count = c.execute(
+            text("SELECT count(*) FROM attachments WHERE uid = :u"), {"u": uid}
+        ).scalar_one()
+    eng.dispose()
+    return count
+
+
+def test_an_unreadable_profile_directory_stops_the_reclaim_and_keeps_the_row(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """Fail closed, end to end: the delete is refused, the row survives, and the files are all
+    still there — the state a later retry can finish, rather than an orphan nothing names."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    att_id = _seed_attachment("pr-scan-fail", subject)
+    legacy = printready.printready_path("pr-scan-fail")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_bytes(b"rendition")
+    profile_dir = legacy.parent / "print-5000-q90-strip-gray"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "pr-scan-fail.jpg").write_bytes(b"other profile")
+    profile_dir.chmod(0o000)
+    try:
+        with capture_logs() as logs:
+            response = client.delete("/api/attachments/pr-scan-fail")
+        assert response.status_code == 500, response.text
+        assert any(entry["event"] == "reclaim.profile_scan_failed" for entry in logs)
+        # The row is intact — the reclaim rolled back rather than committing a half-done delete.
+        assert _attachment_rows("pr-scan-fail") == 1
+        assert legacy.exists(), "a file was removed by a reclaim that reported it had removed none"
+    finally:
+        profile_dir.chmod(0o755)
+        _delete_attachments(att_id)
+
+
+def test_an_interrupted_encodes_temp_file_is_reclaimed_too(logged_in_client, monkeypatch, tmp_path):
+    """The leak B2 closes: `_atomic_save` writes `<uid>.jpg.tmp` and renames it, so a worker killed
+    in between leaves a temp file in a profile directory that no derived list ever named."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    att_id = _seed_attachment("pr-tmp-leak", subject)
+    profile = printready.PrintProfile(5000, 90, "strip", True)
+    final = printready.printready_path("pr-tmp-leak", profile)
+    orphaned_tmp = final.with_suffix(final.suffix + ".tmp")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    orphaned_tmp.write_bytes(b"half a rendition")
+    try:
+        assert client.delete("/api/attachments/pr-tmp-leak").status_code == 204
+    finally:
+        _delete_attachments(att_id)
+
+    assert not orphaned_tmp.exists(), "an interrupted encode's temp file outlived its attachment"
+
+
+def test_a_jobs_sweep_takes_the_temp_files_of_every_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(0, 95, "strip", False)
+    final = printready.printready_path("pr-sweep-tmp", profile)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = final.with_suffix(final.suffix + ".tmp")
+    tmp_file.write_bytes(b"half")
+
+    assert tmp_file in media.derived_outputs("pr-sweep-tmp")
+
+
+def test_a_worker_sweep_survives_an_unreadable_profile_directory(monkeypatch, tmp_path):
+    """The opposite disposition to reclaim's, deliberately: `discard_outputs`'s caller has already
+    established that the row is GONE, so failing the job would reap nothing at all. The other tiers
+    are still swept and the unreadable directory is named in the log."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    legacy = printready.printready_path("pr-sweep-blind")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    profile_dir = legacy.parent / "print-5000-q90-strip-gray"
+    profile_dir.mkdir(parents=True)
+    profile_dir.chmod(0o000)
+    try:
+        with capture_logs() as logs:
+            outputs = media.derived_outputs("pr-sweep-blind")
+    finally:
+        profile_dir.chmod(0o755)
+
+    assert any(entry["event"] == "printready_profile_scan_failed" for entry in logs)
+    assert legacy in outputs  # the rest of the sweep still happened
 
 
 def test_a_deleted_photo_takes_every_profiles_rendition_with_it(
@@ -868,7 +991,6 @@ def test_a_jobs_sweep_finds_every_profiles_rendition_too(monkeypatch, tmp_path):
     outputs = media.derived_outputs("pr-sweep")
 
     assert abandoned in outputs
-    assert abandoned.with_suffix(abandoned.suffix + ".tmp") in outputs
     assert printready.printready_path("pr-sweep") in outputs  # the legacy one, still
 
 
@@ -1078,6 +1200,28 @@ def test_a_16_bit_source_is_normalised_rather_than_clipped(monkeypatch, tmp_path
     dark, mid, light = out.getpixel((4, 4)), out.getpixel((128, 4)), out.getpixel((250, 4))
     assert isinstance(dark, int) and isinstance(mid, int) and isinstance(light, int)
     assert dark < 20 and 100 < mid < 160 and light > 230, (dark, mid, light)
+
+
+@pytest.mark.parametrize("mode", ["I;16", "I;16B"])
+def test_a_16_bit_source_of_either_endianness_produces_a_rendition(monkeypatch, tmp_path, mode):
+    """`point` is implemented for the NATIVE `I;16` only: on the `I;16B` a big-endian TIFF decodes
+    to it raises ValueError, which is not a bad file — it is a good file the worker would retry to
+    exhaustion. Both spellings carry the same picture, so both must come back as the same ramp.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    source = tmp_path / f"deep-{mode.replace(';', '')}.tiff"
+    packer = ">H" if mode.endswith("B") else "<H"
+    raw = b"".join(struct.pack(packer, column * 257) for _row in range(8) for column in range(256))
+    Image.frombytes(mode, (256, 8), raw).save(source, "TIFF")
+    with Image.open(source) as reopened:
+        assert reopened.mode == mode, f"the fixture did not survive as {mode}"
+    att = _attachment(source, uid=f"pr-16-{mode.replace(';', '')}")
+
+    out = _decode(media.process_printready(att))
+
+    dark, mid, light = out.getpixel((4, 4)), out.getpixel((128, 4)), out.getpixel((250, 4))
+    assert isinstance(dark, int) and isinstance(mid, int) and isinstance(light, int)
+    assert dark < 20 and 100 < mid < 160 and light > 230, (mode, dark, mid, light)
 
 
 def test_a_transparent_source_is_composited_onto_white(monkeypatch, tmp_path):

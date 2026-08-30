@@ -96,12 +96,20 @@ def derived_outputs(uid: str) -> list[Path]:
     web = _assets("web")
     print_ready = printready.printready_path(uid)
     poster_file = poster.poster_path(uid)
-    # Every NON-default print profile this uid has a rendition in, enumerated: the set of profiles
-    # that ever existed is unbounded (MEMNG-238), so a derived list could only ever name the ones
-    # settings happen to say today and would leave the rest behind.
+    # Every file this uid owns in a NON-default print profile, enumerated — finals AND the
+    # `.jpg.tmp` an interrupted encode leaves behind, which the enumeration matches by prefix. The
+    # set of profiles that ever existed is unbounded (MEMNG-238), so a derived list could only name
+    # the ones settings happen to say today and would leave the rest behind.
+    #
+    # Unlike reclaim, a scan failure here is logged and swept around rather than raised: this list
+    # feeds `discard_outputs`, whose caller has already established that the attachment row is
+    # GONE. Failing the job would neither bring the row back nor remove anything, while going on
+    # still reaps every other tier. The unreadable directory is named in the log.
     profiles: list[Path] = []
-    for path in printready.profile_variant_paths_sync(uid):
-        profiles += [path, path.with_suffix(path.suffix + ".tmp")]
+    try:
+        profiles = printready.profile_variant_paths_sync(uid)
+    except OSError as exc:
+        logger.warning("printready_profile_scan_failed", uid=uid, error=str(exc))
     return [
         _assets("thumbs") / f"{uid}.jpg",
         _assets("thumbs") / f"{uid}.jpg.tmp",  # _atomic_save
@@ -374,19 +382,25 @@ def _normalise_for_print(img: Image.Image) -> Image.Image:
 
     Two sources would otherwise be silently wrong:
 
-    * **16-bit** (`I;16`, a 16-bit PNG or TIFF). Pillow's `convert("RGB")` treats the value as an
-      8-bit sample and CLIPS: measured here, 16384/32768/65535 all come back 255, so a 16-bit scan
-      would print as a blown-out white field. Scaling by 1/256 first is the conversion that keeps
-      the picture.
+    * **16-bit** (`I;16` and its endian spellings, a 16-bit PNG or TIFF). Pillow's `convert("RGB")`
+      treats the value as an 8-bit sample and CLIPS: measured here, 16384/32768/65535 all come back
+      255, so a 16-bit scan would print as a blown-out white field. Scaling by 1/256 first is the
+      conversion that keeps the picture — but `point` is implemented for the NATIVE `I;16` only and
+      raises `ValueError: point operation not supported for this mode` on the `I;16B` a big-endian
+      TIFF decodes to, which would exhaust the job's retries on a perfectly good file. Going
+      through 32-bit `I` first is what makes the scaling work for every spelling: measured,
+      `I;16B → I` preserves the full 0/16384/32768/65535 range, while `I;16B → I;16` and
+      `I;16B → L` both collapse it.
     * **Alpha** (`RGBA`, `LA`, palette transparency). `convert("RGB")` drops the alpha channel and
       keeps whatever RGB was hiding underneath it, which is arbitrary — a transparent PNG can
       carry any colour in its invisible pixels. They are composited onto WHITE instead, the colour
       of the paper, before either detection or encoding sees them.
     """
     if img.mode in _SIXTEEN_BIT_MODES:
-        # `point` with a float factor is the documented 16-bit reduction; the `convert` after it
-        # is what makes the result an ordinary 8-bit greyscale image.
-        return img.point(lambda value: value * (1 / 256)).convert("L")
+        # `convert("I")` normalises every endian spelling into one 32-bit integer buffer that
+        # `point` accepts; the float factor is the documented 16-bit reduction, and the `convert`
+        # after it makes the result an ordinary 8-bit greyscale image.
+        return img.convert("I").point(lambda value: value * (1 / 256)).convert("L")
     if img.mode in ("RGBA", "LA") or "transparency" in img.info:
         composed = img.convert("RGBA")
         background = Image.new("RGBA", composed.size, (255, 255, 255, 255))

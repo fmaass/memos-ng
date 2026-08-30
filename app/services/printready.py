@@ -167,15 +167,43 @@ def profile_variant_paths_sync(uid: str) -> list[Path]:
     would leave a file behind for every profile the admin has since moved away from — bytes that
     no row names any more, which is the one outcome app/services/reclaim.py exists to prevent.
 
+    EVERY file the uid owns in each profile directory, matched by the `<uid>.` prefix rather than
+    by the final name: an encode interrupted between `img.save` and `os.replace` leaves a
+    `<uid>.jpg.tmp` behind (media._atomic_save), and a list that named only `<uid>.jpg` would walk
+    straight past it — the legacy path's temp is enumerated explicitly by media.derived_outputs,
+    but a profile directory has no such hand-written list. The trailing dot is what keeps the
+    prefix honest: uid `abc` matches `abc.jpg` and `abc.jpg.tmp`, never `abcd.jpg`.
+
     The legacy path is deliberately NOT included: it is `printready_path(uid)` and every caller
     already has it. Blocking I/O — callers on the request loop hop off it first.
+
+    **An empty list means "this uid owns nothing in any profile directory", and nothing else.**
+    Only a genuinely ABSENT tier directory (`FileNotFoundError` — the tier has never been written)
+    is answered that way. Every other OSError PROPAGATES, because the alternative is the worst
+    outcome this module has: a transiently unreadable mount would report "no assets", the caller
+    would delete the row, and the renditions would survive with nothing naming them. A caller that
+    cannot establish the set must fail closed and retry later, not proceed on a guess.
     """
     root = Path(settings.DATA_ROOT) / "assets" / SUBDIR
+    prefix = f"{uid}."
     try:
         subdirs = sorted(entry for entry in root.iterdir() if entry.is_dir())
-    except OSError:  # no tier directory yet, or it is unreadable — nothing to enumerate
+    except FileNotFoundError:  # the tier has never been written — genuinely nothing to enumerate
         return []
-    return [candidate for sub in subdirs if (candidate := sub / f"{uid}.jpg").exists()]
+    found: list[Path] = []
+    for sub in subdirs:
+        try:
+            found += sorted(
+                entry
+                for entry in sub.iterdir()
+                if entry.name.startswith(prefix) and entry.is_file()
+            )
+        except FileNotFoundError:
+            # The directory was removed between the listing above and this read: it holds nothing
+            # now, which is the same answer as never having existed. Any OTHER error still
+            # propagates — see the contract above.
+            continue
+    return found
 
 
 def is_print_variant(variant_key: str) -> bool:
