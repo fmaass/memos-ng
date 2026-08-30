@@ -244,7 +244,7 @@ const scopeOptions = [
               data-test="digest-send-time"
               :invalid="!!errors.send_time"
             />
-            <span v-if="errors.send_time" class="text-xs text-red-600" data-test="digest-error-send_time">
+            <span v-if="errors.send_time" class="text-xs text-red-600" role="alert" data-test="digest-error-send_time">
               {{ errors.send_time }}
             </span>
           </label>
@@ -255,7 +255,7 @@ const scopeOptions = [
               data-test="digest-timezone"
               :invalid="!!errors.timezone"
             />
-            <span v-if="errors.timezone" class="text-xs text-red-600" data-test="digest-error-timezone">
+            <span v-if="errors.timezone" class="text-xs text-red-600" role="alert" data-test="digest-error-timezone">
               {{ errors.timezone }}
             </span>
           </label>
@@ -267,7 +267,7 @@ const scopeOptions = [
               data-test="digest-start-date"
               :invalid="!!errors.start_date"
             />
-            <span v-if="errors.start_date" class="text-xs text-red-600" data-test="digest-error-start_date">
+            <span v-if="errors.start_date" class="text-xs text-red-600" role="alert" data-test="digest-error-start_date">
               {{ errors.start_date }}
             </span>
           </label>
@@ -280,7 +280,7 @@ const scopeOptions = [
               :invalid="!!errors.grace_minutes"
               @update:model-value="setNumber('grace_minutes', $event)"
             />
-            <span v-if="errors.grace_minutes" class="text-xs text-red-600" data-test="digest-error-grace_minutes">
+            <span v-if="errors.grace_minutes" class="text-xs text-red-600" role="alert" data-test="digest-error-grace_minutes">
               {{ errors.grace_minutes }}
             </span>
           </label>
@@ -320,7 +320,7 @@ const scopeOptions = [
               data-test="digest-mail-title"
               :invalid="!!errors.mail_title"
             />
-            <span v-if="errors.mail_title" class="text-xs text-red-600" data-test="digest-error-mail_title">
+            <span v-if="errors.mail_title" class="text-xs text-red-600" role="alert" data-test="digest-error-mail_title">
               {{ errors.mail_title }}
             </span>
           </label>
@@ -331,7 +331,7 @@ const scopeOptions = [
               data-test="digest-from-name"
               :invalid="!!errors.from_name"
             />
-            <span v-if="errors.from_name" class="text-xs text-red-600" data-test="digest-error-from_name">
+            <span v-if="errors.from_name" class="text-xs text-red-600" role="alert" data-test="digest-error-from_name">
               {{ errors.from_name }}
             </span>
           </label>
@@ -343,7 +343,7 @@ const scopeOptions = [
               data-test="digest-from-email"
               :invalid="!!errors.from_email"
             />
-            <span v-if="errors.from_email" class="text-xs text-red-600" data-test="digest-error-from_email">
+            <span v-if="errors.from_email" class="text-xs text-red-600" role="alert" data-test="digest-error-from_email">
               {{ errors.from_email }}
             </span>
           </label>
@@ -359,7 +359,7 @@ const scopeOptions = [
             <span class="text-xs text-muted-color" data-test="digest-max-email-mib">
               {{ formatMib(draft.max_email_bytes) }}
             </span>
-            <span v-if="errors.max_email_bytes" class="text-xs text-red-600" data-test="digest-error-max_email_bytes">
+            <span v-if="errors.max_email_bytes" class="text-xs text-red-600" role="alert" data-test="digest-error-max_email_bytes">
               {{ errors.max_email_bytes }}
             </span>
           </label>
@@ -372,7 +372,7 @@ const scopeOptions = [
               :invalid="!!errors.max_videos_per_memo"
               @update:model-value="setNumber('max_videos_per_memo', $event)"
             />
-            <span v-if="errors.max_videos_per_memo" class="text-xs text-red-600" data-test="digest-error-max_videos_per_memo">
+            <span v-if="errors.max_videos_per_memo" class="text-xs text-red-600" role="alert" data-test="digest-error-max_videos_per_memo">
               {{ errors.max_videos_per_memo }}
             </span>
           </label>
@@ -385,7 +385,7 @@ const scopeOptions = [
               :invalid="!!errors.max_memos_per_run"
               @update:model-value="setNumber('max_memos_per_run', $event)"
             />
-            <span v-if="errors.max_memos_per_run" class="text-xs text-red-600" data-test="digest-error-max_memos_per_run">
+            <span v-if="errors.max_memos_per_run" class="text-xs text-red-600" role="alert" data-test="digest-error-max_memos_per_run">
               {{ errors.max_memos_per_run }}
             </span>
           </label>
@@ -398,7 +398,7 @@ const scopeOptions = [
               :invalid="!!errors.retention_days"
               @update:model-value="setNumber('retention_days', $event)"
             />
-            <span v-if="errors.retention_days" class="text-xs text-red-600" data-test="digest-error-retention_days">
+            <span v-if="errors.retention_days" class="text-xs text-red-600" role="alert" data-test="digest-error-retention_days">
               {{ errors.retention_days }}
             </span>
           </label>
@@ -437,7 +437,7 @@ const scopeOptions = [
             data-test="digest-dropbox-folder"
             :invalid="!!errors.dropbox_folder"
           />
-          <span v-if="errors.dropbox_folder" class="text-xs text-red-600" data-test="digest-error-dropbox_folder">
+          <span v-if="errors.dropbox_folder" class="text-xs text-red-600" role="alert" data-test="digest-error-dropbox_folder">
             {{ errors.dropbox_folder }}
           </span>
         </label>

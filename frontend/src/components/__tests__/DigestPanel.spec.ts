@@ -299,10 +299,19 @@ describe('DigestPanel', () => {
     expect(bar.attributes('aria-label')).toBeTruthy()
   })
 
-  it('announces a refused settings write instead of only colouring it red', () => {
+  it('announces every refusal instead of only colouring it red — async and field alike', async () => {
     digest.enabledError = ref('Another settings change is still saving')
-    const error = mountPanel().find('[data-test="digest-enabled-error"]')
-    expect(error.attributes('role')).toBe('alert')
+    const wrapper = mountPanel()
+    expect(wrapper.find('[data-test="digest-enabled-error"]').attributes('role')).toBe('alert')
+
+    // a validation message the admin never sent anywhere must announce itself the same way
+    await wrapper.find('[data-test="digest-max-memos"]').setValue('0')
+    const fieldError = wrapper.find('[data-test="digest-error-max_memos_per_run"]')
+    expect(fieldError.text()).toBe('Between 1 and 1000.')
+    expect(fieldError.attributes('role')).toBe('alert')
+
+    await wrapper.find('[data-test="digest-from-email"]').setValue('not-an-address')
+    expect(wrapper.find('[data-test="digest-error-from_email"]').attributes('role')).toBe('alert')
   })
 
   it('hands focus back to the Preview button when the drawer closes', async () => {
