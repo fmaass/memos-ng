@@ -503,7 +503,7 @@
         "type": "object"
       },
       "DigestHostingOut": {
-        "description": "Whether media hosting can work at all, as the panel's status line reads it.\n\nPhase 1 answers from the PRESENCE of the three `DROPBOX_*` env keys and nothing else \u2014 no\nnetwork call is made and `account` is therefore always null here. The live account lookup that\nfills it in arrives with the hosting service in Phase 2; a caller reading `configured` alone\ngets the same answer either way, which is what the \"Not configured \u2014 mails go out inline-only\"\nline needs.",
+        "description": "Whether media hosting can work at all, as the panel's status line reads it.\n\nTwo independent facts, and the difference between them is the whole value of the endpoint:\n\n* `configured` is the PRESENCE of the three `DROPBOX_*` env keys \u2014 never their value, which is\n  secret and is echoed nowhere. It answers \"could this work?\" without touching the network.\n* `account` is who those keys actually authenticate as, read live from Dropbox. It is the only\n  thing that distinguishes keys that are set from keys that WORK \u2014 a rotated refresh token\n  leaves `configured` true forever while every upload silently falls back to inline-only.\n\n`account` is null whenever that answer cannot be had \u2014 unconfigured, refused, unreachable \u2014\nbecause an admin status line must never be the reason a page 500s.",
         "properties": {
           "account": {
             "title": "Account",
@@ -518,7 +518,8 @@
           }
         },
         "required": [
-          "configured"
+          "configured",
+          "account"
         ],
         "title": "DigestHostingOut",
         "type": "object"
@@ -691,6 +692,66 @@
           }
         },
         "title": "DigestRecipientPatch",
+        "type": "object"
+      },
+      "DigestRunClaimOut": {
+        "description": "The answer to `POST /run`: a run row exists and nothing has executed it yet.\n\nThree fields and no aggregates, because at this instant there are none to report \u2014 the row is\nthe CLAIM, and everything else about it is read back from `GET /runs/{id}` (which the response\n`Location` header names). `status` is always null here: NULL means \"in flight\", and a run that\nalready had an outcome would not be something this endpoint could have just opened.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trigger": {
+            "title": "Trigger",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "trigger"
+        ],
+        "title": "DigestRunClaimOut",
+        "type": "object"
+      },
+      "DigestRunList": {
+        "description": "One page of runs, in the shape every unbounded list in this API uses (`MemoList`): the\nitems, the token for the page after, and a total the caller has to ask for.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DigestRunOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "nextCursor": {
+            "title": "Nextcursor",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "totalCount": {
+            "title": "Totalcount",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor",
+          "totalCount"
+        ],
+        "title": "DigestRunList",
         "type": "object"
       },
       "DigestRunOut": {
@@ -986,7 +1047,7 @@
         "type": "object"
       },
       "DigestTestSendIn": {
-        "description": "`{\"empty\": true}` renders the \"no memos selected\" body directly, without consulting the\nselection at all \u2014 the pure SMTP probe, with no settings write anywhere in it (R3).",
+        "description": "`{\"empty\": true}` renders the \"no memos selected\" body directly, without consulting the\nselection at all \u2014 the pure SMTP probe, and one that writes no settings anywhere in it.",
         "properties": {
           "empty": {
             "default": false,
@@ -2304,7 +2365,7 @@
   "paths": {
     "/api/admin/digest/hosting": {
       "get": {
-        "description": "Report whether Dropbox hosting is configured, from the env keys alone.\n\nPresence, never the value: the three keys are secrets and nothing about them is echoed back \u2014\n`configured` is the whole answer. All three are required, because two out of three cannot\nrefresh a token, and an empty key is the switch that disables hosting globally.",
+        "description": "Report whether Dropbox hosting is configured, and who the keys authenticate as.\n\nThe account lookup is made once per request and only when the keys are present \u2014 there is no\nprocess-wide cache, deliberately: a cached identity would keep reporting a working channel\nafter a token was revoked, which is the exact failure this line exists to expose. It is\nread-only (`/2/users/get_current_account`) and answers None on any failure, so a slow or angry\nDropbox costs the panel a null, not an error.",
         "operationId": "get_digest_hosting_api_admin_digest_hosting_get",
         "responses": {
           "200": {
@@ -2331,7 +2392,7 @@
     },
     "/api/admin/digest/preview": {
       "get": {
-        "description": "Render what would go out now. Persists nothing and performs NO Dropbox call.\n\n`selected` is the list MEMNG-236 AC2 and the Phase 5 one-victim read-back are checked against,\nso it names the memos rather than counting them.",
+        "description": "Render what would go out now. Persists nothing and performs NO Dropbox call.\n\n`selected` NAMES the memos rather than counting them: a preview whose answer is a number\ncannot be checked against what a run then actually mails.\n\nNo request-scoped session is taken. The render walks the filesystem for every card's media,\nand the reads it needs are taken in short sessions that close before that walk starts \u2014 a\nrequest session would be an idle transaction held across all of it.",
         "operationId": "preview_digest_api_admin_digest_preview_get",
         "responses": {
           "200": {
@@ -2527,18 +2588,26 @@
     },
     "/api/admin/digest/run": {
       "post": {
-        "description": "Perform a real run through the same `runner.py` the worker uses, with `trigger = 'manual'`.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 is derived from the INSERT conflicting with\n`uq_digest_runs_single_inflight` \u2014 never from a pre-flight \"is anything running?\" read, which\nwould be exactly the TOCTOU race that index exists to close and which two concurrent callers\nwould both pass.\n\nNo request-scoped session is taken: the run opens and commits its own, repeatedly, and holding\na pooled connection idle for the minutes a real run takes would be pressure on a pool the app\ndeliberately caps at ten (ADR-0009).",
+        "description": "CLAIM a manual run and answer 202. The worker executes it.\n\nThis endpoint commits exactly one thing \u2014 the `digest_runs` row, which IS the single-flight\nlock \u2014 and returns. It does not send, upload or render, and that split is the point: a run can\nlegitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox\nupload-session operations that allow 600 s EACH), and a contract that awaited it would tie the\nhousehold's mail to a browser tab, a proxy read timeout and a reload. The same repository\nalready backgrounds the scheduled run for exactly this reason; a manual one is not different\nwork, only differently triggered.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 is derived from the INSERT conflicting with\n`uq_digest_runs_single_inflight` \u2014 never from a pre-flight \"is anything running?\" read, which\nwould be exactly the TOCTOU race that index exists to close and which two concurrent callers\nwould both pass.\n\n`Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its\noutcome are read back. Until the worker adopts the row it stays `status: null` with no\nheartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than\nleaving it in flight for ever.",
         "operationId": "run_digest_now_api_admin_digest_run_post",
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DigestRunOut"
+                  "$ref": "#/components/schemas/DigestRunClaimOut"
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful Response",
+            "headers": {
+              "Location": {
+                "description": "The claimed run: `GET /api/admin/digest/runs/{id}`. Poll it for the run's progress and its terminal status \u2014 the work happens in the worker, not in this request.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2554,9 +2623,21 @@
     },
     "/api/admin/digest/runs": {
       "get": {
-        "description": "The most recent runs, newest first \u2014 the panel's Runs table.\n\nOrdered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import\nrow is stamped by the same `now()` as anything else committed in that transaction), and an\nunstable order would make the table shuffle between refreshes.",
+        "description": "The runs, newest first \u2014 the panel's Runs table, paged by keyset.\n\nUnbounded lists in this API page by cursor rather than by a bare `limit`, and this one is\nunbounded: a run row is written every day for ever, so a caller that can only ask for \"the\nfirst N\" can never reach the rest of the history. When more rows follow, `nextCursor` is\nnon-null; resend it as `?cursor=` for the page after.\n\nOrdered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import\nrow is stamped by the same `now()` as anything else committed in that transaction), and an\nunstable order would make the table shuffle between refreshes \u2014 and would make a keyset cursor\nskip or repeat rows, which is worse than shuffling.\n\n`totalCount` is null unless `?with_total=true`, the same opt-in the memo feed uses: a COUNT is\nthe most expensive part of a page and the table that reads this does not show one.",
         "operationId": "list_digest_runs_api_admin_digest_runs_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "title": "Cursor",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           {
             "in": "query",
             "name": "limit",
@@ -2568,6 +2649,16 @@
               "title": "Limit",
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "With Total",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -2575,11 +2666,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/DigestRunOut"
-                  },
-                  "title": "Response List Digest Runs Api Admin Digest Runs Get",
-                  "type": "array"
+                  "$ref": "#/components/schemas/DigestRunList"
                 }
               }
             },
@@ -2602,6 +2689,54 @@
           }
         ],
         "summary": "List Digest Runs",
+        "tags": [
+          "admin-digest"
+        ]
+      }
+    },
+    "/api/admin/digest/runs/{run_id}": {
+      "get": {
+        "description": "One run by id \u2014 what the `Location` of a 202 from `POST /run` points at.\n\nA claim is only useful if its progress can be read back, and paging the whole list to find one\nrow is not that.",
+        "operationId": "get_digest_run_api_admin_digest_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestRunOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Get Digest Run",
         "tags": [
           "admin-digest"
         ]
@@ -2633,7 +2768,7 @@
         ]
       },
       "put": {
-        "description": "Update the one settings row. There is no create path here, deliberately \u2014 see SETTINGS_ID.\n\nThe row is taken FOR UPDATE for the whole request, not because a fresh read is needed but\nbecause arming is a check-then-act: two overlapping requests, one arming the digest and one\ndisabling the last recipient, would each see the other's pre-state and both pass, leaving an\narmed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row\nin the same order, so the two paths serialize against each other and cannot deadlock.",
+        "description": "Update the one settings row. There is no create path here, deliberately: `CHECK (id = 1)`\nplus a router that only ever UPDATEs is what makes a second row impossible.\n\nThe row is taken FOR UPDATE for the whole request, not because a fresh read is needed but\nbecause arming is a check-then-act: two overlapping requests, one arming the digest and one\ndisabling the last recipient, would each see the other's pre-state and both pass, leaving an\narmed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row\nin the same order, so the two paths serialize against each other and cannot deadlock.",
         "operationId": "put_digest_settings_api_admin_digest_settings_put",
         "requestBody": {
           "content": {
@@ -2680,7 +2815,7 @@
     },
     "/api/admin/digest/test-send": {
       "post": {
-        "description": "Send ONE real mail to the calling admin's own address, and persist nothing.\n\nThe destination comes from the authenticated session, never from a request field: an endpoint\nthat took an address would be an open relay for anyone who reached it, and it would let a probe\nreach `digest_recipients`. It performs no Dropbox upload either (A6) \u2014 it renders with whatever\nhosted links already exist, and a video with none carries the \"not hosted\" chip.",
+        "description": "Send ONE real mail to the calling admin's own address, and persist nothing.\n\nThe destination comes from the authenticated session, never from a request field: an endpoint\nthat took an address would be an open relay for anyone who reached it, and it would let a probe\nreach `digest_recipients`. It performs no Dropbox upload either \u2014 it renders with whatever\nhosted links already exist, and a video with none carries the \"not hosted\" chip.\n\nIt stays SYNCHRONOUS, unlike a run, and the reason is that it is bounded by construction: no\nuploads, one recipient, one message. Its database reads still happen in short sessions that\nclose before SMTP is contacted, which is why it takes no request session of its own.",
         "operationId": "test_send_digest_api_admin_digest_test_send_post",
         "requestBody": {
           "content": {

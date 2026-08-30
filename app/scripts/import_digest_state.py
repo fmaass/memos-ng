@@ -76,8 +76,12 @@ from app.models import (
     DigestVisibilityScope,
     Memo,
 )
-from app.routers.admin_digest import SETTINGS_ID, _settings_row, normalise_email
-from fastapi import HTTPException
+from app.services.digest.domain import (
+    SETTINGS_ID,
+    SettingsMissing,
+    normalise_email,
+    settings_row,
+)
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -624,11 +628,13 @@ async def run_import(
     report.settings.unusable_keys = unusable
     if execute:
         try:
-            # The API's own helper, and its `for_update` is a mutex rather than a fresh read: it
-            # holds the singleton for the rest of this transaction, so an admin's save cannot land
-            # between this decision and the write below.
-            await _settings_row(db, for_update=True)
-        except HTTPException:
+            # The domain's own helper, and its `for_update` is a mutex rather than a fresh read:
+            # it holds the singleton for the rest of this transaction, so an admin's save cannot
+            # land between this decision and the write below. It is the DOMAIN's and not the
+            # router's because this process serves no HTTP — catching an `HTTPException` in a CLI
+            # is a layering mistake that reads as an ordinary one.
+            await settings_row(db, for_update=True)
+        except SettingsMissing:
             # The migration seeds the row; its absence is a broken install, not something an
             # import may repair by INSERTing the second row the CHECK exists to forbid.
             report.settings.skipped_reason = f"no digest_settings row {SETTINGS_ID}"

@@ -742,8 +742,7 @@ async def test_the_retention_sweep_does_nothing_without_a_host(env):
 async def test_preview_persists_nothing(env):
     subject, data_root = env
     memo_ids = await _seed_photo_memos(subject, data_root, 2)
-    async with async_session() as db:
-        rendered, settings_row = await digest_runner.preview(db, now_utc=NOW)
+    rendered, settings_row = await digest_runner.preview(now_utc=NOW)
     assert [c.memo_id for c in rendered.selected] == memo_ids
     assert len(rendered.parts) == 1
     assert run_rows() == []
@@ -753,18 +752,16 @@ async def test_preview_persists_nothing(env):
 
 
 async def test_a_test_send_reaches_only_the_given_address_and_hosts_nothing(env):
-    """The probe contract (A6): with several recipients configured and an unhosted video present,
-    a test-send goes to ONE address, writes no `digest_hosted_media` row and makes no Dropbox
-    call."""
+    """The probe contract: with several recipients configured and an unhosted video present, a
+    test-send goes to ONE address, writes no hosted-media row and makes no Dropbox call."""
     subject, data_root = env
     await _seed_video_memo(subject, data_root)
     set_digest_settings(hosting_enabled=True)
     host = FakeHost()
     transport = FakeTransport()
-    async with async_session() as db:
-        count = await digest_runner.test_send(
-            db, address="admin@x", transport=transport, now_utc=NOW
-        )
+    count = await digest_runner.test_send(
+        address="admin@x", transport=transport, now_utc=NOW
+    )
     assert count == 1
     assert [mail.recipients for mail in transport.sent] == [["admin@x"]]
     for address in RECIPIENTS:
@@ -782,42 +779,38 @@ async def test_a_test_send_uses_an_ALREADY_hosted_link_without_uploading(env):
         await db.execute(
             text(
                 "INSERT INTO digest_hosted_media "
-                "(attachment_id, kind, dropbox_path, shared_link, bytes) VALUES "
-                "(:id, 'video', '/x/a.mp4', 'https://dropbox.example/a.mp4?raw=1', 10)"
+                "(attachment_id, kind, dropbox_path, status, shared_link, bytes, uploaded_at) "
+                "VALUES (:id, 'video', '/x/a.mp4', 'uploaded', "
+                "'https://dropbox.example/a.mp4?raw=1', 10, now())"
             ),
             {"id": attachment_id},
         )
         await db.commit()
     transport = FakeTransport()
-    async with async_session() as db:
-        await digest_runner.test_send(
-            db, address="admin@x", transport=transport, now_utc=NOW
-        )
+    await digest_runner.test_send(address="admin@x", transport=transport, now_utc=NOW)
     assert "https://dropbox.example/a.mp4?raw=1" in html_part(transport.sent[0].message)
     assert len(hosted_rows()) == 1  # unchanged: nothing new was uploaded
 
 
 async def test_a_test_send_always_sends_even_with_an_empty_selection(env):
     transport = FakeTransport()
-    async with async_session() as db:
-        count = await digest_runner.test_send(
-            db, address="admin@x", transport=transport, now_utc=NOW
-        )
+    count = await digest_runner.test_send(
+        address="admin@x", transport=transport, now_utc=NOW
+    )
     assert count == 0
     assert len(transport.sent) == 1
     assert "No memos selected." in html_part(transport.sent[0].message)
 
 
 async def test_the_empty_flag_never_consults_the_selection(env):
-    """The Phase 4 SMTP probe: a body with no settings write anywhere in it, and no dependency on
+    """The pure SMTP probe: a body with no settings write anywhere in it, and no dependency on
     what happens to be selectable that morning."""
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 3)
     transport = FakeTransport()
-    async with async_session() as db:
-        count = await digest_runner.test_send(
-            db, address="admin@x", empty=True, transport=transport, now_utc=NOW
-        )
+    count = await digest_runner.test_send(
+        address="admin@x", empty=True, transport=transport, now_utc=NOW
+    )
     assert count == 0
     assert "No memos selected." in html_part(transport.sent[0].message)
     assert delivery_rows() == []
@@ -827,8 +820,7 @@ async def test_preview_and_test_send_honour_max_memos_per_run(env):
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 4)
     set_digest_settings(max_memos_per_run=2)
-    async with async_session() as db:
-        rendered, _ = await digest_runner.preview(db, now_utc=NOW)
+    rendered, _ = await digest_runner.preview(now_utc=NOW)
     assert len(rendered.selected) == 2
 
 
@@ -968,26 +960,24 @@ async def test_a_test_send_to_the_sender_address_is_refused(env):
     """iCloud DROPS From == To with attachments, so this probe would report a clean send and
     deliver nothing — a probe that lies is worse than no probe."""
     transport = FakeTransport()
-    async with async_session() as db:
-        with pytest.raises(digest_runner.SenderIsRecipient):
-            await digest_runner.test_send(
-                db, address=SENDER.upper(), transport=transport, now_utc=NOW
-            )
+    with pytest.raises(digest_runner.SenderIsRecipient):
+        await digest_runner.test_send(
+            address=SENDER.upper(), transport=transport, now_utc=NOW
+        )
     assert transport.sent == []
 
 
 async def test_a_test_send_to_the_sender_address_is_refused_even_when_empty(env):
     """The `empty=True` probe takes an earlier branch; the guard must sit in front of both."""
     transport = FakeTransport()
-    async with async_session() as db:
-        with pytest.raises(digest_runner.SenderIsRecipient):
-            await digest_runner.test_send(
-                db, address=SENDER, empty=True, transport=transport, now_utc=NOW
-            )
+    with pytest.raises(digest_runner.SenderIsRecipient):
+        await digest_runner.test_send(
+            address=SENDER, empty=True, transport=transport, now_utc=NOW
+        )
     assert transport.sent == []
 
 
-# --- the Dropbox client is released on every path (review A1) -----------------------------------
+# --- the Dropbox client is released on every path -----------------------------------
 
 
 async def test_the_media_host_is_closed_after_a_run(env):
@@ -1034,3 +1024,42 @@ async def test_the_retention_sweep_closes_its_host(env):
         host_factory=host_factory_for(host)
     ) == 1
     assert host.closed == closed_before + 1
+
+
+async def test_a_malformed_token_response_closes_the_client_too(env, monkeypatch):
+    """The leak on the path nobody writes a test for.
+
+    A refused refresh raises `DropboxError` and was always cleaned up. A token response that is a
+    clean HTTP 200 with the wrong BODY raises `KeyError` out of `.json()["access_token"]` instead,
+    and that exception used not to be caught here — so the client, and its connection pool, leaked
+    once per run for as long as Dropbox kept answering that way.
+    """
+    import httpx
+
+    set_digest_settings(hosting_enabled=True)
+    monkeypatch.setattr(app_settings, "DROPBOX_APP_KEY", "key")
+    monkeypatch.setattr(app_settings, "DROPBOX_APP_SECRET", "secret")
+    monkeypatch.setattr(app_settings, "DROPBOX_REFRESH_TOKEN", "refresh")
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
+    )
+    closed: list[int] = []
+    real_aclose = client.aclose
+
+    async def _counting_aclose() -> None:
+        closed.append(1)
+        await real_aclose()
+
+    monkeypatch.setattr(client, "aclose", _counting_aclose)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *_a, **_k: client)
+
+    async def _beat() -> None:
+        return None
+
+    async with async_session() as db:
+        settings = await digest_runner.load_settings(db)
+    factory = digest_runner.make_dropbox_host_factory(settings, NOW)
+    with capture_logs() as logs:
+        assert await factory(_beat) is None  # inline-only, not an exception out of the run
+    assert closed == [1]
+    assert any(entry["event"] == "digest.hosting_token_refresh_failed" for entry in logs)

@@ -9,23 +9,19 @@ an hour early or not at all on the other two.
 from datetime import UTC, date, datetime, time
 
 import pytest
-from app.models import DigestSettings, DigestTrigger
+from app.models import DigestTrigger
 from app.services.digest import gate
+from app.services.digest.domain import DigestConfig
 from structlog.testing import capture_logs
 
+from tests.digest_support import digest_config
 
-def _settings(**overrides) -> DigestSettings:
-    """An unsaved settings row. The gate never touches the session, so an unsaved instance is the
-    honest input — it cannot accidentally read something the caller did not set."""
-    row = DigestSettings(
-        id=1,
-        enabled=overrides.pop("enabled", True),
-        send_time=overrides.pop("send_time", time(7, 0)),
-        timezone=overrides.pop("timezone", "Europe/Zurich"),
-    )
-    for key, value in overrides.items():
-        setattr(row, key, value)
-    return row
+
+def _settings(**overrides) -> DigestConfig:
+    """A settings SNAPSHOT. The gate never touches the session — it reads a frozen value the
+    caller loaded — so a plain dataclass is the honest input: it cannot accidentally read
+    something the caller did not set, and it cannot lazily load anything either."""
+    return digest_config(**overrides)
 
 
 @pytest.fixture(autouse=True)

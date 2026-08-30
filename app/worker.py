@@ -566,6 +566,33 @@ async def digest_is_due() -> bool:
         return False
 
 
+async def adopt_manual_digest() -> int | None:
+    """Take ownership of a manual run row the admin API committed, if there is one. Errors
+    isolated, like every other read this loop makes.
+
+    The API only CLAIMS: `POST /api/admin/digest/run` inserts the row (which is the single-flight
+    lock) and answers 202, because the work behind it takes minutes to hours and binding it to a
+    request lifetime would make a browser tab, a proxy timeout or a reload the thing that decides
+    whether the household gets its mail. This is the other half — the worker, which already owns
+    the scheduled run, executing the manual one through exactly the same supervised spawn.
+
+    The adoption is a CAS on `heartbeat_at IS NULL`, not a bare read: the committed row no longer
+    protects itself with the INSERT's unique index, so "nobody has started this yet" has to be
+    claimed rather than observed.
+    """
+    try:
+        async with async_session() as db:
+            run_id = await digest_runner.pending_manual_run_id(db)
+            if run_id is None:
+                return None
+            if not await digest_runner.claim_run(db, run_id):
+                return None
+        return int(run_id)
+    except Exception:
+        logger.exception("digest.manual_adopt_error")
+        return None
+
+
 def spawn_digest() -> bool:
     """Start a digest run as a SUPERVISED BACKGROUND TASK. Returns whether one was started.
 
@@ -582,6 +609,21 @@ def spawn_digest() -> bool:
     if digest_task_in_flight():
         return False
     task = asyncio.create_task(digest_runner.run_scheduled_digest_safe())
+    task.add_done_callback(_clear_digest_task)
+    _digest_task = task
+    return True
+
+
+def spawn_claimed_digest(run_id: int) -> bool:
+    """Start an ALREADY-COMMITTED run (the manual endpoint's row) as the same supervised task.
+
+    Same handle, same single-flight, same never-awaited-in-the-loop rule as `spawn_digest` — the
+    only difference is which entry point the task runs, because the row already exists.
+    """
+    global _digest_task
+    if digest_task_in_flight():
+        return False
+    task = asyncio.create_task(digest_runner.run_claimed_digest_safe(run_id))
     task.add_done_callback(_clear_digest_task)
     _digest_task = task
     return True
@@ -654,10 +696,18 @@ async def run() -> None:
         if health.healthy:
             beat()  # blocking-ok: the liveness stamp itself — see beat()
         # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues draining
-        # immediately — see spawn_digest for why this is never awaited here.
-        if not digest_task_in_flight() and await digest_is_due():
-            if spawn_digest():
-                logger.info("digest_run_spawned")
+        # immediately — see spawn_digest for why this is never awaited here. A manual row the
+        # admin API committed is picked up FIRST and by the same spawn: while one is in flight the
+        # gate answers not-due anyway (its local_date is in the ledger), so the order costs a
+        # scheduled run nothing and gives an operator's "Run now" the shortest path to starting.
+        if not digest_task_in_flight():
+            manual_run_id = await adopt_manual_digest()
+            if manual_run_id is not None:
+                if spawn_claimed_digest(manual_run_id):
+                    logger.info("digest_run_spawned", trigger="manual", run_id=manual_run_id)
+            elif await digest_is_due():
+                if spawn_digest():
+                    logger.info("digest_run_spawned", trigger="scheduled")
         if time.time() - last_reap > REAP_INTERVAL_SECONDS:
             reaped = await reap_expired_committed()
             if reaped:
