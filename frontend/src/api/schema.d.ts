@@ -245,6 +245,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/export/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Export Settings */
+        get: operations["get_export_settings_api_admin_export_settings_get"];
+        /**
+         * Put Export Settings
+         * @description Update the one settings row.
+         *
+         *     The row is taken FOR UPDATE for the whole request. Not for a fresh read: two overlapping saves
+         *     would otherwise interleave field by field and commit a profile that is neither of the two the
+         *     admins pressed Save on — a mixture of print quality from one and grayscale from the other,
+         *     which is a cache key nobody chose. One row, taken in one order by the one writer, so the
+         *     second request waits and overwrites a complete state rather than half of one.
+         */
+        put: operations["put_export_settings_api_admin_export_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/attachments": {
         parameters: {
             query?: never;
@@ -640,11 +667,18 @@ export interface paths {
         };
         /**
          * Export Photobook
-         * @description The photo book for a tag and date range: a print-readiness manifest, or the archive itself.
+         * @description The photo book for a date range: a print-readiness manifest, or the archive itself.
          *
-         *     Selection is `tag` (default `curated`) joined to the owner's image attachments, in memo-date
-         *     order; `from`/`to` bound the memo date and are inclusive whole days. `profile` names the single
-         *     rung the book is printed at.
+         *     Selection is the owner's image attachments in memo-date order; `from`/`to` bound the memo date
+         *     and are inclusive whole days. `tag` NARROWS that to the memos carrying it — omitting it selects
+         *     every image memo in the range, which is what "give me all my photos between two dates" means.
+         *
+         *     `profile` names the print profile the book is derived at. Omitting it follows this
+         *     deployment's export settings, so an admin changing the print profile changes what an export
+         *     produces without any client being told; naming one pins the request to it. Two keys are
+         *     accepted — the permanent default `print-4096`, whose renditions are the shipped tier, and
+         *     whatever the settings currently name; anything else is 422. A non-default profile derives into
+         *     its own cache directory, so requesting one never rewrites or invalidates the default tier.
          *
          *     **Requesting a book schedules it.** Both formats enqueue a print rendition for every member
          *     that lacks a current one, so the first request starts the work and later requests report on it;
@@ -1608,6 +1642,68 @@ export interface components {
         EditRacedError: {
             detail: components["schemas"]["EditRacedDetail"];
         };
+        /** ExportSettingsOut */
+        ExportSettingsOut: {
+            /** Mail Jpeg Quality */
+            mail_jpeg_quality: number;
+            /** Mail Long Edge */
+            mail_long_edge: number;
+            /** Mail Progressive */
+            mail_progressive: boolean;
+            mail_subsampling: components["schemas"]["MailSubsampling"];
+            /** Print Grayscale Single Channel */
+            print_grayscale_single_channel: boolean;
+            /** Print Jpeg Quality */
+            print_jpeg_quality: number;
+            /** Print Long Edge */
+            print_long_edge: number;
+            print_metadata_policy: components["schemas"]["PrintMetadataPolicy"];
+            /** Print Profile Key */
+            print_profile_key: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Updated By */
+            updated_by: string | null;
+        };
+        /**
+         * ExportSettingsPut
+         * @description The WHOLE settings row, not a patch — the panel saves both profiles behind one Save bar, so
+         *     the request IS the new state and an omitted field is a client bug (pydantic answers 422).
+         *
+         *     Every band here is the vendor-documented envelope, not a plausibility limit, and each is the
+         *     exact set the Export panel offers: print quality below 90 shows on gloss paper and above 95
+         *     costs bytes for nothing; the print long edge is the measured set of useful rungs (4096 covers a
+         *     1.5-page spread of the 21x21 layflat at 300 dpi, 5000 is Blurb's published full-bleed rule,
+         *     0 keeps the source's own size); the mail long edge is 2x a 600-800 px rendered width; mail
+         *     quality 77-83 is the band mail-client practice puts an inline photo in. The API and the panel
+         *     admit exactly the same values, so a request the panel could not have produced is a 422 rather
+         *     than a state no UI can show.
+         */
+        ExportSettingsPut: {
+            /** Mail Jpeg Quality */
+            mail_jpeg_quality: number;
+            /**
+             * Mail Long Edge
+             * @enum {integer}
+             */
+            mail_long_edge: 1200 | 1600 | 2048;
+            /** Mail Progressive */
+            mail_progressive: boolean;
+            mail_subsampling: components["schemas"]["MailSubsampling"];
+            /** Print Grayscale Single Channel */
+            print_grayscale_single_channel: boolean;
+            /** Print Jpeg Quality */
+            print_jpeg_quality: number;
+            /**
+             * Print Long Edge
+             * @enum {integer}
+             */
+            print_long_edge: 0 | 4096 | 5000;
+            print_metadata_policy: components["schemas"]["PrintMetadataPolicy"];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1622,6 +1718,19 @@ export interface components {
             /** Version */
             version: string;
         };
+        /**
+         * MailSubsampling
+         * @description Chroma subsampling for the mail profile, in the notation the vendor guidance uses.
+         *
+         *     `4:2:0` is the mail default and is deliberately NOT what print uses: an inline mail image is
+         *     read at a few hundred pixels on a phone, where the halved chroma resolution is invisible and
+         *     the bytes it saves are the difference between a message that arrives and one that bounces off
+         *     a provider's part cap. `4:4:4` is the only alternative offered — an escape hatch for an image
+         *     whose fine coloured detail the subsampling visibly eats. There is no `4:2:2`: it is a
+         *     compromise between the two that saves little and is not worth a third answer in a panel.
+         * @enum {string}
+         */
+        MailSubsampling: "4:2:0" | "4:4:4";
         /**
          * ManageGrantOut
          * @description A step-up grant, returned once and stored only as a hash — like a PAT's plaintext.
@@ -1891,13 +2000,10 @@ export interface components {
             page_cm: string;
             /** Photos */
             photos: components["schemas"]["PhotobookPhotoOut"][];
-            /**
-             * Profile
-             * @constant
-             */
-            profile: "print-4096";
+            /** Profile */
+            profile: string;
             /** Tag */
-            tag: string;
+            tag: string | null;
             totals: components["schemas"]["PhotobookTotalsOut"];
         };
         /**
@@ -1953,6 +2059,19 @@ export interface components {
             /** Unavailable */
             unavailable: number;
         };
+        /**
+         * PrintMetadataPolicy
+         * @description What of the source's metadata survives into a print rendition.
+         *
+         *     `strip` is what the shipped encoder does by writing no EXIF at all. `keep_dates` REBUILDS a
+         *     whitelist of date tags into fresh EXIF rather than passing the source's through — a
+         *     pass-through would carry GPS coordinates, camera serial numbers and a stale Orientation (which
+         *     is already baked into the pixels) into a file that leaves the household for a print service.
+         *     Neither policy touches the ICC profile or the baked orientation: those are print correctness,
+         *     not metadata.
+         * @enum {string}
+         */
+        PrintMetadataPolicy: "strip" | "keep_dates";
         /** PushKeys */
         PushKeys: {
             /** Auth */
@@ -2462,6 +2581,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DigestTestSendOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_export_settings_api_admin_export_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportSettingsOut"];
+                };
+            };
+        };
+    };
+    put_export_settings_api_admin_export_settings_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportSettingsPut"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportSettingsOut"];
                 };
             };
             /** @description Validation Error */
@@ -3031,8 +3203,8 @@ export interface operations {
             query?: {
                 from?: string | null;
                 to?: string | null;
-                tag?: string;
-                profile?: "print-4096";
+                tag?: string | null;
+                profile?: string | null;
                 format?: "manifest" | "zip";
                 page_cm?: string;
                 max_pages?: number;

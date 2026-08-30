@@ -305,6 +305,36 @@ def _rendition(tmp_path: Path, uid: str, size: tuple[int, int] = (400, 200)) -> 
     return dest
 
 
+def _job_profile_keys(att_id: int) -> list[str | None]:
+    """Each printready job's `profile_key`, in id order — the snapshot the worker will encode at."""
+    eng = _engine()
+    with eng.begin() as c:
+        rows = c.execute(
+            text(
+                "SELECT profile_key FROM media_jobs WHERE attachment_id=:a AND kind='printready'"
+                " ORDER BY id"
+            ),
+            {"a": att_id},
+        ).scalars().all()
+    eng.dispose()
+    return list(rows)
+
+
+def _set_job_profile(att_id: int, key: str | None) -> None:
+    """Stamp (or clear) the profile key on this attachment's existing printready jobs. Clearing is
+    how a pre-MEMNG-238 row is reproduced."""
+    eng = _engine()
+    with eng.begin() as c:
+        c.execute(
+            text(
+                "UPDATE media_jobs SET profile_key = :k WHERE attachment_id=:a"
+                " AND kind='printready'"
+            ),
+            {"a": att_id, "k": key},
+        )
+    eng.dispose()
+
+
 def _delete_jobs(att_id: int) -> None:
     eng = _engine()
     with eng.begin() as c:
@@ -453,11 +483,16 @@ def test_photobook_accepts_the_only_profile(logged_in_client):
 # --------------------------------------------------------------------------------------------
 
 
-def test_selection_defaults_to_the_curated_tag(logged_in_client, tmp_path, monkeypatch):
+def test_omitting_the_tag_selects_every_image_memo(logged_in_client, tmp_path, monkeypatch):
+    """MEMNG-238: no tag is not "the curated tag", it is "all of them".
+
+    The parameter used to default to `curated`; it now defaults to nothing, and the book is every
+    image the owner posted in the range. `tag` comes back null to say which question was answered.
+    """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     client, subject = logged_in_client
     curated = _memo(client, "in the book #curated")
-    other = _memo(client, "not in the book #holiday")
+    other = _memo(client, "also in the book now #holiday")
     a1 = _attach(curated["uid"], "pb-sel-1", subject, storage_path=_source(tmp_path, "a.jpg"))
     a2 = _attach(other["uid"], "pb-sel-2", subject, storage_path=_source(tmp_path, "b.jpg"))
     try:
@@ -465,8 +500,8 @@ def test_selection_defaults_to_the_curated_tag(logged_in_client, tmp_path, monke
     finally:
         _cleanup(a1, a2)
 
-    assert [p["attachment"] for p in body["photos"]] == ["pb-sel-1"]
-    assert body["tag"] == "curated"
+    assert [p["attachment"] for p in body["photos"]] == ["pb-sel-1", "pb-sel-2"]
+    assert body["tag"] is None
 
 
 def test_selection_follows_an_explicit_tag(logged_in_client, tmp_path, monkeypatch):
@@ -1191,7 +1226,12 @@ async def test_photobook_archive_streams_large_renditions_in_bounded_memory(tmp_
                 path=path,
             )
         )
-    book = photobook.Photobook(tag="curated", geometry=BOOK, entries=tuple(entries))
+    book = photobook.Photobook(
+        tag="curated",
+        profile=photobook.DEFAULT_PROFILE,
+        geometry=BOOK,
+        entries=tuple(entries),
+    )
 
     tracemalloc.start()
     try:
@@ -1204,3 +1244,323 @@ async def test_photobook_archive_streams_large_renditions_in_bounded_memory(tmp_
 
     assert total > 5 * each  # the payloads really went through (stored, not compressed)
     assert peak < 4_000_000
+
+
+# --------------------------------------------------------------------------------------------
+# the untagged selection and the profile (MEMNG-238)
+# --------------------------------------------------------------------------------------------
+
+
+def _settings(**print_fields) -> None:
+    """Point the export settings at a print profile. Raw SQL rather than the admin API: these tests
+    are about the export, and driving a second endpoint to set them up would make a failure here
+    ambiguous between the two."""
+    if not print_fields:
+        return
+    assignments = ", ".join(f"{name} = :{name}" for name in print_fields)
+    eng = _engine()
+    with eng.begin() as c:
+        c.execute(text(f"UPDATE export_settings SET {assignments} WHERE id = 1"), print_fields)
+    eng.dispose()
+
+
+@pytest.fixture
+def default_settings():
+    """Restore the seeded print profile after a test moves it — the row is committed state that
+    every later test in this module reads."""
+    yield
+    _settings(
+        print_long_edge=4096,
+        print_jpeg_quality=92,
+        print_metadata_policy="strip",
+        print_grayscale_single_channel=True,
+    )
+
+
+def test_an_untagged_export_is_the_exact_image_set_in_the_range(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """AC: exactly the image memos in [from, to], inclusive whole UTC days — no tag involved.
+
+    The day boundaries are the same rule the tagged path follows, asserted here independently: the
+    memo posted at noon on the closing day is IN, and the one a day outside either end is out.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    aids = []
+    for day, uid in ((9, "pb-un-09"), (10, "pb-un-10"), (20, "pb-un-20"), (21, "pb-un-21")):
+        memo = _memo(client, f"day {day} no tag at all")
+        _set_created(memo["uid"], datetime(2026, 5, day, 12, 0, tzinfo=UTC))
+        src = _source(tmp_path, f"{uid}.jpg")
+        aids.append(_attach(memo["uid"], uid, subject, storage_path=src))
+    try:
+        body = _manifest(client, **{"from": "2026-05-10", "to": "2026-05-20"})
+    finally:
+        _cleanup(*aids)
+
+    assert [p["attachment"] for p in body["photos"]] == ["pb-un-10", "pb-un-20"]
+    assert body["totals"]["selected"] == 2
+
+
+def test_an_untagged_export_of_an_empty_range_is_an_empty_book(
+    logged_in_client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "a photo outside the window")
+    _set_created(memo["uid"], datetime(2026, 5, 1, 12, 0, tzinfo=UTC))
+    aid = _attach(memo["uid"], "pb-un-empty", subject, storage_path=_source(tmp_path, "e.jpg"))
+    try:
+        body = _manifest(client, **{"from": "2026-09-01", "to": "2026-09-02"})
+    finally:
+        _cleanup(aid)
+
+    assert body["photos"] == []
+    assert body["totals"] == {
+        "selected": 0, "ready": 0, "pending": 0, "failed": 0, "unavailable": 0
+    }
+    assert body["tag"] is None
+
+
+def test_an_untagged_export_takes_the_photos_out_of_a_mixed_memo(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """A memo with a photo and a clip contributes the photo and only the photo — the same
+    `is_frame_image` filter the tagged path uses, reached without a tag."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "a photo and a clip, untagged")
+    photo = _attach(memo["uid"], "pb-un-jpg", subject, storage_path=_source(tmp_path, "a.jpg"))
+    clip = _attach(
+        memo["uid"], "pb-un-mp4", subject, storage_path=_source(tmp_path, "c.mp4"), mime="video/mp4"
+    )
+    try:
+        body = _manifest(client)
+    finally:
+        _cleanup(photo, clip)
+
+    assert [p["attachment"] for p in body["photos"]] == ["pb-un-jpg"]
+
+
+def test_a_multi_tag_memo_appears_once_in_an_untagged_export(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """The mutation this catches: outer-joining `memo_tags` instead of omitting the joins.
+
+    A memo carrying three tags matches an outer-joined tag table three times, so each of its
+    attachments would come back three times — three identical pages with three sequence numbers.
+    Three tags and two photos: four rows if the joins are gone, six if they are not.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "three tags #curated #holiday #family")
+    a1 = _attach(memo["uid"], "pb-multi-1", subject, storage_path=_source(tmp_path, "m1.jpg"))
+    a2 = _attach(memo["uid"], "pb-multi-2", subject, storage_path=_source(tmp_path, "m2.jpg"))
+    try:
+        body = _manifest(client)
+    finally:
+        _cleanup(a1, a2)
+
+    assert [p["attachment"] for p in body["photos"]] == ["pb-multi-1", "pb-multi-2"]
+
+
+def test_a_tag_still_narrows_an_export(logged_in_client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    curated = _memo(client, "curated one #curated")
+    holiday = _memo(client, "holiday one #holiday")
+    a1 = _attach(curated["uid"], "pb-narrow-1", subject, storage_path=_source(tmp_path, "a.jpg"))
+    a2 = _attach(holiday["uid"], "pb-narrow-2", subject, storage_path=_source(tmp_path, "b.jpg"))
+    try:
+        narrowed = _manifest(client, tag="holiday")
+        everything = _manifest(client)
+    finally:
+        _cleanup(a1, a2)
+
+    assert [p["attachment"] for p in narrowed["photos"]] == ["pb-narrow-2"]
+    assert narrowed["tag"] == "holiday"
+    assert [p["attachment"] for p in everything["photos"]] == ["pb-narrow-1", "pb-narrow-2"]
+
+
+def test_another_owners_photos_stay_out_of_an_untagged_export(
+    logged_in_client, tmp_path, monkeypatch
+):
+    """Owner scope is the tagged path's scope, and dropping the tag must not widen it. The intruder
+    memo is PUBLIC — visible in the feed, and still not a page in this user's book."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    mine = _memo(client, "mine, no tag")
+    a1 = _attach(mine["uid"], "pb-unown-mine", subject, storage_path=_source(tmp_path, "a.jpg"))
+
+    eng = _engine()
+    with eng.begin() as c:
+        other_id = c.execute(
+            text("INSERT INTO users (subject, role) VALUES ('pb_un_intruder','user') RETURNING id")
+        ).scalar_one()
+        other_memo = c.execute(
+            text(
+                "INSERT INTO memos (uid, owner_id, content, visibility, pinned) VALUES"
+                " ('pb-un-other-memo', :o, 'theirs', CAST('PUBLIC' AS visibility), false)"
+                " RETURNING id"
+            ),
+            {"o": other_id},
+        ).scalar_one()
+        a2 = c.execute(
+            text(
+                "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status,"
+                " storage_path) VALUES ('pb-unown-theirs', :o, :m, 't.jpg', 'image/jpeg', 1,"
+                " CAST('ready' AS attachment_status), :sp) RETURNING id"
+            ),
+            {"o": other_id, "m": other_memo, "sp": str(_source(tmp_path, "t.jpg"))},
+        ).scalar_one()
+    eng.dispose()
+    try:
+        body = _manifest(client)
+    finally:
+        _cleanup(a1, a2)
+        eng = _engine()
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM memos WHERE uid='pb-un-other-memo'"))
+            c.execute(text("DELETE FROM users WHERE subject='pb_un_intruder'"))
+        eng.dispose()
+
+    assert [p["attachment"] for p in body["photos"]] == ["pb-unown-mine"]
+
+
+def test_an_omitted_profile_follows_the_settings(logged_in_client, default_settings):
+    """The distinction the route's `None` default exists for: omitting the parameter is not the
+    same as naming `print-4096`, it is "whatever this deployment is set to"."""
+    client, _ = logged_in_client
+    assert _manifest(client)["profile"] == "print-4096"
+
+    _settings(print_long_edge=5000, print_jpeg_quality=90)
+    assert _manifest(client)["profile"] == "print-5000-q90-strip-gray"
+    # The shipped tier stays addressable by name whatever settings say — its cache never goes stale.
+    assert _manifest(client, profile="print-4096")["profile"] == "print-4096"
+
+
+def test_a_profile_no_longer_configured_is_refused(logged_in_client, default_settings):
+    """422, not a silent re-derivation: this endpoint resolves two keys (the permanent default and
+    whatever settings name), and anything else would let a caller queue arbitrary 60 MP encodes."""
+    client, _ = logged_in_client
+    _settings(print_long_edge=5000)
+    assert client.get(
+        "/api/exports/photobook", params={"profile": "print-4096-q95-dates-rgb"}
+    ).status_code == 422
+    # A well-formed key for a profile that simply is not this deployment's is refused too.
+    assert client.get(
+        "/api/exports/photobook", params={"profile": "print-orig-q92-strip-gray"}
+    ).status_code == 422
+
+
+def test_a_non_default_profile_derives_beside_the_default_and_never_over_it(
+    logged_in_client, tmp_path, monkeypatch, default_settings
+):
+    """AC: a non-default profile lands in its own directory and the default tier is untouched.
+
+    The default rendition's bytes AND its inode change time are captured before the second request
+    and compared after — mtime alone would not catch it, since every derived tier is stamped back
+    to the photo's capture date. A regression that resolved one path for both profiles would
+    rewrite this file, and both halves of the assertion would fail.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "one photo, two profiles #curated")
+    src = _real_jpeg(tmp_path / "originals" / "two-profiles.jpg", (600, 400))
+    aid = _attach(memo["uid"], "pb-prof-1", subject, storage_path=src, width=600, height=400)
+    default_file = _rendition(tmp_path, "pb-prof-1")
+    before_bytes, before_ctime = default_file.read_bytes(), default_file.stat().st_ctime
+    try:
+        _settings(print_long_edge=5000, print_jpeg_quality=90)
+        body = _manifest(client, profile="print-5000-q90-strip-gray")
+        jobs = _jobs_for(aid)
+        keys = _job_profile_keys(aid)
+    finally:
+        _cleanup(aid)
+
+    # The 5000 profile has no rendition, so it was queued — under its own key.
+    assert body["profile"] == "print-5000-q90-strip-gray"
+    assert body["photos"][0]["status"] == "pending"
+    assert jobs == ["queued"] and keys == ["print-5000-q90-strip-gray"]
+    # ...and the default tier's file is byte-for-byte the one that was there before.
+    assert default_file.read_bytes() == before_bytes
+    assert default_file.stat().st_ctime == before_ctime
+    assert not (tmp_path / "assets" / "printready" / "print-5000-q90-strip-gray").exists()
+
+
+def test_a_ready_default_rendition_does_not_satisfy_another_profile(
+    logged_in_client, tmp_path, monkeypatch, default_settings
+):
+    """The cache is per profile in BOTH directions: a finished default rendition must not make a
+    5000 px book read `ready`, and the 5000 px file must not be served from the default's path."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "cached at the default only #curated")
+    src = _real_jpeg(tmp_path / "originals" / "cached.jpg", (600, 400))
+    aid = _attach(memo["uid"], "pb-prof-2", subject, storage_path=src, width=600, height=400)
+    _rendition(tmp_path, "pb-prof-2")
+    try:
+        at_default = _manifest(client)
+        _settings(print_long_edge=5000)
+        at_5000 = _manifest(client, profile="print-5000-q92-strip-gray")
+    finally:
+        _cleanup(aid)
+
+    assert at_default["photos"][0]["status"] == "ready"
+    assert at_5000["photos"][0]["status"] == "pending"
+
+
+def test_one_profiles_failure_does_not_condemn_another(
+    logged_in_client, tmp_path, monkeypatch, default_settings
+):
+    """A terminal failure is scoped to the profile it failed at. Otherwise a photo that cannot be
+    encoded at 5000 px would be reported broken in every book the household ever makes."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "failed at one rung only #curated")
+    src = _source(tmp_path, "condemn.jpg")
+    aid = _attach(memo["uid"], "pb-prof-3", subject, storage_path=src, width=600, height=400)
+    try:
+        _fail_after_source(src, aid)
+        _set_job_profile(aid, "print-5000-q92-strip-gray")
+        _settings(print_long_edge=5000)
+        at_5000 = _manifest(client, profile="print-5000-q92-strip-gray")
+        at_default = _manifest(client, profile="print-4096")
+        default_jobs = [
+            key for key in _job_profile_keys(aid) if key != "print-5000-q92-strip-gray"
+        ]
+    finally:
+        _cleanup(aid)
+
+    assert at_5000["photos"][0]["status"] == "failed"
+    # The default profile never ran, so it is queued rather than condemned...
+    assert at_default["photos"][0]["status"] == "pending"
+    # ...and the job it queued carries the default key, not the failed one.
+    assert default_jobs == ["print-4096"]
+
+
+def test_a_legacy_job_row_with_no_profile_key_is_the_default_profile(
+    logged_in_client, tmp_path, monkeypatch, default_settings
+):
+    """Every printready job written before the column existed produced the shipped tier, so NULL
+    has to read as `print-4096` — not as "no profile" (which would queue a duplicate 60 MP encode
+    beside a job already in flight) and not as "any profile"."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    client, subject = logged_in_client
+    memo = _memo(client, "an old job row #curated")
+    aid = _attach(
+        memo["uid"], "pb-prof-4", subject, storage_path=_source(tmp_path, "legacy.jpg")
+    )
+    try:
+        _job(aid, "queued")  # _job writes no profile_key, exactly like a pre-MEMNG-238 row
+        _set_job_profile(aid, None)
+        _settings(print_long_edge=5000)
+        at_default = _manifest(client, profile="print-4096")
+        at_5000 = _manifest(client, profile="print-5000-q92-strip-gray")
+        keys = _job_profile_keys(aid)
+    finally:
+        _cleanup(aid)
+
+    assert at_default["photos"][0]["status"] == "pending"  # joined the in-flight job
+    assert at_5000["photos"][0]["status"] == "pending"  # queued one of its own
+    assert keys == [None, "print-5000-q92-strip-gray"]  # exactly one new job, not two

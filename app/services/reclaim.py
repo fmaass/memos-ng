@@ -57,12 +57,14 @@ from pathlib import Path
 from typing import Literal
 
 import structlog
+from anyio import to_thread
 from sqlalchemy import Select, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app.models import Attachment, MediaJob
+from app.services import printready
 from app.services.asset_paths import all_asset_paths
 
 logger = structlog.get_logger(__name__)
@@ -196,8 +198,25 @@ async def reclaim_attachment(
         await db.rollback()  # give the job rows back too: this attachment is live again
         logger.warning("reclaim.skipped", attachment_id=attachment_id, uid=uid, reason=ineligible)
         return ReclaimResult("skipped_ineligible")
-    # 3-5. The derivable set, unlinked, and only then the row.
-    paths = all_asset_paths(att)
+    # 3-5. The derivable set PLUS the print profiles that are actually on disk, unlinked, and only
+    #      then the row. The profiles have to be enumerated rather than derived (MEMNG-238: the set
+    #      of profiles that ever existed is unbounded), and this runs on the request loop, so the
+    #      one directory listing goes off it — every stat on this volume is a network round-trip.
+    uid = att.uid  # read BEFORE any rollback below: it expires every instance (see above)
+    try:
+        profile_assets = await to_thread.run_sync(printready.profile_variant_paths_sync, uid)
+    except OSError as exc:
+        # FAIL CLOSED, for the same reason a failed unlink does. The enumeration could not be
+        # ESTABLISHED — an unreadable mount, an I/O error — so we do not know what this row owns,
+        # and deleting it now would leave whatever is in those directories with nothing naming it.
+        # The row stays and the whole transaction unwinds; the caller retries (the reconcile sweep
+        # finds it again), and by then the mount is either back or the problem is visible.
+        await db.rollback()
+        logger.warning(
+            "reclaim.profile_scan_failed", attachment_id=attachment_id, uid=uid, error=str(exc)
+        )
+        return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
+    paths = all_asset_paths(att) + profile_assets
     failed = remove(paths)
     if failed:
         # FAIL CLOSED. Deleting the row now would leave these files with nothing naming them — the
@@ -247,7 +266,16 @@ def reclaim_attachment_sync(
     if ineligible is not None:
         session.rollback()
         return ReclaimResult("skipped_ineligible")
-    paths = all_asset_paths(att)
+    uid = att.uid
+    try:
+        profile_assets = printready.profile_variant_paths_sync(uid)
+    except OSError as exc:
+        session.rollback()  # fail closed — see reclaim_attachment
+        logger.warning(
+            "reclaim.profile_scan_failed", attachment_id=attachment_id, uid=uid, error=str(exc)
+        )
+        return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
+    paths = all_asset_paths(att) + profile_assets
     failed = remove(paths)
     if failed:
         session.rollback()  # fail closed — see reclaim_attachment

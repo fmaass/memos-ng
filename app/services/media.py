@@ -5,15 +5,16 @@ import signal
 import subprocess
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pillow_heif
 import structlog
-from PIL import Image, ImageCms, ImageOps
+from PIL import Image, ImageChops, ImageCms, ImageOps, ImageStat
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -45,11 +46,13 @@ MOBILE_MAX = 2048
 #   4:4:4    — chroma subsampling artefacts are visible in print, and the saving is ~28% of ~1 GB;
 #   300 dpi  — nothing else in this codebase writes a DPI, so layout software assumes 72 and
 #              mis-scales the photo on placement. This is the tag that makes the tier usable.
-# Re-exported, not redefined: the rung is tier identity and lives in app/services/printready.py,
-# which the app process can import without pulling in Pillow (the photo-book manifest projects a
-# rendition's size from it). Two literals here and there would be two rungs the day one changes.
-PRINTREADY_MAX = printready.MAX_EDGE
-PRINTREADY_QUALITY = 92
+# The long edge and the quality are no longer constants here: they are two of the four fields of a
+# PRINT PROFILE (MEMNG-238), resolved per request from `export_settings` and carried into this
+# function as a value — because the file's name and its cache directory are derived from the same
+# four fields, and a constant read here could not agree with them. Their DEFAULTS still say 4096
+# and q92, and they live once, in app/services/printready.py, which the app process can import
+# without pulling in Pillow.
+# The two below are not profile fields: they are print correctness, true of every profile.
 PRINTREADY_SUBSAMPLING = 0  # 4:4:4 — keep full chroma resolution
 PRINTREADY_DPI = (300, 300)
 # Grace between SIGTERM and SIGKILL when stopping a runaway transcode: ffmpeg closes the output
@@ -93,6 +96,20 @@ def derived_outputs(uid: str) -> list[Path]:
     web = _assets("web")
     print_ready = printready.printready_path(uid)
     poster_file = poster.poster_path(uid)
+    # Every file this uid owns in a NON-default print profile, enumerated — finals AND the
+    # `.jpg.tmp` an interrupted encode leaves behind, which the enumeration matches by prefix. The
+    # set of profiles that ever existed is unbounded (MEMNG-238), so a derived list could only name
+    # the ones settings happen to say today and would leave the rest behind.
+    #
+    # Unlike reclaim, a scan failure here is logged and swept around rather than raised: this list
+    # feeds `discard_outputs`, whose caller has already established that the attachment row is
+    # GONE. Failing the job would neither bring the row back nor remove anything, while going on
+    # still reaps every other tier. The unreadable directory is named in the log.
+    profiles: list[Path] = []
+    try:
+        profiles = printready.profile_variant_paths_sync(uid)
+    except OSError as exc:
+        logger.warning("printready_profile_scan_failed", uid=uid, error=str(exc))
     return [
         _assets("thumbs") / f"{uid}.jpg",
         _assets("thumbs") / f"{uid}.jpg.tmp",  # _atomic_save
@@ -100,6 +117,7 @@ def derived_outputs(uid: str) -> list[Path]:
         _assets("mobile") / f"{uid}.jpg.tmp",
         print_ready,
         print_ready.with_suffix(print_ready.suffix + ".tmp"),  # _atomic_save
+        *profiles,
         poster_file,  # the hero frame OR a client-supplied override (app/services/poster.py)
         poster.poster_tmp_path(uid),  # in flight: process_video_poster, or an override's copy
         web / f"{uid}.mp4",
@@ -260,7 +278,156 @@ def to_srgb(img: Image.Image) -> tuple[Image.Image, bytes]:
     return img.convert("RGB"), profile.tobytes()
 
 
-def process_printready(attachment: Attachment) -> Path:
+# --- monochrome detection (MEMNG-238) ---------------------------------------------------------
+#
+# The reference set that motivated this: a professional lab's B&W exports are byte-identical in
+# pixels to their colour twins but 5-7x smaller, and measurement showed WHY — the lab's B&W preset
+# drops to q91/4:2:0. That is a quality cut and is explicitly not imitated. What IS imitated is the
+# half of the saving that costs nothing: a neutral monochrome photo carries two chroma planes of
+# nothing, and a single-channel JPEG simply does not have them. Same quality, fewer planes.
+#
+# The classification has to tell NEUTRAL from TONED, because sepia and split-toning ARE the picture:
+# encoding them single-channel would throw the toning away and hand back a grey image. Both look
+# monochrome; the difference is that toning has non-zero chroma, and it is UNIFORM (one hue over
+# the whole frame) where a colour photograph's chroma varies.
+DETECT_SAMPLE_EDGE = 256  # the downscale detection runs on: enough hue, ~65k pixels of work
+# Chroma is measured in CIELAB as |a-128| + |b-128| per pixel (8-bit LAB, neutral = 128). A truly
+# neutral image scores 0. Both neutral thresholds are deliberately tight — misreading a toned photo
+# as neutral DESTROYS it, while misreading a neutral one as colour costs a few percent of file
+# size, so every uncertain case must fall to the RGB side.
+NEUTRAL_MEAN_CHROMA_MAX = 2.0
+NEUTRAL_CHROMA_STDDEV_MAX = 2.0
+# What separates TONED from COLOUR is not how much chroma there is, it is whether it all points the
+# same way. Toning is ONE HUE whose strength varies with luminance (a sepia's shadows are near
+# neutral and its midtones are warm), so its signed mean chroma is nearly its mean MAGNITUDE — the
+# vectors do not cancel. A colour photograph's hues cancel: measured on synthetic photographs,
+# sepia and split-toning score 1.00 and 0.96 while a colour frame scores 0.17.
+TONED_UNIFORMITY_MIN = 0.85
+
+Chromaticity = Literal["neutral", "toned", "color"]
+
+
+@dataclass(frozen=True, slots=True)
+class ChromaStats:
+    """What a downscaled sample says about an image's colour, in three numbers.
+
+    `magnitude` is the mean per-pixel chroma and `spread` its standard deviation — together they
+    answer "is there any colour here at all". `uniformity` is the length of the MEAN chroma vector
+    over `magnitude`: 1.0 when every pixel's hue points the same way (toning), near 0 when the
+    hues cancel (a colour photograph). Separating the two questions is the point — a sepia photo
+    has plenty of chroma AND plenty of spread, so no threshold on the first two can tell it from a
+    landscape.
+    """
+
+    magnitude: float
+    spread: float
+    uniformity: float
+
+
+def chroma_stats(img: Image.Image) -> ChromaStats:
+    """Measure the colour of a downscaled sample of `img`.
+
+    Pillow only, and no per-pixel Python: the sample is converted to LAB, each chroma channel is
+    folded to its distance from neutral through a 256-entry lookup table, the two are added into
+    one chroma image, and `ImageStat` reads the numbers off histograms. The addition cannot clip —
+    each term is at most 127.
+
+    `img` must already be RGB in sRGB (see `process_printready`): chroma statistics of a CMYK,
+    wide-gamut or 16-bit buffer are not comparable to these thresholds.
+    """
+    sample = img.copy()
+    sample.thumbnail((DETECT_SAMPLE_EDGE, DETECT_SAMPLE_EDGE))
+    _, a_channel, b_channel = sample.convert("LAB").split()
+    distance_from_neutral = [abs(value - 128) for value in range(256)]
+    chroma = ImageChops.add(
+        a_channel.point(distance_from_neutral), b_channel.point(distance_from_neutral)
+    )
+    stat = ImageStat.Stat(chroma)
+    magnitude, spread = stat.mean[0], stat.stddev[0]
+    # SIGNED means, which is what makes this a direction rather than a second magnitude.
+    signed_a = ImageStat.Stat(a_channel).mean[0] - 128
+    signed_b = ImageStat.Stat(b_channel).mean[0] - 128
+    uniformity = (abs(signed_a) + abs(signed_b)) / magnitude if magnitude else 0.0
+    return ChromaStats(magnitude=magnitude, spread=spread, uniformity=uniformity)
+
+
+def classify_chromaticity(img: Image.Image) -> Chromaticity:
+    """Is this picture neutral monochrome, toned monochrome, or colour?
+
+    `neutral` is the only verdict that changes the encode. `toned` is named separately rather than
+    lumped in with `color` because it is the verdict that has to be got RIGHT — a sepia print is
+    monochrome to the eye, and the naive test ("are the channels equal?") calls it colour while a
+    "not much chroma" test calls it neutral and greys it. So the distinction is stated in the code
+    rather than left implicit in a threshold.
+    """
+    stats = chroma_stats(img)
+    if (
+        stats.magnitude <= NEUTRAL_MEAN_CHROMA_MAX
+        and stats.spread <= NEUTRAL_CHROMA_STDDEV_MAX
+    ):
+        return "neutral"
+    return "toned" if stats.uniformity >= TONED_UNIFORMITY_MIN else "color"
+
+
+_SIXTEEN_BIT_MODES = frozenset({"I", "I;16", "I;16B", "I;16L", "I;16N"})
+# The two date tags a `keep_dates` rendition carries, by EXIF number: DateTimeOriginal (when the
+# shutter fired) and DateTimeDigitized/CreateDate. Both live in the Exif sub-IFD.
+EXIF_SUB_IFD = 0x8769
+DATE_TAGS = (0x9003, 0x9004)
+
+
+def _normalise_for_print(img: Image.Image) -> Image.Image:
+    """An arbitrary decoded source reduced to 8-bit with alpha resolved, before anything measures
+    or encodes it.
+
+    Two sources would otherwise be silently wrong:
+
+    * **16-bit** (`I;16` and its endian spellings, a 16-bit PNG or TIFF). Pillow's `convert("RGB")`
+      treats the value as an 8-bit sample and CLIPS: measured here, 16384/32768/65535 all come back
+      255, so a 16-bit scan would print as a blown-out white field. Scaling by 1/256 first is the
+      conversion that keeps the picture — but `point` is implemented for the NATIVE `I;16` only and
+      raises `ValueError: point operation not supported for this mode` on the `I;16B` a big-endian
+      TIFF decodes to, which would exhaust the job's retries on a perfectly good file. Going
+      through 32-bit `I` first is what makes the scaling work for every spelling: measured,
+      `I;16B → I` preserves the full 0/16384/32768/65535 range, while `I;16B → I;16` and
+      `I;16B → L` both collapse it.
+    * **Alpha** (`RGBA`, `LA`, palette transparency). `convert("RGB")` drops the alpha channel and
+      keeps whatever RGB was hiding underneath it, which is arbitrary — a transparent PNG can
+      carry any colour in its invisible pixels. They are composited onto WHITE instead, the colour
+      of the paper, before either detection or encoding sees them.
+    """
+    if img.mode in _SIXTEEN_BIT_MODES:
+        # `convert("I")` normalises every endian spelling into one 32-bit integer buffer that
+        # `point` accepts; the float factor is the documented 16-bit reduction, and the `convert`
+        # after it makes the result an ordinary 8-bit greyscale image.
+        return img.convert("I").point(lambda value: value * (1 / 256)).convert("L")
+    if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+        composed = img.convert("RGBA")
+        background = Image.new("RGBA", composed.size, (255, 255, 255, 255))
+        return Image.alpha_composite(background, composed).convert("RGB")
+    return img
+
+
+def _date_only_exif(source: Image.Image) -> bytes | None:
+    """A FRESH EXIF block carrying only this source's date tags, or None when it has none.
+
+    Rebuilt, never passed through, and that is the whole point of the policy: the source's own EXIF
+    carries GPS coordinates, the camera's make/model/serial and an Orientation tag that is already
+    baked into the pixels here — and this file is about to be uploaded to a print service. A
+    whitelist that is constructed rather than filtered cannot leak a tag nobody thought to remove.
+    """
+    incoming = source.getexif().get_ifd(EXIF_SUB_IFD)
+    kept = {tag: incoming[tag] for tag in DATE_TAGS if tag in incoming}
+    if not kept:
+        return None
+    rebuilt = Image.Exif()
+    rebuilt.get_ifd(EXIF_SUB_IFD).update(kept)
+    return rebuilt.tobytes()
+
+
+def process_printready(
+    attachment: Attachment, profile: printready.PrintProfile | None = None
+) -> Path:
     """Derive the print rendition of one photo and publish it. Returns the file it wrote.
 
     Source preference is the point of the tier: the PRINT MASTER when the photo has one — that is
@@ -270,26 +437,47 @@ def process_printready(attachment: Attachment) -> Path:
     Downscaled with LANCZOS rather than `thumbnail`'s default bicubic: this is a 60 MP → 4096 px
     reduction whose result is inspected at 300 dpi on gloss paper, where bicubic's softness is the
     one artefact a reader can actually see. `thumbnail` never enlarges, so a source already at or
-    below 4096 px keeps its own dimensions — upscaling would invent detail and print worse than
-    the honest smaller image.
+    below the cap keeps its own dimensions — upscaling would invent detail and print worse than
+    the honest smaller image. A profile with no cap skips the resize entirely.
+
+    THE ORDER IS THE CONTRACT. Orientation is baked, the buffer is normalised to 8-bit with alpha
+    resolved, it is colour-MANAGED into sRGB, and only then is it measured: chroma statistics of a
+    wide-gamut or 16-bit buffer are not comparable to the thresholds they are judged against, and
+    a transparent pixel's hidden colour would skew them. The `L` image is created after the
+    verdict, never before — building it first would make the classification a formality.
+
+    A single-channel rendition is written UNTAGGED. The profile this pipeline embeds is a
+    three-component sRGB one, and putting it in a one-component JPEG is a mismatch every reader is
+    entitled to reject; an untagged grayscale JPEG is read as gamma 2.2, which is the sRGB tone
+    curve to within a hair. That is a deliberate, recorded trade, not an omission.
     """
+    resolved = profile or printready.DEFAULT_PROFILE
     source = printready.source_path(attachment)
     if source is None:  # enqueue refuses these; a hand-made job must fail loudly, not silently
         raise RuntimeError(f"attachment {attachment.id} has no source file for a print rendition")
-    dest = printready.printready_path(attachment.uid)
+    dest = printready.printready_path(attachment.uid, resolved)
     with Image.open(source) as raw:
         img = ImageOps.exif_transpose(raw)  # orientation first — the same path the tiers use
+        img = _normalise_for_print(img)
         img, icc = to_srgb(img)
-        img.thumbnail((PRINTREADY_MAX, PRINTREADY_MAX), Image.Resampling.LANCZOS)
-        _atomic_save(
-            img,
-            dest,
-            quality=PRINTREADY_QUALITY,
-            subsampling=PRINTREADY_SUBSAMPLING,
-            optimize=True,
-            dpi=PRINTREADY_DPI,
-            icc_profile=icc,
-        )
+        if resolved.long_edge != printready.ORIGINAL_LONG_EDGE:
+            img.thumbnail(
+                (resolved.long_edge, resolved.long_edge), Image.Resampling.LANCZOS
+            )
+        keep_dates = resolved.metadata_policy == printready.METADATA_KEEP_DATES
+        exif = _date_only_exif(raw) if keep_dates else None
+        if resolved.grayscale_single_channel and classify_chromaticity(img) == "neutral":
+            img, icc = img.convert("L"), None
+        params: dict[str, Any] = {
+            "quality": resolved.jpeg_quality,
+            "subsampling": PRINTREADY_SUBSAMPLING,
+            "optimize": True,
+            "dpi": PRINTREADY_DPI,
+            "icc_profile": icc,
+        }
+        if exif is not None:
+            params["exif"] = exif
+        _atomic_save(img, dest, **params)
     _stamp_mtime(dest, attachment)  # carries the capture date, like every other derived tier
     return dest
 
@@ -1013,9 +1201,21 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
     if not attachment.mime.startswith("image/"):
         # enqueue_printready filters non-images out; reaching here means a hand-made job row.
         raise RuntimeError(f"printready is image-only: attachment {attachment.id} is not an image")
+    # The profile comes off the JOB, never out of settings: minutes or hours may separate the
+    # request from this line, and the bytes that get written have to be the ones that were asked
+    # for — the cache path they land at was decided by the same key. NULL is the default profile
+    # (every job written before the column existed produced the shipped tier).
+    profile = printready.DEFAULT_PROFILE
+    if job.profile_key is not None:
+        parsed = printready.profile_from_key(job.profile_key)
+        if parsed is None:
+            # Only a hand-made row can get here: enqueue writes a canonical key. Fail loudly
+            # rather than guess a profile and publish bytes nobody asked for.
+            raise RuntimeError(f"job {job.id} names an unknown print profile {job.profile_key!r}")
+        profile = parsed
     # blocking-ok: this IS the worker's job — a CPU-bound decode/encode that would still occupy
     # the process in a thread. Nothing else is queued on this loop to yield to.
-    process_printready(attachment)
+    process_printready(attachment, profile)
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
     await guard_publish(db, job, attachment)

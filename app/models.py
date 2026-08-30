@@ -335,6 +335,11 @@ class MediaJob(Base):
     state: Mapped[JobState] = mapped_column(
         Enum(JobState, name="job_state"), default=JobState.queued, index=True
     )
+    # WHICH print profile this job was asked for (MEMNG-238), snapshot at enqueue. NULL means the
+    # default profile — every printready job written before this column existed produced the
+    # shipped 4096/q92 tier at the legacy path, so NULL and `print-4096` are the same job. Only
+    # `kind = printready` ever sets it; the upload pipeline has no profile.
+    profile_key: Mapped[str | None] = mapped_column(String(64))
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     progress_pct: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text)
@@ -646,6 +651,88 @@ class DigestSettings(Base):
     )
     retention_days: Mapped[int] = mapped_column(Integer, default=30, server_default=text("30"))
     link_images_full: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    updated_by: Mapped[str | None] = mapped_column(String(255))
+
+
+class PrintMetadataPolicy(enum.StrEnum):
+    """What of the source's metadata survives into a print rendition.
+
+    `strip` is what the shipped encoder does by writing no EXIF at all. `keep_dates` REBUILDS a
+    whitelist of date tags into fresh EXIF rather than passing the source's through — a
+    pass-through would carry GPS coordinates, camera serial numbers and a stale Orientation (which
+    is already baked into the pixels) into a file that leaves the household for a print service.
+    Neither policy touches the ICC profile or the baked orientation: those are print correctness,
+    not metadata.
+    """
+
+    # UPPERCASE members, lowercase values: `strip` as a member name would shadow `str.strip` on a
+    # StrEnum, which is both a type error and a trap for anything that calls a string method on a
+    # policy value. The stored and published value is the lowercase one.
+    STRIP = "strip"
+    KEEP_DATES = "keep_dates"
+
+
+class MailSubsampling(enum.StrEnum):
+    """Chroma subsampling for the mail profile, in the notation the vendor guidance uses.
+
+    `4:2:0` is the mail default and is deliberately NOT what print uses: an inline mail image is
+    read at a few hundred pixels on a phone, where the halved chroma resolution is invisible and
+    the bytes it saves are the difference between a message that arrives and one that bounces off
+    a provider's part cap. `4:4:4` is the only alternative offered — an escape hatch for an image
+    whose fine coloured detail the subsampling visibly eats. There is no `4:2:2`: it is a
+    compromise between the two that saves little and is not worth a third answer in a panel.
+    """
+
+    C420 = "4:2:0"
+    C444 = "4:4:4"
+
+
+class ExportSettings(Base):
+    """The ONE row (id=1) holding the two named image profiles every export resolves from.
+
+    Same shape and the same two guarantees as `DigestSettings`: `CHECK (id = 1)` in the database
+    and a router with no INSERT path (app/routers/admin_export.py). Every non-nullable column
+    carries a `server_default`, so the migration seeds the row by naming only `id` and a column
+    added by a later expand-only migration has a defined value for the row that already exists.
+
+    Two profiles, one row, because they are one decision: how this deployment encodes an image for
+    somewhere that is not a screen. The `print_*` group is the photo-book tier's (MEMNG-49) and its
+    defaults are exactly what that tier already ships, so the seeded row resolves to the existing
+    `print-4096` profile and changes nothing on disk. The `mail_*` group is stored and exposed
+    here and consumed by the digest renderer in its own story — nothing reads it yet, which is why
+    it has no bearing on any cache key.
+    """
+
+    __tablename__ = "export_settings"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_export_settings_singleton"),)
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=False, server_default=text("1"), default=1
+    )
+    # 4096 (the shipped rung), 5000 (Blurb's published full-bleed rule) or 0 = the source's own
+    # size. Not an enum type in the database: the admissible set is a request-validation question
+    # and a migration is the wrong place to relitigate a print-size decision.
+    print_long_edge: Mapped[int] = mapped_column(Integer, default=4096, server_default=text("4096"))
+    print_jpeg_quality: Mapped[int] = mapped_column(Integer, default=92, server_default=text("92"))
+    print_metadata_policy: Mapped[str] = mapped_column(
+        String(16),
+        default=PrintMetadataPolicy.STRIP,
+        server_default=PrintMetadataPolicy.STRIP,
+    )
+    print_grayscale_single_channel: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true")
+    )
+    mail_long_edge: Mapped[int] = mapped_column(Integer, default=1600, server_default=text("1600"))
+    mail_jpeg_quality: Mapped[int] = mapped_column(Integer, default=80, server_default=text("80"))
+    mail_subsampling: Mapped[str] = mapped_column(
+        String(8), default=MailSubsampling.C420, server_default=MailSubsampling.C420
+    )
+    mail_progressive: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
     updated_at: Mapped[datetime] = mapped_column(
