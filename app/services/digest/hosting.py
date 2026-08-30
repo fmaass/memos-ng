@@ -100,6 +100,11 @@ class MediaHost(Protocol):
 
     async def delete(self, dropbox_path: str) -> None: ...
 
+    # Part of the protocol so that CLOSING is not optional. A host that owns a connection pool
+    # (`DropboxHost` owns an `httpx.AsyncClient`) leaks it otherwise, once per run, in a process
+    # that runs for weeks — and a caller cannot close what the type does not promise.
+    async def aclose(self) -> None: ...
+
 
 def _size_sync(path: Path) -> int:
     return path.stat().st_size
@@ -160,6 +165,10 @@ class DropboxHost:
         self._client = client
         self._on_operation = on_operation
         self._token: str | None = None
+
+    async def aclose(self) -> None:
+        """Release the HTTP client. Idempotent, and safe on a host whose refresh never succeeded."""
+        await self._client.aclose()
 
     async def _beat(self) -> None:
         if self._on_operation is not None:

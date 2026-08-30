@@ -588,12 +588,14 @@ def spawn_digest() -> bool:
 
 
 async def sweep_digest_safe() -> None:
-    """The two periodic digest sweeps, on the existing reap cadence and in their own tasks.
+    """The two periodic digest sweeps, on the existing reap cadence.
 
-    Both are already error-isolated inside `runner`; this is the one place the worker names them,
-    so the reap block stays readable.
+    BOTH go through an error-isolated entry point. This loop is serial and unguarded: an exception
+    escaping either sweep propagates out of `run()` and stops the worker outright — no heartbeat,
+    no media drain, no frame drain — which is the optional digest feature taking the media pipeline
+    down with it, the one failure every `*_safe` helper in this module exists to prevent.
     """
-    await digest_runner.sweep_stale_runs()
+    await digest_runner.sweep_stale_runs_safe()
     await digest_runner.sweep_hosted_media_safe()
 
 

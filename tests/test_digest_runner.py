@@ -25,6 +25,7 @@ from app.database import async_session
 from app.models import DigestTrigger, User, Visibility
 from app.services.digest import runner as digest_runner
 from sqlalchemy import delete, text
+from structlog.testing import capture_logs
 
 from tests.digest_support import (
     FakeHost,
@@ -637,6 +638,21 @@ async def test_a_hosted_video_is_recorded_and_never_attached(env):
     assert "cid:poster-" in body  # the poster and its play badge
 
 
+async def test_hosting_switched_off_logs_nothing_about_it(env):
+    """Not an incident: an admin who turned hosting off does not need a warning every morning.
+    The line above is for hosting that was ASKED for and could not be had."""
+    from structlog.testing import capture_logs as _capture
+
+    subject, data_root = env
+    await _seed_video_memo(subject, data_root)
+    set_digest_settings(hosting_enabled=False)
+    with _capture() as logs:
+        await digest_runner.run_digest(
+            transport=FakeTransport(), host_factory=host_factory_for(None), now_utc=NOW
+        )
+    assert not [entry for entry in logs if entry["event"] == "digest.hosting_unavailable"]
+
+
 async def test_hosting_unavailable_produces_an_inline_only_mail_and_a_log_line(env):
     """AC 8. `host_factory` returning None is what "hosting unconfigured or token refresh failing"
     reduces to — all three causes reach the same path."""
@@ -655,7 +671,14 @@ async def test_hosting_unavailable_produces_an_inline_only_mail_and_a_log_line(e
     body = html_part(transport.sent[0].message)
     assert "video hosting not configured" in body
     assert "cid:poster-" not in body
-    assert any(entry["event"] == "digest.run_finished" for entry in logs)
+    # The LINE, not a line: "logged, never fatal" is the contract, and asserting an unrelated
+    # event (`digest.run_finished`, which every run emits) would make this test unfalsifiable.
+    hosting_events = [
+        entry for entry in logs if entry["event"] == "digest.hosting_unavailable"
+    ]
+    assert len(hosting_events) == 1, [entry["event"] for entry in logs]
+    assert hosting_events[0]["run_id"] == result.run_id
+    assert hosting_events[0]["log_level"] == "warning"
 
 
 # --- the retention sweep -----------------------------------------------------------------------
@@ -840,3 +863,174 @@ async def test_the_local_date_on_the_row_is_the_LOCAL_one(env):
     late = datetime(2026, 7, 1, 22, 30, tzinfo=UTC)  # 00:30 on 2 July in Zurich
     await digest_runner.run_digest(transport=FakeTransport(), now_utc=late)
     assert run_rows()[0]["local_date"] == (late + timedelta(hours=2)).date()
+
+
+# --- the day ledger, revalidated inside the scheduled INSERT (review B1) ----------------------
+
+
+async def test_a_manual_run_today_blocks_todays_scheduled_run(env):
+    """`uq_digest_runs_scheduled_local_date` covers `trigger = 'scheduled'` ONLY, so it cannot see
+    a manual run — and the worker's gate read happens BEFORE the insert. A manual run that
+    completes in that window would otherwise let a second digest go out the same day, to the same
+    six mailboxes, carrying whatever the manual run did not reach.
+    """
+    subject, data_root = env
+    await _seed_photo_memos(subject, data_root, 2)
+    manual = FakeTransport()
+    manual_result = await digest_runner.run_digest(
+        trigger=DigestTrigger.manual, transport=manual, now_utc=NOW
+    )
+    assert manual_result is not None and manual_result.status == digest_runner.SENT
+
+    scheduled = FakeTransport()
+    with pytest.raises(digest_runner.RunSkipped):
+        await digest_runner.run_digest(transport=scheduled, now_utc=NOW)
+    assert scheduled.sent == []
+    assert [row["trigger"] for row in run_rows()] == [DigestTrigger.manual]
+
+
+async def test_a_scheduled_run_today_blocks_a_second_scheduled_one(env):
+    subject, data_root = env
+    await _seed_photo_memos(subject, data_root, 1)
+    await digest_runner.run_digest(transport=FakeTransport(), now_utc=NOW)
+    second = FakeTransport()
+    with pytest.raises(digest_runner.RunSkipped):
+        await digest_runner.run_digest(transport=second, now_utc=NOW)
+    assert second.sent == []
+    assert len(run_rows()) == 1
+
+
+async def test_yesterdays_runs_do_not_block_today(env):
+    """The predicate is the DAY's ledger, not "has anything ever run"."""
+    subject, data_root = env
+    await _seed_photo_memos(subject, data_root, 2)
+    yesterday = NOW - timedelta(days=1)
+    await digest_runner.run_digest(
+        trigger=DigestTrigger.manual, transport=FakeTransport(), now_utc=yesterday
+    )
+    # Yesterday's manual run mailed both memos, so today has nothing left to send — what matters
+    # is that today's run was ALLOWED to open at all, which is the property the ledger predicate
+    # must not over-reach on.
+    result = await digest_runner.run_digest(transport=FakeTransport(), now_utc=NOW)
+    assert result is not None and result.status == digest_runner.NOTHING_TO_SEND
+    assert sorted(row["trigger"] for row in run_rows()) == [
+        DigestTrigger.manual,
+        DigestTrigger.scheduled,
+    ]
+
+
+async def test_a_test_or_import_run_today_does_not_block_the_scheduled_one(env):
+    """B7 again, now in the INSERT: a probe or the one-shot import must not swallow the day's real
+    send, so the ledger predicate names `scheduled` and `manual` only."""
+    subject, data_root = env
+    await _seed_photo_memos(subject, data_root, 1)
+    async with async_session() as db:
+        for trigger in (DigestTrigger.test, DigestTrigger.import_):
+            run_id = await digest_runner.open_run(
+                db, trigger=trigger, local_date=NOW.date()
+            )
+            await digest_runner.finish_run(db, run_id, status=digest_runner.SENT)
+    transport = FakeTransport()
+    result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
+    assert result is not None and result.status == digest_runner.SENT
+    assert len(transport.sent) == 1
+
+
+# --- the isolated stale sweep (review B2) ------------------------------------------------------
+
+
+async def test_the_stale_sweep_isolates_a_database_error(env, monkeypatch):
+    """An exception escaping the sweep propagates out of `worker.run()` and stops the worker —
+    heartbeat, media drain and frame drain with it. The optional digest feature must never be able
+    to take the media pipeline down."""
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated database outage")
+
+    monkeypatch.setattr(digest_runner, "sweep_stale_runs", boom)
+    with capture_logs() as logs:
+        assert await digest_runner.sweep_stale_runs_safe() == 0
+    assert any(entry["event"] == "digest.stale_sweep_error" for entry in logs)
+
+
+async def test_the_isolated_sweep_still_sweeps(env):
+    """A positive control on the wrapper: it must not have become a no-op."""
+    run_id = await _open()
+    age_run(run_id, heartbeat_minutes=20, started_minutes=25)
+    assert await digest_runner.sweep_stale_runs_safe() == 1
+    assert run_rows()[0]["status"] == digest_runner.FAILED
+
+
+# --- test-send honours the sender guard (review B3) --------------------------------------------
+
+
+async def test_a_test_send_to_the_sender_address_is_refused(env):
+    """iCloud DROPS From == To with attachments, so this probe would report a clean send and
+    deliver nothing — a probe that lies is worse than no probe."""
+    transport = FakeTransport()
+    async with async_session() as db:
+        with pytest.raises(digest_runner.SenderIsRecipient):
+            await digest_runner.test_send(
+                db, address=SENDER.upper(), transport=transport, now_utc=NOW
+            )
+    assert transport.sent == []
+
+
+async def test_a_test_send_to_the_sender_address_is_refused_even_when_empty(env):
+    """The `empty=True` probe takes an earlier branch; the guard must sit in front of both."""
+    transport = FakeTransport()
+    async with async_session() as db:
+        with pytest.raises(digest_runner.SenderIsRecipient):
+            await digest_runner.test_send(
+                db, address=SENDER, empty=True, transport=transport, now_utc=NOW
+            )
+    assert transport.sent == []
+
+
+# --- the Dropbox client is released on every path (review A1) -----------------------------------
+
+
+async def test_the_media_host_is_closed_after_a_run(env):
+    subject, data_root = env
+    await _seed_video_memo(subject, data_root)
+    set_digest_settings(hosting_enabled=True)
+    host = FakeHost()
+    await digest_runner.run_digest(
+        transport=FakeTransport(), host_factory=host_factory_for(host), now_utc=NOW
+    )
+    assert host.closed == 1
+
+
+async def test_the_media_host_is_closed_even_when_the_run_raises(env, monkeypatch):
+    """The leak this closes is once per DAY in a process that runs for weeks, and it only bites
+    while something else is already going wrong — which is when it is hardest to see."""
+    subject, data_root = env
+    await _seed_video_memo(subject, data_root)
+    set_digest_settings(hosting_enabled=True)
+    host = FakeHost()
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated render failure")
+
+    monkeypatch.setattr(digest_runner, "build_digest", boom)
+    with pytest.raises(RuntimeError):
+        await digest_runner.run_digest(
+            transport=FakeTransport(), host_factory=host_factory_for(host), now_utc=NOW
+        )
+    assert host.closed == 1
+
+
+async def test_the_retention_sweep_closes_its_host(env):
+    subject, data_root = env
+    _, attachment_id = await _seed_video_memo(subject, data_root)
+    set_digest_settings(hosting_enabled=True, retention_days=30)
+    host = FakeHost()
+    await digest_runner.run_digest(
+        transport=FakeTransport(), host_factory=host_factory_for(host), now_utc=NOW
+    )
+    age_hosted_media(attachment_id, days=31)
+    closed_before = host.closed
+    assert await digest_runner.sweep_hosted_media_safe(
+        host_factory=host_factory_for(host)
+    ) == 1
+    assert host.closed == closed_before + 1

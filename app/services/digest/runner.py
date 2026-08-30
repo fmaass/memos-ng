@@ -87,6 +87,14 @@ class RunLost(RuntimeError):
     """A fenced CAS updated 0 rows: the sweep closed this run, or another actor advanced it."""
 
 
+class SenderIsRecipient(RuntimeError):
+    """The destination address is the address the mail is sent FROM.
+
+    Its own type because two callers must answer it differently — a run writes a `failed` row, a
+    test-send answers 422 — while the RULE is one rule and lives in one place.
+    """
+
+
 @dataclass
 class RunResult:
     run_id: int
@@ -113,26 +121,53 @@ class RenderedDigest:
 # --- the run row, and every fenced write against it ---------------------------------------------
 
 
+# A scheduled run's INSERT re-checks the day ledger inside the statement. `local_date` is bound
+# twice (the row it writes and the ledger it tests), which is why the trigger list is a literal:
+# it is a constant of the ledger, not a caller's input.
+_INSERT_SCHEDULED = (
+    "INSERT INTO digest_runs (trigger, local_date) "
+    "SELECT :trigger, :local_date "
+    "WHERE NOT EXISTS ("
+    "  SELECT 1 FROM digest_runs "
+    "  WHERE local_date = :local_date AND trigger IN ('scheduled', 'manual')"
+    ") RETURNING id"
+)
+_INSERT_PLAIN = (
+    "INSERT INTO digest_runs (trigger, local_date) VALUES (:trigger, :local_date) RETURNING id"
+)
+
+
 async def open_run(db: AsyncSession, *, trigger: str, local_date: date) -> int:
     """INSERT and COMMIT the run row before any other work. Raises `RunSkipped` on a conflict.
 
     The conflict IS the answer, never a pre-flight "is anything running?" read: a check-then-insert
-    is exactly the TOCTOU race the two unique partial indexes exist to close, and two concurrent
-    callers would both pass it.
+    is exactly the TOCTOU race the unique partial indexes exist to close, and two concurrent callers
+    would both pass it.
+
+    **A SCHEDULED insert additionally re-tests the day ledger in the same statement.**
+    `uq_digest_runs_scheduled_local_date` covers `trigger = 'scheduled'` ONLY, so it cannot see a
+    manual run — and a manual run that finishes between the worker's gate read and this insert
+    would otherwise let a second digest go out the same day, to the same six mailboxes, with the
+    memos the manual run did not reach. The gate's ledger read is an optimisation; this predicate
+    is the guarantee, and it lives in the INSERT rather than beside it for exactly the reason the
+    unique indexes do. Zero rows inserted means "today already had its attempt" — skip, do not
+    send.
     """
+    scheduled = trigger == DigestTrigger.scheduled
     try:
         run_id = await db.scalar(
-            sa_text(
-                "INSERT INTO digest_runs (trigger, local_date) VALUES (:trigger, :local_date) "
-                "RETURNING id"
-            ),
+            sa_text(_INSERT_SCHEDULED if scheduled else _INSERT_PLAIN),
             {"trigger": trigger, "local_date": local_date},
         )
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
         raise RunSkipped(str(exc.orig)) from exc
-    assert run_id is not None
+    if run_id is None:
+        # Only the scheduled statement can insert nothing; a plain INSERT either returns an id
+        # or raises. `assert` would be wrong here — this is an ordinary outcome, not a broken
+        # invariant.
+        raise RunSkipped(f"{local_date} already has a scheduled or manual run")
     return int(run_id)
 
 
@@ -250,6 +285,25 @@ async def finish_run(
         # must not be rewritten — that is what keeps the Counter monotonic.
         logger.warning("digest.terminal_write_lost", run_id=run_id, intended_status=status)
     return finished is not None
+
+
+async def sweep_stale_runs_safe(
+    session_factory: SessionFactory = async_session, *, stale_minutes: int = STALE_RUN_MINUTES
+) -> int:
+    """`sweep_stale_runs` with ALL errors isolated — the boundary guard every periodic sweep in the
+    worker loop gets (`run_media_recover_safe`, `run_frame_share_recover_safe`,
+    `sweep_job_progress_safe`).
+
+    Without it a transient database error inside the sweep propagates out of `worker.run()` and
+    stops the whole worker: no heartbeat, no media drain, no frame drain — the optional digest
+    feature taking down the media pipeline, which is the one thing every other sweep here is
+    written to prevent. Returns rows swept, 0 on error.
+    """
+    try:
+        return await sweep_stale_runs(session_factory, stale_minutes=stale_minutes)
+    except Exception:
+        logger.exception("digest.stale_sweep_error")
+        return 0
 
 
 async def sweep_stale_runs(
@@ -488,14 +542,17 @@ def make_dropbox_host_factory(
 ) -> HostFactory:
     """A factory that builds and authenticates a `DropboxHost`, or returns None.
 
-    None is the inline-only path, and three different causes reach it identically: hosting off in
-    the settings, the env keys unset, and a token refresh that failed. Only the last is a surprise,
-    so only it logs a warning — and the run continues either way rather than failing, which is the
-    behaviour AC 8 asks for.
+    None is the inline-only path, and three causes reach it: hosting off in the settings, the env
+    keys unset, and a token refresh that failed. The run continues in all three rather than failing
+    (AC 8) and says so in one line of its own — see `_execute_run`. Only the surprising causes log
+    here, because "hosting is switched off" is a decision, not an incident.
     """
 
     async def factory(on_operation: hosting.Operation) -> MediaHost | None:
-        if not settings.hosting_enabled or not dropbox_configured():
+        if not settings.hosting_enabled:
+            return None
+        if not dropbox_configured():
+            logger.warning("digest.hosting_keys_missing")
             return None
         client = httpx.AsyncClient()
         host = DropboxHost(
@@ -511,7 +568,9 @@ def make_dropbox_host_factory(
             await host.refresh()
         except (hosting.DropboxError, httpx.HTTPError):
             await client.aclose()
-            logger.warning("digest.hosting_unavailable", reason="token refresh failed")
+            # The CAUSE, under its own event name: the per-run "inline-only" line is emitted by
+            # the run itself, so that one stays exactly one per run whatever brought hosting down.
+            logger.warning("digest.hosting_token_refresh_failed")
             return None
         return host
 
@@ -611,7 +670,24 @@ async def _execute_run(
     host = None
     if host_factory is not None:
         host = await host_factory(beat)
-    rendered = await build_digest(db, settings, candidates, host=host, upload=True)
+    if host is None and settings.hosting_enabled:
+        # ONE line per run, and it is the CONSEQUENCE rather than the cause: hosting was asked for
+        # and is not available, so this mail goes out inline-only with the "video not hosted" chip
+        # on every video card. The cause (keys unset, token refresh failed) is logged where it is
+        # known; this is what an operator reading the run back needs to see. "Logged, never fatal"
+        # is the contract — the run continues.
+        logger.warning(
+            "digest.hosting_unavailable",
+            run_id=run_id,
+            detail="hosting is enabled but no media host is available; sending inline-only",
+        )
+    try:
+        rendered = await build_digest(db, settings, candidates, host=host, upload=True)
+    finally:
+        # Every path, not just the happy one: the host owns an httpx client, and a run that raised
+        # between here and the end would leak it once per day for as long as the fault lasted.
+        if host is not None:
+            await host.aclose()
 
     if not rendered.parts:
         status = DEFERRED if rendered.deferred else NOTHING_TO_SEND
@@ -761,24 +837,11 @@ async def sweep_hosted_media_safe(
                 logger.info("digest.retention_sweep_skipped", reason="hosting unavailable")
                 return 0
             swept = 0
-            for attachment_id, dropbox_path in due:
-                try:
-                    await host.delete(dropbox_path)
-                except (hosting.DropboxError, httpx.HTTPError):
-                    logger.warning("digest.retention_delete_failed", attachment_id=attachment_id)
-                    continue
-                # Stamped only after the file is actually gone from Dropbox — `swept_at` is the
-                # claim that it IS gone, and stamping it for a failed delete would leave a live
-                # file no sweep ever looks at again.
-                await db.execute(
-                    sa_text(
-                        "UPDATE digest_hosted_media SET swept_at = now() "
-                        "WHERE attachment_id = :id"
-                    ),
-                    {"id": attachment_id},
-                )
-                swept += 1
-            await db.commit()
+            try:
+                swept = await _delete_due(db, host, due)
+                await db.commit()
+            finally:
+                await host.aclose()  # every path: the sweep owns this host's client
             if swept:
                 logger.info(
                     "digest.retention_swept", count=swept, retention_days=retention_days
@@ -787,6 +850,28 @@ async def sweep_hosted_media_safe(
     except Exception:
         logger.exception("digest.retention_sweep_error")
         return 0
+
+
+async def _delete_due(
+    db: AsyncSession, host: MediaHost, due: list[tuple[int, str]]
+) -> int:
+    """Delete each due file and stamp `swept_at`. Returns how many actually went."""
+    swept = 0
+    for attachment_id, dropbox_path in due:
+        try:
+            await host.delete(dropbox_path)
+        except (hosting.DropboxError, httpx.HTTPError):
+            logger.warning("digest.retention_delete_failed", attachment_id=attachment_id)
+            continue
+        # Stamped only after the file is actually gone from Dropbox — `swept_at` is the claim
+        # that it IS gone, and stamping it for a failed delete would leave a live file no sweep
+        # ever looks at again.
+        await db.execute(
+            sa_text("UPDATE digest_hosted_media SET swept_at = now() WHERE attachment_id = :id"),
+            {"id": attachment_id},
+        )
+        swept += 1
+    return swept
 
 
 # --- the probes the admin panel drives ------------------------------------------------------------
@@ -823,6 +908,12 @@ async def test_send(
     moment = now_utc or datetime.now(UTC)
     active_transport = transport or default_transport()
     sender = sender_address(settings)
+    if address.lower() == sender.lower():
+        # The same refusal a real run applies (AC 7), and for the same reason: iCloud DROPS a
+        # message whose From equals its To when it carries attachments, so the probe would report
+        # a clean send and deliver nothing — the exact false-success this feature exists to end,
+        # and worse here because a test-send is what an admin uses to CHECK the channel.
+        raise SenderIsRecipient(ERROR_SENDER_IS_RECIPIENT)
     if empty:
         html, plain = render.render_empty(settings.mail_title)
         message = build_message(

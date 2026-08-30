@@ -259,3 +259,77 @@ def test_the_default_send_time_is_a_time_not_a_string():
     from app.models import DigestSettings
 
     assert isinstance(DigestSettings.__table__.c.send_time.type.python_type(0, 0), time)
+
+
+# --- the sweeps cannot stop the loop (review B2) ------------------------------------------------
+
+
+async def test_the_digest_sweeps_go_through_the_isolated_entry_points(env, monkeypatch):
+    """Both, not one: an exception escaping either propagates out of `run()` and stops the whole
+    worker — heartbeat, media drain and frame drain with it."""
+    called: list[str] = []
+
+    async def fake_stale_safe(*args, **kwargs) -> int:
+        called.append("stale_safe")
+        return 0
+
+    async def fake_retention(*args, **kwargs) -> int:
+        called.append("retention_safe")
+        return 0
+
+    monkeypatch.setattr(digest_runner, "sweep_stale_runs_safe", fake_stale_safe)
+    monkeypatch.setattr(digest_runner, "sweep_hosted_media_safe", fake_retention)
+    await worker.sweep_digest_safe()
+    assert called == ["stale_safe", "retention_safe"]
+
+
+async def test_a_failing_stale_sweep_leaves_the_loop_running(env, monkeypatch):
+    """Drives the REAL loop with a sweep that raises on every call. Before the boundary guard this
+    propagated out of `run()` and the worker stopped stamping, draining and beating."""
+    beats = {"n": 0}
+    drains = {"n": 0}
+
+    async def exploding_sweep(*args, **kwargs) -> int:
+        raise RuntimeError("simulated database outage in the stale sweep")
+
+    async def counted_media_drain() -> str:
+        drains["n"] += 1
+        return "idle"
+
+    async def idle_frame_drain() -> str:
+        return "idle"
+
+    async def noop(*args, **kwargs):
+        return 0
+
+    async def never_due() -> bool:
+        return False
+
+    monkeypatch.setattr(digest_runner, "sweep_stale_runs", exploding_sweep)
+    monkeypatch.setattr(worker, "POLL_SECONDS", 0.01)
+    monkeypatch.setattr(worker, "REAP_INTERVAL_SECONDS", 0)  # the reap block on EVERY pass
+    monkeypatch.setattr(worker, "beat", lambda: beats.__setitem__("n", beats["n"] + 1))
+    monkeypatch.setattr(worker, "run_media_drain", counted_media_drain)
+    monkeypatch.setattr(worker, "run_frame_share_drain", idle_frame_drain)
+    monkeypatch.setattr(worker, "run_frame_share_recover_safe", noop)
+    monkeypatch.setattr(worker, "run_media_recover_safe", noop)
+    monkeypatch.setattr(worker, "reap_expired_committed", noop)
+    monkeypatch.setattr(worker, "sweep_job_progress_safe", noop)
+    monkeypatch.setattr(worker, "run_commit_race_reconcile_safe", noop)
+    monkeypatch.setattr(worker, "digest_is_due", never_due)
+    monkeypatch.setattr(migrations, "wait_for_migrated_schema", noop)
+
+    loop_task = asyncio.create_task(worker.run())
+    try:
+        with capture_logs() as logs:
+            await asyncio.sleep(0.3)
+        assert not loop_task.done(), "the loop stopped when the sweep raised"
+        assert drains["n"] >= 3, drains
+        assert beats["n"] >= 3, beats
+        assert any(entry["event"] == "digest.stale_sweep_error" for entry in logs)
+    finally:
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass

@@ -327,3 +327,33 @@ def test_the_real_transport_is_what_the_handlers_use_by_default(monkeypatch):
     monkeypatch.setattr(app_settings, "SMTP_PORT", 587)
     transport = digest_runner.default_transport()
     assert isinstance(transport, digest_mailer.SmtplibTransport)
+
+
+# --- the sender guard reaches test-send too (review B3) -----------------------------------------
+
+
+async def test_a_test_send_to_an_admin_who_IS_the_sender_is_refused(
+    env, admin_client, capture_sends, monkeypatch
+):
+    """A real run refuses `sender == recipient` (AC 7) because iCloud DROPS From == To with
+    attachments. The probe an admin uses to CHECK the channel must refuse it for the same reason —
+    otherwise it reports a clean send and delivers nothing, which is worse than no probe.
+
+    `admin@x` is the address the admin fixture's session carries, so making it the sender is how
+    this configuration is reached.
+    """
+    monkeypatch.setattr(app_settings, "SMTP_USERNAME", "admin@x")
+    client, _ = admin_client
+    refused = client.post(f"{PREFIX}/test-send", json={})
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == digest_runner.ERROR_SENDER_IS_RECIPIENT
+    assert capture_sends.sent == []
+
+
+async def test_a_test_send_is_allowed_when_the_admin_is_not_the_sender(
+    env, admin_client, capture_sends
+):
+    """A positive control on the refusal above: it must bite on the collision only."""
+    client, _ = admin_client
+    assert client.post(f"{PREFIX}/test-send", json={}).status_code == 200
+    assert [mail.recipients for mail in capture_sends.sent] == [["admin@x"]]

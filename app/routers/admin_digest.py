@@ -661,7 +661,13 @@ async def test_send_digest(
         )
     if not digest_runner.smtp_configured():
         raise HTTPException(status_code=422, detail=digest_runner.ERROR_SMTP_UNCONFIGURED)
-    memo_count = await digest_runner.test_send(db, address=admin.email, empty=body.empty)
+    try:
+        memo_count = await digest_runner.test_send(db, address=admin.email, empty=body.empty)
+    except digest_runner.SenderIsRecipient as exc:
+        # The same refusal a real run applies (AC 7). Answered 422 rather than sent-and-hoped:
+        # iCloud drops From == To with attachments, so the probe would report success and deliver
+        # nothing — and a probe that lies is worse than no probe.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await digest_metrics.refresh_now()
     logger.info("digest.test_send", subject=admin.subject, memos=memo_count)
     return DigestTestSendOut(sent_to=admin.email, memo_count=memo_count)

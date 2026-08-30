@@ -287,6 +287,7 @@ class FakeHost:
     uploads: list[tuple[str, str]] = field(default_factory=list)
     deletes: list[str] = field(default_factory=list)
     base_folder: str = "/memos-mail/run"
+    closed: int = 0
 
     async def upload(self, local_path: Path, filename: str) -> tuple[str, str, int]:
         self.uploads.append((str(local_path), filename))
@@ -295,6 +296,11 @@ class FakeHost:
 
     async def delete(self, dropbox_path: str) -> None:
         self.deletes.append(dropbox_path)
+
+    async def aclose(self) -> None:
+        # Counted, not ignored: "the client is released on every path" is an assertion, and a
+        # no-op here would make it unfalsifiable.
+        self.closed += 1
 
 
 def forbid_real_smtp(monkeypatch) -> None:
