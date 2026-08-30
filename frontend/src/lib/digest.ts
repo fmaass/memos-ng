@@ -13,17 +13,25 @@ export type DigestSettingsPut = components['schemas']['DigestSettingsPut']
 
 // --- the tab in the URL -------------------------------------------------------------------
 
-export type SettingsTab = 'general' | 'mail'
+export type SettingsTab = 'general' | 'mail' | 'export'
 
-/** Which tab `?tab=` asks for. Unknown values and a non-admin asking for Mail land on General.
+/** The tabs only an admin is shown. General is everyone's and is the fallback for all three cases
+ * below, so it is deliberately not in here. */
+export const ADMIN_TABS: readonly SettingsTab[] = ['mail', 'export']
+
+/** Which tab `?tab=` asks for. Unknown values and a non-admin asking for an admin tab land on
+ * General.
  *
- * The admin argument is not decoration: the Mail tab is not rendered for a non-admin, so a
- * `?tab=mail` they were linked (or that survived a role change) must resolve to a tab that exists
- * — otherwise the view would show an empty tab strip position and no panel at all.
+ * The admin argument is not decoration: the Mail and Export tabs are not rendered for a non-admin,
+ * so a `?tab=mail` or `?tab=export` they were linked (or that survived a role change) must resolve
+ * to a tab that exists — otherwise the view would show an empty tab strip position and no panel at
+ * all. One resolver answers for every tab: a second copy for a later tab is how the address bar and
+ * the panel start disagreeing.
  */
 export function tabFromQuery(value: unknown, isAdmin: boolean): SettingsTab {
   const raw = Array.isArray(value) ? value[0] : value
-  return raw === 'mail' && isAdmin ? 'mail' : 'general'
+  if (!isAdmin || typeof raw !== 'string') return 'general'
+  return (ADMIN_TABS as readonly string[]).includes(raw) ? (raw as SettingsTab) : 'general'
 }
 
 // --- addresses ----------------------------------------------------------------------------

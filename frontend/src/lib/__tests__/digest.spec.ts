@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  ADMIN_TABS,
   type DigestConfigDraft,
   type DigestRun,
   type DigestSettings,
@@ -92,6 +93,30 @@ describe('tabFromQuery', () => {
     expect(tabFromQuery('mail', false)).toBe('general')
     expect(tabFromQuery(['mail'], false)).toBe('general')
     expect(tabFromQuery('general', false)).toBe('general')
+  })
+
+  it('gives an admin the export tab, from a bare value or a repeated one', () => {
+    expect(tabFromQuery('export', true)).toBe('export')
+    expect(tabFromQuery(['export', 'mail'], true)).toBe('export')
+  })
+
+  it('lands a non-admin asking for export on general', () => {
+    expect(tabFromQuery('export', false)).toBe('general')
+    expect(tabFromQuery(['export'], false)).toBe('general')
+  })
+
+  it('still falls back to general for a value close to an admin tab', () => {
+    expect(tabFromQuery('Export', true)).toBe('general')
+    expect(tabFromQuery('exports', true)).toBe('general')
+    expect(tabFromQuery({ tab: 'export' }, true)).toBe('general')
+  })
+
+  it('names every admin-only tab, so a new one cannot be forgotten here', () => {
+    expect([...ADMIN_TABS].sort()).toEqual(['export', 'mail'])
+    for (const tab of ADMIN_TABS) {
+      expect(tabFromQuery(tab, true)).toBe(tab)
+      expect(tabFromQuery(tab, false)).toBe('general')
+    }
   })
 })
 

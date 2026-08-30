@@ -11,6 +11,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import DigestPanel from '@/components/DigestPanel.vue'
+import ExportPanel from '@/components/ExportPanel.vue'
 import PatManager from '@/components/PatManager.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
@@ -24,8 +25,9 @@ const initials = computed(() =>
   (user.value?.display_name ?? user.value?.subject ?? '?').slice(0, 2).toUpperCase(),
 )
 
-// The Mail tab is not rendered for a non-admin — not disabled, not a stub. The refusal that
-// matters is the API's `require_admin`; this only keeps a panel out of a view that could not use it.
+// The Mail and Export tabs are not rendered for a non-admin — not disabled, not stubs. The refusal
+// that matters is the API's `require_admin`; this only keeps panels out of a view that could not
+// use them.
 const isAdmin = computed(() => user.value?.role === 'admin')
 // Until the session query answers, EVERYONE looks like a non-admin. That is fine for what is
 // rendered (there is nothing to show yet), but it must not be acted on: correcting the URL from a
@@ -36,15 +38,15 @@ const route = useRoute()
 const router = useRouter()
 
 // The tab lives in the URL, so it is linkable and survives a reload. The session arrives
-// asynchronously, so `?tab=mail` is re-resolved once the role is known — before that an admin
-// looks like a non-admin and would otherwise be dropped onto General for good.
+// asynchronously, so `?tab=mail` and `?tab=export` are re-resolved once the role is known — before
+// that an admin looks like a non-admin and would otherwise be dropped onto General for good.
 const activeTab = ref<SettingsTab>('general')
 watch(
   [() => route.query.tab, isAdmin, roleKnown],
   ([raw, admin, known]) => {
     const tab = tabFromQuery(raw, admin)
     activeTab.value = tab
-    // A `?tab=` the view will not honour — an unknown value, or Mail for a non-admin — is written
+    // A `?tab=` the view will not honour — an unknown value, or an admin tab for a non-admin — is written
     // back as the tab actually rendered, so the address bar never states something the page is not
     // showing (and a link shared from here cannot pass the same wrong value on). `replace`, never
     // push: Back leaves /settings rather than stepping through the correction.
@@ -101,6 +103,7 @@ function setTheme(value: string) {
       <TabList>
         <Tab value="general" data-test="settings-tab-general">General</Tab>
         <Tab v-if="isAdmin" value="mail" data-test="settings-tab-mail">Mail</Tab>
+        <Tab v-if="isAdmin" value="export" data-test="settings-tab-export">Export</Tab>
       </TabList>
 
       <TabPanels>
@@ -205,6 +208,12 @@ function setTheme(value: string) {
         <TabPanel v-if="isAdmin" value="mail">
           <div class="pt-2">
             <DigestPanel />
+          </div>
+        </TabPanel>
+
+        <TabPanel v-if="isAdmin" value="export">
+          <div class="pt-2">
+            <ExportPanel />
           </div>
         </TabPanel>
       </TabPanels>
