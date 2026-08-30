@@ -74,6 +74,14 @@ describe('useDigest', () => {
   beforeEach(() => {
     state.queries = []
     state.data = new Map()
+    setQueryData.mockImplementation((key: readonly unknown[], data: unknown) => {
+      // Stand in for the real cache: the response IS the new settings row, and the next writer must
+      // build its body from it.
+      const k = JSON.stringify(key)
+      const existing = state.data.get(k)
+      if (existing) existing.value = data
+      else state.data.set(k, ref(data))
+    })
     PUT.mockResolvedValue({ data: SERVER, error: undefined })
     POST.mockResolvedValue({ data: { id: 1 }, error: undefined })
     PATCH.mockResolvedValue({ data: { id: 1 }, error: undefined })
@@ -157,6 +165,61 @@ describe('useDigest', () => {
     expect(second).toBe(false)
     expect(await first).toBe(true)
     expect(PUT).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses a toggle fired while a save of the same row is still on the wire', async () => {
+    seedSettings({ enabled: false })
+    let release: (v: unknown) => void = () => {}
+    PUT.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = () => resolve({ data: { ...SERVER, mail_title: 'Changed' }, error: undefined })
+      }),
+    )
+    const digest = useDigest()
+
+    const saving = digest.saveConfig({ ...digestDraft(), mail_title: 'Changed' })
+    const toggled = await digest.setEnabled(true) // same row, second writer — refused, not queued
+    release(null)
+
+    expect(toggled).toBe(false)
+    expect(digest.enabledError.value).toMatch(/still saving/i)
+    expect(await saving).toBe(true)
+    expect(PUT).toHaveBeenCalledTimes(1)
+  })
+
+  it('builds each settings write from the row the previous write installed', async () => {
+    seedSettings({ enabled: false, mail_title: 'Daily memos' })
+    PUT.mockImplementation(async (_path: string, opts: { body: Record<string, unknown> }) => ({
+      data: { ...SERVER, ...opts.body },
+      error: undefined,
+    }))
+    const digest = useDigest()
+
+    expect(await digest.saveConfig({ ...digestDraft(), mail_title: 'Changed' })).toBe(true)
+    expect(await digest.setEnabled(true)).toBe(true)
+
+    // the switch's body carries the SAVED title, not the one the page loaded with
+    expect(PUT).toHaveBeenCalledTimes(2)
+    expect(PUT.mock.calls[1][1].body).toMatchObject({ mail_title: 'Changed', enabled: true })
+  })
+
+  it('reports both settings writers as busy while either is in flight', async () => {
+    seedSettings()
+    let release: (v: unknown) => void = () => {}
+    PUT.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = () => resolve({ data: SERVER, error: undefined })
+      }),
+    )
+    const digest = useDigest()
+
+    const saving = digest.saveConfig(digestDraft())
+    expect(digest.savingConfig.value).toBe(true)
+    expect(digest.togglingEnabled.value).toBe(true) // the switch is held too — one row, one gate
+    release(null)
+    await saving
+    expect(digest.savingConfig.value).toBe(false)
+    expect(digest.togglingEnabled.value).toBe(false)
   })
 
   it('adds, toggles and removes a recipient, each on its own request and none of them a settings write', async () => {

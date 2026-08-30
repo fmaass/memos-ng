@@ -71,14 +71,17 @@ describe('DigestPreviewDrawer', () => {
 
   it('shows the render in progress and a failed render instead of a stale frame', async () => {
     await mountDrawer({ loading: true, preview: null })
-    expect(document.querySelector('[data-test="digest-preview-loading"]')).not.toBeNull()
+    expect(
+      document.querySelector('[data-test="digest-preview-loading"]')!.getAttribute('aria-live'),
+    ).toBe('polite')
     expect(document.querySelector('[data-test="digest-preview-frame"]')).toBeNull()
 
     document.body.innerHTML = ''
     await mountDrawer({ loading: false, preview: null, error: 'rendering failed' })
-    expect(document.querySelector('[data-test="digest-preview-error"]')!.textContent).toMatch(
-      /rendering failed/,
-    )
+    const error = document.querySelector('[data-test="digest-preview-error"]')!
+    expect(error.textContent).toMatch(/rendering failed/)
+    expect(error.getAttribute('role')).toBe('alert')
+    
     expect(document.querySelector('[data-test="digest-preview-frame"]')).toBeNull()
   })
 })

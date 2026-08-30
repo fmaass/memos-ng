@@ -3,7 +3,7 @@ import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
 import SelectButton from 'primevue/selectbutton'
 import ToggleSwitch from 'primevue/toggleswitch'
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 import DigestPreviewDrawer from '@/components/DigestPreviewDrawer.vue'
 import DigestRecipients from '@/components/DigestRecipients.vue'
@@ -78,13 +78,22 @@ const canSave = computed(() => dirty.value && Object.keys(errors.value).length =
 // "what did I just configure", not "how long until the next send".
 const now = new Date()
 const nextSend = computed(() =>
-  settings.value ? nextSendLabel(describeNextSend(settings.value, now)) : '',
+  settings.value ? nextSendLabel(describeNextSend(settings.value, now, runs.value)) : '',
 )
 const lastRun = computed(() =>
   summariseLastRun(runs.value, settings.value?.timezone ?? 'UTC', now),
 )
 
 const previewOpen = ref(false)
+const previewButton = ref<{ $el?: HTMLElement } | null>(null)
+
+/** Escape and the drawer's own Close button both arrive here. Focus must go back to the control
+ * that opened the drawer — otherwise a keyboard user is dropped at the top of the document with no
+ * idea where they are. `nextTick` because the drawer is still tearing its focus trap down. */
+function setPreviewOpen(open: boolean) {
+  previewOpen.value = open
+  if (!open) void nextTick(() => previewButton.value?.$el?.focus())
+}
 
 function setNumber(field: keyof DigestConfigDraft, value: string | undefined) {
   if (!draft.value) return
@@ -107,7 +116,7 @@ async function save() {
 
 async function openPreview() {
   clearActionMessages()
-  previewOpen.value = true
+  setPreviewOpen(true)
   await loadPreview()
 }
 
@@ -157,6 +166,7 @@ const scopeOptions = [
 
         <div class="flex flex-wrap gap-2">
           <Button
+            ref="previewButton"
             label="Preview"
             icon="pi pi-eye"
             size="small"
@@ -185,16 +195,39 @@ const scopeOptions = [
           />
         </div>
 
-        <p v-if="enabledError" class="text-sm text-red-600" data-test="digest-enabled-error">
+        <p
+          v-if="enabledError"
+          class="text-sm text-red-600"
+          role="alert"
+          data-test="digest-enabled-error"
+        >
           {{ enabledError }}
         </p>
-        <p v-if="actionError" class="text-sm text-red-600" data-test="digest-action-error">
+        <p
+          v-if="actionError"
+          class="text-sm text-red-600"
+          role="alert"
+          data-test="digest-action-error"
+        >
           {{ actionError }}
         </p>
-        <p v-if="actionNotice" class="text-sm text-green-600" data-test="digest-action-notice">
+        <p
+          v-if="actionNotice"
+          class="text-sm text-green-600"
+          role="status"
+          aria-live="polite"
+          data-test="digest-action-notice"
+        >
           {{ actionNotice }}
         </p>
-        <p v-if="notice" class="text-sm text-green-600" data-test="digest-notice" @click="clearNotice">
+        <p
+          v-if="notice"
+          class="text-sm text-green-600"
+          role="status"
+          aria-live="polite"
+          data-test="digest-notice"
+          @click="clearNotice"
+        >
           {{ notice }}
         </p>
       </div>
@@ -417,6 +450,8 @@ const scopeOptions = [
       <div
         v-if="dirty"
         class="sticky bottom-0 flex items-center gap-3 border-t border-surface-200 bg-surface-0 py-3 dark:border-surface-700 dark:bg-surface-900"
+        role="group"
+        aria-label="Unsaved digest settings"
         data-test="digest-save-bar"
       >
         <Button
@@ -427,17 +462,23 @@ const scopeOptions = [
           @click="save"
         />
         <Button label="Discard" text data-test="digest-discard" @click="discard" />
-        <span v-if="configError" class="text-sm text-red-600" data-test="digest-config-error">
+        <span
+          v-if="configError"
+          class="text-sm text-red-600"
+          role="alert"
+          data-test="digest-config-error"
+        >
           {{ configError }}
         </span>
       </div>
     </template>
 
     <DigestPreviewDrawer
-      v-model:visible="previewOpen"
+      :visible="previewOpen"
       :preview="preview"
       :loading="previewing"
       :error="previewError"
+      @update:visible="setPreviewOpen"
     />
   </div>
 </template>

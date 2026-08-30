@@ -27,6 +27,10 @@ const initials = computed(() =>
 // The Mail tab is not rendered for a non-admin — not disabled, not a stub. The refusal that
 // matters is the API's `require_admin`; this only keeps a panel out of a view that could not use it.
 const isAdmin = computed(() => user.value?.role === 'admin')
+// Until the session query answers, EVERYONE looks like a non-admin. That is fine for what is
+// rendered (there is nothing to show yet), but it must not be acted on: correcting the URL from a
+// role that is merely unknown would bounce an admin's `?tab=mail` deep link to General for good.
+const roleKnown = computed(() => user.value !== undefined)
 
 const route = useRoute()
 const router = useRouter()
@@ -34,10 +38,21 @@ const router = useRouter()
 // The tab lives in the URL, so it is linkable and survives a reload. The session arrives
 // asynchronously, so `?tab=mail` is re-resolved once the role is known — before that an admin
 // looks like a non-admin and would otherwise be dropped onto General for good.
-const activeTab = ref<SettingsTab>(tabFromQuery(route.query.tab, isAdmin.value))
-watch([() => route.query.tab, isAdmin], ([tab, admin]) => {
-  activeTab.value = tabFromQuery(tab, admin)
-})
+const activeTab = ref<SettingsTab>('general')
+watch(
+  [() => route.query.tab, isAdmin, roleKnown],
+  ([raw, admin, known]) => {
+    const tab = tabFromQuery(raw, admin)
+    activeTab.value = tab
+    // A `?tab=` the view will not honour — an unknown value, or Mail for a non-admin — is written
+    // back as the tab actually rendered, so the address bar never states something the page is not
+    // showing (and a link shared from here cannot pass the same wrong value on). `replace`, never
+    // push: Back leaves /settings rather than stepping through the correction.
+    if (known && raw !== undefined && raw !== tab)
+      void router.replace({ query: { ...route.query, tab } })
+  },
+  { immediate: true },
+)
 
 function selectTab(value: string | number) {
   const tab = tabFromQuery(String(value), isAdmin.value)

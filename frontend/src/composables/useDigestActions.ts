@@ -12,10 +12,15 @@
 //   GET  /api/admin/digest/preview   -> {html, plain, memo_count, parts, selected[], deferred[]}
 //   POST /api/admin/digest/test-send  body {"empty"?: true}; always sends, to the caller only
 //   POST /api/admin/digest/run        -> the digest_runs row; 409 while a run is in flight
+//
+// Every shape one of them answers with is declared HERE, locally. The module imports no generated
+// type at all — the isolation IS the contract, so a `components['schemas'][…]` reference would
+// quietly couple it to a schema that does not describe these routes yet. The one thing it borrows
+// is `apiErrorMessage`, a pure string helper with no type coupling.
 import { ref } from 'vue'
 
 import { redirectToLogin } from '@/api/client'
-import { type DigestRun, apiErrorMessage } from '@/lib/digest'
+import { apiErrorMessage } from '@/lib/digest'
 
 export interface DigestPreviewMemo {
   uid: string
@@ -27,6 +32,23 @@ export interface DigestPreviewMemo {
 export interface DigestPreviewDeferred {
   uid: string
   reason: string
+}
+
+/** The `digest_runs` row `POST /run` answers with — declared locally on purpose (see the header),
+ * even though Phase 1 already publishes the same shape as `DigestRunOut`. */
+export interface DigestRunRow {
+  id: number
+  trigger: string
+  started_at: string
+  finished_at: string | null
+  status: string | null
+  memos_sent: number
+  parts: number
+  parts_sent: number
+  parts_claimed: number
+  recipients: number
+  error: string | null
+  local_date: string
 }
 
 export interface DigestPreview {
@@ -132,13 +154,13 @@ export function useDigestActions() {
 
   /** A real run, now. The API answers 409 while another run is in flight — that is a state, not a
    * fault, so it is reported as one rather than as a failed request. */
-  async function runNow(): Promise<DigestRun | null> {
+  async function runNow(): Promise<DigestRunRow | null> {
     if (runningNow.value) return null
     runningNow.value = true
     actionError.value = null
     try {
       const response = await call(RUN_PATH, { method: 'POST' })
-      const data = (await response.json()) as DigestRun
+      const data = (await response.json()) as DigestRunRow
       actionNotice.value = 'A run has started.'
       return data
     } catch (error) {

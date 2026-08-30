@@ -17,6 +17,7 @@ import {
   normaliseEmail,
   normaliseSendTime,
   putBodyFromDraft,
+  ranOn,
   recipientChangeGuard,
   summariseLastRun,
   tabFromQuery,
@@ -334,6 +335,38 @@ describe('describeNextSend', () => {
       kind: 'scheduled',
       when: 'tomorrow',
     })
+  })
+
+  it('says tomorrow when a scheduled run already took today, however early it is', () => {
+    // 04:00 UTC = 06:00 Zurich, still before 07:00 — but the day is already spent.
+    const early = new Date('2026-08-30T04:00:00Z')
+    expect(describeNextSend(settings(), early, [run({ local_date: '2026-08-30' })])).toMatchObject({
+      when: 'tomorrow',
+    })
+    expect(describeNextSend(settings(), early, [])).toMatchObject({ when: 'today' })
+  })
+
+  it('counts a manual run and a FAILED run as having taken the day, but not a test or an import', () => {
+    const early = new Date('2026-08-30T04:00:00Z')
+    const taken = (over: Partial<DigestRun>) =>
+      describeNextSend(settings(), early, [run({ local_date: '2026-08-30', ...over })])
+    expect(taken({ trigger: 'manual' })).toMatchObject({ when: 'tomorrow' })
+    expect(taken({ status: 'failed' })).toMatchObject({ when: 'tomorrow' })
+    expect(taken({ status: null })).toMatchObject({ when: 'tomorrow' })
+    expect(taken({ trigger: 'test' })).toMatchObject({ when: 'today' })
+    expect(taken({ trigger: 'import' })).toMatchObject({ when: 'today' })
+    // yesterday's run says nothing about today
+    expect(
+      describeNextSend(settings(), early, [run({ local_date: '2026-08-29' })]),
+    ).toMatchObject({ when: 'today' })
+  })
+
+  it('ranOn answers for one day at a time', () => {
+    const runs = [run({ local_date: '2026-08-30' }), run({ local_date: '2026-08-29', trigger: 'test' })]
+    expect(ranOn(runs, '2026-08-30')).toBe(true)
+    expect(ranOn(runs, '2026-08-29')).toBe(false) // a test send is not a delivery
+    expect(ranOn(runs, '2026-08-28')).toBe(false)
+    expect(ranOn(undefined, '2026-08-30')).toBe(false)
   })
 
   it('names the start date while it is still in the future', () => {

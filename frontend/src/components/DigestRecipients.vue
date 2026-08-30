@@ -123,9 +123,16 @@ function submit() {
       />
     </div>
 
-    <p v-if="localError" class="text-sm text-red-600" data-test="digest-recipient-local-error">
+    <p
+      v-if="localError"
+      class="text-sm text-red-600"
+      role="alert"
+      data-test="digest-recipient-local-error"
+    >
       {{ localError }}
     </p>
-    <p v-if="error" class="text-sm text-red-600" data-test="digest-recipient-error">{{ error }}</p>
+    <p v-if="error" class="text-sm text-red-600" role="alert" data-test="digest-recipient-error">
+      {{ error }}
+    </p>
   </div>
 </template>

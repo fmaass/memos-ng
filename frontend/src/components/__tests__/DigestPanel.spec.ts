@@ -67,6 +67,7 @@ function aRun(over: Partial<DigestRun> = {}): DigestRun {
 const digest = vi.hoisted(() => ({
   settings: undefined as unknown,
   runs: undefined as unknown,
+  enabledError: undefined as unknown,
   saveConfig: vi.fn(),
   setEnabled: vi.fn(),
   addRecipient: vi.fn(),
@@ -91,7 +92,7 @@ vi.mock('@/composables/useDigest', () => ({
     togglingEnabled: ref(false),
     recipientBusy: ref(null),
     configError: ref(null),
-    enabledError: ref(null),
+    enabledError: digest.enabledError,
     recipientError: ref(null),
     notice: ref(null),
     clearNotice: vi.fn(),
@@ -123,11 +124,13 @@ vi.mock('@/composables/useDigestActions', () => ({
 const DrawerStub = {
   name: 'DigestPreviewDrawer',
   props: ['visible', 'preview', 'loading', 'error'],
+  emits: ['update:visible'],
   template: '<div data-test="drawer-stub" :data-visible="String(visible)" />',
 }
 
-function mountPanel() {
+function mountPanel(options: { attach?: boolean } = {}) {
   return mount(DigestPanel, {
+    ...(options.attach ? { attachTo: document.body } : {}),
     global: { plugins: [PrimeVue], stubs: { DigestPreviewDrawer: DrawerStub } },
   })
 }
@@ -136,6 +139,7 @@ describe('DigestPanel', () => {
   beforeEach(() => {
     digest.settings = ref({ ...SERVER })
     digest.runs = ref([aRun()])
+    digest.enabledError = ref(null)
     actions.preview = ref(null)
     digest.saveConfig.mockResolvedValue(true)
     digest.setEnabled.mockResolvedValue(true)
@@ -275,6 +279,47 @@ describe('DigestPanel', () => {
     const wrapper = mountPanel()
     expect(wrapper.find('[data-test="digest-recovery"]').exists()).toBe(false)
     vi.useRealTimers()
+  })
+
+  it('reads the next send off the runs list, not the clock alone', async () => {
+    vi.setSystemTime(new Date('2026-08-30T04:00:00Z')) // 06:00 in Zurich, before the 07:00 send
+    digest.runs = ref([aRun({ local_date: '2026-08-29' })])
+    expect(mountPanel().find('[data-test="digest-next-send"]').text()).toMatch(/today at 07:00/)
+
+    digest.runs = ref([aRun({ local_date: '2026-08-30' })]) // today already ran
+    expect(mountPanel().find('[data-test="digest-next-send"]').text()).toMatch(/tomorrow at 07:00/)
+    vi.useRealTimers()
+  })
+
+  it('gives the unsaved-changes bar a name of its own', async () => {
+    const wrapper = mountPanel()
+    await wrapper.find('[data-test="digest-mail-title"]').setValue('Something else')
+    const bar = wrapper.find('[data-test="digest-save-bar"]')
+    expect(bar.attributes('role')).toBe('group')
+    expect(bar.attributes('aria-label')).toBeTruthy()
+  })
+
+  it('announces a refused settings write instead of only colouring it red', () => {
+    digest.enabledError = ref('Another settings change is still saving')
+    const error = mountPanel().find('[data-test="digest-enabled-error"]')
+    expect(error.attributes('role')).toBe('alert')
+  })
+
+  it('hands focus back to the Preview button when the drawer closes', async () => {
+    const wrapper = mountPanel({ attach: true })
+    const trigger = wrapper.find('[data-test="digest-preview-open"]').element as HTMLElement
+
+    await wrapper.find('[data-test="digest-preview-open"]').trigger('click')
+    await flushPromises()
+    ;(document.activeElement as HTMLElement | null)?.blur() // the drawer took focus
+    expect(document.activeElement).not.toBe(trigger)
+
+    wrapper.findComponent(DrawerStub).vm.$emit('update:visible', false) // Escape or Close
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="drawer-stub"]').attributes('data-visible')).toBe('false')
+    expect(document.activeElement).toBe(trigger)
+    wrapper.unmount()
   })
 
   it('opens the preview drawer and asks for a render', async () => {

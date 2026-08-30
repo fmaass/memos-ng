@@ -277,6 +277,15 @@ function wallClockIn(timezone: string, now: Date): string | null {
   }
 }
 
+// A run that consumes the day. `test` renders or probes and `import` is the satellite's one-shot
+// bookkeeping row — neither is a delivery, so neither may push the next send to tomorrow.
+const DAY_CONSUMING_TRIGGERS = new Set(['scheduled', 'manual'])
+
+/** Has a scheduled or manual run already taken `today` (in the configured zone)? */
+export function ranOn(runs: readonly DigestRun[] | undefined, day: string): boolean {
+  return (runs ?? []).some((r) => r.local_date === day && DAY_CONSUMING_TRIGGERS.has(r.trigger))
+}
+
 export type NextSend =
   | { kind: 'off' }
   | { kind: 'unknown-timezone'; time: string; timezone: string }
@@ -286,12 +295,13 @@ export type NextSend =
 /** When the next digest would go out, judged in the configured zone.
  *
  * Only ever a calendar answer — today, tomorrow, or the start date still ahead. The worker owns the
- * real gate (grace window, a day already sent); this line exists so the admin can see that the
- * schedule they typed means what they think it means.
+ * real gate; this line exists so the admin can see that the schedule they typed means what they
+ * think it means, and it must not promise a send today that the day ledger has already spent.
  */
 export function describeNextSend(
   settings: Pick<DigestSettings, 'enabled' | 'send_time' | 'timezone' | 'start_date'>,
   now: Date,
+  runs?: readonly DigestRun[],
 ): NextSend {
   const time = normaliseSendTime(settings.send_time)
   if (!settings.enabled) return { kind: 'off' }
@@ -300,7 +310,11 @@ export function describeNextSend(
   if (today === null || clock === null)
     return { kind: 'unknown-timezone', time, timezone: settings.timezone }
 
-  const when = clock < time.slice(0, 5) ? 'today' : 'tomorrow'
+  // A day that already had a scheduled or manual run is spent, whatever the clock says: nothing
+  // sends twice on one local date, and a FAILED run is not retried before tomorrow either (the
+  // status row offers Send now for that). `grace_minutes` is a media-readiness window inside the
+  // send, not a second chance at the day, so it deliberately does not enter this line.
+  const when = !ranOn(runs, today) && clock < time.slice(0, 5) ? 'today' : 'tomorrow'
   const nextDay =
     when === 'today'
       ? today

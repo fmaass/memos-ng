@@ -49,10 +49,16 @@ const width = ref(720)
         </p>
       </div>
 
-      <p v-if="loading" class="text-sm text-muted-color" data-test="digest-preview-loading">
+      <p
+        v-if="loading"
+        class="text-sm text-muted-color"
+        role="status"
+        aria-live="polite"
+        data-test="digest-preview-loading"
+      >
         Rendering…
       </p>
-      <p v-else-if="error" class="text-sm text-red-600" data-test="digest-preview-error">
+      <p v-else-if="error" class="text-sm text-red-600" role="alert" data-test="digest-preview-error">
         {{ error }}
       </p>
 

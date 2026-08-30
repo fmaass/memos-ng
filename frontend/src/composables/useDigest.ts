@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
-import { ref } from 'vue'
+import { type Ref, computed, ref } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import {
@@ -122,47 +122,69 @@ export function useDigest() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: digestKeys.recipients }),
   })
 
-  // Each writer serializes ITSELF rather than trusting a disabled button: a double-click, a rapid
-  // toggle or an Enter held down must put ONE request on the wire, and the second attempt is
-  // refused rather than queued (a queued second toggle would land the state the admin just left).
-  const savingConfig = ref(false)
-  const togglingEnabled = ref(false)
+  // ONE gate for EVERY writer of the settings row, not one per button. Saving the grouped config
+  // and flipping the enabled switch are two paths to the same PUT, and that PUT replaces the WHOLE
+  // row: two of them in flight together would each build a body from the row as it stood before the
+  // other, and whichever answered second would silently undo the first. A disabled button is not
+  // that guard — a double-click, a rapid toggle, or a toggle fired while a save is still on the
+  // wire all pass it.
+  //
+  // The second writer is REFUSED, not queued: a queued toggle would land the state the admin just
+  // left, and a queued save would re-send a draft the server has already moved past. The refusal
+  // says so on the same notice the write would have used.
+  const settingsWriter = ref<'config' | 'enabled' | null>(null)
+  const savingConfig = computed(() => settingsWriter.value === 'config')
+  const togglingEnabled = computed(() => settingsWriter.value !== null)
   const recipientBusy = ref<number | 'add' | null>(null)
   const configError = ref<string | null>(null)
   const enabledError = ref<string | null>(null)
   const recipientError = ref<string | null>(null)
   const notice = ref<string | null>(null)
 
-  async function saveConfig(draft: DigestConfigDraft): Promise<boolean> {
-    if (savingConfig.value) return false
-    savingConfig.value = true
-    configError.value = null
+  const SETTINGS_BUSY = 'Another settings change is still saving — try that again in a moment.'
+
+  /** Run one settings write behind the gate. `build` is called AFTER the gate is taken, so its body
+   * is built from the row the previous write's response installed rather than from a stale copy. */
+  async function writeSettings(
+    kind: 'config' | 'enabled',
+    build: (current: ReturnType<typeof currentSettings>) => ReturnType<typeof putBodyFromDraft>,
+    confirmation: string,
+    errorRef: Ref<string | null>,
+  ): Promise<boolean> {
+    if (settingsWriter.value !== null) {
+      errorRef.value = SETTINGS_BUSY
+      return false
+    }
+    settingsWriter.value = kind
+    errorRef.value = null
     try {
-      await putSettings.mutateAsync(putBodyFromDraft(draft, currentSettings().enabled))
-      notice.value = 'Saved.'
+      await putSettings.mutateAsync(build(currentSettings()))
+      notice.value = confirmation
       return true
     } catch (error) {
-      configError.value = error instanceof Error ? error.message : apiErrorMessage(error)
+      errorRef.value = error instanceof Error ? error.message : apiErrorMessage(error)
       return false
     } finally {
-      savingConfig.value = false
+      settingsWriter.value = null
     }
   }
 
-  async function setEnabled(next: boolean): Promise<boolean> {
-    if (togglingEnabled.value) return false
-    togglingEnabled.value = true
-    enabledError.value = null
-    try {
-      await putSettings.mutateAsync(putBodyFromDraft(draftFromSettings(currentSettings()), next))
-      notice.value = next ? 'The digest is on.' : 'The digest is off.'
-      return true
-    } catch (error) {
-      enabledError.value = error instanceof Error ? error.message : apiErrorMessage(error)
-      return false
-    } finally {
-      togglingEnabled.value = false
-    }
+  function saveConfig(draft: DigestConfigDraft): Promise<boolean> {
+    return writeSettings(
+      'config',
+      (current) => putBodyFromDraft(draft, current.enabled),
+      'Saved.',
+      configError,
+    )
+  }
+
+  function setEnabled(next: boolean): Promise<boolean> {
+    return writeSettings(
+      'enabled',
+      (current) => putBodyFromDraft(draftFromSettings(current), next),
+      next ? 'The digest is on.' : 'The digest is off.',
+      enabledError,
+    )
   }
 
   async function runRecipientChange(

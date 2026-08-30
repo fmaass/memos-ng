@@ -94,8 +94,19 @@ describe('DigestRecipients', () => {
     ).toBeUndefined()
   })
 
-  it('shows the API refusal it was handed', () => {
+  it('shows the API refusal it was handed, and announces it', () => {
     const wrapper = mountRecipients({ error: 'that address is already a recipient' })
-    expect(wrapper.find('[data-test="digest-recipient-error"]').text()).toMatch(/already/)
+    const error = wrapper.find('[data-test="digest-recipient-error"]')
+    expect(error.text()).toMatch(/already/)
+    expect(error.attributes('role')).toBe('alert')
+  })
+
+  it('announces a refusal the panel never sent to the API either', async () => {
+    const wrapper = mountRecipients()
+    await wrapper.find('[data-test="digest-recipient-input"]').setValue('nope')
+    await wrapper.find('[data-test="digest-recipient-add"]').trigger('click')
+    expect(wrapper.find('[data-test="digest-recipient-local-error"]').attributes('role')).toBe(
+      'alert',
+    )
   })
 })
