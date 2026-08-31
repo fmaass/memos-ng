@@ -452,6 +452,13 @@ def video_source_path(uid: str) -> Path | None:
 
 
 def image_full_source_path(uid: str) -> Path | None:
+    """The screen tier hosted as an image's full-size copy when nothing better is offered.
+
+    The FALLBACK, since MEMNG-240: a run that can derive them hands in the print profile's
+    renditions (`image_full_sources`), and this is what an image without one still gets — the same
+    2048 px copy the digest hosted before, which is why a spent encode budget or a hot host costs
+    quality and never a link.
+    """
     resolved = derived_tier_path(uid, "mobile")
     return None if resolved is None else resolved[0]
 
@@ -496,6 +503,7 @@ async def resolve_links(
     existing: dict[int, str],
     max_videos_per_memo: int,
     link_images_full: bool,
+    image_full_sources: dict[int, Path] | None = None,
 ) -> MediaLinks:
     """Which attachments this render can link to, uploading what is missing when `host` is set.
 
@@ -507,6 +515,12 @@ async def resolve_links(
     A test-send and a preview reach this with `host=None` BY CONTRACT, not by configuration: a
     probe must never create a Dropbox file the ledger does not know about, or one the retention
     sweep would later have to guess at.
+
+    `image_full_sources` names the file to host as an image's full-size copy, per attachment: the
+    print profile's rendition, prepared by the caller (`runner.print_grade_sources`) because only
+    the caller has a database session and this module must not open one across a Dropbox call. An
+    attachment with no entry falls back to `image_full_source_path` — the screen tier — which is
+    what makes a spent encode budget or a hot host a quality difference and not a missing link.
 
     **Every upload is bracketed by the ledger, one file at a time.** The intention is committed
     first, the bytes go second, the success is committed third — so the only state a crash can
@@ -525,7 +539,9 @@ async def resolve_links(
                 videos.append((ref.attachment_id, f"{ref.uid}.mp4", path))
         if link_images_full:
             for ref in candidate.images:
-                path = image_full_source_path(ref.uid)
+                path = (image_full_sources or {}).get(
+                    ref.attachment_id
+                ) or image_full_source_path(ref.uid)
                 if path is not None:
                     images.append((ref.attachment_id, f"{ref.uid}.jpg", path))
 

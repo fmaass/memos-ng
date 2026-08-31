@@ -64,19 +64,21 @@
 
     {% if card.images|length == 1 %}
       {% set img = card.images[0] %}
+      {% set h = display_height(img.pixel_width, img.pixel_height, single_image_width) %}
       {% if img.link_url %}
-      <a href="{{ img.link_url }}" style="text-decoration:none;"><img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="540" style="width:100%;max-width:540px;height:auto;display:block;border-radius:10px;" /></a>
+      <a href="{{ img.link_url }}" style="text-decoration:none;"><img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="{{ single_image_width }}"{% if h %} height="{{ h }}"{% endif %} style="width:100%;max-width:{{ single_image_width }}px;height:auto;display:block;border-radius:10px;" /></a>
       {% else %}
-      <img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="540" style="width:100%;max-width:540px;height:auto;display:block;border-radius:10px;" />
+      <img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="{{ single_image_width }}"{% if h %} height="{{ h }}"{% endif %} style="width:100%;max-width:{{ single_image_width }}px;height:auto;display:block;border-radius:10px;" />
       {% endif %}
     {% elif card.images|length > 1 %}
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>
       {% for img in card.images %}
+        {% set h = display_height(img.pixel_width, img.pixel_height, grid_image_width) %}
         <td class="gcell" width="50%" valign="top" style="width:50%;padding:0 {% if loop.index is odd %}5px{% else %}0{% endif %} 10px {% if loop.index is even %}5px{% else %}0{% endif %};">
           {% if img.link_url %}
-          <a href="{{ img.link_url }}" style="text-decoration:none;"><img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="262" style="width:100%;max-width:262px;height:auto;display:block;border-radius:10px;" /></a>
+          <a href="{{ img.link_url }}" style="text-decoration:none;"><img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="{{ grid_image_width }}"{% if h %} height="{{ h }}"{% endif %} style="width:100%;max-width:{{ grid_image_width }}px;height:auto;display:block;border-radius:10px;" /></a>
           {% else %}
-          <img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="262" style="width:100%;max-width:262px;height:auto;display:block;border-radius:10px;" />
+          <img src="cid:{{ img.cid }}" alt="{{ img.alt }}" width="{{ grid_image_width }}"{% if h %} height="{{ h }}"{% endif %} style="width:100%;max-width:{{ grid_image_width }}px;height:auto;display:block;border-radius:10px;" />
           {% endif %}
         </td>
         {% if loop.index is even and not loop.last %}</tr><tr>{% endif %}
@@ -88,8 +90,9 @@
       {% if v.status == "hosted" %}
       <div style="margin-top:10px;text-align:center;">
         {% if v.poster_cid %}
+        {% set ph = display_height(v.poster_width, v.poster_height, single_image_width) %}
         <a href="{{ v.url }}" style="text-decoration:none;display:inline-block;position:relative;">
-          <img src="cid:{{ v.poster_cid }}" alt="Video" width="540" style="width:100%;max-width:540px;height:auto;display:block;border-radius:10px;" />
+          <img src="cid:{{ v.poster_cid }}" alt="Video" width="{{ single_image_width }}"{% if ph %} height="{{ ph }}"{% endif %} style="width:100%;max-width:{{ single_image_width }}px;height:auto;display:block;border-radius:10px;" />
           <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;background:rgba(0,0,0,0.55);border-radius:50%;display:flex;align-items:center;justify-content:center;">
             <div style="width:0;height:0;border-top:15px solid transparent;border-bottom:15px solid transparent;border-left:26px solid #ffffff;margin-left:5px;"></div>
           </div>

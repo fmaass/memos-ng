@@ -44,8 +44,8 @@ from tests.digest_support import (
     seed_memo,
     seed_user,
     set_digest_settings,
+    write_mobile,
     write_poster,
-    write_thumb,
     write_web_mp4,
 )
 
@@ -87,7 +87,7 @@ async def _seed_video_memo(subject: str, data_root, *, videos: int = 1) -> list[
             )
             write_web_mp4(data_root, clip.uid)
             write_poster(data_root, clip.uid)
-            write_thumb(data_root, clip.uid)
+            write_mobile(data_root, clip.uid)
             attachment_ids.append(clip.id)
         await db.commit()
     return attachment_ids

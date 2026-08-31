@@ -34,7 +34,7 @@ from tests.digest_support import (
     seed_memo,
     seed_user,
     set_digest_settings,
-    write_thumb,
+    write_mobile,
 )
 
 SENDER = "sender@example.com"
@@ -68,7 +68,7 @@ async def _seed_one_memo(subject: str, data_root) -> None:
             created_at=datetime(2026, 6, 20, tzinfo=UTC),
         )
         attachment = await seed_attachment(db, user, memo, mime="image/jpeg")
-        write_thumb(data_root, attachment.uid)
+        write_mobile(data_root, attachment.uid)
         await db.commit()
 
 

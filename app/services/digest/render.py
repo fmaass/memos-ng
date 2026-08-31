@@ -29,13 +29,21 @@ from anyio import to_thread
 from jinja2 import Environment, FileSystemLoader, Template, select_autoescape
 
 from app.config import settings as app_settings
+from app.services import media
 from app.services.asset_paths import derived_tier_path
 from app.services.digest.gate import FALLBACK_TIMEZONE, resolve_zone
 from app.services.digest.hosting import MediaLinks
-from app.services.digest.select import Candidate
+from app.services.digest.select import MAIL_IMAGE_TIER, Candidate
+from app.services.export_settings import MailProfile
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 TEMPLATE_NAME = "email.html.j2"
+
+# The CSS width the template lays each inline image out at. They are here rather than only in the
+# template because the `height` attribute is computed from them, and a width that lived in two
+# places would put a distorted picture in the mail the first time one of them moved.
+SINGLE_IMAGE_WIDTH = 540  # a card with one photo, and every video poster
+GRID_IMAGE_WIDTH = 262  # a card with two or more, in the two-column grid
 
 # The satellite's allow-lists, unchanged (`app/render.py:22-39`).
 ALLOWED_TAGS = [
@@ -131,9 +139,15 @@ class InlineImage:
 class CardImage:
     cid: str
     alt: str
-    # Set only when `link_images_full` is on AND the full-size copy is hosted: the inline thumb
+    # Set only when `link_images_full` is on AND the full-size copy is hosted: the inline image
     # becomes a link to it.
     link_url: str | None = None
+    # The size the encoded bytes actually decode to — NOT the size it is displayed at. The
+    # template derives the display height from these and its own layout width, which is why they
+    # survive the splitter's shedding: shedding a photo can turn a grid card back into a
+    # single-photo card, and a height baked in at build time would then be the wrong one.
+    pixel_width: int | None = None
+    pixel_height: int | None = None
 
 
 @dataclass
@@ -142,6 +156,31 @@ class CardVideo:
     status: str
     url: str | None = None
     poster_cid: str | None = None
+    poster_width: int | None = None
+    poster_height: int | None = None
+
+
+def display_height(
+    pixel_width: int | None, pixel_height: int | None, display_width: int
+) -> int | None:
+    """The `height` attribute that keeps an image's aspect ratio at `display_width`, or None.
+
+    Stated explicitly because a mail client that has not loaded the images yet has no other way to
+    know how much room to leave: without it the card reflows the moment the pictures arrive, and
+    in the clients that block remote content by default it never stops being a 1 px sliver. The
+    style keeps `height:auto` alongside it, so a client that DOES honour CSS scales the image
+    correctly when the 600 px container narrows on a phone — the attribute is the fallback, not
+    the instruction.
+
+    None when the size is not known (a card built before the encoder ran, or a degenerate image):
+    the template then omits the attribute rather than asserting a height that is a guess.
+    """
+    if not pixel_width or not pixel_height or pixel_width <= 0 or pixel_height <= 0:
+        return None
+    # Half-UP, not `round`: `round` is banker's rounding, so a ratio landing exactly on .5 would
+    # go down for one image and up for the next. A height attribute is read by a person comparing
+    # it against a ratio, and "sometimes down" is the kind of surprise that reads as a bug.
+    return max(1, int(display_width * pixel_height / pixel_width + 0.5))
 
 
 @dataclass
@@ -238,7 +277,8 @@ def strip_video_refs(content: str, video_uids: Iterable[str]) -> str:
 def card_source_paths(
     candidates: list[Candidate], links: MediaLinks, max_videos_per_memo: int
 ) -> list[Path]:
-    """Every local file the cards will inline: a thumb per photo, a poster per HOSTED video.
+    """Every local file the cards will inline FROM: a mobile tier per photo, a poster per HOSTED
+    video.
 
     A poster is read only for a video that has a link, because that is the only branch the
     template renders one in — an unhosted video is a chip, not a picture.
@@ -246,7 +286,7 @@ def card_source_paths(
     paths: list[Path] = []
     for candidate in candidates:
         for image in candidate.images:
-            resolved = derived_tier_path(image.uid, "thumb")
+            resolved = derived_tier_path(image.uid, MAIL_IMAGE_TIER)
             if resolved is not None:
                 paths.append(resolved[0])
         for video in candidate.videos[:max_videos_per_memo]:
@@ -258,25 +298,43 @@ def card_source_paths(
     return paths
 
 
-def _read_files_sync(paths: list[Path]) -> dict[Path, bytes]:
-    """One offloaded hop for every inline image in the run. On the deployed bind mount each of
-    these is a network round trip, and a run reads dozens."""
-    contents: dict[Path, bytes] = {}
+def _encode_files_sync(paths: list[Path], profile: MailProfile) -> dict[Path, media.MailImage]:
+    """Read every inline source and re-encode it for the mail, in ONE offloaded hop.
+
+    Both halves belong in the same hop and neither belongs on the loop: on the deployed bind mount
+    each read is a network round trip, and each encode is a decode + LANCZOS reduction + JPEG
+    write that occupies a core for as long as it takes. A run does dozens of both.
+
+    A source that will not read or will not decode is simply absent from the result, which is the
+    degradation `build_cards` already handles — one photo leaves its card, the mail goes out.
+    """
+    encoded: dict[Path, media.MailImage] = {}
     for path in paths:
         try:
-            contents[path] = path.read_bytes()
+            raw = path.read_bytes()
         except OSError:
             continue  # a tier that vanished between the readiness scan and now: card degrades
-    return contents
+        image = media.encode_for_mail(raw, profile)
+        if image is not None:
+            encoded[path] = image
+    return encoded
 
 
-async def read_card_files(paths: list[Path]) -> dict[Path, bytes]:
-    return await to_thread.run_sync(_read_files_sync, paths)
+async def read_card_images(
+    paths: list[Path], profile: MailProfile
+) -> dict[Path, media.MailImage]:
+    """Every inline image of the run, encoded to the MAIL profile it was handed.
+
+    The profile is a parameter and never a lookup: it is the run's snapshot, read once before any
+    of this, so a settings change between the first photo and the last cannot put two encodings in
+    one message.
+    """
+    return await to_thread.run_sync(_encode_files_sync, paths, profile)
 
 
 def build_cards(
     candidates: list[Candidate],
-    files: dict[Path, bytes],
+    files: dict[Path, media.MailImage],
     links: MediaLinks,
     *,
     max_videos_per_memo: int,
@@ -301,14 +359,22 @@ def build_cards(
             is_incomplete=candidate.incomplete,
         )
         for image in candidate.images:
-            resolved = derived_tier_path(image.uid, "thumb")
-            data = None if resolved is None else files.get(resolved[0])
-            if data is None:
+            resolved = derived_tier_path(image.uid, MAIL_IMAGE_TIER)
+            encoded = None if resolved is None else files.get(resolved[0])
+            if encoded is None:
                 continue
             cid = f"img-{image.uid}-{uuid.uuid4().hex[:8]}"
-            inline.append(InlineImage(cid=cid, data=data))
+            inline.append(InlineImage(cid=cid, data=encoded.data))
             link = links.by_attachment.get(image.attachment_id) if link_images_full else None
-            card.images.append(CardImage(cid=cid, alt=image.filename or "photo", link_url=link))
+            card.images.append(
+                CardImage(
+                    cid=cid,
+                    alt=image.filename or "photo",
+                    link_url=link,
+                    pixel_width=encoded.width,
+                    pixel_height=encoded.height,
+                )
+            )
         for video in candidate.videos[:max_videos_per_memo]:
             url = links.by_attachment.get(video.attachment_id)
             if url is None:
@@ -318,14 +384,21 @@ def build_cards(
                 card.videos.append(CardVideo(filename=video.filename, status=status))
                 continue
             poster_cid = None
+            poster_size: tuple[int | None, int | None] = (None, None)
             resolved = derived_tier_path(video.uid, "poster")
-            data = None if resolved is None else files.get(resolved[0])
-            if data is not None:
+            encoded = None if resolved is None else files.get(resolved[0])
+            if encoded is not None:
                 poster_cid = f"poster-{video.uid}-{uuid.uuid4().hex[:8]}"
-                inline.append(InlineImage(cid=poster_cid, data=data))
+                inline.append(InlineImage(cid=poster_cid, data=encoded.data))
+                poster_size = (encoded.width, encoded.height)
             card.videos.append(
                 CardVideo(
-                    filename=video.filename, status=HOSTED, url=url, poster_cid=poster_cid
+                    filename=video.filename,
+                    status=HOSTED,
+                    url=url,
+                    poster_cid=poster_cid,
+                    poster_width=poster_size[0],
+                    poster_height=poster_size[1],
                 )
             )
         cards.append(card)
@@ -353,6 +426,12 @@ def _template() -> Template:
         autoescape=select_autoescape(["html"]),
         auto_reload=False,
     )
+    # The layout decides the display width, so the layout computes the height — a Python helper
+    # rather than arithmetic in the markup, so it can be tested directly and so the two widths the
+    # template lays out at are the only numbers the template itself has to know.
+    environment.globals["display_height"] = display_height
+    environment.globals["single_image_width"] = SINGLE_IMAGE_WIDTH
+    environment.globals["grid_image_width"] = GRID_IMAGE_WIDTH
     return environment.get_template(TEMPLATE_NAME)
 
 

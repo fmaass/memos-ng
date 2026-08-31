@@ -35,6 +35,13 @@ from app.services.asset_paths import derived_tier_path
 from app.services.digest.domain import DigestConfig
 from app.services.digest.gate import start_of_local_day_utc
 
+# The derived tier a photo is inlined FROM: `mobile` (2048 px) rather than `thumb` (800 px),
+# because the mail profile's long edge is 1600 and a thumb source would cap the picture below what
+# the profile asks for. ONE definition, and it lives here rather than in `render` because
+# readiness and rendering must name the same file and render already imports this module — the
+# dependency only runs one way.
+MAIL_IMAGE_TIER = "mobile"
+
 # Which memo visibilities each scope admits. PRIVATE is in neither, in any configuration: the
 # digest goes to six mailboxes outside the household.
 SCOPE_VISIBILITIES: dict[str, tuple[Visibility, ...]] = {
@@ -101,14 +108,21 @@ def _media_of(memo: Memo) -> tuple[list[MediaRef], list[MediaRef]]:
 
 
 def readiness_paths(candidate: Candidate) -> list[Path]:
-    """Every file that must exist for this memo to be READY: a thumb per photo, a web mp4 per
-    video. The poster is deliberately not in this set — a video with an mp4 but no poster still
-    mails (it renders as a play button rather than a poster + badge), and holding the whole scan
-    for it would defer the memo behind a file the template can do without.
+    """Every file that must exist for this memo to be READY: the tier each photo is inlined FROM
+    (`render.MAIL_IMAGE_TIER`), and a web mp4 per video.
+
+    It is the tier the mail actually reads, not a proxy for it: readiness that gated on a
+    different file would let a memo be selected and then lose a photo silently in `build_cards`,
+    with no `incomplete` note to say so. Both image tiers are written by the same worker call
+    (`media.process_image`, mobile last), so naming the later one is also the stricter test.
+
+    The poster is deliberately not in this set — a video with an mp4 but no poster still mails (it
+    renders as a play button rather than a poster + badge), and holding the whole scan for it
+    would defer the memo behind a file the template can do without.
     """
     paths: list[Path] = []
     for image in candidate.images:
-        resolved = derived_tier_path(image.uid, "thumb")
+        resolved = derived_tier_path(image.uid, MAIL_IMAGE_TIER)
         if resolved is not None:
             paths.append(resolved[0])
     for video in candidate.videos:
