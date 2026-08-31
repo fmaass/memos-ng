@@ -188,6 +188,14 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.6.0
+
+- The daily photo digest moves into memos-ng, replacing the decommissioned satellite: settings, recipients, runs and per-recipient deliveries live in the database behind an admin-only API, and the worker selects, renders, hosts and sends on a Europe/Zurich calendar gate, with videos hosted through Dropbox links held in a durable ownership ledger. The feature ships **disabled**; the cutover that imports the satellite's registry and enables it is a separate step.
+- `/settings` gains General and Mail tabs: admins manage digest recipients, trigger a manual run and read run history from the Mail tab, which also deep-links as `/settings?tab=mail`. Non-admins see no Mail tab.
+- Digest observability: `memosng_digest_*` gauges and counters on `/metrics`, guarded by a staleness rule that publishes nothing once the snapshot is older than 300 s — a dead refresher trips an absence alert instead of freezing a healthy-looking `enabled=0`.
+- Print and mail image profiles are editable in a new Export settings tab, an export renders every image in a date range through the print profile, and the digest's pictures go out through the mail profile of the same pipeline.
+- Two expand-only migration chains: the five digest tables, and `export_settings` plus `media_jobs.profile_key`.
+
 ### v1.5.2
 
 - The HDR poster tone-map uses the hable operator: mobius, shipped hours earlier in 1.5.1, blew ~7% of pixels past Y=250 on a real clip and read as an overdone HDR look on the device; hable restores the same chroma and clips essentially nothing on either test clip.
