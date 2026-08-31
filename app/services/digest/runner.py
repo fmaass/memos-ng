@@ -676,6 +676,11 @@ async def print_grade_sources(
     probes = await printready.probe_renditions(rows, profile=profile)
 
     sources: dict[int, Path] = {}
+    # ATTEMPTS, not successes, are what the budget spends. The expensive half of a print derive —
+    # the 40-60 MP decode and the LANCZOS reduction — is paid BEFORE anything can fail, so a
+    # budget that only counted the encodes that worked would let a run of corrupt or unreadable
+    # masters do unbounded Pillow work while reporting that it had derived nothing at all.
+    attempts = 0
     derived = 0
     hot = False
     exhausted = False
@@ -689,9 +694,13 @@ async def print_grade_sources(
             continue
         if hot:
             continue  # the host does not cool down inside one run; stop asking
-        if derived >= allowance:
+        if attempts >= allowance:
             exhausted = True
             continue
+        # Counted before the dispatch, so EVERY path spends it: the encode that succeeds, the one
+        # that raises, and the one `_derive_printready_sync` abandons because the host is hot
+        # (which still cost the thermal read and the hop).
+        attempts += 1
         try:
             written = await to_thread.run_sync(_derive_printready_sync, attachment, profile)
         except Exception:
@@ -707,9 +716,14 @@ async def print_grade_sources(
     if hot:
         # ONE line per run, like `digest.hosting_unavailable`: the cause is a host temperature and
         # the consequence is that the rest of this run hosts screen tiers.
-        logger.warning("digest.printready_too_hot", derived=derived)
+        logger.warning("digest.printready_too_hot", attempts=attempts, derived=derived)
     if exhausted:
-        logger.info("digest.printready_budget_spent", budget=allowance, derived=derived)
+        logger.info(
+            "digest.printready_budget_spent",
+            budget=allowance,
+            attempts=attempts,
+            derived=derived,
+        )
     return sources
 
 

@@ -205,6 +205,38 @@ async def test_the_run_derives_no_more_than_its_budget_and_the_rest_fall_back(en
     assert not printready.printready_path(uids[3], printready.DEFAULT_PROFILE).exists()
 
 
+async def test_the_budget_counts_ATTEMPTS_so_failing_encodes_cannot_run_away(env, monkeypatch):
+    """The bound has to be on work STARTED, not work that worked.
+
+    The expensive half of a print derive — the 40-60 MP decode and the LANCZOS reduction — is paid
+    before anything can fail, so a budget that only counted successes would let a folder of
+    corrupt masters do unbounded Pillow work while reporting that it derived nothing. Every
+    encode here raises, and the gate must still trip after `allowance` of them.
+    """
+    subject, data_root = env
+    uids = await _seed_photos(subject, data_root, 4, size=(1200, 800))
+    monkeypatch.setattr(digest_runner, "MAX_PRINTREADY_DERIVES_PER_RUN", 2)
+
+    attempts: list[int] = []
+
+    def always_failing(attachment, profile=None):
+        attempts.append(1)
+        raise OSError("simulated decode failure")
+
+    monkeypatch.setattr(media, "process_printready", always_failing)
+
+    host = FakeHost()
+    with capture_logs() as logs:
+        await _run(host)
+
+    assert len(attempts) == 2  # the gate tripped on attempts; it would be 4 on successes-only
+    # Every photo is still hosted, all four from the screen tier — nothing deferred, nothing lost.
+    assert _uploaded_paths(host) == [_mobile_path(data_root, uid) for uid in uids]
+    events = [log["event"] for log in logs]
+    assert events.count("digest.printready_derive_failed") == 2
+    assert events.count("digest.printready_budget_spent") == 1
+
+
 async def test_a_hot_host_hosts_screen_tiers_and_says_so_once(env, monkeypatch, tmp_path):
     """Mitigation 2, against a FAKED SENSOR rather than a patched predicate: the run reads the
     same thermal zone the media worker does, so this exercises `media.too_hot` itself."""

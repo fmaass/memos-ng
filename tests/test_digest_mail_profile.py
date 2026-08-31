@@ -21,7 +21,7 @@ import pytest
 from app.config import settings as app_settings
 from app.database import async_session
 from app.models import MailSubsampling, User, Visibility
-from app.services import media
+from app.services import export_settings, media
 from app.services.digest import render as digest_render
 from app.services.digest import runner as digest_runner
 from app.services.digest import splitting as digest_splitting
@@ -328,25 +328,32 @@ async def test_a_settings_change_between_two_parts_does_not_reach_the_second(env
 
 async def test_the_run_reads_the_export_profiles_exactly_once(env, monkeypatch):
     """The same invariant counted rather than inferred, so a second read is caught even when it
-    would have returned the same answer."""
+    would have returned the same answer.
+
+    Counted at the ACCESSOR, not at the runner's wrapper. `export_settings.settings_row` is the
+    one place the singleton is ever fetched — `load_config`, `print_profile` and
+    `resolve_print_profile` all go through it — so this sees a read from anywhere in the process,
+    including one a future encoder made behind the renderer's back. Wrapping
+    `runner.load_export_config` instead would have counted only the read that is already correct.
+    """
     subject, data_root = env
     await _seed(subject, data_root, 2, size=(1200, 900), noise=True)
     set_digest_settings(max_email_bytes=_one_card_cap(data_root))
 
-    real = digest_runner.load_export_config
+    real = export_settings.settings_row
     calls: list[int] = []
 
-    async def counting(db):
+    async def counting(db, **kwargs):
         calls.append(1)
-        return await real(db)
+        return await real(db, **kwargs)
 
-    monkeypatch.setattr(digest_runner, "load_export_config", counting)
+    monkeypatch.setattr(export_settings, "settings_row", counting)
     transport = FakeTransport()
     await digest_runner.run_digest(transport=transport, now_utc=NOW)
 
     assert len(transport.sent) == 2  # control: two parts, four images, still one read
     assert sum(1 for mail in transport.sent for _ in inline_jpegs(mail.message)) == 2
-    assert len(calls) == 1
+    assert len(calls) == 1  # two parts, two encodes, one read of the settings row
 
 
 async def test_the_mail_profile_costs_the_digest_fewer_parts_than_the_raw_tier(env):
