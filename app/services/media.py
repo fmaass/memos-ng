@@ -28,10 +28,11 @@ from app.models import (
     JobKind,
     JobLane,
     JobState,
+    MailSubsampling,
     MediaJob,
     MediaJobProgress,
 )
-from app.services import blurhash_pure, poster, printready
+from app.services import blurhash_pure, export_settings, poster, printready
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
@@ -480,6 +481,88 @@ def process_printready(
         _atomic_save(img, dest, **params)
     _stamp_mtime(dest, attachment)  # carries the capture date, like every other derived tier
     return dest
+
+
+# --- the mail rendition (MEMNG-240) -------------------------------------------------------------
+#
+# The digest's inline `cid:` images are encoded HERE rather than attached as a derived tier,
+# because an inline mail image is a different picture from a screen tier: it is read at ~540 CSS
+# px in a client that will never negotiate a format, it is base64-expanded by 4/3 into a message
+# with a hard part cap, and it must survive a legacy Outlook that cannot decode a progressive
+# JPEG. The four decisions that make it that picture are the MAIL PROFILE (app/services/
+# export_settings.py) and are resolved from settings once per run — never here, and never per
+# image: this function is handed the profile as a value, exactly like `process_printready`.
+#
+# It is a re-encode of the `mobile` tier, not of the original: the tier is already oriented,
+# already 8-bit and already close to the target size, so the expensive part of a print derive (a
+# 60 MP decode) is not paid for a photo that is about to be looked at on a phone.
+
+# The mail subsampling, in Pillow's spelling. Keyed by the enum rather than by bare strings so a
+# renamed member breaks here instead of silently falling through to a default.
+MAIL_SUBSAMPLING: dict[str, int] = {
+    MailSubsampling.C444: 0,  # 4:4:4 — no chroma reduction
+    MailSubsampling.C420: 2,  # 4:2:0 — half chroma in both axes
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MailImage:
+    """One encoded inline image: the bytes the message carries and the size they decode to.
+
+    The size travels WITH the bytes because the template has to state it: an `<img>` with no
+    height attribute collapses to nothing in the clients that block images until asked, and the
+    only honest height is the one the encoder actually produced — the profile's long edge is a
+    cap, not a dimension, and `thumbnail` never enlarges.
+    """
+
+    data: bytes
+    width: int
+    height: int
+
+
+def encode_for_mail(source: bytes, profile: export_settings.MailProfile) -> MailImage | None:
+    """One derived-tier JPEG re-encoded for the mail, or None when it cannot be read.
+
+    None rather than an exception for a source that will not decode: a truncated or half-written
+    tier must cost ONE photo its place on its card (the same degradation a missing file already
+    causes) and never the whole digest. A profile this deployment cannot encode is the other case
+    and DOES raise — an unknown subsampling can only come from a hand-edited settings row, and
+    quietly substituting a default would ship bytes nobody asked for.
+
+    The order is the same contract `process_printready` states: orientation is baked first, the
+    buffer is normalised to 8-bit with alpha resolved, it is colour-MANAGED into sRGB (a
+    Display-P3 phone photo is dull and desaturated without it), and only then is it downscaled and
+    encoded. `optimize=True` costs a Huffman pass and buys a few percent of a budget measured
+    against a hard cap.
+    """
+    subsampling = MAIL_SUBSAMPLING.get(profile.subsampling)
+    if subsampling is None:
+        raise ValueError(f"unknown mail subsampling {profile.subsampling!r}")
+    try:
+        with Image.open(BytesIO(source)) as raw:
+            img = ImageOps.exif_transpose(raw)
+            img = _normalise_for_print(img)  # not print-specific: 8-bit, alpha onto white
+            img, icc = to_srgb(img)
+            img.thumbnail(
+                (profile.long_edge, profile.long_edge), Image.Resampling.LANCZOS
+            )
+            buffer = BytesIO()
+            img.save(
+                buffer,
+                "JPEG",
+                quality=profile.jpeg_quality,
+                subsampling=subsampling,
+                progressive=profile.progressive,
+                optimize=True,
+                icc_profile=icc,
+            )
+            return MailImage(data=buffer.getvalue(), width=img.width, height=img.height)
+    except (OSError, ValueError) as exc:
+        # OSError covers Pillow's "cannot identify image file" and a truncated decode; ValueError
+        # covers a mode the encoder refuses. Neither names the file, because the log line is read
+        # off a production host and the uid is already in the run's own record.
+        logger.warning("digest.mail_image_unreadable", error=str(exc))
+        return None
 
 
 QUARTER_TURNS = (0, 90, 180, 270)

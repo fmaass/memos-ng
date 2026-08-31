@@ -13,21 +13,27 @@ claim CAS or the CID accounting, which is exactly what these tests exist to prov
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
+from email import message_from_bytes
 from email.mime.multipart import MIMEMultipart
+from io import BytesIO
 from pathlib import Path
 
 from app.models import (
     Attachment,
     AttachmentStatus,
     DigestVisibilityScope,
+    MailSubsampling,
     Memo,
     User,
     Visibility,
 )
 from app.services.digest.domain import DigestConfig
 from app.services.digest.hosting import DropboxError
+from app.services.export_settings import MailProfile
+from PIL import Image
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,6 +75,22 @@ def digest_config(**overrides) -> DigestConfig:
     }
     values.update(overrides)
     return DigestConfig(**values)  # pyright: ignore[reportArgumentType]
+
+
+def mail_profile(**overrides) -> MailProfile:
+    """The mail profile carrying the migration's own defaults, with named overrides.
+
+    The renderer is handed a profile as a VALUE (the run reads settings once), so this is the
+    honest input for every test that does not need the database to have an opinion about it.
+    """
+    values = {
+        "long_edge": 1600,
+        "jpeg_quality": 80,
+        "subsampling": MailSubsampling.C420,
+        "progressive": False,
+    }
+    values.update(overrides)
+    return MailProfile(**values)  # pyright: ignore[reportArgumentType]
 
 
 class BorrowedSession:
@@ -150,6 +172,32 @@ def set_digest_settings(**columns: object) -> None:
                 text(f"UPDATE digest_settings SET {column} = :value WHERE id = 1"),
                 {"value": value},
             )
+    engine.dispose()
+
+
+def set_export_settings(**columns: object) -> None:
+    """Write columns of the `export_settings` singleton, COMMITTED.
+
+    Separate from `set_digest_settings` because the two rows answer different questions and the
+    digest reads them from different modules — and because a test that changes the mail profile
+    MID-RUN needs a write that a running pipeline can actually see.
+    """
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        for column, value in columns.items():
+            conn.execute(
+                text(f"UPDATE export_settings SET {column} = :value WHERE id = 1"),
+                {"value": value},
+            )
+    engine.dispose()
+
+
+def reset_export_settings() -> None:
+    """The export singleton back to the migration's defaults, the way the migration seeds it."""
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM export_settings"))
+        conn.execute(text("INSERT INTO export_settings (id) VALUES (1)"))
     engine.dispose()
 
 
@@ -333,6 +381,7 @@ async def seed_attachment(
     mime: str = "image/jpeg",
     uid: str | None = None,
     filename: str = "photo.jpg",
+    storage_path: str | None = None,
 ) -> Attachment:
     attachment = Attachment(
         uid=uid or secrets.token_urlsafe(8),
@@ -342,6 +391,7 @@ async def seed_attachment(
         mime=mime,
         size=1,
         status=AttachmentStatus.ready,
+        storage_path=storage_path,
     )
     db.add(attachment)
     await db.flush()
@@ -351,17 +401,67 @@ async def seed_attachment(
 # --- derived-tier files -------------------------------------------------------------------------
 
 
-def write_thumb(data_root: Path, uid: str, payload: bytes = b"thumb") -> Path:
-    path = data_root / "assets" / "thumbs" / f"{uid}.jpg"
+def jpeg_bytes(size: tuple[int, int] = (240, 180), *, noise: bool = False) -> bytes:
+    """A REAL JPEG of `size`, because the digest now DECODES what it finds on disk.
+
+    `b"thumb"` was an honest fixture while the pipeline copied a tier's bytes into the message
+    untouched; it stopped being one the moment the renderer re-encoded them
+    (`media.encode_for_mail`), because a placeholder that will not decode exercises only the
+    failure branch. Every tier helper below therefore writes a decodable image.
+
+    `noise=True` fills it with incompressible random pixels — the honest shape for anything that
+    measures BYTES, since a flat colour compresses to almost nothing at any quality and would make
+    a size comparison meaningless.
+    """
+    width, height = size
+    if noise:
+        image = Image.frombytes("RGB", size, secrets.token_bytes(width * height * 3))
+    else:
+        # A gradient rather than a flat fill: it survives chroma subsampling with something left
+        # to measure, and it is not degenerate for the encoder.
+        image = Image.new("RGB", size)
+        image.putdata(
+            [
+                ((x * 255) // max(1, width - 1), (y * 255) // max(1, height - 1), 128)
+                for y in range(height)
+                for x in range(width)
+            ]
+        )
+    buffer = BytesIO()
+    image.save(buffer, "JPEG", quality=95)
+    return buffer.getvalue()
+
+
+def write_mobile(
+    data_root: Path,
+    uid: str,
+    payload: bytes | None = None,
+    *,
+    size: tuple[int, int] = (2048, 1536),
+    noise: bool = False,
+) -> Path:
+    """The `mobile` tier — the file the digest inlines FROM (`select.MAIL_IMAGE_TIER`)."""
+    path = data_root / "assets" / "mobile" / f"{uid}.jpg"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    path.write_bytes(jpeg_bytes(size, noise=noise) if payload is None else payload)
     return path
 
 
-def write_mobile(data_root: Path, uid: str, payload: bytes = b"mobile") -> Path:
-    path = data_root / "assets" / "mobile" / f"{uid}.jpg"
+def write_original(
+    data_root: Path,
+    uid: str,
+    *,
+    size: tuple[int, int] = (5000, 3000),
+    noise: bool = False,
+) -> Path:
+    """The archive master a print rendition is DERIVED from (`printready.source_path`).
+
+    Not a derived tier: the print tier is never made from a screen tier, so a test about the
+    hosted full-size copy has to put a real original on disk and name it on the attachment row.
+    """
+    path = data_root / "originals" / f"{uid}.jpg"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    path.write_bytes(jpeg_bytes(size, noise=noise))
     return path
 
 
@@ -372,10 +472,17 @@ def write_web_mp4(data_root: Path, uid: str, payload: bytes = b"mp4") -> Path:
     return path
 
 
-def write_poster(data_root: Path, uid: str, payload: bytes = b"poster") -> Path:
+def write_poster(
+    data_root: Path,
+    uid: str,
+    payload: bytes | None = None,
+    *,
+    size: tuple[int, int] = (1280, 720),
+    noise: bool = False,
+) -> Path:
     path = data_root / "assets" / "web" / f"{uid}.poster.jpg"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    path.write_bytes(jpeg_bytes(size, noise=noise) if payload is None else payload)
     return path
 
 
@@ -405,6 +512,9 @@ class FakeTransport:
     raise_on_part: int | None = None
     delay: float = 0.0
     sessions: TrackingSessionFactory | None = None
+    # Called with the 1-based part number AFTER that part is accepted. A seam for the one thing
+    # that cannot be staged any other way: something changing in the world part-way through a run.
+    on_sent: Callable[[int], None] | None = None
 
     async def send(
         self, message: MIMEMultipart, sender: str, recipients: list[str]
@@ -421,6 +531,8 @@ class FakeTransport:
         self.sent.append(
             SentMail(message=message, sender=sender, recipients=list(recipients))
         )
+        if self.on_sent is not None:
+            self.on_sent(part)
         return self.refusals_by_part.get(part, {})
 
 
@@ -528,6 +640,113 @@ def host_factory_for(host: object | None):
         return host
 
     return factory
+
+
+# --- an independent JPEG oracle -------------------------------------------------------------------
+#
+# Pillow encodes every image this codebase produces, so asking Pillow what it encoded is a
+# conversation the encoder has with itself: it would stay green with `subsampling=` and
+# `progressive=` deleted from the call and the library's own defaults answering instead (measured
+# — the mutation was run). This reads the bytes a recipient would receive, segment by segment, and
+# knows nothing about how they were made.
+#
+# The JPEG container is a chain of `FF <marker> <2-byte length> <payload>` after the `FFD8` start
+# of image. Three segments carry everything asserted anywhere:
+#
+#   SOF0 (C0) / SOF1 (C1)  a BASELINE frame; SOF2 (C2) a progressive one — the distinction legacy
+#                          Outlook cannot decode past;
+#   the SOF payload        precision, height, width, component count, then per component
+#                          `id, (h << 4) | v, quantisation table` — the sampling factors ARE the
+#                          chroma subsampling;
+#   APP2 (E2)              the ICC profile, whose payload starts `ICC_PROFILE\0`.
+#
+# Parsing stops at SOS (DA): everything after it is entropy-coded scan data with no segment
+# structure, and nothing needs it.
+
+_STANDALONE = {0xD8, 0x01, *range(0xD0, 0xD8)}  # markers that carry no length field
+_SOF_BASELINE = {0xC0, 0xC1}
+_SOF_PROGRESSIVE = {0xC2}
+
+
+@dataclass(frozen=True)
+class JpegFacts:
+    """What the bytes on the wire say about themselves."""
+
+    width: int
+    height: int
+    progressive: bool
+    sampling: tuple[tuple[int, int], ...]
+    has_icc: bool
+
+    @property
+    def long_edge(self) -> int:
+        return max(self.width, self.height)
+
+    @property
+    def subsampling(self) -> str:
+        """`4:2:0` or `4:4:4` in the notation the settings row uses, or a description of neither.
+
+        Read off the luma component's sampling factors against the chroma planes', which is what
+        the notation means: 2x2 luma samples per chroma sample is 4:2:0, 1x1 is 4:4:4.
+        """
+        if len(self.sampling) != 3:
+            return f"{len(self.sampling)}-component"
+        (luma_h, luma_v), *chroma = self.sampling
+        if any(pair != (1, 1) for pair in chroma):
+            return "irregular"
+        if (luma_h, luma_v) == (2, 2):
+            return MailSubsampling.C420
+        if (luma_h, luma_v) == (1, 1):
+            return MailSubsampling.C444
+        return f"{luma_h}x{luma_v}"
+
+
+def jpeg_facts(data: bytes) -> JpegFacts:
+    assert data[:2] == b"\xff\xd8", "not a JPEG"
+    index = 2
+    has_icc = False
+    while index < len(data):
+        assert data[index] == 0xFF, f"lost segment alignment at byte {index}"
+        marker = data[index + 1]
+        index += 2
+        if marker in _STANDALONE:
+            continue
+        length = int.from_bytes(data[index : index + 2], "big")
+        payload = data[index + 2 : index + length]
+        if marker == 0xE2 and payload.startswith(b"ICC_PROFILE\x00"):
+            has_icc = True
+        elif marker in _SOF_BASELINE or marker in _SOF_PROGRESSIVE:
+            components = payload[5]
+            return JpegFacts(
+                width=int.from_bytes(payload[3:5], "big"),
+                height=int.from_bytes(payload[1:3], "big"),
+                progressive=marker in _SOF_PROGRESSIVE,
+                sampling=tuple(
+                    (payload[7 + i * 3] >> 4, payload[7 + i * 3] & 0x0F)
+                    for i in range(components)
+                ),
+                has_icc=has_icc,
+            )
+        elif marker == 0xDA:  # start of scan: no frame header was found before the pixels
+            break
+        index += length
+    raise AssertionError("the JPEG carries no frame header")
+
+
+def inline_jpegs(message: MIMEMultipart) -> list[JpegFacts]:
+    """Every `image/jpeg` part of a SERIALISED message, decoded from its transfer encoding.
+
+    Serialised and re-parsed rather than read off the objects a run built: base64 is where a
+    message stops being a Python structure, and what arrives is the thing under test.
+    """
+    parsed = message_from_bytes(message.as_bytes())
+    facts = []
+    for part in parsed.walk():
+        if part.get_content_type() == "image/jpeg":
+            payload = part.get_payload(decode=True)
+            assert isinstance(payload, bytes)
+            facts.append(jpeg_facts(payload))
+    return facts
 
 
 def message_content_types(message: MIMEMultipart) -> list[str]:

@@ -23,7 +23,7 @@ from tests.digest_support import (
     seed_attachment,
     seed_memo,
     seed_user,
-    write_thumb,
+    write_mobile,
     write_web_mp4,
 )
 
@@ -125,7 +125,10 @@ def test_the_readiness_paths_come_from_the_repos_own_tier_map(tmp_path, monkeypa
     monkeypatch.setattr(app_settings, "DATA_ROOT", str(tmp_path))
     candidate = _candidate("a", images=(1,), videos=(2,))
     paths = digest_select.readiness_paths(candidate)
-    assert Path(tmp_path / "assets" / "thumbs" / "a-img1.jpg") in paths
+    # The MOBILE tier, because that is the file the mail is encoded from (MEMNG-240): readiness
+    # that gated on the thumb would let a memo be selected and then lose its photo silently.
+    assert Path(tmp_path / "assets" / "mobile" / "a-img1.jpg") in paths
+    assert Path(tmp_path / "assets" / "thumbs" / "a-img1.jpg") not in paths
     assert Path(tmp_path / "assets" / "web" / "a-vid2.mp4") in paths
 
 
@@ -223,7 +226,7 @@ async def test_select_for_run_reads_the_real_filesystem(adb, tmp_path, monkeypat
     user = await seed_user(adb)
     ready = await seed_memo(adb, user, created_at=datetime(2026, 6, 5, tzinfo=UTC))
     ready_photo = await seed_attachment(adb, user, ready, mime="image/jpeg")
-    write_thumb(tmp_path, ready_photo.uid)
+    write_mobile(tmp_path, ready_photo.uid)
     with_video = await seed_memo(adb, user, created_at=datetime(2026, 6, 6, tzinfo=UTC))
     clip = await seed_attachment(adb, user, with_video, mime="video/mp4", filename="c.mp4")
     write_web_mp4(tmp_path, clip.uid)

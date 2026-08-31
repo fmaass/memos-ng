@@ -420,21 +420,31 @@ async def test_a_host_without_a_ledger_is_refused_rather_than_uploading_unowned(
     assert host.uploads == []
 
 
-async def test_link_images_full_uploads_the_mobile_tier(tmp_path, monkeypatch):
+def _candidate_with_image(uid: str, attachment_id: int) -> Candidate:
     from datetime import UTC, datetime
 
-    monkeypatch.setattr(app_settings, "DATA_ROOT", str(tmp_path))
-    write_mobile(tmp_path, "img-1")
-    candidate = Candidate(
+    return Candidate(
         memo_id=1,
         uid="memo",
         content="",
         created_at=datetime(2026, 7, 1, tzinfo=UTC),
-        images=[MediaRef(attachment_id=5, uid="img-1", filename="p.jpg", mime="image/jpeg")],
+        images=[
+            MediaRef(
+                attachment_id=attachment_id, uid=uid, filename="p.jpg", mime="image/jpeg"
+            )
+        ],
     )
+
+
+async def test_link_images_full_falls_back_to_the_mobile_tier(tmp_path, monkeypatch):
+    """No print-grade copy offered for this attachment: the screen tier is hosted, which is what
+    keeps a spent encode budget or a hot host (MEMNG-240) a quality difference and not a missing
+    link."""
+    monkeypatch.setattr(app_settings, "DATA_ROOT", str(tmp_path))
+    write_mobile(tmp_path, "img-1")
     host = FakeHost()
     links = await hosting.resolve_links(
-        [candidate],
+        [_candidate_with_image("img-1", 5)],
         host=host,
         ledger=RecordingLedger(),
         existing={},
@@ -444,6 +454,30 @@ async def test_link_images_full_uploads_the_mobile_tier(tmp_path, monkeypatch):
     assert host.uploads == [(str(tmp_path / "assets" / "mobile" / "img-1.jpg"), "img-1.jpg")]
     assert links.uploaded[0].kind == hosting.IMAGE_FULL
     assert 5 in links.by_attachment
+
+
+async def test_a_print_grade_source_is_hosted_in_place_of_the_mobile_tier(tmp_path, monkeypatch):
+    """The override the caller prepares wins, per attachment — and only for that attachment."""
+    monkeypatch.setattr(app_settings, "DATA_ROOT", str(tmp_path))
+    write_mobile(tmp_path, "img-1")
+    write_mobile(tmp_path, "img-2")
+    print_grade = tmp_path / "assets" / "printready" / "img-1.jpg"
+    print_grade.parent.mkdir(parents=True, exist_ok=True)
+    print_grade.write_bytes(b"print-grade bytes")
+    host = FakeHost()
+    await hosting.resolve_links(
+        [_candidate_with_image("img-1", 5), _candidate_with_image("img-2", 6)],
+        host=host,
+        ledger=RecordingLedger(),
+        existing={},
+        max_videos_per_memo=2,
+        link_images_full=True,
+        image_full_sources={5: print_grade},
+    )
+    assert host.uploads == [
+        (str(print_grade), "img-1.jpg"),
+        (str(tmp_path / "assets" / "mobile" / "img-2.jpg"), "img-2.jpg"),
+    ]
 
 
 async def test_link_images_full_off_uploads_no_photo(tmp_path, monkeypatch):

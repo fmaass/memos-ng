@@ -15,7 +15,7 @@ from app.services.digest import render
 from app.services.digest.hosting import MediaLinks
 from app.services.digest.select import Candidate, MediaRef
 
-from tests.digest_support import write_poster, write_thumb
+from tests.digest_support import mail_profile, write_mobile, write_poster
 
 MEMOS_HOST = "memos.discomarder.live"
 
@@ -44,6 +44,18 @@ def _image(uid: str, attachment_id: int = 1, filename: str = "p.jpg") -> MediaRe
 
 def _video(uid: str, attachment_id: int = 2, filename: str = "clip.mp4") -> MediaRef:
     return MediaRef(attachment_id=attachment_id, uid=uid, filename=filename, mime="video/mp4")
+
+
+async def _encoded(candidates, links: MediaLinks, profile=None):
+    """Every inline source of these candidates, read and encoded by the REAL pipeline step.
+
+    Not a hand-built dict of raw bytes: `build_cards` is fed what `read_card_images` produces, so
+    a test that assembled the mapping itself would stop exercising the encoder the moment one was
+    introduced — which is exactly what happened here.
+    """
+    return await render.read_card_images(
+        render.card_source_paths(candidates, links, 2), profile or mail_profile()
+    )
 
 
 # --- the sanitiser, and AC 4 --------------------------------------------------------------------
@@ -148,10 +160,10 @@ def test_the_subject_names_the_part_only_when_there_is_more_than_one():
 # --- cards --------------------------------------------------------------------------------------
 
 
-def test_a_photo_card_inlines_its_thumb_as_a_cid(data_root):
-    write_thumb(data_root, "img-1", b"JPEGBYTES")
+async def test_a_photo_card_inlines_its_mobile_tier_as_a_cid(data_root):
+    tier = write_mobile(data_root, "img-1", size=(800, 600))
     candidate = _candidate(content="hello", images=[_image("img-1")])
-    files = {p: p.read_bytes() for p in render.card_source_paths([candidate], MediaLinks(), 2)}
+    files = await _encoded([candidate], MediaLinks())
     cards, inline = render.build_cards(
         [candidate],
         files,
@@ -162,15 +174,20 @@ def test_a_photo_card_inlines_its_thumb_as_a_cid(data_root):
     )
     assert len(cards) == 1 and len(cards[0].images) == 1
     assert inline[0].cid == cards[0].images[0].cid
-    assert inline[0].data == b"JPEGBYTES"
     assert inline[0].content_type == "image/jpeg"
+    # The bytes are the RE-ENCODE, not a copy of the tier: same picture, the mail profile's
+    # encoding. The tier is written at q95 and the profile asks for q80, so the two cannot match.
+    assert inline[0].data != tier.read_bytes()
+    assert inline[0].data.startswith(b"\xff\xd8")  # still a JPEG
+    # 800x600 is under the profile's 1600 long edge, so the re-encode does not resize it.
+    assert (cards[0].images[0].pixel_width, cards[0].images[0].pixel_height) == (800, 600)
 
 
-def test_a_hosted_video_gets_a_poster_cid_and_a_link(data_root):
-    write_poster(data_root, "vid-1", b"POSTER")
+async def test_a_hosted_video_gets_a_poster_cid_and_a_link(data_root):
+    write_poster(data_root, "vid-1")
     links = MediaLinks(by_attachment={2: "https://dropbox.example/v.mp4?raw=1"})
     candidate = _candidate(videos=[_video("vid-1")])
-    files = {p: p.read_bytes() for p in render.card_source_paths([candidate], links, 2)}
+    files = await _encoded([candidate], links)
     cards, inline = render.build_cards(
         [candidate],
         files,
@@ -189,7 +206,7 @@ def test_a_hosted_video_gets_a_poster_cid_and_a_link(data_root):
 def test_an_unhosted_video_carries_the_not_hosted_chip_and_no_poster(data_root):
     """AC 2 as amended: hosting off or its token refresh failed → a "video not hosted" note, never
     an attached mp4."""
-    write_poster(data_root, "vid-1", b"POSTER")
+    write_poster(data_root, "vid-1")
     candidate = _candidate(videos=[_video("vid-1")])
     cards, inline = render.build_cards(
         [candidate],
@@ -218,14 +235,14 @@ def test_a_video_whose_mp4_is_not_transcoded_yet_reads_as_processing():
     assert cards[0].videos[0].status == render.PROCESSING
 
 
-def test_max_videos_per_memo_bounds_the_card(data_root):
+async def test_max_videos_per_memo_bounds_the_card(data_root):
     for uid in ("v1", "v2", "v3"):
-        write_poster(data_root, uid, b"P")
+        write_poster(data_root, uid)
     candidate = _candidate(
         videos=[_video("v1", 1), _video("v2", 2), _video("v3", 3)]
     )
     links = MediaLinks(by_attachment={1: "u1", 2: "u2", 3: "u3"})
-    files = {p: p.read_bytes() for p in render.card_source_paths([candidate], links, 2)}
+    files = await _encoded([candidate], links)
     cards, _ = render.build_cards(
         [candidate],
         files,
@@ -237,11 +254,11 @@ def test_max_videos_per_memo_bounds_the_card(data_root):
     assert len(cards[0].videos) == 2
 
 
-def test_link_images_full_turns_the_inline_thumb_into_a_link(data_root):
-    write_thumb(data_root, "img-1", b"T")
+async def test_link_images_full_turns_the_inline_image_into_a_link(data_root):
+    write_mobile(data_root, "img-1")
     links = MediaLinks(by_attachment={1: "https://dropbox.example/full.jpg?raw=1"})
     candidate = _candidate(images=[_image("img-1")])
-    files = {p: p.read_bytes() for p in render.card_source_paths([candidate], links, 2)}
+    files = await _encoded([candidate], links)
     cards, _ = render.build_cards(
         [candidate],
         files,
@@ -253,10 +270,10 @@ def test_link_images_full_turns_the_inline_thumb_into_a_link(data_root):
     assert cards[0].images[0].link_url == "https://dropbox.example/full.jpg?raw=1"
 
 
-def test_the_incomplete_flag_reaches_the_card_and_the_template(data_root):
-    write_thumb(data_root, "img-1", b"T")
+async def test_the_incomplete_flag_reaches_the_card_and_the_template(data_root):
+    write_mobile(data_root, "img-1")
     candidate = _candidate(images=[_image("img-1")], incomplete=True)
-    files = {p: p.read_bytes() for p in render.card_source_paths([candidate], MediaLinks(), 2)}
+    files = await _encoded([candidate], MediaLinks())
     cards, _ = render.build_cards(
         [candidate],
         files,
@@ -279,10 +296,10 @@ def test_the_incomplete_flag_reaches_the_card_and_the_template(data_root):
 # --- the rendered message  ----------------------------------------------------------------------
 
 
-def _one_card_groups(data_root, content: str = "hello") -> list[render.DayGroup]:
-    write_thumb(data_root, "img-1", b"T")
+async def _one_card_groups(data_root, content: str = "hello") -> list[render.DayGroup]:
+    write_mobile(data_root, "img-1")
     candidate = _candidate(content=content, images=[_image("img-1")])
-    files = {p: p.read_bytes() for p in render.card_source_paths([candidate], MediaLinks(), 2)}
+    files = await _encoded([candidate], MediaLinks())
     cards, _ = render.build_cards(
         [candidate],
         files,
@@ -294,9 +311,9 @@ def _one_card_groups(data_root, content: str = "hello") -> list[render.DayGroup]
     return render.group_by_local_day(cards, "Europe/Zurich")
 
 
-def test_the_html_uses_the_configured_mail_title(data_root):
+async def test_the_html_uses_the_configured_mail_title(data_root):
     html = render.render_html(
-        _one_card_groups(data_root),
+        await _one_card_groups(data_root),
         subject="s",
         mail_title="Household Post",
         date_range="July 1, 2026",
@@ -305,8 +322,8 @@ def test_the_html_uses_the_configured_mail_title(data_root):
     assert "Household Post" in html
 
 
-def test_the_part_banner_appears_only_in_a_multi_part_mail(data_root):
-    groups = _one_card_groups(data_root)
+async def test_the_part_banner_appears_only_in_a_multi_part_mail(data_root):
+    groups = await _one_card_groups(data_root)
     single = render.render_html(
         groups, subject="s", mail_title="t", date_range="r", memo_count=1
     )
@@ -323,17 +340,17 @@ def test_the_part_banner_appears_only_in_a_multi_part_mail(data_root):
     assert "Part 1 of 1" not in single
 
 
-def test_a_memos_ng_link_in_a_memo_never_reaches_the_rendered_html(data_root):
+async def test_a_memos_ng_link_in_a_memo_never_reaches_the_rendered_html(data_root):
     """The end-to-end shape of AC 4, through the real template."""
-    groups = _one_card_groups(data_root, content=f"[home](https://{MEMOS_HOST}/m/abc)")
+    groups = await _one_card_groups(data_root, content=f"[home](https://{MEMOS_HOST}/m/abc)")
     html = render.render_html(
         groups, subject="s", mail_title="t", date_range="r", memo_count=1
     )
     assert MEMOS_HOST not in html
 
 
-def test_the_plain_alternative_carries_the_text_and_the_media_summary(data_root):
-    groups = _one_card_groups(data_root, content="hello world")
+async def test_the_plain_alternative_carries_the_text_and_the_media_summary(data_root):
+    groups = await _one_card_groups(data_root, content="hello world")
     plain = render.render_plain(groups, subject="Subject", memo_count=1)
     assert plain.startswith("Subject\n=======")
     assert "hello world" in plain

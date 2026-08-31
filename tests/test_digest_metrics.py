@@ -33,7 +33,7 @@ from tests.digest_support import (
     seed_memo,
     seed_user,
     set_digest_settings,
-    write_thumb,
+    write_mobile,
 )
 
 NOW = datetime(2026, 7, 1, 6, 0, tzinfo=UTC)
@@ -252,7 +252,7 @@ async def test_the_families_are_exposed_on_the_apps_metrics_endpoint_and_change_
             created_at=datetime(2026, 6, 20, tzinfo=UTC),
         )
         attachment = await seed_attachment(db, user, memo, mime="image/jpeg")
-        write_thumb(data_root, attachment.uid)
+        write_mobile(data_root, attachment.uid)
         await db.commit()
 
     await digest_metrics.refresh_now()

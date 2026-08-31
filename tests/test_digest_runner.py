@@ -43,8 +43,8 @@ from tests.digest_support import (
     seed_memo,
     seed_user,
     set_digest_settings,
+    write_mobile,
     write_poster,
-    write_thumb,
     write_web_mp4,
 )
 
@@ -76,8 +76,17 @@ async def env(db_engine, tmp_path, monkeypatch):
             await db.commit()
 
 
-async def _seed_photo_memos(subject: str, data_root, count: int, *, thumb_bytes: int = 500):
-    """`count` public memos, each with one photo whose thumb is on disk, one minute apart."""
+async def _seed_photo_memos(
+    subject: str, data_root, count: int, *, photo_size: tuple[int, int] = (64, 48)
+):
+    """`count` public memos, each with one photo whose mobile tier is on disk, one minute apart.
+
+    The tier is a REAL JPEG of `photo_size` filled with NOISE: the renderer decodes and re-encodes
+    it now, so a placeholder would not survive, and only incompressible pixels give the splitting
+    tests a byte count that means anything. One of these encodes to ~2.7 kB, which is why the
+    part-splitting tests below cap a message at 6000 rather than 3000 bytes: the cap has to sit
+    between one card and two, and the numbers on both sides moved when the encoder arrived.
+    """
     async with async_session() as db:
         user = await seed_user(db, subject=subject)
         memo_ids = []
@@ -90,7 +99,7 @@ async def _seed_photo_memos(subject: str, data_root, count: int, *, thumb_bytes:
                 created_at=datetime(2026, 6, 20, 10, index, tzinfo=UTC),
             )
             attachment = await seed_attachment(db, user, memo, mime="image/jpeg")
-            write_thumb(data_root, attachment.uid, b"T" * thumb_bytes)
+            write_mobile(data_root, attachment.uid, size=photo_size, noise=True)
             memo_ids.append(memo.id)
         await db.commit()
     return memo_ids
@@ -137,7 +146,7 @@ async def test_a_single_part_subject_is_byte_identical_to_the_satellites(env):
 async def test_a_multi_part_subject_names_the_part(env):
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 2)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
     transport = FakeTransport()
     await digest_runner.run_digest(transport=transport, now_utc=NOW)
     assert [mail.message["Subject"] for mail in transport.sent] == [
@@ -199,7 +208,7 @@ async def test_everything_deferred_ends_the_run_deferred(env):
 async def test_each_part_commits_its_own_deliveries_with_its_part_index(env):
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 2)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
     transport = FakeTransport()
     result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
     assert result is not None and result.parts == 2 and result.parts_sent == 2
@@ -212,7 +221,7 @@ async def test_a_part_refused_by_ONE_recipient_still_commits(env):
     the accepting recipients forever."""
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 2)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
     transport = FakeTransport(refusals_by_part={2: {"b@example.com": (550, b"no such user")}})
     result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
 
@@ -231,7 +240,7 @@ async def test_a_part_NOBODY_accepted_is_a_failed_part(env):
     not, and the run reads `failed` with `parts_sent < parts`."""
     subject, data_root = env
     memo_ids = await _seed_photo_memos(subject, data_root, 2)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
     refusals = {address: (550, b"denied") for address in RECIPIENTS}
     transport = FakeTransport(refusals_by_part={2: refusals})
     result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
@@ -252,7 +261,7 @@ async def test_a_part_NOBODY_accepted_is_a_failed_part(env):
 async def test_an_smtp_failure_on_a_part_leaves_that_part_unwritten(env):
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 2)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
     transport = FakeTransport(raise_on_part=2)
     result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
     assert result is not None
@@ -373,7 +382,7 @@ async def test_a_lost_claim_aborts_before_the_next_part_reaches_smtp(env):
     updates 0 rows and it stops — with the fake transport recording no further send."""
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 3)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
 
     async def advance_parts_claimed():
         run_id = await _current_run_id()
@@ -398,7 +407,7 @@ async def test_a_swept_run_cannot_advance_or_send_again(env):
     must stop at its very next fenced write, before any further SMTP contact."""
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 3)
-    set_digest_settings(max_email_bytes=3000)
+    set_digest_settings(max_email_bytes=6000)
 
     async def sweep_it():
         run_id = await _current_run_id()
@@ -609,7 +618,7 @@ async def _seed_video_memo(subject: str, data_root):
         )
         await db.commit()
         write_web_mp4(data_root, attachment.uid, b"MP4" * 10)
-        write_poster(data_root, attachment.uid, b"POSTER")
+        write_poster(data_root, attachment.uid)
         return memo.id, attachment.id
 
 

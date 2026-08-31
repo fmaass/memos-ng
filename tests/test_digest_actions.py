@@ -36,7 +36,7 @@ from tests.digest_support import (
     seed_memo,
     seed_user,
     set_digest_settings,
-    write_thumb,
+    write_mobile,
     write_web_mp4,
 )
 
@@ -93,7 +93,7 @@ async def _seed_memo_with_photo(subject: str, data_root, *, content: str = "hell
             created_at=datetime(2026, 6, 20, tzinfo=UTC),
         )
         attachment = await seed_attachment(db, user, memo, mime="image/jpeg")
-        write_thumb(data_root, attachment.uid)
+        write_mobile(data_root, attachment.uid)
         await db.commit()
         return memo.id
 

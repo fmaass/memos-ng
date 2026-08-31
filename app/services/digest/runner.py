@@ -45,17 +45,21 @@ cleanable orphan and an unfindable one.
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
+from anyio import to_thread
+from sqlalchemy import select
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as app_settings
 from app.database import async_session
-from app.models import DigestRunStatus, DigestTrigger, HostedMediaStatus
+from app.models import Attachment, DigestRunStatus, DigestTrigger, HostedMediaStatus
+from app.services import media, printready
 from app.services.digest import domain, hosting, render
 from app.services.digest import select as selection_mod
 from app.services.digest.domain import DigestConfig, sender_address
@@ -72,6 +76,8 @@ from app.services.digest.mailer import (
 from app.services.digest.render import DayGroup, InlineImage
 from app.services.digest.select import Candidate, Deferral
 from app.services.digest.splitting import Part, build_cid_to_bytes, split_into_parts
+from app.services.export_settings import ExportConfig
+from app.services.export_settings import load_config as load_export_settings
 
 logger = structlog.get_logger(__name__)
 
@@ -428,6 +434,17 @@ async def load_settings(db: AsyncSession) -> DigestConfig:
     return await domain.load_config(db)
 
 
+async def load_export_config(db: AsyncSession) -> ExportConfig:
+    """The two export profiles as a frozen snapshot — see `app.services.export_settings`.
+
+    ONE read per run, taken beside the digest settings and then carried as a value through every
+    render. Not a convenience: the mail profile decides the bytes of every inline image, and a
+    settings change committed between the first photo and the last would otherwise put two
+    encodings in one message — visibly, since the long edge is one of the four fields.
+    """
+    return await load_export_settings(db)
+
+
 async def enabled_recipients(db: AsyncSession) -> list[str]:
     rows = await db.execute(
         sa_text(
@@ -577,11 +594,145 @@ def dropbox_configured() -> bool:
     return domain.dropbox_configured()
 
 
+# --- the hosted full-size copies (MEMNG-240) ------------------------------------------------------
+#
+# `link_images_full` offers each inline photo an "Open full size" link to a copy on Dropbox, and
+# that copy is now the PRINT profile's rendition rather than the 2048 px screen tier: the hosted
+# files are temporary (the digest's `retention_days`, default 30) and may carry photobook quality.
+#
+# The rendition is derived IN THE RUN when it is not already on disk, and that is a deliberate,
+# bounded exception to `printready`'s "on demand, slow lane" rule rather than an oversight. The
+# queue cannot serve this case at all: a memo is ONE-SHOT (`select.load_candidates` anti-joins
+# `digest_deliveries`), so an attachment that is not hosted in the run that mails its memo is never
+# hosted — a job enqueued here would finish minutes after the mail had gone, for a memo no later
+# run will ever look at again.
+#
+# What keeps that from becoming a thermal event on a host shared with production:
+
+# The most renditions ONE run will derive. A 40-60 MP decode + LANCZOS reduction + q92 encode is
+# seconds of full-core CPU, `max_memos_per_run` defaults to 40, and photos are per MEMO — so an
+# unbounded run could ask for well over a hundred. Twelve is a few times the household's real daily
+# posting rate and bounds one run's worst case to well under a minute of CPU. It is deliberately a
+# constant and not a setting: the number that matters is the one nobody can raise by accident.
+MAX_PRINTREADY_DERIVES_PER_RUN = 12
+
+
+def _derive_printready_sync(
+    attachment: Attachment, profile: printready.PrintProfile
+) -> Path | None:
+    """Derive ONE print rendition, or None when the host is too hot to encode.
+
+    The heat check rides in the same offloaded hop as the encode it guards: it is a sysfs read, it
+    has to happen immediately before the work rather than at the top of the run, and splitting the
+    two would put a blocking file read back on the loop for nothing.
+
+    This is `media.process_printready` with no `guard_publish` behind it, because there is no job
+    row to guard — the residual is an attachment DELETED between this run's read of it and this
+    encode, which would leave a rendition no row names (see the ledger's Open questions).
+    """
+    if media.too_hot():
+        return None
+    return media.process_printready(attachment, profile)
+
+
+async def print_grade_sources(
+    session_factory: SessionFactory,
+    candidates: list[Candidate],
+    *,
+    profile: printready.PrintProfile,
+    budget: int | None = None,
+) -> dict[int, Path]:
+    """The print-grade file to host for each photo that HAS one, by attachment id.
+
+    An attachment missing from the answer is not a failure and never defers anything: the hosting
+    step falls back to the screen tier for it, which is exactly what the digest hosted before this
+    existed. Three causes reach that fallback and all three are graceful — the run's encode budget
+    is spent, the host is too hot, or the encode itself failed.
+
+    The rendition is written through `printready.printready_path`, the same profile-versioned cache
+    every other consumer reads, so the work is REUSABLE: the photo book, a later digest run and a
+    re-send all find it already there. That is also why a rendition that is already current is
+    simply used — the expensive thing must not happen twice for one photo.
+
+    The session is opened, read from and CLOSED before any encoding starts. `expunge_all` is what
+    makes that possible: the rows are detached but every attribute this needs is already loaded
+    (`renditions` is `lazy="selectin"`), so nothing here can lazy-load, and a pooled connection is
+    provably not held across seconds of Pillow.
+    """
+    # Resolved at CALL time, not bound as a default: the number is a module constant so that a
+    # reader finds one answer, and a default argument would freeze whatever it was at import.
+    allowance = MAX_PRINTREADY_DERIVES_PER_RUN if budget is None else budget
+    ids = list(dict.fromkeys(ref.attachment_id for c in candidates for ref in c.images))
+    if not ids:
+        return {}
+    async with session_factory() as db:
+        rows = list(
+            (await db.execute(select(Attachment).where(Attachment.id.in_(ids))))
+            .scalars()
+            .unique()
+        )
+        db.expunge_all()
+    attachments = {row.id: row for row in rows}
+    probes = await printready.probe_renditions(rows, profile=profile)
+
+    sources: dict[int, Path] = {}
+    # ATTEMPTS, not successes, are what the budget spends. The expensive half of a print derive —
+    # the 40-60 MP decode and the LANCZOS reduction — is paid BEFORE anything can fail, so a
+    # budget that only counted the encodes that worked would let a run of corrupt or unreadable
+    # masters do unbounded Pillow work while reporting that it had derived nothing at all.
+    attempts = 0
+    derived = 0
+    hot = False
+    exhausted = False
+    for attachment_id in ids:
+        attachment = attachments.get(attachment_id)
+        probe = probes.get(attachment_id)
+        if attachment is None or probe is None or not probe.source_present:
+            continue
+        if probe.current:  # already on disk for THIS profile — never re-encoded
+            sources[attachment_id] = printready.printready_path(attachment.uid, profile)
+            continue
+        if hot:
+            continue  # the host does not cool down inside one run; stop asking
+        if attempts >= allowance:
+            exhausted = True
+            continue
+        # Counted before the dispatch, so EVERY path spends it: the encode that succeeds, the one
+        # that raises, and the one `_derive_printready_sync` abandons because the host is hot
+        # (which still cost the thermal read and the hop).
+        attempts += 1
+        try:
+            written = await to_thread.run_sync(_derive_printready_sync, attachment, profile)
+        except Exception:
+            # One unreadable master costs ONE hosted copy its quality, never the run. The log
+            # names the attachment; the card still gets its link, from the screen tier.
+            logger.warning("digest.printready_derive_failed", attachment_id=attachment_id)
+            continue
+        if written is None:
+            hot = True
+            continue
+        derived += 1
+        sources[attachment_id] = written
+    if hot:
+        # ONE line per run, like `digest.hosting_unavailable`: the cause is a host temperature and
+        # the consequence is that the rest of this run hosts screen tiers.
+        logger.warning("digest.printready_too_hot", attempts=attempts, derived=derived)
+    if exhausted:
+        logger.info(
+            "digest.printready_budget_spent",
+            budget=allowance,
+            attempts=attempts,
+            derived=derived,
+        )
+    return sources
+
+
 async def build_digest(
     session_factory: SessionFactory,
     settings: DigestConfig,
     selection: selection_mod.Selection,
     *,
+    export: ExportConfig,
     host: MediaHost | None,
     ledger: HostedLedger | None = None,
 ) -> RenderedDigest:
@@ -596,6 +747,8 @@ async def build_digest(
     The selection is TRUNCATED at `max_memos_per_run` here, which is how a preview and a test-send
     "honour max_memos_per_run like every run" while still always producing a body. A real run never
     reaches this with an over-cap selection: its plausibility guard has already failed the run.
+
+    `export` is the caller's snapshot and is never re-read here — see `load_export_config`.
     """
     included = selection.included[: settings.max_memos_per_run]
     rendered = RenderedDigest(selected=included, deferred=list(selection.deferred))
@@ -607,6 +760,14 @@ async def build_digest(
     )
     async with session_factory() as db:
         existing = await existing_hosted_links(db, attachment_ids)
+    # Only a run that will actually UPLOAD prepares print-grade copies: a preview or a test-send
+    # reaches here with `host=None` by contract, and deriving renditions for a probe would spend
+    # the host's CPU on files nothing is going to send.
+    image_full_sources: dict[int, Path] = {}
+    if settings.link_images_full and host is not None:
+        image_full_sources = await print_grade_sources(
+            session_factory, included, profile=export.print_profile
+        )
     rendered.links = await hosting.resolve_links(
         included,
         host=host,
@@ -614,10 +775,12 @@ async def build_digest(
         existing=existing,
         max_videos_per_memo=settings.max_videos_per_memo,
         link_images_full=settings.link_images_full,
+        image_full_sources=image_full_sources,
     )
 
-    files = await render.read_card_files(
-        render.card_source_paths(included, rendered.links, settings.max_videos_per_memo)
+    files = await render.read_card_images(
+        render.card_source_paths(included, rendered.links, settings.max_videos_per_memo),
+        export.mail_profile,
     )
     cards, inline = render.build_cards(
         included,
@@ -777,6 +940,7 @@ async def _execute_run(
     async with session_factory() as db:
         settings = await load_settings(db)
         recipients = await enabled_recipients(db)
+        export = await load_export_config(db)
     sender = sender_address(settings)
 
     # Capability and plausibility guards, all BEFORE any render or upload work (LSN-0022: never
@@ -832,6 +996,7 @@ async def _execute_run(
             session_factory,
             settings,
             candidates,
+            export=export,
             host=host,
             ledger=SessionLedger(session_factory, run_id=run_id),
         )
@@ -1173,9 +1338,13 @@ async def preview(
     """Render what would go out now. Persists nothing and uploads nothing."""
     async with session_factory() as db:
         settings = await load_settings(db)
+        export = await load_export_config(db)
     moment = now_utc or datetime.now(UTC)
     selection = await selection_mod.select_for_run(session_factory, settings, moment)
-    return await build_digest(session_factory, settings, selection, host=None), settings
+    rendered = await build_digest(
+        session_factory, settings, selection, export=export, host=None
+    )
+    return rendered, settings
 
 
 async def test_send(
@@ -1202,6 +1371,7 @@ async def test_send(
     """
     async with session_factory() as db:
         settings = await load_settings(db)
+        export = await load_export_config(db)
     moment = now_utc or datetime.now(UTC)
     active_transport = transport or default_transport()
     sender = sender_address(settings)
@@ -1225,7 +1395,9 @@ async def test_send(
         return 0
 
     selection = await selection_mod.select_for_run(session_factory, settings, moment)
-    rendered = await build_digest(session_factory, settings, selection, host=None)
+    rendered = await build_digest(
+        session_factory, settings, selection, export=export, host=None
+    )
     if not rendered.parts:
         html, plain = render.render_empty(settings.mail_title)
         message = build_message(
