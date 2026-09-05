@@ -1,5 +1,6 @@
 """Acceptance probe for W-AUTODATE: the capture inspection endpoint over the real upload lane."""
 
+import json
 from pathlib import Path
 
 from app.config import settings
@@ -7,7 +8,10 @@ from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
 
-FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "auto-memo-date"
+ROOT = Path(__file__).resolve().parent.parent
+FIXTURES = ROOT / "fixtures" / "auto-memo-date"
+# The expected answer is the artefact's, by name — the probe proves the LANE, not the rule.
+EXPECTED = json.loads((ROOT / "fixtures" / "auto-memo-date.json").read_text())["binaries"]
 
 
 def _cleanup():
@@ -38,11 +42,6 @@ def test_capture_endpoint_reports_the_jpeg_exif_instant(logged_in_client, monkey
         uid = _upload(client, "jpeg-offset.jpg", "image/jpeg")
         r = client.get(f"/api/uploads/{uid}/capture")
         assert r.status_code == 200, r.text
-        assert r.json() == {
-            "state": "done",
-            "capture_instant": "2026-01-01T07:15:00Z",
-            "capture_civil": None,
-            "capture_source": "exif",
-        }
+        assert r.json() == {"state": "done", **EXPECTED["jpeg-offset.jpg"]["expect"]}
     finally:
         _cleanup()
