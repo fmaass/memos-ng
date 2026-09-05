@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { effectScope, nextTick, watchEffect } from 'vue'
 
 import { uploadFile, useUploadQueue } from '@/composables/useResumableUpload'
+import { instantOf } from '@/lib/__tests__/artefact'
+
+// The one dated instant these tests need is the artefact's, by id: the subject here is the FENCE,
+// not the rule, and a second spelling of a capture instant is a second place to change it.
+const DATED = instantOf('single-exact', 'A')
 
 function jsonRes(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -317,7 +322,7 @@ describe('the capture inspection is identity-fenced (MEMNG-262)', () => {
     laneWith(async () =>
       jsonRes({
         state: 'done',
-        capture_instant: '2026-01-01T13:00:00Z',
+        capture_instant: DATED,
         capture_civil: null,
         capture_source: 'exif',
       }),
@@ -325,7 +330,7 @@ describe('the capture inspection is identity-fenced (MEMNG-262)', () => {
     const queue = useUploadQueue()
     const [item] = queue.add([fileOf(4, 'pic.jpg', 'image/jpeg')])
     await vi.waitFor(() => expect(item.captureState).toBe('done'))
-    expect(item.captureInstant).toBe('2026-01-01T13:00:00Z')
+    expect(item.captureInstant).toBe(DATED)
     expect(item.captureSource).toBe('exif')
   })
 
@@ -344,7 +349,7 @@ describe('the capture inspection is identity-fenced (MEMNG-262)', () => {
     answer(
       jsonRes({
         state: 'done',
-        capture_instant: '2026-01-01T13:00:00Z',
+        capture_instant: DATED,
         capture_civil: null,
         capture_source: 'exif',
       }),

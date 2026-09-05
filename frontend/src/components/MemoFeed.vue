@@ -97,6 +97,13 @@ const editMemo = useMutation({
   },
 })
 
+// Which memo's edit is still in flight, if any (MEMNG-262). The card cannot see the request the
+// parent owns, and it needs to: without this its own claim would have to be released by a guess,
+// and reopening the panel while the PATCH is out would offer a second Save for the same edit.
+const editPendingUid = computed(() =>
+  editMemo.isPending.value ? editMemo.variables.value?.uid : undefined,
+)
+
 // Attach/replace/remove the print master of one of your photos, and refresh. Shared with the
 // Resources lightbox — the composable carries the resumable upload, the per-photo progress the
 // tiles chip, and the success/error toasts (MEMNG-74/75).
@@ -171,6 +178,7 @@ onUnmounted(() => observer?.disconnect())
         :key="m.uid"
         :memo="m"
         :restorable="restorable"
+        :edit-pending="editPendingUid === m.uid"
         @restore="emit('restore', $event)"
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"

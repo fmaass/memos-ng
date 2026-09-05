@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
@@ -9,6 +6,14 @@ import { nextTick } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import CaptureEditor from '@/components/CaptureEditor.vue'
+
+import {
+  dateVector,
+  fileNameOf,
+  instantOf,
+  orderVector,
+  type VectorItem,
+} from '@/lib/__tests__/artefact'
 
 /**
  * The composer's Auto memo date and capture order, driven through the REAL upload lane
@@ -33,30 +38,6 @@ vi.mock('@/composables/useSettings', async () => {
   const { ref } = await import('vue')
   return { useSettings: () => ({ settings: ref(undefined), update: { mutate: () => {} } }) }
 })
-
-interface VectorItem {
-  id: string
-  instant: string | null
-  civil: string | null
-}
-interface Artefact {
-  vectors: {
-    autoMemoDate: {
-      id: string
-      items: VectorItem[]
-      expect: { instant: string | null; approximate: boolean; span: number }
-    }[]
-    captureOrder: { id: string; items: VectorItem[]; expect: string[] }[]
-  }
-}
-const artefact: Artefact = JSON.parse(
-  readFileSync(join(import.meta.dirname, '../../../../fixtures/auto-memo-date.json'), 'utf8'),
-)
-const dateVector = (id: string) => artefact.vectors.autoMemoDate.find((v) => v.id === id)!
-const orderVector = (id: string) => artefact.vectors.captureOrder.find((v) => v.id === id)!
-
-/** A vector item becomes a file named after it, and the answer its inspection gives. */
-const fileNameOf = (item: VectorItem) => `${item.id}.jpg`
 
 interface CaptureAnswer {
   state?: 'pending' | 'done'
@@ -268,7 +249,7 @@ describe('CaptureEditor — the Auto memo date', () => {
   })
 
   it('goes Auto → Manual on a picked date, and back to Auto on one click', async () => {
-    stubLane({ 'pic.jpg': [{ capture_instant: '2026-01-01T13:00:00Z' }] })
+    stubLane({ 'pic.jpg': [{ capture_instant: instantOf('single-exact', 'A') }] })
     const wrapper = mountEditor()
     await attach(wrapper, 'pic.jpg')
     expect(wrapper.find('[data-test="auto-date-chip"]').exists()).toBe(true)
@@ -281,14 +262,16 @@ describe('CaptureEditor — the Auto memo date', () => {
     await nextTick()
 
     const picker = wrapper.findComponent({ name: 'DatePicker' })
-    picker.vm.$emit('update:model-value', new Date('2026-06-06T08:00:00Z'))
+    // Any instant the artefact knows about will do — the subject is the MODE, not the value.
+    const manual = instantOf('two-calendar-days', 'A')
+    picker.vm.$emit('update:model-value', new Date(manual))
     await nextTick()
     expect(wrapper.find('[data-test="date-chip"]').exists()).toBe(true) // MANUAL now
     expect(wrapper.find('[data-test="auto-date-chip"]').exists()).toBe(false)
 
     await wrapper.find('[data-test="save"]').trigger('click')
     await flushPromises()
-    expect(postMemo.mock.calls[0][1].body.created_at).toBe('2026-06-06T08:00:00Z')
+    expect(postMemo.mock.calls[0][1].body.created_at).toBe(manual)
 
     // after the post the composer is back on Auto for the next memo
     await nextTick()
@@ -355,8 +338,8 @@ describe('CaptureEditor — one post at a time, and it clears only what it poste
 
   it('keeps a file attached WHILE the post was in flight, and clears only the posted one', async () => {
     stubLane({
-      'posted.jpg': [{ capture_instant: '2026-01-01T13:00:00Z' }],
-      'later.jpg': [{ capture_instant: '2026-01-02T13:00:00Z' }],
+      'posted.jpg': [{ capture_instant: instantOf('single-exact', 'A') }],
+      'later.jpg': [{ capture_instant: instantOf('two-calendar-days', 'A') }],
     })
     const land = deferredPost()
     const wrapper = mountEditor()
@@ -376,6 +359,38 @@ describe('CaptureEditor — one post at a time, and it clears only what it poste
     // the posted tile is released; the one added meanwhile belongs to the NEXT memo and stays
     expect(tileNames(wrapper)).toEqual(['later.jpg'])
     expect(wrapper.emitted('saved')).toBeTruthy()
+  })
+
+  it('keeps a DATE picked while the post was in flight', async () => {
+    stubLane({})
+    const land = deferredPost()
+    const wrapper = mountEditor()
+    await wrapper.find('[data-test="content"]').setValue('auto-dated memo')
+
+    wrapper.find('[data-test="save"]').trigger('click')
+    await flushPromises()
+    expect(postMemo).toHaveBeenCalledTimes(1)
+    expect(postMemo.mock.calls[0][1].body.created_at).toBeUndefined() // posted on Auto
+
+    // the person starts the NEXT memo while the first is still going out, and picks a date for it
+    const menus = wrapper.findAllComponents({ name: 'Menu' })
+    ;(menus[menus.length - 1].props('model') as { command: () => void }[])[0].command()
+    await nextTick()
+    const next = instantOf('two-calendar-days', 'A')
+    wrapper.findComponent({ name: 'DatePicker' }).vm.$emit('update:model-value', new Date(next))
+    await nextTick()
+
+    land()
+    await flushPromises()
+    await nextTick()
+
+    // the completion resets what it posted — not the date the next memo is already carrying
+    expect(wrapper.find('[data-test="date-chip"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="auto-date-chip"]').exists()).toBe(false)
+    await wrapper.find('[data-test="content"]').setValue('the next one')
+    await wrapper.find('[data-test="save"]').trigger('click')
+    await flushPromises()
+    expect(postMemo.mock.calls[1][1].body.created_at).toBe(next)
   })
 })
 

@@ -196,6 +196,8 @@ async function save() {
     // refused); a tile added later belongs to the next one.
     const submittedContent = content.value
     const submittedIds = uploads.map((u) => u.id)
+    const submittedMode = dateMode.value
+    const submittedDate = memoDate.value
     const body: Record<string, unknown> = {
       content: submittedContent,
       visibility: visibility.value,
@@ -225,7 +227,14 @@ async function save() {
     // `removeUpload` per id, never `clearUploads()`, so the survivors keep their previews and
     // File references and the posted ones still release theirs.
     for (const id of submittedIds) removeUpload(id)
-    const untouched = content.value === submittedContent && uploads.length === 0
+    // The DATE is part of the draft too: a date picked while the request was in flight belongs to
+    // the next memo, and resetting to Auto because the text and the tiles happen to look untouched
+    // would throw it away.
+    const untouched =
+      content.value === submittedContent &&
+      uploads.length === 0 &&
+      dateMode.value === submittedMode &&
+      memoDate.value === submittedDate
     if (untouched) {
       content.value = ''
       useAutoDate() // a clean composer starts the next memo on Auto again

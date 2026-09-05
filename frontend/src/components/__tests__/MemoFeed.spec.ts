@@ -29,18 +29,36 @@ const patch = vi.fn().mockResolvedValue({ error: undefined })
 vi.mock('@/composables/useApi', () => ({ useApi: () => ({ PATCH: patch }) }))
 
 const invalidateQueries = vi.fn()
-vi.mock('@tanstack/vue-query', () => ({
-  useQueryClient: () => ({ invalidateQueries }),
-  useMutation: (opts: {
-    mutationFn: (v: unknown) => Promise<unknown>
-    onSuccess?: () => void
-  }) => ({
-    mutate: async (v: unknown) => {
-      await opts.mutationFn(v)
-      opts.onSuccess?.()
+// The double carries `isPending` and `variables` because the real one does, and the feed reads
+// them to tell a card that ITS edit is still in flight (MEMNG-262). A double missing them would
+// make that wiring untestable — and silently break the component it is standing in for.
+vi.mock('@tanstack/vue-query', async () => {
+  const { ref } = await import('vue')
+  return {
+    useQueryClient: () => ({ invalidateQueries }),
+    useMutation: (opts: {
+      mutationFn: (v: unknown) => Promise<unknown>
+      onSuccess?: () => void
+    }) => {
+      const isPending = ref(false)
+      const variables = ref<unknown>(undefined)
+      return {
+        isPending,
+        variables,
+        mutate: async (v: unknown) => {
+          variables.value = v
+          isPending.value = true
+          try {
+            await opts.mutationFn(v)
+            opts.onSuccess?.()
+          } finally {
+            isPending.value = false
+          }
+        },
+      }
     },
-  }),
-}))
+  }
+})
 
 // Print masters live in a shared composable (feed + Resources lightbox) and are unit-tested there;
 // here we only pin that the feed wires those mutations, with its own cache key.

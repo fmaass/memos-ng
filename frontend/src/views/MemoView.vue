@@ -160,6 +160,7 @@ function onTileRetry() {
     <MemoCard
       v-else-if="memo"
       :memo="memo"
+      :edit-pending="editMemo.isPending.value"
       @task-toggle="toggleTask.mutate($event)"
       @toggle-reaction="toggleReaction.mutate($event)"
       @delete-attachment="deleteAttachment.mutate($event)"

@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -11,33 +8,13 @@ import {
   type CaptureItem,
 } from '@/lib/autoMemoDate'
 
+import { artefact, instantOf, type VectorItem } from './artefact'
+
 /**
  * The Auto-date rules are held to `fixtures/auto-memo-date.json` — the ONE normative artefact the
  * backend suite and the iOS client are held to as well. Every case here comes out of that file by
- * id; nothing is restated locally, so a rule can only change in one place.
+ * id (see ./artefact); nothing is restated locally, so a rule can only change in one place.
  */
-interface VectorItem {
-  id: string
-  instant: string | null
-  civil: string | null
-}
-interface Artefact {
-  vectors: {
-    autoMemoDate: {
-      id: string
-      zone: string
-      items: VectorItem[]
-      expect: { instant: string | null; approximate: boolean; span: number }
-    }[]
-    captureOrder: { id: string; zone: string; items: VectorItem[]; expect: string[] }[]
-    span: { id: string; zone: string; instants: string[]; expect: number }[]
-    civilResolution: { id: string; civil: string; zone: string; expect: string | null }[]
-  }
-}
-
-const artefact: Artefact = JSON.parse(
-  readFileSync(join(import.meta.dirname, '../../../../fixtures/auto-memo-date.json'), 'utf8'),
-)
 
 const asItems = (items: VectorItem[]): CaptureItem[] =>
   items.map((i) => ({
@@ -94,12 +71,14 @@ describe('resolveCivil (fixture vectors)', () => {
 })
 
 describe('pending items never settle a date or an order', () => {
+  // The dated item is the artefact's own "single-exact" vector; only its STATE is the subject here.
+  const dated = instantOf('single-exact', 'A')
   const items: CaptureItem[] = [
     { id: 'A', captureState: 'pending', captureInstant: null, captureCivil: null },
-    { id: 'B', captureState: 'done', captureInstant: '2026-01-01T13:00:00Z', captureCivil: null },
+    { id: 'B', captureState: 'done', captureInstant: dated, captureCivil: null },
   ]
   it('a pending item contributes no instant', () => {
-    expect(iso(autoMemoDate(items, 'Europe/Berlin').instant)).toBe('2026-01-01T13:00:00Z')
+    expect(iso(autoMemoDate(items, 'Europe/Berlin').instant)).toBe(dated)
   })
   it('a pending item sorts as undated', () => {
     expect(captureOrder(items, 'Europe/Berlin').map((i) => i.id)).toEqual(['B', 'A'])

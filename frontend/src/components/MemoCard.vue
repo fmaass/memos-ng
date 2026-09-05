@@ -35,7 +35,16 @@ import { TASK_CHECKBOX_CLASS, toggleTask } from '@/lib/tasks'
 type Memo = components['schemas']['MemoOut']
 type Visibility = Memo['visibility']
 
-const props = defineProps<{ memo: Memo; restorable?: boolean }>()
+const props = defineProps<{
+  memo: Memo
+  restorable?: boolean
+  /**
+   * The parent's PATCH for THIS memo is still in flight. The card cannot know that on its own —
+   * the parent owns the request — and it is what releases the card's own claim, so a save cannot
+   * be repeated by reopening the editor while the first one is still out (MEMNG-262).
+   */
+  editPending?: boolean
+}>()
 const emit = defineEmits<{
   restore: [uid: string]
   'task-toggle': [payload: { uid: string; content: string }]
@@ -97,21 +106,29 @@ function onEditFiles(files: FileList | null) {
   if (files?.length) addEditUploads(Array.from(files))
 }
 function startEdit() {
-  submittingEdit = false
   editContent.value = props.memo.content
   editVisibility.value = props.memo.visibility
   editDate.value = new Date(props.memo.created_at)
   clearEditUploads() // NOT `editUploads.length = 0` — that strands preview object URLs + File refs
   editing.value = true
 }
-// Claimed synchronously, like the composer's: the parent owns the request, so this card would
-// otherwise emit a second edit for the same draft on a double click before the DOM settles.
-let submittingEdit = false
+// Claimed synchronously (a double click lands both handlers in one tick), and held until the
+// PATCH COMPLETES — which the parent reports through `editPending`. Reopening the editor while it
+// is out therefore shows the save in progress instead of offering a second one.
+const submittingEdit = ref(false)
+const editBusy = computed(() => submittingEdit.value || props.editPending === true)
+watch(
+  () => props.editPending,
+  (now, before) => {
+    // Landed or failed — either way the request is over and this card may be edited again.
+    if (before && !now) submittingEdit.value = false
+  },
+)
 
 function saveEdit() {
-  if (submittingEdit) return
+  if (editBusy.value) return
   if (editCapturePending.value.length > 0) return // the sentence is already on screen
-  submittingEdit = true
+  submittingEdit.value = true
   // Snapshot what is being submitted, then release exactly those tiles — a file attached in the
   // same moment is not part of this edit and must not vanish with it. Everything staged NOW is
   // part of it, a failed upload included; only what its uid reaches the wire.
@@ -130,15 +147,13 @@ function saveEdit() {
   })
   for (const item of staged) removeEditUpload(item.id)
   editing.value = false
-  // The claim is NOT released here: the parent owns the request, so nothing in this card can know
-  // it has landed. It is released when the editor is opened again (startEdit) or abandoned
-  // (cancelEdit) — which is exactly when a second edit becomes a genuinely different one.
+  // The claim is NOT released here, nor by reopening or cancelling: only the parent knows when
+  // its PATCH is over, and it says so through `editPending`.
 }
 // Cancel discards the staged uploads — they were never going to be attached (startEdit would drop
 // them on the next open anyway), so release them now instead of stranding their object URLs.
 function cancelEdit() {
   clearEditUploads()
-  submittingEdit = false
   editing.value = false
 }
 
@@ -421,6 +436,9 @@ function onContentClick(event: MouseEvent) {
       <p v-if="editCaptureMessage" class="text-sm text-muted-color" data-test="edit-capture-pending">
         {{ editCaptureMessage }}
       </p>
+      <p v-else-if="editBusy" class="text-sm text-muted-color" data-test="edit-in-flight">
+        Saving this memo… reopening it does not send it twice.
+      </p>
       <div class="flex items-center gap-1">
         <Button
           text
@@ -478,9 +496,9 @@ function onContentClick(event: MouseEvent) {
           <Button text size="small" label="Cancel" data-test="edit-cancel" @click="cancelEdit" />
           <Button
             size="small"
-            :label="editUploading ? 'Uploading…' : 'Save'"
+            :label="editBusy ? 'Saving…' : editUploading ? 'Uploading…' : 'Save'"
             icon="pi pi-check"
-            :disabled="editUploading || editCapturePending.length > 0"
+            :disabled="editUploading || editBusy || editCapturePending.length > 0"
             data-test="edit-save"
             @click="saveEdit"
           />

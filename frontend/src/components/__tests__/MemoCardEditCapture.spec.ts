@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
@@ -9,6 +6,8 @@ import { nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import MemoCard from '@/components/MemoCard.vue'
+
+import { fileNameOf, instantOf, orderVector } from '@/lib/__tests__/artefact'
 
 /**
  * The EDIT half of the settle-before-save rule (MEMNG-262): an edit opens in MANUAL on the memo's
@@ -25,20 +24,17 @@ vi.mock('@/composables/usePrintMaster', () => ({
   fetchPrintMasters: vi.fn().mockResolvedValue([]),
 }))
 
-const json = (body: unknown) => ({ ok: true, status: 200, headers: new Headers(), json: async () => body })
+const json = (body: unknown) => ({
+  ok: true,
+  status: 200,
+  headers: new Headers(),
+  json: async () => body,
+})
 
-// The order scenario is the shared artefact's, by id — the rule lives there, not here.
-interface VectorItem {
-  id: string
-  instant: string | null
-  civil: string | null
-}
-const artefact: { vectors: { captureOrder: { id: string; items: VectorItem[]; expect: string[] }[] } } =
-  JSON.parse(readFileSync(join(import.meta.dirname, '../../../../fixtures/auto-memo-date.json'), 'utf8'))
-const orderVector = (id: string) => artefact.vectors.captureOrder.find((v) => v.id === id)!
-const fileNameOf = (item: VectorItem) => `${item.id}.jpg`
-
-function stubLane(script: Record<string, { state?: 'pending' | 'done'; capture_instant?: string | null }>) {
+/** create → one append → the capture inspection, with the answers under the test's control. */
+function stubLane(
+  script: Record<string, { state?: 'pending' | 'done'; capture_instant?: string | null }>,
+) {
   const nameOf = new Map<string, string>()
   let n = 0
   vi.stubGlobal(
@@ -81,9 +77,9 @@ const memo = {
   total_size: 0,
 }
 
-function mountCard() {
+function mountCard(props: { editPending?: boolean } = {}) {
   return mount(MemoCard, {
-    props: { memo },
+    props: { memo, ...props },
     global: { plugins: [PrimeVue, ConfirmationService, ToastService] },
   })
 }
@@ -150,7 +146,7 @@ describe('MemoCard — the edit path waits for the capture decisions', () => {
   })
 
   it('emits ONE edit for two clicks in the same moment', async () => {
-    stubLane({ 'pic.jpg': { capture_instant: '2026-01-01T13:00:00Z' } })
+    stubLane({ 'pic.jpg': { capture_instant: instantOf('single-exact', 'A') } })
     const wrapper = mountCard()
     await openEditor(wrapper)
     await addFiles(wrapper, 'pic.jpg')
@@ -180,5 +176,46 @@ describe('MemoCard — the edit path waits for the capture decisions', () => {
     expect(wrapper.find('[data-test="edit-capture-pending"]').exists()).toBe(false)
     await wrapper.find('[data-test="edit-save"]').trigger('click')
     expect(wrapper.emitted('edit')).toHaveLength(1) // settled, just undated
+  })
+})
+
+
+describe('MemoCard — one edit at a time, until the parent says it is over', () => {
+  afterEach(() => {
+    vi.clearAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('will not send a second PATCH when the editor is REOPENED while the first is in flight', async () => {
+    stubLane({ 'pic.jpg': { capture_instant: instantOf('single-exact', 'A') } })
+    const wrapper = mountCard()
+    await openEditor(wrapper)
+    await addFiles(wrapper, 'pic.jpg')
+    await wrapper.find('[data-test="edit-save"]').trigger('click')
+    expect(wrapper.emitted('edit')).toHaveLength(1)
+
+    // the parent's PATCH is now out; the card is told so, and the person reopens the panel
+    await wrapper.setProps({ editPending: true })
+    await openEditor(wrapper)
+    expect(wrapper.find('[data-test="edit-in-flight"]').exists()).toBe(true) // it SAYS why
+    expect(wrapper.find('[data-test="edit-save"]').attributes('disabled')).toBeDefined()
+
+    await wrapper.find('[data-test="edit-save"]').trigger('click')
+    expect(wrapper.emitted('edit')).toHaveLength(1) // still one — the claim outlives the reopen
+  })
+
+  it('accepts a new edit once the parent reports the request finished', async () => {
+    stubLane({})
+    const wrapper = mountCard()
+    await openEditor(wrapper)
+    await wrapper.find('[data-test="edit-save"]').trigger('click')
+    expect(wrapper.emitted('edit')).toHaveLength(1)
+
+    await wrapper.setProps({ editPending: true })
+    await wrapper.setProps({ editPending: false }) // landed, or failed — either way it is over
+    await openEditor(wrapper)
+    expect(wrapper.find('[data-test="edit-in-flight"]').exists()).toBe(false)
+    await wrapper.find('[data-test="edit-save"]').trigger('click')
+    expect(wrapper.emitted('edit')).toHaveLength(2)
   })
 })
