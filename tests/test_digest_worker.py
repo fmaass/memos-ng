@@ -21,6 +21,7 @@ from app import migrations, worker
 from app.config import settings as app_settings
 from app.database import async_session
 from app.models import User, Visibility
+from app.services.digest import gate as digest_gate
 from app.services.digest import runner as digest_runner
 from sqlalchemy import delete
 from structlog.testing import capture_logs
@@ -38,6 +39,19 @@ from tests.digest_support import (
 )
 
 SENDER = "sender@example.com"
+
+
+async def _today_local():
+    """The LOCAL date the gate reasons in — deliberately not `datetime.now(UTC).date()`.
+
+    The ledger is keyed by the household zone's calendar date, so between local midnight and UTC
+    midnight (22:00–24:00 UTC under CEST) the two differ by a day: a run seeded under the UTC date
+    is a run for YESTERDAY, and every gate assertion that depends on "today already ran" silently
+    inverts inside that window.
+    """
+    async with async_session() as db:
+        settings_row = await digest_runner.load_settings(db)
+    return digest_gate.local_date_of(datetime.now(UTC), settings_row.timezone)
 
 
 @pytest.fixture
@@ -91,7 +105,7 @@ async def test_an_in_flight_run_makes_the_gate_false_before_the_index_has_to_dec
     set_digest_settings(enabled=True, send_time="00:00")
     async with async_session() as db:
         await digest_runner.open_run(
-            db, trigger="scheduled", local_date=datetime.now(UTC).date()
+            db, trigger="scheduled", local_date=await _today_local()
         )
     assert await worker.digest_is_due() is False
 
@@ -102,7 +116,7 @@ async def test_a_test_run_does_not_count_as_todays_attempt(env):
     set_digest_settings(enabled=True, send_time="00:00")
     async with async_session() as db:
         run_id = await digest_runner.open_run(
-            db, trigger="test", local_date=datetime.now(UTC).date()
+            db, trigger="test", local_date=await _today_local()
         )
         await digest_runner.finish_run(db, run_id, status=digest_runner.SENT)
     assert await worker.digest_is_due() is True
@@ -351,7 +365,7 @@ async def test_the_worker_adopts_and_executes_a_manual_run_the_api_committed(env
     set_digest_settings(enabled=True, start_date="2026-06-01")
     async with async_session() as db:
         run_id = await digest_runner.open_run(
-            db, trigger="manual", local_date=datetime.now(UTC).date()
+            db, trigger="manual", local_date=await _today_local()
         )
 
     adopted = await worker.adopt_manual_digest()
@@ -378,7 +392,7 @@ async def test_the_loop_gate_spawns_a_claimed_manual_run(env, monkeypatch):
     """
     async with async_session() as db:
         run_id = await digest_runner.open_run(
-            db, trigger="manual", local_date=datetime.now(UTC).date()
+            db, trigger="manual", local_date=await _today_local()
         )
     seen: list[int] = []
     done = asyncio.Event()
@@ -402,7 +416,7 @@ async def test_a_manual_row_already_being_run_is_not_adopted_a_second_time(env):
     else's — including one the stale sweep has not yet judged."""
     async with async_session() as db:
         run_id = await digest_runner.open_run(
-            db, trigger="manual", local_date=datetime.now(UTC).date()
+            db, trigger="manual", local_date=await _today_local()
         )
         assert await digest_runner.claim_run(db, run_id) is True
     assert await worker.adopt_manual_digest() is None
@@ -413,6 +427,6 @@ async def test_a_scheduled_row_is_never_adopted_as_a_manual_one(env):
     adopting it here would run today's digest twice through two different entry points."""
     async with async_session() as db:
         await digest_runner.open_run(
-            db, trigger="scheduled", local_date=datetime.now(UTC).date()
+            db, trigger="scheduled", local_date=await _today_local()
         )
     assert await worker.adopt_manual_digest() is None
