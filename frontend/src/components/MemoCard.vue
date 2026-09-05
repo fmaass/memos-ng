@@ -12,8 +12,10 @@ import type { components } from '@/api/schema'
 import { useElementWidth } from '@/composables/useElementWidth'
 import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
 import { fetchPrintMasters, printMasterUploads } from '@/composables/usePrintMaster'
-import { useUploadQueue } from '@/composables/useResumableUpload'
+import { type UploadItem, useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
+import { captureOrder } from '@/lib/autoMemoDate'
+import { captureBlockedMessage, pendingCaptureItems } from '@/lib/composer'
 import {
   printBadgeLabel,
   printChipState,
@@ -78,6 +80,16 @@ const editFileInput = ref<HTMLInputElement | null>(null)
 const editUploading = computed(() =>
   editUploads.some((u) => u.status === 'queued' || u.status === 'uploading'),
 )
+// An EDIT is always a manual date — it opens on the memo's own date and Auto is not offered (an
+// attachment that is already saved carries no capture instant this browser can read). The capture
+// decisions still have to SETTLE before Save, because the files added here are appended in capture
+// order among themselves, and that order is saved (MEMNG-262).
+const editZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+const editTiles = computed<UploadItem[]>(() => [...editUploads])
+const editCapturePending = computed(() => pendingCaptureItems(editTiles.value))
+const editCaptureMessage = computed(() =>
+  editCapturePending.value.length ? captureBlockedMessage(editCapturePending.value) : '',
+)
 function onEditFiles(files: FileList | null) {
   if (files?.length) addEditUploads(Array.from(files))
 }
@@ -89,12 +101,15 @@ function startEdit() {
   editing.value = true
 }
 function saveEdit() {
+  if (editCapturePending.value.length > 0) return // the sentence is already on screen
   emit('edit', {
     uid: props.memo.uid,
     content: editContent.value,
     visibility: editVisibility.value,
     created_at: (editDate.value ?? new Date(props.memo.created_at)).toISOString(),
-    upload_uids: editUploads
+    // In capture order among themselves; the server appends them after the memo's existing
+    // attachments, whose saved order this edit never re-sorts.
+    upload_uids: captureOrder(editTiles.value, editZone)
       .filter((u) => u.status === 'done' && u.uploadUid)
       .map((u) => u.uploadUid as string),
   })
@@ -369,6 +384,9 @@ function onContentClick(event: MouseEvent) {
           </button>
         </div>
       </div>
+      <p v-if="editCaptureMessage" class="text-sm text-muted-color" data-test="edit-capture-pending">
+        {{ editCaptureMessage }}
+      </p>
       <div class="flex items-center gap-1">
         <Button
           text
@@ -428,7 +446,7 @@ function onContentClick(event: MouseEvent) {
             size="small"
             :label="editUploading ? 'Uploading…' : 'Save'"
             icon="pi pi-check"
-            :disabled="editUploading"
+            :disabled="editUploading || editCapturePending.length > 0"
             data-test="edit-save"
             @click="saveEdit"
           />

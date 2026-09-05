@@ -290,3 +290,93 @@ describe('useUploadQueue', () => {
     expect(viaClear).toEqual(viaRemove) // identical per-item behaviour: no abort in either path
   })
 })
+
+describe('the capture inspection is identity-fenced (MEMNG-262)', () => {
+  /** create → one append → the capture poll, with the inspection answer under the test's control. */
+  function laneWith(capture: () => Promise<Response>) {
+    const captureCalls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const method = init.method ?? 'GET'
+        if (url === '/api/uploads' && method === 'POST') {
+          return jsonRes({ upload_uid: 'u1', chunk_size: 64, bytes_received: 0 })
+        }
+        if (url === '/api/uploads/u1' && method === 'PATCH') return jsonRes({ bytes_received: 4 })
+        if (url === '/api/uploads/u1/capture') {
+          captureCalls.push(url)
+          return capture()
+        }
+        throw new Error(`unexpected ${method} ${url}`)
+      }),
+    )
+    return captureCalls
+  }
+
+  it('applies the answer to the tile that asked for it', async () => {
+    laneWith(async () =>
+      jsonRes({
+        state: 'done',
+        capture_instant: '2026-01-01T13:00:00Z',
+        capture_civil: null,
+        capture_source: 'exif',
+      }),
+    )
+    const queue = useUploadQueue()
+    const [item] = queue.add([fileOf(4, 'pic.jpg', 'image/jpeg')])
+    await vi.waitFor(() => expect(item.captureState).toBe('done'))
+    expect(item.captureInstant).toBe('2026-01-01T13:00:00Z')
+    expect(item.captureSource).toBe('exif')
+  })
+
+  it('drops an answer whose tile is gone — it can never mark another tile done', async () => {
+    let answer!: (value: Response) => void
+    const pending = new Promise<Response>((resolve) => {
+      answer = resolve
+    })
+    laneWith(() => pending)
+    const queue = useUploadQueue()
+    const [first] = queue.add([fileOf(4, 'first.jpg', 'image/jpeg')])
+    await vi.waitFor(() => expect(first.status).toBe('done'))
+
+    queue.remove(first.id) // removed while its inspection is in flight
+    const [second] = queue.add([fileOf(4, 'second.jpg', 'image/jpeg')])
+    answer(
+      jsonRes({
+        state: 'done',
+        capture_instant: '2026-01-01T13:00:00Z',
+        capture_civil: null,
+        capture_source: 'exif',
+      }),
+    )
+    await nextTick()
+    await nextTick()
+
+    // the late answer belonged to a tile that no longer exists; the one still on screen keeps its
+    // own decision (it has its own poll) and never inherits a stranger's date
+    expect(first.captureInstant).toBeNull()
+    expect(second.captureInstant).toBeNull()
+  })
+
+  it('settles as undated rather than pending for ever when the server keeps saying pending', async () => {
+    const calls = laneWith(async () =>
+      jsonRes({ state: 'pending', capture_instant: null, capture_civil: null, capture_source: null }),
+    )
+    // Fake timers from the start — the backoff is deliberately ~20 s of wall clock, and what is
+    // being proved is that it ENDS, not how long it takes. (Installed BEFORE the upload, so every
+    // wait in the poll is on the fake clock.)
+    vi.useFakeTimers()
+    try {
+      const queue = useUploadQueue()
+      const [item] = queue.add([fileOf(4, 'slow.jpg', 'image/jpeg')])
+      for (let i = 0; i < 60 && item.captureState !== 'done'; i++) {
+        await vi.advanceTimersByTimeAsync(1000)
+      }
+      expect(item.captureState).toBe('done')
+      expect(item.captureInstant).toBeNull() // settled with no date — Save is never blocked
+      expect(calls.length).toBeGreaterThan(1) // …and it really did keep asking first
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

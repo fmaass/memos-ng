@@ -34,6 +34,38 @@ export interface StagedUpload {
   name: string
 }
 
+/** A queue tile as the capture gate needs it: whether its bytes landed, and what came back. */
+export interface CaptureGateItem {
+  name: string
+  status: string
+  captureState: string
+}
+
+/**
+ * The tiles whose capture decision has not settled yet (MEMNG-262).
+ *
+ * A tile still uploading counts as pending — its file has not even arrived. One whose upload
+ * FAILED does not: it will never be posted (only `done` tiles carry an upload_uid), so waiting for
+ * a date it can never have would block the composer over a file that is not going anywhere.
+ */
+export function pendingCaptureItems<T extends CaptureGateItem>(uploads: readonly T[]): T[] {
+  return uploads.filter((u) => u.status !== 'error' && u.captureState !== 'done')
+}
+
+/**
+ * The one sentence a post refused for an unsettled capture decision says. It NAMES the file — the
+ * person has to know which tile is being waited for, and the tile is marked at the same time.
+ *
+ * The refusal applies whatever the date mode is: the attachment ORDER is decided by the same
+ * decisions as the date, and posting early would save an order nobody chose.
+ */
+export function captureBlockedMessage(pendingItems: readonly CaptureGateItem[]): string {
+  const first = pendingItems[0]?.name ?? 'a file'
+  const rest = pendingItems.length - 1
+  const others = rest > 0 ? ` and ${rest} more file${rest === 1 ? '' : 's'}` : ''
+  return `Still reading the date of ${first}${others}. It decides the memo's date and the order of the pictures — one moment, then post.`
+}
+
 const asStrings = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
 

@@ -7,12 +7,15 @@ import { useToast } from 'primevue/usetoast'
 import { computed, nextTick, ref, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
-import { useUploadQueue } from '@/composables/useResumableUpload'
+import { type UploadItem, useUploadQueue } from '@/composables/useResumableUpload'
 import { useSettings } from '@/composables/useSettings'
+import { autoMemoDate, captureOrder, toWireInstant } from '@/lib/autoMemoDate'
 import {
   canPost,
+  captureBlockedMessage,
   composerKeyAction,
   formatMemoDate,
+  pendingCaptureItems,
   uploadsUnlinkableMessage,
 } from '@/lib/composer'
 import { applyMarkdown, type MarkdownAction } from '@/lib/markdownToolbar'
@@ -49,12 +52,34 @@ function visMeta(v: string) {
   return visibilityOptions.find((o) => o.value === v)
 }
 
-// Custom display date — null = server now; the ⋯ menu reveals a picker, then it shows as a chip.
+// The memo's date has two modes (MEMNG-262). AUTO — the default for a new memo — is the EARLIEST
+// capture instant among the attached media, recomputed on every add, remove, retry and late
+// inspection; MANUAL is a date the person picked, and picking one is what switches the mode. The
+// zone is the browser's: it is what resolves an EXIF time that carries no offset, and what the
+// span hint counts calendar days in.
+const dateMode = ref<'auto' | 'manual'>('auto')
 const memoDate = ref<Date | null>(null)
 const showDate = ref(false)
-function clearDate() {
+const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+// A plain snapshot of the reactive queue — the pure functions take arrays, not reactive proxies.
+const tiles = computed<UploadItem[]>(() => [...uploads])
+const auto = computed(() => autoMemoDate(tiles.value, zone))
+// Capture-ordered tiles: what the composer shows IS what it posts, and what the server saves.
+const orderedUploads = computed(() => captureOrder(tiles.value, zone))
+const pendingCapture = computed(() => pendingCaptureItems(tiles.value))
+const autoLabel = computed(() => {
+  const { instant, approximate, span } = auto.value
+  const head = instant ? `Auto · ${approximate ? '≈ ' : ''}${formatMemoDate(instant)}` : 'Auto · now'
+  return span > 0 ? `${head} · spans ${span} days` : head
+})
+function useAutoDate() {
+  dateMode.value = 'auto'
   memoDate.value = null
   showDate.value = false
+}
+function onManualDate(picked: Date | null) {
+  memoDate.value = picked
+  dateMode.value = picked ? 'manual' : 'auto'
 }
 const saving = ref(false)
 const uploading = computed(() =>
@@ -141,10 +166,23 @@ function onPaste(event: ClipboardEvent) {
 
 async function save() {
   if (!hasContent.value) return
+  // Settle before posting, REGARDLESS of the date mode: the tile ORDER depends on the capture
+  // decisions as much as the Auto date does, and both are frozen by this post. Refused with one
+  // sentence naming the file, never silently dropped or silently posted out of order.
+  if (pendingCapture.value.length > 0) {
+    toast.add({
+      severity: 'warn',
+      summary: 'One moment',
+      detail: captureBlockedMessage(pendingCapture.value),
+      life: 6000,
+    })
+    return
+  }
   saving.value = true
   try {
     // Finalize-on-post: send finished uploads' upload_uids; the server turns them into attachments.
-    const upload_uids = uploads
+    // In CAPTURE ORDER — the server saves that order as each attachment's position.
+    const upload_uids = orderedUploads.value
       .filter((u) => u.status === 'done' && u.uploadUid)
       .map((u) => u.uploadUid!)
     const body: Record<string, unknown> = {
@@ -153,7 +191,10 @@ async function save() {
       pinned: false,
       upload_uids,
     }
-    if (memoDate.value) body.created_at = memoDate.value.toISOString() // only when backdated
+    // Manual sends what was picked. Auto sends the earliest capture instant it resolved — and
+    // sends NOTHING when it resolved none, which is what makes "Auto · now" the server's now.
+    const dated = dateMode.value === 'manual' ? memoDate.value : auto.value.instant
+    if (dated) body.created_at = toWireInstant(dated)
     const { data, error } = await api.POST('/api/memos', { body: body as never })
     if (error) {
       // A composer left open past the upload expiry still shows its tiles as `done`, but the
@@ -169,8 +210,8 @@ async function save() {
     }
     emit('saved', data)
     content.value = ''
-    memoDate.value = null
-    showDate.value = false
+    useAutoDate() // the next memo starts on Auto again
+
     clearUploads() // NOT `uploads.length = 0` — that strands the preview object URLs and File refs
     nextTick(autosize)
   } finally {
@@ -202,19 +243,25 @@ async function save() {
       @blur="trackSelection"
     />
 
-    <!-- backdate: a removable chip once set, or a picker the moment you choose "Set custom date…" -->
+    <!-- the memo's date: the Auto chip by default, a manual chip once a date is picked, and the
+         picker in between (the ⋯ menu opens it) -->
     <div
-      v-if="memoDate"
+      v-if="dateMode === 'manual' && memoDate"
       class="flex items-center gap-2 self-start rounded-full bg-surface-100 px-3 py-1 text-sm text-muted-color dark:bg-surface-800"
       data-test="date-chip"
     >
       <i class="pi pi-clock text-xs" aria-hidden="true" />
       <span>{{ formatMemoDate(memoDate) }}</span>
-      <button class="pi pi-times text-xs hover:text-color" aria-label="Clear date" @click="clearDate" />
+      <button
+        class="pi pi-times text-xs hover:text-color"
+        aria-label="Use the automatic date"
+        data-test="date-auto"
+        @click="useAutoDate"
+      />
     </div>
     <DatePicker
       v-else-if="showDate"
-      v-model="memoDate"
+      :model-value="memoDate"
       show-time
       hour-format="24"
       size="small"
@@ -222,11 +269,20 @@ async function save() {
       class="w-full sm:w-64"
       aria-label="Memo date"
       data-test="memo-date"
+      @update:model-value="onManualDate($event as Date | null)"
     />
+    <div
+      v-else
+      class="flex items-center gap-2 self-start rounded-full bg-surface-100 px-3 py-1 text-sm text-muted-color dark:bg-surface-800"
+      data-test="auto-date-chip"
+    >
+      <i class="pi pi-sparkles text-xs" aria-hidden="true" />
+      <span>{{ autoLabel }}</span>
+    </div>
 
     <div v-if="uploads.length" class="flex flex-wrap gap-2" data-test="uploads">
       <div
-        v-for="u in uploads"
+        v-for="u in orderedUploads"
         :key="u.id"
         class="group relative h-20 w-20 overflow-hidden rounded-lg bg-surface-100 dark:bg-surface-800"
         :title="u.name"
@@ -243,6 +299,16 @@ async function save() {
             ><i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true"
           /></span>
           <span v-else>{{ u.progress }}%</span>
+        </div>
+        <!-- uploaded, but its capture decision has not come back yet: this is the tile the refusal
+             names, so it has to be visible as the one being waited for -->
+        <div
+          v-else-if="u.captureState === 'pending'"
+          class="absolute inset-0 flex items-center justify-center bg-black/35 text-white"
+          data-test="capture-pending"
+          :aria-label="`Reading the date of ${u.name}`"
+        >
+          <i class="pi pi-spin pi-spinner text-sm" aria-hidden="true" />
         </div>
         <button
           class="absolute right-1 top-1 hidden h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white group-hover:flex"

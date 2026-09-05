@@ -81,6 +81,7 @@ export async function uploadFile(file: File, onProgress?: (pct: number) => void)
 }
 
 export type UploadItemStatus = 'queued' | 'uploading' | 'done' | 'error'
+export type CaptureDecision = 'pending' | 'done'
 
 export interface UploadItem {
   id: number
@@ -91,7 +92,22 @@ export interface UploadItem {
   error?: string
   preview?: string // local object URL for an instant image thumbnail while uploading
   isVideo?: boolean
+  // What the SERVER read out of this file's own metadata (MEMNG-262). `pending` until the
+  // inspection answers; `done` is settled even when all three values are null — a file with no
+  // capture date is an answer. The composer's Auto date and its tile order both wait for it.
+  captureState: CaptureDecision
+  captureInstant: string | null
+  captureCivil: string | null
+  captureSource: string | null
 }
+
+// The inspection poll: the server reads the file the moment its last chunk lands, so the first
+// look almost always answers `done`. The backoff exists for the file that is slower than that,
+// and it is BOUNDED — an item that never settles is treated as one with no capture date rather
+// than blocking the composer's Save for ever.
+const CAPTURE_POLL_DELAYS_MS = [0, 150, 300, 600, 1000, 1500, 2000, 3000, 3000, 5000, 5000]
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // Reactive multi-file queue with bounded concurrency. Each file uploads independently so a
 // memo can be posted while a video is still uploading (the queue is not awaited by save).
@@ -100,6 +116,58 @@ export function useUploadQueue(concurrency = 2) {
   let nextId = 0
   let active = 0
   const pending: UploadItem[] = []
+  // One abort handle per tile, so removing a tile stops its inspection poll at once.
+  const captureAborts = new Map<number, AbortController>()
+
+  /**
+   * Ask the server what this upload's file says about its capture date, until it answers.
+   *
+   * IDENTITY-FENCED: the answer is applied only if the tile that ISSUED the request is still in
+   * the queue AND still holds the same upload_uid. A response that outlives its tile — removed,
+   * retried into a new upload — is dropped, so it can never mark a DIFFERENT file done or date a
+   * memo from media that is no longer attached.
+   */
+  async function pollCapture(id: number, uid: string): Promise<void> {
+    const controller = new AbortController()
+    captureAborts.get(id)?.abort()
+    captureAborts.set(id, controller)
+    const live = () => {
+      const it = items.find((i) => i.id === id)
+      return it && it.uploadUid === uid && !controller.signal.aborted ? it : undefined
+    }
+    try {
+      for (const delay of CAPTURE_POLL_DELAYS_MS) {
+        if (delay) await wait(delay)
+        if (!live()) return
+        try {
+          const res = await fetch(`/api/uploads/${uid}/capture`, { signal: controller.signal })
+          if (!res.ok) break // 404 = the session is gone; nothing more to learn here
+          const body = (await res.json()) as {
+            state: CaptureDecision
+            capture_instant: string | null
+            capture_civil: string | null
+            capture_source: string | null
+          }
+          const item = live() // re-checked AFTER the await: the tile may have gone meanwhile
+          if (!item) return
+          if (body.state === 'done') {
+            item.captureInstant = body.capture_instant
+            item.captureCivil = body.capture_civil
+            item.captureSource = body.capture_source
+            item.captureState = 'done'
+            return
+          }
+        } catch {
+          if (controller.signal.aborted) return
+          break // a transport failure is not worth a second network storm
+        }
+      }
+      const item = live()
+      if (item) item.captureState = 'done' // settled with no date, rather than pending for ever
+    } finally {
+      if (captureAborts.get(id) === controller) captureAborts.delete(id)
+    }
+  }
 
   function pump() {
     while (active < concurrency && pending.length > 0) {
@@ -112,10 +180,15 @@ export function useUploadQueue(concurrency = 2) {
           item.status = 'done'
           item.progress = 100
           item.uploadUid = uploadUid
+          void pollCapture(item.id, uploadUid)
         })
         .catch((err: unknown) => {
           item.status = 'error'
           item.error = err instanceof Error ? err.message : String(err)
+          // A file whose bytes never landed has no capture decision to wait for — and it is not
+          // posted either (only `done` tiles contribute an upload_uid), so it settles here rather
+          // than holding the composer.
+          item.captureState = 'done'
         })
         .finally(() => {
           active--
@@ -140,6 +213,10 @@ export function useUploadQueue(concurrency = 2) {
             ? URL.createObjectURL(file)
             : undefined,
         isVideo: file.type.startsWith('video/'),
+        captureState: 'pending',
+        captureInstant: null,
+        captureCivil: null,
+        captureSource: null,
       }
       files.set(raw.id, file)
       items.push(raw)
@@ -162,6 +239,10 @@ export function useUploadQueue(concurrency = 2) {
   // would make pump() dereference a File that was just released.
   function release(it: UploadItem): void {
     if (it.preview && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(it.preview)
+    // Stop this tile's inspection poll: the fence would drop its answer anyway, but a removed
+    // tile has no business still asking.
+    captureAborts.get(it.id)?.abort()
+    captureAborts.delete(it.id)
     files.delete(it.id)
     const p = pending.findIndex((q) => q.id === it.id)
     if (p >= 0) pending.splice(p, 1)

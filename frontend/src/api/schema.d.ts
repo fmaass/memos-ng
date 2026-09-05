@@ -1003,6 +1003,36 @@ export interface paths {
         patch: operations["append_chunk_api_uploads__upload_uid__patch"];
         trace?: never;
     };
+    "/api/uploads/{upload_uid}/capture": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Upload Capture
+         * @description What this upload's own metadata says about when it was captured (MEMNG-262).
+         *
+         *     NON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a
+         *     composer may poll it while the person is still typing and then post the memo exactly as it
+         *     would have without it. Owner-scoped through the same `_get_upload` as every other verb, so
+         *     another owner's uid answers with the same 404 as one that never existed.
+         *
+         *     It may still WRITE — once. `ensure_capture` performs the read the completing append normally
+         *     does, for the two cases that append cannot cover: a session that finished before this feature
+         *     shipped, and a zero-byte file, which is complete without an append at all. The row lock makes
+         *     that exactly-once, and every later poll is a plain read.
+         */
+        get: operations["upload_capture_api_uploads__upload_uid__capture_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/uploads/{upload_uid}/finalize": {
         parameters: {
             query?: never;
@@ -1213,6 +1243,15 @@ export interface components {
         };
         /** AttachmentOut */
         AttachmentOut: {
+            /** Capture Civil */
+            capture_civil: string | null;
+            /**
+             * Capture Instant
+             * Format: date-time
+             */
+            capture_instant: string | null;
+            /** Capture Source */
+            capture_source: string | null;
             /**
              * Captured At
              * Format: date-time
@@ -1226,6 +1265,8 @@ export interface components {
             height: number | null;
             /** Mime */
             mime: string;
+            /** Position */
+            position: number | null;
             /** Size */
             size: number;
             status: components["schemas"]["AttachmentStatus"];
@@ -1252,6 +1293,8 @@ export interface components {
             mime: string;
             /** Mine */
             mine: boolean;
+            /** Position */
+            position: number | null;
             /** Posterurl */
             posterUrl: string;
             /** Previewurl */
@@ -1281,6 +1324,30 @@ export interface components {
         Body_upload_print_api_attachments__uid__print_post: {
             /** File */
             file: string;
+        };
+        /**
+         * CaptureOut
+         * @description What the server read out of an upload's own metadata, and whether it has read it yet.
+         *
+         *     `pending` means the read has not happened (the bytes are still arriving, or nothing has asked
+         *     yet); `done` is a SETTLED answer even when all three values are null — a file with no capture
+         *     date is an answer, not a reason for a composer to keep waiting.
+         */
+        CaptureOut: {
+            /** Capture Civil */
+            capture_civil: string | null;
+            /**
+             * Capture Instant
+             * Format: date-time
+             */
+            capture_instant: string | null;
+            /** Capture Source */
+            capture_source: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "pending" | "done";
         };
         /**
          * CreateRacedDetail
@@ -3954,6 +4021,37 @@ export interface operations {
                     "application/json": {
                         detail?: string;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upload_capture_api_uploads__upload_uid__capture_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureOut"];
                 };
             };
             /** @description Validation Error */
