@@ -8,6 +8,7 @@ a vector changes in the artefact or it does not change.
 import builtins
 import hashlib
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,7 +29,27 @@ BINARIES = ROOT / "fixtures" / "auto-memo-date"
 
 
 def _instant(value: datetime | None) -> str | None:
-    return None if value is None else value.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Render for comparison — after asserting the precision on the RAW value.
+
+    `strftime` drops microseconds by itself, so a formatted comparison passes even if production
+    stopped flooring. The assertion below is what actually holds "whole seconds everywhere".
+    """
+    if value is None:
+        return None
+    assert value.microsecond == 0, f"{value!r} carries sub-second precision"
+    assert value.tzinfo is not None, f"{value!r} is naive"
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _expect(name: str) -> dict[str, str | None]:
+    """What the artefact says this binary fixture reads as. The ONE source of that answer."""
+    return ARTEFACT["binaries"][name]["expect"]
+
+
+def _expected_instant(name: str) -> datetime:
+    raw = _expect(name)["capture_instant"]
+    assert isinstance(raw, str)
+    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 def _cleanup():
@@ -97,6 +118,23 @@ def _drop_user(subject):
     with eng.begin() as c:
         c.execute(text("DELETE FROM users WHERE subject = :s"), {"s": subject})
     eng.dispose()
+
+
+def _filenames_in_order(memo_uid: str) -> list[str]:
+    """The memo's attachment FILENAMES in saved order — what a place actually holds."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as conn:
+        names = list(
+            conn.execute(
+                text(
+                    "SELECT a.filename FROM attachments a JOIN memos m ON m.id = a.memo_id "
+                    "WHERE m.uid = :u ORDER BY a.position NULLS LAST, a.id"
+                ),
+                {"u": memo_uid},
+            ).scalars()
+        )
+    eng.dispose()
+    return names
 
 
 def _memo_attachments(client, uid: str) -> list[dict]:
@@ -228,7 +266,7 @@ def test_the_video_reader_seeks_over_the_samples_instead_of_reading_them(tmp_pat
         result = capture.read_capture(clip, "video/mp4")
     finally:
         del capture.open  # back to the builtin
-    assert _instant(result.capture_instant) == "2026-02-03T09:30:00Z"
+    assert _instant(result.capture_instant) == "2026-02-03T09:30:00Z"  # the clip's own header
     assert read_total < size // 10, f"read {read_total} of {size} bytes — the mdat was pulled in"
 
 
@@ -261,9 +299,7 @@ def test_capture_is_pending_until_the_last_chunk_lands(logged_in_client, monkeyp
         }
         client.patch(f"/api/uploads/{uid}", content=data[200:], headers={"Upload-Offset": "200"})
         done = client.get(f"/api/uploads/{uid}/capture").json()
-        assert done["state"] == "done"
-        assert done["capture_instant"] == "2026-01-01T07:15:00Z"
-        assert done["capture_source"] == "exif"
+        assert done == {"state": "done", **_expect("jpeg-offset.jpg")}
     finally:
         _cleanup()
 
@@ -277,9 +313,7 @@ def test_capture_of_a_civil_only_photo_hands_the_wall_clock_over_unresolved(
         uid = _upload_fixture(client, "jpeg-no-offset.jpg")
         assert client.get(f"/api/uploads/{uid}/capture").json() == {
             "state": "done",
-            "capture_instant": None,
-            "capture_civil": "2026-01-01T13:00:00",
-            "capture_source": "exif",
+            **_expect("jpeg-no-offset.jpg"),
         }
     finally:
         _cleanup()
@@ -317,9 +351,10 @@ def test_inspection_consumes_nothing(logged_in_client, monkeypatch, tmp_path):
         finalized = client.post(f"/api/uploads/{uid}/finalize")
         assert finalized.status_code == 200, finalized.text
         att = finalized.json()
-        assert att["capture_instant"] == "2026-01-01T07:15:00Z"
-        assert att["capture_source"] == "exif"
-        assert att["captured_at"] == "2026-01-01T07:15:00Z"  # precedence: the file's own instant
+        expected = _expect("jpeg-offset.jpg")
+        assert att["capture_instant"] == expected["capture_instant"]
+        assert att["capture_source"] == expected["capture_source"]
+        assert att["captured_at"] == expected["capture_instant"]  # precedence: the file's instant
         assert att["position"] is None  # a standalone finalize links nothing
     finally:
         _cleanup()
@@ -333,7 +368,7 @@ def test_captured_at_falls_back_to_the_browser_mtime_when_the_file_says_nothing(
     try:
         uid = _upload_fixture(client, "png-none.png")
         att = client.post(f"/api/uploads/{uid}/finalize").json()
-        assert att["capture_instant"] is None and att["capture_source"] is None
+        assert {k: att[k] for k in _expect("png-none.png")} == _expect("png-none.png")
         assert att["captured_at"] == "2021-01-01T00:00:00Z"  # last_modified 1609459200000
     finally:
         _cleanup()
@@ -357,9 +392,8 @@ def test_create_saves_the_declared_order(logged_in_client, monkeypatch, tmp_path
         ).json()
         got = _memo_attachments(client, memo["uid"])
         assert [x["position"] for x in got] == [0, 1, 2]
-        # the uid order the server saved IS the order the client sent, not the id order
-        by_uid = {x["uid"]: x["position"] for x in got}
-        assert len(by_uid) == 3
+        # …and each place holds the FILE that was asked for there, not merely some attachment
+        assert _filenames_in_order(memo["uid"]) == ["c.png", "a.png", "b.png"]
         assert [x["uid"] for x in got] == [x["uid"] for x in memo["attachments"]]
     finally:
         _cleanup()
@@ -477,6 +511,8 @@ def test_an_edit_appends_after_a_fully_positioned_memo(logged_in_client, monkeyp
         after = _memo_attachments(client, memo["uid"])
         assert [x["position"] for x in after] == [0, 1, 2, 3]
         assert [x["uid"] for x in after[:2]] == before  # the saved order is a fact
+        # and the appended pair keeps the order the edit asked for, after the existing two
+        assert _filenames_in_order(memo["uid"])[2:] == ["d.png", "c.png"]
     finally:
         _cleanup()
 
@@ -587,9 +623,107 @@ def test_the_memo_response_carries_the_capture_fields_through_the_upload_lane(
                 {"u": memo["uid"]},
             ).one()
         eng.dispose()
-        assert row.capture_instant == datetime(2026, 1, 1, 7, 15, tzinfo=UTC)
-        assert row.capture_source == "exif"
+        assert row.capture_instant == _expected_instant("jpeg-offset.jpg")
+        assert row.capture_source == _expect("jpeg-offset.jpg")["capture_source"]
         assert row.captured_at == row.capture_instant  # the precedence, end to end
         assert row.position == 0
+    finally:
+        _cleanup()
+
+
+# --------------------------------------------------------------------------------------------
+# What the reader must never do
+# --------------------------------------------------------------------------------------------
+
+
+class _Forbidden(BaseException):
+    """Raised by the guards below. NOT an Exception: `read_capture` swallows those by design, and
+    a swallowed violation would be indistinguishable from a file that simply had no date."""
+
+
+def test_no_fixture_is_ever_decoded(monkeypatch):
+    """Not one of the seven reaches a pixel decoder.
+
+    `Image.getexif()` used to be how the EXIF was read, and for a PNG with no eXIf chunk it falls
+    through to `load()` — decoding every photo that has no date, which is the opposite of what
+    this module promises. The guard has to cover `ImageFile.load` as well as `Image.load`, since
+    that is the one the JPEG/PNG/HEIF plugins actually inherit.
+    """
+    from PIL import Image, ImageFile
+
+    def decoded(*_args, **_kwargs):
+        raise _Forbidden("the reader decoded pixels")
+
+    monkeypatch.setattr(Image.Image, "load", decoded)
+    monkeypatch.setattr(ImageFile.ImageFile, "load", decoded)
+    for name, spec in ARTEFACT["binaries"].items():
+        result = capture.read_capture(BINARIES / name, spec["mime"])
+        assert {
+            "capture_instant": _instant(result.capture_instant),
+            "capture_civil": result.capture_civil,
+            "capture_source": result.capture_source,
+        } == spec["expect"]
+
+
+def test_only_the_exif_sub_ifd_is_ever_asked_for(monkeypatch):
+    """The whitelist, mechanically: one sub-IFD is requested and the GPS IFD is never walked.
+
+    Also pins the log guard — PIL's TIFF plugin logs every tag it parses at DEBUG, so the level is
+    held at INFO for the length of the read and restored afterwards.
+    """
+    from PIL import Image
+
+    real_get_ifd = Image.Exif.get_ifd
+    seen: list[int] = []
+    levels: list[int] = []
+
+    def guard(self, tag):
+        seen.append(tag)
+        if tag != capture.EXIF_IFD:
+            raise _Forbidden(f"asked for IFD {tag:#x}")
+        levels.append(logging.getLogger("PIL.TiffImagePlugin").getEffectiveLevel())
+        return real_get_ifd(self, tag)
+
+    before = logging.getLogger("PIL.TiffImagePlugin").level
+    monkeypatch.setattr(Image.Exif, "get_ifd", guard)
+    result = capture.read_capture(BINARIES / "jpeg-offset.jpg", "image/jpeg")
+
+    assert _instant(result.capture_instant) == _expect("jpeg-offset.jpg")["capture_instant"]
+    assert seen == [capture.EXIF_IFD]  # never 0x8825 (GPS), never anything else
+    assert levels and all(level >= logging.INFO for level in levels)
+    assert logging.getLogger("PIL.TiffImagePlugin").level == before  # and put back afterwards
+
+
+# --------------------------------------------------------------------------------------------
+# Order under concurrency, and the finalize/completion race
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_promoted_print_takes_the_place_of_the_uid_that_asked_first(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """[orphan print (bytes A), screen B, screen (bytes A)] — the print is promoted in pass 2 and
+    dedups onto the attachment pass 1 made from the identical bytes. The EARLIEST request index
+    wins, so that attachment holds place 0; keeping the first FINALIZED index instead would read
+    back as [B, A] — an order nobody asked for."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        same = _png(b"SAME")
+        orphan_print = _upload_bytes(client, "_ZZ9 - print.png", "image/png", same)
+        screen_b = _upload_bytes(client, "b.png", "image/png", _png(b"B"))
+        screen_a = _upload_bytes(client, "_AR9.png", "image/png", same)
+        memo = client.post(
+            "/api/memos",
+            json={
+                "content": "dedup across the passes",
+                "visibility": "PRIVATE",
+                "upload_uids": [orphan_print, screen_b, screen_a],
+            },
+        ).json()
+        atts = _memo_attachments(client, memo["uid"])
+        assert len(atts) == 2  # the print's bytes are the screen's bytes: one attachment
+        assert [x["position"] for x in atts] == [0, 1]
+        assert _filenames_in_order(memo["uid"]) == ["_AR9.png", "b.png"]
     finally:
         _cleanup()

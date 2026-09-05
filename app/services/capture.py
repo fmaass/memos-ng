@@ -16,9 +16,11 @@ Absence is the normal answer: anything unreadable, malformed or absent yields `N
 exception to the caller. A capture date the app cannot prove is worth less than no date at all.
 """
 
+import logging
 import re
 import struct
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -158,19 +160,53 @@ def instant_from_movie_header(seconds: int, now: datetime | None = None) -> date
     return instant.replace(microsecond=0)
 
 
-def _read_image(path: Path) -> CaptureResult:
-    """The PRIMARY image's whitelisted EXIF tags. Pillow opens lazily; pixels are never decoded.
+@contextmanager
+def _quiet_pil() -> Iterator[None]:
+    """Hold PIL's loggers at INFO for the duration of a read.
 
-    pillow_heif answers for the primary item of a multi-image HEIC — which is NOT necessarily the
-    first one, as `fixtures/auto-memo-date/heic-offset.heic` proves (its first item carries a
-    different date on purpose).
+    `TiffImagePlugin` logs every tag it walks at DEBUG — including the ones this module never
+    asks for. Nothing in the whitelist is worth a GPS coordinate in a log file if someone turns
+    DEBUG on, so the level is raised for the length of the parse and put back afterwards.
     """
-    with Image.open(path) as im:
-        ifd = im.getexif().get_ifd(EXIF_IFD)
-    offset = ifd.get(OFFSET_TIME_ORIGINAL)
-    if offset is None:
-        offset = ifd.get(OFFSET_TIME)
-    return capture_from_exif(ifd.get(DATETIME_ORIGINAL), offset)
+    loggers = [logging.getLogger("PIL"), logging.getLogger("PIL.TiffImagePlugin")]
+    previous = [(logger, logger.level) for logger in loggers]
+    try:
+        for logger_ in loggers:
+            if logger_.level == logging.NOTSET or logger_.level < logging.INFO:
+                logger_.setLevel(logging.INFO)
+        yield
+    finally:
+        for logger_, level in previous:
+            logger_.setLevel(level)
+
+
+def _read_image(path: Path) -> CaptureResult:
+    """The PRIMARY image's whitelisted EXIF tags, read from the CONTAINER's metadata alone.
+
+    `im.info["exif"]` is the raw APP1/eXIf/HEIF-exif payload the format plugin picked up while
+    parsing the header — for a HEIC that is the PRIMARY item's payload, which is NOT necessarily
+    the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a different date on its
+    first item on purpose). `Image.getexif()` is deliberately NOT used: for a PNG with no eXIf
+    chunk it falls through to `load()`, decoding the pixels of every photo that has no date —
+    the one thing this module promises never to do.
+
+    The whitelist is enforced by asking for ONE sub-IFD: `get_ifd(0x8769)` parses the Exif IFD and
+    nothing else, so the GPS IFD (0x8825) is never even walked. Parsing that IFD in memory and
+    reading three tags out of it — then discarding the rest with the object — IS what the
+    whitelist means: no other tag reaches a caller, a log line, or the database.
+    """
+    with _quiet_pil():
+        with Image.open(path) as im:
+            raw = im.info.get("exif")
+        if not raw:
+            return NOTHING
+        exif = Image.Exif()
+        exif.load(raw)
+        ifd = exif.get_ifd(EXIF_IFD)
+        offset = ifd.get(OFFSET_TIME_ORIGINAL)
+        if offset is None:
+            offset = ifd.get(OFFSET_TIME)
+        return capture_from_exif(ifd.get(DATETIME_ORIGINAL), offset)
 
 
 def _boxes(buf: bytes, start: int = 0, end: int | None = None) -> Iterator[tuple[bytes, int, int]]:
