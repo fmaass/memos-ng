@@ -786,6 +786,17 @@
       "sha256": "8148ee1e17319c791e5ac238c6f1241f6c93f59ac3aeb07fb14afd3cab9752b8",
       "size": 77
     },
+    "png-exif.png": {
+      "mime": "image/png",
+      "note": "an eXIf chunk, the PNG spelling of EXIF \u2014 its twin png-none.png has none at all.",
+      "expect": {
+        "capture_instant": "2026-01-01T07:15:00Z",
+        "capture_civil": null,
+        "capture_source": "exif"
+      },
+      "sha256": "556ea3f4eb8560835433976d2f5895b8f839ed2ca51923722cf08f5eea1edc63",
+      "size": 173
+    },
     "mov-creationdate.mov": {
       "mime": "video/quicktime",
       "note": "the movie header says 2019-05-05; the creationdate key must win.",

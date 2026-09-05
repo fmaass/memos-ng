@@ -666,32 +666,87 @@ def test_no_fixture_is_ever_decoded(monkeypatch):
 
 
 def test_only_the_exif_sub_ifd_is_ever_asked_for(monkeypatch):
-    """The whitelist, mechanically: one sub-IFD is requested and the GPS IFD is never walked.
-
-    Also pins the log guard — PIL's TIFF plugin logs every tag it parses at DEBUG, so the level is
-    held at INFO for the length of the read and restored afterwards.
-    """
+    """The whitelist, mechanically: one sub-IFD is requested and the GPS IFD is never walked."""
     from PIL import Image
 
     real_get_ifd = Image.Exif.get_ifd
     seen: list[int] = []
-    levels: list[int] = []
 
     def guard(self, tag):
         seen.append(tag)
         if tag != capture.EXIF_IFD:
             raise _Forbidden(f"asked for IFD {tag:#x}")
-        levels.append(logging.getLogger("PIL.TiffImagePlugin").getEffectiveLevel())
         return real_get_ifd(self, tag)
 
-    before = logging.getLogger("PIL.TiffImagePlugin").level
     monkeypatch.setattr(Image.Exif, "get_ifd", guard)
     result = capture.read_capture(BINARIES / "jpeg-offset.jpg", "image/jpeg")
 
     assert _instant(result.capture_instant) == _expect("jpeg-offset.jpg")["capture_instant"]
     assert seen == [capture.EXIF_IFD]  # never 0x8825 (GPS), never anything else
-    assert levels and all(level >= logging.INFO for level in levels)
-    assert logging.getLogger("PIL.TiffImagePlugin").level == before  # and put back afterwards
+
+
+def test_a_debug_enabled_process_still_gets_no_tag_values_out_of_pil():
+    """The log guard, from the outside: PIL's plugins log every tag they walk at DEBUG, so a
+    `basicConfig(DEBUG)` anywhere in the process would otherwise put the tags this module refuses
+    to read — GPS included — into the log file.
+
+    The reader raises PIL's own loggers to INFO once at import, which the root level cannot undo;
+    with that removed, the reads below emit tag records and this test goes red.
+    """
+    records: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Collect(level=logging.DEBUG)
+    pil = logging.getLogger("PIL")
+    root = logging.getLogger()
+    previous_root = root.level
+    pil.addHandler(handler)
+    root.setLevel(logging.DEBUG)  # the whole process in debug, as an operator would set it
+    try:
+        for name, spec in ARTEFACT["binaries"].items():
+            capture.read_capture(BINARIES / name, spec["mime"])
+    finally:
+        pil.removeHandler(handler)
+        root.setLevel(previous_root)
+
+    assert records == [], [r.getMessage()[:120] for r in records[:5]]
+    for name in ("PIL", "PIL.Image", "PIL.TiffImagePlugin", "PIL.PngImagePlugin"):
+        assert logging.getLogger(name).level >= logging.INFO
+
+
+def test_a_tiff_carries_its_exif_in_its_own_ifd_and_is_still_not_decoded(tmp_path):
+    """A TIFF has no APP1/eXIf payload at all — its EXIF lives in the file's first IFD, which the
+    open already parsed into `tag_v2`. Reading `im.info["exif"]` alone loses the date entirely
+    (verified: it answers None), so the TIFF branch exists; `getexif()` there costs no decode.
+    """
+    from PIL import ExifTags, Image, ImageFile
+
+    exif = Image.Exif()
+    ifd = exif.get_ifd(ExifTags.IFD.Exif)
+    ifd[capture.DATETIME_ORIGINAL] = "2026:01:01 13:00:00"
+    ifd[capture.OFFSET_TIME_ORIGINAL] = "+05:45"
+    path = tmp_path / "scan.tif"
+    Image.new("RGB", (8, 8), (7, 7, 7)).save(path, "TIFF", exif=exif.tobytes())
+
+    def decoded(*_args, **_kwargs):
+        raise _Forbidden("the reader decoded pixels")
+
+    monkey = [
+        (Image.Image, "load", Image.Image.load),
+        (ImageFile.ImageFile, "load", ImageFile.ImageFile.load),
+    ]
+    for target, attr, _original in monkey:
+        setattr(target, attr, decoded)
+    try:
+        result = capture.read_capture(path, "image/tiff")
+    finally:
+        for target, attr, original in monkey:
+            setattr(target, attr, original)
+    assert _instant(result.capture_instant) == "2026-01-01T07:15:00Z"
+    assert result.capture_source == "exif"
 
 
 # --------------------------------------------------------------------------------------------

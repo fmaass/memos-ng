@@ -70,6 +70,18 @@ def png_none(path: Path) -> None:
     _still((120, 200, 10)).save(path, "PNG")
 
 
+def png_exif(path: Path) -> None:
+    """A PNG that DOES carry EXIF, in an eXIf chunk — the container that has no APP1 segment.
+
+    Its twin `png-none.png` is the one that used to be decoded: asking Pillow for the EXIF of a PNG
+    without an eXIf chunk falls through to a full pixel decode. Both spellings are fixtures now, so
+    the reader has to answer each from the header alone.
+    """
+    _still((10, 120, 200)).save(
+        path, "PNG", exif=_exif("2026:01:01 13:00:00", "+05:45").tobytes()
+    )
+
+
 def _ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", "-v", "error", *args], check=True)
 
@@ -129,6 +141,7 @@ FIXTURES = {
     "jpeg-no-offset.jpg": jpeg_no_offset,
     "heic-offset.heic": heic_offset,
     "png-none.png": png_none,
+    "png-exif.png": png_exif,
     "mov-creationdate.mov": mov_creationdate,
     "mp4-header-only.mp4": mp4_header_only,
     "mp4-zero-header.mp4": mp4_zero_header,

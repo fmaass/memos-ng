@@ -20,18 +20,27 @@ import logging
 import re
 import struct
 from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pillow_heif
 import structlog
-from PIL import Image
+from PIL import Image, TiffImagePlugin
 
 pillow_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
 
 logger = structlog.get_logger()
+
+# ONCE, at import, and never restored: PIL's TIFF/PNG plugins log every tag they walk at DEBUG —
+# including the ones this module deliberately does not read — so a `logging.basicConfig(DEBUG)`
+# anywhere in the process would put GPS coordinates in the log file. It is set here rather than
+# around each read because the level is process-wide state: two reads on two threads would
+# interleave a save/restore and leave the loggers wherever the loser put them. Nothing in this
+# application ever wants PIL's debug output; when a PIL problem needs debugging, it is debugged by
+# raising it here on purpose.
+for _pil_logger in ("PIL", "PIL.Image", "PIL.TiffImagePlugin", "PIL.PngImagePlugin"):
+    logging.getLogger(_pil_logger).setLevel(logging.INFO)
 
 # The whole whitelist. Nothing else is read out of an image.
 DATETIME_ORIGINAL = 0x9003
@@ -160,48 +169,37 @@ def instant_from_movie_header(seconds: int, now: datetime | None = None) -> date
     return instant.replace(microsecond=0)
 
 
-@contextmanager
-def _quiet_pil() -> Iterator[None]:
-    """Hold PIL's loggers at INFO for the duration of a read.
-
-    `TiffImagePlugin` logs every tag it walks at DEBUG — including the ones this module never
-    asks for. Nothing in the whitelist is worth a GPS coordinate in a log file if someone turns
-    DEBUG on, so the level is raised for the length of the parse and put back afterwards.
-    """
-    loggers = [logging.getLogger("PIL"), logging.getLogger("PIL.TiffImagePlugin")]
-    previous = [(logger, logger.level) for logger in loggers]
-    try:
-        for logger_ in loggers:
-            if logger_.level == logging.NOTSET or logger_.level < logging.INFO:
-                logger_.setLevel(logging.INFO)
-        yield
-    finally:
-        for logger_, level in previous:
-            logger_.setLevel(level)
-
-
 def _read_image(path: Path) -> CaptureResult:
-    """The PRIMARY image's whitelisted EXIF tags, read from the CONTAINER's metadata alone.
+    """The PRIMARY image's whitelisted EXIF tags, read from metadata the OPEN already parsed.
 
-    `im.info["exif"]` is the raw APP1/eXIf/HEIF-exif payload the format plugin picked up while
-    parsing the header — for a HEIC that is the PRIMARY item's payload, which is NOT necessarily
-    the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a different date on its
-    first item on purpose). `Image.getexif()` is deliberately NOT used: for a PNG with no eXIf
-    chunk it falls through to `load()`, decoding the pixels of every photo that has no date —
-    the one thing this module promises never to do.
+    Two containers, two places that metadata lives:
+
+    * JPEG / PNG / HEIF — `im.info["exif"]` is the raw APP1/eXIf/HEIF-exif payload the format
+      plugin picked up while parsing the header. For a HEIC that is the PRIMARY item's payload,
+      which is NOT necessarily the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a
+      different date on its first item on purpose).
+    * TIFF — there is no such payload: the EXIF tags live in the file's own first IFD, which
+      `TiffImageFile` parses at open into `tag_v2`. `getexif()` reads THAT, so it costs nothing and
+      decodes nothing here — while for a PNG with no eXIf chunk the same call would fall through
+      to `load()` and decode the pixels of every photo that has no date, which is the one thing
+      this module promises never to do.
 
     The whitelist is enforced by asking for ONE sub-IFD: `get_ifd(0x8769)` parses the Exif IFD and
     nothing else, so the GPS IFD (0x8825) is never even walked. Parsing that IFD in memory and
     reading three tags out of it — then discarding the rest with the object — IS what the
     whitelist means: no other tag reaches a caller, a log line, or the database.
     """
-    with _quiet_pil():
-        with Image.open(path) as im:
+    with Image.open(path) as im:
+        if isinstance(im, TiffImagePlugin.TiffImageFile):
+            exif = im.getexif()  # from tag_v2, parsed at open; no sample decode
+        else:
             raw = im.info.get("exif")
-        if not raw:
-            return NOTHING
-        exif = Image.Exif()
-        exif.load(raw)
+            if not raw:
+                return NOTHING
+            exif = Image.Exif()
+            exif.load(raw)
+        # Inside the `with`: a TIFF's Exif object resolves the sub-IFD by seeking in the FILE, so
+        # the handle has to still be open. (A standalone Exif built from bytes does not care.)
         ifd = exif.get_ifd(EXIF_IFD)
         offset = ifd.get(OFFSET_TIME_ORIGINAL)
         if offset is None:
