@@ -2,7 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import MemoFeed from '@/components/MemoFeed.vue'
@@ -38,22 +38,35 @@ vi.mock('@tanstack/vue-query', async () => {
     useQueryClient: () => ({ invalidateQueries }),
     useMutation: (opts: {
       mutationFn: (v: unknown) => Promise<unknown>
+      onMutate?: (v: unknown) => void
       onSuccess?: () => void
+      onError?: (e: unknown) => void
+      onSettled?: (data: unknown, error: unknown, v: unknown) => void
     }) => {
+      // ONE observer, many calls — exactly like the real one, including the part that matters
+      // here: `variables` describes the LATEST call, while onMutate/onSettled run per call.
       const isPending = ref(false)
       const variables = ref<unknown>(undefined)
       return {
         isPending,
         variables,
-        mutate: async (v: unknown) => {
+        mutate: (v: unknown) => {
           variables.value = v
           isPending.value = true
-          try {
-            await opts.mutationFn(v)
-            opts.onSuccess?.()
-          } finally {
-            isPending.value = false
-          }
+          opts.onMutate?.(v)
+          return opts
+            .mutationFn(v)
+            .then((data) => {
+              opts.onSuccess?.()
+              opts.onSettled?.(data, null, v)
+            })
+            .catch((error: unknown) => {
+              opts.onError?.(error)
+              opts.onSettled?.(undefined, error, v)
+            })
+            .finally(() => {
+              isPending.value = false
+            })
         },
       }
     },
@@ -204,5 +217,94 @@ describe('MemoFeed', () => {
     card.vm.$emit('retry', 'a1') // another tile fails immediately after
     await flushPromises()
     expect(refetch).toHaveBeenCalledTimes(1) // cooldown blocks a refetch loop
+  })
+})
+
+describe('MemoFeed — one PATCH per memo, however many are in flight (MEMNG-262)', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        observe() {}
+        disconnect() {}
+        unobserve() {}
+      },
+    )
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    useTimelineMock.mockReset()
+    patch.mockReset()
+    patch.mockResolvedValue({ error: undefined })
+  })
+
+  /** Freshly located each time: a card re-renders, and a held wrapper goes stale. */
+  const cardAt = (wrapper: ReturnType<typeof mountFeed>, index: number) =>
+    wrapper.findAll('[data-test="memo-card"]')[index]
+
+  /** Open a card's editor through the ⋯ menu (a popup teleported to body). */
+  async function openEditorOn(wrapper: ReturnType<typeof mountFeed>, index: number) {
+    await cardAt(wrapper, index).find('[data-test="memo-edit"]').trigger('click')
+    await nextTick()
+    const items = document.body.querySelectorAll<HTMLElement>('[data-test="memo-action-edit"]')
+    items[items.length - 1].click()
+    await nextTick()
+  }
+
+  const save = async (wrapper: ReturnType<typeof mountFeed>, index: number) => {
+    await cardAt(wrapper, index).find('[data-test="edit-save"]').trigger('click')
+    await flushPromises()
+  }
+
+  const inFlight = (wrapper: ReturnType<typeof mountFeed>, index: number) =>
+    cardAt(wrapper, index).find('[data-test="edit-in-flight"]').exists()
+
+  it('does not re-send an edit whose PATCH is still out when a SECOND memo is edited', async () => {
+    useTimelineMock.mockReturnValue(
+      feedResult([memoStub('a', 'memo A'), memoStub('b', 'memo B')]),
+    )
+    // Two PATCHes the test lands one at a time.
+    const land: Record<string, () => void> = {}
+    patch.mockImplementation(
+      (_url: string, options: { params: { path: { uid: string } } }) =>
+        new Promise((resolve) => {
+          land[options.params.path.uid] = () => resolve({ error: undefined })
+        }),
+    )
+    const wrapper = mountFeed()
+
+    await openEditorOn(wrapper, 0)
+    await save(wrapper, 0)
+    expect(patch).toHaveBeenCalledTimes(1)
+
+    await openEditorOn(wrapper, 1)
+    await save(wrapper, 1)
+    expect(patch).toHaveBeenCalledTimes(2) // A still out, B now out too
+
+    // A's request has NOT landed — reopening its editor must not offer to send it again. (This is
+    // where a single "which uid is the observer on" answer fails: starting B moved it off A.)
+    await openEditorOn(wrapper, 0)
+    expect(inFlight(wrapper, 0)).toBe(true)
+    await save(wrapper, 0)
+    expect(patch).toHaveBeenCalledTimes(2)
+    // …and the refusal leaves the panel open, so the person sees why rather than losing the sheet
+    expect(cardAt(wrapper, 0).find('[data-test="memo-editor"]').exists()).toBe(true)
+
+    // A lands; B is still out. The panel A left open is editable again, B's card is not.
+    land.a()
+    await flushPromises()
+    await nextTick()
+    expect(inFlight(wrapper, 0)).toBe(false)
+    await save(wrapper, 0)
+    expect(patch).toHaveBeenCalledTimes(3)
+
+    await openEditorOn(wrapper, 1)
+    expect(inFlight(wrapper, 1)).toBe(true) // B's own PATCH is still on the wire
+    await save(wrapper, 1)
+    expect(patch).toHaveBeenCalledTimes(3) // …so B still refuses
+
+    land.b()
+    land.a()
+    await flushPromises()
   })
 })

@@ -66,9 +66,25 @@ const toggleReaction = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// The memos whose edit is in flight, BY UID (MEMNG-262). One mutation observer serves every card,
+// and its `variables` only ever describe the LATEST call — so a second edit starting while a first
+// is still out would move that observer and tell the first card it was finished, releasing a claim
+// whose request is still on the wire. These two callbacks are per-CALL: `onMutate` runs before the
+// request, `onSettled` after it lands or fails, so a uid is in this set for exactly as long as its
+// own PATCH is out.
+const pendingEdits = ref(new Set<string>())
+const markEditStarted = (vars: { uid: string }) => {
+  pendingEdits.value.add(vars.uid)
+}
+const markEditSettled = (_data: unknown, _error: unknown, vars: { uid: string }) => {
+  pendingEdits.value.delete(vars.uid)
+}
+
 // Edit a memo's content / visibility / display date + attach any new images (owner-only on the
 // server) and refresh.
 const editMemo = useMutation({
+  onMutate: markEditStarted,
+  onSettled: markEditSettled,
   mutationFn: async (p: {
     uid: string
     content: string
@@ -96,13 +112,6 @@ const editMemo = useMutation({
     if (lost) toast.add({ severity: 'error', summary: 'Memo not saved', detail: lost, life: 10000 })
   },
 })
-
-// Which memo's edit is still in flight, if any (MEMNG-262). The card cannot see the request the
-// parent owns, and it needs to: without this its own claim would have to be released by a guess,
-// and reopening the panel while the PATCH is out would offer a second Save for the same edit.
-const editPendingUid = computed(() =>
-  editMemo.isPending.value ? editMemo.variables.value?.uid : undefined,
-)
 
 // Attach/replace/remove the print master of one of your photos, and refresh. Shared with the
 // Resources lightbox — the composable carries the resumable upload, the per-photo progress the
@@ -178,7 +187,7 @@ onUnmounted(() => observer?.disconnect())
         :key="m.uid"
         :memo="m"
         :restorable="restorable"
-        :edit-pending="editPendingUid === m.uid"
+        :edit-pending="pendingEdits.has(m.uid)"
         @restore="emit('restore', $event)"
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"

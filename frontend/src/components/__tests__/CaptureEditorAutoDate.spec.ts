@@ -231,9 +231,10 @@ describe('CaptureEditor — the Auto memo date', () => {
   })
 
   it('re-orders and re-dates on the vector "after-removal"', async () => {
-    // The vector is the state AFTER the removal; the removed item is the earliest, added first.
+    // The vector is the state AFTER the removal, and its note names what was removed: the
+    // earliest item, added first. That item is the artefact's own "single-exact" one.
     const vector = orderVector('after-removal')
-    const removed = { id: 'removed', instant: '2026-01-01T13:00:00Z', civil: null }
+    const removed: VectorItem = { id: 'removed', instant: instantOf('single-exact', 'A'), civil: null }
     stubLane(answersFor([removed, ...vector.items]))
     const wrapper = mountEditor()
     await attach(wrapper, ...[removed, ...vector.items].map(fileNameOf))
