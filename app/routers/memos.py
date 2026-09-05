@@ -889,6 +889,11 @@ async def patch_memo(
         positions: dict[str, int] = {}
         committed = False
         try:
+            # The FIRST lock this edit takes, before any upload is finalized or any attachment is
+            # linked: every later lock belongs to something hanging off this memo, so they all
+            # nest under it and two edits of one memo can neither deadlock nor both allocate the
+            # same attachment position (see services.memos.lock_memo_for_write).
+            await svc.lock_memo_for_write(db, memo)
             if key is not None:
                 # Recorded BEFORE any work: the loser of a same-key race blocks on the unique
                 # constraint and fails here, having moved no bytes — so it has none to move back.

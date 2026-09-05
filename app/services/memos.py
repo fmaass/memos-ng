@@ -174,6 +174,26 @@ async def _place_attachment_masters(
             r.storage_path = str(new)
 
 
+async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> None:
+    """Take the memo row's write lock — the FIRST lock a memo edit acquires (MEMNG-262).
+
+    Everything an edit locks afterwards hangs off this memo: the uploads it finalizes, the
+    attachments it links, the screen sibling a print binds onto. Those are reached in different
+    orders by different edits (a print binds its sibling inside finalize, before any linking), so
+    two edits of ONE memo could hold each other's rows. Taking the parent row first gives every
+    edit of a memo the same outermost lock, and the rest nest under it.
+
+    It is also what makes the numbering correct rather than merely deadlock-free: `position` is
+    allocated by reading the memo's existing attachments, and two appends that both read an EMPTY
+    memo would both allocate 0. Serialized here, the second one sees the first one's attachment
+    and continues from it.
+
+    A CREATE needs none of this: its memo row is inserted inside its own transaction and no other
+    transaction can see — let alone edit — it before the commit, so it is already the only writer.
+    """
+    await db.execute(select(Memo.id).where(Memo.id == memo.id).with_for_update())
+
+
 async def link_attachments(
     db: AsyncSession,
     owner_id: int,

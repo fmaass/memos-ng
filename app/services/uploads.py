@@ -910,7 +910,13 @@ async def finalize_pending(
             assert poster_copies_out is not None  # guaranteed by the guard above
             await attach_video_poster(db, poster_upload, att, poster_copies_out)
         if positions_out is not None and upload.upload_uid in request_index:
-            positions_out.setdefault(att.uid, request_index[upload.upload_uid])
+            # The EARLIEST request index wins, not the first one to be finalized. Pass 2 runs after
+            # pass 1, and a print promoted there can dedup onto an attachment pass 1 already made
+            # from identical bytes — so the uid that asked for it FIRST is the one whose place the
+            # attachment takes, whichever pass happened to create it.
+            rank = request_index[upload.upload_uid]
+            current = positions_out.get(att.uid)
+            positions_out[att.uid] = rank if current is None else min(current, rank)
         return att
 
     out: list[str] = []
@@ -973,6 +979,13 @@ async def finalize(
     `consumed_out` collects the part files this call CONSUMED without moving — see
     `finalize_pending` for why the caller has to unlink them after its commit rather than here.
     """
+    # Under the upload's row lock BEFORE anything is copied off it. The append that completes an
+    # upload writes its capture read in the same transaction as the last chunk, so a finalize that
+    # raced it would otherwise find the bytes complete on disk and the capture columns still empty
+    # — and stamp an attachment with no date the file plainly has. Locking queues this finalize
+    # behind that commit; `ensure_capture` also performs the read itself when nothing has yet
+    # (a session that completed before this feature shipped, or a zero-byte file).
+    upload = await ensure_capture(db, upload)
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:
