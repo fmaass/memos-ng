@@ -24,12 +24,9 @@ const emit = defineEmits<{ saved: [memo: unknown] }>()
 
 const api = useApi()
 const toast = useToast()
-const {
-  items: uploads,
-  add: addUploads,
-  remove: removeUpload,
-  clear: clearUploads,
-} = useUploadQueue()
+// No `clear`: a post releases exactly the tiles it submitted, one by one, so a file attached
+// while it was in flight survives it (see save()).
+const { items: uploads, add: addUploads, remove: removeUpload } = useUploadQueue()
 const { settings } = useSettings()
 
 const content = ref('')
@@ -164,7 +161,13 @@ function onPaste(event: ClipboardEvent) {
   }
 }
 
+// Claimed SYNCHRONOUSLY, before the first await of a post — `saving` is a ref the template reads,
+// and two clicks in one tick would both pass a check on it. One post at a time: the second
+// invocation is refused rather than joined, because a second POST is a second MEMO.
+let posting = false
+
 async function save() {
+  if (posting) return
   if (!hasContent.value) return
   // Settle before posting, REGARDLESS of the date mode: the tile ORDER depends on the capture
   // decisions as much as the Auto date does, and both are frozen by this post. Refused with one
@@ -178,6 +181,7 @@ async function save() {
     })
     return
   }
+  posting = true
   saving.value = true
   try {
     // Finalize-on-post: send finished uploads' upload_uids; the server turns them into attachments.
@@ -185,8 +189,15 @@ async function save() {
     const upload_uids = orderedUploads.value
       .filter((u) => u.status === 'done' && u.uploadUid)
       .map((u) => u.uploadUid!)
+    // What this post CONTAINS, snapshotted before the request goes out. The composer stays live
+    // while it is in flight — someone can keep typing and keep attaching — and only what was
+    // submitted may be cleared when it comes back. Every tile PRESENT at this moment belongs to
+    // the submitted draft, including one whose upload failed (it was offered to this memo and
+    // refused); a tile added later belongs to the next one.
+    const submittedContent = content.value
+    const submittedIds = uploads.map((u) => u.id)
     const body: Record<string, unknown> = {
-      content: content.value,
+      content: submittedContent,
       visibility: visibility.value,
       pinned: false,
       upload_uids,
@@ -209,12 +220,19 @@ async function save() {
       throw error
     }
     emit('saved', data)
-    content.value = ''
-    useAutoDate() // the next memo starts on Auto again
-
-    clearUploads() // NOT `uploads.length = 0` — that strands the preview object URLs and File refs
+    // Clear the SUBMITTED draft, not whatever the composer holds now. A file attached while the
+    // request was in flight belongs to the next memo and stays; text typed meanwhile stays too.
+    // `removeUpload` per id, never `clearUploads()`, so the survivors keep their previews and
+    // File references and the posted ones still release theirs.
+    for (const id of submittedIds) removeUpload(id)
+    const untouched = content.value === submittedContent && uploads.length === 0
+    if (untouched) {
+      content.value = ''
+      useAutoDate() // a clean composer starts the next memo on Auto again
+    }
     nextTick(autosize)
   } finally {
+    posting = false
     saving.value = false
   }
 }
@@ -300,6 +318,14 @@ async function save() {
           /></span>
           <span v-else>{{ u.progress }}%</span>
         </div>
+        <!-- the inspection gave up on this file: the memo will not be dated by it, and saying so
+             on the tile is the difference between an unknown date and a silently wrong one -->
+        <span
+          v-else-if="u.captureUnknown"
+          class="absolute inset-x-0 top-0 bg-black/55 px-1 py-0.5 text-[10px] text-white"
+          data-test="capture-unknown"
+          >date unknown</span
+        >
         <!-- uploaded, but its capture decision has not come back yet: this is the tile the refusal
              names, so it has to be visible as the one being waited for -->
         <div

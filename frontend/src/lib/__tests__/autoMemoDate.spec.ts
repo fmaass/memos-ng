@@ -47,8 +47,16 @@ const asItems = (items: VectorItem[]): CaptureItem[] =>
     captureCivil: i.civil,
   }))
 
-const iso = (d: Date | null): string | null =>
-  d === null ? null : `${d.toISOString().slice(0, 19)}Z`
+/**
+ * Render for comparison — after asserting the precision on the RAW value. Slicing the ISO string
+ * would floor sub-second digits by itself, so a formatter-only assertion passes even if the
+ * production flooring is deleted; the millisecond check is what actually holds the rule.
+ */
+const iso = (d: Date | null): string | null => {
+  if (d === null) return null
+  expect(d.getMilliseconds()).toBe(0) // whole seconds, before any formatting
+  return `${d.toISOString().slice(0, 19)}Z`
+}
 
 describe('autoMemoDate (fixture vectors)', () => {
   for (const v of artefact.vectors.autoMemoDate) {
@@ -83,17 +91,6 @@ describe('resolveCivil (fixture vectors)', () => {
       expect(iso(resolveCivil(v.civil, v.zone))).toBe(v.expect)
     })
   }
-})
-
-describe('resolveCivil DST edges, stated explicitly', () => {
-  // Named here as well as in the artefact: these two are the rule ("a gap is not a candidate; an
-  // overlap takes the earlier instant"), and a fixture edit must not be able to quietly drop them.
-  it('rejects a civil time inside the Europe/Berlin spring-forward gap', () => {
-    expect(resolveCivil('2026-03-29T02:30:00', 'Europe/Berlin')).toBeNull()
-  })
-  it('takes the earlier instant in the Europe/Berlin autumn overlap', () => {
-    expect(iso(resolveCivil('2026-10-25T02:30:00', 'Europe/Berlin'))).toBe('2026-10-25T00:30:00Z')
-  })
 })
 
 describe('pending items never settle a date or an order', () => {

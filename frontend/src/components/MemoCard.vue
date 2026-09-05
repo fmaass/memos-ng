@@ -14,7 +14,7 @@ import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMedi
 import { fetchPrintMasters, printMasterUploads } from '@/composables/usePrintMaster'
 import { type UploadItem, useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
-import { captureOrder } from '@/lib/autoMemoDate'
+import { captureOrder, toWireInstant } from '@/lib/autoMemoDate'
 import { captureBlockedMessage, pendingCaptureItems } from '@/lib/composer'
 import {
   printBadgeLabel,
@@ -86,6 +86,9 @@ const editUploading = computed(() =>
 // order among themselves, and that order is saved (MEMNG-262).
 const editZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 const editTiles = computed<UploadItem[]>(() => [...editUploads])
+// The tiles are SHOWN in the order they will be SAVED — an edit that displayed pick order while
+// submitting capture order would be telling the person something untrue about their own memo.
+const editOrdered = computed(() => captureOrder(editTiles.value, editZone))
 const editCapturePending = computed(() => pendingCaptureItems(editTiles.value))
 const editCaptureMessage = computed(() =>
   editCapturePending.value.length ? captureBlockedMessage(editCapturePending.value) : '',
@@ -94,32 +97,48 @@ function onEditFiles(files: FileList | null) {
   if (files?.length) addEditUploads(Array.from(files))
 }
 function startEdit() {
+  submittingEdit = false
   editContent.value = props.memo.content
   editVisibility.value = props.memo.visibility
   editDate.value = new Date(props.memo.created_at)
   clearEditUploads() // NOT `editUploads.length = 0` — that strands preview object URLs + File refs
   editing.value = true
 }
+// Claimed synchronously, like the composer's: the parent owns the request, so this card would
+// otherwise emit a second edit for the same draft on a double click before the DOM settles.
+let submittingEdit = false
+
 function saveEdit() {
+  if (submittingEdit) return
   if (editCapturePending.value.length > 0) return // the sentence is already on screen
+  submittingEdit = true
+  // Snapshot what is being submitted, then release exactly those tiles — a file attached in the
+  // same moment is not part of this edit and must not vanish with it. Everything staged NOW is
+  // part of it, a failed upload included; only what its uid reaches the wire.
+  const staged = [...editOrdered.value]
+  const submitted = staged.filter((u) => u.status === 'done' && u.uploadUid)
   emit('edit', {
     uid: props.memo.uid,
     content: editContent.value,
     visibility: editVisibility.value,
-    created_at: (editDate.value ?? new Date(props.memo.created_at)).toISOString(),
+    // Seconds precision, the same serializer the composer uses — the wire carries whole seconds
+    // everywhere in this feature, and a millisecond spelling here would be a second dialect.
+    created_at: toWireInstant(editDate.value ?? new Date(props.memo.created_at)),
     // In capture order among themselves; the server appends them after the memo's existing
     // attachments, whose saved order this edit never re-sorts.
-    upload_uids: captureOrder(editTiles.value, editZone)
-      .filter((u) => u.status === 'done' && u.uploadUid)
-      .map((u) => u.uploadUid as string),
+    upload_uids: submitted.map((u) => u.uploadUid as string),
   })
-  clearEditUploads()
+  for (const item of staged) removeEditUpload(item.id)
   editing.value = false
+  // The claim is NOT released here: the parent owns the request, so nothing in this card can know
+  // it has landed. It is released when the editor is opened again (startEdit) or abandoned
+  // (cancelEdit) — which is exactly when a second edit becomes a genuinely different one.
 }
 // Cancel discards the staged uploads — they were never going to be attached (startEdit would drop
 // them on the next open anyway), so release them now instead of stranding their object URLs.
 function cancelEdit() {
   clearEditUploads()
+  submittingEdit = false
   editing.value = false
 }
 
@@ -360,7 +379,7 @@ function onContentClick(event: MouseEvent) {
           </button>
         </div>
         <div
-          v-for="u in editUploads"
+          v-for="u in editOrdered"
           :key="u.id"
           class="relative h-16 w-16 overflow-hidden rounded-md bg-surface-100 dark:bg-surface-800"
         >
@@ -373,6 +392,21 @@ function onContentClick(event: MouseEvent) {
             class="absolute inset-0 flex items-center justify-center bg-black/45 text-xs font-medium text-white"
           >
             {{ u.progress }}%
+          </div>
+          <!-- the same two capture states the composer shows: still being read, and given up on -->
+          <span
+            v-else-if="u.captureUnknown"
+            class="absolute inset-x-0 top-0 bg-black/55 px-1 py-0.5 text-[9px] text-white"
+            data-test="edit-capture-unknown"
+            >date unknown</span
+          >
+          <div
+            v-else-if="u.captureState === 'pending'"
+            class="absolute inset-0 flex items-center justify-center bg-black/35 text-white"
+            data-test="edit-capture-item-pending"
+            :aria-label="`Reading the date of ${u.name}`"
+          >
+            <i class="pi pi-spin pi-spinner text-xs" aria-hidden="true" />
           </div>
           <button
             type="button"

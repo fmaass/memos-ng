@@ -99,6 +99,10 @@ export interface UploadItem {
   captureInstant: string | null
   captureCivil: string | null
   captureSource: string | null
+  // The inspection gave up (it kept answering `pending`, or the network did not answer at all).
+  // The item settles as UNDATED so the composer is never blocked for ever — and says so on the
+  // tile, because a date silently missing from a memo is exactly what this feature is fixing.
+  captureUnknown: boolean
 }
 
 // The inspection poll: the server reads the file the moment its last chunk lands, so the first
@@ -106,6 +110,9 @@ export interface UploadItem {
 // and it is BOUNDED — an item that never settles is treated as one with no capture date rather
 // than blocking the composer's Save for ever.
 const CAPTURE_POLL_DELAYS_MS = [0, 150, 300, 600, 1000, 1500, 2000, 3000, 3000, 5000, 5000]
+// Per REQUEST, not per poll: without it one socket that never answers holds the whole bounded
+// loop open, and "bounded" becomes a promise the code does not keep.
+const CAPTURE_REQUEST_TIMEOUT_MS = 4000
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -139,8 +146,12 @@ export function useUploadQueue(concurrency = 2) {
       for (const delay of CAPTURE_POLL_DELAYS_MS) {
         if (delay) await wait(delay)
         if (!live()) return
+        const request = new AbortController()
+        const abortRequest = () => request.abort()
+        const timer = setTimeout(abortRequest, CAPTURE_REQUEST_TIMEOUT_MS)
+        controller.signal.addEventListener('abort', abortRequest)
         try {
-          const res = await fetch(`/api/uploads/${uid}/capture`, { signal: controller.signal })
+          const res = await fetch(`/api/uploads/${uid}/capture`, { signal: request.signal })
           if (!res.ok) break // 404 = the session is gone; nothing more to learn here
           const body = (await res.json()) as {
             state: CaptureDecision
@@ -159,11 +170,19 @@ export function useUploadQueue(concurrency = 2) {
           }
         } catch {
           if (controller.signal.aborted) return
-          break // a transport failure is not worth a second network storm
+          break // a transport failure (or this request's own timeout) ends the poll
+        } finally {
+          clearTimeout(timer)
+          controller.signal.removeEventListener('abort', abortRequest)
         }
       }
       const item = live()
-      if (item) item.captureState = 'done' // settled with no date, rather than pending for ever
+      if (item) {
+        // Settled with no date rather than pending for ever — and MARKED, so the tile can say the
+        // date is unknown instead of the memo quietly taking today's.
+        item.captureState = 'done'
+        item.captureUnknown = true
+      }
     } finally {
       if (captureAborts.get(id) === controller) captureAborts.delete(id)
     }
@@ -187,7 +206,9 @@ export function useUploadQueue(concurrency = 2) {
           item.error = err instanceof Error ? err.message : String(err)
           // A file whose bytes never landed has no capture decision to wait for — and it is not
           // posted either (only `done` tiles contribute an upload_uid), so it settles here rather
-          // than holding the composer.
+          // than holding the composer. Not `captureUnknown`: the tile already shows the upload
+          // error, and a second complaint about the date of a file that is not going anywhere
+          // would only add noise.
           item.captureState = 'done'
         })
         .finally(() => {
@@ -217,6 +238,7 @@ export function useUploadQueue(concurrency = 2) {
         captureInstant: null,
         captureCivil: null,
         captureSource: null,
+        captureUnknown: false,
       }
       files.set(raw.id, file)
       items.push(raw)

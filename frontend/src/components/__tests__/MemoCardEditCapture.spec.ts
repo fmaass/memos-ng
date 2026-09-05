@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
@@ -23,6 +26,17 @@ vi.mock('@/composables/usePrintMaster', () => ({
 }))
 
 const json = (body: unknown) => ({ ok: true, status: 200, headers: new Headers(), json: async () => body })
+
+// The order scenario is the shared artefact's, by id — the rule lives there, not here.
+interface VectorItem {
+  id: string
+  instant: string | null
+  civil: string | null
+}
+const artefact: { vectors: { captureOrder: { id: string; items: VectorItem[]; expect: string[] }[] } } =
+  JSON.parse(readFileSync(join(import.meta.dirname, '../../../../fixtures/auto-memo-date.json'), 'utf8'))
+const orderVector = (id: string) => artefact.vectors.captureOrder.find((v) => v.id === id)!
+const fileNameOf = (item: VectorItem) => `${item.id}.jpg`
 
 function stubLane(script: Record<string, { state?: 'pending' | 'done'; capture_instant?: string | null }>) {
   const nameOf = new Map<string, string>()
@@ -110,23 +124,61 @@ describe('MemoCard — the edit path waits for the capture decisions', () => {
     expect(wrapper.emitted('edit')).toBeFalsy()
   })
 
-  it('sends the added files in capture order once they have settled', async () => {
-    stubLane({
-      'later.jpg': { capture_instant: '2026-01-01T15:00:00Z' },
-      'earlier.jpg': { capture_instant: '2026-01-01T13:00:00Z' },
-    })
+  it('shows AND sends the vector "basic" capture order — the display is the saved order', async () => {
+    const vector = orderVector('basic')
+    stubLane(
+      Object.fromEntries(
+        vector.items.map((i) => [fileNameOf(i), { capture_instant: i.instant }]),
+      ),
+    )
     const wrapper = mountCard()
     await openEditor(wrapper)
-    await addFiles(wrapper, 'later.jpg', 'earlier.jpg')
+    await addFiles(wrapper, ...vector.items.map(fileNameOf))
 
     expect(wrapper.find('[data-test="edit-capture-pending"]').exists()).toBe(false)
+    const shown = wrapper
+      .findAll('[data-test="edit-attachments"] > div')
+      .map((d) => d.find('img').attributes('alt'))
+    expect(shown).toEqual(vector.expect.map((id) => `${id}.jpg`)) // what you see…
+
     await wrapper.find('[data-test="edit-save"]').trigger('click')
-    const payload = wrapper.emitted('edit')![0][0] as {
-      upload_uids: string[]
-      created_at: string
+    const payload = wrapper.emitted('edit')![0][0] as { upload_uids: string[]; created_at: string }
+    const uidOfName = (name: string) => `upload-${vector.items.findIndex((i) => fileNameOf(i) === name) + 1}`
+    expect(payload.upload_uids).toEqual(vector.expect.map((id) => uidOfName(`${id}.jpg`))) // …is what is saved
+    // MANUAL, always: the edit keeps the memo's own date, in whole seconds like the composer
+    expect(payload.created_at).toBe('2026-06-20T00:00:00Z')
+  })
+
+  it('emits ONE edit for two clicks in the same moment', async () => {
+    stubLane({ 'pic.jpg': { capture_instant: '2026-01-01T13:00:00Z' } })
+    const wrapper = mountCard()
+    await openEditor(wrapper)
+    await addFiles(wrapper, 'pic.jpg')
+
+    const save = wrapper.find('[data-test="edit-save"]')
+    save.trigger('click')
+    save.trigger('click')
+    await flushPromises()
+    expect(wrapper.emitted('edit')).toHaveLength(1)
+  })
+
+  it('marks a file whose date could not be read, and still lets the edit be saved', async () => {
+    stubLane({ 'silent.jpg': { state: 'pending' } })
+    const wrapper = mountCard()
+    await openEditor(wrapper)
+    vi.useFakeTimers()
+    try {
+      await addFiles(wrapper, 'silent.jpg')
+      for (let i = 0; i < 120 && !wrapper.find('[data-test="edit-capture-unknown"]').exists(); i++) {
+        await vi.advanceTimersByTimeAsync(1000)
+        await nextTick()
+      }
+    } finally {
+      vi.useRealTimers()
     }
-    expect(payload.upload_uids).toEqual(['upload-2', 'upload-1'])
-    // MANUAL, always: the edit keeps the memo's own date and Auto never re-dates it
-    expect(payload.created_at).toBe('2026-06-20T00:00:00.000Z')
+    expect(wrapper.find('[data-test="edit-capture-unknown"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="edit-capture-pending"]').exists()).toBe(false)
+    await wrapper.find('[data-test="edit-save"]').trigger('click')
+    expect(wrapper.emitted('edit')).toHaveLength(1) // settled, just undated
   })
 })
