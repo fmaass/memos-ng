@@ -211,13 +211,17 @@ async def upload_capture(
     that exactly-once, and every later poll is a plain read.
     """
     upload = await _get_upload(db, upload_uid, user.id)
-    upload = await svc.ensure_capture(db, upload)
+    settled = await svc.ensure_capture(db, upload)
+    if settled is None:
+        # Finalized (or reaped) while this read waited for the row: the session is gone, and a
+        # gone session answers here exactly as an unknown uid does.
+        raise HTTPException(status_code=404, detail="Upload not found")
     await db.commit()
     return CaptureOut(
-        state="done" if upload.capture_state == "done" else "pending",
-        capture_instant=upload.capture_instant,
-        capture_civil=upload.capture_civil,
-        capture_source=upload.capture_source,
+        state="done" if settled.capture_state == "done" else "pending",
+        capture_instant=settled.capture_instant,
+        capture_civil=settled.capture_civil,
+        capture_source=settled.capture_source,
     )
 
 
@@ -235,6 +239,10 @@ async def finalize_upload(
     consumed: list[str] = []
     try:
         attachment = await svc.finalize(db, upload, owner_id=user.id, consumed_out=consumed)
+    except svc.UploadsUnlinkable:
+        # The session was consumed by another finalize while this one waited for its row. Same
+        # answer as an unknown uid — because that is what it now is.
+        raise HTTPException(status_code=404, detail="Upload not found") from None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     await db.commit()

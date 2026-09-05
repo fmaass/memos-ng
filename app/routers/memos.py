@@ -722,7 +722,11 @@ async def create_memo(
         # a COMMITTED memo owns, so it must never run once this is set.
         committed = False
         try:
-            try:
+            # Finalizing runs INSIDE create_memo, after the memo row is inserted and locked, so
+            # this write takes the same outermost lock as every other one (see create_memo). The
+            # closure is the only way to sit between those two steps without the router owning the
+            # insert.
+            async def finalize_uploads(memo: Memo) -> list[str]:
                 # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
                 # of this memo, and must be answered as the mistake it is rather than dropped in
                 # silence because the batch looked empty.
@@ -740,28 +744,29 @@ async def create_memo(
                     if body.upload_uids or body.video_posters
                     else []
                 )
-            except uploads_svc.UploadsUnlinkable as exc:
-                raise _unlinkable(exc) from None
-            except uploads_svc.VideoPostersInvalid as exc:
-                raise _video_posters_invalid(exc) from None
-            memo = await svc.create_memo(
-                db,
-                user,
-                content=body.content,
-                visibility=visibility,
-                pinned=body.pinned,
                 # Sorted back into the DECLARED order: `finalized` comes out in pass order
                 # (screens, then promoted prints), while it is the REQUEST order that becomes each
                 # attachment's saved `position`. Stable, so a uid the map does not name keeps its
                 # relative place at the end.
-                attachment_uids=[
-                    *body.attachment_uids,
-                    *sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
-                ],
-                created_at=body.created_at,
-                moved_out=moved,  # placement into the memo folder appends here → undone on fail
-                idempotency_key=key,
-            )
+                return sorted(finalized, key=lambda uid: positions.get(uid, len(finalized)))
+
+            try:
+                memo = await svc.create_memo(
+                    db,
+                    user,
+                    content=body.content,
+                    visibility=visibility,
+                    pinned=body.pinned,
+                    attachment_uids=body.attachment_uids,
+                    created_at=body.created_at,
+                    moved_out=moved,  # placement into the memo folder appends here → undone on fail
+                    idempotency_key=key,
+                    finalize=finalize_uploads,
+                )
+            except uploads_svc.UploadsUnlinkable as exc:
+                raise _unlinkable(exc) from None
+            except uploads_svc.VideoPostersInvalid as exc:
+                raise _video_posters_invalid(exc) from None
             # After all attachments are linked, enqueue frame shares for #curated photos (no-op
             # unless configured). Savepoint-isolated so a feature error can't fail the save.
             await _enqueue_frame_shares_safe(db, memo, user)
@@ -893,15 +898,19 @@ async def patch_memo(
             # linked: every later lock belongs to something hanging off this memo, so they all
             # nest under it and two edits of one memo can neither deadlock nor both allocate the
             # same attachment position (see services.memos.lock_memo_for_write).
-            await svc.lock_memo_for_write(db, memo)
+            # It re-reads as well as locks: this edit read the memo BEFORE queueing for the
+            # lock, so everything it holds is the winner's before-picture, and patching that is a
+            # lost update SQLAlchemy cannot see (see lock_memo_for_write). A distinct name, since
+            # the enclosing handler's `memo` is what the retry loop re-enters with.
+            locked = await svc.lock_memo_for_write(db, memo)
             if key is not None:
                 # Recorded BEFORE any work: the loser of a same-key race blocks on the unique
                 # constraint and fails here, having moved no bytes — so it has none to move back.
                 # It lands in the same transaction as the edit, so the two commit or roll back
                 # together and a recorded key never outlives the edit it names.
-                await svc.record_edit_key(db, memo, owner_id, key)
+                await svc.record_edit_key(db, locked, owner_id, key)
             fields = body.model_dump(exclude_unset=True, exclude={"upload_uids", "edit_key"})
-            edited = await svc.update_memo(db, memo, **fields)
+            edited = await svc.update_memo(db, locked, **fields)
             if body.upload_uids:
                 # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto
                 # that screen instead of promoting a second visible copy of the same photo

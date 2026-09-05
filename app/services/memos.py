@@ -1,7 +1,7 @@
 import re
 import secrets
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -109,7 +109,17 @@ async def create_memo(
     created_at: datetime | None = None,
     moved_out: list[storage.TrackedMove] | None = None,
     idempotency_key: str | None = None,
+    finalize: Callable[[Memo], Awaitable[Sequence[str]]] | None = None,
 ) -> Memo:
+    """Store one memo and link its media.
+
+    `finalize` is the create path's upload work — turning pending uploads into attachments — and it
+    is a callback for exactly one reason: the ORDER of the locks. The memo row is inserted and
+    LOCKED first, and only then does anything take an upload's or an attachment's row, so every
+    write path in this application acquires the same outermost lock in the same place and no pair
+    of them can hold what the other is waiting for. It returns the uids to link after
+    `attachment_uids`, in the order they are to be numbered.
+    """
     memo = Memo(
         uid=gen_uid(),
         owner_id=owner.id,
@@ -128,7 +138,12 @@ async def create_memo(
     # access on an expired column would raise). A caller-supplied created_at is already loaded; the
     # refresh just reloads the identical persisted value.
     await db.refresh(memo, ["created_at"])
-    await link_attachments(db, owner.id, memo, attachment_uids or [], moved_out=moved_out)
+    # The row exists now — take its lock before any upload or attachment row is touched.
+    memo = await lock_memo_for_write(db, memo)
+    finalized = list(await finalize(memo)) if finalize is not None else []
+    await link_attachments(
+        db, owner.id, memo, [*(attachment_uids or []), *finalized], moved_out=moved_out
+    )
     await db.refresh(memo)
     return memo
 
@@ -174,7 +189,7 @@ async def _place_attachment_masters(
             r.storage_path = str(new)
 
 
-async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> None:
+async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo:
     """Take the memo row's write lock — the FIRST lock a memo edit acquires (MEMNG-262).
 
     Everything an edit locks afterwards hangs off this memo: the uploads it finalizes, the
@@ -188,10 +203,25 @@ async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> None:
     memo would both allocate 0. Serialized here, the second one sees the first one's attachment
     and continues from it.
 
-    A CREATE needs none of this: its memo row is inserted inside its own transaction and no other
-    transaction can see — let alone edit — it before the commit, so it is already the only writer.
+    It LOADS as well as locks, and that is not a convenience. The caller read this memo before it
+    queued for the lock, so every attribute it holds is a snapshot from before the winner's write.
+    Applying a patch on top of that is a silent lost update: SQLAlchemy compares each new value
+    with the STALE one, sees "unchanged" for a field that changed underneath, and emits no UPDATE
+    at all — the edit reports success and changes nothing. `populate_existing` refreshes the
+    identity map from the locked row, so the patch is applied to what the row actually says now.
+
+    A create takes it too (see `create_memo`): its row cannot be contended, but taking the same
+    outermost lock on every path is what makes the lock ORDER a property of the code rather than
+    of an argument about visibility.
     """
-    await db.execute(select(Memo.id).where(Memo.id == memo.id).with_for_update())
+    return (
+        await db.execute(
+            select(Memo)
+            .where(Memo.id == memo.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
 
 
 async def link_attachments(

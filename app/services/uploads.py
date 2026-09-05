@@ -517,7 +517,9 @@ async def append_stream(
                 # has consumed them yet. The capture read happens here, inside the same row lock
                 # and the same transaction as the offset that completed it, so it can neither run
                 # twice nor be visible without the bytes it describes (MEMNG-262).
-                upload = await ensure_capture(db, upload)
+                # This transaction already holds the row, so the read cannot come back empty;
+                # the walrus keeps the type honest without inventing a branch that cannot run.
+                upload = await ensure_capture(db, upload) or upload
         # offset < bytes_received → a concurrent append already covered this range; no-op
         return upload
     finally:
@@ -737,7 +739,7 @@ async def _consume(part: Path, consumed_out: list[str] | None) -> None:
     await to_thread.run_sync(_unlink_sync, part)
 
 
-async def ensure_capture(db: AsyncSession, upload: Upload) -> Upload:
+async def ensure_capture(db: AsyncSession, upload: Upload) -> Upload | None:
     """Read this upload's capture date ONCE, as soon as all of its bytes are here (MEMNG-262).
 
     Two callers reach it: the append that lands the last chunk, and the inspection endpoint. The
@@ -753,6 +755,11 @@ async def ensure_capture(db: AsyncSession, upload: Upload) -> Upload:
     Blocking work runs in a worker thread under a deadline. On timeout the read is ABANDONED — the
     thread finishes into nothing — and the upload settles with no date, because a capture date is
     a nicety and a stuck upload is not.
+
+    Answers None when the row is GONE. Waiting on the lock is exactly when it can disappear: the
+    writer this call queued behind may have been another finalize, which consumes the session and
+    deletes the row. A caller that finds None must take its "unknown upload" path — the bytes and
+    the row it was about to work from are somebody else's now.
     """
     locked = (
         await db.execute(
@@ -762,8 +769,8 @@ async def ensure_capture(db: AsyncSession, upload: Upload) -> Upload:
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if locked is None:  # reaped or finalized under us; nothing to record it on
-        return upload
+    if locked is None:  # reaped or finalized under us — see the docstring
+        return None
     if locked.capture_state == "done":
         return locked
     part = part_path(locked.upload_uid)
@@ -985,7 +992,13 @@ async def finalize(
     # — and stamp an attachment with no date the file plainly has. Locking queues this finalize
     # behind that commit; `ensure_capture` also performs the read itself when nothing has yet
     # (a session that completed before this feature shipped, or a zero-byte file).
-    upload = await ensure_capture(db, upload)
+    locked = await ensure_capture(db, upload)
+    if locked is None:
+        # Gone while this call waited for the lock — another finalize consumed it. Its part file
+        # is that finalize's business now (moved into place, or reaped after its commit), so this
+        # one must not touch it: it answers exactly as an unknown uid does.
+        raise UploadsUnlinkable([upload.upload_uid], [])
+    upload = locked
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:

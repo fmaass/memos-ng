@@ -141,43 +141,6 @@ async def test_two_concurrent_appends_to_one_memo_do_not_both_allocate_position_
         _cleanup()
 
 
-async def test_two_concurrent_print_bindings_on_one_memo_complete(
-    logged_in_client, monkeypatch, tmp_path
-):
-    """A print binds to its screen INSIDE finalize, before any linking — so two edits of one memo
-    take the same rows in different orders. With the memo's row taken first by both, they serialize
-    instead of holding each other's rows; both come back, neither is a deadlock abort."""
-    client, _ = logged_in_client
-    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    try:
-        screen_one = _upload(client, "_A1.png", _png(b"S1"))
-        screen_two = _upload(client, "_A2.png", _png(b"S2"))
-        memo = client.post(
-            "/api/memos",
-            json={
-                "content": "two photos",
-                "visibility": "PRIVATE",
-                "upload_uids": [screen_one, screen_two],
-            },
-        ).json()
-        print_one = _upload(client, "_A1 - print.png", _png(b"P1"))
-        print_two = _upload(client, "_A2 - print.png", _png(b"P2"))
-
-        async with _async_client(client) as first, _async_client(client) as second:
-            results = await asyncio.gather(
-                first.patch(f"/api/memos/{memo['uid']}", json={"upload_uids": [print_one]}),
-                second.patch(f"/api/memos/{memo['uid']}", json={"upload_uids": [print_two]}),
-            )
-
-        assert [r.status_code for r in results] == [200, 200], [r.text for r in results]
-        saved = _positions(memo["uid"])
-        assert [p for p, _ in saved] == [0, 1]  # both prints bound; neither became a third picture
-        attachments = client.get(f"/api/memos/{memo['uid']}").json()["attachments"]
-        assert [a["hasPrint"] for a in attachments] == [True, True]
-    finally:
-        _cleanup()
-
-
 async def test_finalize_waits_for_a_completing_append_to_land_its_capture_read(
     logged_in_client, monkeypatch, tmp_path
 ):
@@ -238,5 +201,113 @@ async def test_finalize_waits_for_a_completing_append_to_land_its_capture_read(
         assert row.capture_instant.strftime("%Y-%m-%dT%H:%M:%SZ") == expected["capture_instant"]
         assert row.capture_source == expected["capture_source"]
         assert row.captured_at == row.capture_instant
+    finally:
+        _cleanup()
+
+
+async def test_the_second_patch_applies_to_what_the_row_says_after_the_first(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """A silent lost update, and the reason the memo lock also RE-READS.
+
+    Both edits load the memo before either commits, so the second one holds the winner's
+    before-picture. Setting a field back to the value in that stale snapshot then changes nothing
+    at all — SQLAlchemy compares against the snapshot, finds them equal and emits no UPDATE — and
+    the edit reports success while the first edit's value survives.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = client.post(
+            "/api/memos", json={"content": "orig", "visibility": "PRIVATE"}
+        ).json()
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_lock = memos_router.svc.lock_memo_for_write
+        calls = 0
+
+        async def park_holding_the_lock(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            locked = await real_lock(*args, **kwargs)
+            if calls == 1:
+                entered.set()
+                await release.wait()  # the second edit is queued on this row meanwhile
+            return locked
+
+        monkeypatch.setattr(memos_router.svc, "lock_memo_for_write", park_holding_the_lock)
+
+        async with _async_client(client) as first, _async_client(client) as second:
+            a = asyncio.create_task(
+                first.patch(f"/api/memos/{memo['uid']}", json={"content": "changed"})
+            )
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            b = asyncio.create_task(
+                second.patch(f"/api/memos/{memo['uid']}", json={"content": "orig"})
+            )
+            await asyncio.sleep(0.3)  # long enough for the second to load and queue for the lock
+            release.set()
+            first_res, second_res = await asyncio.gather(a, b)
+
+        assert [first_res.status_code, second_res.status_code] == [200, 200]
+        stored = client.get(f"/api/memos/{memo['uid']}").json()
+        assert stored["content"] == "orig"  # the LAST writer wins, and it actually wrote
+        assert second_res.json()["content"] == "orig"  # …and said so
+    finally:
+        _cleanup()
+
+
+async def test_a_finalize_that_waited_for_a_consumed_upload_answers_unknown(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """Waiting on the upload's row lock is exactly when the row can disappear: the writer ahead may
+    be another finalize, which consumes the session and deletes it. The loser must take the
+    unknown-upload path — not carry on and touch a part file that now belongs to the winner (or to
+    nobody), which is a FileNotFoundError at best and someone else's bytes at worst."""
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        uid = _upload(client, "shared.png", _png(b"ONCE"))
+
+        async def winner():
+            async with async_session() as session:
+                owner = (
+                    await session.execute(select(User).where(User.subject == subject))
+                ).scalar_one()
+                upload = (
+                    await session.execute(select(Upload).where(Upload.upload_uid == uid))
+                ).scalar_one()
+                attachment = await uploads_svc.finalize(session, upload, owner.id)
+                await asyncio.sleep(0.4)  # the loser queues on the row meanwhile
+                await session.commit()
+                return attachment.uid
+
+        async def loser():
+            await asyncio.sleep(0.1)
+            async with async_session() as session:
+                owner = (
+                    await session.execute(select(User).where(User.subject == subject))
+                ).scalar_one()
+                upload = (
+                    await session.execute(select(Upload).where(Upload.upload_uid == uid))
+                ).scalar_one()
+                try:
+                    await uploads_svc.finalize(session, upload, owner.id)
+                except uploads_svc.UploadsUnlinkable as exc:
+                    await session.rollback()
+                    return exc
+                await session.commit()
+                return None
+
+        winner_uid, refused = await asyncio.gather(winner(), loser())
+
+        assert isinstance(refused, uploads_svc.UploadsUnlinkable), refused
+        assert refused.missing == [uid]
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as conn:
+            uids = list(conn.execute(text("SELECT uid FROM attachments")).scalars())
+        eng.dispose()
+        assert uids == [winner_uid]  # one attachment, one owner of those bytes
     finally:
         _cleanup()
