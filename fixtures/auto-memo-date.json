@@ -797,6 +797,17 @@
       "sha256": "556ea3f4eb8560835433976d2f5895b8f839ed2ca51923722cf08f5eea1edc63",
       "size": 173
     },
+    "png-exif-after-idat.png": {
+      "mime": "image/png",
+      "note": "the same eXIf chunk as png-exif.png, placed AFTER the image data \u2014 legal, and invisible to a reader that trusts what the header parse collected.",
+      "expect": {
+        "capture_instant": "2026-01-01T07:15:00Z",
+        "capture_civil": null,
+        "capture_source": "exif"
+      },
+      "sha256": "19479024f499139574accea7e5a666905d1218b3bf03569b01d4fcd0ead980ef",
+      "size": 173
+    },
     "mov-creationdate.mov": {
       "mime": "video/quicktime",
       "note": "the movie header says 2019-05-05; the creationdate key must win.",

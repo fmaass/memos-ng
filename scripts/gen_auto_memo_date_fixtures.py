@@ -82,6 +82,38 @@ def png_exif(path: Path) -> None:
     )
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_chunks(raw: bytes) -> list[tuple[bytes, bytes]]:
+    """The file's chunks as (type, whole chunk INCLUDING length/type/CRC), in file order."""
+    chunks: list[tuple[bytes, bytes]] = []
+    i = len(PNG_SIGNATURE)
+    while i + 8 <= len(raw):
+        length = int.from_bytes(raw[i : i + 4], "big")
+        kind = raw[i + 4 : i + 8]
+        end = i + 12 + length
+        chunks.append((kind, raw[i:end]))
+        i = end
+    return chunks
+
+
+def png_exif_after_idat(path: Path) -> None:
+    """The same eXIf chunk as `png-exif.png`, moved AFTER the image data.
+
+    A PNG's metadata chunks may legally sit on either side of IDAT, and Pillow stops parsing at
+    IDAT when it opens the file — so `im.info["exif"]` is empty for this one while being populated
+    for its twin. Two files, one date: the reader has to find it in both, which is what forces it
+    to walk the chunk list itself instead of trusting what the open happened to collect.
+    """
+    source = _png_chunks((path.parent / "png-exif.png").read_bytes())
+    exif = [chunk for kind, chunk in source if kind == b"eXIf"]
+    assert exif, "png-exif.png carries no eXIf chunk to move"
+    head = [chunk for kind, chunk in source if kind not in (b"eXIf", b"IEND")]
+    tail = [chunk for kind, chunk in source if kind == b"IEND"]
+    path.write_bytes(PNG_SIGNATURE + b"".join(head) + b"".join(exif) + b"".join(tail))
+
+
 def _ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", "-v", "error", *args], check=True)
 
@@ -142,6 +174,7 @@ FIXTURES = {
     "heic-offset.heic": heic_offset,
     "png-none.png": png_none,
     "png-exif.png": png_exif,
+    "png-exif-after-idat.png": png_exif_after_idat,
     "mov-creationdate.mov": mov_creationdate,
     "mp4-header-only.mp4": mp4_header_only,
     "mp4-zero-header.mp4": mp4_zero_header,

@@ -226,12 +226,15 @@ def test_the_video_reader_seeks_over_the_samples_instead_of_reading_them(tmp_pat
     entire file through memory, which is what made "route large videos through the worker" look
     necessary. Counting the bytes is the only way to tell the two implementations apart.
     """
+    # The clip's date is the artefact's own "valid-2026" movie-header vector, so even this
+    # throwaway file carries an instant the contract names rather than one invented here.
+    header = next(v for v in ARTEFACT["vectors"]["videoHeader"] if v["id"] == "valid-2026")
     clip = tmp_path / "big.mp4"
     subprocess.run(
         [
             "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=s=640x480:d=8:r=25",
             "-c:v", "libx264", "-crf", "5", "-pix_fmt", "yuv420p",
-            "-metadata", "creation_time=2026-02-03T09:30:00Z", "-y", str(clip),
+            "-metadata", f"creation_time={header['expect']}", "-y", str(clip),
         ],
         check=True,
     )
@@ -266,7 +269,7 @@ def test_the_video_reader_seeks_over_the_samples_instead_of_reading_them(tmp_pat
         result = capture.read_capture(clip, "video/mp4")
     finally:
         del capture.open  # back to the builtin
-    assert _instant(result.capture_instant) == "2026-02-03T09:30:00Z"  # the clip's own header
+    assert _instant(result.capture_instant) == header["expect"]  # the clip's own header
     assert read_total < size // 10, f"read {read_total} of {size} bytes — the mdat was pulled in"
 
 
@@ -724,10 +727,11 @@ def test_a_tiff_carries_its_exif_in_its_own_ifd_and_is_still_not_decoded(tmp_pat
     """
     from PIL import ExifTags, Image, ImageFile
 
+    vector = next(v for v in ARTEFACT["vectors"]["exifStrings"] if v["id"] == "with-offset")
     exif = Image.Exif()
     ifd = exif.get_ifd(ExifTags.IFD.Exif)
-    ifd[capture.DATETIME_ORIGINAL] = "2026:01:01 13:00:00"
-    ifd[capture.OFFSET_TIME_ORIGINAL] = "+05:45"
+    ifd[capture.DATETIME_ORIGINAL] = vector["datetime"]
+    ifd[capture.OFFSET_TIME_ORIGINAL] = vector["offset"]
     path = tmp_path / "scan.tif"
     Image.new("RGB", (8, 8), (7, 7, 7)).save(path, "TIFF", exif=exif.tobytes())
 
@@ -745,8 +749,8 @@ def test_a_tiff_carries_its_exif_in_its_own_ifd_and_is_still_not_decoded(tmp_pat
     finally:
         for target, attr, original in monkey:
             setattr(target, attr, original)
-    assert _instant(result.capture_instant) == "2026-01-01T07:15:00Z"
-    assert result.capture_source == "exif"
+    assert _instant(result.capture_instant) == vector["expect"]["instant"]
+    assert result.capture_source == vector["expect"]["source"]
 
 
 # --------------------------------------------------------------------------------------------

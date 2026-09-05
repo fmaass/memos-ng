@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pillow_heif
 import structlog
-from PIL import Image, TiffImagePlugin
+from PIL import Image, PngImagePlugin, TiffImagePlugin
 
 pillow_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
 
@@ -60,6 +60,9 @@ MAX_HEADER_SKEW = timedelta(days=1)
 # A `moov` box is metadata; a megabyte of it is already extravagant. The cap bounds what a hostile
 # or corrupt header can make this process allocate.
 MOOV_READ_CAP = 8 * 1024 * 1024
+# A PNG's eXIf chunk is metadata; the same reasoning (and the same generosity) as the moov cap.
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_EXIF_READ_CAP = 2 * 1024 * 1024
 
 _EXIF_DATETIME = "%Y:%m:%d %H:%M:%S"
 _OFFSET = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
@@ -169,15 +172,46 @@ def instant_from_movie_header(seconds: int, now: datetime | None = None) -> date
     return instant.replace(microsecond=0)
 
 
+def _png_exif(path: Path) -> bytes | None:
+    """The bytes of a PNG's `eXIf` chunk, found by walking the chunk list — or None.
+
+    Pillow stops parsing a PNG's header at the first `IDAT`, so `im.info["exif"]` only ever holds
+    an eXIf chunk that happens to precede the image data. Both placements are legal and both occur
+    (`fixtures/auto-memo-date/png-exif-after-idat.png` is the other one), so the list is walked
+    here: each chunk's 8-byte length+type header is read and its payload SEEKED over — `IDAT` is
+    never read, only skipped — and only an `eXIf` payload is ever pulled into memory.
+    """
+    with open(path, "rb") as f:
+        if f.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+            return None
+        while True:
+            header = f.read(8)
+            if len(header) < 8:
+                return None
+            length = int.from_bytes(header[:4], "big")
+            kind = header[4:8]
+            if kind == b"IEND":
+                return None
+            if kind == b"eXIf":
+                if length > PNG_EXIF_READ_CAP:
+                    return None
+                payload = f.read(length)
+                # The same shape the other containers hand over, so one parser reads them all.
+                return b"Exif\x00\x00" + payload
+            f.seek(length + 4, 1)  # payload + CRC, unread
+
+
 def _read_image(path: Path) -> CaptureResult:
     """The PRIMARY image's whitelisted EXIF tags, read from metadata the OPEN already parsed.
 
     Two containers, two places that metadata lives:
 
-    * JPEG / PNG / HEIF — `im.info["exif"]` is the raw APP1/eXIf/HEIF-exif payload the format
-      plugin picked up while parsing the header. For a HEIC that is the PRIMARY item's payload,
-      which is NOT necessarily the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a
-      different date on its first item on purpose).
+    * JPEG / HEIF — `im.info["exif"]` is the raw APP1/HEIF-exif payload the format plugin picked
+      up while parsing the header. For a HEIC that is the PRIMARY item's payload, which is NOT
+      necessarily the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a different
+      date on its first item on purpose).
+    * PNG — the chunk list is walked here (`_png_exif`), because Pillow stops at IDAT and an eXIf
+      chunk is equally legal on the far side of it.
     * TIFF — there is no such payload: the EXIF tags live in the file's own first IFD, which
       `TiffImageFile` parses at open into `tag_v2`. `getexif()` reads THAT, so it costs nothing and
       decodes nothing here — while for a PNG with no eXIf chunk the same call would fall through
@@ -193,7 +227,9 @@ def _read_image(path: Path) -> CaptureResult:
         if isinstance(im, TiffImagePlugin.TiffImageFile):
             exif = im.getexif()  # from tag_v2, parsed at open; no sample decode
         else:
-            raw = im.info.get("exif")
+            raw = _png_exif(path) if isinstance(im, PngImagePlugin.PngImageFile) else None
+            if raw is None:
+                raw = im.info.get("exif")
             if not raw:
                 return NOTHING
             exif = Image.Exif()
