@@ -1,4 +1,4 @@
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -48,9 +48,33 @@ class AttachmentOut(BaseModel):
     size: int
     status: AttachmentStatus
     captured_at: Rfc3339Datetime | None
+    # What the FILE's own metadata said, as opposed to `captured_at`, which falls back to the
+    # browser's modification time and then to the upload time and so always holds something
+    # (MEMNG-262). `capture_civil` is a wall-clock reading with no zone — the client resolves it.
+    capture_instant: Rfc3339Datetime | None
+    capture_civil: str | None
+    capture_source: str | None
+    # Only ever set once the attachment belongs to a memo — this route answers a STANDALONE
+    # finalize, which links nothing, so it is null here and carries the saved order in the memo
+    # responses (`AttachmentRef`).
+    position: int | None
     width: int | None
     height: int | None
     duration: float | None
+
+
+class CaptureOut(BaseModel):
+    """What the server read out of an upload's own metadata, and whether it has read it yet.
+
+    `pending` means the read has not happened (the bytes are still arriving, or nothing has asked
+    yet); `done` is a SETTLED answer even when all three values are null — a file with no capture
+    date is an answer, not a reason for a composer to keep waiting.
+    """
+
+    state: Literal["pending", "done"]
+    capture_instant: Rfc3339Datetime | None
+    capture_civil: str | None
+    capture_source: str | None
 
 
 async def _get_upload(db: AsyncSession, upload_uid: str, owner_id: int) -> Upload:
@@ -168,6 +192,35 @@ async def upload_offset(
     return Response(status_code=200, headers={"Upload-Offset": str(upload.bytes_received)})
 
 
+@router.get("/{upload_uid}/capture", response_model=CaptureOut)
+async def upload_capture(
+    upload_uid: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> CaptureOut:
+    """What this upload's own metadata says about when it was captured (MEMNG-262).
+
+    NON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a
+    composer may poll it while the person is still typing and then post the memo exactly as it
+    would have without it. Owner-scoped through the same `_get_upload` as every other verb, so
+    another owner's uid answers with the same 404 as one that never existed.
+
+    It may still WRITE — once. `ensure_capture` performs the read the completing append normally
+    does, for the two cases that append cannot cover: a session that finished before this feature
+    shipped, and a zero-byte file, which is complete without an append at all. The row lock makes
+    that exactly-once, and every later poll is a plain read.
+    """
+    upload = await _get_upload(db, upload_uid, user.id)
+    upload = await svc.ensure_capture(db, upload)
+    await db.commit()
+    return CaptureOut(
+        state="done" if upload.capture_state == "done" else "pending",
+        capture_instant=upload.capture_instant,
+        capture_civil=upload.capture_civil,
+        capture_source=upload.capture_source,
+    )
+
+
 @router.post("/{upload_uid}/finalize", response_model=AttachmentOut)
 async def finalize_upload(
     upload_uid: str,
@@ -194,6 +247,10 @@ async def finalize_upload(
         size=attachment.size,
         status=attachment.status,
         captured_at=attachment.captured_at,
+        capture_instant=attachment.capture_instant,
+        capture_civil=attachment.capture_civil,
+        capture_source=attachment.capture_source,
+        position=attachment.position,
         width=attachment.width,
         height=attachment.height,
         duration=attachment.duration,

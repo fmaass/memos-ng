@@ -129,6 +129,10 @@ class AttachmentRef(BaseModel):
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
     renditions: list[RenditionItem]
+    # This attachment's place in the memo's saved order, 0-based; null on a row written before the
+    # order was persisted (MEMNG-262). The list is ALREADY sorted by it — the field is carried so a
+    # client can tell a saved order from an incidental one.
+    position: int | None
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -422,6 +426,7 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,
         renditions=rendition_items(att),
+        position=att.position,
         **signed_tier_urls(att.uid, user_id, now=now),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
@@ -708,6 +713,10 @@ async def create_memo(
         # bytes may only be unlinked once the commit makes that deletion real; until then they are
         # what a rolled-back row still promises (MEMNG-142). Per-attempt, like `moved`.
         consumed: list[str] = []
+        # attachment uid -> its 0-based place in `upload_uids`, so the memo's attachments are
+        # linked (and numbered) in the order the composer DECLARED rather than in the order the
+        # two finalize passes happened to produce them (MEMNG-262). Per-attempt, like `moved`.
+        positions: dict[str, int] = {}
         # The line between "this write may still be undone" and "this memo is stored". Everything
         # the failure path does — discarding posters, moving originals back — destroys files that
         # a COMMITTED memo owns, so it must never run once this is set.
@@ -726,6 +735,7 @@ async def create_memo(
                         video_posters=body.video_posters,
                         poster_copies_out=poster_copies,
                         consumed_out=consumed,
+                        positions_out=positions,
                     )
                     if body.upload_uids or body.video_posters
                     else []
@@ -740,7 +750,14 @@ async def create_memo(
                 content=body.content,
                 visibility=visibility,
                 pinned=body.pinned,
-                attachment_uids=[*body.attachment_uids, *finalized],
+                # Sorted back into the DECLARED order: `finalized` comes out in pass order
+                # (screens, then promoted prints), while it is the REQUEST order that becomes each
+                # attachment's saved `position`. Stable, so a uid the map does not name keeps its
+                # relative place at the end.
+                attachment_uids=[
+                    *body.attachment_uids,
+                    *sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
+                ],
                 created_at=body.created_at,
                 moved_out=moved,  # placement into the memo folder appends here → undone on fail
                 idempotency_key=key,
@@ -867,6 +884,9 @@ async def patch_memo(
         # Same reason as on create: a dedup hit's part file belongs to an upload row this edit may
         # still roll back, so it is unlinked after the commit, never before (MEMNG-142).
         consumed: list[str] = []
+        # Same as on create: the declared order of the files this edit adds (MEMNG-262). They are
+        # appended after the attachments the memo already carries, which keep their saved order.
+        positions: dict[str, int] = {}
         committed = False
         try:
             if key is not None:
@@ -889,13 +909,20 @@ async def patch_memo(
                         moved_out=moved,
                         memo=edited,
                         consumed_out=consumed,
+                        positions_out=positions,
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
                     # to be rolled back by get_session, so a refused edit changes nothing at all —
                     # the recorded key included, which keeps it free for the client's real retry.
                     raise _unlinkable(exc) from None
-                await svc.link_attachments(db, owner_id, edited, finalized, moved_out=moved)
+                await svc.link_attachments(
+                    db,
+                    owner_id,
+                    edited,
+                    sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
+                    moved_out=moved,
+                )
             # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
             # caught. Savepoint-isolated so a feature error can't fail the memo save.
