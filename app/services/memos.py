@@ -1,7 +1,7 @@
 import re
 import secrets
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -109,7 +109,17 @@ async def create_memo(
     created_at: datetime | None = None,
     moved_out: list[storage.TrackedMove] | None = None,
     idempotency_key: str | None = None,
+    finalize: Callable[[Memo], Awaitable[Sequence[str]]] | None = None,
 ) -> Memo:
+    """Store one memo and link its media.
+
+    `finalize` is the create path's upload work — turning pending uploads into attachments — and it
+    is a callback for exactly one reason: the ORDER of the locks. The memo row is inserted and
+    LOCKED first, and only then does anything take an upload's or an attachment's row, so every
+    write path in this application acquires the same outermost lock in the same place and no pair
+    of them can hold what the other is waiting for. It returns the uids to link after
+    `attachment_uids`, in the order they are to be numbered.
+    """
     memo = Memo(
         uid=gen_uid(),
         owner_id=owner.id,
@@ -128,7 +138,12 @@ async def create_memo(
     # access on an expired column would raise). A caller-supplied created_at is already loaded; the
     # refresh just reloads the identical persisted value.
     await db.refresh(memo, ["created_at"])
-    await link_attachments(db, owner.id, memo, attachment_uids or [], moved_out=moved_out)
+    # The row exists now — take its lock before any upload or attachment row is touched.
+    memo = await lock_memo_for_write(db, memo)
+    finalized = list(await finalize(memo)) if finalize is not None else []
+    await link_attachments(
+        db, owner.id, memo, [*(attachment_uids or []), *finalized], moved_out=moved_out
+    )
     await db.refresh(memo)
     return memo
 
@@ -174,6 +189,41 @@ async def _place_attachment_masters(
             r.storage_path = str(new)
 
 
+async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo:
+    """Take the memo row's write lock — the FIRST lock a memo edit acquires (MEMNG-262).
+
+    Everything an edit locks afterwards hangs off this memo: the uploads it finalizes, the
+    attachments it links, the screen sibling a print binds onto. Those are reached in different
+    orders by different edits (a print binds its sibling inside finalize, before any linking), so
+    two edits of ONE memo could hold each other's rows. Taking the parent row first gives every
+    edit of a memo the same outermost lock, and the rest nest under it.
+
+    It is also what makes the numbering correct rather than merely deadlock-free: `position` is
+    allocated by reading the memo's existing attachments, and two appends that both read an EMPTY
+    memo would both allocate 0. Serialized here, the second one sees the first one's attachment
+    and continues from it.
+
+    It LOADS as well as locks, and that is not a convenience. The caller read this memo before it
+    queued for the lock, so every attribute it holds is a snapshot from before the winner's write.
+    Applying a patch on top of that is a silent lost update: SQLAlchemy compares each new value
+    with the STALE one, sees "unchanged" for a field that changed underneath, and emits no UPDATE
+    at all — the edit reports success and changes nothing. `populate_existing` refreshes the
+    identity map from the locked row, so the patch is applied to what the row actually says now.
+
+    A create takes it too (see `create_memo`): its row cannot be contended, but taking the same
+    outermost lock on every path is what makes the lock ORDER a property of the code rather than
+    of an argument about visibility.
+    """
+    return (
+        await db.execute(
+            select(Memo)
+            .where(Memo.id == memo.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+
+
 async def link_attachments(
     db: AsyncSession,
     owner_id: int,
@@ -181,9 +231,35 @@ async def link_attachments(
     uids: Sequence[str],
     moved_out: list[storage.TrackedMove] | None = None,
 ) -> None:
-    """Link the caller's OWN attachments to a memo. A uid belonging to another user is silently
-    ignored so a memo can never claim someone else's media. Used on create and on edit. As each
-    attachment is linked, its still-staged masters are placed into the memo's per-memo folder."""
+    """Link the caller's OWN attachments to a memo, IN THE ORDER `uids` names them.
+
+    A uid belonging to another user is silently ignored so a memo can never claim someone else's
+    media. Used on create and on edit. As each attachment is linked, its still-staged masters are
+    placed into the memo's per-memo folder.
+
+    ORDER (MEMNG-262). `uids` is the client's declared order, and each newly linked attachment is
+    stamped with its RANK in it — `Attachment.position`, which the memo's `attachments` relation
+    sorts by (NULLS LAST, then id). Rank, not the raw index in the request: a uid can name no new
+    attachment of its own (a print master binds onto its screen as a rendition) or name one another
+    uid already named (dedup), and a hole left where such a uid sat would make the column mean
+    "index into a request nobody keeps" rather than "place in this memo" — which is also the only
+    reading under which the append rule below (continue from max + 1) stays consistent.
+
+    New attachments go AFTER whatever the memo already carries,
+    because an existing memo's saved order is a fact and opening it for an edit must not re-sort
+    it. Two shapes of "whatever it already carries":
+
+    * every existing attachment already numbered → continue from `max + 1`;
+    * ANY of them still NULL (a memo from before the column, or a mix of the two, which a PATCH
+      can produce by adding files to a memo that also holds legacy rows) → renumber ALL of the
+      memo's existing attachments 0..k-1 in their CURRENT DISPLAYED order first, then append. Only
+      numbering the NULL ones would sort them ahead of the numbered ones (NULLS LAST means the
+      numbers win), which would reorder attachments somebody has already seen.
+
+    An attachment already linked to this memo keeps its place; one linked to a DIFFERENT memo is
+    skipped and consumes no position. It all happens in the caller's transaction, so the renumber
+    and the append land together or not at all.
+    """
     if not uids:
         return
     owned = (
@@ -203,13 +279,44 @@ async def link_attachments(
     )
     data_root = Path(settings.DATA_ROOT)
     dest_dir = storage.memo_dir(data_root, memo.created_at, memo.uid)
-    for att in owned:
+    # Read BEFORE anything is linked: these are the attachments whose order is already a fact.
+    # Locked in id order (a stable lock order), then sorted the way they are displayed.
+    already = (
+        (
+            await db.execute(
+                select(Attachment)
+                .where(Attachment.memo_id == memo.id)
+                .order_by(Attachment.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    next_position = 0
+    if already:
+        if any(a.position is None for a in already):
+            displayed = sorted(already, key=lambda a: (a.position is None, a.position or 0, a.id))
+            for i, a in enumerate(displayed):
+                a.position = i
+            next_position = len(displayed)
+        else:
+            next_position = max(a.position or 0 for a in already) + 1
+    by_uid = {a.uid: a for a in owned}
+    linked: set[int] = {a.id for a in already}
+    for uid in uids:  # the DECLARED order — `owned` is in id order and cannot carry it
+        att = by_uid.get(uid)
         # Never STEAL an attachment already linked to a different memo — that would strand the
         # original memo (the defence for the back-compat `attachment_uids` path; the dedup path is
         # also guarded at the source in uploads.finalize). Re-linking to the same memo is a no-op.
-        if att.memo_id is not None and att.memo_id != memo.id:
+        if att is None or (att.memo_id is not None and att.memo_id != memo.id):
             continue
+        if att.id in linked:  # the same uid twice, or one already on this memo: one place only
+            continue
+        linked.add(att.id)
         att.memo_id = memo.id
+        att.position = next_position
+        next_position += 1
         await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)
     await db.flush()
 

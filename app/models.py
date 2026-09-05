@@ -153,8 +153,14 @@ class Memo(Base):
         secondary=memo_tags, back_populates="memos", lazy="selectin"
     )
     owner: Mapped["User"] = relationship(lazy="selectin")
+    # position first, NULLS LAST, then id: the saved order IS the order the composer sent
+    # (MEMNG-262). Every row written before that column existed carries NULL and therefore keeps
+    # its historical id order, behind anything positioned — which is why an edit that adds a file
+    # to such a memo renumbers the whole memo first (services.memos.link_attachments).
     attachments: Mapped[list["Attachment"]] = relationship(
-        "Attachment", lazy="selectin", order_by="Attachment.id"
+        "Attachment",
+        lazy="selectin",
+        order_by="(Attachment.position.nulls_last(), Attachment.id)",
     )
     reactions: Mapped[list["Reaction"]] = relationship(
         lazy="selectin", cascade="all, delete-orphan"
@@ -227,8 +233,22 @@ class Attachment(Base):
     duration: Mapped[float | None]
     blurhash: Mapped[str | None] = mapped_column(String(255))
     sha256: Mapped[str | None] = mapped_column(String(64), index=True)  # content dedup
-    # Original capture time (EXIF/QuickTime → File.lastModified → upload time).
+    # Original capture time (EXIF/QuickTime → File.lastModified → upload time). The first link of
+    # that chain is `capture_instant` below, copied here at finalize — before MEMNG-262 nothing
+    # read a file's metadata and the chain started at the browser's lastModified.
     captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Capture-only facts, read from the file's OWN metadata at upload completion and never
+    # inferred (MEMNG-262). NULL means the file said nothing — which is different from
+    # `captured_at`, which always holds something. `capture_civil` is a wall-clock reading whose
+    # zone the file never recorded (EXIF without OffsetTimeOriginal); only a client knows the zone
+    # to resolve it in, so it travels unresolved. `capture_source` is 'exif' or 'quicktime'.
+    capture_instant: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    capture_civil: Mapped[str | None] = mapped_column(String(32))
+    capture_source: Mapped[str | None] = mapped_column(String(16))
+    # 0-based place in this memo's attachment order, written at finalize from the order the client
+    # declared (`upload_uids`). NULL on every row that predates the column, and on an attachment
+    # that belongs to no memo.
+    position: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[AttachmentStatus] = mapped_column(
         Enum(AttachmentStatus, name="attachment_status"),
         default=AttachmentStatus.uploading,
@@ -300,6 +320,17 @@ class Upload(Base):
     client_mtime: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )  # File.lastModified
+    # The capture read of these bytes (MEMNG-262), taken ONCE when the last chunk lands and
+    # carried onto the Attachment at finalize. `capture_state` is what
+    # `GET /api/uploads/{uid}/capture` answers with: 'pending' until the read has happened,
+    # 'done' afterwards — including when the file simply had no date, which is a settled answer
+    # and not a reason for a composer to keep waiting.
+    capture_state: Mapped[str] = mapped_column(
+        String(16), default="pending", server_default="pending"
+    )
+    capture_instant: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    capture_civil: Mapped[str | None] = mapped_column(String(32))
+    capture_source: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

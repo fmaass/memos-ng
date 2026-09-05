@@ -249,6 +249,28 @@
       },
       "AttachmentOut": {
         "properties": {
+          "capture_civil": {
+            "title": "Capture Civil",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_instant": {
+            "format": "date-time",
+            "title": "Capture Instant",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_source": {
+            "title": "Capture Source",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "captured_at": {
             "format": "date-time",
             "title": "Captured At",
@@ -279,6 +301,13 @@
             "title": "Mime",
             "type": "string"
           },
+          "position": {
+            "title": "Position",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "size": {
             "title": "Size",
             "type": "integer"
@@ -305,6 +334,10 @@
           "size",
           "status",
           "captured_at",
+          "capture_instant",
+          "capture_civil",
+          "capture_source",
+          "position",
           "width",
           "height",
           "duration"
@@ -354,6 +387,13 @@
           "mine": {
             "title": "Mine",
             "type": "boolean"
+          },
+          "position": {
+            "title": "Position",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "posterUrl": {
             "title": "Posterurl",
@@ -417,6 +457,7 @@
           "hasPrint",
           "hasLegacyPrint",
           "renditions",
+          "position",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
@@ -450,6 +491,49 @@
           "file"
         ],
         "title": "Body_upload_print_api_attachments__uid__print_post",
+        "type": "object"
+      },
+      "CaptureOut": {
+        "description": "What the server read out of an upload's own metadata, and whether it has read it yet.\n\n`pending` means the read has not happened (the bytes are still arriving, or nothing has asked\nyet); `done` is a SETTLED answer even when all three values are null \u2014 a file with no capture\ndate is an answer, not a reason for a composer to keep waiting.",
+        "properties": {
+          "capture_civil": {
+            "title": "Capture Civil",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_instant": {
+            "format": "date-time",
+            "title": "Capture Instant",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_source": {
+            "title": "Capture Source",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "done"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "capture_instant",
+          "capture_civil",
+          "capture_source"
+        ],
+        "title": "CaptureOut",
         "type": "object"
       },
       "CreateRacedDetail": {
@@ -5469,6 +5553,57 @@
           }
         ],
         "summary": "Append Chunk",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/api/uploads/{upload_uid}/capture": {
+      "get": {
+        "description": "What this upload's own metadata says about when it was captured (MEMNG-262).\n\nNON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a\ncomposer may poll it while the person is still typing and then post the memo exactly as it\nwould have without it. Owner-scoped through the same `_get_upload` as every other verb, so\nanother owner's uid answers with the same 404 as one that never existed.\n\nIt may still WRITE \u2014 once. `ensure_capture` performs the read the completing append normally\ndoes, for the two cases that append cannot cover: a session that finished before this feature\nshipped, and a zero-byte file, which is complete without an append at all. The row lock makes\nthat exactly-once, and every later poll is a plain read.",
+        "operationId": "upload_capture_api_uploads__upload_uid__capture_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaptureOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Upload Capture",
         "tags": [
           "uploads"
         ]

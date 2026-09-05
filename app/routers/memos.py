@@ -129,6 +129,10 @@ class AttachmentRef(BaseModel):
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
     renditions: list[RenditionItem]
+    # This attachment's place in the memo's saved order, 0-based; null on a row written before the
+    # order was persisted (MEMNG-262). The list is ALREADY sorted by it — the field is carried so a
+    # client can tell a saved order from an incidental one.
+    position: int | None
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -422,6 +426,7 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,
         renditions=rendition_items(att),
+        position=att.position,
         **signed_tier_urls(att.uid, user_id, now=now),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
@@ -708,12 +713,20 @@ async def create_memo(
         # bytes may only be unlinked once the commit makes that deletion real; until then they are
         # what a rolled-back row still promises (MEMNG-142). Per-attempt, like `moved`.
         consumed: list[str] = []
+        # attachment uid -> its 0-based place in `upload_uids`, so the memo's attachments are
+        # linked (and numbered) in the order the composer DECLARED rather than in the order the
+        # two finalize passes happened to produce them (MEMNG-262). Per-attempt, like `moved`.
+        positions: dict[str, int] = {}
         # The line between "this write may still be undone" and "this memo is stored". Everything
         # the failure path does — discarding posters, moving originals back — destroys files that
         # a COMMITTED memo owns, so it must never run once this is set.
         committed = False
         try:
-            try:
+            # Finalizing runs INSIDE create_memo, after the memo row is inserted and locked, so
+            # this write takes the same outermost lock as every other one (see create_memo). The
+            # closure is the only way to sit between those two steps without the router owning the
+            # insert.
+            async def finalize_uploads(memo: Memo) -> list[str]:
                 # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
                 # of this memo, and must be answered as the mistake it is rather than dropped in
                 # silence because the batch looked empty.
@@ -726,25 +739,34 @@ async def create_memo(
                         video_posters=body.video_posters,
                         poster_copies_out=poster_copies,
                         consumed_out=consumed,
+                        positions_out=positions,
                     )
                     if body.upload_uids or body.video_posters
                     else []
+                )
+                # Sorted back into the DECLARED order: `finalized` comes out in pass order
+                # (screens, then promoted prints), while it is the REQUEST order that becomes each
+                # attachment's saved `position`. Stable, so a uid the map does not name keeps its
+                # relative place at the end.
+                return sorted(finalized, key=lambda uid: positions.get(uid, len(finalized)))
+
+            try:
+                memo = await svc.create_memo(
+                    db,
+                    user,
+                    content=body.content,
+                    visibility=visibility,
+                    pinned=body.pinned,
+                    attachment_uids=body.attachment_uids,
+                    created_at=body.created_at,
+                    moved_out=moved,  # placement into the memo folder appends here → undone on fail
+                    idempotency_key=key,
+                    finalize=finalize_uploads,
                 )
             except uploads_svc.UploadsUnlinkable as exc:
                 raise _unlinkable(exc) from None
             except uploads_svc.VideoPostersInvalid as exc:
                 raise _video_posters_invalid(exc) from None
-            memo = await svc.create_memo(
-                db,
-                user,
-                content=body.content,
-                visibility=visibility,
-                pinned=body.pinned,
-                attachment_uids=[*body.attachment_uids, *finalized],
-                created_at=body.created_at,
-                moved_out=moved,  # placement into the memo folder appends here → undone on fail
-                idempotency_key=key,
-            )
             # After all attachments are linked, enqueue frame shares for #curated photos (no-op
             # unless configured). Savepoint-isolated so a feature error can't fail the save.
             await _enqueue_frame_shares_safe(db, memo, user)
@@ -867,16 +889,28 @@ async def patch_memo(
         # Same reason as on create: a dedup hit's part file belongs to an upload row this edit may
         # still roll back, so it is unlinked after the commit, never before (MEMNG-142).
         consumed: list[str] = []
+        # Same as on create: the declared order of the files this edit adds (MEMNG-262). They are
+        # appended after the attachments the memo already carries, which keep their saved order.
+        positions: dict[str, int] = {}
         committed = False
         try:
+            # The FIRST lock this edit takes, before any upload is finalized or any attachment is
+            # linked: every later lock belongs to something hanging off this memo, so they all
+            # nest under it and two edits of one memo can neither deadlock nor both allocate the
+            # same attachment position (see services.memos.lock_memo_for_write).
+            # It re-reads as well as locks: this edit read the memo BEFORE queueing for the
+            # lock, so everything it holds is the winner's before-picture, and patching that is a
+            # lost update SQLAlchemy cannot see (see lock_memo_for_write). A distinct name, since
+            # the enclosing handler's `memo` is what the retry loop re-enters with.
+            locked = await svc.lock_memo_for_write(db, memo)
             if key is not None:
                 # Recorded BEFORE any work: the loser of a same-key race blocks on the unique
                 # constraint and fails here, having moved no bytes — so it has none to move back.
                 # It lands in the same transaction as the edit, so the two commit or roll back
                 # together and a recorded key never outlives the edit it names.
-                await svc.record_edit_key(db, memo, owner_id, key)
+                await svc.record_edit_key(db, locked, owner_id, key)
             fields = body.model_dump(exclude_unset=True, exclude={"upload_uids", "edit_key"})
-            edited = await svc.update_memo(db, memo, **fields)
+            edited = await svc.update_memo(db, locked, **fields)
             if body.upload_uids:
                 # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto
                 # that screen instead of promoting a second visible copy of the same photo
@@ -889,13 +923,20 @@ async def patch_memo(
                         moved_out=moved,
                         memo=edited,
                         consumed_out=consumed,
+                        positions_out=positions,
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
                     # to be rolled back by get_session, so a refused edit changes nothing at all —
                     # the recorded key included, which keeps it free for the client's real retry.
                     raise _unlinkable(exc) from None
-                await svc.link_attachments(db, owner_id, edited, finalized, moved_out=moved)
+                await svc.link_attachments(
+                    db,
+                    owner_id,
+                    edited,
+                    sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
+                    moved_out=moved,
+                )
             # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
             # caught. Savepoint-isolated so a feature error can't fail the memo save.

@@ -47,12 +47,29 @@ vi.mock('@tanstack/vue-query', async () => {
         })
       return { data, isPending, isError, refetch }
     },
-    useMutation: (opts: { mutationFn: (v: never) => Promise<unknown>; onSuccess?: () => void }) => ({
-      mutate: async (v: never) => {
-        await opts.mutationFn(v)
-        opts.onSuccess?.()
-      },
-    }),
+    // `isPending`/`variables` because the real one has them: the view passes the edit's pending
+    // state down to the card, which is what stops one edit being sent twice (MEMNG-262).
+    useMutation: (opts: {
+      mutationFn: (v: never) => Promise<unknown>
+      onSuccess?: () => void
+    }) => {
+      const isPending = ref(false)
+      const variables = ref<unknown>(undefined)
+      return {
+        isPending,
+        variables,
+        mutate: async (v: never) => {
+          variables.value = v
+          isPending.value = true
+          try {
+            await opts.mutationFn(v)
+            opts.onSuccess?.()
+          } finally {
+            isPending.value = false
+          }
+        },
+      }
+    },
   }
 })
 

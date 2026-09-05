@@ -66,9 +66,25 @@ const toggleReaction = useMutation({
   onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos'] }),
 })
 
+// The memos whose edit is in flight, BY UID (MEMNG-262). One mutation observer serves every card,
+// and its `variables` only ever describe the LATEST call — so a second edit starting while a first
+// is still out would move that observer and tell the first card it was finished, releasing a claim
+// whose request is still on the wire. These two callbacks are per-CALL: `onMutate` runs before the
+// request, `onSettled` after it lands or fails, so a uid is in this set for exactly as long as its
+// own PATCH is out.
+const pendingEdits = ref(new Set<string>())
+const markEditStarted = (vars: { uid: string }) => {
+  pendingEdits.value.add(vars.uid)
+}
+const markEditSettled = (_data: unknown, _error: unknown, vars: { uid: string }) => {
+  pendingEdits.value.delete(vars.uid)
+}
+
 // Edit a memo's content / visibility / display date + attach any new images (owner-only on the
 // server) and refresh.
 const editMemo = useMutation({
+  onMutate: markEditStarted,
+  onSettled: markEditSettled,
   mutationFn: async (p: {
     uid: string
     content: string
@@ -171,6 +187,7 @@ onUnmounted(() => observer?.disconnect())
         :key="m.uid"
         :memo="m"
         :restorable="restorable"
+        :edit-pending="pendingEdits.has(m.uid)"
         @restore="emit('restore', $event)"
         @task-toggle="toggleTask.mutate($event)"
         @toggle-reaction="toggleReaction.mutate($event)"

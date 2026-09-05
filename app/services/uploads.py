@@ -13,7 +13,7 @@ from typing import BinaryIO, Literal
 
 import puremagic
 import structlog
-from anyio import to_thread
+from anyio import fail_after, to_thread
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,7 +30,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import poster, storage
+from app.services import capture, poster, storage
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -38,6 +38,13 @@ logger = structlog.get_logger(__name__)
 
 def _data_root() -> Path:
     return Path(settings.DATA_ROOT)
+
+
+# How long the capture read (MEMNG-262) may take before the upload is called settled without one.
+# It is metadata only — a JPEG header, or a video's `moov` box found by seeking over the samples —
+# so the budget is generous by an order of magnitude and exists for the pathological file, not the
+# ordinary one. A timeout is a settled answer of "no date", never a stuck `pending`.
+CAPTURE_READ_TIMEOUT_S = 5.0
 
 
 # Bounded read granularity for receiving a request body. Chosen well under the 5 MiB client chunk
@@ -505,6 +512,14 @@ async def append_stream(
             await to_thread.run_sync(_concat_sync, spool, part_path(upload.upload_uid), offset)
             upload.bytes_received = offset + received
             await db.flush()
+            if upload.bytes_received >= upload.declared_size:
+                # The upload just COMPLETED — the one moment its bytes are all here and nothing
+                # has consumed them yet. The capture read happens here, inside the same row lock
+                # and the same transaction as the offset that completed it, so it can neither run
+                # twice nor be visible without the bytes it describes (MEMNG-262).
+                # This transaction already holds the row, so the read cannot come back empty;
+                # the walrus keeps the type honest without inventing a branch that cannot run.
+                upload = await ensure_capture(db, upload) or upload
         # offset < bytes_received → a concurrent append already covered this range; no-op
         return upload
     finally:
@@ -724,6 +739,61 @@ async def _consume(part: Path, consumed_out: list[str] | None) -> None:
     await to_thread.run_sync(_unlink_sync, part)
 
 
+async def ensure_capture(db: AsyncSession, upload: Upload) -> Upload | None:
+    """Read this upload's capture date ONCE, as soon as all of its bytes are here (MEMNG-262).
+
+    Two callers reach it: the append that lands the last chunk, and the inspection endpoint. The
+    second one to arrive does not read the file again — the row lock is the serialization point,
+    so it blocks, then finds `capture_state == 'done'` and JOINS the first one's answer. That is
+    also what keeps a retried or duplicated request from turning into two reads of the same file.
+
+    The inspection endpoint calls it for two cases the append cannot cover: a session that
+    completed BEFORE this code shipped (its state is the column's 'pending' default and no further
+    append will ever come), and a zero-byte file, which is complete without a single append. Both
+    would otherwise leave a composer waiting for a decision that could never arrive.
+
+    Blocking work runs in a worker thread under a deadline. On timeout the read is ABANDONED — the
+    thread finishes into nothing — and the upload settles with no date, because a capture date is
+    a nicety and a stuck upload is not.
+
+    Answers None when the row is GONE. Waiting on the lock is exactly when it can disappear: the
+    writer this call queued behind may have been another finalize, which consumes the session and
+    deletes the row. A caller that finds None must take its "unknown upload" path — the bytes and
+    the row it was about to work from are somebody else's now.
+    """
+    locked = (
+        await db.execute(
+            select(Upload)
+            .where(Upload.upload_uid == upload.upload_uid)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked is None:  # reaped or finalized under us — see the docstring
+        return None
+    if locked.capture_state == "done":
+        return locked
+    part = part_path(locked.upload_uid)
+    if not await to_thread.run_sync(_is_complete_sync, part, locked.declared_size):
+        return locked  # still uploading — stays pending, which is exactly what it is
+    mime = await to_thread.run_sync(_sniff_mime, part, locked.mime)
+    result = capture.NOTHING
+    try:
+        with fail_after(CAPTURE_READ_TIMEOUT_S):
+            result = await to_thread.run_sync(
+                capture.read_capture, part, mime, abandon_on_cancel=True
+            )
+    except TimeoutError:
+        # The uid and the mime only — a capture read never puts metadata in a log line.
+        logger.warning("capture.read_timeout", upload_uid=locked.upload_uid, mime=mime)
+    locked.capture_instant = result.capture_instant
+    locked.capture_civil = result.capture_civil
+    locked.capture_source = result.capture_source
+    locked.capture_state = "done"
+    await db.flush()
+    return locked
+
+
 async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
@@ -733,6 +803,7 @@ async def finalize_pending(
     video_posters: dict[str, str] | None = None,
     poster_copies_out: list[PosterCopy] | None = None,
     consumed_out: list[str] | None = None,
+    positions_out: dict[str, int] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -774,9 +845,24 @@ async def finalize_pending(
     one of them cannot be honoured — the same all-or-nothing rule, for the same reason, as the
     missing/incomplete refusal above. A poster is COPIED into place, so passing `video_posters`
     also means passing `poster_copies_out` for the caller to settle after its commit (PosterCopy);
-    omitting it is refused outright rather than leaking a file per post."""
+    omitting it is refused outright rather than leaking a file per post.
+
+    `positions_out` collects attachment uid -> the 0-based index, IN `upload_uids`, of the uid that
+    produced or named it (MEMNG-262). It is what the caller SORTS the returned uids by, so the
+    memo's attachments are linked in the order the client declared (`link_attachments` then ranks
+    them, since a bound print and a dedup hit consume no place of their own). It is the ORIGINAL
+    request index in every branch: a screen finalized in pass
+    1, a print promoted in pass 2 (its own uid's index), and an attachment the dedup path handed
+    back (the index of the uid that named it). A print BOUND to a screen adds nothing — it rides
+    with that screen and takes no place of its own. The returned uid list keeps its pass order;
+    a caller that wants the DECLARED order sorts it by this map."""
     if video_posters and poster_copies_out is None:
         raise ValueError("video_posters requires poster_copies_out to settle after the commit")
+    # First mention wins: the same uid twice, or two uids whose bytes dedup onto one attachment,
+    # both name ONE attachment, and its place is where the client first asked for it.
+    request_index: dict[str, int] = {}
+    for position, up_uid in enumerate(upload_uids):
+        request_index.setdefault(up_uid, position)
     pending: list[tuple[Upload, ParsedName]] = []
     missing: list[str] = []
     incomplete: list[str] = []
@@ -830,6 +916,14 @@ async def finalize_pending(
         if poster_upload is not None:
             assert poster_copies_out is not None  # guaranteed by the guard above
             await attach_video_poster(db, poster_upload, att, poster_copies_out)
+        if positions_out is not None and upload.upload_uid in request_index:
+            # The EARLIEST request index wins, not the first one to be finalized. Pass 2 runs after
+            # pass 1, and a print promoted there can dedup onto an attachment pass 1 already made
+            # from identical bytes — so the uid that asked for it FIRST is the one whose place the
+            # attachment takes, whichever pass happened to create it.
+            rank = request_index[upload.upload_uid]
+            current = positions_out.get(att.uid)
+            positions_out[att.uid] = rank if current is None else min(current, rank)
         return att
 
     out: list[str] = []
@@ -892,6 +986,19 @@ async def finalize(
     `consumed_out` collects the part files this call CONSUMED without moving — see
     `finalize_pending` for why the caller has to unlink them after its commit rather than here.
     """
+    # Under the upload's row lock BEFORE anything is copied off it. The append that completes an
+    # upload writes its capture read in the same transaction as the last chunk, so a finalize that
+    # raced it would otherwise find the bytes complete on disk and the capture columns still empty
+    # — and stamp an attachment with no date the file plainly has. Locking queues this finalize
+    # behind that commit; `ensure_capture` also performs the read itself when nothing has yet
+    # (a session that completed before this feature shipped, or a zero-byte file).
+    locked = await ensure_capture(db, upload)
+    if locked is None:
+        # Gone while this call waited for the lock — another finalize consumed it. Its part file
+        # is that finalize's business now (moved into place, or reaped after its commit), so this
+        # one must not touch it: it answers exactly as an unknown uid does.
+        raise UploadsUnlinkable([upload.upload_uid], [])
+    upload = locked
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:
@@ -959,7 +1066,12 @@ async def finalize(
         mime=mime,
         size=actual,
         sha256=digest,
-        captured_at=upload.client_mtime or now,
+        # The documented precedence, finally whole: what the FILE said, else what the browser said
+        # about its own copy, else when it arrived (MEMNG-262).
+        captured_at=upload.capture_instant or upload.client_mtime or now,
+        capture_instant=upload.capture_instant,
+        capture_civil=upload.capture_civil,
+        capture_source=upload.capture_source,
         status=AttachmentStatus.pending if is_video else AttachmentStatus.processing,
         storage_path=str(dest),
         # width/height/duration are filled by the worker fast lane (T2.2 pyvips/ffprobe).

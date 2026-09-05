@@ -52,6 +52,7 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     mine: true,
     hasPrint: false,
     hasLegacyPrint: false,
+    position: null,
     renditions: [] as {
       variant_key: string
       label: string | null

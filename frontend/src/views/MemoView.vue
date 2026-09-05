@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useToast } from 'primevue/usetoast'
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
 import MemoCard from '@/components/MemoCard.vue'
@@ -79,7 +79,23 @@ const toggleReaction = useMutation({
   onSuccess: refresh,
 })
 
+// The memos whose edit is in flight, BY UID (MEMNG-262). One mutation observer serves every card,
+// and its `variables` only ever describe the LATEST call — so a second edit starting while a first
+// is still out would move that observer and tell the first card it was finished, releasing a claim
+// whose request is still on the wire. These two callbacks are per-CALL: `onMutate` runs before the
+// request, `onSettled` after it lands or fails, so a uid is in this set for exactly as long as its
+// own PATCH is out.
+const pendingEdits = ref(new Set<string>())
+const markEditStarted = (vars: { uid: string }) => {
+  pendingEdits.value.add(vars.uid)
+}
+const markEditSettled = (_data: unknown, _error: unknown, vars: { uid: string }) => {
+  pendingEdits.value.delete(vars.uid)
+}
+
 const editMemo = useMutation({
+  onMutate: markEditStarted,
+  onSettled: markEditSettled,
   mutationFn: async (p: {
     uid: string
     content: string
@@ -160,6 +176,7 @@ function onTileRetry() {
     <MemoCard
       v-else-if="memo"
       :memo="memo"
+      :edit-pending="memo ? pendingEdits.has(memo.uid) : false"
       @task-toggle="toggleTask.mutate($event)"
       @toggle-reaction="toggleReaction.mutate($event)"
       @delete-attachment="deleteAttachment.mutate($event)"

@@ -260,7 +260,9 @@ def _datetime_fields() -> list[tuple[str, str, Any]]:
 # failure rather than a silently shrinking (and therefore vacuous) parametrisation.
 EXPECTED_DATETIME_FIELDS = {
     ("AttachmentMeta", "captured_at"),
+    ("AttachmentOut", "capture_instant"),
     ("AttachmentOut", "captured_at"),
+    ("CaptureOut", "capture_instant"),
     ("DigestPreviewMemo", "created_at"),
     ("DigestRecipientOut", "added_at"),
     ("DigestRunOut", "finished_at"),

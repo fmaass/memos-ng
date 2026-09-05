@@ -12,8 +12,10 @@ import type { components } from '@/api/schema'
 import { useElementWidth } from '@/composables/useElementWidth'
 import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
 import { fetchPrintMasters, printMasterUploads } from '@/composables/usePrintMaster'
-import { useUploadQueue } from '@/composables/useResumableUpload'
+import { type UploadItem, useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
+import { captureOrder, toWireInstant } from '@/lib/autoMemoDate'
+import { captureBlockedMessage, pendingCaptureItems } from '@/lib/composer'
 import {
   printBadgeLabel,
   printChipState,
@@ -33,7 +35,16 @@ import { TASK_CHECKBOX_CLASS, toggleTask } from '@/lib/tasks'
 type Memo = components['schemas']['MemoOut']
 type Visibility = Memo['visibility']
 
-const props = defineProps<{ memo: Memo; restorable?: boolean }>()
+const props = defineProps<{
+  memo: Memo
+  restorable?: boolean
+  /**
+   * The parent's PATCH for THIS memo is still in flight. The card cannot know that on its own —
+   * the parent owns the request — and it is what releases the card's own claim, so a save cannot
+   * be repeated by reopening the editor while the first one is still out (MEMNG-262).
+   */
+  editPending?: boolean
+}>()
 const emit = defineEmits<{
   restore: [uid: string]
   'task-toggle': [payload: { uid: string; content: string }]
@@ -78,6 +89,19 @@ const editFileInput = ref<HTMLInputElement | null>(null)
 const editUploading = computed(() =>
   editUploads.some((u) => u.status === 'queued' || u.status === 'uploading'),
 )
+// An EDIT is always a manual date — it opens on the memo's own date and Auto is not offered (an
+// attachment that is already saved carries no capture instant this browser can read). The capture
+// decisions still have to SETTLE before Save, because the files added here are appended in capture
+// order among themselves, and that order is saved (MEMNG-262).
+const editZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+const editTiles = computed<UploadItem[]>(() => [...editUploads])
+// The tiles are SHOWN in the order they will be SAVED — an edit that displayed pick order while
+// submitting capture order would be telling the person something untrue about their own memo.
+const editOrdered = computed(() => captureOrder(editTiles.value, editZone))
+const editCapturePending = computed(() => pendingCaptureItems(editTiles.value))
+const editCaptureMessage = computed(() =>
+  editCapturePending.value.length ? captureBlockedMessage(editCapturePending.value) : '',
+)
 function onEditFiles(files: FileList | null) {
   if (files?.length) addEditUploads(Array.from(files))
 }
@@ -88,18 +112,43 @@ function startEdit() {
   clearEditUploads() // NOT `editUploads.length = 0` — that strands preview object URLs + File refs
   editing.value = true
 }
+// Claimed synchronously (a double click lands both handlers in one tick), and held until the
+// PATCH COMPLETES — which the parent reports through `editPending`. Reopening the editor while it
+// is out therefore shows the save in progress instead of offering a second one.
+const submittingEdit = ref(false)
+const editBusy = computed(() => submittingEdit.value || props.editPending === true)
+watch(
+  () => props.editPending,
+  (now, before) => {
+    // Landed or failed — either way the request is over and this card may be edited again.
+    if (before && !now) submittingEdit.value = false
+  },
+)
+
 function saveEdit() {
+  if (editBusy.value) return
+  if (editCapturePending.value.length > 0) return // the sentence is already on screen
+  submittingEdit.value = true
+  // Snapshot what is being submitted, then release exactly those tiles — a file attached in the
+  // same moment is not part of this edit and must not vanish with it. Everything staged NOW is
+  // part of it, a failed upload included; only what its uid reaches the wire.
+  const staged = [...editOrdered.value]
+  const submitted = staged.filter((u) => u.status === 'done' && u.uploadUid)
   emit('edit', {
     uid: props.memo.uid,
     content: editContent.value,
     visibility: editVisibility.value,
-    created_at: (editDate.value ?? new Date(props.memo.created_at)).toISOString(),
-    upload_uids: editUploads
-      .filter((u) => u.status === 'done' && u.uploadUid)
-      .map((u) => u.uploadUid as string),
+    // Seconds precision, the same serializer the composer uses — the wire carries whole seconds
+    // everywhere in this feature, and a millisecond spelling here would be a second dialect.
+    created_at: toWireInstant(editDate.value ?? new Date(props.memo.created_at)),
+    // In capture order among themselves; the server appends them after the memo's existing
+    // attachments, whose saved order this edit never re-sorts.
+    upload_uids: submitted.map((u) => u.uploadUid as string),
   })
-  clearEditUploads()
+  for (const item of staged) removeEditUpload(item.id)
   editing.value = false
+  // The claim is NOT released here, nor by reopening or cancelling: only the parent knows when
+  // its PATCH is over, and it says so through `editPending`.
 }
 // Cancel discards the staged uploads — they were never going to be attached (startEdit would drop
 // them on the next open anyway), so release them now instead of stranding their object URLs.
@@ -345,7 +394,7 @@ function onContentClick(event: MouseEvent) {
           </button>
         </div>
         <div
-          v-for="u in editUploads"
+          v-for="u in editOrdered"
           :key="u.id"
           class="relative h-16 w-16 overflow-hidden rounded-md bg-surface-100 dark:bg-surface-800"
         >
@@ -359,6 +408,21 @@ function onContentClick(event: MouseEvent) {
           >
             {{ u.progress }}%
           </div>
+          <!-- the same two capture states the composer shows: still being read, and given up on -->
+          <span
+            v-else-if="u.captureUnknown"
+            class="absolute inset-x-0 top-0 bg-black/55 px-1 py-0.5 text-[9px] text-white"
+            data-test="edit-capture-unknown"
+            >date unknown</span
+          >
+          <div
+            v-else-if="u.captureState === 'pending'"
+            class="absolute inset-0 flex items-center justify-center bg-black/35 text-white"
+            data-test="edit-capture-item-pending"
+            :aria-label="`Reading the date of ${u.name}`"
+          >
+            <i class="pi pi-spin pi-spinner text-xs" aria-hidden="true" />
+          </div>
           <button
             type="button"
             class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-black/55 text-white"
@@ -369,6 +433,12 @@ function onContentClick(event: MouseEvent) {
           </button>
         </div>
       </div>
+      <p v-if="editCaptureMessage" class="text-sm text-muted-color" data-test="edit-capture-pending">
+        {{ editCaptureMessage }}
+      </p>
+      <p v-else-if="editBusy" class="text-sm text-muted-color" data-test="edit-in-flight">
+        Saving this memo… reopening it does not send it twice.
+      </p>
       <div class="flex items-center gap-1">
         <Button
           text
@@ -426,9 +496,9 @@ function onContentClick(event: MouseEvent) {
           <Button text size="small" label="Cancel" data-test="edit-cancel" @click="cancelEdit" />
           <Button
             size="small"
-            :label="editUploading ? 'Uploading…' : 'Save'"
+            :label="editBusy ? 'Saving…' : editUploading ? 'Uploading…' : 'Save'"
             icon="pi pi-check"
-            :disabled="editUploading"
+            :disabled="editUploading || editBusy || editCapturePending.length > 0"
             data-test="edit-save"
             @click="saveEdit"
           />
