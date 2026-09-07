@@ -188,6 +188,22 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.6.1
+
+- A memo whose line is nothing but hashtags no longer becomes the digest mail's heading. The mail
+  applies the same tag-only-line rule the web view does — one shared vector file holds the rule and
+  its cases for both — and shows the memo's tags as chips below its body, and as a tag line below
+  the text in the plain-text alternative that archive search reads.
+- The part-splitting estimate counts a memo's rendered body: its HTML, its chip row (each tag name
+  measured as the template escapes it) and its tag line. A digest carrying no pictures was
+  previously estimated at zero bytes however much text it held, and could be sent as one message
+  over the configured size cap.
+- The size of the mail's inline pictures is pinned by tests that decode the bytes the message
+  carries, for a landscape and a portrait source, together with the layout heights they produce.
+- A hosted video's poster keeps its box when its image has not been downloaded yet: the anchor
+  around it is block-level and bounded to the layout width, instead of shrinking to the size of the
+  play badge.
+
 ### v1.6.0
 
 - The daily photo digest moves into memos-ng, replacing the decommissioned satellite: settings, recipients, runs and per-recipient deliveries live in the database behind an admin-only API, and the worker selects, renders, hosts and sends on a Europe/Zurich calendar gate, with videos hosted through Dropbox links held in a durable ownership ledger. The feature ships **disabled**; the cutover that imports the satellite's registry and enables it is a separate step.
