@@ -53,6 +53,7 @@ interface TagOnlyFixture {
   schema: number
   rule: string
   cases: { id: string; input: string; stripped: string }[]
+  predicate: { id: string; line: string; tag_only: boolean }[]
   render: {
     id: string
     input: string
@@ -73,11 +74,12 @@ describe('fixtures/tag-only-lines.json', () => {
     expect(fixture.schema).toBe(1)
     // 15 strip cases and 2 render cases as of 2026-09-07: the file may grow, never shrink.
     expect(fixture.cases.length).toBeGreaterThanOrEqual(15)
+    expect(fixture.predicate.length).toBeGreaterThanOrEqual(11)
     expect(fixture.render.length).toBeGreaterThanOrEqual(2)
   })
 
   it('has unique, non-empty case ids', () => {
-    const ids = [...fixture.cases, ...fixture.render].map((entry) => entry.id)
+    const ids = [...fixture.cases, ...fixture.predicate, ...fixture.render].map((e) => e.id)
     expect(ids.every((id) => id.length > 0)).toBe(true)
     expect(new Set(ids).size).toBe(ids.length)
   })
@@ -98,6 +100,18 @@ describe('fixtures/tag-only-lines.json', () => {
 
   it.each(fixture.cases)('strips $id as the file records', ({ input, stripped }) => {
     expect(stripTagOnlyLines(input)).toBe(stripped)
+  })
+
+  // The predicate takes WHOLE STRINGS, terminators included: `'#curated\n'` is tag-only under a
+  // `$` anchor in Python and never in JavaScript, which is exactly what the port had to match.
+  it.each(fixture.predicate)('answers $id as the file records', ({ line, tag_only }) => {
+    expect(isTagOnlyLine(line)).toBe(tag_only)
+  })
+
+  it('is the side that PRODUCES the trailing-newline vector', () => {
+    // Literal, so an emptied `predicate` section cannot make the loop above vanish silently.
+    expect(isTagOnlyLine('#curated')).toBe(true)
+    expect(isTagOnlyLine('#curated\n')).toBe(false)
   })
 
   it.each(fixture.render)('renders $id as the file records', (entry) => {

@@ -21,6 +21,7 @@ from app.services import tag_lines
 ROOT = Path(__file__).resolve().parent.parent
 ARTEFACT = json.loads((ROOT / "fixtures" / "tag-only-lines.json").read_text(encoding="utf-8"))
 CASES = ARTEFACT["cases"]
+PREDICATE = ARTEFACT["predicate"]
 
 
 def _ids(cases: list[dict]) -> list[str]:
@@ -34,6 +35,8 @@ def test_the_artefact_is_the_document_this_suite_thinks_it_is():
     assert len(CASES) >= 15
     assert len({case["id"] for case in CASES}) == len(CASES)
     assert {"unicode-accented-tag-kept", "unicode-cjk-tag-kept"} <= set(_ids(CASES))
+    assert len(PREDICATE) >= 11
+    assert "predicate-trailing-lf" in set(_ids(PREDICATE))
 
 
 def test_the_compiled_rule_is_the_one_the_artefact_records():
@@ -62,3 +65,18 @@ def test_a_source_of_only_tags_is_emptied_and_prose_is_untouched():
     assert tag_lines.strip_tag_only_lines("#curated #trip") == ""
     assert tag_lines.strip_tag_only_lines("a paragraph") == "a paragraph"
     assert tag_lines.strip_tag_only_lines("") == ""
+
+
+@pytest.mark.parametrize("case", PREDICATE, ids=_ids(PREDICATE))
+def test_the_predicate_answers_every_whole_string_as_the_spa_does(case: dict):
+    """Whole strings, not lines of a split: the predicate is exported and a caller may hand it a
+    string carrying its own terminator. `"#curated\\n"` is the one that separates a `$` anchor
+    from a full match, and the SPA's answer for each of these was recorded by running it."""
+    assert tag_lines.is_tag_only_line(case["line"]) is case["tag_only"]
+
+
+def test_a_trailing_newline_is_not_a_tag_only_line():
+    """The literal form of the vector above, so an emptied `predicate` section cannot make the
+    parametrised test disappear silently."""
+    assert tag_lines.is_tag_only_line("#curated") is True
+    assert tag_lines.is_tag_only_line("#curated\n") is False

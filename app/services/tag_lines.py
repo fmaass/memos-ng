@@ -13,6 +13,9 @@ Two details are the whole reason this is a module and not a one-liner at the cal
 * **`re.ASCII`.** JavaScript's `\\w` is ASCII-only; Python's matches every unicode word character.
   Without the flag `#café` and `#旅行` would be tag-only lines HERE and prose in the SPA, so the
   mail would drop text every other client shows. The shared vector file carries both as witnesses.
+* **A FULL match.** Python's `$` matches just before a trailing newline and JavaScript's
+  does not, so anchoring on `$` alone would make `"#curated\\n"` tag-only here and prose in
+  the SPA. The artefact's `predicate` section carries that vector.
 * **Splitting on `\\n` only.** A CRLF source leaves its `\\r` on the line, and a line ending in
   `\\r` is therefore not tag-only in either implementation — the same behaviour, kept because
   matching it is cheaper than explaining a divergence to a reader comparing two mails.
@@ -35,7 +38,11 @@ def is_tag_only_line(line: str) -> bool:
     `#word` requires no space after the `#`, so a real Markdown heading (`# Heading`, `## Sub`) is
     NOT one of these, and an inline tag in prose ("see #curated here") is not either.
     """
-    return TAG_ONLY_LINE.match(line) is not None
+    # `fullmatch`, not `match`: Python's `$` ALSO matches just before a trailing newline, while
+    # JavaScript's (no `m` flag) matches only at the very end of the string — so `"#curated\\n"`
+    # would be tag-only here and prose in the SPA. The artefact's `predicate` vectors are that
+    # divergence's witnesses; the PATTERN stays character-for-character the SPA's.
+    return TAG_ONLY_LINE.fullmatch(line) is not None
 
 
 def strip_tag_only_lines(text: str) -> str:

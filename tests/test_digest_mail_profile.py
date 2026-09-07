@@ -174,23 +174,36 @@ async def env(db_engine, tmp_path, monkeypatch):
             await db.commit()
 
 
-def _one_card_cap(data_root) -> int:
+def _one_card_cap(data_root, *, content: str = "memo number 0") -> int:
     """A `max_email_bytes` that fits exactly ONE of these cards and never two.
 
     Computed from the bytes the mail profile actually produces rather than written down: a
     hardcoded cap is a guess about an encoder, and it would start deferring cards (or stop
     splitting at all) the first time a quality default moved.
+
+    The card's BODY is in the number too, because the splitter counts it (`card_body_bytes`): a
+    cap sized from the image alone is a few dozen bytes short of the card it claims to fit, and
+    the card is then deferred instead of sent — which is the same "fits exactly one" contract,
+    just measured against everything the message actually carries.
     """
     sizes = []
     for tier in sorted((data_root / "assets" / "mobile").iterdir()):
         encoded = media.encode_for_mail(tier.read_bytes(), mail_profile())
         assert encoded is not None
         sizes.append(len(encoded.data))
+    body = digest_splitting.card_body_bytes(
+        digest_render.Card(
+            uid="cap",
+            memo_id=0,
+            content_html=digest_render.sanitize_markdown(content, frozenset()),
+            created_at=NOW,
+        )
+    )
     # The LARGEST, so every card fits alone rather than only the one that happened to be first:
     # each fixture carries its own random pixels and they do not encode to the same size. Two
     # cards still cannot share a part at this cap, whatever their sizes — the per-attachment
     # allowance alone doubles.
-    return digest_splitting.estimate_mime_size(max(sizes), 1)
+    return digest_splitting.estimate_mime_size(max(sizes) + body, 1)
 
 
 async def _seed(subject: str, data_root, count: int, *, size=(2400, 1800), noise=False):
