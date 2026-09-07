@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from app.services.digest import render, splitting
 from app.services.digest.mailer import build_message
 from app.services.digest.render import Card, CardImage, CardVideo, DayGroup, InlineImage
+from jinja2 import Environment
 
 DAY = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
 
@@ -405,3 +406,58 @@ def test_an_ordinary_digest_of_seven_photo_memos_is_still_one_part():
     assert len(result.parts) == 1
     assert result.deferred == []
     _no_part_exceeds(result, sizes, cap)
+
+
+def test_the_estimator_escapes_a_tag_name_the_way_the_template_does():
+    """A chip renders `{{ tag | e }}`, so an imported tag name full of ampersands costs the message
+    five bytes for every one it is written with. The estimator therefore escapes with the SAME
+    function the template applies — asserted by identity, not by imitation, because a hand-rolled
+    `html.escape` differs from Jinja's on quotes (`&quot;` vs `&#34;`) and would drift again."""
+    assert splitting.html_escape is Environment().filters["e"]
+    name = "t00_" + "&" * 196
+    escaped = str(splitting.html_escape(name))
+    assert len(escaped) == 4 + 196 * 5  # `&` -> `&amp;`
+
+    def html_size(count: int) -> int:
+        card = _tagged_card("m", tuple(name for _ in range(count)), "body")
+        groups = render.group_by_local_day([card], "Europe/Zurich")
+        return len(
+            render.render_html(
+                groups, subject="s", mail_title="t", date_range="r", memo_count=1
+            ).encode("utf-8")
+        )
+
+    # What the template really spends on one more chip of this name, against what the estimator
+    # would spend: the escaped name, never the raw one.
+    assert html_size(2) - html_size(1) == splitting.PER_CHIP_MARKUP_BYTES + len(
+        escaped.encode("utf-8")
+    )
+    assert splitting.card_body_bytes(_tagged_card("m", (name,), "body")) == (
+        2 * len("<p>body</p>")
+        + splitting.CHIP_ROW_MARKUP_BYTES
+        + splitting.PER_CHIP_MARKUP_BYTES
+        + len(escaped.encode("utf-8"))
+        + len(name.encode("utf-8"))
+        + splitting.PER_PLAIN_TAG_BYTES
+    )
+
+
+def test_an_escaping_heavy_tag_set_still_splits_under_the_real_message_size():
+    """The reviewer's reproduction: 40 image-free cards, 40 imported tags each, every name 200
+    bytes raw and 984 escaped. Counting the raw length estimated a 32-card part at 1,033,001 bytes
+    that serialises to 2,388,966 — over twice the cap. Tag names are unrestricted (they arrive from
+    the memos import), so this is a real message shape, not a constructed one."""
+    cap = 1_048_576
+    names = tuple(f"t{slot:02d}_" + "&" * 196 for slot in range(40))
+    cards = [_tagged_card(f"m{index}", names, f"memo {index}") for index in range(40)]
+    chrome = _rendered_size(splitting.Part(day_groups=[], inline_image_cids=set()), {})
+    whole = splitting.Part(day_groups=[_day(cards)], inline_image_cids=set())
+    assert _rendered_size(whole, {}) > cap + chrome  # control: it really does not fit one message
+
+    result = splitting.split_into_parts([_day(cards)], sizes := {}, cap)
+    assert sizes == {}  # no media anywhere: the body bytes are the whole estimate
+    assert len(result.parts) >= 2
+    assert result.deferred == []
+    assert sum(len(part.cards()) for part in result.parts) == len(cards)
+    for part in result.parts:
+        assert _rendered_size(part, {}) <= cap + chrome
