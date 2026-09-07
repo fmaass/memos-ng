@@ -62,6 +62,18 @@
     <div class="text" style="color:#33373d;font-size:16px;line-height:1.6;margin-bottom:12px;">{{ card.content_html | safe }}</div>
     {% endif %}
 
+    {# The memo's tags, as the SPA shows them (MemoCard.vue). The body no longer carries a
+       tag-only line, so this row is the only place the mail states them. `| e` is not optional:
+       this file is `.html.j2` and Jinja's select_autoescape(["html"]) does not cover that
+       extension, so nothing escapes these names for us — and a tag name can arrive unsanitised
+       from an import. The `chip` class is here for the dark-mode rule in <style>; `tagchip` is
+       what the render tests hook on. #}
+    {% if card.tags %}
+    <div style="margin-bottom:12px;">
+      {% for tag in card.tags %}<span class="chip tagchip" style="display:inline-block;background:#eef2f4;color:#42525c;font-size:13px;line-height:1.4;padding:3px 10px;border-radius:999px;margin:0 6px 6px 0;">#{{ tag | e }}</span>{% endfor %}
+    </div>
+    {% endif %}
+
     {% if card.images|length == 1 %}
       {% set img = card.images[0] %}
       {% set h = display_height(img.pixel_width, img.pixel_height, single_image_width) %}

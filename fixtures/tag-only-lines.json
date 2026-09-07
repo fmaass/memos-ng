@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "rule": "^[ \\t]*#\\w+(?:[ \\t]+#\\w+)*[ \\t]*$",
+  "note": "The tag-only-line rule as DATA, so the SPA (frontend/src/lib/markdown.ts) and the digest's server-side port (app/services/tag_lines.py) are held to one contract instead of two implementations. `rule` is the regex source verbatim; both sides assert their own pattern equals it. `\\w` is ASCII in JavaScript, so the Python port compiles with re.ASCII — the unicode cases below are that difference's witnesses. Lines are split on \\n only, so a CRLF source keeps its \\r on the line and the line is therefore NOT tag-only (tags-carriage-return-kept). Every `stripped` value was produced by the SPA and pinned here.",
+  "cases": [
+    { "id": "tag-only-single", "input": "#curated", "stripped": "" },
+    { "id": "tag-only-trailing-space", "input": "#curated ", "stripped": "" },
+    { "id": "tag-only-surrounding-tabs", "input": "\t#curated\t", "stripped": "" },
+    { "id": "tag-only-two-tags", "input": "#curated #trip", "stripped": "" },
+    { "id": "tag-only-underscore-and-digits", "input": "#tag_1 #tag2", "stripped": "" },
+    { "id": "inline-tag-in-prose-kept", "input": "see #curated here", "stripped": "see #curated here" },
+    { "id": "heading-kept", "input": "# Heading", "stripped": "# Heading" },
+    { "id": "subheading-kept", "input": "## Sub", "stripped": "## Sub" },
+    { "id": "mixed-content-tag-line-dropped", "input": "#curated\nMy trip photos", "stripped": "My trip photos" },
+    { "id": "mixed-content-blank-line-survives", "input": "#curated\n\nMy trip photos", "stripped": "\nMy trip photos" },
+    { "id": "tag-line-between-prose", "input": "Hello\n#curated\nWorld", "stripped": "Hello\nWorld" },
+    { "id": "unicode-accented-tag-kept", "input": "#café", "stripped": "#café" },
+    { "id": "unicode-cjk-tag-kept", "input": "#旅行", "stripped": "#旅行" },
+    { "id": "tags-carriage-return-kept", "input": "#curated\r\nHello", "stripped": "#curated\r\nHello" },
+    { "id": "empty-source", "input": "", "stripped": "" }
+  ],
+  "render": [
+    {
+      "id": "render-tag-only-memo-is-empty",
+      "input": "#curated",
+      "html_empty": true,
+      "html_contains": [],
+      "html_excludes": []
+    },
+    {
+      "id": "render-prose-around-a-stripped-tag-line",
+      "input": "#curated\nHello",
+      "html_empty": false,
+      "html_contains": ["Hello"],
+      "html_excludes": ["#curated"]
+    }
+  ]
+}
