@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from app.config import settings as app_settings
-from app.models import DigestVisibilityScope, Visibility
+from app.models import DigestVisibilityScope, Tag, Visibility, memo_tags
 from app.services.digest import select as digest_select
 from app.services.digest.domain import DigestConfig
 from sqlalchemy import text
@@ -260,3 +260,27 @@ def test_no_scope_admits_a_private_memo(scope):
     """A category-per-input check, not just the happy path: PRIVATE is out in EVERY scope, because
     the digest goes to six mailboxes outside the household."""
     assert Visibility.PRIVATE not in digest_select.SCOPE_VISIBILITIES[scope]
+
+
+async def test_a_candidate_carries_its_memos_tags_sorted(adb):
+    """The chip row and the plain part's tag line both read `Candidate.tags`, so selection is
+    where they have to arrive — and sorted, because the mail must not reorder a memo's tags
+    between two runs. `Memo.tags` is `lazy="selectin"`, so this costs the loader no extra query.
+    """
+    user = await seed_user(adb)
+    memo = await seed_memo(adb, user, content="#trip\nphotos")
+    untagged = await seed_memo(adb, user, content="no tags here")
+    trip, curated = Tag(name="trip"), Tag(name="curated")
+    adb.add_all([trip, curated])
+    await adb.flush()
+    # The association rows written directly, in the order the sort has to undo — appending to
+    # `memo.tags` would lazy-load the collection on an object this session has not refreshed.
+    await adb.execute(
+        memo_tags.insert(),
+        [{"memo_id": memo.id, "tag_id": trip.id}, {"memo_id": memo.id, "tag_id": curated.id}],
+    )
+    await adb.flush()
+    adb.expire(memo)
+    found = {c.memo_id: c for c in await digest_select.load_candidates(adb, _settings())}
+    assert found[memo.id].tags == ("curated", "trip")
+    assert found[untagged.id].tags == ()

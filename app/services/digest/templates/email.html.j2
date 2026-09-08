@@ -62,6 +62,18 @@
     <div class="text" style="color:#33373d;font-size:16px;line-height:1.6;margin-bottom:12px;">{{ card.content_html | safe }}</div>
     {% endif %}
 
+    {# The memo's tags, as the SPA shows them (MemoCard.vue). The body no longer carries a
+       tag-only line, so this row is the only place the mail states them. `| e` is not optional:
+       this file is `.html.j2` and Jinja's select_autoescape(["html"]) does not cover that
+       extension, so nothing escapes these names for us — and a tag name can arrive unsanitised
+       from an import. The `chip` class is here for the dark-mode rule in <style>; `tagchip` is
+       what the render tests hook on. #}
+    {% if card.tags %}
+    <div style="margin-bottom:12px;">
+      {% for tag in card.tags %}<span class="chip tagchip" style="display:inline-block;background:#eef2f4;color:#42525c;font-size:13px;line-height:1.4;padding:3px 10px;border-radius:999px;margin:0 6px 6px 0;">#{{ tag | e }}</span>{% endfor %}
+    </div>
+    {% endif %}
+
     {% if card.images|length == 1 %}
       {% set img = card.images[0] %}
       {% set h = display_height(img.pixel_width, img.pixel_height, single_image_width) %}
@@ -91,7 +103,12 @@
       <div style="margin-top:10px;text-align:center;">
         {% if v.poster_cid %}
         {% set ph = display_height(v.poster_width, v.poster_height, single_image_width) %}
-        <a href="{{ v.url }}" style="text-decoration:none;display:inline-block;position:relative;">
+        {# display:block, not inline-block: an inline-block whose only child is an <img> the
+           client has not loaded (or that never arrived in this part) shrinks to the alt text and
+           the play badge lands on a 57x101 box — the same failure the height attribute exists to
+           prevent. Blocked to the layout width, centred by its own margins because the wrapping
+           div's text-align no longer reaches it. #}
+        <a href="{{ v.url }}" style="text-decoration:none;display:block;position:relative;width:100%;max-width:{{ single_image_width }}px;margin:0 auto;">
           <img src="cid:{{ v.poster_cid }}" alt="Video" width="{{ single_image_width }}"{% if ph %} height="{{ ph }}"{% endif %} style="width:100%;max-width:{{ single_image_width }}px;height:auto;display:block;border-radius:10px;" />
           <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:64px;height:64px;background:rgba(0,0,0,0.55);border-radius:50%;display:flex;align-items:center;justify-content:center;">
             <div style="width:0;height:0;border-top:15px solid transparent;border-bottom:15px solid transparent;border-left:26px solid #ffffff;margin-left:5px;"></div>

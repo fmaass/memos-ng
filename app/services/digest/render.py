@@ -35,6 +35,7 @@ from app.services.digest.gate import FALLBACK_TIMEZONE, resolve_zone
 from app.services.digest.hosting import MediaLinks
 from app.services.digest.select import MAIL_IMAGE_TIER, Candidate
 from app.services.export_settings import MailProfile
+from app.services.tag_lines import strip_tag_only_lines
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 TEMPLATE_NAME = "email.html.j2"
@@ -197,6 +198,9 @@ class Card:
     memo_id: int
     content_html: str
     created_at: datetime
+    # The memo's tags, shown as chips below the body — and, because the body no longer carries a
+    # tag-only line, the ONLY place the mail states them. Both alternatives render them.
+    tags: tuple[str, ...] = ()
     images: list[CardImage] = field(default_factory=list)
     videos: list[CardVideo] = field(default_factory=list)
     shed_links: list[ShedImage] = field(default_factory=list)
@@ -351,11 +355,16 @@ def build_cards(
     inline: list[InlineImage] = []
     for candidate in candidates:
         content = strip_video_refs(candidate.content, (v.uid for v in candidate.videos))
+        # The SPA's rule, applied to the SAME text python-markdown is about to parse: a line that
+        # is nothing but hashtags is a heading to every Markdown parser and has never been one in
+        # any other client (MEMNG-275). The tags reach the reader as chips instead, below.
+        content = strip_tag_only_lines(content)
         card = Card(
             uid=candidate.uid,
             memo_id=candidate.memo_id,
             content_html=sanitize_markdown(content, blocked_hosts),
             created_at=candidate.created_at,
+            tags=candidate.tags,
             is_incomplete=candidate.incomplete,
         )
         for image in candidate.images:
@@ -480,6 +489,11 @@ def render_plain(
             text = bleach.clean(text, tags=[], strip=True).strip()
             if text:
                 lines.append(text)
+            if card.tags:
+                # The tags are not in `content_html` any more (the tag-only line was stripped), and
+                # this alternative is what the household's archive search reads — so they are
+                # stated here, below the text, or the text part would silently lose them.
+                lines.append(" ".join(f"#{tag}" for tag in card.tags))
             if card.images:
                 lines.append(f"  [{len(card.images)} image(s)]")
             for video in card.videos:

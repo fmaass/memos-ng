@@ -24,11 +24,31 @@ never rescue (more parts, same oversized card). This port degrades in a fixed or
 
 from dataclasses import dataclass, field
 
+from markupsafe import escape as html_escape  # THE `e` filter the chip template applies
+
 from app.services.digest.render import Card, DayGroup, InlineImage, ShedImage
+
+# `markupsafe.escape` IS Jinja's `e` filter (`Environment().filters["e"] is markupsafe.escape`),
+# imported rather than imitated: `html.escape(quote=True)` writes `&quot;`/`&#x27;` where Jinja
+# writes `&#34;`/`&#39;`, so a hand-rolled copy would under-count a quote by a byte and drift again
+# the next time either implementation moved. markupsafe arrives with jinja2, which this service
+# already renders its template with.
 
 # MIME base64 overhead plus per-part headers, as the satellite measured it against real messages.
 MIME_OVERHEAD_FACTOR = 1.37
 PER_ATTACHMENT_BYTES = 2048
+
+# What a tagged card's chip row and plain-text tag line cost, MEASURED off the real render (the
+# rendered-byte difference one chip makes, minus the tag name itself) rather than counted off the
+# template by eye: the row wrapper `<div>`, one styled `<span>` per chip (email.html.j2), and the
+# `#` + separator each tag adds to `render_plain`'s tag line. `card_body_bytes` adds the names
+# themselves once per alternative on top.
+# `tests/test_digest_splitting.py::test_the_chip_and_tag_line_allowances_are_what_the_template_
+# actually_renders` re-derives all three against the live template, so a markup edit cannot leave
+# them stale.
+CHIP_ROW_MARKUP_BYTES = 61
+PER_CHIP_MARKUP_BYTES = 185
+PER_PLAIN_TAG_BYTES = 2
 
 DEFERRED_TOO_LARGE = "card exceeds max_email_bytes after shedding"
 
@@ -46,8 +66,45 @@ def card_cids(card: Card) -> list[str]:
     return card.photo_cids() + card.poster_cids()
 
 
+def card_body_bytes(card: Card) -> int:
+    """The bytes a card's own BODY puts in the message: its rendered HTML, its chip row and its
+    line in the text alternative.
+
+    Left out, this is how a digest carrying no pictures estimated at ZERO however much text it
+    held — the cap was then compared against nothing and one over-cap part went out. The tag row
+    made the omission bigger, which is what surfaced it.
+
+    Everything is counted ONCE PER ALTERNATIVE, because the message carries both: the body as
+    HTML and again as the text `render_plain` derives from it (markup stripped, so never longer),
+    and each tag name in its chip and again in the text line. Over the cap is the one direction an
+    estimator must never be wrong in, so the cheaper over-count is the right one.
+
+    The chip spells the name out ESCAPED (`{{ tag | e }}`) and the text line spells it raw, so the
+    two alternatives are measured differently. That is not a detail: tag names arrive unrestricted
+    from the memos import, and a name of 196 ampersands is 200 bytes in the text part and 984 in
+    the HTML one. Counting the raw length for both put a 32-card part at an estimated 1,033,001
+    bytes that serialised to 2,388,966 under a 1,048,576 cap.
+
+    What this still does NOT cover is the message's FIXED per-part chrome — the template's header
+    and footer, the day headings and the MIME boundaries, about 4.5 KB measured
+    (`test_a_tag_heavy_image_free_digest_...` states the number). That gap predates the tag row and
+    is unchanged by it; against the 18 MB production cap it is 0.02%, and closing it would move
+    every digest's split point, so it is left as a stated limit rather than folded in here.
+    """
+    body = len(card.content_html.encode("utf-8"))
+    if not card.tags:
+        return 2 * body
+    escaped = sum(len(str(html_escape(tag)).encode("utf-8")) for tag in card.tags)
+    raw = sum(len(tag.encode("utf-8")) for tag in card.tags)
+    chips = CHIP_ROW_MARKUP_BYTES + len(card.tags) * PER_CHIP_MARKUP_BYTES + escaped
+    tag_line = raw + len(card.tags) * PER_PLAIN_TAG_BYTES
+    return 2 * body + chips + tag_line
+
+
 def card_raw_bytes(card: Card, cid_to_bytes: dict[str, int]) -> int:
-    return sum(cid_to_bytes.get(cid, 0) for cid in card_cids(card))
+    """Everything this card contributes to a part's raw size, before the MIME overhead factor."""
+    inline = sum(cid_to_bytes.get(cid, 0) for cid in card_cids(card))
+    return inline + card_body_bytes(card)
 
 
 def _card_att_count(card: Card) -> int:

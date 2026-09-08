@@ -76,6 +76,10 @@ class Candidate:
     created_at: datetime
     images: list[MediaRef] = field(default_factory=list)
     videos: list[MediaRef] = field(default_factory=list)
+    # The memo's tags, sorted — the same projection the API serves the SPA
+    # (`app/routers/memos.py`). The mail shows them as chips below the body, which is what makes
+    # dropping a tag-only LINE from the body safe: the tags are still in the message.
+    tags: tuple[str, ...] = ()
     # Set past the grace: some of this memo's media never became ready and it goes out anyway,
     # with the template's "Some images weren't ready at send time" note.
     incomplete: bool = False
@@ -210,6 +214,10 @@ async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Cand
                 created_at=memo.created_at,
                 images=images,
                 videos=videos,
+                # `Memo.tags` is `lazy="selectin"` (app/models.py), so this reads the rows the
+                # same statement already loaded — no query is added, and nothing is read after
+                # the session closes.
+                tags=tuple(sorted(tag.name for tag in memo.tags)),
             )
         )
     return candidates

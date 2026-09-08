@@ -11,11 +11,11 @@ from datetime import UTC, datetime
 
 import pytest
 from app.config import settings as app_settings
-from app.services.digest import render
+from app.services.digest import render, runner, splitting
 from app.services.digest.hosting import MediaLinks
 from app.services.digest.select import Candidate, MediaRef
 
-from tests.digest_support import mail_profile, write_mobile, write_poster
+from tests.digest_support import digest_config, mail_profile, write_mobile, write_poster
 
 MEMOS_HOST = "memos.discomarder.live"
 
@@ -35,6 +35,7 @@ def _candidate(**overrides) -> Candidate:
         images=overrides.pop("images", []),
         videos=overrides.pop("videos", []),
         incomplete=overrides.pop("incomplete", False),
+        tags=overrides.pop("tags", ()),
     )
 
 
@@ -399,3 +400,150 @@ def test_the_template_is_compiled_once_and_never_re_read():
         render_module._template.cache_clear()
     assert first == second  # control: both calls really rendered the same template
     assert reads == [render_module.TEMPLATE_NAME]
+
+
+# --- tag-only lines and the chip row (MEMNG-275) --------------------------------------------------
+#
+# The rule itself is pinned against the SPA's vectors in tests/test_tag_lines.py. What is asserted
+# here is that the DIGEST applies it: on the rendered string, through the real `build_cards` +
+# template, because the defect the household saw was a heading in a mail, not a wrong return value.
+
+CHIP_MARKER = 'class="chip tagchip"'
+
+
+async def _cards_of(candidate) -> list[render.Card]:
+    files = await _encoded([candidate], MediaLinks())
+    cards, _ = render.build_cards(
+        [candidate],
+        files,
+        MediaLinks(),
+        max_videos_per_memo=2,
+        link_images_full=False,
+        blocked_hosts=render.memos_ng_hosts(),
+    )
+    return cards
+
+
+async def _html_of(candidate) -> str:
+    cards = await _cards_of(candidate)
+    return render.render_html(
+        render.group_by_local_day(cards, "Europe/Zurich"),
+        subject="s",
+        mail_title="t",
+        date_range="r",
+        memo_count=len(cards),
+    )
+
+
+async def test_a_tag_only_first_line_is_never_the_memos_heading(data_root):
+    """The reported defect: `#curated` on its own line was rendered as an `<h1>` title, which no
+    other client has ever shown."""
+    write_mobile(data_root, "img-1")
+    candidate = _candidate(
+        content="#curated\nMy trip photos", images=[_image("img-1")], tags=("curated",)
+    )
+    html = await _html_of(candidate)
+    assert "<h1" not in html
+    assert "My trip photos" in html
+    assert CHIP_MARKER in html
+    assert "#curated" in html
+
+
+async def test_a_memo_whose_body_is_only_tags_renders_chips_and_no_body_at_all(data_root):
+    """No heading, and no empty paragraph either — the card is its pictures and its chips."""
+    write_mobile(data_root, "img-1")
+    candidate = _candidate(
+        content="#curated #trip", images=[_image("img-1")], tags=("curated", "trip")
+    )
+    cards = await _cards_of(candidate)
+    assert cards[0].content_html == ""
+    html = await _html_of(candidate)
+    assert "<h1" not in html
+    assert "<p>" not in html  # the body div is skipped entirely, not emitted empty
+    assert html.count(CHIP_MARKER) == 2
+    assert "#curated" in html and "#trip" in html
+
+
+async def test_an_inline_tag_stays_inside_its_sentence(data_root):
+    """Only whole tag-only LINES go; a tag inside prose is part of the memo's text."""
+    candidate = _candidate(content="see #curated inline", tags=("curated",))
+    cards = await _cards_of(candidate)
+    assert "see #curated inline" in cards[0].content_html
+    assert (await _html_of(candidate)).count("see #curated inline") == 1
+
+
+async def test_a_memo_without_tags_renders_no_chip_markup(data_root):
+    candidate = _candidate(content="just prose", tags=())
+    html = await _html_of(candidate)
+    assert CHIP_MARKER not in html
+    assert "just prose" in html
+
+
+async def test_a_tag_name_is_escaped_into_the_chip_row(data_root):
+    """Tag names arrive unsanitised from imports (app/scripts/migrate_from_memos.py), and this
+    template file is `.html.j2`, which Jinja's `select_autoescape(["html"])` does NOT cover — so
+    every chip interpolation escapes explicitly. Without the filter this memo would inject an
+    `<img>` element into the mail."""
+    candidate = _candidate(content="prose", tags=("<img src=x onerror=1>",))
+    html = await _html_of(candidate)
+    assert "&lt;img src=x onerror=1&gt;" in html
+    assert "<img" not in html  # the card has no pictures, so this is the tag name or nothing
+
+
+async def _rendered_digest(candidates) -> runner.RenderedDigest:
+    """A `RenderedDigest` built by the same steps `build_digest` runs, so `part_payload` is
+    exercised on the real object rather than a stand-in."""
+    files = await _encoded(candidates, MediaLinks())
+    cards, inline = render.build_cards(
+        candidates,
+        files,
+        MediaLinks(),
+        max_videos_per_memo=2,
+        link_images_full=False,
+        blocked_hosts=render.memos_ng_hosts(),
+    )
+    rendered = runner.RenderedDigest(selected=list(candidates))
+    rendered.inline_by_cid = {image.cid: image for image in inline}
+    rendered.day_groups = render.group_by_local_day(cards, "Europe/Zurich")
+    rendered.date_range = render.subject_date_range(rendered.day_groups)
+    split = splitting.split_into_parts(
+        rendered.day_groups, splitting.build_cid_to_bytes(inline), 18874368
+    )
+    rendered.parts = split.parts
+    return rendered
+
+
+async def test_both_alternatives_of_a_tag_only_memo_carry_the_tags_and_no_heading(data_root):
+    """Through the real `part_payload`: the HTML part loses the heading and gains chips, and the
+    TEXT part — which the household's archive search runs over — still names the tags."""
+    write_mobile(data_root, "img-1")
+    candidate = _candidate(
+        content="#curated #trip", images=[_image("img-1")], tags=("curated", "trip")
+    )
+    rendered = await _rendered_digest([candidate])
+    _, html, plain, _, _, _ = runner.part_payload(rendered, 1, digest_config())
+    assert "<h1" not in html
+    assert html.count(CHIP_MARKER) == 2
+    assert "#curated #trip" in plain
+
+
+async def test_both_alternatives_of_a_mixed_memo_keep_the_text_and_add_the_tag_line(data_root):
+    """The tag line sits BELOW the card's text in the plain part — stripping it from the body
+    without putting it back here would delete the tags from the text alternative entirely."""
+    candidate = _candidate(content="#curated\nMy trip photos", tags=("curated",))
+    rendered = await _rendered_digest([candidate])
+    _, html, plain, _, _, _ = runner.part_payload(rendered, 1, digest_config())
+    assert "<h1" not in html
+    assert "My trip photos" in html
+    assert CHIP_MARKER in html
+    lines = plain.split("\n")
+    assert "My trip photos" in lines
+    assert lines.index("#curated") == lines.index("My trip photos") + 1
+
+
+async def test_the_plain_alternative_of_an_untagged_memo_gains_no_tag_line(data_root):
+    candidate = _candidate(content="just prose", tags=())
+    rendered = await _rendered_digest([candidate])
+    _, _, plain, _, _, _ = runner.part_payload(rendered, 1, digest_config())
+    assert "just prose" in plain
+    assert "#" not in plain

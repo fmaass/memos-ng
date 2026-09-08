@@ -10,9 +10,10 @@ divergence exists for: **no emitted part exceeds the cap.**
 import secrets
 from datetime import UTC, datetime
 
-from app.services.digest import splitting
+from app.services.digest import render, splitting
 from app.services.digest.mailer import build_message
 from app.services.digest.render import Card, CardImage, CardVideo, DayGroup, InlineImage
+from jinja2 import Environment
 
 DAY = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
 
@@ -40,7 +41,9 @@ def _day(cards: list[Card], iso: str = "2026-07-01") -> DayGroup:
 
 def _no_part_exceeds(result: splitting.SplitResult, sizes: dict[str, int], cap: int) -> None:
     for part in result.parts:
-        raw = sum(sizes.get(cid, 0) for cid in part.inline_image_cids)
+        # The production accounting, so this reads a part exactly as the splitter decided it:
+        # inline bytes AND the body bytes the cards render into.
+        raw = sum(splitting.card_raw_bytes(card, sizes) for card in part.cards())
         assert splitting.estimate_mime_size(raw, len(part.inline_image_cids)) <= cap
 
 
@@ -267,3 +270,194 @@ def test_the_independent_oracle_can_actually_fail():
     payloads = {f"p{index}": secrets.token_bytes(40_000) for index in range(6)}
     oversized = splitting.Part(day_groups=[], inline_image_cids=set(payloads))
     assert _serialised_size(oversized, payloads) > cap
+
+
+# --- the body a card renders is part of the message too (MEMNG-275 follow-up) --------------------
+#
+# `card_raw_bytes` counted inline images and nothing else, so an image-free digest estimated at
+# ZERO bytes however much text it carried. The chip row and the plain-text tag line made that
+# omission bigger, which is what these tests hold.
+
+FROM_NAME = "The Daily Dami Memos Mail"
+
+
+def _rendered_size(part: splitting.Part, payloads: dict[str, bytes]) -> int:
+    """The bytes an SMTP server receives for this part, with its REAL rendered body.
+
+    The other oracle in this file sends a stub body, which is honest for a test about image bytes
+    and useless for one about body bytes. This one renders the part through the production
+    template and text builder, so the number includes every chip and every tag line.
+    """
+    subject = f"{FROM_NAME} — July 1, 2026"
+    cards = part.cards()
+    html = render.render_html(
+        part.day_groups,
+        subject=subject,
+        mail_title=FROM_NAME,
+        date_range="July 1, 2026",
+        memo_count=len(cards),
+    )
+    plain = render.render_plain(part.day_groups, subject=subject, memo_count=len(cards))
+    message = build_message(
+        subject=subject,
+        from_email="sender@example.com",
+        from_name=FROM_NAME,
+        html_body=html,
+        plain_body=plain,
+        inline_images=[
+            InlineImage(cid=cid, data=payloads[cid]) for cid in sorted(part.inline_image_cids)
+        ],
+    )
+    return len(message.as_bytes())
+
+
+def _tagged_card(uid: str, tags: tuple[str, ...], body: str) -> Card:
+    return Card(
+        uid=uid,
+        memo_id=abs(hash(uid)) % 100000,
+        content_html=f"<p>{body}</p>",
+        created_at=DAY,
+        tags=tags,
+    )
+
+
+def test_the_chip_and_tag_line_allowances_are_what_the_template_actually_renders():
+    """The constants are DERIVED, and this is where they stay derived: the same measurement that
+    produced them, run against the live template and text builder. A markup edit that changes what
+    a chip costs turns this red instead of leaving the estimate quietly stale."""
+    name = "aaaa"
+
+    def sizes(count: int) -> tuple[int, int]:
+        card = _tagged_card("m", tuple(name for _ in range(count)), "body")
+        groups = render.group_by_local_day([card], "Europe/Zurich")
+        html = render.render_html(
+            groups, subject="s", mail_title="t", date_range="r", memo_count=1
+        )
+        plain = render.render_plain(groups, subject="s", memo_count=1)
+        return len(html.encode("utf-8")), len(plain.encode("utf-8"))
+
+    (html0, plain0), (html1, plain1), (html2, plain2) = sizes(0), sizes(1), sizes(2)
+    assert html2 - html1 == splitting.PER_CHIP_MARKUP_BYTES + len(name)
+    assert html1 - html0 == (
+        splitting.CHIP_ROW_MARKUP_BYTES + splitting.PER_CHIP_MARKUP_BYTES + len(name)
+    )
+    assert plain2 - plain1 == splitting.PER_PLAIN_TAG_BYTES + len(name)
+    assert plain1 - plain0 == splitting.PER_PLAIN_TAG_BYTES + len(name)
+
+
+def test_a_card_with_no_media_is_no_longer_estimated_at_zero_bytes():
+    card = _tagged_card("m", ("curated", "trip"), "a body")
+    assert splitting.card_raw_bytes(card, {}) > len(card.content_html.encode("utf-8"))
+    bare = Card(uid="m2", memo_id=2, content_html="", created_at=DAY)
+    assert splitting.card_raw_bytes(bare, {}) == 0  # nothing to render, nothing to count
+
+
+def test_a_tag_heavy_image_free_digest_splits_instead_of_emitting_one_over_cap_part():
+    """The regression this fold exists for: 40 image-free memos carrying 40 tags each estimated at
+    ZERO under the old accounting — the splitter emitted one part whose real MIME was far over the
+    cap. The oracle here is the serialised message, not the estimator."""
+    cap = 262_144
+    cards = [
+        _tagged_card(
+            f"m{index}",
+            tuple(f"tag-{index:02d}{slot:02d}" for slot in range(40)),
+            f"memo {index} " * 20,
+        )
+        for index in range(40)
+    ]
+    sizes: dict[str, int] = {}
+    # Control: no media at all, so the OLD accounting (inline bytes only) saw nothing to count.
+    assert all(splitting.card_cids(card) == [] for card in cards)
+    assert splitting.estimate_mime_size(0, 0) == 0
+    whole = splitting.Part(day_groups=[_day(cards)], inline_image_cids=set())
+    assert _rendered_size(whole, {}) > cap  # the digest really is over the cap in real bytes
+
+    # The message's FIXED chrome — template header and footer, day heading, MIME boundaries — is
+    # not in `estimate_mime_size` at all and never was (it has no per-part term). Measured here
+    # with the same oracle rather than written down, so the residual this change does NOT close is
+    # a number the test states instead of a rounding nobody checks.
+    chrome = _rendered_size(splitting.Part(day_groups=[], inline_image_cids=set()), {})
+    assert chrome > 0
+    assert _rendered_size(whole, {}) > cap + chrome  # the split is needed for real, not by chrome
+
+    result = splitting.split_into_parts([_day(cards)], sizes, cap)
+    assert len(result.parts) >= 2
+    assert result.deferred == []
+    assert sum(len(part.cards()) for part in result.parts) == len(cards)
+    for part in result.parts:
+        assert _rendered_size(part, {}) <= cap + chrome
+
+
+def test_an_ordinary_digest_of_seven_photo_memos_is_still_one_part():
+    """The no-regression half: the shape of nearly every real run — seven memos, two photos each,
+    a couple of tags — must still be a single message under the production cap."""
+    cap = 18_874_368
+    cards: list[Card] = []
+    sizes: dict[str, int] = {}
+    for index in range(7):
+        card, card_sizes = _card(
+            f"m{index}", photos=[(f"p{index}a", 200_000), (f"p{index}b", 200_000)]
+        )
+        card.content_html = "<p>a normal memo with a sentence or two in it</p>"
+        card.tags = ("curated", "trip")
+        cards.append(card)
+        sizes.update(card_sizes)
+    result = splitting.split_into_parts([_day(cards)], sizes, cap)
+    assert len(result.parts) == 1
+    assert result.deferred == []
+    _no_part_exceeds(result, sizes, cap)
+
+
+def test_the_estimator_escapes_a_tag_name_the_way_the_template_does():
+    """A chip renders `{{ tag | e }}`, so an imported tag name full of ampersands costs the message
+    five bytes for every one it is written with. The estimator therefore escapes with the SAME
+    function the template applies — asserted by identity, not by imitation, because a hand-rolled
+    `html.escape` differs from Jinja's on quotes (`&quot;` vs `&#34;`) and would drift again."""
+    assert splitting.html_escape is Environment().filters["e"]
+    name = "t00_" + "&" * 196
+    escaped = str(splitting.html_escape(name))
+    assert len(escaped) == 4 + 196 * 5  # `&` -> `&amp;`
+
+    def html_size(count: int) -> int:
+        card = _tagged_card("m", tuple(name for _ in range(count)), "body")
+        groups = render.group_by_local_day([card], "Europe/Zurich")
+        return len(
+            render.render_html(
+                groups, subject="s", mail_title="t", date_range="r", memo_count=1
+            ).encode("utf-8")
+        )
+
+    # What the template really spends on one more chip of this name, against what the estimator
+    # would spend: the escaped name, never the raw one.
+    assert html_size(2) - html_size(1) == splitting.PER_CHIP_MARKUP_BYTES + len(
+        escaped.encode("utf-8")
+    )
+    assert splitting.card_body_bytes(_tagged_card("m", (name,), "body")) == (
+        2 * len("<p>body</p>")
+        + splitting.CHIP_ROW_MARKUP_BYTES
+        + splitting.PER_CHIP_MARKUP_BYTES
+        + len(escaped.encode("utf-8"))
+        + len(name.encode("utf-8"))
+        + splitting.PER_PLAIN_TAG_BYTES
+    )
+
+
+def test_an_escaping_heavy_tag_set_still_splits_under_the_real_message_size():
+    """The reviewer's reproduction: 40 image-free cards, 40 imported tags each, every name 200
+    bytes raw and 984 escaped. Counting the raw length estimated a 32-card part at 1,033,001 bytes
+    that serialises to 2,388,966 — over twice the cap. Tag names are unrestricted (they arrive from
+    the memos import), so this is a real message shape, not a constructed one."""
+    cap = 1_048_576
+    names = tuple(f"t{slot:02d}_" + "&" * 196 for slot in range(40))
+    cards = [_tagged_card(f"m{index}", names, f"memo {index}") for index in range(40)]
+    chrome = _rendered_size(splitting.Part(day_groups=[], inline_image_cids=set()), {})
+    whole = splitting.Part(day_groups=[_day(cards)], inline_image_cids=set())
+    assert _rendered_size(whole, {}) > cap + chrome  # control: it really does not fit one message
+
+    result = splitting.split_into_parts([_day(cards)], sizes := {}, cap)
+    assert sizes == {}  # no media anywhere: the body bytes are the whole estimate
+    assert len(result.parts) >= 2
+    assert result.deferred == []
+    assert sum(len(part.cards()) for part in result.parts) == len(cards)
+    for part in result.parts:
+        assert _rendered_size(part, {}) <= cap + chrome
