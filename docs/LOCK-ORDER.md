@@ -106,6 +106,49 @@ INSERT of a private row, which is not an acquisition (R8).
 This is not a claim that all application writes are deadlock-free. Unique-key arbitration on
 `tags` is a separate class with its own settlement and is out of the protocol's scope.
 
+## What the protocol does not change
+
+The exclusions below are binding. Each is copied from the design's §3.2 in its own words; the
+citations are given as file and function rather than as line numbers, so they stay true as the
+files move.
+
+- **X1** Do **not** sort processing semantics with lock order. Acquisition is canonical; processing
+  keeps declared attachment order, first-mention ranking, screen/print grouping and existing
+  positions (`uploads.finalize_pending`'s passes; `memos.link_attachments`' rank and append rules).
+- **X2** Do **not** fix dedup contention by accepting a stale candidate or stealing a linked
+  attachment. Revalidate owner and `memo_id IS NULL` after the wait; keep the linking steal guard
+  (`uploads.finalize_pending`'s pass-0 revalidation and `uploads.finalize`'s standalone locked
+  re-read; `memos.link_attachments`' `att.memo_id is not None and att.memo_id != memo.id`).
+- **X3** Do **not** drop freshness when consolidating locks. `populate_existing` on the memo lock
+  (`memos.lock_memo_for_write`), the rendition attach's read-through-the-lock
+  (`assets.attach_rendition`), and both `print_path` refreshes arbitrating the displaced path
+  (`assets.upload_print`, `uploads.bind_print_to_sibling`) all stay.
+- **X4** Do **not** validate consumed uploads before idempotency replay. Replay wins first on both
+  create and PATCH (`memos.get_by_idempotency_key`, `memos.get_memo_by_edit_key`, both reached
+  before any upload work). Keep the SHARE reads and `OF Memo`; introduce no shared→exclusive
+  upgrade on a replay path.
+- **X5** Do **not** use `SKIP LOCKED` to silently omit a requested upload or attachment. A refused
+  batch keeps its media and reports the existing missing/incomplete or poster error
+  (`uploads.UploadsUnlinkable` → 409 `uploads_unlinkable`; `uploads.VideoPostersInvalid` → 422
+  `video_poster.<reason>`).
+- **X6** Do **not** remove reclaim's revalidation, file journal or non-blocking job cleanup. Keep
+  the identity-vs-orphan predicates, the per-attachment transaction boundary, and the absence of a
+  media-job FK cascade (`reclaim._ineligible`, `reclaim.reclaim_attachment`,
+  `asset_paths.all_asset_paths`; `models.MediaJob`).
+- **X7** Do **not** unlink consumed parts before commit, and do **not** discard committed media in
+  a cleanup path. Keep `consumed_out`, `TrackedMove`, poster-copy settlement and the
+  committed-state guards (`uploads.PosterCopy`, `storage.TrackedMove`, and the create/PATCH
+  routes' post-commit reaps). `tests/test_commit_race_reconcile.py` documents actual damage, not a
+  hypothetical.
+- **X8** Do **not** unify ingest and interactive replacement semantics. Ingest renditions are
+  write-once; interactive renditions replace; a sibling print collision promotes rather than
+  dropping a master (`uploads.finalize_rendition`, `assets.attach_rendition`,
+  `uploads.bind_print_to_sibling`).
+- **X9** Do **not** reverse only reclaim or only worker publication. All J/A participants —
+  publication, stale recovery, `_fail_attachment`'s implicit terminal update, both reclaims —
+  agree already, and they change together or not at all (`media.guard_publish`,
+  `worker._fail_attachment`, `worker.recover_stale_media_claims`, `reclaim.reclaim_attachment`).
+
 ## The transaction / I-O boundary
 
 > A transaction may hold row locks across **bounded local filesystem I/O under `DATA_ROOT`** —
@@ -178,3 +221,16 @@ the environment variable the probe's `skipif` names:
     git apply -R tests/mutations/no_r7a.patch
 
 The suite itself never applies one: it must stay green on the tree it is run against.
+
+`scripts/check-mutations.sh` runs that loop for every row of `tests/mutations/expected.tsv`
+(`patch`, `marker`, `expected_failed`, optional `sqlstate`). It applies each patch in place with
+`git apply`, runs the concurrency module with `MEMNG267_MUTATION` set to the row's marker,
+reverses the patch and proves the revert by sha256; it refuses to start if the file a row's patch
+touches has uncommitted changes. A row passes only when pytest exits 1 and the set of FAILED node
+ids — read from the run's JUnit report, not from the terminal output, and cross-checked against
+pytest's own summary line — equals the row's `expected_failed` exactly, with zero errors; an
+errored probe never counts as a failing one, and a named `sqlstate` must appear in the run's log.
+Before the loop the module is run once with `MEMNG267_MUTATION` removed from the environment as
+the positive control, which must exit 0. `--selftest` proves the checker can fail. It takes the
+database from the caller's environment and neither creates, migrates nor drops one. **It MUTATES
+the working tree it runs in**, so nothing else may read or write that checkout while it runs.

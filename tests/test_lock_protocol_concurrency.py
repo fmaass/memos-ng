@@ -1898,6 +1898,14 @@ async def test_memo_delete_and_patch_of_that_memo_do_not_cycle(
     try:
         memo = _memo(client, "delete me", upload_uids=[_upload(client, "c8.png", _png(b"C8"))])
         added = _upload(client, "c8b.png", _png(b"C8b"))
+        # The two files this race is judged on (§5.1 wants rows AND bytes): the master the winning
+        # delete has to sweep, and the part file the losing PATCH must leave exactly as it found
+        # it. Read now, so the after-picture is compared against real bytes and not against
+        # whatever the assertions themselves could invent.
+        master = Path(_one("SELECT storage_path FROM attachments")[0])
+        assert master.read_bytes() == _png(b"C8")
+        pending = uploads_svc.part_path(added)
+        assert pending.read_bytes() == _png(b"C8b")
         listener = _park_before_the_memo_delete_statement(park, statements)
 
         async with _async_client(client) as deleter, _async_client(client) as editor:
@@ -1934,7 +1942,16 @@ async def test_memo_delete_and_patch_of_that_memo_do_not_cycle(
         # never became one — the loser moved no bytes.
         assert _sql("SELECT id FROM memos WHERE uid = :u", u=memo["uid"]) == []
         assert _sql("SELECT id FROM attachments") == []
+        # BYTES, not only rows. Reclaim ran inside the winning request (its phase 2), so the
+        # master is gone with the row — a reclaim that dropped the row and left the file is the
+        # one outcome app/services/reclaim.py exists to prevent, and it would satisfy every row
+        # assertion above.
+        assert not master.exists(), "the deleted memo's master was left behind"
+        # The loser moved nothing: its upload is still pending and still holds its own bytes, so
+        # the client's retry against a memo that exists has something to retry with. Compared by
+        # CONTENT — an emptied or truncated part file exists just as happily as an intact one.
         assert _one("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=added)[0] == 1
+        assert pending.read_bytes() == _png(b"C8b")
     finally:
         if listener is not None:
             event.remove(async_engine.sync_engine, "before_cursor_execute", listener)
@@ -1953,7 +1970,12 @@ async def test_a_patch_that_loses_its_memo_answers_404_not_500(
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
-        memo = _memo(client, "patch me")
+        memo = _memo(client, "patch me", upload_uids=[_upload(client, "p404.png", _png(b"P4"))])
+        master = Path(_one("SELECT storage_path FROM attachments")[0])
+        assert master.read_bytes() == _png(b"P4")
+        added = _upload(client, "p404b.png", _png(b"P4b"))
+        pending = uploads_svc.part_path(added)
+        assert pending.read_bytes() == _png(b"P4b")
         park = Park()
         _park_before_the_memo_lock(monkeypatch, park)
 
@@ -1961,7 +1983,11 @@ async def test_a_patch_that_loses_its_memo_answers_404_not_500(
             edit = asyncio.create_task(
                 editor.patch(
                     f"/api/memos/{memo['uid']}",
-                    json={"content": "edited", "edit_key": "lost-memo"},
+                    json={
+                        "content": "edited",
+                        "upload_uids": [added],
+                        "edit_key": "lost-memo",
+                    },
                 )
             )
             await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
@@ -1974,6 +2000,11 @@ async def test_a_patch_that_loses_its_memo_answers_404_not_500(
         assert edited.json() == {"detail": "Memo not found"}
         # Raised inside `attempt()` BEFORE `record_edit_key`, so the key is untouched.
         assert _one("SELECT count(*) FROM memo_edit_keys")[0] == 0
+        # And before any byte, which only the files can say: the edit's own upload is still
+        # pending with its bytes intact, and the memo's master — orphaned by the delete, not
+        # reclaimed by it — was not touched by the request that lost.
+        assert pending.read_bytes() == _png(b"P4b")
+        assert master.read_bytes() == _png(b"P4")
     finally:
         _cleanup()
 
@@ -1993,7 +2024,11 @@ async def test_a_delete_that_loses_its_memo_answers_404_not_500(
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
-        memo = _memo(client, "delete me twice")
+        memo = _memo(
+            client, "delete me twice", upload_uids=[_upload(client, "d404.png", _png(b"D4"))]
+        )
+        master = Path(_one("SELECT storage_path FROM attachments")[0])
+        assert master.read_bytes() == _png(b"D4")
         park = Park()
         _park_after_require_owned(monkeypatch, park)
 
@@ -2008,5 +2043,10 @@ async def test_a_delete_that_loses_its_memo_answers_404_not_500(
         assert answered.status_code == 404, answered.text
         assert answered.json() == {"detail": "Memo not found"}
         assert _sql("SELECT id FROM memos WHERE uid = :u", u=memo["uid"]) == []
+        # The loser reclaimed NOTHING. The winner here deleted the memo row alone, so the
+        # attachment is an orphan the sweep will collect — and the request that answered 404 must
+        # not have unlinked its master on the way out, which no row assertion can tell.
+        assert _one("SELECT count(*) FROM attachments")[0] == 1
+        assert master.read_bytes() == _png(b"D4")
     finally:
         _cleanup()
