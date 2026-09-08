@@ -322,13 +322,22 @@ async def native_manage_grant(
     return ManageGrantOut(grant=grant, expires_at=expires_at)
 
 
-def presenting_token_hash(request: Request) -> str:
+def presenting_token_hash(
+    request: Request,
+    _user: User = Depends(auth.require_user),
+) -> str:
     """The sha256 of the bearer this request is speaking with — or a 401.
 
     The one seam every self-service route reads its subject through. Each of them acts on the
     credential that presented itself, so a session cookie — which names no token at all — is
-    refused here rather than four times over (Decision 5/6). Runs AFTER `require_user`, whose
-    `auth_kind` stamp is what this reads; on its own it authenticates nothing.
+    refused here rather than four times over (Decision 5/6).
+
+    A DEPENDENCY rather than a call inside the handler, for two halves of one reason. It nests
+    `require_user`, whose `auth_kind` stamp is the thing this reads, so running after it is
+    structural instead of a sentence in a docstring; and it is the name DEPENDENCY_SECURITY reads,
+    so the exported contract narrows to bearer-only with the enforcement rather than beside it
+    (MEMNG-201). Declare it AHEAD of `require_user` on the route — the schema pass takes the first
+    auth dependency it recognises. On its own it authenticates nothing.
     """
     if getattr(request.state, "auth_kind", None) != "pat":
         raise HTTPException(status_code=401, detail="Token authentication required")
@@ -363,7 +372,7 @@ async def _renew_rejection(db: AsyncSession, hashed_token: str) -> HTTPException
 # accepts — a browser session or a step-up management grant — and never a bearer.
 @router.post("/native/renew", response_model=NativeExchangeOut)
 async def native_renew(
-    request: Request,
+    hashed_token: str = Depends(presenting_token_hash),
     user: User = Depends(auth.require_user),
     db: AsyncSession = Depends(get_session),
 ) -> NativeExchangeOut:
@@ -389,7 +398,6 @@ async def native_renew(
     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
     session cookie names no token at all.
     """
-    hashed_token = presenting_token_hash(request)
     now = datetime.now(UTC)
     # ONE statement, for the reason `native_auth.consume_code` is one: reading the row, judging it
     # renewable and then deleting it would let two concurrent renewals both find a live token and
@@ -421,7 +429,7 @@ async def native_renew(
 
 @router.post("/native/logout", status_code=204)
 async def native_logout(
-    request: Request,
+    hashed_token: str = Depends(presenting_token_hash),
     user: User = Depends(auth.require_user),
     db: AsyncSession = Depends(get_session),
 ) -> None:
@@ -433,7 +441,6 @@ async def native_logout(
     device offline. A session cookie is refused here for the same reason from the other side — the
     SPA revokes through `/api/pats/{pat_id}`, which knows which token it is talking about.
     """
-    hashed_token = presenting_token_hash(request)
     await db.execute(
         delete(Pat).where(Pat.hashed_token == hashed_token, Pat.user_id == user.id)
     )
@@ -479,7 +486,7 @@ def _self_row_response(row: _SelfRow) -> NativeTokenOut:
 
 @router.get("/native/token", response_model=NativeTokenOut)
 async def native_token(
-    request: Request,
+    hashed_token: str = Depends(presenting_token_hash),
     user: User = Depends(auth.require_user),
     db: AsyncSession = Depends(get_session),
 ) -> NativeTokenOut:
@@ -495,7 +502,6 @@ async def native_token(
     session or a step-up management grant — `/api/pats` is where a credential that names another
     token lives; a bearer manages nothing but itself.
     """
-    hashed_token = presenting_token_hash(request)
     row = (
         await db.execute(
             select(*_SELF_ROW).where(Pat.hashed_token == hashed_token, Pat.user_id == user.id)
@@ -509,7 +515,7 @@ async def native_token(
 @router.patch("/native/token", response_model=NativeTokenOut)
 async def rename_native_token(
     body: NativeTokenRename,
-    request: Request,
+    hashed_token: str = Depends(presenting_token_hash),
     user: User = Depends(auth.require_user),
     db: AsyncSession = Depends(get_session),
 ) -> NativeTokenOut:
@@ -522,7 +528,6 @@ async def rename_native_token(
     is the response: nothing here can widen to a sibling, and a row that stopped existing between
     authentication and the write matches nothing rather than renaming the wrong token.
     """
-    hashed_token = presenting_token_hash(request)
     row = (
         await db.execute(
             update(Pat)

@@ -687,6 +687,24 @@ def test_native_token_refuses_an_unauthenticated_caller(client, db_engine):
     assert client.patch("/api/auth/native/token", json={"name": "x"}).status_code == 401
 
 
+def test_a_session_cookie_is_refused_before_the_lane_reads_its_body(logged_in_client):
+    """A credential the lane does not accept is refused BEFORE its input is validated.
+
+    PATCH is the only lane route that carries a body, and `name: ""` is a genuine 422 — a bearer
+    sending it gets exactly that, in
+    `test_a_rename_the_create_route_would_refuse_is_refused_here_too`.
+    A session cookie gets 401 instead, because `presenting_token_hash` is a dependency and so has
+    already refused the caller by the time the body would be read. That order is deliberate: a
+    caller this route will not answer learns nothing about the shape of what it sent. It is also an
+    observable change — the same request answered 422 while the check ran inside the handler — so
+    it is pinned here rather than left to be rediscovered.
+    """
+    client, _ = logged_in_client
+    refused = client.patch("/api/auth/native/token", json={"name": ""})
+    assert refused.status_code == 401, refused.text
+    assert refused.json()["detail"] == "Token authentication required"
+
+
 def test_rename_touches_no_sibling(native_oidc):
     """The rename is scoped to the presenting row; the other phone in the same account comes out
     of it byte-identical, column for column."""

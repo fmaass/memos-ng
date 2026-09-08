@@ -185,8 +185,15 @@ async def append_chunk(
     )
 
 
+# A HEAD answer carries no body, so an operation that declares one leaves every generated client
+# waiting for bytes that never arrive (MEMNG-198). `response_class=Response` is what says so in the
+# schema: FastAPI publishes the response content under the media type it reads off the response
+# class, and the base Response names none, so nothing is published under `content` at all. The
+# status stays 200 and the Upload-Offset header, which is the whole answer, stays declared; the
+# wire is untouched, because this handler already returns that Response itself.
 @router.head(
     "/{upload_uid}",
+    response_class=Response,
     openapi_extra={"responses": {"200": {"headers": _upload_offset_header()}}},
 )
 async def upload_offset(

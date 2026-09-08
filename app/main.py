@@ -152,6 +152,11 @@ SECURITY_SCHEMES = {
 
 USER_SECURITY = [{"bearerAuth": []}, {"sessionCookie": []}]
 SESSION_SECURITY = [{"sessionCookie": []}]
+# The native self-service lane — renew, logout, and the token read/rename pair. Each of them acts
+# ON the credential presenting it, and a session cookie names no token at all, so `require_user`
+# alone described the lane wider than it is enforced (MEMNG-201): the routes read their subject
+# through `presenting_token_hash`, which refuses anything but a bearer.
+BEARER_SECURITY = [{"bearerAuth": []}]
 # Token management: the browser session as before, or a grant for a client that holds no session.
 # A bearer is in neither arm and reaches these routes under no circumstances.
 SESSION_OR_GRANT_SECURITY = [{"sessionCookie": []}, {"grantAuth": []}]
@@ -161,7 +166,10 @@ SESSION_OR_GRANT_SECURITY = [{"sessionCookie": []}, {"grantAuth": []}]
 OPTIONAL_PAT_SECURITY = [{"bearerAuth": []}, {}]
 SIGNED_OR_USER_SECURITY = [{"bearerAuth": []}, {"sessionCookie": []}, {}]
 
+# Keyed on the dependency NAME, and `route_security` takes the FIRST entry it recognises on a
+# route — so a route that narrows a wider dependency declares the narrow one ahead of it.
 DEPENDENCY_SECURITY: dict[str, list[dict[str, list[str]]]] = {
+    "presenting_token_hash": BEARER_SECURITY,
     "require_user": USER_SECURITY,
     "require_pat_or_user": USER_SECURITY,
     "require_session_user": SESSION_SECURITY,
