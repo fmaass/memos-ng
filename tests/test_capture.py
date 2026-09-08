@@ -634,6 +634,43 @@ def test_the_memo_response_carries_the_capture_fields_through_the_upload_lane(
         _cleanup()
 
 
+CAPTURE_FIELDS = ("capture_instant", "capture_civil", "capture_source")
+
+
+def test_a_memo_read_back_carries_the_capture_read_on_every_ref_and_on_the_detail(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """What the server read out of the file travels on the memo's own attachments and on the
+    attachment detail, so a reader that already holds the memo can tell an exact capture time from
+    a wall-clock one — and a file that said nothing reads back as three nulls, not as an error.
+
+    The legacy `captured_at` is asserted alongside: it keeps its fallback chain and so always holds
+    something, which is exactly what the three fields are here to distinguish it from.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    names = ["jpeg-offset.jpg", "jpeg-no-offset.jpg", "png-none.png"]
+    try:
+        uids = [_upload_fixture(client, name) for name in names]
+        memo = client.post(
+            "/api/memos",
+            json={"content": "three reads", "visibility": "PRIVATE", "upload_uids": uids},
+        ).json()
+        refs = _memo_attachments(client, memo["uid"])
+        assert [r["position"] for r in refs] == [0, 1, 2]  # declared order, so the zip below holds
+        for ref, name in zip(refs, names, strict=True):
+            assert {k: ref[k] for k in CAPTURE_FIELDS} == _expect(name), name
+            detail = client.get(f"/api/attachments/{ref['uid']}")
+            assert detail.status_code == 200, detail.text
+            assert {k: detail.json()[k] for k in CAPTURE_FIELDS} == _expect(name), name
+            # unchanged by this exposure: the chain still ends at the upload time
+            assert detail.json()["captured_at"] is not None
+        # the file with no date of its own: three nulls, one row, no 500
+        assert {k: refs[2][k] for k in CAPTURE_FIELDS} == {k: None for k in CAPTURE_FIELDS}
+    finally:
+        _cleanup()
+
+
 # --------------------------------------------------------------------------------------------
 # What the reader must never do
 # --------------------------------------------------------------------------------------------

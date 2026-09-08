@@ -170,6 +170,13 @@ class AttachmentMeta(BaseModel):
     duration: float | None
     blurhash: str | None
     captured_at: Rfc3339Datetime | None
+    # The same three capture-only facts the memo's own attachment list carries (`AttachmentRef`):
+    # what the file's metadata said, with no fallback, so all three are null when it said nothing.
+    # `captured_at` above keeps its fallback chain and therefore always holds something — telling
+    # the two apart is what these are for. `capture_civil` is a wall-clock reading with no zone.
+    capture_instant: Rfc3339Datetime | None
+    capture_civil: str | None
+    capture_source: str | None
     mine: bool
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
@@ -367,6 +374,9 @@ async def attachment_meta(
         duration=att.duration,
         blurhash=att.blurhash,
         captured_at=att.captured_at,
+        capture_instant=att.capture_instant,
+        capture_civil=att.capture_civil,
+        capture_source=att.capture_source,
         mine=att.owner_id == user.id,
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,

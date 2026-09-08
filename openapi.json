@@ -122,6 +122,28 @@
               "null"
             ]
           },
+          "capture_civil": {
+            "title": "Capture Civil",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_instant": {
+            "format": "date-time",
+            "title": "Capture Instant",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_source": {
+            "title": "Capture Source",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "captured_at": {
             "format": "date-time",
             "title": "Captured At",
@@ -232,6 +254,9 @@
           "duration",
           "blurhash",
           "captured_at",
+          "capture_instant",
+          "capture_civil",
+          "capture_source",
           "mine",
           "hasPrint",
           "hasLegacyPrint",
@@ -354,6 +379,28 @@
               "null"
             ]
           },
+          "capture_civil": {
+            "title": "Capture Civil",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_instant": {
+            "format": "date-time",
+            "title": "Capture Instant",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_source": {
+            "title": "Capture Source",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "downloadUrl": {
             "title": "Downloadurl",
             "type": "string"
@@ -453,6 +500,9 @@
           "height",
           "duration",
           "sha256",
+          "capture_instant",
+          "capture_civil",
+          "capture_source",
           "mine",
           "hasPrint",
           "hasLegacyPrint",

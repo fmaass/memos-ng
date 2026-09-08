@@ -1197,6 +1197,15 @@ export interface components {
         AttachmentMeta: {
             /** Blurhash */
             blurhash: string | null;
+            /** Capture Civil */
+            capture_civil: string | null;
+            /**
+             * Capture Instant
+             * Format: date-time
+             */
+            capture_instant: string | null;
+            /** Capture Source */
+            capture_source: string | null;
             /**
              * Captured At
              * Format: date-time
@@ -1278,6 +1287,15 @@ export interface components {
         AttachmentRef: {
             /** Blurhash */
             blurhash: string | null;
+            /** Capture Civil */
+            capture_civil: string | null;
+            /**
+             * Capture Instant
+             * Format: date-time
+             */
+            capture_instant: string | null;
+            /** Capture Source */
+            capture_source: string | null;
             /** Downloadurl */
             downloadUrl: string;
             /** Duration */

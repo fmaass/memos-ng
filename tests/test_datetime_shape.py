@@ -259,9 +259,11 @@ def _datetime_fields() -> list[tuple[str, str, Any]]:
 # The fields that exist today. Pinned so that a route or model disappearing from the sweep is a
 # failure rather than a silently shrinking (and therefore vacuous) parametrisation.
 EXPECTED_DATETIME_FIELDS = {
+    ("AttachmentMeta", "capture_instant"),
     ("AttachmentMeta", "captured_at"),
     ("AttachmentOut", "capture_instant"),
     ("AttachmentOut", "captured_at"),
+    ("AttachmentRef", "capture_instant"),
     ("CaptureOut", "capture_instant"),
     ("DigestPreviewMemo", "created_at"),
     ("DigestRecipientOut", "added_at"),
