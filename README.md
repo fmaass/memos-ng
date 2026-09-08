@@ -188,6 +188,23 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.6.2
+
+- Every path that finalizes or consumes an upload now takes its row locks in one total order — the
+  memo, then the upload, then the job, then the attachment, then the rendition rows, ascending by
+  id in a single statement. That closes the deadlock cycles between a memo create, a standalone
+  finalize and a PATCH that shared a deduplicated attachment, and a dedup candidate is judged on
+  the row the locking statement returned rather than on one read before the lock.
+- Deleting a memo locks the memo row first, so a PATCH or DELETE whose memo vanished in between
+  answers 404 instead of a 500 or a silent 204.
+- The expiry reaper claims an upload under its row lock before unlinking its part, so a finalize
+  in progress can no longer lose its file; an append whose upload row is gone answers 404.
+- `docs/LOCK-ORDER.md` states the protocol, `docs/lock-census.tsv` lists every explicit lock site
+  with a test that proves the list is complete, and `scripts/check-mutations.sh` runs the
+  repo-carried mutation controls and requires each to fail exactly its named probes.
+- No migration, and the API contract is unchanged: the new 404s are runtime answers, and
+  documenting them is a later change.
+
 ### v1.6.1
 
 - A memo whose line is nothing but hashtags no longer becomes the digest mail's heading. The mail
