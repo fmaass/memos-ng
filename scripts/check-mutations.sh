@@ -29,9 +29,17 @@ Run from the repository root. For every row of tests/mutations/expected.tsv the 
   * records that file's sha256, applies the patch, runs
     `uv run pytest -q tests/test_lock_protocol_concurrency.py` with MEMNG267_MUTATION set to
     the row's marker, then reverses the patch and compares the sha256 — a mismatch stops the run;
-  * requires pytest to exit 1 and the set of FAILED node ids to equal the row's expected_failed
+  * requires pytest to exit 1 and the set of failed node ids to equal the row's expected_failed
     EXACTLY — no more, no fewer — and, when the row names a sqlstate, that the sqlstate appears
     in the run's log.
+
+NODE IDS COME FROM THE JUNIT REPORT, not from the terminal output: the run is given
+`-o junit_family=xunit1 --junitxml=<file>` and each failed or errored `<testcase>` is read with
+stdlib `xml.etree`, its id rebuilt as `<file>::<classname-tail>::<name>`. The `name` attribute
+carries the parameter bracket verbatim, so an id containing ` - `, `::` or a space survives it —
+the terminal `FAILED <nodeid> - <message>` line cannot be parsed back without ambiguity. The
+number of ids read from the report is then cross-checked against pytest's own "N failed"/"N
+errors" summary as a second, independent guard.
 
 Before the loop the module is run ONCE with MEMNG267_MUTATION removed from the environment (not
 merely unset in the manifest) as the positive control; it must exit 0.
@@ -49,10 +57,12 @@ anything else. This script neither creates, migrates nor drops a database.
 
 Options:
   --manifest <path>   read the rows from <path> instead of tests/mutations/expected.tsv
-  --selftest          prove the checker can fail: a parse leg (two distinct FAILED nodes must not
-                      collapse onto one id), a manifest naming a wrong expected set (must report
-                      FAIL), a run with MEMNG267_MUTATION exported (the control must still pass),
-                      and the real manifest (must report PASS); non-zero if any is violated
+  --selftest          prove the checker can fail: a parse leg (node ids whose parameter brackets
+                      contain ` - `, `::` and spaces must stay distinct), a manifest naming a
+                      wrong expected set (must report FAIL), a run with MEMNG267_MUTATION
+                      exported (the control must still pass), an INT sent while a patch is
+                      applied (the tree must come back identical), and the real manifest (must
+                      report PASS); non-zero if any is violated
   -h, --help          print this text
 USAGE
 }
@@ -62,12 +72,24 @@ die() {
     exit 2
 }
 
-# pytest's short summary line is `FAILED <nodeid> - <message>`, and the message may be absent.
-# The node id is taken WHOLE up to the first ` - `: a parameter id may contain spaces and `::`,
-# so cutting on either collapses distinct nodes onto one name
-# (`…::test_other[x::test_probe y]` would read as `test_probe`).
+# Failed/errored node ids out of a pytest JUnit report, one per line, in report order.
+PARSE_PY='
+import sys
+import xml.etree.ElementTree as ET
+
+for case in ET.parse(sys.argv[1]).iter("testcase"):
+    if case.find("failure") is None and case.find("error") is None:
+        continue
+    path = case.get("file") or ""
+    name = case.get("name") or ""
+    classname = case.get("classname") or ""
+    module = path[:-3].replace("/", ".") if path.endswith(".py") else path.replace("/", ".")
+    tail = classname[len(module):].lstrip(".") if classname.startswith(module) else ""
+    print("::".join(part for part in (path, tail, name) if part))
+'
+
 parse_failed_ids() {
-    sed -n 's/^FAILED \(.*\)$/\1/p' "$1" | sed 's/ - .*$//'
+    uv run python -c "$PARSE_PY" "$1"
 }
 
 while [ $# -gt 0 ]; do
@@ -100,33 +122,39 @@ if [ "$SELFTEST" -eq 1 ]; then
     wrong=$(mktemp) || die "mktemp failed"
     one_row=$(mktemp) || die "mktemp failed"
     run_out=$(mktemp) || die "mktemp failed"
-    fake_log=$(mktemp) || die "mktemp failed"
-    trap 'rm -f "$wrong" "$one_row" "$run_out" "$fake_log"' EXIT
+    fake_xml=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$wrong" "$one_row" "$run_out" "$fake_xml"' EXIT
 
-    # --- leg 1: two distinct failed nodes must not collapse onto one expected id ------------
-    echo "selftest leg 1: a parameterised node whose id contains '::' and a space"
-    {
-        printf 'FAILED %s::test_probe - assertion\n' "$MODULE"
-        printf 'FAILED %s::test_other[x::test_probe y] - assertion\n' "$MODULE"
-    } > "$fake_log"
-    parsed=$(parse_failed_ids "$fake_log")
-    parsed_n=$(printf '%s\n' "$parsed" | grep -c .)
+    grep -v '^#' "$MANIFEST_DEFAULT" | grep -m1 'c5b_merge_answers' > "$one_row"
+    [ -s "$one_row" ] || die "no c5b_merge_answers row in $MANIFEST_DEFAULT"
+    IFS=$'\t' read -r one_patch _ _ _ < "$one_row"
+    one_target=$(grep -m1 '^+++ b/' "$one_patch" | sed 's#^+++ b/##')
+    [ -f "$one_target" ] || die "$one_patch targets $one_target, which does not exist"
+
+    # --- leg 1: parameter ids that contain the terminal-output delimiters ---------------------
+    echo "selftest leg 1: parameter ids containing ' - ', '::' and spaces"
+    cat > "$fake_xml" <<XML
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="3" tests="3">
+<testcase classname="tests.test_lock_protocol_concurrency" name="test_probe[a]" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
+<testcase classname="tests.test_lock_protocol_concurrency" name="test_probe[a - extra]]" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
+<testcase classname="tests.test_lock_protocol_concurrency" name="test_other[x::test_probe y]" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
+</testsuite></testsuites>
+XML
+    parsed=$(parse_failed_ids "$fake_xml")
     printf '%s\n' "$parsed" | sed 's/^/  parsed: /'
-    if [ "$parsed_n" -ne 2 ]; then
-        echo "SELFTEST FAIL: parsed $parsed_n node id(s) from 2 FAILED lines"
+    if [ "$(printf '%s\n' "$parsed" | grep -c .)" -ne 3 ] ||
+        [ "$(printf '%s\n' "$parsed" | LC_ALL=C sort -u | grep -c .)" -ne 3 ]; then
+        echo "SELFTEST FAIL: 3 distinct testcases did not parse as 3 distinct node ids"
         exit 1
     fi
-    if [ "$(printf '%s\n' "$parsed" | LC_ALL=C sort -u | grep -c .)" -ne 2 ]; then
-        echo "SELFTEST FAIL: the two distinct nodes collapsed onto one id"
+    if [ "$(printf '%s\n' "$parsed" | grep -cFx "$MODULE::test_probe[a]")" -ne 1 ]; then
+        echo "SELFTEST FAIL: '$MODULE::test_probe[a]' is not exactly one of the parsed ids"
         exit 1
     fi
-    if [ "$(printf '%s\n' "$parsed" | LC_ALL=C sort -u)" = "$MODULE::test_probe" ]; then
-        echo "SELFTEST FAIL: the parsed set equals the single expected id"
-        exit 1
-    fi
-    echo "selftest leg 1: PASS — 2 distinct node ids, neither set equal to $MODULE::test_probe"
+    echo "selftest leg 1: PASS — 3 distinct node ids, 'test_probe[a]' and 'test_probe[a - extra]]' apart"
 
-    # --- leg 2: a wrong expected set must be caught ------------------------------------------
+    # --- leg 2: a wrong expected set must be caught -------------------------------------------
     # A real mutation with a real test id that it does NOT fail: the run still exits 1, so only
     # the set comparison can catch it.
     printf 'tests/mutations/c5b_merge_answers.patch\tc5b_merge_answers\ttest_pass_zero_locks_the_named_and_the_dedup_attachment_in_one_ascending_statement\t\n' > "$wrong"
@@ -146,9 +174,7 @@ if [ "$SELFTEST" -eq 1 ]; then
     fi
     echo "selftest leg 2: PASS"
 
-    # --- leg 3: an inherited marker must not reach the positive control ----------------------
-    grep -v '^#' "$MANIFEST_DEFAULT" | grep -m1 'c5b_merge_answers' > "$one_row"
-    [ -s "$one_row" ] || die "no c5b_merge_answers row in $MANIFEST_DEFAULT"
+    # --- leg 3: an inherited marker must not reach the positive control -----------------------
     echo "selftest leg 3: expecting PASS with $MARKER_VAR=no_r7a exported by the caller"
     ( export "$MARKER_VAR=no_r7a" && "$SCRIPT_PATH" --manifest "$one_row" ) 2>&1 | tee "$run_out"
     marker_rc=${PIPESTATUS[0]}
@@ -159,16 +185,58 @@ if [ "$SELFTEST" -eq 1 ]; then
     fi
     echo "selftest leg 3: PASS"
 
-    # --- leg 4: the real manifest must pass ---------------------------------------------------
-    echo "selftest leg 4: expecting PASS from $MANIFEST_DEFAULT"
+    # --- leg 4: an INT while the patch is applied must still restore the tree -----------------
+    echo "selftest leg 4: INT while $one_patch is applied; $one_target must come back identical"
+    clean_sha=$(sha256sum "$one_target" | cut -d' ' -f1)
+    # Job control for the launch: a non-interactive shell sets SIGINT to IGNORE in an
+    # asynchronous command, and a trap cannot reset a signal inherited as ignored — the INT
+    # would never reach the handler this leg exists to prove.
+    set -m
+    "$SCRIPT_PATH" --manifest "$one_row" > "$run_out" 2>&1 &
+    victim=$!
+    set +m
+    applied=0
+    for _ in $(seq 1 1200); do
+        if [ "$(sha256sum "$one_target" | cut -d' ' -f1)" != "$clean_sha" ]; then
+            applied=1
+            break
+        fi
+        kill -0 "$victim" 2> /dev/null || break
+        sleep 0.1
+    done
+    if [ "$applied" -ne 1 ]; then
+        kill -TERM "$victim" 2> /dev/null
+        wait "$victim"
+        echo "SELFTEST FAIL: the run never had $one_target mutated, so the INT proves nothing"
+        exit 1
+    fi
+    echo "  $one_target is mutated; sending INT to pid $victim"
+    kill -INT "$victim"
+    wait "$victim"
+    int_rc=$?
+    sed 's/^/  /' "$run_out" | tail -3
+    after_sha=$(sha256sum "$one_target" | cut -d' ' -f1)
+    echo "  interrupted run exited $int_rc; $one_target sha256 $after_sha (clean $clean_sha)"
+    if [ "$int_rc" -ne 130 ]; then
+        echo "SELFTEST FAIL: the interrupted run exited $int_rc, expected 130 — the INT did not reach the handler"
+        exit 1
+    fi
+    if [ "$after_sha" != "$clean_sha" ] || ! git diff --quiet -- "$one_target"; then
+        echo "SELFTEST FAIL: $one_target was left mutated by the interrupted run"
+        exit 1
+    fi
+    echo "selftest leg 4: PASS — tree identical after INT"
+
+    # --- leg 5: the real manifest must pass ---------------------------------------------------
+    echo "selftest leg 5: expecting PASS from $MANIFEST_DEFAULT"
     "$SCRIPT_PATH" --manifest "$MANIFEST_DEFAULT"
     real_rc=$?
-    echo "selftest leg 4: run exited $real_rc (expected 0)"
+    echo "selftest leg 5: run exited $real_rc (expected 0)"
     if [ "$real_rc" -ne 0 ]; then
         echo "SELFTEST FAIL: the checker did not pass the real manifest"
         exit 1
     fi
-    echo "SELFTEST PASS: parse leg clean, wrong manifest -> FAIL ($wrong_rc), exported marker -> PASS ($marker_rc), real manifest -> PASS ($real_rc)"
+    echo "SELFTEST PASS: parse leg clean, wrong manifest -> FAIL ($wrong_rc), exported marker -> PASS ($marker_rc), INT while applied -> tree restored ($int_rc), real manifest -> PASS ($real_rc)"
     exit 0
 fi
 
@@ -227,20 +295,24 @@ applied_target=""
 applied_sha=""
 
 revert_applied() {
-    # Echoes the outcome and returns 0 only when the target is provably back to `applied_sha`.
+    # Idempotent: reverses the patch only if it is still applied, always proves the sha256, and
+    # clears the cleanup state ONLY once that proof holds — so a signal arriving anywhere in here
+    # leaves a second call with everything it needs to finish the job.
     [ -n "$applied_patch" ] || return 0
     local patch="$applied_patch" target="$applied_target" before="$applied_sha" note="" now
-    applied_patch=""
-    git apply -R "$patch" || note="git apply -R failed"
+    if git apply -R --check "$patch" 2> /dev/null; then
+        git apply -R "$patch" || note="git apply -R failed"
+    fi
     now=$(sha256sum "$target" | cut -d' ' -f1)
     if [ "$now" != "$before" ]; then
         echo "check-mutations: $target was NOT restored (sha256 $before -> $now${note:+; $note}) — restore it by hand" >&2
         return 1
     fi
-    [ -z "$note" ] || {
+    if [ -n "$note" ]; then
         echo "check-mutations: $note, though $target matches its recorded sha256" >&2
         return 1
-    }
+    fi
+    applied_patch=""
     return 0
 }
 
@@ -261,6 +333,7 @@ on_exit() {
     if [ -n "$applied_patch" ]; then
         echo "check-mutations: exiting with $applied_patch applied — reverting" >&2
         revert_applied || rc=1
+        [ "$rc" -ne 0 ] || rc=1
     fi
     exit "$rc"
 }
@@ -293,24 +366,24 @@ for i in "${!patches[@]}"; do
     sqlstate="${sqlstates[$i]}"
     target="${targets[$i]}"
     log="$logdir/$marker.log"
+    xml="$logdir/$marker.xml"
 
-    before=$(sha256sum "$target" | cut -d' ' -f1)
     # Recorded BEFORE the apply, so the trap can revert whatever the apply managed to write.
     applied_patch="$patch"
     applied_target="$target"
-    applied_sha="$before"
+    applied_sha=$(sha256sum "$target" | cut -d' ' -f1)
 
     git apply "$patch"
     apply_rc=$?
     if [ "$apply_rc" -ne 0 ]; then
         revert_applied || exit 1
-        applied_patch=""
         echo "$marker: FAIL — $patch does not apply to $target"
         failures=$((failures + 1))
         continue
     fi
 
-    env "$MARKER_VAR=$marker" uv run pytest -q "$MODULE" > "$log" 2>&1 < /dev/null
+    env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
+        "$MODULE" > "$log" 2>&1 < /dev/null
     rc=$?
 
     if ! revert_applied; then
@@ -319,29 +392,39 @@ for i in "${!patches[@]}"; do
         exit 1
     fi
 
-    mapfile -t actual_list < <(parse_failed_ids "$log")
-    actual_ids=$(printf '%s\n' "${actual_list[@]}" | grep . | LC_ALL=C sort -u)
+    reasons=()
+    if [ "$rc" -ne 1 ]; then
+        reasons+=("pytest exited $rc, expected 1")
+    fi
+
+    if [ ! -s "$xml" ]; then
+        reasons+=("pytest wrote no JUnit report, so its failures cannot be identified")
+        actual_ids=""
+        parsed_n=-1
+        reported_n=-1
+    else
+        mapfile -t actual_list < <(parse_failed_ids "$xml")
+        parsed_n=$(printf '%s\n' "${actual_list[@]}" | grep -c .)
+        actual_ids=$(printf '%s\n' "${actual_list[@]}" | grep . | LC_ALL=C sort -u)
+        # Second, independent guard: pytest's own terminal summary, not the report.
+        failed_n=$(tail -3 "$log" | grep -oE '[0-9]+ failed' | tail -1 | awk '{print $1}')
+        errors_n=$(tail -3 "$log" | grep -oE '[0-9]+ error' | tail -1 | awk '{print $1}')
+        reported_n=$((${failed_n:-0} + ${errors_n:-0}))
+        if [ "$parsed_n" -ne "$reported_n" ]; then
+            reasons+=("the JUnit report holds $parsed_n failed case(s) but pytest summarised $reported_n")
+        fi
+    fi
+
     expected_ids=$(
         # shellcheck disable=SC2086  # expected_failed is a space-separated list; splitting is the point
         for id in $expected; do
             case "$id" in *::*) printf '%s\n' "$id" ;; *) printf '%s::%s\n' "$MODULE" "$id" ;; esac
         done | LC_ALL=C sort -u
     )
-    parsed_n=$(printf '%s\n' "${actual_list[@]}" | grep -c .)
-    reported_n=$(tail -3 "$log" | grep -oE '[0-9]+ failed' | tail -1 | awk '{print $1}')
-    reported_n=${reported_n:-0}
-
-    reasons=()
-    if [ "$rc" -ne 1 ]; then
-        reasons+=("pytest exited $rc, expected 1")
-    fi
-    if [ "$parsed_n" -ne "$reported_n" ]; then
-        reasons+=("parsed $parsed_n FAILED line(s) but pytest reported $reported_n failed — the log did not parse")
-    fi
     if [ "$actual_ids" != "$expected_ids" ]; then
         extra=$(comm -13 <(printf '%s\n' "$expected_ids") <(printf '%s\n' "$actual_ids") | paste -sd' ' -)
         missing=$(comm -23 <(printf '%s\n' "$expected_ids") <(printf '%s\n' "$actual_ids") | paste -sd' ' -)
-        reasons+=("FAILED set differs${missing:+; did not fail: $missing}${extra:+; also failed: $extra}")
+        reasons+=("failed set differs${missing:+; did not fail: $missing}${extra:+; also failed: $extra}")
     fi
     if [ -n "$sqlstate" ] && ! grep -qF -- "$sqlstate" "$log"; then
         reasons+=("sqlstate $sqlstate absent from the log")
@@ -349,7 +432,7 @@ for i in "${!patches[@]}"; do
 
     if [ "${#reasons[@]}" -eq 0 ]; then
         n=$(printf '%s\n' "$expected_ids" | grep -c .)
-        echo "$marker: PASS — exit 1, exactly $n expected FAILED node id(s)${sqlstate:+, sqlstate $sqlstate present}"
+        echo "$marker: PASS — exit 1, exactly $n expected failed node id(s)${sqlstate:+, sqlstate $sqlstate present}"
     else
         printf '%s: FAIL — ' "$marker"
         printf '%s' "${reasons[0]}"
