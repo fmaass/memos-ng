@@ -1525,8 +1525,10 @@ async def test_the_append_writer_serializes_behind_a_parked_finalize_holding_its
 
     `append_stream` re-reads the row FOR UPDATE precisely so the merge decides against the
     committed offset, so the append blocks until the finalize commits, and then finds the session
-    consumed. What it answers then is recorded, not wished for: see the ledger's Round 2 open
-    questions.
+    consumed. What it answers then is the documented one (MEMNG-278, R6a): a lock acquisition may
+    lose its row, and losing it is an ordinary 404 — the same status and the same body an unknown
+    uid gets from `_get_upload` (`app/routers/uploads.py:90-91`), never a 500 out of
+    `.scalar_one()`.
     """
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
@@ -1555,11 +1557,11 @@ async def test_the_append_writer_serializes_behind_a_parked_finalize_holding_its
 
         park.fired()
         assert finalized.status_code == 200, finalized.text  # the finalize consumed the session
-        # The append reached its FOR UPDATE after the row was gone. `append_stream` ends in
-        # `.scalar_one()` (`app/services/uploads.py:527`), so the loser of this race raises rather
-        # than answering 404 — pre-existing, untouched by phase 1, and the same class R6a fixes for
-        # memos in phase 2. Asserted as observed, and reported as an open question.
-        assert isinstance(appended, Exception) or appended.status_code >= 400, appended
+        # The append reached its FOR UPDATE after the row was gone. It must ANSWER, not raise:
+        # exactly 404, with the body every other missing-upload answer on this router carries.
+        assert not isinstance(appended, BaseException), repr(appended)
+        assert appended.status_code == 404, appended.text
+        assert appended.json() == {"detail": "Upload not found"}, appended.text
         assert _one("SELECT count(*) FROM uploads")[0] == 0
         assert _one("SELECT count(*) FROM attachments")[0] == 1
     finally:
@@ -1594,16 +1596,13 @@ async def test_the_capture_reader_serializes_behind_a_parked_finalize_holding_it
 async def test_the_expiry_reaper_serializes_behind_a_parked_finalize_holding_its_row(
     logged_in_client, monkeypatch, tmp_path
 ):
-    """Same row, `reap_expired`. It takes no upload lock of its own — it walks `uploads` and issues
-    a DELETE — so the DELETE is what waits, and once the finalize has committed there is no row to
-    reap. The bytes the finalize placed must survive the sweep.
+    """Same row, `reap_expired`. It claims its expired set with one ascending `FOR UPDATE` before
+    it touches a byte, so the CLAIM is what waits, and once the finalize has committed there is no
+    row left to reap. The bytes the finalize placed must survive the sweep.
 
-    The finalize is parked AFTER its placement here, not before it. Parked before, this probe would
-    be measuring something else entirely: `reap_expired` unlinks part files BEFORE it takes any
-    lock (`app/services/uploads.py:1381-1387`), so it destroys the bytes of a finalize that has not
-    moved them yet — OQ-6, which the design rules explicitly out of scope for phase 1
-    ("no change (out of scope) ... File a follow-up ticket, do not fix here", §3.1). That defect is
-    reported in the ledger, not smuggled into a preservation probe as an expectation.
+    The finalize is parked AFTER its placement here. The window BEFORE it — where the sweep used to
+    unlink a part file its owner had not moved yet — is MEMNG-279 and has its own probe below; this
+    one stays where it was so the pair covers both sides of the placement.
     """
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
@@ -1642,14 +1641,86 @@ async def test_the_expiry_reaper_serializes_behind_a_parked_finalize_holding_its
 
         park.fired()
         assert finalized.status_code == 200, finalized.text
-        # `reap_expired` returns the size of the set it SELECTED, not the number of rows its
-        # DELETE actually removed — so 1 here is "it saw the row", and the assertions below are
-        # what say it took nothing: the upload row is the finalize's to delete, and the master it
-        # placed is still on disk.
-        assert reaped == 1, reaped
+        # `reap_expired` returns the size of the set it CLAIMED under the row lock, so 0 here says
+        # it took nothing: by the time the lock was granted the row was the finalize's to delete
+        # and had gone. (Before MEMNG-279 this read 1 — the size of an UNLOCKED select taken before
+        # the wait, which counted a row the sweep never removed.)
+        assert reaped == 0, reaped
         stored = _one("SELECT storage_path FROM attachments")[0]
         assert Path(stored).read_bytes() == payload  # rows AND bytes: the master survived the sweep
         assert _one("SELECT count(*) FROM uploads")[0] == 0
+    finally:
+        _cleanup()
+
+
+async def test_the_expiry_reaper_does_not_unlink_a_part_the_finalize_has_not_moved_yet(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-279 — the window the probe above deliberately does NOT cover: the finalize is parked
+    BEFORE its placement, holding U with its bytes still in the `.part` file.
+
+    The sweep reaches that part first. Unlinking it before any lock is taken destroys the only copy
+    of an upload another transaction already owns, and the finalize then dies on the missing bytes
+    — the reaper must claim the row under its U lock before it touches the file (design §2.1's
+    total order; §2.5 permits the unlink INSIDE that window because it is bounded local I/O under
+    DATA_ROOT).
+
+    Rows AND bytes, both directions: the finalize's master is on disk under its `storage_path`, and
+    the sweep reaped nothing — the row it saw was the finalize's to delete.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        payload = _png(b"WINDOW")
+        uid = _upload(client, "unmoved.png", payload)
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(
+                text(
+                    "UPDATE uploads SET expires_at = now() - interval \'1 day\' "
+                    "WHERE upload_uid = :u"
+                ),
+                {"u": uid},
+            )
+        eng.dispose()
+        part = uploads_svc.part_path(uid)
+        # The control for the byte assertions below: the bytes really are in the part file, and
+        # really are still there when the sweep starts, so their survival is the fix's doing.
+        assert part.read_bytes() == payload
+
+        # Parked at `ensure_capture`: U held, NOTHING moved yet — the one instant this defect
+        # needs. `_park_finalize` (the probe above) returns after the placement and cannot see it.
+        park = Park()
+        _park_ensure_capture(monkeypatch, park, lambda held: held == uid)
+        holder = _async_client(client)
+        finalize_task = asyncio.create_task(holder.post(f"/api/uploads/{uid}/finalize"))
+        await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+        handle = (holder, finalize_task)
+        assert part.read_bytes() == payload  # still unmoved while the finalize holds the row
+        waiting = set(_lock_waiters())
+
+        async def reap() -> int:
+            async with async_session() as db:
+                reaped = await uploads_svc.reap_expired(db)
+                await db.commit()
+                return reaped
+
+        sweep = asyncio.create_task(reap())
+        # Released on ANY observed wait (§5.1's accommodation): the sweep blocks at its DELETE
+        # flush on the unfixed tree and at its own U acquisition on the fixed one.
+        await _wait_for_a_new_lock_wait(waiting)
+        finalized = await _release(park, handle)
+        reaped = _answers([await asyncio.wait_for(sweep, timeout=WAIT_TIMEOUT)])[0]
+
+        park.fired()
+        assert finalized.status_code == 200, finalized.text
+        stored = _one("SELECT storage_path FROM attachments")[0]
+        assert Path(stored).read_bytes() == payload  # the bytes the reaper nearly destroyed
+        # Nothing the finalize owned was reaped: after the wait the row is gone from the sweep's
+        # own locked set, so it unlinks nothing and deletes nothing.
+        assert reaped == 0, reaped
+        assert _one("SELECT count(*) FROM uploads")[0] == 0
+        assert not part.exists()  # consumed by the placement, not by the sweep
     finally:
         _cleanup()
 

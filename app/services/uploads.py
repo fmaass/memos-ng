@@ -493,10 +493,11 @@ def _spool_path(upload_uid: str) -> Path:
 
 async def append_stream(
     db: AsyncSession, upload: Upload, offset: int, stream: AsyncIterable[bytes]
-) -> Upload:
+) -> Upload | None:
     """Receive an append at `offset`: spool the body to a private file, then merge it into the
     shared part file. Idempotent — replaying an already-received range is a no-op; a forward gap
     raises ValueError (caller → 409); an over-ceiling body raises UploadTooLarge (caller → 413).
+    Answers None when the session is GONE by the time the row lock is granted (caller → 404).
 
     The offset the body was built against may be STALE by the time it is fully received, so the
     merge re-reads the row FOR UPDATE and re-decides gap/replay/match against the refreshed
@@ -519,14 +520,22 @@ async def append_stream(
         # upload is refused mid-stream. Where it LANDS is not yet known — that needs the offset the
         # merge settles on, so the offset-relative check is the one under the lock below.
         received = await spool_stream(stream, spool, start=0, ceiling=size_ceiling(upload))
-        upload = (
+        # `scalar_one_or_none`, not `scalar_one`: waiting on this lock is exactly when the row can
+        # disappear — the writer this append queued behind may have been a finalize, which consumes
+        # the session and deletes it. A lock acquisition may lose its row, and losing it is an
+        # ordinary answer, not a 500 (MEMNG-278; the protocol's R6a, the same contract
+        # `ensure_capture` and `reclaim_attachment` already honour).
+        locked = (
             await db.execute(
                 select(Upload)
                 .where(Upload.upload_uid == upload.upload_uid)
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
-        ).scalar_one()
+        ).scalar_one_or_none()
+        if locked is None:
+            return None
+        upload = locked
         if offset > upload.bytes_received:
             raise ValueError("offset gap")
         if offset == upload.bytes_received:
@@ -549,7 +558,9 @@ async def append_stream(
         await to_thread.run_sync(_unlink_sync, spool)
 
 
-async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: bytes) -> Upload:
+async def append_chunk(
+    db: AsyncSession, upload: Upload, offset: int, data: bytes
+) -> Upload | None:
     """Append an already-materialized `data` chunk — the in-process path (migration, tests).
     Network callers use append_stream so the bytes are never held whole in RAM."""
 
@@ -1547,15 +1558,46 @@ async def reap_expired_committed(now: datetime | None = None) -> int:
 
 async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
     """Delete abandoned uploads (past expires_at) + part files, and any spool file a killed process
-    orphaned mid-append. Returns the number of upload SESSIONS reaped. Worker-wired in T2.2."""
+    orphaned mid-append. Returns the number of upload SESSIONS reaped — the size of the set it
+    actually claimed under the row lock, so a session another transaction consumed while this sweep
+    queued counts for nobody. Worker-wired in T2.2."""
     now = now or datetime.now(UTC)
     # List the spool directory BEFORE reading which sessions are live. In that order every listed
     # file's session row was already committed when the read below ran, so a session opened while
     # this sweep runs can never be mistaken for a dead one — its spool simply waits a cycle.
     spools = await to_thread.run_sync(_list_spools_sync, _data_root() / "uploads")
-    rows = (await db.execute(select(Upload).where(Upload.expires_at < now))).scalars().all()
-    # Every part file in ONE hop, still before the flush — an hourly sweep of a large backlog
-    # would otherwise be that many blocking unlinks in a row.
+    # CLAIMED before a single byte is unlinked. The sweep used to read this set unlocked, unlink
+    # every part file, and only then let the DELETEs take the row locks — so it destroyed the only
+    # copy of an upload a finalize already held and had not yet moved, and that finalize then died
+    # on the missing bytes (MEMNG-279). The claim is the protocol's canonical U acquisition: ONE
+    # statement, ascending by `upload_uid`, the same clause every other U site emits (§2.1/R2), and
+    # no other lock class is involved. Plain `FOR UPDATE`, deliberately not `SKIP LOCKED`: a sweep
+    # that stepped around a held row would stop being a writer that serializes behind the holder,
+    # which is the property the census probe beside this one exists to pin.
+    #
+    # The set is judged AFTER the wait, not before it (R10): under READ COMMITTED a locking select
+    # re-evaluates its predicate once the lock is granted, so a row a finalize consumed while this
+    # statement queued is simply absent from the result — the same re-evaluation the standalone
+    # dedup `FOR UPDATE` already relies on. Nothing extends `expires_at` (it is written once, at
+    # `create_upload`), so there is no second value here to re-read by hand.
+    rows = (
+        (
+            await db.execute(
+                select(Upload)
+                .where(Upload.expires_at < now)
+                .order_by(Upload.upload_uid)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Every part file in ONE hop — an hourly sweep of a large backlog would otherwise be that many
+    # blocking unlinks in a row — and now INSIDE the window those locks fence. §2.5 permits it: an
+    # unlink under DATA_ROOT is bounded local file I/O of the same class as the finalize's own
+    # placements, not a third party, not a subprocess and not a client stream. The alternative
+    # (unlink after the caller's commit) would need a second commit boundary, which §2.5 rejects.
     await to_thread.run_sync(_unlink_many_sync, [part_path(u.upload_uid) for u in rows])
     for upload in rows:
         await db.delete(upload)
