@@ -202,6 +202,18 @@ def test_both_upload_operations_model_the_upload_offset_response_header():
         assert header["description"]
 
 
+def test_the_offset_head_declares_no_response_body():
+    """Read off the COMMITTED file, because a generated client only ever sees this snapshot: a
+    HEAD answer carries no body, so an operation that declares one leaves the generated call
+    waiting for bytes that never arrive and the published operation is unusable as declared
+    (MEMNG-198). The `Upload-Offset` header is the entire answer, and it stays declared."""
+    ok = json.loads((REPO_ROOT / "openapi.json").read_text())["paths"][UPLOAD_PATH]["head"][
+        "responses"
+    ]["200"]
+    assert "content" not in ok, ok
+    assert ok["headers"]["Upload-Offset"]["schema"] == {"type": "integer"}
+
+
 def test_the_upload_offset_request_header_is_declared_exactly_once():
     """It already comes from the handler signature; the extra must not add a second one."""
     from app.main import app
