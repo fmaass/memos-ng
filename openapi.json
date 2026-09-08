@@ -779,7 +779,7 @@
         "type": "object"
       },
       "DigestRunClaimOut": {
-        "description": "The answer to `POST /run`: a run row exists and nothing has executed it yet.\n\nThree fields and no aggregates, because at this instant there are none to report \u2014 the row is\nthe CLAIM, and everything else about it is read back from `GET /runs/{id}` (which the response\n`Location` header names). `status` is always null here: NULL means \"in flight\", and a run that\nalready had an outcome would not be something this endpoint could have just opened.",
+        "description": "The answer to `POST /run`: a run row exists and nothing has executed it yet.\n\nThree fields and no aggregates, because at this instant there are none to report \u2014 the row is\nthe CLAIM, and everything else about it is read back from\n`GET /api/admin/digest/runs/{run_id}` (which the response `Location` header names).\n\n`status` is always null here: NULL means \"in flight\", and a run that already had an outcome\nwould not be something this endpoint could have just opened.",
         "properties": {
           "id": {
             "title": "Id",
@@ -2831,7 +2831,7 @@
     },
     "/api/admin/digest/run": {
       "post": {
-        "description": "CLAIM a manual run and answer 202. The worker executes it.\n\nThis endpoint commits exactly one thing \u2014 the run row, which IS the single-flight lock \u2014 and\nreturns. It does not send, upload or render, and that split is the point: a run can\nlegitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox\nupload-session operations that allow 600 s EACH), and a contract that awaited it would tie the\nhousehold's mail to a browser tab, a proxy read timeout and a reload. The scheduled run is\nalready backgrounded for exactly this reason; a manual one is not different work, only\ndifferently triggered.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 comes from the insert that loses the race for the single-flight\nindex \u2014 never from a pre-flight \"is anything running?\" read, which would be exactly the TOCTOU\nrace that index exists to close and which two concurrent callers would both pass.\n\n`Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its\noutcome are read back. Until the worker adopts the row it stays `status: null` with no\nheartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than\nleaving it in flight for ever.",
+        "description": "CLAIM a manual run and answer 202. The worker executes it.\n\nThis endpoint commits exactly one thing \u2014 the run row, which IS the single-flight lock \u2014 and\nreturns. It does not send, upload or render, and that split is the point: a run can\nlegitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox\nupload-session operations that allow 600 s EACH), and a contract that awaited it would tie the\nhousehold's mail to a browser tab, a proxy read timeout and a reload. The scheduled run is\nalready backgrounded for exactly this reason; a manual one is not different work, only\ndifferently triggered.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 comes from the insert that loses the race for the single-flight\nindex \u2014 never from a pre-flight \"is anything running?\" read, which would be exactly the TOCTOU\nrace that index exists to close and which two concurrent callers would both pass.\n\n`Location` names the run, and `GET /api/admin/digest/runs/{run_id}` is where its progress\nand its outcome are read back. Until the worker adopts the row it stays `status: null` with no\nheartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than\nleaving it in flight for ever.",
         "operationId": "run_digest_now_api_admin_digest_run_post",
         "responses": {
           "202": {
@@ -2845,7 +2845,7 @@
             "description": "Successful Response",
             "headers": {
               "Location": {
-                "description": "The claimed run: `GET /api/admin/digest/runs/{id}`. Poll it for the run's progress and its terminal status \u2014 the work happens in the worker, not in this request.",
+                "description": "The claimed run: `GET /api/admin/digest/runs/{run_id}`. Poll it for the run's progress and its terminal status \u2014 the work happens in the worker, not in this request.",
                 "schema": {
                   "type": "string"
                 }
@@ -3821,7 +3821,7 @@
     },
     "/api/auth/native/logout": {
       "post": {
-        "description": "Revoke the presenting device token, and only that one.\n\nA bearer may revoke ITSELF and nothing else: the rest of token management takes a browser\nsession or a step-up management grant obtained through the native login, never a token, so a\nleaked device token can neither mint successors that outlive its revocation nor take another\ndevice offline. A session cookie is refused here for the same reason from the other side \u2014 the\nSPA revokes through `/api/pats/{id}`, which knows which token it is talking about.",
+        "description": "Revoke the presenting device token, and only that one.\n\nA bearer may revoke ITSELF and nothing else: the rest of token management takes a browser\nsession or a step-up management grant obtained through the native login, never a token, so a\nleaked device token can neither mint successors that outlive its revocation nor take another\ndevice offline. A session cookie is refused here for the same reason from the other side \u2014 the\nSPA revokes through `/api/pats/{pat_id}`, which knows which token it is talking about.",
         "operationId": "native_logout_api_auth_native_logout_post",
         "responses": {
           "204": {

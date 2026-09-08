@@ -119,8 +119,8 @@ export interface paths {
          *     index — never from a pre-flight "is anything running?" read, which would be exactly the TOCTOU
          *     race that index exists to close and which two concurrent callers would both pass.
          *
-         *     `Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its
-         *     outcome are read back. Until the worker adopts the row it stays `status: null` with no
+         *     `Location` names the run, and `GET /api/admin/digest/runs/{run_id}` is where its progress
+         *     and its outcome are read back. Until the worker adopts the row it stays `status: null` with no
          *     heartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than
          *     leaving it in flight for ever.
          */
@@ -480,7 +480,7 @@ export interface paths {
          *     session or a step-up management grant obtained through the native login, never a token, so a
          *     leaked device token can neither mint successors that outlive its revocation nor take another
          *     device offline. A session cookie is refused here for the same reason from the other side — the
-         *     SPA revokes through `/api/pats/{id}`, which knows which token it is talking about.
+         *     SPA revokes through `/api/pats/{pat_id}`, which knows which token it is talking about.
          */
         post: operations["native_logout_api_auth_native_logout_post"];
         delete?: never;
@@ -1483,9 +1483,11 @@ export interface components {
          * @description The answer to `POST /run`: a run row exists and nothing has executed it yet.
          *
          *     Three fields and no aggregates, because at this instant there are none to report — the row is
-         *     the CLAIM, and everything else about it is read back from `GET /runs/{id}` (which the response
-         *     `Location` header names). `status` is always null here: NULL means "in flight", and a run that
-         *     already had an outcome would not be something this endpoint could have just opened.
+         *     the CLAIM, and everything else about it is read back from
+         *     `GET /api/admin/digest/runs/{run_id}` (which the response `Location` header names).
+         *
+         *     `status` is always null here: NULL means "in flight", and a run that already had an outcome
+         *     would not be something this endpoint could have just opened.
          */
         DigestRunClaimOut: {
             /** Id */
@@ -2503,7 +2505,7 @@ export interface operations {
             /** @description Successful Response */
             202: {
                 headers: {
-                    /** @description The claimed run: `GET /api/admin/digest/runs/{id}`. Poll it for the run's progress and its terminal status — the work happens in the worker, not in this request. */
+                    /** @description The claimed run: `GET /api/admin/digest/runs/{run_id}`. Poll it for the run's progress and its terminal status — the work happens in the worker, not in this request. */
                     Location?: string;
                     [name: string]: unknown;
                 };

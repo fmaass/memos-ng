@@ -431,7 +431,7 @@ async def native_logout(
     session or a step-up management grant obtained through the native login, never a token, so a
     leaked device token can neither mint successors that outlive its revocation nor take another
     device offline. A session cookie is refused here for the same reason from the other side — the
-    SPA revokes through `/api/pats/{id}`, which knows which token it is talking about.
+    SPA revokes through `/api/pats/{pat_id}`, which knows which token it is talking about.
     """
     hashed_token = presenting_token_hash(request)
     await db.execute(

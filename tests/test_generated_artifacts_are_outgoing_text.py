@@ -62,7 +62,9 @@ ALLOWED_TOKENS = {
     "<memo-uid>.md": "a file-name shape inside the export archive",
     "media/<memo-uid>/": "a directory shape inside the export archive",
     "print-4096": "the permanent default rendition profile, a value `profile` takes",
-    "4:2:2": "chroma subsampling notation, a value the mail profile takes",
+    "4:2:2": "chroma subsampling the mail profile deliberately does NOT offer, named to say so",
+    '{"empty": true}': "a literal request body, quoted as the client must send it",
+    "{video upload_uid: poster upload_uid}": "a literal body shape, quoted as the client sends it",
     "token_not_renewable": "an error `detail` value the client switches on, modelled as no literal",
 }
 
@@ -82,8 +84,7 @@ def _texts(node: object, path: str = "#"):
             yield from _texts(value, f"{path}/{index}")
 
 
-def _normalised_path(template: str) -> str:
-    return re.sub(r"\{[^}]*\}", "{}", template)
+HAS_BRACE = re.compile(r"[{}]")
 
 
 def published_vocabulary(document: dict) -> set[str]:
@@ -127,7 +128,6 @@ def published_vocabulary(document: dict) -> set[str]:
 
     for template, item in document.get("paths", {}).items():
         vocab.add(template)
-        vocab.add(_normalised_path(template))
         # Whole routes and their tails only — deliberately NOT the bare segments. `pats` as a lone
         # word is the table as readily as the route, and a segment that a client really does name
         # on its own reaches this set anyway, as a parameter, a property or a published literal.
@@ -148,10 +148,16 @@ def published_vocabulary(document: dict) -> set[str]:
 
 
 def _path_suffixes(document: dict) -> set[str]:
-    """`native/logout` and `/api/pats/{id}` name real routes by their tail; both are published."""
+    """Every published route and every tail of one, VERBATIM — placeholders included.
+
+    `native/logout` and `/api/pats/{pat_id}` name real routes by their tail, so both belong here.
+    The placeholder keeps the document's own parameter name: normalising `{pat_id}` to a wildcard
+    would make `{model_fields_set}` a route tail too, and the guard would admit any brace-delimited
+    identifier ever written between backticks.
+    """
     suffixes: set[str] = set()
     for template in document.get("paths", {}):
-        segments = _normalised_path(template).strip("/").split("/")
+        segments = template.strip("/").split("/")
         for start in range(len(segments)):
             tail = "/".join(segments[start:])
             suffixes.update({tail, f"/{tail}"})
@@ -170,12 +176,19 @@ def unpublished_tokens(text: str, vocabulary: set[str], suffixes: set[str]) -> l
 
 def _token_is_published(token: str, vocabulary: set[str], suffixes: set[str]) -> bool:
     token = token.strip()
-    if token in vocabulary or token in ALLOWED_TOKENS:
-        return True
     # "GET /api/members", "POST /run": a method and a route, or a route named by its tail.
     head, _, tail = token.partition(" ")
     route = tail if head in vocabulary and tail else token
-    if _normalised_path(route) in suffixes or _normalised_path(route) in vocabulary:
+    if HAS_BRACE.search(token):
+        # A token carrying braces is a route template or nothing. It is accepted only when it IS a
+        # published route (or a tail of one) with the document's own placeholder names, or when it
+        # is byte-equal to a literal the document publishes. Everything else — `{model_fields_set}`,
+        # a JSON object holding an internal identifier — is refused here rather than falling
+        # through to a rule that never looks inside the braces.
+        return route in suffixes or token in vocabulary or token in ALLOWED_TOKENS
+    if token in vocabulary or token in ALLOWED_TOKENS:
+        return True
+    if route in suffixes or route in vocabulary:
         return True
     # "?owner=alice&owner=bob", "format=zip": published parameters carrying illustrative values.
     query = route.lstrip("?")
@@ -277,6 +290,22 @@ def test_the_vocabulary_guard_rejects_a_token_the_document_does_not_publish():
         "not_a_published_field"
     ]
     assert unpublished_tokens("mirrors `_viewable`", vocabulary, suffixes) == ["_viewable"]
+
+    # A brace-delimited token is a route template or nothing: the placeholder NAME has to be the
+    # document's own, and a JSON object holding an internal identifier is not a route.
+    assert unpublished_tokens("told apart by `{model_fields_set}`", vocabulary, suffixes) == [
+        "{model_fields_set}"
+    ]
+    assert unpublished_tokens(
+        'answers `{"detail": {"code": "internal_thing"}}`', vocabulary, suffixes
+    ) == ['{"detail": {"code": "internal_thing"}}']
+    real_route = "read it back from `GET /api/uploads/{upload_uid}`"
+    assert unpublished_tokens(real_route, vocabulary, suffixes) == []
+    assert unpublished_tokens("resend `/api/pats/{pat_id}`", vocabulary, suffixes) == []
+    # The published route names its parameter `upload_uid`; a wildcard-looking `{uid}` is not it.
+    assert unpublished_tokens("`GET /api/uploads/{uid}`", vocabulary, suffixes) == [
+        "GET /api/uploads/{uid}"
+    ]
 
 
 def test_the_mechanical_alphabet_rejects_a_bracketed_internal_label():

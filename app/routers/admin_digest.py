@@ -200,9 +200,11 @@ class DigestRunClaimOut(BaseModel):
     """The answer to `POST /run`: a run row exists and nothing has executed it yet.
 
     Three fields and no aggregates, because at this instant there are none to report — the row is
-    the CLAIM, and everything else about it is read back from `GET /runs/{id}` (which the response
-    `Location` header names). `status` is always null here: NULL means "in flight", and a run that
-    already had an outcome would not be something this endpoint could have just opened.
+    the CLAIM, and everything else about it is read back from
+    `GET /api/admin/digest/runs/{run_id}` (which the response `Location` header names).
+
+    `status` is always null here: NULL means "in flight", and a run that already had an outcome
+    would not be something this endpoint could have just opened.
     """
 
     id: int
@@ -752,7 +754,7 @@ def _location_header() -> dict[str, Any]:
     return {
         "Location": {
             "description": (
-                "The claimed run: `GET /api/admin/digest/runs/{id}`. Poll it for the run's "
+                "The claimed run: `GET /api/admin/digest/runs/{run_id}`. Poll it for the run's "
                 "progress and its terminal status — the work happens in the worker, not in this "
                 "request."
             ),
@@ -786,8 +788,8 @@ async def run_digest_now(
     index — never from a pre-flight "is anything running?" read, which would be exactly the TOCTOU
     race that index exists to close and which two concurrent callers would both pass.
 
-    `Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its
-    outcome are read back. Until the worker adopts the row it stays `status: null` with no
+    `Location` names the run, and `GET /api/admin/digest/runs/{run_id}` is where its progress
+    and its outcome are read back. Until the worker adopts the row it stays `status: null` with no
     heartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than
     leaving it in flight for ever.
     """
