@@ -377,16 +377,15 @@ PRIVACY_PAGE = STATIC_DIR / "privacy-policy.html"
 PRIVACY_CACHE_CONTROL = "public, max-age=3600"
 
 
+# Declared before the SPA catch-all below, which would otherwise answer it with the shell. It is
+# named in PUBLIC_OPERATIONS as well: the schema pass reads each route's requirement off its auth
+# dependency, and a route that has none has to say so out loud (tests/test_openapi_drift.py).
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy() -> FileResponse:
     """The privacy policy, served to anyone — no credential, like /health and the association file.
 
     A policy behind a login is not a published policy: App Store review, and any reader deciding
-    whether to sign in at all, fetch this URL anonymously. It is therefore named in
-    PUBLIC_OPERATIONS, because the schema pass reads each route's requirement off its auth
-    dependency and a route that has none has to say so out loud (tests/test_openapi_drift.py).
-
-    Declared before the SPA catch-all below, which would otherwise answer it with the shell.
+    whether to sign in at all, fetch this URL anonymously.
     """
     return FileResponse(
         PRIVACY_PAGE,

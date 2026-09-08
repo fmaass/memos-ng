@@ -22,13 +22,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OPENAPI = REPO_ROOT / "openapi.json"
 SCHEMA_D_TS = REPO_ROOT / "frontend" / "src" / "api" / "schema.d.ts"
 
-# Tracker keys, the estate's internal hostnames and filesystem layout, and the maintainer pointers
-# that read as prose but name an internal record. Kept as one pattern so both artifacts are held to
-# the same alphabet. Deliberately NOT here: "session", which is this API's own vocabulary — the
-# `sessionCookie` scheme, a browser session, an upload session.
+# One rule, spelled out as an alphabet: an exported description may name only what the client can
+# see — a route, a field, a header, a status or an error code. Everything below is something it
+# cannot: a tracker key, an internal hostname or path, a record where a decision was written down,
+# a source file, or a private identifier that exists only in this repository.
+#
+# Deliberately NOT here: "session", which is this API's own vocabulary (the `sessionCookie` scheme,
+# a browser session, an upload session), and snake_case FIELD names, which a client sends and
+# receives — only identifiers that begin with an underscore are private by convention.
 FORBIDDEN = re.compile(
-    r"MEMNG-|ARCH-|INFRA-|ADR-|Decision [0-9]|[Oo]ption [0-9]|[Pp]hase [0-9]|round [0-9]"
+    r"MEMNG-|ARCH-|INFRA-|\bADR\b|Decision [0-9]|[Dd]esign [0-9]+|[Oo]ption [0-9]"
+    r"|[Pp]hase [0-9]|round [0-9]|§"
     r"|BookStack|windshift|orchestrat|handover|estate|reviewer|ticket"
+    r"|tests/|scripts/|app/|\bsee _|\b_[a-z]"
     r"|discomarder|/home/fabian|jupiter|saturn|merkur"
 )
 
@@ -41,6 +47,21 @@ def _offending_lines(path: Path) -> list[str]:
     ]
 
 
+def _offending_unwrapped(path: Path) -> list[str]:
+    """The same alphabet, read across line breaks.
+
+    A generated comment wraps the description at spaces, so a two-word form — "design 3285", "see
+    `_helper`" — can straddle two lines and pass a line-at-a-time scan. Runs of whitespace and the
+    comment's own `*` gutter collapse to ONE space, which rejoins those without gluing a path back
+    together across a wrap that never happens mid-token.
+    """
+    flat = re.sub(r"[\s*]+", " ", path.read_text())
+    return [
+        f"{path.name}: …{flat[max(0, m.start() - 60) : m.end() + 60]}…"
+        for m in FORBIDDEN.finditer(flat)
+    ]
+
+
 def test_the_served_schema_carries_no_internal_reference():
     assert '"paths"' in OPENAPI.read_text()  # positive control: the document was really read
     offenders = _offending_lines(OPENAPI)
@@ -49,6 +70,16 @@ def test_the_served_schema_carries_no_internal_reference():
         f"route docstring as client-facing prose and move the rationale into a `#` comment, then "
         f"regenerate: {offenders[:3]}"
     )
+
+
+def test_neither_artifact_hides_an_internal_reference_across_a_line_break():
+    for path, control in ((OPENAPI, '"paths"'), (SCHEMA_D_TS, "export interface paths")):
+        assert control in path.read_text()  # positive control
+        offenders = _offending_unwrapped(path)
+        assert offenders == [], (
+            f"{len(offenders)} internal reference(s) in {path.name} spanning a wrapped line: "
+            f"{offenders[:3]}"
+        )
 
 
 def test_the_generated_frontend_types_carry_no_internal_reference():

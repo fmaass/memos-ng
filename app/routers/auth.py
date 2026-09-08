@@ -308,9 +308,12 @@ async def native_manage_grant(
 
     Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
     authority, and the request carries no ambient authority a browser could be tricked into
-    attaching. A `login` code is refused here — see `_redeem_handoff_code` for why that refusal
-    does not burn it.
+    attaching. A `login` code is refused here, and that refusal does not burn it: the purpose is
+    part of the atomic match, so a code minted for the other lane matches nothing and stays
+    redeemable on the route it was minted for.
     """
+    # Why the refusal cannot burn the code: the purpose is a parameter of the atomic consume inside
+    # `_redeem_handoff_code`, so a code minted for the login lane never matches here.
     user, _ = await _redeem_handoff_code(db, body, native_auth.PURPOSE_MANAGE)
     grant, expires_at = await management_grant.mint_grant(db, user)
     await db.commit()
@@ -354,7 +357,8 @@ async def _renew_rejection(db: AsyncSession, hashed_token: str) -> HTTPException
 # One rule governs this whole self-service block, and the exported descriptions state it as
 # behaviour rather than pointing at where it was decided (Decision 5, ADR-0015): a bearer may act
 # on nothing but the token it presents — renew it, revoke it, read it — while token management
-# proper (minting, naming or revoking ANOTHER device's token) stays behind a browser session.
+# proper (minting, naming or revoking ANOTHER device's token) takes what `require_session_or_grant`
+# accepts — a browser session or a step-up management grant — and never a bearer.
 @router.post("/native/renew", response_model=NativeExchangeOut)
 async def native_renew(
     request: Request,
@@ -375,8 +379,9 @@ async def native_renew(
     Restricted to a token that carries an expiry. `pats` has no column that tells a device token
     from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
     only a token that expires can silently sign out, so an unbounded PAT is refused
-    (`token_not_renewable`) rather than rotated: token management stays behind a browser session,
-    and this route reaches no further than the class it exists for.
+    (`token_not_renewable`) rather than rotated: token management proper takes a browser session or
+    a step-up management grant, never the token being presented, and this route reaches no further
+    than the class it exists for.
 
     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
     session cookie names no token at all.
@@ -419,11 +424,11 @@ async def native_logout(
 ) -> None:
     """Revoke the presenting device token, and only that one.
 
-    A bearer may revoke ITSELF and nothing else: the rest of token management stays
-    behind a browser session, so a leaked device token can neither mint successors that outlive its
-    revocation nor take another device offline. A session cookie is refused here for the same
-    reason from the other side — the SPA revokes through `/api/pats/{id}`, which knows which token
-    it is talking about.
+    A bearer may revoke ITSELF and nothing else: the rest of token management takes a browser
+    session or a step-up management grant obtained through the native login, never a token, so a
+    leaked device token can neither mint successors that outlive its revocation nor take another
+    device offline. A session cookie is refused here for the same reason from the other side — the
+    SPA revokes through `/api/pats/{id}`, which knows which token it is talking about.
     """
     hashed_token = presenting_token_hash(request)
     await db.execute(
@@ -483,9 +488,9 @@ async def native_token(
     the credential making the request: a leaked token learns nothing it does not already hold, so
     the route carries no security decision at all.
 
-    Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
-    browser session — `/api/pats` is where a credential that names another token lives; a bearer
-    manages nothing but itself.
+    Bearer-only, like `native/logout` and `native/renew`. Token management proper takes a browser
+    session or a step-up management grant — `/api/pats` is where a credential that names another
+    token lives; a bearer manages nothing but itself.
     """
     hashed_token = presenting_token_hash(request)
     row = (

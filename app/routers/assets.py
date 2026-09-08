@@ -287,8 +287,8 @@ async def list_attachments(
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
     filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
-    memo it does hang on. Another user's PRIVATE or orphan media is excluded — mirrors `_viewable`
-    / memo visibility. ?order=asc walks the same library oldest-first.
+    memo it does hang on. Another user's PRIVATE or orphan media is excluded — the same visibility
+    rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
 
     Paged by keyset, like the memo feed: when more rows follow, the response carries an
     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -710,8 +710,8 @@ async def upload_print(
     file: UploadFile,
 ) -> AttachmentMeta:
     """Attach a print-quality master to an OWNED image attachment (a separate Lightroom print
-    export — see ADR web/print renditions). The web rendition keeps displaying; this file is
-    hidden from the feed and download-only via the `print` tier."""
+    export). The web rendition keeps displaying; this file is hidden from the feed and
+    download-only via the `print` tier."""
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")

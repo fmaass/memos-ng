@@ -757,7 +757,7 @@
         "type": "object"
       },
       "DigestRecipientPatch": {
-        "description": "Partial by design \u2014 the panel toggles `enabled` on its own, without resending the name.\n\nAn omitted field is \"leave it alone\" and is told apart from an explicit `null` (which clears\nthe display name) by `model_fields_set`, not by the value.",
+        "description": "Partial by design \u2014 the panel toggles `enabled` on its own, without resending the name.\n\nAn omitted field is \"leave it alone\" and is told apart from an explicit `null` (which clears\nthe display name) by whether the key is present at all, not by the value.",
         "properties": {
           "display_name": {
             "maxLength": 255,
@@ -1022,7 +1022,7 @@
         "type": "object"
       },
       "DigestSettingsPut": {
-        "description": "The WHOLE settings row, not a patch.\n\nThe panel edits these fields behind one Save bar (design 3285 \u00a76), so the request that Save\nsends IS the new state \u2014 which also means a field the client omits is a client bug rather than\n\"leave it alone\", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:\nthey exist so a typo cannot arm something absurd, and the admin stays free inside them.",
+        "description": "The WHOLE settings row, not a patch.\n\nThe panel edits these fields behind one Save bar, so the request that Save\nsends IS the new state \u2014 which also means a field the client omits is a client bug rather than\n\"leave it alone\", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:\nthey exist so a typo cannot arm something absurd, and the admin stays free inside them.",
         "properties": {
           "dropbox_folder": {
             "maxLength": 255,
@@ -1161,7 +1161,7 @@
         "type": "object"
       },
       "DigestVisibilityScope": {
-        "description": "Which memos a digest may mail. `PUBLIC_PROTECTED` is the default (design 3285 \u00a79).",
+        "description": "Which memos a digest may mail. `PUBLIC_PROTECTED` is the default.",
         "enum": [
           "PUBLIC",
           "PUBLIC_PROTECTED"
@@ -1432,7 +1432,7 @@
         "type": "object"
       },
       "MemberOut": {
-        "description": "One household member, in the field shapes `/api/auth/user` already uses for the caller.\n\nA deliberate subset of `UserOut`: `email` and `role` are the account's own business and no\nclient needs them to draw a filter row, so they are not published about OTHER people here.\n`avatar` is whatever the settings feature stores \u2014 a `data:image/\u2026` URL (app/routers/settings.py\naccepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the\npath string that came with it (app/models.py) \u2014 and null for a member who never set one. It is\npassed through verbatim rather than normalised, so the value a client renders for a member is\nthe same one `/api/auth/user` hands that member for themselves.",
+        "description": "One household member, in the field shapes `/api/auth/user` already uses for the caller.\n\nA deliberate subset of `UserOut`: `email` and `role` are the account's own business and no\nclient needs them to draw a filter row, so they are not published about OTHER people here.\n`avatar` is whatever the settings feature stores \u2014 a `data:image/\u2026` URL (nothing else is\naccepted, capped at 256 KB) or, for an account carried over from old memos, the path string\nthat came with it \u2014 and null for a member who never set one. It is\npassed through verbatim rather than normalised, so the value a client renders for a member is\nthe same one `/api/auth/user` hands that member for themselves.",
         "properties": {
           "avatar": {
             "title": "Avatar",
@@ -2831,7 +2831,7 @@
     },
     "/api/admin/digest/run": {
       "post": {
-        "description": "CLAIM a manual run and answer 202. The worker executes it.\n\nThis endpoint commits exactly one thing \u2014 the `digest_runs` row, which IS the single-flight\nlock \u2014 and returns. It does not send, upload or render, and that split is the point: a run can\nlegitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox\nupload-session operations that allow 600 s EACH), and a contract that awaited it would tie the\nhousehold's mail to a browser tab, a proxy read timeout and a reload. The same repository\nalready backgrounds the scheduled run for exactly this reason; a manual one is not different\nwork, only differently triggered.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 is derived from the INSERT conflicting with\n`uq_digest_runs_single_inflight` \u2014 never from a pre-flight \"is anything running?\" read, which\nwould be exactly the TOCTOU race that index exists to close and which two concurrent callers\nwould both pass.\n\n`Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its\noutcome are read back. Until the worker adopts the row it stays `status: null` with no\nheartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than\nleaving it in flight for ever.",
+        "description": "CLAIM a manual run and answer 202. The worker executes it.\n\nThis endpoint commits exactly one thing \u2014 the run row, which IS the single-flight lock \u2014 and\nreturns. It does not send, upload or render, and that split is the point: a run can\nlegitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox\nupload-session operations that allow 600 s EACH), and a contract that awaited it would tie the\nhousehold's mail to a browser tab, a proxy read timeout and a reload. The scheduled run is\nalready backgrounded for exactly this reason; a manual one is not different work, only\ndifferently triggered.\n\nA manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day\nthat already had one. Its 409 comes from the insert that loses the race for the single-flight\nindex \u2014 never from a pre-flight \"is anything running?\" read, which would be exactly the TOCTOU\nrace that index exists to close and which two concurrent callers would both pass.\n\n`Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its\noutcome are read back. Until the worker adopts the row it stays `status: null` with no\nheartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than\nleaving it in flight for ever.",
         "operationId": "run_digest_now_api_admin_digest_run_post",
         "responses": {
           "202": {
@@ -3011,7 +3011,7 @@
         ]
       },
       "put": {
-        "description": "Update the one settings row. There is no create path here, deliberately: `CHECK (id = 1)`\nplus a router that only ever UPDATEs is what makes a second row impossible.\n\nThe row is taken FOR UPDATE for the whole request, not because a fresh read is needed but\nbecause arming is a check-then-act: two overlapping requests, one arming the digest and one\ndisabling the last recipient, would each see the other's pre-state and both pass, leaving an\narmed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row\nin the same order, so the two paths serialize against each other and cannot deadlock.",
+        "description": "Update the one settings row. There is no create path here, deliberately: the database allows\nexactly one row and this router only ever UPDATEs it, so a second one is impossible.\n\nThe row is taken FOR UPDATE for the whole request, not because a fresh read is needed but\nbecause arming is a check-then-act: two overlapping requests, one arming the digest and one\ndisabling the last recipient, would each see the other's pre-state and both pass, leaving an\narmed digest with nobody to send to. Disabling a recipient locks that same one row in the same\norder, so the two paths serialize against each other and cannot deadlock.",
         "operationId": "put_digest_settings_api_admin_digest_settings_put",
         "requestBody": {
           "content": {
@@ -3176,7 +3176,7 @@
     },
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 mirrors `_viewable`\n/ memo visibility. ?order=asc walks the same library oldest-first.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -3370,7 +3370,7 @@
     },
     "/api/attachments/{uid}/print": {
       "post": {
-        "description": "Attach a print-quality master to an OWNED image attachment (a separate Lightroom print\nexport \u2014 see ADR web/print renditions). The web rendition keeps displaying; this file is\nhidden from the feed and download-only via the `print` tier.",
+        "description": "Attach a print-quality master to an OWNED image attachment (a separate Lightroom print\nexport). The web rendition keeps displaying; this file is hidden from the feed and\ndownload-only via the `print` tier.",
         "operationId": "upload_print_api_attachments__uid__print_post",
         "parameters": [
           {
@@ -3821,7 +3821,7 @@
     },
     "/api/auth/native/logout": {
       "post": {
-        "description": "Revoke the presenting device token, and only that one.\n\nA bearer may revoke ITSELF and nothing else: the rest of token management stays\nbehind a browser session, so a leaked device token can neither mint successors that outlive its\nrevocation nor take another device offline. A session cookie is refused here for the same\nreason from the other side \u2014 the SPA revokes through `/api/pats/{id}`, which knows which token\nit is talking about.",
+        "description": "Revoke the presenting device token, and only that one.\n\nA bearer may revoke ITSELF and nothing else: the rest of token management takes a browser\nsession or a step-up management grant obtained through the native login, never a token, so a\nleaked device token can neither mint successors that outlive its revocation nor take another\ndevice offline. A session cookie is refused here for the same reason from the other side \u2014 the\nSPA revokes through `/api/pats/{id}`, which knows which token it is talking about.",
         "operationId": "native_logout_api_auth_native_logout_post",
         "responses": {
           "204": {
@@ -3844,7 +3844,7 @@
     },
     "/api/auth/native/manage-grant": {
       "post": {
-        "description": "Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.\n\nThis is the only way a grant comes into existence: the code was\nminted by a fresh Authelia authentication minutes ago, and nothing a device already holds can\nproduce one \u2014 a PAT cannot, and neither can an existing browser session. That is the whole\npoint of a step-up: the capability to mint and revoke this account's tokens is bought with an\nauthentication, never with a token.\n\nAnonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the\nauthority, and the request carries no ambient authority a browser could be tricked into\nattaching. A `login` code is refused here \u2014 see `_redeem_handoff_code` for why that refusal\ndoes not burn it.",
+        "description": "Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.\n\nThis is the only way a grant comes into existence: the code was\nminted by a fresh Authelia authentication minutes ago, and nothing a device already holds can\nproduce one \u2014 a PAT cannot, and neither can an existing browser session. That is the whole\npoint of a step-up: the capability to mint and revoke this account's tokens is bought with an\nauthentication, never with a token.\n\nAnonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the\nauthority, and the request carries no ambient authority a browser could be tricked into\nattaching. A `login` code is refused here, and that refusal does not burn it: the purpose is\npart of the atomic match, so a code minted for the other lane matches nothing and stays\nredeemable on the route it was minted for.",
         "operationId": "native_manage_grant_api_auth_native_manage_grant_post",
         "requestBody": {
           "content": {
@@ -3886,7 +3886,7 @@
     },
     "/api/auth/native/renew": {
       "post": {
-        "description": "Rotate the presenting device token: mint a successor and revoke the presenter, atomically.\n\nA device token is deliberately bounded \u2014 it lives on hardware that gets lost, and nobody\nrevokes what they have not noticed is gone \u2014 which without this route means every phone set up\na year ago signs out one morning with no warning and no way back except a full login. Renewal\nrefreshes that lifetime from USE instead of removing the bound.\n\nIt ROTATES rather than extends: the successor is a new secret and the presenter is gone in the\nsame statement, so a token copied out of a backup or a log stops working at the owner's next\nrenewal instead of living the full year twice over.\n\nRestricted to a token that carries an expiry. `pats` has no column that tells a device token\nfrom an SPA-created one \u2014 carrying `expires_at` is the only thing that does, imperfectly \u2014 and\nonly a token that expires can silently sign out, so an unbounded PAT is refused\n(`token_not_renewable`) rather than rotated: token management stays behind a browser session,\nand this route reaches no further than the class it exists for.\n\nBearer-only, like `native/logout`: the presenting token is the subject of the request, and a\nsession cookie names no token at all.",
+        "description": "Rotate the presenting device token: mint a successor and revoke the presenter, atomically.\n\nA device token is deliberately bounded \u2014 it lives on hardware that gets lost, and nobody\nrevokes what they have not noticed is gone \u2014 which without this route means every phone set up\na year ago signs out one morning with no warning and no way back except a full login. Renewal\nrefreshes that lifetime from USE instead of removing the bound.\n\nIt ROTATES rather than extends: the successor is a new secret and the presenter is gone in the\nsame statement, so a token copied out of a backup or a log stops working at the owner's next\nrenewal instead of living the full year twice over.\n\nRestricted to a token that carries an expiry. `pats` has no column that tells a device token\nfrom an SPA-created one \u2014 carrying `expires_at` is the only thing that does, imperfectly \u2014 and\nonly a token that expires can silently sign out, so an unbounded PAT is refused\n(`token_not_renewable`) rather than rotated: token management proper takes a browser session or\na step-up management grant, never the token being presented, and this route reaches no further\nthan the class it exists for.\n\nBearer-only, like `native/logout`: the presenting token is the subject of the request, and a\nsession cookie names no token at all.",
         "operationId": "native_renew_api_auth_native_renew_post",
         "responses": {
           "200": {
@@ -3916,7 +3916,7 @@
     },
     "/api/auth/native/token": {
       "get": {
-        "description": "The presenting device token's own row, and only that one.\n\nA device knows its expiry from the mint response and nowhere else, which means an app that was\nreinstalled \u2014 or simply restarted after a year \u2014 cannot tell the owner how long this phone has\nleft or when it last spoke. This is the read that closes that, and it reaches no further than\nthe credential making the request: a leaked token learns nothing it does not already hold, so\nthe route carries no security decision at all.\n\nBearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a\nbrowser session \u2014 `/api/pats` is where a credential that names another token lives; a bearer\nmanages nothing but itself.",
+        "description": "The presenting device token's own row, and only that one.\n\nA device knows its expiry from the mint response and nowhere else, which means an app that was\nreinstalled \u2014 or simply restarted after a year \u2014 cannot tell the owner how long this phone has\nleft or when it last spoke. This is the read that closes that, and it reaches no further than\nthe credential making the request: a leaked token learns nothing it does not already hold, so\nthe route carries no security decision at all.\n\nBearer-only, like `native/logout` and `native/renew`. Token management proper takes a browser\nsession or a step-up management grant \u2014 `/api/pats` is where a credential that names another\ntoken lives; a bearer manages nothing but itself.",
         "operationId": "native_token_api_auth_native_token_get",
         "responses": {
           "200": {
@@ -4191,7 +4191,7 @@
     },
     "/api/exports/photobook": {
       "get": {
-        "description": "The photo book for a date range: a print-readiness manifest, or the archive itself.\n\nSelection is the owner's image attachments in memo-date order; `from`/`to` bound the memo date\nand are inclusive whole days. `tag` NARROWS that to the memos carrying it \u2014 omitting it selects\nevery image memo in the range, which is what \"give me all my photos between two dates\" means.\n\n`profile` names the print profile the book is derived at. Omitting it follows this\ndeployment's export settings, so an admin changing the print profile changes what an export\nproduces without any client being told; naming one pins the request to it. Two keys are\naccepted \u2014 the permanent default `print-4096`, whose renditions are the shipped tier, and\nwhatever the settings currently name; anything else is 422. A non-default profile derives into\nits own cache directory, so requesting one never rewrites or invalidates the default tier.\n\n**Requesting a book schedules it.** Both formats enqueue a print rendition for every member\nthat lacks a current one, so the first request starts the work and later requests report on it;\nthe enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).\n\n`format=manifest` (the default) answers with one record per photo \u2014 the name it will carry in\nthe archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,\nand the **effective dpi** it will print at for the given `page_cm`/`max_pages` geometry, judged\nagainst `dpi`. That is the field worth having: it names the photos a layout program will flag,\nbefore the import rather than after it. Re-fetching it is also how progress is followed.\n\n`format=zip` streams the ready renditions as `0001_<date>_<uid>.jpg`, numbered in book order so\na folder import lands in sequence. Photos that are not ready yet are left out and recorded in\nthe archive's manifest.json, exactly as the generic export treats a rendition that is missing.",
+        "description": "The photo book for a date range: a print-readiness manifest, or the archive itself.\n\nSelection is the owner's image attachments in memo-date order; `from`/`to` bound the memo date\nand are inclusive whole days. `tag` NARROWS that to the memos carrying it \u2014 omitting it selects\nevery image memo in the range, which is what \"give me all my photos between two dates\" means.\n\n`profile` names the print profile the book is derived at. Omitting it follows this\ndeployment's export settings, so an admin changing the print profile changes what an export\nproduces without any client being told; naming one pins the request to it. Two keys are\naccepted \u2014 the permanent default `print-4096`, whose renditions are the shipped tier, and\nwhatever the settings currently name; anything else is 422. A non-default profile derives into\nits own cache directory, so requesting one never rewrites or invalidates the default tier.\n\n**Requesting a book schedules it.** Both formats enqueue a print rendition for every member\nthat lacks a current one, so the first request starts the work and later requests report on it;\nthe enqueue is idempotent, so polling costs nothing.\n\n`format=manifest` (the default) answers with one record per photo \u2014 the name it will carry in\nthe archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,\nand the **effective dpi** it will print at for the given `page_cm`/`max_pages` geometry, judged\nagainst `dpi`. That is the field worth having: it names the photos a layout program will flag,\nbefore the import rather than after it. Re-fetching it is also how progress is followed.\n\n`format=zip` streams the ready renditions as `0001_<date>_<uid>.jpg`, numbered in book order so\na folder import lands in sequence. Photos that are not ready yet are left out and recorded in\nthe archive's manifest.json, exactly as the generic export treats a rendition that is missing.",
         "operationId": "export_photobook_api_exports_photobook_get",
         "parameters": [
           {
@@ -4413,12 +4413,12 @@
             }
           },
           {
-            "description": "Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all.",
+            "description": "Filter to memos owned by the named household members (`subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all.",
             "in": "query",
             "name": "owner",
             "required": false,
             "schema": {
-              "description": "Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all.",
+              "description": "Filter to memos owned by the named household members (`subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all.",
               "items": {
                 "type": "string"
               },
@@ -5593,7 +5593,7 @@
     },
     "/api/uploads/{upload_uid}/capture": {
       "get": {
-        "description": "What this upload's own metadata says about when it was captured.\n\nNON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a\ncomposer may poll it while the person is still typing and then post the memo exactly as it\nwould have without it. Owner-scoped through the same `_get_upload` as every other verb, so\nanother owner's uid answers with the same 404 as one that never existed.\n\nIt may still WRITE \u2014 once. `ensure_capture` performs the read the completing append normally\ndoes, for the two cases that append cannot cover: a session that finished before this feature\nshipped, and a zero-byte file, which is complete without an append at all. The row lock makes\nthat exactly-once, and every later poll is a plain read.",
+        "description": "What this upload's own metadata says about when it was captured.\n\nNON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a\ncomposer may poll it while the person is still typing and then post the memo exactly as it\nwould have without it. Owner-scoped exactly like every other upload verb, so another owner's\nuid answers with the same 404 as one that never existed.\n\nIt may still WRITE \u2014 once. The first call performs the read the completing append normally\ndoes, for the two cases that append cannot cover: a session that finished before this feature\nshipped, and a zero-byte file, which is complete without an append at all. The row lock makes\nthat exactly-once, and every later poll is a plain read.",
         "operationId": "upload_capture_api_uploads__upload_uid__capture_get",
         "parameters": [
           {
@@ -5811,7 +5811,7 @@
     },
     "/file/attachments/{uid}/{filename}": {
       "get": {
-        "description": "Derived tiers only (F2): ?thumbnail=true \u2192 thumb, mobile UA \u2192 mobile, video \u2192 web.\nThe original path stays 404, as prod is today. Visibility-gated like the memo surfaces:\nanonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's\nvisible set, and anything else (private, orphaned, deleted) is 404 \u2014 never 403, so the\ndenial does not disclose that the uid exists.",
+        "description": "Derived tiers only: ?thumbnail=true \u2192 thumb, mobile UA \u2192 mobile, video \u2192 web.\nThe original path stays 404, as prod is today. Visibility-gated like the memo surfaces:\nanonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's\nvisible set, and anything else (private, orphaned, deleted) is 404 \u2014 never 403, so the\ndenial does not disclose that the uid exists.",
         "operationId": "serve_file_compat_file_attachments__uid___filename__get",
         "parameters": [
           {
@@ -5895,7 +5895,7 @@
     },
     "/privacy": {
       "get": {
-        "description": "The privacy policy, served to anyone \u2014 no credential, like /health and the association file.\n\nA policy behind a login is not a published policy: App Store review, and any reader deciding\nwhether to sign in at all, fetch this URL anonymously. It is therefore named in\nPUBLIC_OPERATIONS, because the schema pass reads each route's requirement off its auth\ndependency and a route that has none has to say so out loud (tests/test_openapi_drift.py).\n\nDeclared before the SPA catch-all below, which would otherwise answer it with the shell.",
+        "description": "The privacy policy, served to anyone \u2014 no credential, like /health and the association file.\n\nA policy behind a login is not a published policy: App Store review, and any reader deciding\nwhether to sign in at all, fetch this URL anonymously.",
         "operationId": "privacy_privacy_get",
         "responses": {
           "200": {

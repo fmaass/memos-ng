@@ -208,10 +208,10 @@ async def upload_capture(
 
     NON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a
     composer may poll it while the person is still typing and then post the memo exactly as it
-    would have without it. Owner-scoped through the same `_get_upload` as every other verb, so
-    another owner's uid answers with the same 404 as one that never existed.
+    would have without it. Owner-scoped exactly like every other upload verb, so another owner's
+    uid answers with the same 404 as one that never existed.
 
-    It may still WRITE — once. `ensure_capture` performs the read the completing append normally
+    It may still WRITE — once. The first call performs the read the completing append normally
     does, for the two cases that append cannot cover: a session that finished before this feature
     shipped, and a zero-byte file, which is complete without an append at all. The row lock makes
     that exactly-once, and every later poll is a plain read.

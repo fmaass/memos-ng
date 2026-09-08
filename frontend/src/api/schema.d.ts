@@ -106,19 +106,18 @@ export interface paths {
          * Run Digest Now
          * @description CLAIM a manual run and answer 202. The worker executes it.
          *
-         *     This endpoint commits exactly one thing — the `digest_runs` row, which IS the single-flight
-         *     lock — and returns. It does not send, upload or render, and that split is the point: a run can
+         *     This endpoint commits exactly one thing — the run row, which IS the single-flight lock — and
+         *     returns. It does not send, upload or render, and that split is the point: a run can
          *     legitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox
          *     upload-session operations that allow 600 s EACH), and a contract that awaited it would tie the
-         *     household's mail to a browser tab, a proxy read timeout and a reload. The same repository
-         *     already backgrounds the scheduled run for exactly this reason; a manual one is not different
-         *     work, only differently triggered.
+         *     household's mail to a browser tab, a proxy read timeout and a reload. The scheduled run is
+         *     already backgrounded for exactly this reason; a manual one is not different work, only
+         *     differently triggered.
          *
          *     A manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day
-         *     that already had one. Its 409 is derived from the INSERT conflicting with
-         *     `uq_digest_runs_single_inflight` — never from a pre-flight "is anything running?" read, which
-         *     would be exactly the TOCTOU race that index exists to close and which two concurrent callers
-         *     would both pass.
+         *     that already had one. Its 409 comes from the insert that loses the race for the single-flight
+         *     index — never from a pre-flight "is anything running?" read, which would be exactly the TOCTOU
+         *     race that index exists to close and which two concurrent callers would both pass.
          *
          *     `Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its
          *     outcome are read back. Until the worker adopts the row it stays `status: null` with no
@@ -199,14 +198,14 @@ export interface paths {
         get: operations["get_digest_settings_api_admin_digest_settings_get"];
         /**
          * Put Digest Settings
-         * @description Update the one settings row. There is no create path here, deliberately: `CHECK (id = 1)`
-         *     plus a router that only ever UPDATEs is what makes a second row impossible.
+         * @description Update the one settings row. There is no create path here, deliberately: the database allows
+         *     exactly one row and this router only ever UPDATEs it, so a second one is impossible.
          *
          *     The row is taken FOR UPDATE for the whole request, not because a fresh read is needed but
          *     because arming is a check-then-act: two overlapping requests, one arming the digest and one
          *     disabling the last recipient, would each see the other's pre-state and both pass, leaving an
-         *     armed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row
-         *     in the same order, so the two paths serialize against each other and cannot deadlock.
+         *     armed digest with nobody to send to. Disabling a recipient locks that same one row in the same
+         *     order, so the two paths serialize against each other and cannot deadlock.
          */
         put: operations["put_digest_settings_api_admin_digest_settings_put"];
         post?: never;
@@ -284,8 +283,8 @@ export interface paths {
          * @description The household media library the user can see, newest first: their own attachments
          *     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
          *     filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
-         *     memo it does hang on. Another user's PRIVATE or orphan media is excluded — mirrors `_viewable`
-         *     / memo visibility. ?order=asc walks the same library oldest-first.
+         *     memo it does hang on. Another user's PRIVATE or orphan media is excluded — the same visibility
+         *     rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
          *
          *     Paged by keyset, like the memo feed: when more rows follow, the response carries an
          *     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -335,8 +334,8 @@ export interface paths {
         /**
          * Upload Print
          * @description Attach a print-quality master to an OWNED image attachment (a separate Lightroom print
-         *     export — see ADR web/print renditions). The web rendition keeps displaying; this file is
-         *     hidden from the feed and download-only via the `print` tier.
+         *     export). The web rendition keeps displaying; this file is hidden from the feed and
+         *     download-only via the `print` tier.
          */
         post: operations["upload_print_api_attachments__uid__print_post"];
         delete?: never;
@@ -476,11 +475,11 @@ export interface paths {
          * Native Logout
          * @description Revoke the presenting device token, and only that one.
          *
-         *     A bearer may revoke ITSELF and nothing else: the rest of token management stays
-         *     behind a browser session, so a leaked device token can neither mint successors that outlive its
-         *     revocation nor take another device offline. A session cookie is refused here for the same
-         *     reason from the other side — the SPA revokes through `/api/pats/{id}`, which knows which token
-         *     it is talking about.
+         *     A bearer may revoke ITSELF and nothing else: the rest of token management takes a browser
+         *     session or a step-up management grant obtained through the native login, never a token, so a
+         *     leaked device token can neither mint successors that outlive its revocation nor take another
+         *     device offline. A session cookie is refused here for the same reason from the other side — the
+         *     SPA revokes through `/api/pats/{id}`, which knows which token it is talking about.
          */
         post: operations["native_logout_api_auth_native_logout_post"];
         delete?: never;
@@ -510,8 +509,9 @@ export interface paths {
          *
          *     Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
          *     authority, and the request carries no ambient authority a browser could be tricked into
-         *     attaching. A `login` code is refused here — see `_redeem_handoff_code` for why that refusal
-         *     does not burn it.
+         *     attaching. A `login` code is refused here, and that refusal does not burn it: the purpose is
+         *     part of the atomic match, so a code minted for the other lane matches nothing and stays
+         *     redeemable on the route it was minted for.
          */
         post: operations["native_manage_grant_api_auth_native_manage_grant_post"];
         delete?: never;
@@ -545,8 +545,9 @@ export interface paths {
          *     Restricted to a token that carries an expiry. `pats` has no column that tells a device token
          *     from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
          *     only a token that expires can silently sign out, so an unbounded PAT is refused
-         *     (`token_not_renewable`) rather than rotated: token management stays behind a browser session,
-         *     and this route reaches no further than the class it exists for.
+         *     (`token_not_renewable`) rather than rotated: token management proper takes a browser session or
+         *     a step-up management grant, never the token being presented, and this route reaches no further
+         *     than the class it exists for.
          *
          *     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
          *     session cookie names no token at all.
@@ -575,9 +576,9 @@ export interface paths {
          *     the credential making the request: a leaked token learns nothing it does not already hold, so
          *     the route carries no security decision at all.
          *
-         *     Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
-         *     browser session — `/api/pats` is where a credential that names another token lives; a bearer
-         *     manages nothing but itself.
+         *     Bearer-only, like `native/logout` and `native/renew`. Token management proper takes a browser
+         *     session or a step-up management grant — `/api/pats` is where a credential that names another
+         *     token lives; a bearer manages nothing but itself.
          */
         get: operations["native_token_api_auth_native_token_get"];
         put?: never;
@@ -681,7 +682,7 @@ export interface paths {
          *
          *     **Requesting a book schedules it.** Both formats enqueue a print rendition for every member
          *     that lacks a current one, so the first request starts the work and later requests report on it;
-         *     the enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).
+         *     the enqueue is idempotent, so polling costs nothing.
          *
          *     `format=manifest` (the default) answers with one record per photo — the name it will carry in
          *     the archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,
@@ -1015,10 +1016,10 @@ export interface paths {
          *
          *     NON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a
          *     composer may poll it while the person is still typing and then post the memo exactly as it
-         *     would have without it. Owner-scoped through the same `_get_upload` as every other verb, so
-         *     another owner's uid answers with the same 404 as one that never existed.
+         *     would have without it. Owner-scoped exactly like every other upload verb, so another owner's
+         *     uid answers with the same 404 as one that never existed.
          *
-         *     It may still WRITE — once. `ensure_capture` performs the read the completing append normally
+         *     It may still WRITE — once. The first call performs the read the completing append normally
          *     does, for the two cases that append cannot cover: a session that finished before this feature
          *     shipped, and a zero-byte file, which is complete without an append at all. The row lock makes
          *     that exactly-once, and every later poll is a plain read.
@@ -1092,7 +1093,7 @@ export interface paths {
         };
         /**
          * Serve File Compat
-         * @description Derived tiers only (F2): ?thumbnail=true → thumb, mobile UA → mobile, video → web.
+         * @description Derived tiers only: ?thumbnail=true → thumb, mobile UA → mobile, video → web.
          *     The original path stays 404, as prod is today. Visibility-gated like the memo surfaces:
          *     anonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's
          *     visible set, and anything else (private, orphaned, deleted) is 404 — never 403, so the
@@ -1136,11 +1137,7 @@ export interface paths {
          * @description The privacy policy, served to anyone — no credential, like /health and the association file.
          *
          *     A policy behind a login is not a published policy: App Store review, and any reader deciding
-         *     whether to sign in at all, fetch this URL anonymously. It is therefore named in
-         *     PUBLIC_OPERATIONS, because the schema pass reads each route's requirement off its auth
-         *     dependency and a route that has none has to say so out loud (tests/test_openapi_drift.py).
-         *
-         *     Declared before the SPA catch-all below, which would otherwise answer it with the shell.
+         *     whether to sign in at all, fetch this URL anonymously.
          */
         get: operations["privacy_privacy_get"];
         put?: never;
@@ -1470,7 +1467,7 @@ export interface components {
          * @description Partial by design — the panel toggles `enabled` on its own, without resending the name.
          *
          *     An omitted field is "leave it alone" and is told apart from an explicit `null` (which clears
-         *     the display name) by `model_fields_set`, not by the value.
+         *     the display name) by whether the key is present at all, not by the value.
          */
         DigestRecipientPatch: {
             /** Display Name */
@@ -1595,7 +1592,7 @@ export interface components {
          * DigestSettingsPut
          * @description The WHOLE settings row, not a patch.
          *
-         *     The panel edits these fields behind one Save bar (design 3285 §6), so the request that Save
+         *     The panel edits these fields behind one Save bar, so the request that Save
          *     sends IS the new state — which also means a field the client omits is a client bug rather than
          *     "leave it alone", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:
          *     they exist so a typo cannot arm something absurd, and the admin stays free inside them.
@@ -1660,7 +1657,7 @@ export interface components {
         };
         /**
          * DigestVisibilityScope
-         * @description Which memos a digest may mail. `PUBLIC_PROTECTED` is the default (design 3285 §9).
+         * @description Which memos a digest may mail. `PUBLIC_PROTECTED` is the default.
          * @enum {string}
          */
         DigestVisibilityScope: "PUBLIC" | "PUBLIC_PROTECTED";
@@ -1820,9 +1817,9 @@ export interface components {
          *
          *     A deliberate subset of `UserOut`: `email` and `role` are the account's own business and no
          *     client needs them to draw a filter row, so they are not published about OTHER people here.
-         *     `avatar` is whatever the settings feature stores — a `data:image/…` URL (app/routers/settings.py
-         *     accepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the
-         *     path string that came with it (app/models.py) — and null for a member who never set one. It is
+         *     `avatar` is whatever the settings feature stores — a `data:image/…` URL (nothing else is
+         *     accepted, capped at 256 KB) or, for an account carried over from old memos, the path string
+         *     that came with it — and null for a member who never set one. It is
          *     passed through verbatim rather than normalised, so the value a client renders for a member is
          *     the same one `/api/auth/user` hands that member for themselves.
          */
@@ -3331,7 +3328,7 @@ export interface operations {
                 created_after?: string | null;
                 tag?: string[] | null;
                 visibility?: components["schemas"]["Visibility"];
-                /** @description Filter to memos owned by the named household members (`User.subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page — like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all. */
+                /** @description Filter to memos owned by the named household members (`subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page — like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all. */
                 owner?: string[] | null;
                 q?: string | null;
                 include_archived?: boolean;

@@ -17,9 +17,9 @@ class MemberOut(BaseModel):
 
     A deliberate subset of `UserOut`: `email` and `role` are the account's own business and no
     client needs them to draw a filter row, so they are not published about OTHER people here.
-    `avatar` is whatever the settings feature stores — a `data:image/…` URL (app/routers/settings.py
-    accepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the
-    path string that came with it (app/models.py) — and null for a member who never set one. It is
+    `avatar` is whatever the settings feature stores — a `data:image/…` URL (nothing else is
+    accepted, capped at 256 KB) or, for an account carried over from old memos, the path string
+    that came with it — and null for a member who never set one. It is
     passed through verbatim rather than normalised, so the value a client renders for a member is
     the same one `/api/auth/user` hands that member for themselves.
     """

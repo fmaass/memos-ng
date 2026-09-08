@@ -506,7 +506,7 @@ async def list_memos(
         list[str] | None,
         Query(
             description=(
-                "Filter to memos owned by the named household members (`User.subject`, as "
+                "Filter to memos owned by the named household members (`subject`, as "
                 "published by `GET /api/members`). Repeatable, and repeating it ORs: "
                 "`?owner=alice&owner=bob` returns the union of what alice and bob wrote that "
                 "the caller may see, never a memo of anyone else's, and never a memo of "
