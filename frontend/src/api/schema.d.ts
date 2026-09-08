@@ -1882,16 +1882,7 @@ export interface components {
             /** Totalcount */
             totalCount: number | null;
         };
-        /**
-         * MemoNotFoundError
-         * @description The 404 both PATCH and DELETE already answer for a memo that is not there (MEMNG-285).
-         *
-         *     Deliberately NOT the nested `code`/`message` shape every other error model in this router
-         *     carries. Those bodies are built here, so their shape is ours to choose; this one is not — all
-         *     three raises behind it hand FastAPI's own `HTTPException` a plain string detail, which FastAPI
-         *     serialises as `{"detail": "<string>"}`. Adopting the house family here would declare a body no
-         *     route returns, replacing one contract lie with another.
-         */
+        /** MemoNotFoundError */
         MemoNotFoundError: {
             /** Detail */
             detail: string;

@@ -235,16 +235,20 @@ class EditRacedError(BaseModel):
     detail: EditRacedDetail
 
 
+# The 404 both PATCH and DELETE already answer for a memo that is not there (MEMNG-285).
+#
+# Deliberately NOT the nested `code`/`message` shape every other error model in this router
+# carries. Those bodies are built here, so their shape is ours to choose; this one is not — all
+# three raises behind it hand FastAPI's own `HTTPException` a plain string detail, which FastAPI
+# serialises as `{"detail": "<string>"}`. Adopting the house family here would declare a body no
+# route returns, replacing one contract lie with another.
+#
+# A comment and not a docstring, because a model docstring is EXPORTED as the component's
+# `description` — into openapi.json and from there into every generated client. Rationale written
+# for a reader of this file does not belong in a document a client reads, and neither does a
+# tracker key. The client-facing wording lives in the response `description` below, and the
+# siblings above export no description at all.
 class MemoNotFoundError(BaseModel):
-    """The 404 both PATCH and DELETE already answer for a memo that is not there (MEMNG-285).
-
-    Deliberately NOT the nested `code`/`message` shape every other error model in this router
-    carries. Those bodies are built here, so their shape is ours to choose; this one is not — all
-    three raises behind it hand FastAPI's own `HTTPException` a plain string detail, which FastAPI
-    serialises as `{"detail": "<string>"}`. Adopting the house family here would declare a body no
-    route returns, replacing one contract lie with another.
-    """
-
     detail: str
 
 
