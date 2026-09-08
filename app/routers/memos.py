@@ -178,9 +178,10 @@ IdempotencyKey = Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A
 class UploadsUnlinkableDetail(BaseModel):
     """Why a memo write was refused: the requested uploads cannot become attachments.
 
-    The two buckets carry different remedies: `missing` (never existed, or expired and reaped — an
-    upload owned by another user reads as missing too) needs a fresh upload; `incomplete`
-    (bytes_received < declared size) needs the transfer resumed from HEAD."""
+    The two buckets carry different remedies: `missing_upload_uids` (never existed, or expired and
+    reaped — an upload owned by another user reads as missing too) need a fresh upload;
+    `incomplete_upload_uids` (fewer bytes received than the declared size) need the transfer
+    resumed from HEAD."""
 
     code: Literal["uploads_unlinkable"]  # required, not defaulted: generated clients switch on it
     missing_upload_uids: list[str]

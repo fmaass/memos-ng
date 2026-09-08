@@ -147,8 +147,8 @@ export interface paths {
          *     first N" can never reach the rest of the history. When more rows follow, `nextCursor` is
          *     non-null; resend it as `?cursor=` for the page after.
          *
-         *     Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import
-         *     row is stamped by the same `now()` as anything else committed in that transaction), and an
+         *     Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (an
+         *     imported row is stamped with the same instant as anything else committed beside it), and an
          *     unstable order would make the table shuffle between refreshes — and would make a keyset cursor
          *     skip or repeat rows, which is worse than shuffling.
          *
@@ -230,7 +230,7 @@ export interface paths {
          *
          *     The destination comes from the authenticated session, never from a request field: an endpoint
          *     that took an address would be an open relay for anyone who reached it, and it would let a probe
-         *     reach `digest_recipients`. It performs no Dropbox upload either — it renders with whatever
+         *     mail the configured recipients. It performs no Dropbox upload either — it renders with whatever
          *     hosted links already exist, and a video with none carries the "not hosted" chip.
          *
          *     It stays SYNCHRONOUS, unlike a run, and the reason is that it is bounded by construction: no
@@ -450,7 +450,8 @@ export interface paths {
          *     would be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the
          *     request carries no ambient authority a browser could be tricked into attaching.
          *
-         *     Only a `login` code is redeemable here. A management code presented to this route is refused
+         *     Only a code minted for the login lane is redeemable here. A management code presented to this
+         *     route is refused
          *     like any unknown one (and left unburned): the two lanes ask Authelia for the same thing but buy
          *     very different credentials, and a manage code spent here would hand a year-long device token to
          *     a flow that asked for ten minutes of token management.
@@ -509,7 +510,8 @@ export interface paths {
          *
          *     Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
          *     authority, and the request carries no ambient authority a browser could be tricked into
-         *     attaching. A `login` code is refused here, and that refusal does not burn it: the purpose is
+         *     attaching. A code minted for the login lane is refused here, and that refusal does not burn
+         *     it: the purpose is
          *     part of the atomic match, so a code minted for the other lane matches nothing and stays
          *     redeemable on the route it was minted for.
          */
@@ -542,9 +544,10 @@ export interface paths {
          *     same statement, so a token copied out of a backup or a log stops working at the owner's next
          *     renewal instead of living the full year twice over.
          *
-         *     Restricted to a token that carries an expiry. `pats` has no column that tells a device token
-         *     from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
-         *     only a token that expires can silently sign out, so an unbounded PAT is refused
+         *     Restricted to a token that carries an expiry. Nothing marks a device token as one — carrying
+         *     an `expires_at` is the only thing that distinguishes it from a token the SPA minted, and only
+         *     imperfectly — and only a token that expires can silently sign out, so an unbounded PAT is
+         *     refused
          *     (`token_not_renewable`) rather than rotated: token management proper takes a browser session or
          *     a step-up management grant, never the token being presented, and this route reaches no further
          *     than the class it exists for.
@@ -715,9 +718,9 @@ export interface paths {
          * @description Every member of the household, for the client-side "whose memos?" filter.
          *
          *     ASSUMPTION, and the reason this route needs no scoping argument: this is a single-household
-         *     instance — every row in `users` is a member of the one household, so membership needs no
-         *     column to express it. A multi-tenant deployment would have to add one and filter here; nothing
-         *     in the schema records tenancy today.
+         *     instance — every account that exists is a member of the one household, so membership needs
+         *     nothing to express it. A multi-tenant deployment would have to record tenancy and filter here;
+         *     nothing in this API expresses it today.
          *
          *     Everyone who can authenticate sees the whole roster, and it deliberately does NOT depend on
          *     what the caller can read: a member who has posted nothing, or only PRIVATE memos, still appears
@@ -1973,7 +1976,7 @@ export interface components {
          * NativeTokenOut
          * @description What a device may learn about the credential it is already holding.
          *
-         *     No `id`, no `hashed_token`, and never the plaintext: this row is the answer to "how long does
+         *     No `id`, no stored hash, and never the plaintext: this row is the answer to "how long does
          *     this token have, and when did I last use it", not a second copy of the secret. Withholding the
          *     id also keeps the shape honest: a device acts on no token but the one it presents, so there is
          *     no sibling here to act on and no handle to act with.
@@ -2264,9 +2267,10 @@ export interface components {
          * UploadsUnlinkableDetail
          * @description Why a memo write was refused: the requested uploads cannot become attachments.
          *
-         *     The two buckets carry different remedies: `missing` (never existed, or expired and reaped — an
-         *     upload owned by another user reads as missing too) needs a fresh upload; `incomplete`
-         *     (bytes_received < declared size) needs the transfer resumed from HEAD.
+         *     The two buckets carry different remedies: `missing_upload_uids` (never existed, or expired and
+         *     reaped — an upload owned by another user reads as missing too) need a fresh upload;
+         *     `incomplete_upload_uids` (fewer bytes received than the declared size) need the transfer
+         *     resumed from HEAD.
          */
         UploadsUnlinkableDetail: {
             /**

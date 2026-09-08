@@ -37,9 +37,9 @@ async def list_members(
     """Every member of the household, for the client-side "whose memos?" filter.
 
     ASSUMPTION, and the reason this route needs no scoping argument: this is a single-household
-    instance — every row in `users` is a member of the one household, so membership needs no
-    column to express it. A multi-tenant deployment would have to add one and filter here; nothing
-    in the schema records tenancy today.
+    instance — every account that exists is a member of the one household, so membership needs
+    nothing to express it. A multi-tenant deployment would have to record tenancy and filter here;
+    nothing in this API expresses it today.
 
     Everyone who can authenticate sees the whole roster, and it deliberately does NOT depend on
     what the caller can read: a member who has posted nothing, or only PRIVATE memos, still appears

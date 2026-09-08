@@ -537,8 +537,8 @@ async def list_digest_runs(
     first N" can never reach the rest of the history. When more rows follow, `nextCursor` is
     non-null; resend it as `?cursor=` for the page after.
 
-    Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import
-    row is stamped by the same `now()` as anything else committed in that transaction), and an
+    Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (an
+    imported row is stamped with the same instant as anything else committed beside it), and an
     unstable order would make the table shuffle between refreshes — and would make a keyset cursor
     skip or repeat rows, which is worse than shuffling.
 
@@ -720,7 +720,7 @@ async def test_send_digest(
 
     The destination comes from the authenticated session, never from a request field: an endpoint
     that took an address would be an open relay for anyone who reached it, and it would let a probe
-    reach `digest_recipients`. It performs no Dropbox upload either — it renders with whatever
+    mail the configured recipients. It performs no Dropbox upload either — it renders with whatever
     hosted links already exist, and a video with none carries the "not hosted" chip.
 
     It stays SYNCHRONOUS, unlike a run, and the reason is that it is bounded by construction: no

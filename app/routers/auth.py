@@ -268,7 +268,8 @@ async def native_exchange(
     would be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the
     request carries no ambient authority a browser could be tricked into attaching.
 
-    Only a `login` code is redeemable here. A management code presented to this route is refused
+    Only a code minted for the login lane is redeemable here. A management code presented to this
+    route is refused
     like any unknown one (and left unburned): the two lanes ask Authelia for the same thing but buy
     very different credentials, and a manage code spent here would hand a year-long device token to
     a flow that asked for ten minutes of token management.
@@ -308,7 +309,8 @@ async def native_manage_grant(
 
     Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
     authority, and the request carries no ambient authority a browser could be tricked into
-    attaching. A `login` code is refused here, and that refusal does not burn it: the purpose is
+    attaching. A code minted for the login lane is refused here, and that refusal does not burn
+    it: the purpose is
     part of the atomic match, so a code minted for the other lane matches nothing and stays
     redeemable on the route it was minted for.
     """
@@ -376,9 +378,10 @@ async def native_renew(
     same statement, so a token copied out of a backup or a log stops working at the owner's next
     renewal instead of living the full year twice over.
 
-    Restricted to a token that carries an expiry. `pats` has no column that tells a device token
-    from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
-    only a token that expires can silently sign out, so an unbounded PAT is refused
+    Restricted to a token that carries an expiry. Nothing marks a device token as one — carrying
+    an `expires_at` is the only thing that distinguishes it from a token the SPA minted, and only
+    imperfectly — and only a token that expires can silently sign out, so an unbounded PAT is
+    refused
     (`token_not_renewable`) rather than rotated: token management proper takes a browser session or
     a step-up management grant, never the token being presented, and this route reaches no further
     than the class it exists for.
@@ -440,7 +443,7 @@ async def native_logout(
 class NativeTokenOut(BaseModel):
     """What a device may learn about the credential it is already holding.
 
-    No `id`, no `hashed_token`, and never the plaintext: this row is the answer to "how long does
+    No `id`, no stored hash, and never the plaintext: this row is the answer to "how long does
     this token have, and when did I last use it", not a second copy of the secret. Withholding the
     id also keeps the shape honest: a device acts on no token but the one it presents, so there is
     no sibling here to act on and no handle to act with.
