@@ -29,17 +29,23 @@ Run from the repository root. For every row of tests/mutations/expected.tsv the 
   * records that file's sha256, applies the patch, runs
     `uv run pytest -q tests/test_lock_protocol_concurrency.py` with MEMNG267_MUTATION set to
     the row's marker, then reverses the patch and compares the sha256 — a mismatch stops the run;
-  * requires pytest to exit 1 and the set of failed node ids to equal the row's expected_failed
+  * requires pytest to exit 1 and the set of FAILED node ids to equal the row's expected_failed
     EXACTLY — no more, no fewer — and, when the row names a sqlstate, that the sqlstate appears
     in the run's log.
 
+A TEST THAT ERRORS DOES NOT COUNT AS A FAILING PROBE. Only a `<failure>` — the test ran and its
+assertion did not hold — can satisfy an expectation. Any `<error>` (setup, teardown or
+collection) makes the whole mutation run INVALID and is reported as `FAIL — <n> error(s): <ids>`,
+because a probe that never executed proves nothing about the mutation.
+
 NODE IDS COME FROM THE JUNIT REPORT, not from the terminal output: the run is given
 `-o junit_family=xunit1 --junitxml=<file>` and each failed or errored `<testcase>` is read with
-stdlib `xml.etree`, its id rebuilt as `<file>::<classname-tail>::<name>`. The `name` attribute
-carries the parameter bracket verbatim, so an id containing ` - `, `::` or a space survives it —
-the terminal `FAILED <nodeid> - <message>` line cannot be parsed back without ambiguity. The
-number of ids read from the report is then cross-checked against pytest's own "N failed"/"N
-errors" summary as a second, independent guard.
+stdlib `xml.etree`, its id rebuilt as `<file>::<class>::<nested class>::<name>`. The `name`
+attribute carries the parameter bracket verbatim, so an id containing ` - `, `::` or a space
+survives it — the terminal `FAILED <nodeid> - <message>` line cannot be parsed back without
+ambiguity. As a second, independent guard the number of failures read from the report is
+cross-checked against pytest's own summary line, which must report that many failed and zero
+errors; a run whose summary line cannot be found is failed, not waved through.
 
 Before the loop the module is run ONCE with MEMNG267_MUTATION removed from the environment (not
 merely unset in the manifest) as the positive control; it must exit 0.
@@ -51,18 +57,22 @@ is a space-separated list of test ids — a bare id is read as a node of the mod
 id containing `::` is read as a full node id. sqlstate is optional. Blank lines and lines
 starting with `#` are ignored.
 
+The pytest output of every run is kept in a temporary directory whose path is printed, so a FAIL
+can be read afterwards; the JUnit reports themselves are deleted on exit, having been read.
+
 The DATABASE comes from the caller's environment: export both DATABASE_URL_SYNC (psycopg2) and
 DATABASE_URL (asyncpg) at a disposable local database before running — tests/db_guard.py refuses
 anything else. This script neither creates, migrates nor drops a database.
 
 Options:
   --manifest <path>   read the rows from <path> instead of tests/mutations/expected.tsv
-  --selftest          prove the checker can fail: a parse leg (node ids whose parameter brackets
-                      contain ` - `, `::` and spaces must stay distinct), a manifest naming a
-                      wrong expected set (must report FAIL), a run with MEMNG267_MUTATION
-                      exported (the control must still pass), an INT sent while a patch is
-                      applied (the tree must come back identical), and the real manifest (must
-                      report PASS); non-zero if any is violated
+  --selftest          prove the checker can fail: a parse leg (parameter brackets containing
+                      ` - `, `::` and spaces, and a nested class, must all reconstruct), an
+                      errored-probe leg (an `<error>` must never satisfy an expectation), a
+                      manifest naming a wrong expected set (must report FAIL), a run with
+                      MEMNG267_MUTATION exported (the control must still pass), an INT sent while
+                      a patch is applied (the tree must come back identical), and the real
+                      manifest (must report PASS); non-zero if any is violated
   -h, --help          print this text
 USAGE
 }
@@ -72,24 +82,115 @@ die() {
     exit 2
 }
 
-# Failed/errored node ids out of a pytest JUnit report, one per line, in report order.
+# One `<kind>\t<node id>` line per failed or errored testcase of a pytest JUnit report, in report
+# order. A case that both failed and errored is reported as an error: the run is not clean.
 PARSE_PY='
 import sys
 import xml.etree.ElementTree as ET
 
 for case in ET.parse(sys.argv[1]).iter("testcase"):
-    if case.find("failure") is None and case.find("error") is None:
+    if case.find("error") is not None:
+        kind = "error"
+    elif case.find("failure") is not None:
+        kind = "failure"
+    else:
         continue
     path = case.get("file") or ""
     name = case.get("name") or ""
     classname = case.get("classname") or ""
     module = path[:-3].replace("/", ".") if path.endswith(".py") else path.replace("/", ".")
     tail = classname[len(module):].lstrip(".") if classname.startswith(module) else ""
-    print("::".join(part for part in (path, tail, name) if part))
+    classes = tail.split(".") if tail else []
+    print(kind + "\t" + "::".join(part for part in [path, *classes, name] if part))
 '
 
-parse_failed_ids() {
+parse_junit_cases() {
     uv run python -c "$PARSE_PY" "$1"
+}
+
+# pytest's own count of failures and errors, from its summary line only — an unanchored search of
+# the tail would happily read a number out of a traceback.
+summary_line() {
+    grep -E '^(=+ )?[0-9]+ [a-z]+' "$1" | grep -E ' in [0-9]+\.[0-9]+s' | tail -1
+}
+
+count_in_summary() {
+    # $1 summary line, $2 word ("failed" / "error")
+    printf '%s\n' "$1" | grep -oE "[0-9]+ $2" | head -1 | awk '{print $1}'
+}
+
+# Prints `<marker>: PASS|FAIL — …` and returns 0 only for a run that behaved as the row names it.
+judge_run() {
+    local marker="$1" rc="$2" log="$3" xml="$4" expected="$5" sqlstate="$6"
+    local reasons=() failure_ids=() error_ids=() case_list=() entry kind id
+    local actual_ids expected_ids extra missing summary failed_n errors_n n
+
+    if [ ! -s "$xml" ]; then
+        reasons+=("pytest wrote no JUnit report, so its failures cannot be identified")
+        actual_ids=""
+    else
+        mapfile -t case_list < <(parse_junit_cases "$xml")
+        for entry in "${case_list[@]}"; do
+            [ -n "$entry" ] || continue
+            kind=${entry%%$'\t'*}
+            id=${entry#*$'\t'}
+            case "$kind" in
+                error) error_ids+=("$id") ;;
+                failure) failure_ids+=("$id") ;;
+            esac
+        done
+        # An errored probe never ran: it can satisfy nothing, and it invalidates the whole run.
+        if [ "${#error_ids[@]}" -gt 0 ]; then
+            reasons+=("${#error_ids[@]} error(s): ${error_ids[*]}")
+        fi
+        actual_ids=$(printf '%s\n' "${failure_ids[@]}" | grep . | LC_ALL=C sort -u)
+
+        summary=$(summary_line "$log")
+        if [ -z "$summary" ]; then
+            reasons+=("no pytest summary line in $log, so the report cannot be cross-checked")
+        else
+            failed_n=$(count_in_summary "$summary" failed)
+            errors_n=$(count_in_summary "$summary" error)
+            failed_n=${failed_n:-0}
+            errors_n=${errors_n:-0}
+            if [ "${#failure_ids[@]}" -ne "$failed_n" ]; then
+                reasons+=("the JUnit report holds ${#failure_ids[@]} failure(s) but pytest summarised $failed_n failed")
+            fi
+            if [ "$errors_n" -ne 0 ]; then
+                reasons+=("pytest summarised $errors_n error(s); a valid mutation run has none")
+            fi
+        fi
+    fi
+
+    if [ "$rc" -ne 1 ]; then
+        reasons+=("pytest exited $rc, expected 1")
+    fi
+
+    expected_ids=$(
+        # shellcheck disable=SC2086  # expected_failed is a space-separated list; splitting is the point
+        for id in $expected; do
+            case "$id" in *::*) printf '%s\n' "$id" ;; *) printf '%s::%s\n' "$MODULE" "$id" ;; esac
+        done | LC_ALL=C sort -u
+    )
+    if [ "$actual_ids" != "$expected_ids" ]; then
+        extra=$(comm -13 <(printf '%s\n' "$expected_ids") <(printf '%s\n' "$actual_ids") | paste -sd' ' -)
+        missing=$(comm -23 <(printf '%s\n' "$expected_ids") <(printf '%s\n' "$actual_ids") | paste -sd' ' -)
+        reasons+=("failed set differs${missing:+; did not fail: $missing}${extra:+; also failed: $extra}")
+    fi
+    if [ -n "$sqlstate" ] && ! grep -qF -- "$sqlstate" "$log"; then
+        reasons+=("sqlstate $sqlstate absent from the log")
+    fi
+
+    if [ "${#reasons[@]}" -eq 0 ]; then
+        n=$(printf '%s\n' "$expected_ids" | grep -c .)
+        echo "$marker: PASS — exit 1, exactly $n expected failed node id(s)${sqlstate:+, sqlstate $sqlstate present}"
+        return 0
+    fi
+    printf '%s: FAIL — ' "$marker"
+    printf '%s' "${reasons[0]}"
+    for entry in "${reasons[@]:1}"; do printf '; %s' "$entry"; done
+    printf ' (see %s)\n' "$log"
+    return 1
 }
 
 while [ $# -gt 0 ]; do
@@ -123,45 +224,78 @@ if [ "$SELFTEST" -eq 1 ]; then
     one_row=$(mktemp) || die "mktemp failed"
     run_out=$(mktemp) || die "mktemp failed"
     fake_xml=$(mktemp) || die "mktemp failed"
-    trap 'rm -f "$wrong" "$one_row" "$run_out" "$fake_xml"' EXIT
+    fake_log=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$wrong" "$one_row" "$run_out" "$fake_xml" "$fake_log"' EXIT
 
     grep -v '^#' "$MANIFEST_DEFAULT" | grep -m1 'c5b_merge_answers' > "$one_row"
     [ -s "$one_row" ] || die "no c5b_merge_answers row in $MANIFEST_DEFAULT"
-    IFS=$'\t' read -r one_patch _ _ _ < "$one_row"
+    IFS=$'\t' read -r one_patch _ one_expected _ < "$one_row"
     one_target=$(grep -m1 '^+++ b/' "$one_patch" | sed 's#^+++ b/##')
     [ -f "$one_target" ] || die "$one_patch targets $one_target, which does not exist"
 
-    # --- leg 1: parameter ids that contain the terminal-output delimiters ---------------------
-    echo "selftest leg 1: parameter ids containing ' - ', '::' and spaces"
+    # --- leg 1: ids the terminal output cannot round-trip, and a nested class -----------------
+    echo "selftest leg 1: parameter ids containing ' - ', '::' and spaces, and a nested class"
     cat > "$fake_xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
-<testsuites><testsuite name="pytest" errors="0" failures="3" tests="3">
+<testsuites><testsuite name="pytest" errors="0" failures="4" tests="4">
 <testcase classname="tests.test_lock_protocol_concurrency" name="test_probe[a]" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
 <testcase classname="tests.test_lock_protocol_concurrency" name="test_probe[a - extra]]" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
 <testcase classname="tests.test_lock_protocol_concurrency" name="test_other[x::test_probe y]" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
+<testcase classname="tests.test_lock_protocol_concurrency.TestOuter.TestInner" name="test_deep" file="$MODULE" line="1"><failure message="assertion">boom</failure></testcase>
 </testsuite></testsuites>
 XML
-    parsed=$(parse_failed_ids "$fake_xml")
+    parsed=$(parse_junit_cases "$fake_xml")
     printf '%s\n' "$parsed" | sed 's/^/  parsed: /'
-    if [ "$(printf '%s\n' "$parsed" | grep -c .)" -ne 3 ] ||
-        [ "$(printf '%s\n' "$parsed" | LC_ALL=C sort -u | grep -c .)" -ne 3 ]; then
-        echo "SELFTEST FAIL: 3 distinct testcases did not parse as 3 distinct node ids"
+    if [ "$(printf '%s\n' "$parsed" | grep -c .)" -ne 4 ] ||
+        [ "$(printf '%s\n' "$parsed" | LC_ALL=C sort -u | grep -c .)" -ne 4 ]; then
+        echo "SELFTEST FAIL: 4 distinct testcases did not parse as 4 distinct entries"
         exit 1
     fi
-    if [ "$(printf '%s\n' "$parsed" | grep -cFx "$MODULE::test_probe[a]")" -ne 1 ]; then
-        echo "SELFTEST FAIL: '$MODULE::test_probe[a]' is not exactly one of the parsed ids"
-        exit 1
-    fi
-    echo "selftest leg 1: PASS — 3 distinct node ids, 'test_probe[a]' and 'test_probe[a - extra]]' apart"
+    for want in \
+        "failure	$MODULE::test_probe[a]" \
+        "failure	$MODULE::test_probe[a - extra]]" \
+        "failure	$MODULE::TestOuter::TestInner::test_deep"; do
+        if [ "$(printf '%s\n' "$parsed" | grep -cFx "$want")" -ne 1 ]; then
+            echo "SELFTEST FAIL: '$want' is not exactly one of the parsed entries"
+            exit 1
+        fi
+    done
+    echo "selftest leg 1: PASS — 4 distinct entries; 'test_probe[a]' and 'test_probe[a - extra]]' apart, TestOuter::TestInner::test_deep joined with '::'"
 
-    # --- leg 2: a wrong expected set must be caught -------------------------------------------
+    # --- leg 2: an errored probe must never satisfy an expectation ----------------------------
+    echo "selftest leg 2: the expected probe reported as an <error>, not a <failure>"
+    cat > "$fake_xml" <<XML
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="1" failures="0" tests="2">
+<testcase classname="tests.test_lock_protocol_concurrency" name="$one_expected" file="$MODULE" line="1"><error message="failed on setup with &quot;Exception&quot;">boom</error></testcase>
+<testcase classname="tests.test_lock_protocol_concurrency" name="test_something_else" file="$MODULE" line="2"/>
+</testsuite></testsuites>
+XML
+    printf '1 error, 22 passed, 2 warnings in 20.00s\n' > "$fake_log"
+    judge_out=$(judge_run c5b_error_probe 1 "$fake_log" "$fake_xml" "$one_expected" "")
+    judge_rc=$?
+    echo "  $judge_out"
+    if [ "$judge_rc" -eq 0 ]; then
+        echo "SELFTEST FAIL: an errored probe satisfied its expectation"
+        exit 1
+    fi
+    case "$judge_out" in
+        "c5b_error_probe: FAIL — 1 error(s): $MODULE::$one_expected"*) ;;
+        *)
+            echo "SELFTEST FAIL: the errored run was not reported as an error"
+            exit 1
+            ;;
+    esac
+    echo "selftest leg 2: PASS — reported as an error, not as a satisfied expectation"
+
+    # --- leg 3: a wrong expected set must be caught -------------------------------------------
     # A real mutation with a real test id that it does NOT fail: the run still exits 1, so only
     # the set comparison can catch it.
     printf 'tests/mutations/c5b_merge_answers.patch\tc5b_merge_answers\ttest_pass_zero_locks_the_named_and_the_dedup_attachment_in_one_ascending_statement\t\n' > "$wrong"
-    echo "selftest leg 2: expecting FAIL from a manifest with a wrong expected set"
+    echo "selftest leg 3: expecting FAIL from a manifest with a wrong expected set"
     "$SCRIPT_PATH" --manifest "$wrong" 2>&1 | tee "$run_out"
     wrong_rc=${PIPESTATUS[0]}
-    echo "selftest leg 2: run exited $wrong_rc (expected non-zero)"
+    echo "selftest leg 3: run exited $wrong_rc (expected non-zero)"
     if [ "$wrong_rc" -eq 0 ]; then
         echo "SELFTEST FAIL: the checker passed a manifest naming the wrong expected set"
         exit 1
@@ -172,21 +306,21 @@ XML
         echo "SELFTEST FAIL: the wrong-manifest run exited $wrong_rc without judging c5b_merge_answers FAIL"
         exit 1
     fi
-    echo "selftest leg 2: PASS"
+    echo "selftest leg 3: PASS"
 
-    # --- leg 3: an inherited marker must not reach the positive control -----------------------
-    echo "selftest leg 3: expecting PASS with $MARKER_VAR=no_r7a exported by the caller"
+    # --- leg 4: an inherited marker must not reach the positive control -----------------------
+    echo "selftest leg 4: expecting PASS with $MARKER_VAR=no_r7a exported by the caller"
     ( export "$MARKER_VAR=no_r7a" && "$SCRIPT_PATH" --manifest "$one_row" ) 2>&1 | tee "$run_out"
     marker_rc=${PIPESTATUS[0]}
-    echo "selftest leg 3: run exited $marker_rc (expected 0)"
+    echo "selftest leg 4: run exited $marker_rc (expected 0)"
     if [ "$marker_rc" -ne 0 ] || ! grep -q '^control: PASS' "$run_out"; then
         echo "SELFTEST FAIL: an exported $MARKER_VAR reached the positive control"
         exit 1
     fi
-    echo "selftest leg 3: PASS"
+    echo "selftest leg 4: PASS"
 
-    # --- leg 4: an INT while the patch is applied must still restore the tree -----------------
-    echo "selftest leg 4: INT while $one_patch is applied; $one_target must come back identical"
+    # --- leg 5: an INT while the patch is applied must still restore the tree -----------------
+    echo "selftest leg 5: INT while $one_patch is applied; $one_target must come back identical"
     clean_sha=$(sha256sum "$one_target" | cut -d' ' -f1)
     # Job control for the launch: a non-interactive shell sets SIGINT to IGNORE in an
     # asynchronous command, and a trap cannot reset a signal inherited as ignored — the INT
@@ -225,18 +359,18 @@ XML
         echo "SELFTEST FAIL: $one_target was left mutated by the interrupted run"
         exit 1
     fi
-    echo "selftest leg 4: PASS — tree identical after INT"
+    echo "selftest leg 5: PASS — tree identical after INT"
 
-    # --- leg 5: the real manifest must pass ---------------------------------------------------
-    echo "selftest leg 5: expecting PASS from $MANIFEST_DEFAULT"
+    # --- leg 6: the real manifest must pass ---------------------------------------------------
+    echo "selftest leg 6: expecting PASS from $MANIFEST_DEFAULT"
     "$SCRIPT_PATH" --manifest "$MANIFEST_DEFAULT"
     real_rc=$?
-    echo "selftest leg 5: run exited $real_rc (expected 0)"
+    echo "selftest leg 6: run exited $real_rc (expected 0)"
     if [ "$real_rc" -ne 0 ]; then
         echo "SELFTEST FAIL: the checker did not pass the real manifest"
         exit 1
     fi
-    echo "SELFTEST PASS: parse leg clean, wrong manifest -> FAIL ($wrong_rc), exported marker -> PASS ($marker_rc), INT while applied -> tree restored ($int_rc), real manifest -> PASS ($real_rc)"
+    echo "SELFTEST PASS: parse leg clean, errored probe -> FAIL, wrong manifest -> FAIL ($wrong_rc), exported marker -> PASS ($marker_rc), INT while applied -> tree restored ($int_rc), real manifest -> PASS ($real_rc)"
     exit 0
 fi
 
@@ -283,7 +417,9 @@ for line in "${rows[@]}"; do
 done
 
 logdir=$(mktemp -d) || die "mktemp -d failed"
-echo "check-mutations: manifest $MANIFEST, ${#patches[@]} mutation(s), logs in $logdir"
+xmldir=$(mktemp -d) || die "mktemp -d failed"
+echo "check-mutations: manifest $MANIFEST, ${#patches[@]} mutation(s), pytest logs in $logdir"
+echo "check-mutations: JUnit reports go to $xmldir and are deleted on exit, having been read"
 
 failures=0
 
@@ -324,6 +460,7 @@ on_signal() {
         echo "check-mutations: interrupted ($sig) with $applied_patch applied — reverting" >&2
     fi
     revert_applied
+    rm -rf "$xmldir"
     case "$sig" in INT) exit 130 ;; TERM) exit 143 ;; *) exit 1 ;; esac
 }
 
@@ -335,6 +472,7 @@ on_exit() {
         revert_applied || rc=1
         [ "$rc" -ne 0 ] || rc=1
     fi
+    rm -rf "$xmldir"
     exit "$rc"
 }
 
@@ -366,7 +504,7 @@ for i in "${!patches[@]}"; do
     sqlstate="${sqlstates[$i]}"
     target="${targets[$i]}"
     log="$logdir/$marker.log"
-    xml="$logdir/$marker.xml"
+    xml="$xmldir/$marker.xml"
 
     # Recorded BEFORE the apply, so the trap can revert whatever the apply managed to write.
     applied_patch="$patch"
@@ -392,54 +530,8 @@ for i in "${!patches[@]}"; do
         exit 1
     fi
 
-    reasons=()
-    if [ "$rc" -ne 1 ]; then
-        reasons+=("pytest exited $rc, expected 1")
-    fi
-
-    if [ ! -s "$xml" ]; then
-        reasons+=("pytest wrote no JUnit report, so its failures cannot be identified")
-        actual_ids=""
-        parsed_n=-1
-        reported_n=-1
-    else
-        mapfile -t actual_list < <(parse_failed_ids "$xml")
-        parsed_n=$(printf '%s\n' "${actual_list[@]}" | grep -c .)
-        actual_ids=$(printf '%s\n' "${actual_list[@]}" | grep . | LC_ALL=C sort -u)
-        # Second, independent guard: pytest's own terminal summary, not the report.
-        failed_n=$(tail -3 "$log" | grep -oE '[0-9]+ failed' | tail -1 | awk '{print $1}')
-        errors_n=$(tail -3 "$log" | grep -oE '[0-9]+ error' | tail -1 | awk '{print $1}')
-        reported_n=$((${failed_n:-0} + ${errors_n:-0}))
-        if [ "$parsed_n" -ne "$reported_n" ]; then
-            reasons+=("the JUnit report holds $parsed_n failed case(s) but pytest summarised $reported_n")
-        fi
-    fi
-
-    expected_ids=$(
-        # shellcheck disable=SC2086  # expected_failed is a space-separated list; splitting is the point
-        for id in $expected; do
-            case "$id" in *::*) printf '%s\n' "$id" ;; *) printf '%s::%s\n' "$MODULE" "$id" ;; esac
-        done | LC_ALL=C sort -u
-    )
-    if [ "$actual_ids" != "$expected_ids" ]; then
-        extra=$(comm -13 <(printf '%s\n' "$expected_ids") <(printf '%s\n' "$actual_ids") | paste -sd' ' -)
-        missing=$(comm -23 <(printf '%s\n' "$expected_ids") <(printf '%s\n' "$actual_ids") | paste -sd' ' -)
-        reasons+=("failed set differs${missing:+; did not fail: $missing}${extra:+; also failed: $extra}")
-    fi
-    if [ -n "$sqlstate" ] && ! grep -qF -- "$sqlstate" "$log"; then
-        reasons+=("sqlstate $sqlstate absent from the log")
-    fi
-
-    if [ "${#reasons[@]}" -eq 0 ]; then
-        n=$(printf '%s\n' "$expected_ids" | grep -c .)
-        echo "$marker: PASS — exit 1, exactly $n expected failed node id(s)${sqlstate:+, sqlstate $sqlstate present}"
-    else
-        printf '%s: FAIL — ' "$marker"
-        printf '%s' "${reasons[0]}"
-        for r in "${reasons[@]:1}"; do printf '; %s' "$r"; done
-        printf ' (see %s)\n' "$log"
+    judge_run "$marker" "$rc" "$log" "$xml" "$expected" "$sqlstate" ||
         failures=$((failures + 1))
-    fi
 done
 
 passed=$((${#patches[@]} - failures))
