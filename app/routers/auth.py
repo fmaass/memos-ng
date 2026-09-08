@@ -300,7 +300,7 @@ async def native_manage_grant(
 ) -> ManageGrantOut:
     """Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.
 
-    This is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was
+    This is the only way a grant comes into existence: the code was
     minted by a fresh Authelia authentication minutes ago, and nothing a device already holds can
     produce one — a PAT cannot, and neither can an existing browser session. That is the whole
     point of a step-up: the capability to mint and revoke this account's tokens is bought with an
@@ -477,11 +477,11 @@ async def native_token(
     reinstalled — or simply restarted after a year — cannot tell the owner how long this phone has
     left or when it last spoke. This is the read that closes that, and it reaches no further than
     the credential making the request: a leaked token learns nothing it does not already hold, so
-    the route carries no security decision at all (MEMNG-138, option 5).
+    the route carries no security decision at all.
 
     Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
-    browser session (Decision 5 / ADR-0015) — `/api/pats` is where a credential that names another
-    token lives; a bearer manages nothing but itself.
+    browser session — `/api/pats` is where a credential that names another token lives; a bearer
+    manages nothing but itself.
     """
     hashed_token = presenting_token_hash(request)
     row = (

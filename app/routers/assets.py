@@ -443,6 +443,8 @@ class RenditionAttach(BaseModel):
     variant_key: str | None = None  # absent (only) → the bare `print`
 
 
+# The legacy multipart `/print` route, which writes the separate print_path column, is untouched
+# by this one and is retired separately.
 @router.post("/attachments/{uid}/renditions", response_model=AttachmentMeta, status_code=201)
 async def attach_rendition(
     uid: str,
@@ -453,8 +455,7 @@ async def attach_rendition(
     """Attach — or replace — the print master of an OWNED image, from a finished resumable upload.
 
     Takes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,
-    resumable, progress-reporting path every other upload in this app uses. The legacy multipart
-    `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
+    resumable, progress-reporting path every other upload in this app uses.
     """
     variant_key, label = _print_variant_key(body.variant_key)
     # UPLOAD BEFORE ATTACHMENT (MEMNG-267 R5). This route consumes the upload — it deletes the row

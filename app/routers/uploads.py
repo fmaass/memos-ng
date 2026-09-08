@@ -204,7 +204,7 @@ async def upload_capture(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> CaptureOut:
-    """What this upload's own metadata says about when it was captured (MEMNG-262).
+    """What this upload's own metadata says about when it was captured.
 
     NON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a
     composer may poll it while the person is still typing and then post the memo exactly as it

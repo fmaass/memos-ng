@@ -391,8 +391,7 @@ export interface paths {
          * @description Attach — or replace — the print master of an OWNED image, from a finished resumable upload.
          *
          *     Takes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,
-         *     resumable, progress-reporting path every other upload in this app uses. The legacy multipart
-         *     `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
+         *     resumable, progress-reporting path every other upload in this app uses.
          */
         post: operations["attach_rendition_api_attachments__uid__renditions_post"];
         delete?: never;
@@ -503,7 +502,7 @@ export interface paths {
          * Native Manage Grant
          * @description Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.
          *
-         *     This is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was
+         *     This is the only way a grant comes into existence: the code was
          *     minted by a fresh Authelia authentication minutes ago, and nothing a device already holds can
          *     produce one — a PAT cannot, and neither can an existing browser session. That is the whole
          *     point of a step-up: the capability to mint and revoke this account's tokens is bought with an
@@ -574,11 +573,11 @@ export interface paths {
          *     reinstalled — or simply restarted after a year — cannot tell the owner how long this phone has
          *     left or when it last spoke. This is the read that closes that, and it reaches no further than
          *     the credential making the request: a leaked token learns nothing it does not already hold, so
-         *     the route carries no security decision at all (MEMNG-138, option 5).
+         *     the route carries no security decision at all.
          *
          *     Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
-         *     browser session (Decision 5 / ADR-0015) — `/api/pats` is where a credential that names another
-         *     token lives; a bearer manages nothing but itself.
+         *     browser session — `/api/pats` is where a credential that names another token lives; a bearer
+         *     manages nothing but itself.
          */
         get: operations["native_token_api_auth_native_token_get"];
         put?: never;
@@ -1012,7 +1011,7 @@ export interface paths {
         };
         /**
          * Upload Capture
-         * @description What this upload's own metadata says about when it was captured (MEMNG-262).
+         * @description What this upload's own metadata says about when it was captured.
          *
          *     NON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a
          *     composer may poll it while the person is still typing and then post the memo exactly as it
@@ -1351,10 +1350,10 @@ export interface components {
         };
         /**
          * CreateRacedDetail
-         * @description Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the
-         *     memo they raced for was deleted before it could be read back. Retrying with the same key is
-         *     safe — that is what the key is for — which is why this is a 5xx the client may repeat and not
-         *     a 4xx telling it to stop.
+         * @description Why a keyed create could not be resolved: concurrent writes raced it and the memo they
+         *     raced for was deleted before it could be read back. Retrying with the same key is safe — that
+         *     is what the key is for — which is why this is a 5xx the client may repeat and not a 4xx
+         *     telling it to stop.
          */
         CreateRacedDetail: {
             /**
@@ -1667,7 +1666,7 @@ export interface components {
         DigestVisibilityScope: "PUBLIC" | "PUBLIC_PROTECTED";
         /**
          * EditKeyConflictDetail
-         * @description Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT
+         * @description Why a keyed edit was refused: this owner already used `edit_key` on a DIFFERENT
          *     memo. Both alternatives to refusing are wrong — replaying would answer a PATCH of one memo with
          *     another memo's body (a uid the client never asked about), and applying would leave one key
          *     naming two edits, after which neither could be replayed. `memo_uid` names the memo the key is
@@ -1691,7 +1690,7 @@ export interface components {
         };
         /**
          * EditRacedDetail
-         * @description Why a keyed edit could not be resolved (MEMNG-124): the write collided on the edit-key
+         * @description Why a keyed edit could not be resolved: the write collided on the edit-key
          *     constraint, and the edit it collided with was gone by the time it could be read back — the memo
          *     itself was deleted, taking its recorded edits with it. Retrying with the same key is safe (that
          *     is what the key is for) and self-correcting: the retry finds no memo and answers 404.
@@ -2266,14 +2265,11 @@ export interface components {
         };
         /**
          * UploadsUnlinkableDetail
-         * @description Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).
+         * @description Why a memo write was refused: the requested uploads cannot become attachments.
          *
-         *     A dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed
-         *     request — a retrying client has to tell "that upload is gone, re-upload the bytes" apart from
-         *     "this request is malformed, never send it again", and a body it cannot classify is how an outbox
-         *     loops forever. The two buckets carry different remedies: `missing` (never existed, or expired
-         *     and reaped — an upload owned by another user reads as missing too) needs a fresh upload;
-         *     `incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD.
+         *     The two buckets carry different remedies: `missing` (never existed, or expired and reaped — an
+         *     upload owned by another user reads as missing too) needs a fresh upload; `incomplete`
+         *     (bytes_received < declared size) needs the transfer resumed from HEAD.
          */
         UploadsUnlinkableDetail: {
             /**

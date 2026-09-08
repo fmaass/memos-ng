@@ -537,7 +537,7 @@
         "type": "object"
       },
       "CreateRacedDetail": {
-        "description": "Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the\nmemo they raced for was deleted before it could be read back. Retrying with the same key is\nsafe \u2014 that is what the key is for \u2014 which is why this is a 5xx the client may repeat and not\na 4xx telling it to stop.",
+        "description": "Why a keyed create could not be resolved: concurrent writes raced it and the memo they\nraced for was deleted before it could be read back. Retrying with the same key is safe \u2014 that\nis what the key is for \u2014 which is why this is a 5xx the client may repeat and not a 4xx\ntelling it to stop.",
         "properties": {
           "code": {
             "const": "create_raced",
@@ -1170,7 +1170,7 @@
         "type": "string"
       },
       "EditKeyConflictDetail": {
-        "description": "Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT\nmemo. Both alternatives to refusing are wrong \u2014 replaying would answer a PATCH of one memo with\nanother memo's body (a uid the client never asked about), and applying would leave one key\nnaming two edits, after which neither could be replayed. `memo_uid` names the memo the key is\nbound to so a client can tell a stale key apart from a mis-generated one. Retrying is pointless:\nthe fix is a fresh key, which is why this is a 4xx and not the 503 a raced edit gets.",
+        "description": "Why a keyed edit was refused: this owner already used `edit_key` on a DIFFERENT\nmemo. Both alternatives to refusing are wrong \u2014 replaying would answer a PATCH of one memo with\nanother memo's body (a uid the client never asked about), and applying would leave one key\nnaming two edits, after which neither could be replayed. `memo_uid` names the memo the key is\nbound to so a client can tell a stale key apart from a mis-generated one. Retrying is pointless:\nthe fix is a fresh key, which is why this is a 4xx and not the 503 a raced edit gets.",
         "properties": {
           "code": {
             "const": "edit_key_conflict",
@@ -1207,7 +1207,7 @@
         "type": "object"
       },
       "EditRacedDetail": {
-        "description": "Why a keyed edit could not be resolved (MEMNG-124): the write collided on the edit-key\nconstraint, and the edit it collided with was gone by the time it could be read back \u2014 the memo\nitself was deleted, taking its recorded edits with it. Retrying with the same key is safe (that\nis what the key is for) and self-correcting: the retry finds no memo and answers 404.",
+        "description": "Why a keyed edit could not be resolved: the write collided on the edit-key\nconstraint, and the edit it collided with was gone by the time it could be read back \u2014 the memo\nitself was deleted, taking its recorded edits with it. Retrying with the same key is safe (that\nis what the key is for) and self-correcting: the retry finds no memo and answers 404.",
         "properties": {
           "code": {
             "const": "edit_raced",
@@ -2429,7 +2429,7 @@
         "type": "object"
       },
       "UploadsUnlinkableDetail": {
-        "description": "Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).\n\nA dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed\nrequest \u2014 a retrying client has to tell \"that upload is gone, re-upload the bytes\" apart from\n\"this request is malformed, never send it again\", and a body it cannot classify is how an outbox\nloops forever. The two buckets carry different remedies: `missing` (never existed, or expired\nand reaped \u2014 an upload owned by another user reads as missing too) needs a fresh upload;\n`incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD.",
+        "description": "Why a memo write was refused: the requested uploads cannot become attachments.\n\nThe two buckets carry different remedies: `missing` (never existed, or expired and reaped \u2014 an\nupload owned by another user reads as missing too) needs a fresh upload; `incomplete`\n(bytes_received < declared size) needs the transfer resumed from HEAD.",
         "properties": {
           "code": {
             "const": "uploads_unlinkable",
@@ -3593,7 +3593,7 @@
         ]
       },
       "post": {
-        "description": "Attach \u2014 or replace \u2014 the print master of an OWNED image, from a finished resumable upload.\n\nTakes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,\nresumable, progress-reporting path every other upload in this app uses. The legacy multipart\n`/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).",
+        "description": "Attach \u2014 or replace \u2014 the print master of an OWNED image, from a finished resumable upload.\n\nTakes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,\nresumable, progress-reporting path every other upload in this app uses.",
         "operationId": "attach_rendition_api_attachments__uid__renditions_post",
         "parameters": [
           {
@@ -3844,7 +3844,7 @@
     },
     "/api/auth/native/manage-grant": {
       "post": {
-        "description": "Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.\n\nThis is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was\nminted by a fresh Authelia authentication minutes ago, and nothing a device already holds can\nproduce one \u2014 a PAT cannot, and neither can an existing browser session. That is the whole\npoint of a step-up: the capability to mint and revoke this account's tokens is bought with an\nauthentication, never with a token.\n\nAnonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the\nauthority, and the request carries no ambient authority a browser could be tricked into\nattaching. A `login` code is refused here \u2014 see `_redeem_handoff_code` for why that refusal\ndoes not burn it.",
+        "description": "Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.\n\nThis is the only way a grant comes into existence: the code was\nminted by a fresh Authelia authentication minutes ago, and nothing a device already holds can\nproduce one \u2014 a PAT cannot, and neither can an existing browser session. That is the whole\npoint of a step-up: the capability to mint and revoke this account's tokens is bought with an\nauthentication, never with a token.\n\nAnonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the\nauthority, and the request carries no ambient authority a browser could be tricked into\nattaching. A `login` code is refused here \u2014 see `_redeem_handoff_code` for why that refusal\ndoes not burn it.",
         "operationId": "native_manage_grant_api_auth_native_manage_grant_post",
         "requestBody": {
           "content": {
@@ -3916,7 +3916,7 @@
     },
     "/api/auth/native/token": {
       "get": {
-        "description": "The presenting device token's own row, and only that one.\n\nA device knows its expiry from the mint response and nowhere else, which means an app that was\nreinstalled \u2014 or simply restarted after a year \u2014 cannot tell the owner how long this phone has\nleft or when it last spoke. This is the read that closes that, and it reaches no further than\nthe credential making the request: a leaked token learns nothing it does not already hold, so\nthe route carries no security decision at all (MEMNG-138, option 5).\n\nBearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a\nbrowser session (Decision 5 / ADR-0015) \u2014 `/api/pats` is where a credential that names another\ntoken lives; a bearer manages nothing but itself.",
+        "description": "The presenting device token's own row, and only that one.\n\nA device knows its expiry from the mint response and nowhere else, which means an app that was\nreinstalled \u2014 or simply restarted after a year \u2014 cannot tell the owner how long this phone has\nleft or when it last spoke. This is the read that closes that, and it reaches no further than\nthe credential making the request: a leaked token learns nothing it does not already hold, so\nthe route carries no security decision at all.\n\nBearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a\nbrowser session \u2014 `/api/pats` is where a credential that names another token lives; a bearer\nmanages nothing but itself.",
         "operationId": "native_token_api_auth_native_token_get",
         "responses": {
           "200": {
@@ -5593,7 +5593,7 @@
     },
     "/api/uploads/{upload_uid}/capture": {
       "get": {
-        "description": "What this upload's own metadata says about when it was captured (MEMNG-262).\n\nNON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a\ncomposer may poll it while the person is still typing and then post the memo exactly as it\nwould have without it. Owner-scoped through the same `_get_upload` as every other verb, so\nanother owner's uid answers with the same 404 as one that never existed.\n\nIt may still WRITE \u2014 once. `ensure_capture` performs the read the completing append normally\ndoes, for the two cases that append cannot cover: a session that finished before this feature\nshipped, and a zero-byte file, which is complete without an append at all. The row lock makes\nthat exactly-once, and every later poll is a plain read.",
+        "description": "What this upload's own metadata says about when it was captured.\n\nNON-CONSUMING and idempotent: it finalizes nothing, deletes nothing and moves nothing, so a\ncomposer may poll it while the person is still typing and then post the memo exactly as it\nwould have without it. Owner-scoped through the same `_get_upload` as every other verb, so\nanother owner's uid answers with the same 404 as one that never existed.\n\nIt may still WRITE \u2014 once. `ensure_capture` performs the read the completing append normally\ndoes, for the two cases that append cannot cover: a session that finished before this feature\nshipped, and a zero-byte file, which is complete without an append at all. The row lock makes\nthat exactly-once, and every later poll is a plain read.",
         "operationId": "upload_capture_api_uploads__upload_uid__capture_get",
         "parameters": [
           {
