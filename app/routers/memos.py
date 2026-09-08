@@ -9,6 +9,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -727,6 +728,30 @@ async def create_memo(
             # closure is the only way to sit between those two steps without the router owning the
             # insert.
             async def finalize_uploads(memo: Memo) -> list[str]:
+                # The ids behind the back-compat `attachment_uids`, resolved UNLOCKED and handed to
+                # pass 0 so its ONE ascending attachment acquisition covers them too (MEMNG-267
+                # R3.4). `link_attachments` takes these rows a moment later; without them in pass 0
+                # that is a SECOND acquisition of the attachment class in this transaction, in an
+                # order nothing else shares — and R7a's sweep, which takes its terminal attachments
+                # ascending, inverts against exactly that. Owner-scoped exactly as
+                # `link_attachments`' own predicate is, so a uid this caller does not own resolves
+                # to nothing here and is skipped there, as it always was. The read DECIDES nothing:
+                # a row that disappears before the lock is simply not locked, and link_attachments
+                # then finds it gone and skips it.
+                named_ids = (
+                    list(
+                        (
+                            await db.execute(
+                                select(Attachment.id).where(
+                                    Attachment.uid.in_(body.attachment_uids),
+                                    Attachment.owner_id == owner_id,
+                                )
+                            )
+                        ).scalars()
+                    )
+                    if body.attachment_uids
+                    else []
+                )
                 # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
                 # of this memo, and must be answered as the mistake it is rather than dropped in
                 # silence because the batch looked empty.
@@ -740,6 +765,7 @@ async def create_memo(
                         poster_copies_out=poster_copies,
                         consumed_out=consumed,
                         positions_out=positions,
+                        named_attachment_ids=named_ids,
                     )
                     if body.upload_uids or body.video_posters
                     else []

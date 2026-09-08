@@ -1,0 +1,14 @@
+--- a/app/services/uploads.py
++++ b/app/services/uploads.py
+@@ -927,8 +927,9 @@
+     for up_uid in upload_uids:
+         upload = locked_uploads.get(up_uid)
+         if upload is None:
+-            missing.append(up_uid)
+-            continue
++            # MUTATION c5b_merge_answers: ONE continuation for every absent upload, the poster
++            # one. This is the merge R4a forbids, and C5b is the probe that must see it.
++            raise VideoPostersInvalid([VideoPosterProblem(up_uid, up_uid, "poster_missing")])
+         part = part_path(up_uid)
+         if not await to_thread.run_sync(_is_complete_sync, part, upload.declared_size):
+             incomplete.append(up_uid)

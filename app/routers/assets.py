@@ -457,9 +457,44 @@ async def attach_rendition(
     `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
     """
     variant_key, label = _print_variant_key(body.variant_key)
-    # Take the attachment's row lock FIRST and read its rendition state THROUGH it. The placement
-    # below decides from the master this photo currently has, and the post-commit sweep unlinks the
-    # file that decision displaced — so a request that WAITED on this lock must not decide from the
+    # UPLOAD BEFORE ATTACHMENT (MEMNG-267 R5). This route consumes the upload — it deletes the row
+    # at the end — so taking the attachment first meant holding A while waiting for U, against
+    # every finalize, which holds U and then waits for A. The two orders are a cycle; this one is
+    # the protocol's.
+    #
+    # The unlocked read comes first all the same, and only to answer the 404/400 the API answers
+    # today: a request for somebody else's photo, or for a video, must not be able to queue on an
+    # upload lock, and the error precedence the clients see must not change. Nothing is DECIDED
+    # from it — every value the placement acts on is re-read through the locks below.
+    # COLUMNS, not the entity: `renditions` is selectin-loaded, and loading the entity here would
+    # read the rendition state before the lock is taken — the very thing this route must not do.
+    # These two columns settle the 404 and the 400 and decide nothing else.
+    precheck = (
+        await db.execute(
+            select(Attachment.owner_id, Attachment.mime).where(Attachment.uid == uid)
+        )
+    ).first()
+    if precheck is None or precheck.owner_id != user.id:  # OWNER-only: a mutation, unlike viewing
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if not precheck.mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Print masters are for images only")
+    # Scoped to the caller like every other upload verb, so another user's session answers exactly
+    # as an unknown uid does — and LOCKED, because this request will delete it. A row that vanished
+    # while this call waited was consumed by whoever got there first, and a consumed session
+    # answers exactly as an unknown uid does.
+    upload = (
+        await db.execute(
+            select(Upload)
+            .where(Upload.upload_uid == body.upload_uid, Upload.owner_id == user.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    # Now the attachment's row lock, and its rendition state read THROUGH it. The placement below
+    # decides from the master this photo currently has, and the post-commit sweep unlinks the file
+    # that decision displaced — so a request that WAITED on this lock must not decide from the
     # state it read before waiting: that stale decision would reap the file the winner just made
     # current. `renditions` is selectin-loaded, i.e. a follow-up query issued once the lock is
     # granted, and populate_existing overwrites anything this session already held.
@@ -471,19 +506,8 @@ async def attach_rendition(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if att is None or att.owner_id != user.id:  # OWNER-only: a mutation, unlike viewing
+    if att is None or att.owner_id != user.id:  # deleted or handed on while this call waited
         raise HTTPException(status_code=404, detail="Attachment not found")
-    if not att.mime.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Print masters are for images only")
-    # Scoped to the caller like every other upload verb, so another user's session answers exactly
-    # as an unknown uid does.
-    upload = (
-        await db.execute(
-            select(Upload).where(Upload.upload_uid == body.upload_uid, Upload.owner_id == user.id)
-        )
-    ).scalar_one_or_none()
-    if upload is None:
-        raise HTTPException(status_code=404, detail="Upload not found")
     data_root = Path(settings.DATA_ROOT)
     # A master of a photo that lives in a memo files into that memo's folder beside the screen
     # master, under its own filename; an unlinked photo stages in _unfiled/ exactly like the ingest
