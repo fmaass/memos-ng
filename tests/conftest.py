@@ -87,6 +87,35 @@ def _reset_rate_limit():
 
 
 @pytest.fixture
+def frozen_rate_limit_clock(monkeypatch):
+    """Pin the clock `auth.rate_limit()` reads, and hand the test the instant it is pinned to.
+
+    The limiter's window is 60 seconds of REAL time, so a burst test that stalls between filling
+    the bucket and asserting the refusal — a loaded box, a debugger, a swapped-out host — would
+    watch its own bucket expire and read a correct 429 as a 400. With the clock pinned the window
+    cannot advance at all, so only the request COUNT can decide the outcome.
+
+    Only `app.auth`'s reference to the module is replaced, and only `monotonic` differs on it:
+    every other attribute is the real `time`, and no other module's notion of time changes.
+    """
+    import time as real_time
+
+    from app import auth
+
+    frozen = 1_000_000.0
+
+    class FrozenClock:
+        def monotonic(self) -> float:
+            return frozen
+
+        def __getattr__(self, name: str):
+            return getattr(real_time, name)
+
+    monkeypatch.setattr(auth, "time", FrozenClock())
+    return frozen
+
+
+@pytest.fixture
 def split_assets_mount(monkeypatch):
     """Reproduce the deployed storage layout, which no test box has: `<DATA_ROOT>/assets` (the
     derived tiers, on NVMe) is a SEPARATE filesystem sitting inside `<DATA_ROOT>` (originals and

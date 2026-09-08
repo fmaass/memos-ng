@@ -411,6 +411,48 @@ async def test_two_concurrent_exchanges_mint_exactly_one_token(native_oidc):
     assert _sql("SELECT count(*) FROM pats WHERE name = :n", n=device)[0][0] == 1
 
 
+# `TestClient`'s default peer address, and therefore the limiter's bucket key for every
+# request these tests make.
+TESTCLIENT_HOST = "testclient"
+
+
+def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, frozen_rate_limit_clock):
+    """The same `rate_limit()` dependency the login legs carry, on the route that mints the token.
+
+    Defence in depth rather than a live hole — a handoff code is single-use, 120-second and
+    PKCE-bound — but this endpoint is anonymous and pays out a year-long device token, so it gets
+    the parity `/api/auth/login` and `/api/auth/callback` already have. The limiter is a
+    dependency, so it answers BEFORE the handler: a burst is refused with its own 429, while an
+    exchange still inside the window is untouched.
+
+    The clock the limiter reads is pinned for the whole case, so the window cannot expire
+    between filling the bucket and asking for the refusal: the outcome depends on the request
+    count and nothing else.
+    """
+    client, _ = native_oidc
+    code = _handoff_code(client)
+    # The login leg that minted the code shares the caller's bucket; burst from empty.
+    auth._RL.clear()
+
+    for _ in range(19):  # one short of rate_limit()'s default limit of 20
+        refused = _exchange(client, "not-a-code-anyone-ever-minted")
+        assert refused.status_code == 400, refused.text
+
+    # Still under the limit: a genuine exchange answers exactly as it did before the limiter.
+    minted = _exchange(client, code)
+    assert minted.status_code == 200, minted.text
+    assert minted.json()["token"]
+
+    over = _exchange(client, "not-a-code-anyone-ever-minted")
+    assert over.status_code == 429, over.text
+    assert over.json()["detail"] == "Too many requests"
+
+    # The pin really reached the limiter: twenty stamps, every one of them the frozen instant —
+    # the refusal above was decided by the request COUNT, with a window that never advanced.
+    assert set(auth._RL[TESTCLIENT_HOST]) == {frozen_rate_limit_clock}
+    assert len(auth._RL[TESTCLIENT_HOST]) == 20
+
+
 # --- a device token may revoke itself, and nothing else ---------------------------------------
 
 

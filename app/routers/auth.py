@@ -260,7 +260,9 @@ async def _redeem_handoff_code(
 
 @router.post("/native/exchange", response_model=NativeExchangeOut)
 async def native_exchange(
-    body: NativeExchangeIn, db: AsyncSession = Depends(get_session)
+    body: NativeExchangeIn,
+    db: AsyncSession = Depends(get_session),
+    _: None = Depends(auth.rate_limit()),
 ) -> NativeExchangeOut:
     """Trade a handoff code plus its PKCE verifier for a device PAT.
 
@@ -278,7 +280,7 @@ async def native_exchange(
     # Bounded, unlike a PAT minted from the SPA with no expiry: a device token lives on hardware
     # that gets lost, and nobody revokes what they have not noticed is gone.
     expires_at = datetime.now(UTC) + timedelta(days=settings.NATIVE_TOKEN_DAYS)
-    _, token = await pats_svc.create_pat(db, user, claim.device_name, expires_at=expires_at)
+    _pat, token = await pats_svc.create_pat(db, user, claim.device_name, expires_at=expires_at)
     await db.commit()
     return _native_token_response(user, token, expires_at)
 
@@ -297,7 +299,9 @@ class ManageGrantOut(BaseModel):
 
 @router.post("/native/manage-grant", response_model=ManageGrantOut)
 async def native_manage_grant(
-    body: NativeExchangeIn, db: AsyncSession = Depends(get_session)
+    body: NativeExchangeIn,
+    db: AsyncSession = Depends(get_session),
+    _: None = Depends(auth.rate_limit()),
 ) -> ManageGrantOut:
     """Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.
 
@@ -316,7 +320,7 @@ async def native_manage_grant(
     """
     # Why the refusal cannot burn the code: the purpose is a parameter of the atomic consume inside
     # `_redeem_handoff_code`, so a code minted for the login lane never matches here.
-    user, _ = await _redeem_handoff_code(db, body, native_auth.PURPOSE_MANAGE)
+    user, _claim = await _redeem_handoff_code(db, body, native_auth.PURPOSE_MANAGE)
     grant, expires_at = await management_grant.mint_grant(db, user)
     await db.commit()
     return ManageGrantOut(grant=grant, expires_at=expires_at)
