@@ -171,15 +171,17 @@ class MemoOut(BaseModel):
 IdempotencyKey = Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
+# A dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed
+# request — a retrying client has to tell "that upload is gone, re-upload the bytes" apart from
+# "this request is malformed, never send it again", and a body it cannot classify is how an outbox
+# loops forever.
 class UploadsUnlinkableDetail(BaseModel):
-    """Why a memo write was refused: the requested uploads cannot become attachments (MEMNG-113).
+    """Why a memo write was refused: the requested uploads cannot become attachments.
 
-    A dedicated 409 with a machine-readable `code`, NOT the 422 FastAPI already uses for a malformed
-    request — a retrying client has to tell "that upload is gone, re-upload the bytes" apart from
-    "this request is malformed, never send it again", and a body it cannot classify is how an outbox
-    loops forever. The two buckets carry different remedies: `missing` (never existed, or expired
-    and reaped — an upload owned by another user reads as missing too) needs a fresh upload;
-    `incomplete` (bytes_received < declared size) needs the transfer resumed from HEAD."""
+    The two buckets carry different remedies: `missing_upload_uids` (never existed, or expired and
+    reaped — an upload owned by another user reads as missing too) need a fresh upload;
+    `incomplete_upload_uids` (fewer bytes received than the declared size) need the transfer
+    resumed from HEAD."""
 
     code: Literal["uploads_unlinkable"]  # required, not defaulted: generated clients switch on it
     missing_upload_uids: list[str]
@@ -191,10 +193,10 @@ class UploadsUnlinkableError(BaseModel):
 
 
 class CreateRacedDetail(BaseModel):
-    """Why a keyed create could not be resolved (MEMNG-110): concurrent writes raced it and the
-    memo they raced for was deleted before it could be read back. Retrying with the same key is
-    safe — that is what the key is for — which is why this is a 5xx the client may repeat and not
-    a 4xx telling it to stop."""
+    """Why a keyed create could not be resolved: concurrent writes raced it and the memo they
+    raced for was deleted before it could be read back. Retrying with the same key is safe — that
+    is what the key is for — which is why this is a 5xx the client may repeat and not a 4xx
+    telling it to stop."""
 
     code: Literal["create_raced"]
     message: str
@@ -205,7 +207,7 @@ class CreateRacedError(BaseModel):
 
 
 class EditKeyConflictDetail(BaseModel):
-    """Why a keyed edit was refused (MEMNG-124): this owner already used `edit_key` on a DIFFERENT
+    """Why a keyed edit was refused: this owner already used `edit_key` on a DIFFERENT
     memo. Both alternatives to refusing are wrong — replaying would answer a PATCH of one memo with
     another memo's body (a uid the client never asked about), and applying would leave one key
     naming two edits, after which neither could be replayed. `memo_uid` names the memo the key is
@@ -222,7 +224,7 @@ class EditKeyConflictError(BaseModel):
 
 
 class EditRacedDetail(BaseModel):
-    """Why a keyed edit could not be resolved (MEMNG-124): the write collided on the edit-key
+    """Why a keyed edit could not be resolved: the write collided on the edit-key
     constraint, and the edit it collided with was gone by the time it could be read back — the memo
     itself was deleted, taking its recorded edits with it. Retrying with the same key is safe (that
     is what the key is for) and self-correcting: the retry finds no memo and answers 404."""
@@ -505,7 +507,7 @@ async def list_memos(
         list[str] | None,
         Query(
             description=(
-                "Filter to memos owned by the named household members (`User.subject`, as "
+                "Filter to memos owned by the named household members (`subject`, as "
                 "published by `GET /api/members`). Repeatable, and repeating it ORs: "
                 "`?owner=alice&owner=bob` returns the union of what alice and bob wrote that "
                 "the caller may see, never a memo of anyone else's, and never a memo of "

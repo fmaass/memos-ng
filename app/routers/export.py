@@ -257,7 +257,7 @@ async def export_photobook(
 
     **Requesting a book schedules it.** Both formats enqueue a print rendition for every member
     that lacks a current one, so the first request starts the work and later requests report on it;
-    the enqueue is idempotent, so polling costs nothing (app/services/photobook.py:build).
+    the enqueue is idempotent, so polling costs nothing.
 
     `format=manifest` (the default) answers with one record per photo — the name it will carry in
     the archive, whether its rendition is `ready`/`pending`/`failed`/`unavailable`, its pixel size,

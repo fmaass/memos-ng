@@ -592,8 +592,9 @@ class DigestRunStatus(enum.StrEnum):
     failed = "failed"
 
 
+# The default is the digest design's choice (3285 §9).
 class DigestVisibilityScope(enum.StrEnum):
-    """Which memos a digest may mail. `PUBLIC_PROTECTED` is the default (design 3285 §9)."""
+    """Which memos a digest may mail. `PUBLIC_PROTECTED` is the default."""
 
     PUBLIC = "PUBLIC"
     PUBLIC_PROTECTED = "PUBLIC_PROTECTED"

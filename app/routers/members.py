@@ -17,9 +17,9 @@ class MemberOut(BaseModel):
 
     A deliberate subset of `UserOut`: `email` and `role` are the account's own business and no
     client needs them to draw a filter row, so they are not published about OTHER people here.
-    `avatar` is whatever the settings feature stores — a `data:image/…` URL (app/routers/settings.py
-    accepts nothing else, capped at 256 KB) or, for an account carried over from old memos, the
-    path string that came with it (app/models.py) — and null for a member who never set one. It is
+    `avatar` is whatever the settings feature stores — a `data:image/…` URL (nothing else is
+    accepted, capped at 256 KB) or, for an account carried over from old memos, the path string
+    that came with it — and null for a member who never set one. It is
     passed through verbatim rather than normalised, so the value a client renders for a member is
     the same one `/api/auth/user` hands that member for themselves.
     """
@@ -37,9 +37,9 @@ async def list_members(
     """Every member of the household, for the client-side "whose memos?" filter.
 
     ASSUMPTION, and the reason this route needs no scoping argument: this is a single-household
-    instance — every row in `users` is a member of the one household, so membership needs no
-    column to express it. A multi-tenant deployment would have to add one and filter here; nothing
-    in the schema records tenancy today.
+    instance — every account that exists is a member of the one household, so membership needs
+    nothing to express it. A multi-tenant deployment would have to record tenancy and filter here;
+    nothing in this API expresses it today.
 
     Everyone who can authenticate sees the whole roster, and it deliberately does NOT depend on
     what the caller can read: a member who has posted nothing, or only PRIVATE memos, still appears

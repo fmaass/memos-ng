@@ -268,7 +268,8 @@ async def native_exchange(
     would be circular. It is also cookie-free, which is what keeps CSRF out of the picture: the
     request carries no ambient authority a browser could be tricked into attaching.
 
-    Only a `login` code is redeemable here. A management code presented to this route is refused
+    Only a code minted for the login lane is redeemable here. A management code presented to this
+    route is refused
     like any unknown one (and left unburned): the two lanes ask Authelia for the same thing but buy
     very different credentials, and a manage code spent here would hand a year-long device token to
     a flow that asked for ten minutes of token management.
@@ -300,7 +301,7 @@ async def native_manage_grant(
 ) -> ManageGrantOut:
     """Trade a MANAGEMENT handoff code plus its PKCE verifier for a short-lived management grant.
 
-    This is the only way a grant comes into existence (MEMNG-138 option 2, ADR-0015): the code was
+    This is the only way a grant comes into existence: the code was
     minted by a fresh Authelia authentication minutes ago, and nothing a device already holds can
     produce one — a PAT cannot, and neither can an existing browser session. That is the whole
     point of a step-up: the capability to mint and revoke this account's tokens is bought with an
@@ -308,9 +309,13 @@ async def native_manage_grant(
 
     Anonymous by construction, exactly like `/native/exchange`: the code and the verifier ARE the
     authority, and the request carries no ambient authority a browser could be tricked into
-    attaching. A `login` code is refused here — see `_redeem_handoff_code` for why that refusal
-    does not burn it.
+    attaching. A code minted for the login lane is refused here, and that refusal does not burn
+    it: the purpose is
+    part of the atomic match, so a code minted for the other lane matches nothing and stays
+    redeemable on the route it was minted for.
     """
+    # Why the refusal cannot burn the code: the purpose is a parameter of the atomic consume inside
+    # `_redeem_handoff_code`, so a code minted for the login lane never matches here.
     user, _ = await _redeem_handoff_code(db, body, native_auth.PURPOSE_MANAGE)
     grant, expires_at = await management_grant.mint_grant(db, user)
     await db.commit()
@@ -351,6 +356,11 @@ async def _renew_rejection(db: AsyncSession, hashed_token: str) -> HTTPException
     return HTTPException(status_code=401, detail="Invalid or revoked token")
 
 
+# One rule governs this whole self-service block, and the exported descriptions state it as
+# behaviour rather than pointing at where it was decided (Decision 5, ADR-0015): a bearer may act
+# on nothing but the token it presents — renew it, revoke it, read it — while token management
+# proper (minting, naming or revoking ANOTHER device's token) takes what `require_session_or_grant`
+# accepts — a browser session or a step-up management grant — and never a bearer.
 @router.post("/native/renew", response_model=NativeExchangeOut)
 async def native_renew(
     request: Request,
@@ -368,11 +378,13 @@ async def native_renew(
     same statement, so a token copied out of a backup or a log stops working at the owner's next
     renewal instead of living the full year twice over.
 
-    Restricted to a token that carries an expiry. `pats` has no column that tells a device token
-    from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
-    only a token that expires can silently sign out, so an unbounded PAT is refused
-    (`token_not_renewable`) rather than rotated: token management stays behind a browser session
-    (Decision 5), and this route reaches no further than the class it exists for.
+    Restricted to a token that carries an expiry. Nothing marks a device token as one — carrying
+    an `expires_at` is the only thing that distinguishes it from a token the SPA minted, and only
+    imperfectly — and only a token that expires can silently sign out, so an unbounded PAT is
+    refused
+    (`token_not_renewable`) rather than rotated: token management proper takes a browser session or
+    a step-up management grant, never the token being presented, and this route reaches no further
+    than the class it exists for.
 
     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
     session cookie names no token at all.
@@ -415,11 +427,11 @@ async def native_logout(
 ) -> None:
     """Revoke the presenting device token, and only that one.
 
-    A bearer may revoke ITSELF and nothing else (Decision 5): the rest of token management stays
-    behind a browser session, so a leaked device token can neither mint successors that outlive its
-    revocation nor take another device offline. A session cookie is refused here for the same
-    reason from the other side — the SPA revokes through `/api/pats/{id}`, which knows which token
-    it is talking about.
+    A bearer may revoke ITSELF and nothing else: the rest of token management takes a browser
+    session or a step-up management grant obtained through the native login, never a token, so a
+    leaked device token can neither mint successors that outlive its revocation nor take another
+    device offline. A session cookie is refused here for the same reason from the other side — the
+    SPA revokes through `/api/pats/{pat_id}`, which knows which token it is talking about.
     """
     hashed_token = presenting_token_hash(request)
     await db.execute(
@@ -431,10 +443,10 @@ async def native_logout(
 class NativeTokenOut(BaseModel):
     """What a device may learn about the credential it is already holding.
 
-    No `id`, no `hashed_token`, and never the plaintext: this row is the answer to "how long does
+    No `id`, no stored hash, and never the plaintext: this row is the answer to "how long does
     this token have, and when did I last use it", not a second copy of the secret. Withholding the
-    id also keeps the shape honest about Decision 5 — there is no sibling here to act on, so there
-    is no handle to act with.
+    id also keeps the shape honest: a device acts on no token but the one it presents, so there is
+    no sibling here to act on and no handle to act with.
     """
 
     name: str
@@ -477,10 +489,10 @@ async def native_token(
     reinstalled — or simply restarted after a year — cannot tell the owner how long this phone has
     left or when it last spoke. This is the read that closes that, and it reaches no further than
     the credential making the request: a leaked token learns nothing it does not already hold, so
-    the route carries no security decision at all (MEMNG-138, option 5).
+    the route carries no security decision at all.
 
-    Bearer-only, like `native/logout` and `native/renew`. Token management proper stays behind a
-    browser session (Decision 5 / ADR-0015) — `/api/pats` is where a credential that names another
+    Bearer-only, like `native/logout` and `native/renew`. Token management proper takes a browser
+    session or a step-up management grant — `/api/pats` is where a credential that names another
     token lives; a bearer manages nothing but itself.
     """
     hashed_token = presenting_token_hash(request)

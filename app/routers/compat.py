@@ -206,7 +206,7 @@ async def file_visible(db: AsyncSession, user: User | None, uid: str) -> bool:
 
 @router.get("/file/attachments/{uid}/{filename}")
 async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail: bool = False):
-    """Derived tiers only (F2): ?thumbnail=true → thumb, mobile UA → mobile, video → web.
+    """Derived tiers only: ?thumbnail=true → thumb, mobile UA → mobile, video → web.
     The original path stays 404, as prod is today. Visibility-gated like the memo surfaces:
     anonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's
     visible set, and anything else (private, orphaned, deleted) is 404 — never 403, so the

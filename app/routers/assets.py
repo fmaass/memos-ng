@@ -287,8 +287,8 @@ async def list_attachments(
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
     filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
-    memo it does hang on. Another user's PRIVATE or orphan media is excluded — mirrors `_viewable`
-    / memo visibility. ?order=asc walks the same library oldest-first.
+    memo it does hang on. Another user's PRIVATE or orphan media is excluded — the same visibility
+    rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
 
     Paged by keyset, like the memo feed: when more rows follow, the response carries an
     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -443,6 +443,8 @@ class RenditionAttach(BaseModel):
     variant_key: str | None = None  # absent (only) → the bare `print`
 
 
+# The legacy multipart `/print` route, which writes the separate print_path column, is untouched
+# by this one and is retired separately.
 @router.post("/attachments/{uid}/renditions", response_model=AttachmentMeta, status_code=201)
 async def attach_rendition(
     uid: str,
@@ -453,8 +455,7 @@ async def attach_rendition(
     """Attach — or replace — the print master of an OWNED image, from a finished resumable upload.
 
     Takes an upload_uid rather than a multipart body so a multi-hundred-MB master gets the chunked,
-    resumable, progress-reporting path every other upload in this app uses. The legacy multipart
-    `/print` route, which writes the separate print_path column, is untouched (MEMNG-51 retires it).
+    resumable, progress-reporting path every other upload in this app uses.
     """
     variant_key, label = _print_variant_key(body.variant_key)
     # UPLOAD BEFORE ATTACHMENT (MEMNG-267 R5). This route consumes the upload — it deletes the row
@@ -709,8 +710,8 @@ async def upload_print(
     file: UploadFile,
 ) -> AttachmentMeta:
     """Attach a print-quality master to an OWNED image attachment (a separate Lightroom print
-    export — see ADR web/print renditions). The web rendition keeps displaying; this file is
-    hidden from the feed and download-only via the `print` tier."""
+    export). The web rendition keeps displaying; this file is hidden from the feed and
+    download-only via the `print` tier."""
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")

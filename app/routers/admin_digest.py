@@ -78,10 +78,11 @@ class DigestSettingsOut(BaseModel):
     updated_by: str | None
 
 
+# One Save bar for the whole panel is the digest design's shape (3285 §6).
 class DigestSettingsPut(BaseModel):
     """The WHOLE settings row, not a patch.
 
-    The panel edits these fields behind one Save bar (design 3285 §6), so the request that Save
+    The panel edits these fields behind one Save bar, so the request that Save
     sends IS the new state — which also means a field the client omits is a client bug rather than
     "leave it alone", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:
     they exist so a typo cannot arm something absurd, and the admin stays free inside them.
@@ -156,7 +157,7 @@ class DigestRecipientPatch(BaseModel):
     """Partial by design — the panel toggles `enabled` on its own, without resending the name.
 
     An omitted field is "leave it alone" and is told apart from an explicit `null` (which clears
-    the display name) by `model_fields_set`, not by the value.
+    the display name) by whether the key is present at all, not by the value.
     """
 
     # Bounded like `DigestRecipientCreate.display_name`, and for a reason a request schema must
@@ -199,9 +200,11 @@ class DigestRunClaimOut(BaseModel):
     """The answer to `POST /run`: a run row exists and nothing has executed it yet.
 
     Three fields and no aggregates, because at this instant there are none to report — the row is
-    the CLAIM, and everything else about it is read back from `GET /runs/{id}` (which the response
-    `Location` header names). `status` is always null here: NULL means "in flight", and a run that
-    already had an outcome would not be something this endpoint could have just opened.
+    the CLAIM, and everything else about it is read back from
+    `GET /api/admin/digest/runs/{run_id}` (which the response `Location` header names).
+
+    `status` is always null here: NULL means "in flight", and a run that already had an outcome
+    would not be something this endpoint could have just opened.
     """
 
     id: int
@@ -368,14 +371,14 @@ async def put_digest_settings(
     admin: Annotated[User, Depends(auth.require_admin)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> DigestSettingsOut:
-    """Update the one settings row. There is no create path here, deliberately: `CHECK (id = 1)`
-    plus a router that only ever UPDATEs is what makes a second row impossible.
+    """Update the one settings row. There is no create path here, deliberately: the database allows
+    exactly one row and this router only ever UPDATEs it, so a second one is impossible.
 
     The row is taken FOR UPDATE for the whole request, not because a fresh read is needed but
     because arming is a check-then-act: two overlapping requests, one arming the digest and one
     disabling the last recipient, would each see the other's pre-state and both pass, leaving an
-    armed digest with nobody to send to. `_refuse_leaving_nobody_to_send_to` locks the same one row
-    in the same order, so the two paths serialize against each other and cannot deadlock.
+    armed digest with nobody to send to. Disabling a recipient locks that same one row in the same
+    order, so the two paths serialize against each other and cannot deadlock.
     """
     row = await _settings_row(db, for_update=True)
     if body.enabled:
@@ -536,8 +539,8 @@ async def list_digest_runs(
     first N" can never reach the rest of the history. When more rows follow, `nextCursor` is
     non-null; resend it as `?cursor=` for the page after.
 
-    Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (the import
-    row is stamped by the same `now()` as anything else committed in that transaction), and an
+    Ordered by `started_at` DESC and then `id` DESC: two runs can share a start instant (an
+    imported row is stamped with the same instant as anything else committed beside it), and an
     unstable order would make the table shuffle between refreshes — and would make a keyset cursor
     skip or repeat rows, which is worse than shuffling.
 
@@ -719,7 +722,7 @@ async def test_send_digest(
 
     The destination comes from the authenticated session, never from a request field: an endpoint
     that took an address would be an open relay for anyone who reached it, and it would let a probe
-    reach `digest_recipients`. It performs no Dropbox upload either — it renders with whatever
+    mail the configured recipients. It performs no Dropbox upload either — it renders with whatever
     hosted links already exist, and a video with none carries the "not hosted" chip.
 
     It stays SYNCHRONOUS, unlike a run, and the reason is that it is bounded by construction: no
@@ -751,7 +754,7 @@ def _location_header() -> dict[str, Any]:
     return {
         "Location": {
             "description": (
-                "The claimed run: `GET /api/admin/digest/runs/{id}`. Poll it for the run's "
+                "The claimed run: `GET /api/admin/digest/runs/{run_id}`. Poll it for the run's "
                 "progress and its terminal status — the work happens in the worker, not in this "
                 "request."
             ),
@@ -772,22 +775,21 @@ async def run_digest_now(
 ) -> DigestRunClaimOut:
     """CLAIM a manual run and answer 202. The worker executes it.
 
-    This endpoint commits exactly one thing — the `digest_runs` row, which IS the single-flight
-    lock — and returns. It does not send, upload or render, and that split is the point: a run can
+    This endpoint commits exactly one thing — the run row, which IS the single-flight lock — and
+    returns. It does not send, upload or render, and that split is the point: a run can
     legitimately last hours (up to `max_memos_per_run` memos, several videos each, Dropbox
     upload-session operations that allow 600 s EACH), and a contract that awaited it would tie the
-    household's mail to a browser tab, a proxy read timeout and a reload. The same repository
-    already backgrounds the scheduled run for exactly this reason; a manual one is not different
-    work, only differently triggered.
+    household's mail to a browser tab, a proxy read timeout and a reload. The scheduled run is
+    already backgrounded for exactly this reason; a manual one is not different work, only
+    differently triggered.
 
     A manual run sits OUTSIDE the scheduled-day index by design, so it is always possible on a day
-    that already had one. Its 409 is derived from the INSERT conflicting with
-    `uq_digest_runs_single_inflight` — never from a pre-flight "is anything running?" read, which
-    would be exactly the TOCTOU race that index exists to close and which two concurrent callers
-    would both pass.
+    that already had one. Its 409 comes from the insert that loses the race for the single-flight
+    index — never from a pre-flight "is anything running?" read, which would be exactly the TOCTOU
+    race that index exists to close and which two concurrent callers would both pass.
 
-    `Location` names the run, and `GET /api/admin/digest/runs/{id}` is where its progress and its
-    outcome are read back. Until the worker adopts the row it stays `status: null` with no
+    `Location` names the run, and `GET /api/admin/digest/runs/{run_id}` is where its progress
+    and its outcome are read back. Until the worker adopts the row it stays `status: null` with no
     heartbeat; if no worker ever does, the stale-run sweep closes it as `failed` rather than
     leaving it in flight for ever.
     """
