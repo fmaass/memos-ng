@@ -7,9 +7,12 @@ model's docstring becomes its component `description` and a route function's doc
 operation `description`. Rationale belongs in ordinary `#` comments beside the code; only text
 written FOR a client belongs in a docstring.
 
-This test is the gate on that class. It reads the two committed artifacts and refuses a tracker
-key, an internal hostname or an estate path in either — and asserts it actually read them, because
-a grep that matched nothing because it opened the wrong file proves nothing at all.
+This test is the gate on that class. It reads the two committed artifacts and refuses anything that
+only means something inside the estate — a tracker key, an internal hostname, a filesystem path, or
+a POINTER to where a rule was decided (a decision number, an ADR id, a phase or a review round). A
+description states the behaviour the client sees; where that behaviour was settled is a comment's
+business. The test also asserts it actually read the files, because a pattern that matched nothing
+because it opened the wrong path proves nothing at all.
 """
 
 import re
@@ -19,9 +22,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OPENAPI = REPO_ROOT / "openapi.json"
 SCHEMA_D_TS = REPO_ROOT / "frontend" / "src" / "api" / "schema.d.ts"
 
-# Tracker keys, the estate's internal hostnames and its filesystem layout. Kept as one pattern so
-# both artifacts are held to the same alphabet.
-FORBIDDEN = re.compile(r"MEMNG-|ARCH-|INFRA-|discomarder|/home/fabian|jupiter|saturn|merkur")
+# Tracker keys, the estate's internal hostnames and filesystem layout, and the maintainer pointers
+# that read as prose but name an internal record. Kept as one pattern so both artifacts are held to
+# the same alphabet. Deliberately NOT here: "session", which is this API's own vocabulary — the
+# `sessionCookie` scheme, a browser session, an upload session.
+FORBIDDEN = re.compile(
+    r"MEMNG-|ARCH-|INFRA-|ADR-|Decision [0-9]|[Oo]ption [0-9]|[Pp]hase [0-9]|round [0-9]"
+    r"|BookStack|windshift|orchestrat|handover|estate|reviewer|ticket"
+    r"|discomarder|/home/fabian|jupiter|saturn|merkur"
+)
 
 
 def _offending_lines(path: Path) -> list[str]:

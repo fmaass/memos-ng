@@ -351,6 +351,10 @@ async def _renew_rejection(db: AsyncSession, hashed_token: str) -> HTTPException
     return HTTPException(status_code=401, detail="Invalid or revoked token")
 
 
+# One rule governs this whole self-service block, and the exported descriptions state it as
+# behaviour rather than pointing at where it was decided (Decision 5, ADR-0015): a bearer may act
+# on nothing but the token it presents — renew it, revoke it, read it — while token management
+# proper (minting, naming or revoking ANOTHER device's token) stays behind a browser session.
 @router.post("/native/renew", response_model=NativeExchangeOut)
 async def native_renew(
     request: Request,
@@ -371,8 +375,8 @@ async def native_renew(
     Restricted to a token that carries an expiry. `pats` has no column that tells a device token
     from an SPA-created one — carrying `expires_at` is the only thing that does, imperfectly — and
     only a token that expires can silently sign out, so an unbounded PAT is refused
-    (`token_not_renewable`) rather than rotated: token management stays behind a browser session
-    (Decision 5), and this route reaches no further than the class it exists for.
+    (`token_not_renewable`) rather than rotated: token management stays behind a browser session,
+    and this route reaches no further than the class it exists for.
 
     Bearer-only, like `native/logout`: the presenting token is the subject of the request, and a
     session cookie names no token at all.
@@ -415,7 +419,7 @@ async def native_logout(
 ) -> None:
     """Revoke the presenting device token, and only that one.
 
-    A bearer may revoke ITSELF and nothing else (Decision 5): the rest of token management stays
+    A bearer may revoke ITSELF and nothing else: the rest of token management stays
     behind a browser session, so a leaked device token can neither mint successors that outlive its
     revocation nor take another device offline. A session cookie is refused here for the same
     reason from the other side — the SPA revokes through `/api/pats/{id}`, which knows which token
@@ -433,8 +437,8 @@ class NativeTokenOut(BaseModel):
 
     No `id`, no `hashed_token`, and never the plaintext: this row is the answer to "how long does
     this token have, and when did I last use it", not a second copy of the secret. Withholding the
-    id also keeps the shape honest about Decision 5 — there is no sibling here to act on, so there
-    is no handle to act with.
+    id also keeps the shape honest: a device acts on no token but the one it presents, so there is
+    no sibling here to act on and no handle to act with.
     """
 
     name: str

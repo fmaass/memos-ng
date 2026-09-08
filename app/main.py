@@ -145,7 +145,7 @@ SECURITY_SCHEMES = {
         "description": "A short-lived step-up management grant (`Authorization: Grant …`), "
         "obtained from POST /api/auth/native/manage-grant with a handoff code minted by a fresh "
         "Authelia login. Accepted only on /api/pats/*, and never mintable from a token — a device "
-        "PAT manages nothing but itself (ADR-0015).",
+        "PAT manages nothing but itself.",  # the ADR-0015 rule, stated as the behaviour it is
     },
 }
 
