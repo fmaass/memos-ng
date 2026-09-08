@@ -15,7 +15,7 @@ import { fetchPrintMasters, printMasterUploads } from '@/composables/usePrintMas
 import { type UploadItem, useUploadQueue } from '@/composables/useResumableUpload'
 import { attachmentUidsToClear } from '@/lib/attachments'
 import { captureOrder, toWireInstant } from '@/lib/autoMemoDate'
-import { captureBlockedMessage, pendingCaptureItems } from '@/lib/composer'
+import { captureBlockedMessage, formatMemoDate, pendingCaptureItems } from '@/lib/composer'
 import {
   printBadgeLabel,
   printChipState,
@@ -93,11 +93,11 @@ const editUploading = computed(() =>
 // attachment that is already saved carries no capture instant this browser can read). The capture
 // decisions still have to SETTLE before Save, because the files added here are appended in capture
 // order among themselves, and that order is saved (MEMNG-262).
-const editZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 const editTiles = computed<UploadItem[]>(() => [...editUploads])
 // The tiles are SHOWN in the order they will be SAVED — an edit that displayed pick order while
 // submitting capture order would be telling the person something untrue about their own memo.
-const editOrdered = computed(() => captureOrder(editTiles.value, editZone))
+const editOrdered = computed(() => captureOrder(editTiles.value, browserZone))
 const editCapturePending = computed(() => pendingCaptureItems(editTiles.value))
 const editCaptureMessage = computed(() =>
   editCapturePending.value.length ? captureBlockedMessage(editCapturePending.value) : '',
@@ -183,6 +183,17 @@ function addReaction(emoji: string) {
   reactPicker.value?.hide()
   emit('toggle-reaction', { uid: props.memo.uid, emoji, add: true })
 }
+
+// The memo's own date, on the card. It is the date the memo is FILED under (the composer's Auto
+// date is the earliest capture instant of its media), so a card without it left the one thing a
+// photo memo is organised by invisible.
+//
+// Shown PLAIN. Whether that date was inferred from a wall-clock reading the camera recorded no
+// zone for — the approximation the composer marks while it is still offering the date — cannot be
+// recovered from the memo as it stands: the attachment that decided it may since have been
+// deleted, and a date typed by hand can land on the same second as an inferred one. The mark waits
+// for the server to record how the date was set.
+const memoDateLabel = computed(() => formatMemoDate(new Date(props.memo.created_at)))
 
 // renderMemoMarkdown sanitizes (markdown-it html:false + DOMPurify allowlist), so v-html
 // of its output is safe — raw HTML/script in memo content is escaped to inert text.
@@ -340,6 +351,14 @@ function onContentClick(event: MouseEvent) {
     class="group relative isolate flex flex-col gap-2 rounded-xl border border-surface-200 p-4 dark:border-surface-700"
     data-test="memo-card"
   >
+    <!-- pr-8 keeps the line clear of the ⋯ button, which floats over this corner -->
+    <time
+      v-if="!editing"
+      class="pr-8 text-xs text-muted-color"
+      :datetime="memo.created_at"
+      data-test="memo-date"
+      >{{ memoDateLabel }}</time
+    >
     <template v-if="memo.mine && !editing && !restorable">
       <button
         type="button"

@@ -53,6 +53,11 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     hasPrint: false,
     hasLegacyPrint: false,
     position: null,
+    // widened, not narrowed to null: a spec that gives a photo a real capture read spreads it
+    // over this shape, which `null` alone would type as accepting nothing else
+    capture_instant: null as string | null,
+    capture_civil: null as string | null,
+    capture_source: null as string | null,
     renditions: [] as {
       variant_key: string
       label: string | null
@@ -88,7 +93,12 @@ function withMaster(att: ReturnType<typeof imageAtt>, variantKey = 'print') {
   }
 }
 
-function memo(content: string, tags: string[] = [], attachments: ReturnType<typeof imageAtt>[] = []) {
+function memo(
+  content: string,
+  tags: string[] = [],
+  attachments: ReturnType<typeof imageAtt>[] = [],
+  createdAt = '2026-06-20T00:00:00Z',
+) {
   return {
     uid: 'm1',
     owner: 'alice',
@@ -96,7 +106,7 @@ function memo(content: string, tags: string[] = [], attachments: ReturnType<type
     content,
     visibility: 'PRIVATE' as const,
     pinned: false,
-    created_at: '2026-06-20T00:00:00Z',
+    created_at: createdAt,
     updated_at: '2026-06-20T00:00:00Z',
     archived_at: null,
     tags,
@@ -131,6 +141,19 @@ describe('MemoCard', () => {
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
     printUploads.clear() // module-level queue — a leftover entry would chip the next test's tiles
+  })
+
+  describe('the memo date', () => {
+    // Midday UTC: every zone within ±11 hours agrees on the calendar day, so the assertion below
+    // is about the card and not about where this suite happens to run.
+    const NOON = '2026-06-20T12:00:00Z'
+
+    it('shows the memo date', () => {
+      const wrapper = mountCard({ memo: memo('dated', [], [], NOON) })
+      const shown = wrapper.find('[data-test="memo-date"]')
+      expect(shown.attributes('datetime')).toBe(NOON)
+      expect(shown.text()).toContain('Jun 20, 2026')
+    })
   })
 
   it('renders markdown content and tag chips', () => {

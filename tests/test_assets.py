@@ -975,6 +975,11 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "duration",
             "blurhash",
             "captured_at",
+            # added deliberately: what the file's own metadata said, with no fallback, so a
+            # reader can tell a real capture time from the chain captured_at falls back through
+            "capture_instant",
+            "capture_civil",
+            "capture_source",
             "sha256",  # added deliberately: content identity for a delete-after-verify caller
             "mine",
             "hasPrint",
@@ -995,6 +1000,11 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "/api/attachments/att-meta-shape", headers={"Authorization": f"Bearer {pat}"}
         ).json()
         assert set(pat_body) == set(body)
+        # this row carries no capture read at all — three nulls, not a missing key and not an error
+        assert body["capture_instant"] is None
+        assert body["capture_civil"] is None
+        assert body["capture_source"] is None
+        assert body["captured_at"] is not None  # while the legacy chain still answers
     finally:
         _cleanup(aid)
 

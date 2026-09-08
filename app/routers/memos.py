@@ -126,6 +126,16 @@ class AttachmentRef(BaseModel):
     # holds the memo does not need a per-attachment round trip to check it. Off the ORM row, no
     # extra query.
     sha256: str | None
+    # What the FILE's own metadata said about when it was taken, as opposed to `captured_at`
+    # (AttachmentMeta), which falls back to the browser's modification time and then to the upload
+    # time and so always holds something. All three are null when the file said nothing.
+    # `capture_civil` is a wall-clock reading the file recorded no zone for — only the reader knows
+    # the zone to resolve it in, which is why it travels unresolved and why a date resolved from it
+    # is approximate. Carried on every ref so a reader holding the memo can tell the memo's own
+    # date apart from a guess without a round trip per attachment.
+    capture_instant: Rfc3339Datetime | None
+    capture_civil: str | None
+    capture_source: str | None
     mine: bool  # the requesting user owns it (→ may delete); shared media is view-only
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
@@ -453,6 +463,9 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         height=att.height,
         duration=att.duration,
         sha256=att.sha256,
+        capture_instant=att.capture_instant,
+        capture_civil=att.capture_civil,
+        capture_source=att.capture_source,
         mine=att.owner_id == user_id,
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,
