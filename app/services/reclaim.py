@@ -38,9 +38,12 @@ THE ORDER, and why it is what it is:
 
 Jobs BEFORE the attachment row, not after: `media.guard_publish` locks job-then-attachment, so a
 deleter that took them the other way round would deadlock against a publishing worker (the lock
-order is the invariant MEMNG-90 left behind, documented in guard_publish). SKIP LOCKED because a
-worker holds its claimed job's row for the whole run and waiting on a slow-lane transcode would pin
-a request-serving connection for minutes (MEMNG-41).
+order is the invariant MEMNG-90 left behind, documented in guard_publish, and the J → A direction
+the whole protocol adopted — MEMNG-267 R7). SKIP LOCKED not because a worker sits on the row for
+the length of a transcode — it does not, since MEMNG-90 commits the claim before processing
+(`app/worker.py:279`) — but because a job row IS momentarily held by whichever short transaction
+the worker is inside, and this sweep has no reason to wait for it: the row it skips belongs to a
+run that will find the attachment gone and discard itself (MEMNG-41).
 
 Holding the attachment lock from step 2 to the commit is what closes the late-publish window: a
 worker republishing a tier takes that same lock inside `guard_publish`, so it either finishes

@@ -338,15 +338,22 @@ class Upload(Base):
 class MediaJob(Base):
     """One unit of derivation work for an attachment (a queue row, not a data row).
 
-    `attachment_id` carries NO foreign key on purpose (MEMNG-41). A worker claims a job with
-    SELECT … FOR UPDATE and holds that row lock until the job commits — for the slow lane that is
-    the whole transcode, up to SLOW_TRANSCODE_TIMEOUT_S. An FK's ON DELETE CASCADE would make
-    `DELETE FROM attachments` lock the same child row, so deleting a photo whose video was being
-    transcoded blocked a request-serving connection for up to an hour (with DB_POOL_SIZE 5 on a
-    shared Postgres, a few of those starve the app). The cascade was also redundant: the delete
-    endpoint already removes the job rows explicitly. It now removes every job row nobody is
-    running (SKIP LOCKED) and leaves the in-flight one to its worker, which discards it on
-    discovering the attachment is gone (media.AttachmentGone → worker.run_once).
+    `attachment_id` carries NO foreign key on purpose (MEMNG-41). When that was filed a worker
+    held this row's lock for the whole transcode, so an FK's ON DELETE CASCADE made
+    `DELETE FROM attachments` queue behind an hour of ffmpeg on a request-serving connection (with
+    DB_POOL_SIZE 5 on a shared Postgres, a few of those starve the app). MEMNG-90 shortened the
+    hold itself — the claim is COMMITTED before processing starts (`app/worker.py:279`) and the
+    outcome is written in a fresh transaction (`app/services/media.py:1324`), so nothing holds
+    this row across a derivation any more.
+
+    The FK stays gone for the reason that outlived that one: a cascade would make a deleter take
+    the attachment row and then this one, A before J — the reverse of the J → A order every path
+    that co-holds them acquires in (`media.guard_publish`, `reclaim.reclaim_attachment`,
+    `worker.recover_stale_media_claims`; MEMNG-267 R7), which is a lock cycle rather than a slow
+    wait. The cascade was also redundant: the delete endpoint already removes the job rows
+    explicitly. It removes every job row nobody is running (SKIP LOCKED) and leaves the in-flight
+    one to its worker, which discards it on discovering the attachment is gone
+    (media.AttachmentGone → worker.run_once).
     """
 
     __tablename__ = "media_jobs"
@@ -385,14 +392,17 @@ class MediaJobProgress(Base):
     """The latest progress sample of a RUNNING media job — a side channel, deliberately not a
     column on `media_jobs` (MEMNG-36).
 
-    A worker claims its job with SELECT … FOR UPDATE and holds that row lock for the WHOLE job:
-    claim and outcome share one transaction on purpose, so a crash rolls the claim back to
-    `queued` (MEMNG-39). Two consequences make the job row unusable as a progress channel — the
-    percentages the worker writes into it are invisible to every other session until that final
-    commit, and any other session UPDATEing the claimed row would wait on the row lock for the
-    length of a transcode (the same wait MEMNG-41 removed from the delete path). This row is
-    written and COMMITTED by a short session of its own instead, so `/api/events` can read a
-    transcode's real progress while it runs.
+    A worker deliberately keeps NO transaction open across a derivation: it commits the
+    `processing` claim before processing starts (`app/worker.py:279`) and commits the read
+    transaction before the derivation itself (`app/services/media.py:1324`), because a session
+    sitting idle-in-transaction across a transcode is what wedged the queue in MEMNG-90. That is
+    also what makes the job row unusable as a progress channel: a percentage written into it is
+    invisible to every other session until the transaction that wrote it commits, so publishing
+    progress through `media_jobs` would mean committing the queue row every few seconds —
+    re-stamping the `updated_at` the stale-claim sweep judges liveness by, and putting a writer
+    on the row that guard_publish and both reclaim paths lock. This row is written and COMMITTED
+    by a short session of its own instead, so `/api/events` can read a transcode's real progress
+    while it runs without touching the queue at all.
 
     `job_id` carries no FK — same reason media_jobs dropped its attachment FK: a cascade would
     make a delete wait on precisely the locks this table exists to sidestep. The row is transient:
