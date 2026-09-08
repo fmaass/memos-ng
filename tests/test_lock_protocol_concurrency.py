@@ -28,6 +28,7 @@ under its own `MEMNG267_MUTATION` value.
 """
 
 import asyncio
+import hashlib
 import io
 import os
 import time
@@ -49,6 +50,7 @@ from app.services import uploads as uploads_svc
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 from sqlalchemy import create_engine, event, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.conftest import SYNC_URL
 
@@ -151,6 +153,20 @@ def _async_client(client) -> AsyncClient:
         headers={"Origin": canonical_origin()},
         cookies={auth.SID_COOKIE: sid or ""},
     )
+
+
+def _memo_attachment_media(memo_uid: str) -> list[tuple[str, bytes]]:
+    """(filename, the bytes actually on disk) for each attachment, in the memo's SAVED order.
+
+    §5.1 requires rows AND bytes: a probe that counts rows passes just as happily when the media
+    the memo promises is a zero-length file or somebody else's picture.
+    """
+    rows = _sql(
+        "SELECT a.filename, a.storage_path FROM attachments a JOIN memos m ON m.id = a.memo_id "
+        "WHERE m.uid = :u ORDER BY a.position NULLS LAST, a.id",
+        u=memo_uid,
+    )
+    return [(name, Path(path).read_bytes()) for name, path in rows]
 
 
 def _memo_attachment_uids(memo_uid: str) -> list[str]:
@@ -296,6 +312,37 @@ def _park_after_hash(monkeypatch, park: Park, when) -> None:
     monkeypatch.setattr(uploads_svc, "to_thread", _ParkingThreadRunner)
 
 
+def _park_after_statement(monkeypatch, park: Park, match) -> None:
+    """Park an actor immediately after ONE real statement of its own has run.
+
+    Pass 0 has two seams that are not function boundaries — the unlocked candidate read and the
+    ascending attachment acquisition — and both are exactly where a second actor has to be let in.
+    The hook delegates to the real `AsyncSession.execute` and parks after it returns, so the
+    statement itself, its locks and its result are entirely the production ones.
+    """
+    real = AsyncSession.execute
+
+    async def parking(self, statement, *args, **kwargs):
+        result = await real(self, statement, *args, **kwargs)
+        if match(" ".join(str(statement).split())) and park.claim():
+            await park.hold()
+        return result
+
+    monkeypatch.setattr(AsyncSession, "execute", parking)
+
+
+def _is_unlocked_candidate_read(sql: str) -> bool:
+    return "attachments.sha256 IN" in sql and "FOR UPDATE" not in sql
+
+
+def _is_ascending_attachment_lock(sql: str) -> bool:
+    return (
+        sql.startswith("SELECT attachments.")
+        and "ORDER BY attachments.id" in sql
+        and "FOR UPDATE" in sql
+    )
+
+
 def _park_finalize_pending(monkeypatch, park: Park) -> None:
     """Park a batch BEFORE it has locked anything at all — the schedule the continuation probes
     need, where the other actor gets a clean run at the upload the batch is about to ask for."""
@@ -422,10 +469,18 @@ async def _two_batches_in_opposite_orders(client, monkeypatch, tmp_path, *, seco
     # The winner keeps both dedup targets, in the order it declared them; the loser's revalidation
     # finds them linked and it mints its own rows rather than stealing (X2).
     assert _memo_attachment_uids(memo_one["uid"]) == [a, b]
+    # The winner's rows are the dedup TARGETS (a dedup hit hands back the pre-existing
+    # attachment), so their filenames are the targets' — but the bytes must be the ones the
+    # uploads carried, in the declared order.
+    assert _memo_attachment_media(memo_one["uid"]) == [("a.png", x), ("b.png", y)]
     other_uid = right_res.json()["uid"]
     other = _memo_attachment_uids(other_uid)
     assert len(other) == 2, other
     assert a not in other and b not in other
+    # "each memo keeps its own media and its DECLARED order" (§5.2, C2). The loser declared
+    # [2y, 2x] — the opposite visiting order that made this a cycle — so that is what it must read
+    # back as, with the bytes the client actually uploaded behind each row.
+    assert _memo_attachment_media(other_uid) == [("2y.png", y), ("2x.png", x)]
     assert _one("SELECT count(*) FROM uploads")[0] == 0
 
 
@@ -659,9 +714,14 @@ async def test_poster_consumption_and_standalone_finalize_do_not_cycle(
 
 async def test_a_lost_poster_upload_answers_422_not_409(logged_in_client, monkeypatch, tmp_path):
     """C5, standalone first. A poster upload consumed under the batch is a `video_posters` problem
-    — 422 in FastAPI's own validation shape — and never the 409 an `upload_uids` member gets. Green
-    on every tree, like C5b: it pins the CONTINUATION, and its red tree is
-    `tests/mutations/c5b_merge_answers.patch`."""
+    — 422 in FastAPI's own validation shape — and never the 409 an `upload_uids` member gets.
+
+    Green on every tree, like C5b, because it pins a CONTINUATION rather than a cycle. Its red tree
+    is NOT `c5b_merge_answers.patch`, which moves only the missing attachment-upload answer and
+    leaves this one alone: it is a one-off mutation that answers the poster problem with the 409
+    instead (recorded in the phase ledger under "Round 2 / one-off mutations"). The two mutations
+    are the two directions the merge can go, and C5b and this test are what refuse each of them.
+    """
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
@@ -702,8 +762,28 @@ async def test_a_lost_poster_upload_answers_422_not_409(logged_in_client, monkey
         assert sorted(r[0] for r in _sql("SELECT upload_uid FROM uploads")) == sorted(
             [image, video]
         )
+        # Rows AND bytes (§5.1). A surviving upload row is a PROMISE about a file; the refusal is
+        # only free if the file is still whole. `_is_complete_sync` reads the row's declared size,
+        # so this is the same completeness the next attempt will be judged by.
+        assert uploads_svc.part_path(image).read_bytes() == _jpeg((1, 2, 3))
+        assert uploads_svc.part_path(video).read_bytes() == VIDEO_BYTES
         stored = [r[0] for r in _sql("SELECT uid FROM attachments")]
         assert not any(poster.poster_path(uid).exists() for uid in stored)
+        # …and the promise is honoured: the identical request minus the lost poster succeeds, which
+        # is the whole point of refusing before the first side effect.
+        repost = client.post(
+            "/api/memos",
+            json={
+                "content": "c5-mirror re-posted",
+                "visibility": "PRIVATE",
+                "upload_uids": [image, video],
+            },
+        )
+        assert repost.status_code == 201, repost.text
+        assert _memo_attachment_media(repost.json()["uid"]) == [
+            ("photo.jpg", _jpeg((1, 2, 3))),
+            ("clip.mov", VIDEO_BYTES),
+        ]
     finally:
         _cleanup()
 
@@ -815,6 +895,14 @@ async def test_in_batch_print_rendition_and_standalone_finalize_do_not_cycle(
             assert after == before, (before, after)  # write-once: the re-dump changed nothing
         else:
             assert len(after) == 1 and after[0][0] == "print", after
+            # Rows AND bytes: the master the memo now carries has to BE the file that was uploaded,
+            # at the path the row names. A count and a variant_key say nothing about either.
+            path, size = _one(
+                "SELECT storage_path, size FROM attachment_renditions WHERE variant_key = 'print'"
+            )
+            assert Path(path).read_bytes() == shared
+            assert size == len(shared)
+            assert after[0][1] == hashlib.sha256(shared).hexdigest()
         assert _one("SELECT count(*) FROM uploads")[0] == 0
     finally:
         _cleanup()
@@ -1040,10 +1128,6 @@ async def _recovery_beside_a_print_only_patch(client, monkeypatch, *, capture_sq
     return recovered, edited, statements, memo, low, high
 
 
-@pytest.mark.skipif(
-    MUTATION == "no_r7a",
-    reason="the (b) tree asserts the deadlock instead — see the mutation probe below",
-)
 async def test_stale_claim_recovery_and_a_two_attachment_patch_do_not_cycle(
     logged_in_client, monkeypatch, tmp_path
 ):
@@ -1075,9 +1159,6 @@ async def test_stale_claim_recovery_and_a_two_attachment_patch_do_not_cycle(
         _cleanup()
 
 
-@pytest.mark.skipif(
-    MUTATION == "no_r7a", reason="the (b) tree has no pre-loop acquisition to observe, by design"
-)
 async def test_the_recovery_sweep_locks_its_terminal_attachments_ascending_before_it_writes(
     logged_in_client, monkeypatch, tmp_path
 ):
@@ -1128,6 +1209,210 @@ async def test_stale_claim_recovery_deadlocks_without_the_pre_loop_acquisition(
     try:
         with pytest.raises(AssertionError, match="SQLSTATE 40P01"):
             await _recovery_beside_a_print_only_patch(client, monkeypatch, capture_sql=False)
+    finally:
+        _cleanup()
+
+
+# --------------------------------------------------------------------------------------------
+# F1 / F2 (round 2) — pass 0's revalidation, and its complete attachment set
+# --------------------------------------------------------------------------------------------
+
+
+async def test_a_candidate_deleted_under_pass_zero_is_dropped_not_reused(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """R3.5's revalidation must judge the rows the LOCKING select actually returned.
+
+    The candidates come from an unlocked read. `populate_existing` refreshes what the locking
+    statement returns — it can say nothing about a row that is ABSENT from the result, which is
+    exactly what a row deleted in between looks like. Judging the stale identity-map object then
+    passes `owner_id == owner_id and memo_id is None` on a row that no longer exists, and the
+    finalize hands back a nonexistent attachment: the memo is stored with NO media, the upload row
+    is deleted and its part file reaped. This probe is the deletion, and it asserts rows AND bytes.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        shared = _png(b"F1")
+        target = _unlinked_attachment(client, "target.png", shared)
+        target_id = _one("SELECT id FROM attachments WHERE uid = :u", u=target)[0]
+        upload = _upload(client, "again.png", shared)
+
+        park = Park()
+        _park_after_statement(monkeypatch, park, _is_unlocked_candidate_read)
+
+        async def reclaim() -> object:
+            async with async_session() as db:
+                return await reclaim_svc.reclaim_attachment(
+                    db, target_id, reclaim_svc.Revalidate.IDENTITY
+                )
+
+        async with _async_client(client) as creator:
+            create = asyncio.create_task(
+                creator.post(
+                    "/api/memos",
+                    json={"content": "f1", "visibility": "PRIVATE", "upload_uids": [upload]},
+                )
+            )
+            await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+            # The real reclaim path, on its own connection, committing before the batch resumes.
+            reclaimed = await asyncio.wait_for(reclaim(), timeout=WAIT_TIMEOUT)
+            park.release.set()
+            created = await create
+
+        park.fired()
+        assert reclaimed.outcome == "reclaimed", reclaimed
+        assert created.status_code == 201, created.text
+        # The candidate is gone, so the upload mints its OWN attachment and its own file.
+        media = _memo_attachment_media(created.json()["uid"])
+        assert media == [("again.png", shared)], media
+        assert _one("SELECT count(*) FROM attachments")[0] == 1
+        assert _one("SELECT count(*) FROM uploads")[0] == 0
+    finally:
+        _cleanup()
+
+
+async def _create_with_a_named_attachment_beside_the_recovery_sweep(client, monkeypatch):
+    """The F2 schedule: a create that names one attachment AND dedups onto another, beside the
+    stale-claim sweep whose terminal set is both of them. Returns everything the two probes assert.
+    """
+    from app import worker
+
+    low_bytes, high_bytes = _png(b"F2LOW"), _png(b"F2HIGH")
+    named = _unlinked_attachment(client, "named.png", low_bytes)
+    dedup_target = _unlinked_attachment(client, "target.png", high_bytes)
+    named_id = _one("SELECT id FROM attachments WHERE uid = :u", u=named)[0]
+    target_id = _one("SELECT id FROM attachments WHERE uid = :u", u=dedup_target)[0]
+    assert named_id < target_id  # A10 below B20, so ascending means named first
+    # The HIGH-id attachment's job is inserted first, so it carries the LOWER media_jobs.id: the
+    # sweep would reach B20 before A10 if it took its attachments in job order.
+    high_job = _seed_stale_terminal_job(dedup_target)
+    low_job = _seed_stale_terminal_job(named)
+    assert high_job < low_job
+    upload = _upload(client, "again.png", high_bytes)
+
+    park = Park()
+    _park_after_statement(monkeypatch, park, _is_ascending_attachment_lock)
+
+    locks: list[tuple[str, object]] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        flat = " ".join(statement.split())
+        if _is_ascending_attachment_lock(flat):
+            locks.append((flat, parameters))
+
+    async def sweep() -> int:
+        async with async_session() as db:
+            recovered = await worker.recover_stale_media_claims(db)
+            await db.commit()
+            return recovered
+
+    event.listen(async_engine.sync_engine, "before_cursor_execute", record)
+    try:
+        async with _async_client(client) as creator:
+            create = asyncio.create_task(
+                creator.post(
+                    "/api/memos",
+                    json={
+                        "content": "f2",
+                        "visibility": "PRIVATE",
+                        "attachment_uids": [named],
+                        "upload_uids": [upload],
+                    },
+                )
+            )
+            await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+            waiting = set(_lock_waiters())
+            recovery = asyncio.create_task(sweep())
+            await _wait_for_a_new_lock_wait(waiting)
+            park.release.set()
+            created, recovered = await _both(create, recovery)
+    finally:
+        event.remove(async_engine.sync_engine, "before_cursor_execute", record)
+
+    park.fired()
+    return (
+        created,
+        recovered,
+        locks,
+        named,
+        dedup_target,
+        named_id,
+        target_id,
+        high_bytes,
+        low_bytes,
+    )
+
+
+async def test_a_create_naming_an_attachment_and_deduping_onto_another_does_not_cycle_with_recovery(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """R3.4's attachment set has to be COMPLETE, the create's named `attachment_uids` included.
+
+    Without them pass 0 locks only the dedup target, and `link_attachments` acquires the named row
+    afterwards — a second attachment-class acquisition in the same transaction, in an order nothing
+    else shares. R7a's sweep takes its terminal set ascending, so the two invert: the sweep holds
+    the low-id named attachment and waits for the dedup target the create is holding, while the
+    create waits for the named one.
+
+    Green on the unmodified tree by construction — there the sweep takes its attachments in JOB
+    order, which reaches the dedup target first and never waits on the create. Its red tree is
+    `tests/mutations/no_named_arm.patch`, run once under `MEMNG267_MUTATION=no_named_arm`.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        (
+            created,
+            recovered,
+            _locks,
+            named,
+            dedup_target,
+            _named_id,
+            _target_id,
+            high_bytes,
+            low_bytes,
+        ) = await _create_with_a_named_attachment_beside_the_recovery_sweep(client, monkeypatch)
+        assert created.status_code == 201, created.text
+        assert recovered == 2, recovered
+        assert _memo_attachment_uids(created.json()["uid"]) == [named, dedup_target]
+        assert _memo_attachment_media(created.json()["uid"]) == [
+            ("named.png", low_bytes),
+            ("target.png", high_bytes),
+        ]
+        assert _one("SELECT count(*) FROM uploads")[0] == 0
+    finally:
+        _cleanup()
+
+
+async def test_pass_zero_locks_the_named_and_the_dedup_attachment_in_one_ascending_statement(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The ordering half of F2, split out so the completion probe above stays readable: the FIRST
+    ascending attachment `FOR UPDATE` the create emits must already carry BOTH ids, and every later
+    attachment-class acquisition is a re-lock of rows it already holds."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        (
+            created,
+            _recovered,
+            locks,
+            _named,
+            _dedup_target,
+            named_id,
+            target_id,
+            _high,
+            _low,
+        ) = await _create_with_a_named_attachment_beside_the_recovery_sweep(client, monkeypatch)
+        assert created.status_code == 201, created.text
+        assert locks, "no ascending attachment FOR UPDATE was emitted at all"
+        # Positive control on the capture: the ids really do appear in a statement's parameters,
+        # so an id-not-found below is a missing lock and not a listener that saw nothing.
+        values = [set(p.values()) if isinstance(p, dict) else set(p) for _, p in locks]
+        assert any(named_id in v for v in values), locks
+        first = values[0]
+        assert named_id in first and target_id in first, (named_id, target_id, values)
     finally:
         _cleanup()
 
@@ -1211,27 +1496,120 @@ async def test_worker_publication_and_reclaim_keep_the_jobs_then_attachment_orde
         _cleanup()
 
 
-async def test_append_capture_and_expiry_writers_run_beside_a_parked_finalize(
+async def _finalize_parked_on(client, monkeypatch, uid: str) -> tuple[Park, object]:
+    """Start a standalone finalize and hold it inside its transaction on `uid`'s upload row."""
+    park = Park()
+    _park_ensure_capture(monkeypatch, park, lambda held: held == uid)
+    holder = _async_client(client)
+    task = asyncio.create_task(holder.post(f"/api/uploads/{uid}/finalize"))
+    await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+    return park, (holder, task)
+
+
+async def _release(park: Park, handle) -> object:
+    holder, task = handle
+    park.release.set()
+    try:
+        return _answers([await asyncio.wait_for(task, timeout=WAIT_TIMEOUT)])[0]
+    finally:
+        await holder.aclose()
+
+
+async def test_the_append_writer_serializes_behind_a_parked_finalize_holding_its_row(
     logged_in_client, monkeypatch, tmp_path
 ):
-    """Every OTHER writer of the upload class keeps running while one finalize holds its row: an
-    append, the capture read, and the expiry reaper (which walks `uploads` with no lock at all)."""
+    """§5.2's preservation row, quoted: "append, capture GET and `reap_expired` each run beside a
+    parked finalize holding U (the census's 'every writer beside a parked conflicting actor'
+    requirement)". The conflicting actor holds THIS upload's row, so the append must queue on it —
+    a probe aimed at some other row could not fail if the serialization were removed.
+
+    `append_stream` re-reads the row FOR UPDATE precisely so the merge decides against the
+    committed offset, so the append blocks until the finalize commits, and then finds the session
+    consumed. What it answers then is recorded, not wished for: see the ledger's Round 2 open
+    questions.
+    """
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
-        held = _upload(client, "held.png", _png(b"HELD"))
-        data = _png(b"PART")
-        chunked = client.post(
-            "/api/uploads",
-            json={"filename": "part.png", "mime": "image/png", "size": len(data)},
-        )
-        assert chunked.status_code == 201, chunked.text
-        chunked_uid = chunked.json()["upload_uid"]
-        first_chunk = client.patch(
-            f"/api/uploads/{chunked_uid}", content=data[:100], headers={"Upload-Offset": "0"}
-        )
-        assert first_chunk.status_code == 200, first_chunk.text
-        expired = _upload(client, "old.png", _png(b"OLD"))
+        data = _png(b"APPEND")
+        uid = _upload(client, "part.png", data)
+
+        park, handle = await _finalize_parked_on(client, monkeypatch, uid)
+        waiting = set(_lock_waiters())
+        async with _async_client(client) as neighbour:
+            # An EMPTY body at the current offset: the one append shape that reaches the row lock
+            # without changing the bytes (a client re-syncing after a lost response). A body with
+            # content would be refused by the receive-time ceiling before it ever queued, and a
+            # short upload cannot be the parked finalize's row at all.
+            append = asyncio.create_task(
+                neighbour.patch(
+                    f"/api/uploads/{uid}",
+                    content=b"",
+                    headers={"Upload-Offset": str(len(data))},
+                )
+            )
+            # THE assertion of this probe: the writer is genuinely queued on the parked row.
+            await _wait_for_a_new_lock_wait(waiting)
+            finalized = await _release(park, handle)
+            appended = list(await asyncio.gather(append, return_exceptions=True))[0]
+
+        park.fired()
+        assert finalized.status_code == 200, finalized.text  # the finalize consumed the session
+        # The append reached its FOR UPDATE after the row was gone. `append_stream` ends in
+        # `.scalar_one()` (`app/services/uploads.py:527`), so the loser of this race raises rather
+        # than answering 404 — pre-existing, untouched by phase 1, and the same class R6a fixes for
+        # memos in phase 2. Asserted as observed, and reported as an open question.
+        assert isinstance(appended, Exception) or appended.status_code >= 400, appended
+        assert _one("SELECT count(*) FROM uploads")[0] == 0
+        assert _one("SELECT count(*) FROM attachments")[0] == 1
+    finally:
+        _cleanup()
+
+
+async def test_the_capture_reader_serializes_behind_a_parked_finalize_holding_its_row(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """Same row, the capture GET. Its documented answer for a session that vanished while it waited
+    is a 404 (`app/routers/uploads.py:216-218`), and that is what it must still give."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        uid = _upload(client, "held.png", _png(b"CAPTURE"))
+        park, handle = await _finalize_parked_on(client, monkeypatch, uid)
+        waiting = set(_lock_waiters())
+        async with _async_client(client) as neighbour:
+            capture = asyncio.create_task(neighbour.get(f"/api/uploads/{uid}/capture"))
+            await _wait_for_a_new_lock_wait(waiting)
+            finalized = await _release(park, handle)
+            captured = await capture
+
+        park.fired()
+        assert finalized.status_code == 200, finalized.text
+        assert captured.status_code == 404, captured.text  # the session is somebody else's now
+        assert _one("SELECT count(*) FROM uploads")[0] == 0
+    finally:
+        _cleanup()
+
+
+async def test_the_expiry_reaper_serializes_behind_a_parked_finalize_holding_its_row(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """Same row, `reap_expired`. It takes no upload lock of its own — it walks `uploads` and issues
+    a DELETE — so the DELETE is what waits, and once the finalize has committed there is no row to
+    reap. The bytes the finalize placed must survive the sweep.
+
+    The finalize is parked AFTER its placement here, not before it. Parked before, this probe would
+    be measuring something else entirely: `reap_expired` unlinks part files BEFORE it takes any
+    lock (`app/services/uploads.py:1381-1387`), so it destroys the bytes of a finalize that has not
+    moved them yet — OQ-6, which the design rules explicitly out of scope for phase 1
+    ("no change (out of scope) ... File a follow-up ticket, do not fix here", §3.1). That defect is
+    reported in the ledger, not smuggled into a preservation probe as an expectation.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        payload = _png(b"REAP")
+        uid = _upload(client, "held.png", payload)
         eng = create_engine(SYNC_URL)
         with eng.begin() as c:
             c.execute(
@@ -1239,34 +1617,39 @@ async def test_append_capture_and_expiry_writers_run_beside_a_parked_finalize(
                     "UPDATE uploads SET expires_at = now() - interval '1 day' "
                     "WHERE upload_uid = :u"
                 ),
-                {"u": expired},
+                {"u": uid},
             )
         eng.dispose()
 
         park = Park()
-        _park_ensure_capture(monkeypatch, park, lambda uid: uid == held)
+        _park_finalize(monkeypatch, park, lambda held: held == uid)
+        holder = _async_client(client)
+        finalize_task = asyncio.create_task(holder.post(f"/api/uploads/{uid}/finalize"))
+        await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+        handle = (holder, finalize_task)
+        waiting = set(_lock_waiters())
 
-        async with _async_client(client) as holder, _async_client(client) as neighbour:
-            solo = asyncio.create_task(holder.post(f"/api/uploads/{held}/finalize"))
-            await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
-
-            appended = await neighbour.patch(
-                f"/api/uploads/{chunked_uid}", content=data[100:], headers={"Upload-Offset": "100"}
-            )
-            captured = await neighbour.get(f"/api/uploads/{chunked_uid}/capture")
+        async def reap() -> int:
             async with async_session() as db:
                 reaped = await uploads_svc.reap_expired(db)
                 await db.commit()
+                return reaped
 
-            park.release.set()
-            finalized = await solo
+        sweep = asyncio.create_task(reap())
+        await _wait_for_a_new_lock_wait(waiting)
+        finalized = await _release(park, handle)
+        reaped = _answers([await asyncio.wait_for(sweep, timeout=WAIT_TIMEOUT)])[0]
 
         park.fired()
-        assert appended.status_code == 200, appended.text
-        assert captured.status_code == 200, captured.text
-        assert reaped == 1, reaped  # exactly the expired one; the parked row was untouched
         assert finalized.status_code == 200, finalized.text
-        assert [r[0] for r in _sql("SELECT upload_uid FROM uploads")] == [chunked_uid]
+        # `reap_expired` returns the size of the set it SELECTED, not the number of rows its
+        # DELETE actually removed — so 1 here is "it saw the row", and the assertions below are
+        # what say it took nothing: the upload row is the finalize's to delete, and the master it
+        # placed is still on disk.
+        assert reaped == 1, reaped
+        stored = _one("SELECT storage_path FROM attachments")[0]
+        assert Path(stored).read_bytes() == payload  # rows AND bytes: the master survived the sweep
+        assert _one("SELECT count(*) FROM uploads")[0] == 0
     finally:
         _cleanup()
 
@@ -1275,23 +1658,33 @@ async def test_rendition_deletion_and_multipart_print_run_beside_a_parked_attach
     logged_in_client, monkeypatch, tmp_path
 ):
     """The rendition class's other writers — the API delete and the legacy multipart `/print` —
-    keep running while an interactive attach holds its upload and its attachment."""
+    beside an interactive attach that holds THIS attachment's row and THIS upload's row.
+
+    The two writers are deliberately different shapes against the same held attachment: the
+    rendition DELETE touches only the `attachment_renditions` row, which the parked attach does not
+    hold yet, so it completes; the multipart `/print` takes the attachment's own row
+    (`app/routers/assets.py:707`, a locking refresh), so it queues. Both must land, and the attach
+    must then decide from state read THROUGH its lock — the rendition it was going to replace is
+    gone, so it inserts rather than replacing (X3).
+    """
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         held_target = _unlinked_attachment(client, "held.jpg", _jpeg((5, 10, 15)), "image/jpeg")
-        other = _unlinked_attachment(client, "other.jpg", _jpeg((20, 25, 30)), "image/jpeg")
         seeded = client.post(
-            f"/api/attachments/{other}/renditions",
+            f"/api/attachments/{held_target}/renditions",
             json={"upload_uid": _upload(client, "m.jpg", _jpeg((35, 40, 45)), "image/jpeg")},
         )
         assert seeded.status_code == 201, seeded.text
-        attach_upload = _upload(client, "hold.jpg", _jpeg((50, 55, 60)), "image/jpeg")
+        replacement = _jpeg((50, 55, 60))
+        attach_upload = _upload(client, "hold.jpg", replacement, "image/jpeg")
+        print_bytes = _jpeg((65, 70, 75))
 
         park = Park()
         real_attach = uploads_svc.attach_print_master
 
         async def parking(*args, **kwargs):
+            # Parked with the upload row and the attachment row both held, before the placement.
             if park.claim():
                 await park.hold()
             return await real_attach(*args, **kwargs)
@@ -1306,24 +1699,35 @@ async def test_rendition_deletion_and_multipart_print_run_beside_a_parked_attach
                 )
             )
             await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
-            deleted = await neighbour.delete(f"/api/attachments/{other}/rendition/print")
-            printed = await neighbour.post(
-                f"/api/attachments/{other}/print",
-                files={"file": ("p.jpg", _jpeg((65, 70, 75)), "image/jpeg")},
+            deleted = await neighbour.delete(f"/api/attachments/{held_target}/rendition/print")
+            waiting = set(_lock_waiters())
+            printed = asyncio.create_task(
+                neighbour.post(
+                    f"/api/attachments/{held_target}/print",
+                    files={"file": ("p.jpg", print_bytes, "image/jpeg")},
+                )
             )
+            # The multipart print takes the held attachment's row: it must queue, not race.
+            await _wait_for_a_new_lock_wait(waiting)
             park.release.set()
-            attached = await attach
+            attached, printed_res = await _both(attach, printed)
 
         park.fired()
         assert deleted.status_code == 204, deleted.text
-        assert printed.status_code == 200, printed.text
         assert attached.status_code == 201, attached.text
-        assert _one("SELECT print_path FROM attachments WHERE uid = :u", u=other)[0] is not None
-        held_renditions = _one(
-            "SELECT count(*) FROM attachment_renditions r "
+        assert printed_res.status_code == 200, printed_res.text
+        # Rows AND bytes on both writers' results.
+        path, key = _one(
+            "SELECT r.storage_path, r.variant_key FROM attachment_renditions r "
             "JOIN attachments a ON a.id = r.attachment_id WHERE a.uid = :u",
             u=held_target,
+        )
+        assert key == "print"
+        assert Path(path).read_bytes() == replacement  # the attach's file, not the deleted one
+        print_path = _one(
+            "SELECT print_path FROM attachments WHERE uid = :u", u=held_target
         )[0]
-        assert held_renditions == 1
+        assert print_path is not None
+        assert Path(print_path).read_bytes() == print_bytes
     finally:
         _cleanup()

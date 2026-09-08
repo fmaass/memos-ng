@@ -3,7 +3,7 @@ import os
 import secrets
 import shutil
 import uuid
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -836,6 +836,7 @@ async def finalize_pending(
     poster_copies_out: list[PosterCopy] | None = None,
     consumed_out: list[str] | None = None,
     positions_out: dict[str, int] | None = None,
+    named_attachment_ids: Sequence[int] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -878,6 +879,12 @@ async def finalize_pending(
     missing/incomplete refusal above. A poster is COPIED into place, so passing `video_posters`
     also means passing `poster_copies_out` for the caller to settle after its commit (PosterCopy);
     omitting it is refused outright rather than leaking a file per post.
+
+    `named_attachment_ids` are the ids of attachments the CALLER will link alongside this batch's
+    output — the create route's back-compat `attachment_uids`, resolved by the router. They are not
+    finalized here and nothing reads them; they exist so pass 0's single ascending attachment
+    acquisition covers the whole set the transaction touches (MEMNG-267 R3.4), instead of leaving
+    `link_attachments` to acquire them afterwards in an order no other writer shares.
 
     `positions_out` collects attachment uid -> the 0-based index, IN `upload_uids`, of the uid that
     produced or named it (MEMNG-262). It is what the caller SORTS the returned uids by, so the
@@ -989,30 +996,54 @@ async def finalize_pending(
         if att.sha256 is not None:
             locked.candidates.setdefault(att.sha256, att)
 
-    # ONE ascending acquisition of the attachment class: the dedup candidates, plus the memo's own
-    # attachments — which `link_attachments` and a sibling print bind both take afterwards, and now
-    # re-lock rather than acquire. `populate_existing` because the candidates are already in the
-    # identity map from the unlocked read above, and the revalidation must judge the LOCKED row.
+    # ONE ascending acquisition of the attachment class, over the COMPLETE set this transaction
+    # will touch: the dedup candidates, the attachments the caller NAMED (the create's back-compat
+    # `attachment_uids`), and the memo's own attachments. `link_attachments` and a sibling print
+    # bind take all three afterwards, and after this they re-lock rather than acquire — which is
+    # what makes "nothing below acquires another row" true rather than nearly true. A named
+    # attachment left out of it is a second acquisition in an order nothing else shares, and R7a's
+    # sweep — which takes its terminal attachments ascending — inverts against exactly that.
+    # `populate_existing` because the candidates are already in the identity map from the unlocked
+    # read above, and the revalidation must judge the LOCKED row.
     a_predicates = []
     if locked.candidates:
         a_predicates.append(Attachment.id.in_({a.id for a in locked.candidates.values()}))
+    if named_attachment_ids:
+        a_predicates.append(Attachment.id.in_(set(named_attachment_ids)))
     if memo is not None:
         a_predicates.append(Attachment.memo_id == memo.id)
+    # The ids the locking statement ACTUALLY RETURNED. `populate_existing` refreshes what comes
+    # back; it can say nothing about a row that is absent from the result, and absent is precisely
+    # what a row deleted between the unlocked read and the lock looks like. Judging the stale
+    # identity-map object instead would let a reclaimed attachment pass `memo_id IS NULL` and be
+    # handed back as this upload's attachment — a memo stored with no media at all, its upload row
+    # deleted and its part file reaped.
+    live_ids: set[int] = set()
     if a_predicates:
-        await db.execute(
-            select(Attachment)
-            .where(or_(*a_predicates))
-            .order_by(Attachment.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
+        live_ids = {
+            row.id
+            for row in (
+                (
+                    await db.execute(
+                        select(Attachment)
+                        .where(or_(*a_predicates))
+                        .order_by(Attachment.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        }
     # Revalidated under the lock, which is what Postgres used to do implicitly by re-evaluating the
-    # predicate after the wait: a candidate that has since been linked or changed hands is dropped,
-    # and its upload mints its own attachment and its own file instead of stealing one (X2).
+    # predicate after the wait: a candidate that has since been deleted, linked or changed hands is
+    # dropped, and its upload mints its own attachment and its own file instead of stealing one or
+    # reusing a row that is not there any more (X2).
     locked.candidates = {
         digest: att
         for digest, att in locked.candidates.items()
-        if att.owner_id == owner_id and att.memo_id is None
+        if att.id in live_ids and att.owner_id == owner_id and att.memo_id is None
     }
     # ---- end of pass 0. Nothing below acquires another row. ---------------------------------
 
