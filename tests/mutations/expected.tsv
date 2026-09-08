@@ -1,0 +1,6 @@
+# The repo-carried mutation controls (MEMNG-267), read by scripts/check-mutations.sh.
+# Tab-separated: patch<TAB>marker<TAB>expected_failed (space-separated test ids)<TAB>sqlstate (optional).
+# expected_failed is the EXACT set of FAILED ids the module must report under that marker.
+tests/mutations/no_r7a.patch	no_r7a	test_stale_claim_recovery_and_a_two_attachment_patch_do_not_cycle test_the_recovery_sweep_locks_its_terminal_attachments_ascending_before_it_writes	40P01
+tests/mutations/no_named_arm.patch	no_named_arm	test_a_create_naming_an_attachment_and_deduping_onto_another_does_not_cycle_with_recovery test_pass_zero_locks_the_named_and_the_dedup_attachment_in_one_ascending_statement	40P01
+tests/mutations/c5b_merge_answers.patch	c5b_merge_answers	test_a_missing_attachment_upload_still_answers_409_when_a_poster_is_also_named	

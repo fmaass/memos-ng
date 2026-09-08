@@ -130,6 +130,10 @@ met until its tests exist and pass.
 - **Real, not fake:** a test must fail when the feature is broken (remove the implementation →
   test goes red). No test that builds its own expected value and asserts against it. Never mock
   the unit under test.
+- **Mutation controls are run, not trusted.** A repo-carried mutation under `tests/mutations/` is
+  run by `scripts/check-mutations.sh`, which applies each patch in place with a sha256-proven
+  revert, runs the module under its `MEMNG267_MUTATION` value, and requires exit 1 with exactly
+  the FAILED set named in `tests/mutations/expected.tsv`; a mutation run that exits 0 is a defect.
 - **Coverage:** every new/changed backend function gets a pytest unit test; every frontend
   view/composable gets a vitest test. Classification/routing heuristics need a case per input
   category, not just the happy path.

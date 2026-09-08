@@ -20,11 +20,13 @@ There is no GitHub Actions workflow (retired 2026-08-25 after every run had been
 the billing layer for 40+ runs while the local gates did all the catching). The release gate
 is the LOCAL gate, run bare with each exit code cited:
 `uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q &&
-uv run alembic check`, plus the frontend suite (`npx vitest run`) and the version checker
-above. Images are never pulled from a registry — the deploy image is built locally (below),
-so there is no `ghcr.io` push and no Trivy gate; run the local `docker build` before deploy
-to catch slim-image/wheel breakage. Tag agreement is enforced *before* tagging via the
-checker's `--tag`.
+uv run alembic check && scripts/check-mutations.sh`, plus the frontend suite (`npx vitest run`)
+and the version checker above. `scripts/check-mutations.sh` runs the repo-carried mutation
+controls: each patch in `tests/mutations/` is applied in place with a sha256-proven revert and
+must fail exactly the probes `tests/mutations/expected.tsv` names. Images are never pulled from
+a registry — the deploy image is built locally (below), so there is no `ghcr.io` push and no
+Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
+agreement is enforced *before* tagging via the checker's `--tag`.
 
 ## Migrations
 
