@@ -1559,6 +1559,20 @@
         "title": "MemoList",
         "type": "object"
       },
+      "MemoNotFoundError": {
+        "description": "The 404 both PATCH and DELETE already answer for a memo that is not there (MEMNG-285).\n\nDeliberately NOT the nested `code`/`message` shape every other error model in this router\ncarries. Those bodies are built here, so their shape is ours to choose; this one is not \u2014 all\nthree raises behind it hand FastAPI's own `HTTPException` a plain string detail, which FastAPI\nserialises as `{\"detail\": \"<string>\"}`. Adopting the house family here would declare a body no\nroute returns, replacing one contract lie with another.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "MemoNotFoundError",
+        "type": "object"
+      },
       "MemoOut": {
         "properties": {
           "archived_at": {
@@ -4614,6 +4628,16 @@
           "204": {
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoNotFoundError"
+                }
+              }
+            },
+            "description": "No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -4719,6 +4743,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoNotFoundError"
+                }
+              }
+            },
+            "description": "No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted."
           },
           "409": {
             "content": {

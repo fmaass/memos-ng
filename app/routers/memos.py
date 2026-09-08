@@ -235,6 +235,29 @@ class EditRacedError(BaseModel):
     detail: EditRacedDetail
 
 
+class MemoNotFoundError(BaseModel):
+    """The 404 both PATCH and DELETE already answer for a memo that is not there (MEMNG-285).
+
+    Deliberately NOT the nested `code`/`message` shape every other error model in this router
+    carries. Those bodies are built here, so their shape is ours to choose; this one is not — all
+    three raises behind it hand FastAPI's own `HTTPException` a plain string detail, which FastAPI
+    serialises as `{"detail": "<string>"}`. Adopting the house family here would declare a body no
+    route returns, replacing one contract lie with another.
+    """
+
+    detail: str
+
+
+MEMO_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
+    404: {
+        "model": MemoNotFoundError,
+        "description": "No such memo for this caller: it never existed, or it is another user's "
+        "private memo, or it was deleted between this request's read and the memo lock being "
+        "granted. Nothing was edited or deleted.",
+    }
+}
+
+
 UNLINKABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
     409: {
         "model": UploadsUnlinkableError,
@@ -245,6 +268,7 @@ UNLINKABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
 
 
 PATCH_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **MEMO_NOT_FOUND_RESPONSE,
     409: {
         "model": UploadsUnlinkableError | EditKeyConflictError,
         "description": "Either a requested upload_uid is missing, expired or incomplete "
@@ -1025,7 +1049,7 @@ async def patch_memo(
     return _out(settled, owner_id)
 
 
-@router.delete("/memos/{uid}", status_code=204)
+@router.delete("/memos/{uid}", status_code=204, responses=MEMO_NOT_FOUND_RESPONSE)
 async def delete_memo(
     uid: str,
     user: Annotated[User, Depends(auth.require_user)],

@@ -1882,6 +1882,20 @@ export interface components {
             /** Totalcount */
             totalCount: number | null;
         };
+        /**
+         * MemoNotFoundError
+         * @description The 404 both PATCH and DELETE already answer for a memo that is not there (MEMNG-285).
+         *
+         *     Deliberately NOT the nested `code`/`message` shape every other error model in this router
+         *     carries. Those bodies are built here, so their shape is ours to choose; this one is not — all
+         *     three raises behind it hand FastAPI's own `HTTPException` a plain string detail, which FastAPI
+         *     serialises as `{"detail": "<string>"}`. Adopting the house family here would declare a body no
+         *     route returns, replacing one contract lie with another.
+         */
+        MemoNotFoundError: {
+            /** Detail */
+            detail: string;
+        };
         /** MemoOut */
         MemoOut: {
             /**
@@ -3466,6 +3480,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoNotFoundError"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -3499,6 +3522,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoOut"];
+                };
+            };
+            /** @description No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoNotFoundError"];
                 };
             };
             /** @description Either a requested upload_uid is missing, expired or incomplete (`uploads_unlinkable`), or the `edit_key` is already bound to a different memo (`edit_key_conflict`). Switch on `detail.code`. Nothing is edited and no attachment is linked in either case. */

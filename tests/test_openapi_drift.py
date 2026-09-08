@@ -307,3 +307,27 @@ def test_the_compat_reads_publish_their_optional_credential():
     from app.main import app
 
     assert app.openapi()["paths"]["/api/v1/memos"]["get"]["security"] == [{"bearerAuth": []}, {}]
+
+
+def test_a_vanished_memo_is_a_declared_404_on_both_patch_and_delete():
+    """MEMNG-285. Both operations answer 404 for a memo that is not there on THREE paths —
+    `_require_owned` (never existed, or not the caller's) and the two MEMNG-267 lock-loss raises —
+    and FastAPI infers a response from none of them, because none is a return type. The runtime
+    answers are driven by tests/test_lock_protocol_concurrency.py
+    (`test_a_patch_that_loses_its_memo_answers_404_not_500`,
+    `test_a_delete_that_loses_its_memo_answers_404_not_500`); this is the schema saying the same
+    thing. The body shape is asserted, not just the status: these raise FastAPI's own
+    `HTTPException`, so `detail` is a plain string, and declaring this router's nested
+    `code`/`message` family here would swap one contract lie for another."""
+    from app.main import app
+
+    document = app.openapi()
+    operations = document["paths"]["/api/memos/{uid}"]
+    for method in ("patch", "delete"):
+        not_found = operations[method]["responses"]["404"]
+        assert not_found["description"], method
+        ref = not_found["content"]["application/json"]["schema"]["$ref"]
+        model = document["components"]["schemas"][ref.removeprefix("#/components/schemas/")]
+        assert model["required"] == ["detail"], method
+        # `type: string`, not a `$ref` to a nested detail object: the plain shape is the assertion.
+        assert model["properties"]["detail"]["type"] == "string", method
