@@ -14,7 +14,7 @@ from typing import BinaryIO, Literal
 import puremagic
 import structlog
 from anyio import fail_after, to_thread
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -191,6 +191,29 @@ class VideoPostersInvalid(Exception):
     def __init__(self, problems: list[VideoPosterProblem]) -> None:
         super().__init__(f"{len(problems)} video poster override(s) cannot be consumed")
         self.problems = problems
+
+
+@dataclass
+class LockedMedia:
+    """Everything pass 0 of `finalize_pending` acquired, handed to the per-upload work that follows
+    so that work acquires NOTHING more (MEMNG-267 R3/R4).
+
+    The batch used to alternate classes — an upload row, then an attachment row, then the next
+    upload row — which is what let two batches hold each other's rows. Pass 0 takes the whole
+    upload set in one ascending statement, does every read that could discover a new row (the
+    completeness stat, the capture read, the sniff, the sha256), and only then takes the whole
+    attachment set in one ascending statement. After it, the loop's dedup is a dictionary lookup
+    and its `db.delete(upload)` calls can wait on nobody.
+
+    `candidates` maps a sha256 to the unlinked attachment that holds those bytes, already
+    revalidated under its lock (owner, and `memo_id IS NULL`). `finalize` also REGISTERS the rows
+    it mints here: a fresh row is private to this transaction and carries no lock order (R8), and
+    two uploads of identical bytes in one batch have always produced one attachment.
+    """
+
+    uploads: dict[str, Upload]
+    digests: dict[str, str]
+    candidates: dict[str, Attachment]
 
 
 # Blocking disk I/O runs off the event loop (anyio.to_thread) so large chunk writes /
@@ -589,6 +612,7 @@ async def _resolve_video_poster(
     pending: dict[str, tuple[Upload, ParsedName]],
     claimed: set[str],
     owner_id: int,
+    locked: LockedMedia | None = None,
 ) -> tuple[Upload | None, VideoPosterReason | None]:
     """One mapping: the poster Upload it will consume, or the reason it cannot be honoured.
 
@@ -612,11 +636,18 @@ async def _resolve_video_poster(
         return None, "poster_listed_as_attachment"
     if poster_uid in claimed:
         return None, "poster_reused"
-    poster_upload = (
-        await db.execute(
-            select(Upload).where(Upload.upload_uid == poster_uid, Upload.owner_id == owner_id)
-        )
-    ).scalar_one_or_none()
+    if locked is not None:
+        # Read the row pass 0 LOCKED, not a fresh unlocked one: the poster is deleted later in this
+        # same transaction, and R4 requires the row it will delete to be one it already holds. The
+        # pass-0 statement was owner-scoped, so a foreign uid is absent here exactly as it was
+        # absent from the old owner-scoped select.
+        poster_upload = locked.uploads.get(poster_uid)
+    else:
+        poster_upload = (
+            await db.execute(
+                select(Upload).where(Upload.upload_uid == poster_uid, Upload.owner_id == owner_id)
+            )
+        ).scalar_one_or_none()
     if poster_upload is None:  # unknown, expired, or another user's — one fail-closed answer
         return None, "poster_missing"
     complete = await to_thread.run_sync(
@@ -637,6 +668,7 @@ async def _validate_video_posters(
     video_posters: dict[str, str],
     pending: dict[str, tuple[Upload, ParsedName]],
     owner_id: int,
+    locked: LockedMedia | None = None,
 ) -> dict[str, Upload]:
     """Resolve every video→poster mapping to the poster Upload it consumes, or refuse the batch.
 
@@ -653,7 +685,7 @@ async def _validate_video_posters(
     claimed: set[str] = set()
     for video_uid, poster_uid in sorted(video_posters.items()):
         poster_upload, reason = await _resolve_video_poster(
-            db, video_uid, poster_uid, pending, claimed, owner_id
+            db, video_uid, poster_uid, pending, claimed, owner_id, locked
         )
         if reason is not None:
             problems.append(VideoPosterProblem(video_uid, poster_uid, reason))
@@ -863,15 +895,37 @@ async def finalize_pending(
     request_index: dict[str, int] = {}
     for position, up_uid in enumerate(upload_uids):
         request_index.setdefault(up_uid, position)
+    # ---- PASS 0 (MEMNG-267 R3/R4/R4a) ------------------------------------------------------
+    # ONE ascending acquisition of the upload class, over the UNION of the two roles: the uploads
+    # that become attachments and the uploads that become poster tiers. Every row this transaction
+    # will later DELETE is in it, so no deletion can wait once an attachment row is held; a uid
+    # named in both roles is locked once, because this is a set.
+    requested = set(upload_uids) | set((video_posters or {}).values())
+    locked_uploads: dict[str, Upload] = {
+        row.upload_uid: row
+        for row in (
+            (
+                await db.execute(
+                    select(Upload)
+                    .where(Upload.upload_uid.in_(requested), Upload.owner_id == owner_id)
+                    .order_by(Upload.upload_uid)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+
     pending: list[tuple[Upload, ParsedName]] = []
     missing: list[str] = []
     incomplete: list[str] = []
+    # The ATTACHMENT role. Its continuation is the one it has always had — a 409 naming every
+    # offender — and the poster role's is a 422 in FastAPI's validation shape. One acquisition, two
+    # continuations: merging them would answer `poster_missing` with the wrong status (R4a).
     for up_uid in upload_uids:
-        upload = (
-            await db.execute(
-                select(Upload).where(Upload.upload_uid == up_uid, Upload.owner_id == owner_id)
-            )
-        ).scalar_one_or_none()
+        upload = locked_uploads.get(up_uid)
         if upload is None:
             missing.append(up_uid)
             continue
@@ -889,11 +943,78 @@ async def finalize_pending(
     # owner-scoped row, so a mapping whose video is absent here names a video this memo is not
     # posting at all.
     by_uid = {upload.upload_uid: (upload, parsed) for upload, parsed in pending}
+    # The POSTER role, resolved against the SAME locked set and refused whole before any
+    # attachment is touched — so a batch this rejects has locked no attachment at all.
+    locked = LockedMedia(uploads=locked_uploads, digests={}, candidates={})
     posters = (
-        await _validate_video_posters(db, video_posters, by_uid, owner_id)
+        await _validate_video_posters(db, video_posters, by_uid, owner_id, locked)
         if video_posters
         else {}
     )
+
+    # Every read that could otherwise DISCOVER an attachment late, done here under the upload
+    # locks: the capture read, and the digest the dedup decision is made from. Hashing a print that
+    # will bind to a memo sibling is one extra read of a file that is about to be moved anyway —
+    # the alternative, hashing lazily, is precisely the defect being fixed, because it finds a
+    # dedup candidate AFTER the attachment set has been locked.
+    for upload, _parsed in pending:
+        settled = await ensure_capture(db, upload)
+        if settled is None:  # cannot happen under the lock above; answered as an unknown uid would
+            raise UploadsUnlinkable([upload.upload_uid], [])
+        locked.uploads[settled.upload_uid] = settled
+        locked.digests[settled.upload_uid] = await to_thread.run_sync(
+            _sha256_sync, part_path(settled.upload_uid)
+        )
+
+    # An UNLOCKED read that makes no ownership claim — it produces ids, and every one of them is
+    # revalidated under its own lock below. `ORDER BY id` so the candidate a digest resolves to is
+    # the same one on every run (it was arbitrary under a bare LIMIT 1).
+    for att in (
+        (
+            await db.execute(
+                select(Attachment)
+                .where(
+                    Attachment.sha256.in_(set(locked.digests.values())),
+                    Attachment.owner_id == owner_id,
+                    Attachment.memo_id.is_(None),
+                )
+                .order_by(Attachment.id)
+            )
+        )
+        .scalars()
+        .all()
+        if locked.digests
+        else []
+    ):
+        if att.sha256 is not None:
+            locked.candidates.setdefault(att.sha256, att)
+
+    # ONE ascending acquisition of the attachment class: the dedup candidates, plus the memo's own
+    # attachments — which `link_attachments` and a sibling print bind both take afterwards, and now
+    # re-lock rather than acquire. `populate_existing` because the candidates are already in the
+    # identity map from the unlocked read above, and the revalidation must judge the LOCKED row.
+    a_predicates = []
+    if locked.candidates:
+        a_predicates.append(Attachment.id.in_({a.id for a in locked.candidates.values()}))
+    if memo is not None:
+        a_predicates.append(Attachment.memo_id == memo.id)
+    if a_predicates:
+        await db.execute(
+            select(Attachment)
+            .where(or_(*a_predicates))
+            .order_by(Attachment.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    # Revalidated under the lock, which is what Postgres used to do implicitly by re-evaluating the
+    # predicate after the wait: a candidate that has since been linked or changed hands is dropped,
+    # and its upload mints its own attachment and its own file instead of stealing one (X2).
+    locked.candidates = {
+        digest: att
+        for digest, att in locked.candidates.items()
+        if att.owner_id == owner_id and att.memo_id is None
+    }
+    # ---- end of pass 0. Nothing below acquires another row. ---------------------------------
 
     async def _finalize_one(upload: Upload) -> Attachment:
         """Finalize one upload as an attachment and consume its poster override, if it has one.
@@ -912,6 +1033,7 @@ async def finalize_pending(
             moved_out,
             dedup=poster_upload is None,
             consumed_out=consumed_out,
+            locked=locked,
         )
         if poster_upload is not None:
             assert poster_copies_out is not None  # guaranteed by the guard above
@@ -975,9 +1097,16 @@ async def finalize(
     *,
     dedup: bool = True,
     consumed_out: list[str] | None = None,
+    locked: LockedMedia | None = None,
 ) -> Attachment:
     """Turn one fully-received upload into this owner's attachment (or, by dedup, hand back the
     unlinked one that already holds these bytes).
+
+    `locked` is what a BATCH passes: the upload set, the digests and the dedup candidates its
+    pass 0 already acquired and revalidated (MEMNG-267 R3). With it, this call takes no attachment
+    row lock of its own — the candidate is a dictionary lookup, and the row behind it is already
+    held. Without it (the standalone finalize route) the behaviour is unchanged, down to the single
+    `FOR UPDATE` statement that lets Postgres re-evaluate the predicate for the loser of a race.
 
     `dedup=False` opts out of that reuse and always creates a new row. Its one caller is a video
     carrying a client-supplied poster: the override is written to a path derived from the returned
@@ -992,19 +1121,21 @@ async def finalize(
     # — and stamp an attachment with no date the file plainly has. Locking queues this finalize
     # behind that commit; `ensure_capture` also performs the read itself when nothing has yet
     # (a session that completed before this feature shipped, or a zero-byte file).
-    locked = await ensure_capture(db, upload)
-    if locked is None:
+    settled = await ensure_capture(db, upload)
+    if settled is None:
         # Gone while this call waited for the lock — another finalize consumed it. Its part file
         # is that finalize's business now (moved into place, or reaped after its commit), so this
         # one must not touch it: it answers exactly as an unknown uid does.
         raise UploadsUnlinkable([upload.upload_uid], [])
-    upload = locked
+    upload = settled
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
     if actual != upload.declared_size:
         raise ValueError(f"size mismatch: {actual} != {upload.declared_size}")
 
-    digest = await to_thread.run_sync(_sha256_sync, part)
+    digest = (locked.digests if locked is not None else {}).get(upload.upload_uid)
+    if digest is None:
+        digest = await to_thread.run_sync(_sha256_sync, part)
 
     # sha256 dedup — identical bytes already stored BY THIS OWNER → return the existing
     # attachment. Scoped per-owner: a global dedup would hand one user a reference to another
@@ -1013,8 +1144,15 @@ async def finalize(
     # memo is that memo's — reusing it would let link_attachments re-point memo_id and STRAND the
     # original memo (the same photo in a second memo must get its own row + file, like renditions).
     # limit(1) since several memos may legitimately share identical bytes now.
-    existing = (
-        (
+    if not dedup:
+        existing = None
+    elif locked is not None:
+        # The batch: the candidate was resolved, LOCKED and revalidated in pass 0, so this decision
+        # acquires nothing. A digest the map does not name has no reusable twin (or had one that
+        # failed revalidation), and this upload mints its own row below.
+        existing = locked.candidates.get(digest)
+    else:
+        existing = (
             (
                 await db.execute(
                     select(Attachment)
@@ -1023,6 +1161,9 @@ async def finalize(
                         Attachment.owner_id == owner_id,
                         Attachment.memo_id.is_(None),
                     )
+                    # ORDER BY id so several identical unlinked twins always yield the same one:
+                    # a bare LIMIT 1 picked arbitrarily, which is not something a probe can pin.
+                    .order_by(Attachment.id)
                     .limit(1)
                     # FOR UPDATE so two concurrent posts can't both reuse the same unlinked row: the
                     # loser blocks, then Postgres re-evaluates `memo_id IS NULL` against the
@@ -1034,9 +1175,6 @@ async def finalize(
             .scalars()
             .first()
         )
-        if dedup
-        else None
-    )
     if existing is not None:
         await _consume(part, consumed_out)
         await db.delete(upload)
@@ -1078,6 +1216,12 @@ async def finalize(
     )
     db.add(attachment)
     await db.flush()
+    if locked is not None:
+        # A row this transaction just inserted is invisible to every other one, so it carries no
+        # lock order (R8) — but it IS a dedup target for the rest of the batch, exactly as it was
+        # when the loop re-ran the query and found it. Two uploads of identical bytes in one batch
+        # have always produced one attachment; registering it here is what keeps that true.
+        locked.candidates.setdefault(digest, attachment)
 
     # Lane routing: video → fast (poster/dims), and the fast lane then enqueues the slow
     # (transcode) job — so the two never race a status overwrite under concurrent workers (a slow

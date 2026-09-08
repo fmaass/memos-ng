@@ -361,6 +361,11 @@ async def recover_stale_media_claims(db: AsyncSession, now: datetime | None = No
             await db.execute(
                 select(MediaJob)
                 .where(MediaJob.state == JobState.processing, MediaJob.updated_at < cutoff)
+                # Ascending by id, because the protocol acquires every class ascending and a sweep
+                # is bound by that rule exactly as a request is (MEMNG-267 R2). It closes nothing
+                # on its own — SKIP LOCKED never waits — but it is the order the class is written
+                # down in, and an unordered set here is what a later change would inherit.
+                .order_by(MediaJob.id)
                 # skip_locked: a row a worker is actively finishing (its brief result txn) is theirs
                 .with_for_update(skip_locked=True)
             )
@@ -368,6 +373,30 @@ async def recover_stale_media_claims(db: AsyncSession, now: datetime | None = No
         .scalars()
         .all()
     )
+    # The attachment rows this sweep will write, taken as ONE ascending set BEFORE the loop
+    # (MEMNG-267 R7a). `_fail_attachment` writes them one at a time in JOB order, autoflushed
+    # inside the single transaction the caller commits, so without this the sweep acquires A in an
+    # order nothing else shares — and a request that holds a memo's attachments ascending (the
+    # protocol's own order) inverts against it.
+    #
+    # The PRECISE set, not every attachment a stale job names: a job that merely re-queues writes
+    # no attachment row, and this sweep runs hourly across the whole backlog. It is decidable from
+    # the rows already loaded, because `_fail_attachment` is kind-scoped and the ceiling test is
+    # arithmetic. J is still acquired first, so J → A is preserved.
+    terminal = sorted(
+        {
+            job.attachment_id
+            for job in rows
+            if job.kind == JobKind.derive and job.attempts + 1 >= settings.MEDIA_MAX_ATTEMPTS
+        }
+    )
+    if terminal:
+        await db.execute(
+            select(Attachment.id)
+            .where(Attachment.id.in_(terminal))
+            .order_by(Attachment.id)
+            .with_for_update()
+        )
     for job in rows:
         job.attempts += 1
         job.claimed_by = None

@@ -262,37 +262,41 @@ async def link_attachments(
     """
     if not uids:
         return
-    owned = (
+    # ONE globally sorted acquisition of the attachment class, not two (MEMNG-267 R2). Two
+    # separately-ordered FOR UPDATE statements in one transaction are not an order: this
+    # transaction could take a high id in the first set and then wait for a low id in the second,
+    # which is exactly the wait a concurrent batch inverts against. Membership is preserved
+    # EXACTLY — the OR, not a single owner conjunct, because the memo-linked set carries no owner
+    # predicate today and narrowing it would silently drop a legacy or foreign-owner row from the
+    # renumber. `populate_existing` because a row this transaction already holds (finalize's pass 0
+    # pre-locks them) must be judged by what the locked row says now, not by an older snapshot.
+    locked_rows = (
         (
             await db.execute(
-                # FOR UPDATE (ordered by id for a stable lock order) so the memo_id steal-guard
-                # below re-checks under a row lock: a concurrent post racing for the same unlinked
-                # attachment blocks, then sees it already linked and skips it.
                 select(Attachment)
-                .where(Attachment.uid.in_(uids), Attachment.owner_id == owner_id)
+                .where(
+                    or_(
+                        and_(Attachment.uid.in_(uids), Attachment.owner_id == owner_id),
+                        Attachment.memo_id == memo.id,
+                    )
+                )
                 .order_by(Attachment.id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
         .all()
     )
+    wanted = set(uids)
+    # Partitioned in Python, by the same two predicates the two statements carried. A row can
+    # satisfy both, and did before: the sets are not exclusive and are not made so here.
+    # `owned` feeds the steal-guarded link below.
+    owned = [a for a in locked_rows if a.uid in wanted and a.owner_id == owner_id]
     data_root = Path(settings.DATA_ROOT)
     dest_dir = storage.memo_dir(data_root, memo.created_at, memo.uid)
     # Read BEFORE anything is linked: these are the attachments whose order is already a fact.
-    # Locked in id order (a stable lock order), then sorted the way they are displayed.
-    already = (
-        (
-            await db.execute(
-                select(Attachment)
-                .where(Attachment.memo_id == memo.id)
-                .order_by(Attachment.id)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .all()
-    )
+    already = [a for a in locked_rows if a.memo_id == memo.id]
     next_position = 0
     if already:
         if any(a.position is None for a in already):
