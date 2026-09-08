@@ -139,7 +139,14 @@ async def create_memo(
     # refresh just reloads the identical persisted value.
     await db.refresh(memo, ["created_at"])
     # The row exists now — take its lock before any upload or attachment row is touched.
-    memo = await lock_memo_for_write(db, memo)
+    locked = await lock_memo_for_write(db, memo)
+    # None is the edit paths' answer for "somebody deleted it while I queued" (MEMNG-267 R6a), and
+    # it cannot happen here: this row is THIS transaction's own uncommitted insert, so no other
+    # session can see it, let alone delete it. Asserted rather than handled — the create path
+    # keeps handing a `Memo` to everything below, and reasoning that turns out to be wrong should
+    # surface as itself instead of as a None flowing on.
+    assert locked is not None, "the memo this transaction just inserted cannot be missing"
+    memo = locked
     finalized = list(await finalize(memo)) if finalize is not None else []
     await link_attachments(
         db, owner.id, memo, [*(attachment_uids or []), *finalized], moved_out=moved_out
@@ -189,7 +196,7 @@ async def _place_attachment_masters(
             r.storage_path = str(new)
 
 
-async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo:
+async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo | None:
     """Take the memo row's write lock — the FIRST lock a memo edit acquires (MEMNG-262).
 
     Everything an edit locks afterwards hangs off this memo: the uploads it finalizes, the
@@ -213,6 +220,16 @@ async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo:
     A create takes it too (see `create_memo`): its row cannot be contended, but taking the same
     outermost lock on every path is what makes the lock ORDER a property of the code rather than
     of an argument about visibility.
+
+    LOSING THE ROW IS AN ANSWER, not an error (MEMNG-267 R6a). The caller read this memo before it
+    queued here, and a delete of that memo committing while it queued is precisely the
+    interleaving this lock exists to order — so it returns None rather than raising, and each
+    caller says what a lost memo means to it: a 404 on the edit and delete routes, an
+    impossibility on create, whose row is its own uncommitted insert. Raising instead turned that
+    ordinary loss into a 500 on the one path the lock was added to make safe. Every other lock in
+    the protocol already answers this way: `uploads.ensure_capture` returns None for a vanished
+    upload, `reclaim.reclaim_attachment` answers "vanished", `media.guard_publish` reads a missing
+    job row as the delete having won.
     """
     return (
         await db.execute(
@@ -221,7 +238,7 @@ async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo:
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-    ).scalar_one()
+    ).scalar_one_or_none()
 
 
 async def link_attachments(

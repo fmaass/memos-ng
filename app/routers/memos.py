@@ -755,6 +755,11 @@ async def create_memo(
                 # `or body.video_posters`: a mapping sent with no upload_uids at all names no video
                 # of this memo, and must be answered as the mistake it is rather than dropped in
                 # silence because the batch looked empty.
+                # No `memo=`, and that is the difference from the PATCH path rather than an
+                # omission: `memo=` is what lets a print bind onto a screen the memo ALREADY
+                # carries, and a memo being created carries nothing yet — this very call is what
+                # produces its first attachments. Passing the half-built memo would offer
+                # `bind_print_to_sibling` a sibling set that cannot exist.
                 finalized = (
                     await uploads_svc.finalize_pending(
                         db,
@@ -929,6 +934,14 @@ async def patch_memo(
             # lost update SQLAlchemy cannot see (see lock_memo_for_write). A distinct name, since
             # the enclosing handler's `memo` is what the retry loop re-enters with.
             locked = await svc.lock_memo_for_write(db, memo)
+            if locked is None:
+                # The memo was deleted between this request's unlocked read and the lock being
+                # granted — the interleaving the memo lock exists to order (MEMNG-267 R6a).
+                # Raised HERE, ahead of the edit key and ahead of every byte, so the client's key
+                # stays free for a retry and the answer is the one this API already gives for a
+                # memo that is not there. `_apply_or_replay` catches IntegrityError alone, so it
+                # travels out untouched.
+                raise HTTPException(status_code=404, detail="Memo not found")
             if key is not None:
                 # Recorded BEFORE any work: the loser of a same-key race blocks on the unique
                 # constraint and fails here, having moved no bytes — so it has none to move back.
@@ -1021,11 +1034,25 @@ async def delete_memo(
     memo = await _require_owned(db, user, uid)
     if memo.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Not your memo")
+    # M FIRST, before this transaction touches anything else (MEMNG-267 R6). The ORM delete below
+    # emits `UPDATE attachments SET memo_id=NULL` and only then `DELETE FROM memos`, so left to
+    # itself this request takes the attachment rows before the memo row — the protocol's order
+    # backwards, and exactly what a PATCH of the same memo (which holds M and then reaches for
+    # those attachments) deadlocks against. Taking the memo lock at the head puts the delete on
+    # the same M → A path as every edit, and it costs nothing: everything after it is downstream.
+    locked = await svc.lock_memo_for_write(db, memo)
+    if locked is None:
+        # A concurrent delete of this memo committed while this one queued for the lock. It won:
+        # there is no row left to delete and no attachment left to reclaim, and saying so is
+        # honest where a 204 would report work this request did not do (R6a).
+        raise HTTPException(status_code=404, detail="Memo not found")
     # PHASE 1: the memo goes and its attachments are left ORPHANED, on purpose. Deleting their rows
     # here would put this request one crash away from files that no row names any more; an orphan
     # row is the durable journal that survives the crash and is reconcilable afterwards
     # (app/services/reclaim.py states the principle in full).
-    orphaned = await svc.delete_memo(db, memo)
+    # The LOCKED memo, not the one read before the wait: its `attachments` were reloaded through
+    # the lock, so the orphan journal names what the row actually carries now (§3.3).
+    orphaned = await svc.delete_memo(db, locked)
     await db.commit()
     # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
     # its files, then the row. Each id gets its own transaction, so a failure part way through

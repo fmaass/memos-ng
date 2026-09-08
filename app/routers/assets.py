@@ -648,16 +648,18 @@ async def delete_attachment(
     DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
     memo keeps its text; only the media is removed."""
     # (Kept out of the docstring, which FastAPI publishes as this endpoint's OpenAPI description.)
-    # This request NEVER waits on a running media job. A worker claims a job with SELECT … FOR
-    # UPDATE and holds that row lock until the job commits — for a slow-lane transcode, the whole
-    # run (up to SLOW_TRANSCODE_TIMEOUT_S). Both statements this used to issue queued behind that
-    # lock: the plain `DELETE FROM media_jobs WHERE attachment_id = …`, and the attachment delete
-    # itself through the old FK's ON DELETE CASCADE. Either one pinned a request-serving
-    # connection for the transcode's duration, and a handful of those exhaust DB_POOL_SIZE +
-    # overflow on the shared Postgres (MEMNG-41). So the FK is gone (see MediaJob) and the job
-    # cleanup below takes only the rows it can lock immediately; the in-flight row belongs to its
-    # worker, which discards job and partial output on finding the attachment gone
-    # (media.AttachmentGone → worker.run_once).
+    # This request NEVER waits on a running media job, and never inverts against one. When
+    # MEMNG-41 was filed a worker held its job row for the whole transcode, so both statements
+    # this used to issue queued behind that lock for up to an hour — the plain `DELETE FROM
+    # media_jobs WHERE attachment_id = …` and the attachment delete itself through the old FK's
+    # ON DELETE CASCADE — and a handful of those exhaust DB_POOL_SIZE + overflow on the shared
+    # Postgres. MEMNG-90 shortened the hold to the worker's two short transactions (the claim is
+    # committed before processing, `app/worker.py:279`), so what is left to avoid is not the long
+    # wait but the ORDER: a cascade would take the attachment row before the job row, against the
+    # J → A every worker and reclaim path acquires in (MEMNG-267 R7). So the FK is gone (see
+    # MediaJob) and the job cleanup below takes only the rows it can lock immediately; the
+    # in-flight row belongs to its worker, which discards job and partial output on finding the
+    # attachment gone (media.AttachmentGone → worker.run_once).
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")

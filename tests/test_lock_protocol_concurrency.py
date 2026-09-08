@@ -42,6 +42,7 @@ from app.database import async_session
 from app.database import engine as async_engine
 from app.main import app
 from app.models import Attachment, MediaJob
+from app.routers import memos as memos_router
 from app.scripts import backfill_media_metadata as backfill
 from app.services import media as media_svc
 from app.services import poster
@@ -51,6 +52,7 @@ from httpx import ASGITransport, AsyncClient
 from PIL import Image
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.util import await_only
 
 from tests.conftest import SYNC_URL
 
@@ -1800,5 +1802,251 @@ async def test_rendition_deletion_and_multipart_print_run_beside_a_parked_attach
         )[0]
         assert print_path is not None
         assert Path(print_path).read_bytes() == print_bytes
+    finally:
+        _cleanup()
+
+
+# --------------------------------------------------------------------------------------------
+# C8 (phase 2, MEMNG-280) — memo DELETE ∥ PATCH of that memo, and the missing-memo continuation
+# --------------------------------------------------------------------------------------------
+
+
+def _commit_sql(query: str, **params) -> None:
+    """Run one statement on its OWN connection and COMMIT it.
+
+    The probes below need a memo to genuinely vanish under a parked reader, and §5.1 forbids the
+    `adb` fixture for exactly that: its outer transaction is rolled back at teardown and is
+    invisible to a second connection (`tests/conftest.py:65-75`). `_sql` opens a connection it
+    never commits, so it cannot be the deleter.
+    """
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text(query), params)
+    eng.dispose()
+
+
+def _park_before_the_memo_delete_statement(park: Park, statements: list[str]):
+    """Park the deleting actor BETWEEN the ORM flush's `UPDATE attachments SET memo_id=NULL` and
+    its `DELETE FROM memos` — the instant C8 is built on, where A is held and M is about to be
+    asked for.
+
+    Both statements come out of ONE `db.flush()` inside `delete_memo` (`app/services/memos.py`),
+    so there is no Python boundary between them and the module's `AsyncSession.execute` wrapper
+    never sees them: an ORM flush goes to the connection, not through `execute`.
+    `before_cursor_execute` is the only seam that sits between the two, and `await_only` is how a
+    coroutine is awaited from inside the greenlet SQLAlchemy runs that callback in. The seam lives
+    here, in the test harness — nothing is added to `app/` for it.
+    """
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(" ".join(statement.split()))
+        if statement.lstrip().upper().startswith("DELETE FROM MEMOS") and park.claim():
+            await_only(park.hold())
+
+    event.listen(async_engine.sync_engine, "before_cursor_execute", record)
+    return record
+
+
+def _park_before_the_memo_lock(monkeypatch, park: Park) -> None:
+    """Park an actor at the instant BEFORE it queues for the memo row lock — the window R6a is
+    about: the caller has read the memo unlocked, and by the time the lock is granted the row it
+    read may be gone."""
+    real = memos_router.svc.lock_memo_for_write
+
+    async def parking(db, memo):
+        if park.claim():
+            await park.hold()
+        return await real(db, memo)
+
+    monkeypatch.setattr(memos_router.svc, "lock_memo_for_write", parking)
+
+
+def _park_after_require_owned(monkeypatch, park: Park) -> None:
+    """Park a route between its unlocked ownership read and everything that follows.
+
+    This is the one seam that exists on BOTH trees for the DELETE probe: before R6 the route goes
+    straight from here into `svc.delete_memo`, after R6 it goes into `lock_memo_for_write`, and
+    the probe must schedule the same race against each.
+    """
+    real = memos_router._require_owned
+
+    async def parking(db, user, uid):
+        memo = await real(db, user, uid)
+        if park.claim():
+            await park.hold()
+        return memo
+
+    monkeypatch.setattr(memos_router, "_require_owned", parking)
+
+
+async def test_memo_delete_and_patch_of_that_memo_do_not_cycle(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """C8. The DELETE's ORM flush takes A (`UPDATE attachments SET memo_id=NULL`) and then wants M;
+    a PATCH of the same memo holds M and wants the memo's attachment set. Before R6 the DELETE
+    route takes no memo lock at all, so the two invert.
+
+    The loser is not merely "not a deadlock": the PATCH's `lock_memo_for_write` is granted a memo
+    that no longer exists, which before R6a was a `NoResultFound` out of `.scalar_one()` — a 500
+    on the very interleaving R6 exists to make safe.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    statements: list[str] = []
+    park = Park()
+    listener = None
+    try:
+        memo = _memo(client, "delete me", upload_uids=[_upload(client, "c8.png", _png(b"C8"))])
+        added = _upload(client, "c8b.png", _png(b"C8b"))
+        # The two files this race is judged on (§5.1 wants rows AND bytes): the master the winning
+        # delete has to sweep, and the part file the losing PATCH must leave exactly as it found
+        # it. Read now, so the after-picture is compared against real bytes and not against
+        # whatever the assertions themselves could invent.
+        master = Path(_one("SELECT storage_path FROM attachments")[0])
+        assert master.read_bytes() == _png(b"C8")
+        pending = uploads_svc.part_path(added)
+        assert pending.read_bytes() == _png(b"C8b")
+        listener = _park_before_the_memo_delete_statement(park, statements)
+
+        async with _async_client(client) as deleter, _async_client(client) as editor:
+            delete = asyncio.create_task(deleter.delete(f"/api/memos/{memo['uid']}"))
+            await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+            waiting = set(_lock_waiters())
+            edit = asyncio.create_task(
+                editor.patch(
+                    f"/api/memos/{memo['uid']}",
+                    json={"upload_uids": [added], "edit_key": "c8-lost-memo-key"},
+                )
+            )
+            await _wait_for_a_new_lock_wait(waiting)
+            park.release.set()
+            deleted, edited = await _both(delete, edit)
+
+        park.fired()
+        # The implicit order this cycle rests on, read off the wire rather than assumed: without
+        # this the probe could pass for a reason that has nothing to do with the ORM's flush order.
+        upper = [s.upper() for s in statements]
+        updates = [i for i, s in enumerate(upper) if s.startswith("UPDATE ATTACHMENTS")]
+        deletes = [i for i, s in enumerate(upper) if s.startswith("DELETE FROM MEMOS")]
+        assert any("FOR UPDATE" in s for s in upper), statements  # capture control
+        assert updates and deletes, statements
+        assert min(updates) < min(deletes), (updates, deletes)
+
+        assert deleted.status_code == 204, deleted.text
+        assert edited.status_code == 404, edited.text
+        assert edited.json() == {"detail": "Memo not found"}
+        # No edit key was consumed: it is recorded only after the memo lock is granted, so the
+        # client's key is still free for the retry it will make against a memo that exists.
+        assert _one("SELECT count(*) FROM memo_edit_keys")[0] == 0
+        # The memo is gone, its attachment was orphaned and then reclaimed, and the PATCH's upload
+        # never became one — the loser moved no bytes.
+        assert _sql("SELECT id FROM memos WHERE uid = :u", u=memo["uid"]) == []
+        assert _sql("SELECT id FROM attachments") == []
+        # BYTES, not only rows. Reclaim ran inside the winning request (its phase 2), so the
+        # master is gone with the row — a reclaim that dropped the row and left the file is the
+        # one outcome app/services/reclaim.py exists to prevent, and it would satisfy every row
+        # assertion above.
+        assert not master.exists(), "the deleted memo's master was left behind"
+        # The loser moved nothing: its upload is still pending and still holds its own bytes, so
+        # the client's retry against a memo that exists has something to retry with. Compared by
+        # CONTENT — an emptied or truncated part file exists just as happily as an intact one.
+        assert _one("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=added)[0] == 1
+        assert pending.read_bytes() == _png(b"C8b")
+    finally:
+        if listener is not None:
+            event.remove(async_engine.sync_engine, "before_cursor_execute", listener)
+        _cleanup()
+
+
+async def test_a_patch_that_loses_its_memo_answers_404_not_500(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """R6a on the PATCH path, without a deadlock in the way: park the edit before it queues for M,
+    delete the memo on a second connection and commit, then let the lock be granted.
+
+    Before R6a `lock_memo_for_write` ended in `.scalar_one()`, so this answered with a
+    `NoResultFound` escaping the route — a 500 for an outcome the API already has a word for.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = _memo(client, "patch me", upload_uids=[_upload(client, "p404.png", _png(b"P4"))])
+        master = Path(_one("SELECT storage_path FROM attachments")[0])
+        assert master.read_bytes() == _png(b"P4")
+        added = _upload(client, "p404b.png", _png(b"P4b"))
+        pending = uploads_svc.part_path(added)
+        assert pending.read_bytes() == _png(b"P4b")
+        park = Park()
+        _park_before_the_memo_lock(monkeypatch, park)
+
+        async with _async_client(client) as editor:
+            edit = asyncio.create_task(
+                editor.patch(
+                    f"/api/memos/{memo['uid']}",
+                    json={
+                        "content": "edited",
+                        "upload_uids": [added],
+                        "edit_key": "lost-memo",
+                    },
+                )
+            )
+            await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+            await asyncio.to_thread(_commit_sql, "DELETE FROM memos WHERE uid = :u", u=memo["uid"])
+            park.release.set()
+            edited = await edit
+
+        park.fired()
+        assert edited.status_code == 404, edited.text
+        assert edited.json() == {"detail": "Memo not found"}
+        # Raised inside `attempt()` BEFORE `record_edit_key`, so the key is untouched.
+        assert _one("SELECT count(*) FROM memo_edit_keys")[0] == 0
+        # And before any byte, which only the files can say: the edit's own upload is still
+        # pending with its bytes intact, and the memo's master — orphaned by the delete, not
+        # reclaimed by it — was not touched by the request that lost.
+        assert pending.read_bytes() == _png(b"P4b")
+        assert master.read_bytes() == _png(b"P4")
+    finally:
+        _cleanup()
+
+
+async def test_a_delete_that_loses_its_memo_answers_404_not_500(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """R6a's DELETE sibling. Two deleters of one memo: the first is parked after its unlocked
+    ownership read, the second commits, and the first is then let go.
+
+    Before R6 the route went straight from that read into `db.delete(memo)`, and its flush matched
+    no row: SQLAlchemy logged `DELETE statement on table 'memos' expected to delete 1 row(s); 0
+    were matched` as a WARNING and the route answered **204** — success for work it did not do,
+    and for a memo it never held. Under R6 the memo lock is taken first and answers what actually
+    happened: the row is gone, and that is a 404.
+    """
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo = _memo(
+            client, "delete me twice", upload_uids=[_upload(client, "d404.png", _png(b"D4"))]
+        )
+        master = Path(_one("SELECT storage_path FROM attachments")[0])
+        assert master.read_bytes() == _png(b"D4")
+        park = Park()
+        _park_after_require_owned(monkeypatch, park)
+
+        async with _async_client(client) as deleter:
+            request = asyncio.create_task(deleter.delete(f"/api/memos/{memo['uid']}"))
+            await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+            await asyncio.to_thread(_commit_sql, "DELETE FROM memos WHERE uid = :u", u=memo["uid"])
+            park.release.set()
+            answered = await request
+
+        park.fired()
+        assert answered.status_code == 404, answered.text
+        assert answered.json() == {"detail": "Memo not found"}
+        assert _sql("SELECT id FROM memos WHERE uid = :u", u=memo["uid"]) == []
+        # The loser reclaimed NOTHING. The winner here deleted the memo row alone, so the
+        # attachment is an orphan the sweep will collect — and the request that answered 404 must
+        # not have unlinked its master on the way out, which no row assertion can tell.
+        assert _one("SELECT count(*) FROM attachments")[0] == 1
+        assert master.read_bytes() == _png(b"D4")
     finally:
         _cleanup()
