@@ -295,6 +295,60 @@ def test_the_pat_surface_takes_a_session_or_a_grant_and_never_a_bearer():
         assert operation["security"] == [{"sessionCookie": []}, {"grantAuth": []}], (method, path)
 
 
+# The native self-service lane: every operation whose subject is the credential presenting it.
+NATIVE_SELF_SERVICE = {
+    ("post", "/api/auth/native/renew"),
+    ("post", "/api/auth/native/logout"),
+    ("get", "/api/auth/native/token"),
+    ("patch", "/api/auth/native/token"),
+}
+
+
+def test_the_native_self_service_lane_publishes_a_bearer_and_nothing_else():
+    """Read off the COMMITTED file, the only thing a generated client sees. Each of these acts ON
+    the token that presented it, so `presenting_token_hash` refuses a session cookie — which names
+    no token at all — and a contract that published one anyway would be wider than the lane it
+    describes, sending every generated client at a credential the routes reject (MEMNG-201)."""
+    document = json.loads((REPO_ROOT / "openapi.json").read_text())
+    for method, path in sorted(NATIVE_SELF_SERVICE):
+        assert document["paths"][path][method]["security"] == [{"bearerAuth": []}], (method, path)
+
+
+def test_the_bearer_only_lane_is_exactly_the_routes_that_read_the_presenting_token():
+    """The set above is written by hand, so a fifth route joining the lane later would leave it
+    over-published with nothing to say so. This reads the lane back off the routes instead: it is
+    the ones that take `presenting_token_hash` as a dependency, and the two must agree."""
+    from app.main import app
+    from app.routers.auth import presenting_token_hash
+    from fastapi.routing import APIRoute
+
+    reading_the_presenter = {
+        (method.lower(), route.path_format)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+        if any(d.call is presenting_token_hash for d in route.dependant.dependencies)
+    }
+    assert reading_the_presenter == NATIVE_SELF_SERVICE
+
+
+def test_the_narrower_credential_is_the_one_the_lane_publishes():
+    """`route_security` returns the FIRST auth dependency it recognises, so the bearer-only one has
+    to be declared ahead of `require_user` on each of these routes; declared after it, the lane
+    would quietly publish the session cookie again. This is that ordering, stated as a test."""
+    from app.main import app
+    from fastapi.routing import APIRoute
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        methods = {(method.lower(), route.path_format) for method in route.methods}
+        if not methods & NATIVE_SELF_SERVICE:
+            continue
+        names = [getattr(d.call, "__name__", "") for d in route.dependant.dependencies]
+        assert names.index("presenting_token_hash") < names.index("require_user"), route.path_format
+
+
 def test_a_bearer_route_states_both_credentials():
     from app.main import app
 

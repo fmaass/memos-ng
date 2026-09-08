@@ -3831,9 +3831,6 @@
         "security": [
           {
             "bearerAuth": []
-          },
-          {
-            "sessionCookie": []
           }
         ],
         "summary": "Native Logout",
@@ -3903,9 +3900,6 @@
         "security": [
           {
             "bearerAuth": []
-          },
-          {
-            "sessionCookie": []
           }
         ],
         "summary": "Native Renew",
@@ -3933,9 +3927,6 @@
         "security": [
           {
             "bearerAuth": []
-          },
-          {
-            "sessionCookie": []
           }
         ],
         "summary": "Native Token",
@@ -3981,9 +3972,6 @@
         "security": [
           {
             "bearerAuth": []
-          },
-          {
-            "sessionCookie": []
           }
         ],
         "summary": "Rename Native Token",
