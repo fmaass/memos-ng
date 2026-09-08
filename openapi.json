@@ -1559,6 +1559,19 @@
         "title": "MemoList",
         "type": "object"
       },
+      "MemoNotFoundError": {
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "MemoNotFoundError",
+        "type": "object"
+      },
       "MemoOut": {
         "properties": {
           "archived_at": {
@@ -4614,6 +4627,16 @@
           "204": {
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoNotFoundError"
+                }
+              }
+            },
+            "description": "No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -4719,6 +4742,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoNotFoundError"
+                }
+              }
+            },
+            "description": "No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted."
           },
           "409": {
             "content": {

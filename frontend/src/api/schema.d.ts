@@ -1882,6 +1882,11 @@ export interface components {
             /** Totalcount */
             totalCount: number | null;
         };
+        /** MemoNotFoundError */
+        MemoNotFoundError: {
+            /** Detail */
+            detail: string;
+        };
         /** MemoOut */
         MemoOut: {
             /**
@@ -3466,6 +3471,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoNotFoundError"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -3499,6 +3513,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoOut"];
+                };
+            };
+            /** @description No such memo for this caller: it never existed, or it is another user's private memo, or it was deleted between this request's read and the memo lock being granted. Nothing was edited or deleted. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoNotFoundError"];
                 };
             };
             /** @description Either a requested upload_uid is missing, expired or incomplete (`uploads_unlinkable`), or the `edit_key` is already bound to a different memo (`edit_key_conflict`). Switch on `detail.code`. Nothing is edited and no attachment is linked in either case. */
