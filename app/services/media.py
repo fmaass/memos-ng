@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from typing import Any, Literal
 
 import pillow_heif
 import structlog
-from PIL import Image, ImageChops, ImageCms, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageCms, ImageFile, ImageOps, ImageStat
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -182,6 +183,116 @@ async def guard_publish(db: AsyncSession, job: MediaJob, attachment: Attachment)
     )
 
 
+# The write buffer an OPTIMIZED save needs (MEMNG-241).
+#
+# `optimize=True` — and `progressive` — makes libjpeg run a pass over the whole scan, and that pass
+# cannot suspend: everything it produces has to fit the single buffer Pillow hands the encoder.
+# Pillow sizes that buffer by a heuristic and not by a bound (`JpegImagePlugin._save`: one byte per
+# pixel below quality 95, two at or above, four for CMYK; then `ImageFile._save`:
+# `max(MAXBLOCK, bufsize, width * 4)`), so a scan that costs more than the heuristic guessed makes
+# libjpeg print "Suspension not allowed here" and Pillow raise
+# OSError("broken data stream when writing image file") — the derive failing for an image that
+# saves fine without `optimize`.
+#
+# TWO things the pixel count misses, and both are load-bearing:
+#
+#   * PADDING. A JPEG codes whole MCUs, so each component is padded up to the MCU size before it
+#     is coded (8 px with 4:4:4, 16 px with 4:2:0 chroma; 16 is used here because it is the larger
+#     and every profile has to fit the same bound). A NARROW picture is mostly padding and pays for
+#     all of it: 2x5000 px is 10 000 pixels but 625 MCU rows, and at q95 4:4:4 it encodes to
+#     72 609 bytes — past four bytes per PIXEL, and past Pillow's floor as well.
+#   * The FLOOR. Pillow never goes below MAXBLOCK (65 536 by default), which is why small images
+#     get away with the heuristic at all. The bound below keeps that floor rather than computing
+#     its way under it, so a tiny image is never handed a smaller buffer than Pillow would.
+#
+# Four bytes per padded pixel is the FIRST rung, measured rather than guessed: on this build
+# (Pillow 12.3.0, libjpeg-turbo 3.1.4.1) at 4:4:4 the densest inputs an 8-bit source can carry
+# encode to 1.75 B/px (uniform noise, q92) through 3.22 B/px (an alternating-extremes pattern,
+# q100). It is not a PROOF of sufficiency, and no such bound is derivable from what libjpeg
+# documents — the coefficient coding alone allows ~10 B/px for three components before byte
+# stuffing — so the encode grows its buffer and retries rather than trusting the first number:
+# doubling up to 16 bytes per padded pixel, after which the OSError is raised as before. Each
+# attempt encodes into a FRESH sink, so no half-written file survives a rung that failed.
+_OPTIMIZED_JPEG_BYTES_PER_PIXEL = 4
+_OPTIMIZED_JPEG_BYTES_PER_PIXEL_CAP = 16
+_JPEG_MCU = 16  # the larger of the two MCU sizes (4:2:0); 4:4:4 pads to 8 and fits inside it
+_JPEG_MIN_BUFFER = 65536  # ImageFile.MAXBLOCK's own default, kept as the floor
+_JPEG_BUFFER_OVERFLOW = "broken data stream"  # Pillow's wording for the failed encode
+
+# `ImageFile.MAXBLOCK` is a module attribute, so raising it is visible process-wide while it is in
+# effect. The raised value harms nothing (a bigger buffer changes no byte of the output, and the
+# size is read once per save, before any encoding), but the RESTORE would: two overlapping
+# optimized saves would each put back the value they found, and whichever finished last would put
+# the inflated one back for good. This lock is what keeps the global exactly as it was found. It
+# serialises optimized encodes and nothing else — the screen tiers do not take it.
+_MAXBLOCK_LOCK = threading.Lock()
+
+
+def _jpeg_buffer_bound(img: Image.Image, params: Mapping[str, Any], bytes_per_pixel: int) -> int:
+    """How many bytes to let the encoder write, for `img` saved with `params`.
+
+    The area is the MCU-PADDED one, because that is what actually gets coded, and the metadata the
+    save carries is added on top of it: an ICC profile and an EXIF block are written into the same
+    buffer as the scan.
+    """
+    padded_width = -(-img.width // _JPEG_MCU) * _JPEG_MCU
+    padded_height = -(-img.height // _JPEG_MCU) * _JPEG_MCU
+    metadata = sum(
+        len(params[key])
+        for key in ("exif", "icc_profile")
+        if isinstance(params.get(key), bytes | bytearray)
+    )
+    return max(_JPEG_MIN_BUFFER, bytes_per_pixel * padded_width * padded_height + metadata)
+
+
+def _encode_jpeg(img: Image.Image, fp: "Path | BytesIO", buffer_bytes: int, **params: Any) -> None:
+    """One encode attempt into a FRESH sink, with the write buffer raised to `buffer_bytes`.
+
+    Fresh because an attempt that overflows has already written most of a file: reopening the path
+    (or truncating the buffer) is what keeps a failed rung from prefixing the next one's output.
+    """
+    with _MAXBLOCK_LOCK:
+        previous = ImageFile.MAXBLOCK
+        ImageFile.MAXBLOCK = max(previous, buffer_bytes)
+        try:
+            if isinstance(fp, Path):
+                with fp.open("wb") as handle:
+                    img.save(handle, "JPEG", **params)
+            else:
+                fp.seek(0)
+                fp.truncate()
+                img.save(fp, "JPEG", **params)
+        finally:
+            ImageFile.MAXBLOCK = previous
+
+
+def _save_jpeg(img: Image.Image, fp: Path | BytesIO, **params: Any) -> None:
+    """`img.save(fp, "JPEG", ...)`, with a write buffer big enough for the encode it asks for.
+
+    Every optimized save in this module goes through here rather than sizing the buffer at its own
+    call site: the print tier alone has two of them (the default rung and every settings-chosen
+    profile) and the mail rendition a third, and a per-site copy would leave whichever one nobody
+    remembered raising on the same photo.
+    """
+    if not (params.get("optimize") or params.get("progressive")):
+        img.save(fp, "JPEG", **params)  # a plain baseline save streams; it needs no headroom
+        return
+    bytes_per_pixel = _OPTIMIZED_JPEG_BYTES_PER_PIXEL
+    while True:
+        try:
+            _encode_jpeg(img, fp, _jpeg_buffer_bound(img, params, bytes_per_pixel), **params)
+            return
+        except OSError as exc:
+            # Only the overflow is retried, and only up to the cap: any other OSError (a full disk,
+            # a vanished directory) is the caller's to see, immediately and unchanged.
+            if (
+                _JPEG_BUFFER_OVERFLOW not in str(exc)
+                or bytes_per_pixel >= _OPTIMIZED_JPEG_BYTES_PER_PIXEL_CAP
+            ):
+                raise
+            bytes_per_pixel *= 2
+
+
 def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: Any) -> None:
     """Encode to a sibling temp and rename it into place, so no reader ever sees a partial tier.
 
@@ -190,7 +301,14 @@ def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: A
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    img.save(tmp, "JPEG", quality=quality, **params)
+    try:
+        _save_jpeg(img, tmp, quality=quality, **params)
+    except BaseException:
+        # An encode that gave up has left most of a JPEG behind. Nothing reads a `.tmp` — only the
+        # job's own sweep enumerates them — but leaving one costs the disk and lets a later reader
+        # of the directory guess wrong about what is there.
+        tmp.unlink(missing_ok=True)
+        raise
     os.replace(tmp, dest)
 
 
@@ -547,9 +665,9 @@ def encode_for_mail(source: bytes, profile: export_settings.MailProfile) -> Mail
                 (profile.long_edge, profile.long_edge), Image.Resampling.LANCZOS
             )
             buffer = BytesIO()
-            img.save(
+            _save_jpeg(
+                img,
                 buffer,
-                "JPEG",
                 quality=profile.jpeg_quality,
                 subsampling=subsampling,
                 progressive=profile.progressive,

@@ -30,7 +30,7 @@ from app.models import (
     MediaJob,
 )
 from app.services import asset_urls, media, printready
-from PIL import Image, ImageCms, ImageStat, JpegImagePlugin
+from PIL import Image, ImageCms, ImageFile, ImageStat, JpegImagePlugin
 from PIL.TiffImagePlugin import IFDRational
 from sqlalchemy import create_engine, select, text
 from structlog.testing import capture_logs
@@ -1035,6 +1035,158 @@ def test_a_higher_quality_profile_writes_a_bigger_file(monkeypatch, tmp_path):
     )
 
     assert high.stat().st_size > low.stat().st_size
+
+
+# --- a source the encoder's write buffer cannot hold (MEMNG-241) ------------------------------
+
+
+def _high_entropy_png(path: Path, size=(512, 512)) -> Path:
+    """A source whose encoded SCAN is bigger than its pixel count — the shape MEMNG-241 is about.
+
+    Uniform per-pixel noise is the most an 8-bit source can carry, and at 4:4:4 it encodes here to
+    ~1.9 bytes per pixel: past the one-byte-per-pixel buffer Pillow gives an optimized save, which
+    is exactly the condition that used to abort the encode. The large-scale warm/cool split is
+    what keeps it a COLOUR photograph to the classifier — chroma is measured on a downsampled
+    sample, where unbiased noise averages to flat grey, and a rendition written single-channel
+    would fit the buffer after all and prove nothing. Built in code, never committed (convention).
+    """
+    width, height = size
+    rng = random.Random(20260909)
+    raw = bytearray(rng.getrandbits(8) for _ in range(width * height * 3))
+    for y in range(height):
+        for x in range(width):
+            i = (y * width + x) * 3
+            raw[i + (2 if x < width // 2 else 0)] //= 4
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.frombytes("RGB", size, bytes(raw)).save(path, "PNG")
+    return path
+
+
+def test_a_high_entropy_source_encodes_at_the_default_profile(monkeypatch, tmp_path):
+    """AC: the default rung survives a source whose scan does not fit the write buffer libjpeg is
+    handed. `optimize=True` cannot suspend mid-scan, so this used to raise OSError('broken data
+    stream when writing image file') and fail the job for an image that saves fine without it."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-default")
+
+    dest = media.process_printready(att)
+
+    assert dest == printready.printready_path("pr-entropy-default")
+    out = _decode(dest)
+    assert out.mode == "RGB"  # a single-channel rendition would fit the buffer and prove nothing
+    assert out.size == (512, 512)
+    assert JpegImagePlugin.get_sampling(out) == 0
+    # The file is the evidence that the encode really was the overflowing one: more bytes of scan
+    # than the pixel count Pillow sizes the buffer from.
+    assert dest.stat().st_size > 512 * 512
+
+
+def test_a_high_entropy_source_encodes_at_a_versioned_profile(monkeypatch, tmp_path):
+    """The other save path: a profile with its own directory reaches the same encoder, so the
+    buffer has to be sized there too — a fix that only covered the default rung would leave every
+    settings-chosen profile raising."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(5000, 90, "strip", False)
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-profile")
+
+    dest = media.process_printready(att, profile)
+
+    assert dest == (
+        tmp_path / "assets" / "printready" / "print-5000-q90-strip-rgb" / "pr-entropy-profile.jpg"
+    )
+    assert _decode(dest).size == (512, 512)  # under the cap: never upscaled
+    assert dest.stat().st_size > 512 * 512
+    assert not printready.printready_path("pr-entropy-profile").exists()
+
+
+def test_the_encoder_leaves_pillows_buffer_size_where_it_found_it(monkeypatch, tmp_path):
+    """The headroom is scoped to the save. `ImageFile.MAXBLOCK` is a module attribute shared with
+    every other Pillow user in the process — a derive that left it raised would quietly change how
+    every later encode in the app is buffered, and nothing would say why."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    # Pinned to Pillow's own default rather than read off the module: whatever ran before this
+    # test in the same process would otherwise BE the expected value, and a derive that never put
+    # the raised buffer back would still pass.
+    monkeypatch.setattr(ImageFile, "MAXBLOCK", 65536)
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-scope")
+
+    media.process_printready(att)
+
+    assert ImageFile.MAXBLOCK == 65536
+
+
+def _narrow_high_entropy_png(path: Path, size=(2, 5000)) -> Path:
+    """The same noise, in a picture two pixels wide.
+
+    A JPEG codes whole MCUs, so a 2 px wide frame is coded 16 px wide and pays for the padding:
+    10 000 pixels here encode to ~72 kB at q95 4:4:4 — more than four bytes per PIXEL, and more
+    than the 65 536-byte floor under which Pillow's own guess disappears. A bound taken from the
+    pixel count alone passes every square fixture and still fails on this one.
+    """
+    width, height = size
+    rng = random.Random(20260909)
+    pixels = bytes(rng.getrandbits(8) for _ in range(width * height * 3))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.frombytes("RGB", size, pixels).save(path, "PNG")
+    return path
+
+
+def test_a_narrow_high_entropy_source_encodes_at_the_highest_profile(monkeypatch, tmp_path):
+    """AC: every admissible profile, every shape. q95 at 5000 px is a profile the admin panel can
+    save (app/routers/admin_export.py), and this shape is the one whose scan outruns a bound
+    measured in pixels rather than in the MCU-padded area that is actually coded."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(5000, 95, "strip", False)
+    att = _attachment(_narrow_high_entropy_png(tmp_path / "narrow.png"), uid="pr-entropy-narrow")
+
+    dest = media.process_printready(att, profile)
+
+    out = _decode(dest)
+    assert out.size == (2, 5000)  # under the cap on both edges: never upscaled
+    assert JpegImagePlugin.get_sampling(out) == 0
+    # 10 000 pixels, and far more than four bytes for each of them: the padding is the point.
+    assert dest.stat().st_size > 4 * 2 * 5000
+
+
+def test_an_encode_the_first_buffer_cannot_hold_grows_it_and_retries(monkeypatch, tmp_path):
+    """The rung the measured number is not enough for. Nothing about the FIRST bound is a proof —
+    libjpeg documents no worst case — so the encoder doubles its buffer and re-encodes instead of
+    failing the derive, and it re-encodes into a fresh file rather than onto the half-written one.
+
+    Driven by starting the ladder a rung too low, which is the only honest way to reach it: an
+    image that beats four bytes per padded pixel is not something this suite can construct.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "_OPTIMIZED_JPEG_BYTES_PER_PIXEL", 1)
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-retry")
+
+    dest = media.process_printready(att)
+
+    out = _decode(dest)
+    assert out.size == (512, 512)
+    # Bigger than the first rung's whole buffer, so the file cannot be the first attempt's work;
+    # and it decodes, so it is not a half-written one either.
+    assert dest.stat().st_size > 1 * 512 * 512
+    assert not dest.with_suffix(".jpg.tmp").exists()
+
+
+def test_the_first_buffer_bound_covers_what_that_shape_actually_encodes_to(tmp_path):
+    """The bound is checked against a real encode, not against itself.
+
+    Two pixels wide is coded sixteen pixels wide, so the padded area — not the pixel count — is
+    what the scan is paid for. Both directions are asserted: the bound covers the bytes libjpeg
+    actually produced, and the naive pixel-count bound would not have.
+    """
+    with Image.open(_narrow_high_entropy_png(tmp_path / "narrow.png")) as img:
+        img.load()
+        params = {"quality": 95, "subsampling": 0, "optimize": True}
+        buffer = BytesIO()
+        media._save_jpeg(img, buffer, **params)
+        encoded = len(buffer.getvalue())
+        bound = media._jpeg_buffer_bound(img, params, media._OPTIMIZED_JPEG_BYTES_PER_PIXEL)
+
+    assert bound >= encoded
+    assert media._OPTIMIZED_JPEG_BYTES_PER_PIXEL * img.width * img.height < encoded
 
 
 # --- monochrome detection ---------------------------------------------------------------------
