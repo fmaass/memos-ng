@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from typing import Any, Literal
 
 import pillow_heif
 import structlog
-from PIL import Image, ImageChops, ImageCms, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageCms, ImageFile, ImageOps, ImageStat
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -182,6 +183,57 @@ async def guard_publish(db: AsyncSession, job: MediaJob, attachment: Attachment)
     )
 
 
+# What one pixel of an OPTIMIZED save can cost the write buffer (MEMNG-241).
+#
+# `optimize=True` — and `progressive` — makes libjpeg run a pass over the whole scan, and that pass
+# cannot suspend: everything it produces has to fit the single buffer Pillow hands the encoder,
+# which JpegImagePlugin sizes at one byte per pixel below quality 95 and two at or above. A
+# photograph encodes far under that. A high-entropy source does not: libjpeg prints "Suspension
+# not allowed here", Pillow raises OSError("broken data stream when writing image file"), and the
+# job fails for an image that saves fine without `optimize`.
+#
+# Four bytes is measured, not guessed. On this build (Pillow 12.3.0, libjpeg-turbo 3.1.4.1) at
+# 4:4:4 — the print tier's subsampling, and the worst case, since halving the chroma halves the
+# scan — the densest inputs an 8-bit source can carry encode to: uniform random noise 1.75 B/px at
+# q92 and 2.92 at q100; an alternating-extremes pattern 2.05 and 3.22. The buffer is malloc'd and
+# only the part actually written is ever resident, so the headroom costs address space, not RAM.
+_OPTIMIZED_JPEG_BYTES_PER_PIXEL = 4
+
+# `ImageFile.MAXBLOCK` is a module attribute, so raising it is visible process-wide while it is in
+# effect. The raised value harms nothing (a bigger buffer changes no byte of the output, and the
+# size is read once per save, before any encoding), but the RESTORE would: two overlapping
+# optimized saves would each put back the value they found, and whichever finished last would put
+# the inflated one back for good. This lock is what keeps the global exactly as it was found. It
+# serialises optimized encodes and nothing else — the screen tiers do not take it.
+_MAXBLOCK_LOCK = threading.Lock()
+
+
+def _save_jpeg(img: Image.Image, fp: Path | BytesIO, **params: Any) -> None:
+    """`img.save(fp, "JPEG", ...)`, with a write buffer big enough for the encode it asks for.
+
+    Every optimized save in this module goes through here rather than sizing the buffer at its own
+    call site: the print tier alone has two of them (the default rung and every settings-chosen
+    profile) and the mail rendition a third, and a per-site copy would leave whichever one nobody
+    remembered raising on the same photo.
+    """
+    if not (params.get("optimize") or params.get("progressive")):
+        img.save(fp, "JPEG", **params)  # a plain baseline save streams; it needs no headroom
+        return
+    metadata = sum(
+        len(params[key])
+        for key in ("exif", "icc_profile")
+        if isinstance(params.get(key), bytes | bytearray)
+    )
+    needed = _OPTIMIZED_JPEG_BYTES_PER_PIXEL * img.width * img.height + metadata
+    with _MAXBLOCK_LOCK:
+        previous = ImageFile.MAXBLOCK
+        ImageFile.MAXBLOCK = max(previous, needed)
+        try:
+            img.save(fp, "JPEG", **params)
+        finally:
+            ImageFile.MAXBLOCK = previous
+
+
 def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: Any) -> None:
     """Encode to a sibling temp and rename it into place, so no reader ever sees a partial tier.
 
@@ -190,7 +242,7 @@ def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: A
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    img.save(tmp, "JPEG", quality=quality, **params)
+    _save_jpeg(img, tmp, quality=quality, **params)
     os.replace(tmp, dest)
 
 
@@ -547,9 +599,9 @@ def encode_for_mail(source: bytes, profile: export_settings.MailProfile) -> Mail
                 (profile.long_edge, profile.long_edge), Image.Resampling.LANCZOS
             )
             buffer = BytesIO()
-            img.save(
+            _save_jpeg(
+                img,
                 buffer,
-                "JPEG",
                 quality=profile.jpeg_quality,
                 subsampling=subsampling,
                 progressive=profile.progressive,

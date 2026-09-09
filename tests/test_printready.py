@@ -30,7 +30,7 @@ from app.models import (
     MediaJob,
 )
 from app.services import asset_urls, media, printready
-from PIL import Image, ImageCms, ImageStat, JpegImagePlugin
+from PIL import Image, ImageCms, ImageFile, ImageStat, JpegImagePlugin
 from PIL.TiffImagePlugin import IFDRational
 from sqlalchemy import create_engine, select, text
 from structlog.testing import capture_logs
@@ -1035,6 +1035,84 @@ def test_a_higher_quality_profile_writes_a_bigger_file(monkeypatch, tmp_path):
     )
 
     assert high.stat().st_size > low.stat().st_size
+
+
+# --- a source the encoder's write buffer cannot hold (MEMNG-241) ------------------------------
+
+
+def _high_entropy_png(path: Path, size=(512, 512)) -> Path:
+    """A source whose encoded SCAN is bigger than its pixel count — the shape MEMNG-241 is about.
+
+    Uniform per-pixel noise is the most an 8-bit source can carry, and at 4:4:4 it encodes here to
+    ~1.9 bytes per pixel: past the one-byte-per-pixel buffer Pillow gives an optimized save, which
+    is exactly the condition that used to abort the encode. The large-scale warm/cool split is
+    what keeps it a COLOUR photograph to the classifier — chroma is measured on a downsampled
+    sample, where unbiased noise averages to flat grey, and a rendition written single-channel
+    would fit the buffer after all and prove nothing. Built in code, never committed (convention).
+    """
+    width, height = size
+    rng = random.Random(20260909)
+    raw = bytearray(rng.getrandbits(8) for _ in range(width * height * 3))
+    for y in range(height):
+        for x in range(width):
+            i = (y * width + x) * 3
+            raw[i + (2 if x < width // 2 else 0)] //= 4
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.frombytes("RGB", size, bytes(raw)).save(path, "PNG")
+    return path
+
+
+def test_a_high_entropy_source_encodes_at_the_default_profile(monkeypatch, tmp_path):
+    """AC: the default rung survives a source whose scan does not fit the write buffer libjpeg is
+    handed. `optimize=True` cannot suspend mid-scan, so this used to raise OSError('broken data
+    stream when writing image file') and fail the job for an image that saves fine without it."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-default")
+
+    dest = media.process_printready(att)
+
+    assert dest == printready.printready_path("pr-entropy-default")
+    out = _decode(dest)
+    assert out.mode == "RGB"  # a single-channel rendition would fit the buffer and prove nothing
+    assert out.size == (512, 512)
+    assert JpegImagePlugin.get_sampling(out) == 0
+    # The file is the evidence that the encode really was the overflowing one: more bytes of scan
+    # than the pixel count Pillow sizes the buffer from.
+    assert dest.stat().st_size > 512 * 512
+
+
+def test_a_high_entropy_source_encodes_at_a_versioned_profile(monkeypatch, tmp_path):
+    """The other save path: a profile with its own directory reaches the same encoder, so the
+    buffer has to be sized there too — a fix that only covered the default rung would leave every
+    settings-chosen profile raising."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    profile = printready.PrintProfile(5000, 90, "strip", False)
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-profile")
+
+    dest = media.process_printready(att, profile)
+
+    assert dest == (
+        tmp_path / "assets" / "printready" / "print-5000-q90-strip-rgb" / "pr-entropy-profile.jpg"
+    )
+    assert _decode(dest).size == (512, 512)  # under the cap: never upscaled
+    assert dest.stat().st_size > 512 * 512
+    assert not printready.printready_path("pr-entropy-profile").exists()
+
+
+def test_the_encoder_leaves_pillows_buffer_size_where_it_found_it(monkeypatch, tmp_path):
+    """The headroom is scoped to the save. `ImageFile.MAXBLOCK` is a module attribute shared with
+    every other Pillow user in the process — a derive that left it raised would quietly change how
+    every later encode in the app is buffered, and nothing would say why."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    # Pinned to Pillow's own default rather than read off the module: whatever ran before this
+    # test in the same process would otherwise BE the expected value, and a derive that never put
+    # the raised buffer back would still pass.
+    monkeypatch.setattr(ImageFile, "MAXBLOCK", 65536)
+    att = _attachment(_high_entropy_png(tmp_path / "entropy.png"), uid="pr-entropy-scope")
+
+    media.process_printready(att)
+
+    assert ImageFile.MAXBLOCK == 65536
 
 
 # --- monochrome detection ---------------------------------------------------------------------

@@ -14,8 +14,10 @@ counting the reads, and by CHANGING the settings row in the database between two
 run and requiring the second part's images to still be the first part's profile.
 """
 
+import random
 import secrets
 from datetime import UTC, datetime
+from io import BytesIO
 
 import pytest
 from app.config import settings as app_settings
@@ -25,6 +27,7 @@ from app.services import export_settings, media
 from app.services.digest import render as digest_render
 from app.services.digest import runner as digest_runner
 from app.services.digest import splitting as digest_splitting
+from PIL import Image
 from sqlalchemy import delete
 
 from tests.digest_support import (
@@ -127,6 +130,38 @@ def test_the_encoded_size_travels_with_the_bytes():
     assert encoded is not None
     assert jpeg_facts(encoded.data).width == encoded.width
     assert jpeg_facts(encoded.data).height == encoded.height
+
+
+def _high_entropy_jpeg(size=(512, 512)) -> bytes:
+    """A tier whose pixels survive as noise: 4:4:4 at q95, so the chroma entropy is still there
+    when the mail encoder decodes it. `jpeg_bytes(noise=True)` writes at Pillow's default
+    subsampling, which halves the chroma and makes the re-encode fit the buffer this test is
+    about."""
+    width, height = size
+    rng = random.Random(20260909)
+    pixels = bytes(rng.getrandbits(8) for _ in range(width * height * 3))
+    image = Image.frombytes("RGB", size, pixels)
+    buffer = BytesIO()
+    image.save(buffer, "JPEG", quality=95, subsampling=0)
+    return buffer.getvalue()
+
+
+def test_a_high_entropy_tier_still_encodes_inline():
+    """The mail rendition takes the same optimized save as the print one (MEMNG-241): a scan that
+    does not fit the write buffer libjpeg is handed aborts the encode, and here that shows up as a
+    dropped photo rather than a raised error — the card would go out without its picture."""
+    encoded = media.encode_for_mail(
+        _high_entropy_jpeg(), mail_profile(subsampling=MailSubsampling.C444)
+    )
+
+    assert encoded is not None
+    assert (encoded.width, encoded.height) == (512, 512)
+    facts = jpeg_facts(encoded.data)
+    assert (facts.width, facts.height) == (512, 512)
+    assert facts.subsampling == MailSubsampling.C444
+    # More scan than the pixel count Pillow sizes the buffer from: the overflowing encode really
+    # is the one that ran.
+    assert len(encoded.data) > 512 * 512
 
 
 # --- the display height ---------------------------------------------------------------------------
