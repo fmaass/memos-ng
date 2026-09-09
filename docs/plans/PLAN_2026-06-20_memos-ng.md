@@ -2,7 +2,7 @@
 type: implementation-plan
 project: memos-ng
 feature: Memos-NG — Memos rebuilt on the default web stack
-status: shipped
+status: partial (the app shipped; still open: T3.2 posting during an upload, and the tag autocomplete tracked as MEMNG-52)
 scope: major
 created: 2026-06-20
 last_updated: 2026-06-20
