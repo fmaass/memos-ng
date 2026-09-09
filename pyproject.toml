@@ -4,41 +4,49 @@ version = "1.6.2"
 description = "Memos rebuilt on the household default web stack — FastAPI + async media pipeline"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.34",
-    "sqlalchemy[asyncio]>=2.0.36",
-    "asyncpg>=0.30",
-    "psycopg2-binary>=2.9",
-    "alembic>=1.14",
-    "pydantic>=2.10",
-    "pydantic-settings>=2.7",
+    # Each entry carries an upper bound at the next major of the version uv.lock resolves today, so a
+    # rebuild from a stale or regenerated lock cannot silently cross a major-version break. Bounds are
+    # a floor-and-ceiling contract, not the pin — uv.lock is the pin. A new entry gets a bound too,
+    # unless it is CalVer (see structlog and tzdata).
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "sqlalchemy[asyncio]>=2.0.36,<3",
+    "asyncpg>=0.30,<1",
+    "psycopg2-binary>=2.9,<3",
+    "alembic>=1.14,<2",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    # CalVer (year.release), so deliberately unbounded: its next "major" is next January, not an API
+    # break, and a bound on it would be a yearly chore protecting nothing. uv.lock is its pin.
     "structlog>=24.4",
-    "prometheus-fastapi-instrumentator>=7.0",
-    "python-multipart>=0.0.20",
-    "httpx>=0.28",
-    "pyjwt[crypto]>=2.10",
-    "cryptography>=44",
-    "puremagic>=1.28",
-    "pillow>=11",
-    "pillow-heif>=0.18",
-    "pywebpush>=2.0",
+    "prometheus-fastapi-instrumentator>=7.0,<9",
+    "python-multipart>=0.0.20,<1",
+    "httpx>=0.28,<1",
+    "pyjwt[crypto]>=2.10,<3",
+    "cryptography>=44,<51",
+    "puremagic>=1.28,<3",
+    "pillow>=11,<13",
+    "pillow-heif>=0.18,<2",
+    "pywebpush>=2.0,<3",
     # --- daily digest (MEMNG-234). memos-ng had no server-side Markdown renderer and no template
     # engine; the digest's mail body is the satellite's Jinja2 template rendering memo Markdown,
     # so all three arrive together and the versions are the satellite's proven ones as a FLOOR
     # (uv.lock is what actually pins; the local gate checks it).
-    "jinja2>=3.1.6",
-    "markdown>=3.7",
-    "bleach>=6.2",
+    "jinja2>=3.1.6,<4",
+    "markdown>=3.7,<4",
+    "bleach>=6.2,<7",
     # Imported DIRECTLY by app/services/digest/metrics.py (CounterMetricFamily, GaugeMetricFamily,
     # REGISTRY). It reached the graph only transitively through prometheus-fastapi-instrumentator
     # until now, and a transitive dependency is not a contract: a future instrumentator release
     # could drop it and this import would break at runtime, not at resolve time.
-    "prometheus-client>=0.21",
+    "prometheus-client>=0.21,<1",
     # The digest is the first feature whose CORRECTNESS depends on a named IANA zone resolving:
     # `digest_due` converts UTC to the configured zone to decide whether today's run is due, and
     # python:3.13-slim's zone availability rides on whatever the Debian package graph happens to
     # pull. Declaring it makes ZoneInfo("Europe/Zurich") a resolved fact rather than an
     # observation of one image build.
+    # CalVer too, and unbounded for a second reason: a ceiling would hold back zone data from the
+    # turn of the year onward — the moment the data exists to correct a zone.
     "tzdata>=2024.2",
 ]
 

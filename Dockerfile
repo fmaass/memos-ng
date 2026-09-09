@@ -12,7 +12,10 @@ RUN npm run build
 
 # --- Backend runtime (uv-managed, Python 3.13) ---
 FROM python:3.13-slim
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Pinned by digest so a rebuild installs the uv this lockfile was resolved with, not
+# whatever :latest moved to. To bump: read the new digest with
+# `docker buildx imagetools inspect ghcr.io/astral-sh/uv:<version>` and replace both halves.
+COPY --from=ghcr.io/astral-sh/uv:0.12.12@sha256:73d2665b478d8fa2de1cf105c6841f8e9cb6b09e568fc7700440c09f8fcd7ac4 /uv /uvx /bin/
 # ffmpeg/ffprobe for the video fast lane (poster) + slow lane (H.264). pillow-heif's
 # wheel bundles libheif, so no system libvips/libheif is needed.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ffmpeg \
