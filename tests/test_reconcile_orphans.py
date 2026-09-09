@@ -9,6 +9,7 @@ classes before the script is ever pointed at production.
 """
 
 import pytest
+import scripts.reconcile_orphan_attachments as script
 from app.config import settings
 from app.models import (
     Attachment,
@@ -156,5 +157,119 @@ def test_a_victim_that_is_not_a_listed_orphan_is_refused(db_engine, monkeypatch,
         assert seeded["paths"]["dated"].exists()
         assert "DRY RUN" in capsys.readouterr().out
     finally:
+        session.close()
+        _cleanup()
+
+
+# MEMNG-174 — the exit code of a `--victim` run is what a caller acts on: it is the proof step
+# between a dry run and `--apply`. Every outcome in which the victim is STILL THERE has to say so
+# on stderr and exit nonzero, or a run that reclaimed nothing reads as success.
+
+
+def test_a_victim_run_with_no_leaked_orphans_at_all_exits_nonzero(
+    db_engine, monkeypatch, tmp_path, capsys
+):
+    """An empty list is the case a caller is least able to notice: nothing was reclaimed, and the
+    id it named was never even considered."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL_SYNC", SYNC_URL)
+    session = _session(db_engine)
+    try:
+        _cleanup()
+        assert leaked_orphans(session) == []  # the control: the list really is empty
+        code = main(["--victim", "4242"])
+        out, err = capsys.readouterr()
+        assert code != 0, out + err
+        assert "4242" in err and "NOT reclaimed" in err
+    finally:
+        session.close()
+        _cleanup()
+
+
+def test_a_victim_outside_a_non_empty_list_exits_nonzero_with_a_reason(
+    db_engine, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL_SYNC", SYNC_URL)
+    session = _session(db_engine)
+    try:
+        seeded = _seed(session, tmp_path)
+        session.commit()
+        code = main(["--victim", str(seeded["linked"].id)])
+        out, err = capsys.readouterr()
+        assert code != 0, out + err
+        assert str(seeded["linked"].id) in err and "NOT reclaimed" in err
+        assert seeded["paths"]["linked"].exists()
+    finally:
+        session.close()
+        _cleanup()
+
+
+def test_a_victim_another_run_already_took_is_skipped_and_exits_nonzero(
+    db_engine, monkeypatch, tmp_path, capsys
+):
+    """The row was a leaked orphan when this run listed it and is gone by the time the reclaim
+    locks it — a second reconcile got there first. Nothing was reclaimed HERE, and a run whose
+    whole job was to reclaim one named row must not report that as success."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL_SYNC", SYNC_URL)
+    session = _session(db_engine)
+    try:
+        seeded = _seed(session, tmp_path)
+        session.commit()
+        leaked_id = seeded["leaked"].id
+
+        real_reclaim = script.reclaim_attachment_sync
+
+        def take_it_first(sess, att_id, mode, **kwargs):
+            # A concurrent reconcile claims the row after this run listed it, on its own
+            # connection — the race the reclaim re-reads the row under a lock for.
+            other = create_engine(SYNC_URL)
+            with other.begin() as conn:
+                conn.execute(text("DELETE FROM attachments WHERE id = :att"), {"att": att_id})
+            other.dispose()
+            return real_reclaim(sess, att_id, mode, **kwargs)
+
+        monkeypatch.setattr(script, "reclaim_attachment_sync", take_it_first)
+
+        code = main(["--victim", str(leaked_id)])
+        out, err = capsys.readouterr()
+        assert code != 0, out + err
+        assert str(leaked_id) in err and "NOT reclaimed" in err
+        # This run unlinked nothing: it never got as far as owning the row.
+        assert seeded["paths"]["dated"].exists()
+    finally:
+        session.close()
+        _cleanup()
+
+
+def test_a_victim_whose_files_cannot_be_removed_exits_nonzero_with_a_reason(
+    db_engine, monkeypatch, tmp_path, capsys
+):
+    """A failed unlink keeps the row on purpose, so the files stay findable. That is the outcome a
+    caller most needs the exit code for."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL_SYNC", SYNC_URL)
+    session = _session(db_engine)
+    holding_dir = None
+    try:
+        seeded = _seed(session, tmp_path)
+        session.commit()
+        leaked_id = seeded["leaked"].id
+        holding_dir = seeded["paths"]["dated"].parent
+        holding_dir.chmod(0o500)  # a real unlink failure: the directory is not writable
+
+        code = main(["--victim", str(leaked_id)])
+        out, err = capsys.readouterr()
+        assert code != 0, out + err
+        assert str(leaked_id) in err and "NOT reclaimed" in err
+        assert seeded["paths"]["dated"].exists()  # kept, so the bytes stay findable
+        assert (
+            session.execute(select(Attachment.id).where(Attachment.id == leaked_id)).scalar_one()
+            == leaked_id
+        )
+    finally:
+        if holding_dir is not None:
+            holding_dir.chmod(0o700)
         session.close()
         _cleanup()

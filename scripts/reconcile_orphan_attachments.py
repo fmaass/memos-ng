@@ -86,6 +86,17 @@ def read_back(session: Session, att_id: int, paths: list[Path]) -> bool:
     return row is None and not left
 
 
+def not_reclaimed(victim: int, reason: str, code: int) -> int:
+    """Say on stderr that the victim is still there, and hand back a nonzero code.
+
+    A `--victim` run is the proof step between a dry run and `--apply`, so its caller acts on the
+    exit code: every outcome in which the named row was NOT reclaimed has to be one of these, or a
+    run that reclaimed nothing reads as success.
+    """
+    print(f"\nvictim id {victim} was NOT reclaimed: {reason}", file=sys.stderr)
+    return code
+
+
 def _database_url() -> str:
     url = os.environ.get("DATABASE_URL_SYNC")
     if not url:
@@ -114,24 +125,31 @@ def main(argv: list[str] | None = None) -> int:
             for att in found:
                 print(describe(att))
             if not found:
+                if args.victim is not None:
+                    return not_reclaimed(
+                        args.victim, "nothing here is a leaked orphan — the list is empty", 2
+                    )
                 return 0
 
             if args.victim is not None:
                 chosen = next((a for a in found if a.id == args.victim), None)
                 if chosen is None:
-                    print(
-                        f"\nid {args.victim} is not in the list above — refusing to touch it.",
-                        file=sys.stderr,
+                    return not_reclaimed(
+                        args.victim, "it is not in the list above — refusing to touch it", 2
                     )
-                    return 2
-                print(f"\nreclaiming ONE victim: id={chosen.id}")
-                paths = all_asset_paths(chosen)
-                outcome = reclaim_one(session, chosen.id)
+                # Read the id and the path set BEFORE the reclaim: it commits, which expires every
+                # instance, and re-reading a column of a row that is now gone raises rather than
+                # answering — the reason a report about it has to be built from values held here.
+                victim_id, paths = chosen.id, all_asset_paths(chosen)
+                print(f"\nreclaiming ONE victim: id={victim_id}")
+                outcome = reclaim_one(session, victim_id)
                 if outcome == "failed_unlink":
-                    return 1  # the row was kept on purpose; its files are still on disk
+                    # The row was kept on purpose; its files are still on disk.
+                    return not_reclaimed(victim_id, "its files could not be removed", 1)
                 if outcome != "reclaimed":
-                    return 3  # nothing was touched; the row is not this run's to take
-                return 0 if read_back(session, chosen.id, paths) else 1
+                    # Nothing was touched; the row is not this run's to take.
+                    return not_reclaimed(victim_id, f"the reclaim {outcome}", 3)
+                return 0 if read_back(session, victim_id, paths) else 1
 
             if args.apply:
                 print(f"\nreclaiming all {len(found)}:")
