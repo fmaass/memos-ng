@@ -1,7 +1,7 @@
 # PLAN 2026-07-30 — Photo-book print tier + flexible export API
 
 Status: **shipped** (app/services/photobook.py; #74, #127). Derived from a live-measured design consultation
-(2026-07-28/30). No code written. GitHub issue: see "Tracking" below.
+(2026-07-28/30). GitHub issue: see "Tracking" below.
 
 ## Problem (measured, not assumed)
 
