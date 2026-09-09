@@ -87,7 +87,7 @@ def _reset_rate_limit():
 
 
 @pytest.fixture
-def controlled_clock(monkeypatch):
+def controlled_clock(monkeypatch, request):
     """Control every clock the code-redemption and limiter paths read; hand the test the instant.
 
     Two windows decide these tests and neither may be measured in real time. The limiter's is 60
@@ -102,9 +102,21 @@ def controlled_clock(monkeypatch):
     module outside this list changes its notion of time.
 
     The pin starts at the real instant rather than an arbitrary one, so a row the DATABASE stamps
-    with its own `now()` — a `created_at` default, a test's `now() - interval '1 second'`
-    backdating — still sits where the pinned code expects it. `advance()` moves both clocks
+    with its own `now()` — a `created_at` default — still sits where the pinned code expects it.
+    A test that BACKDATES a row computes the instant from `now()` here and binds it as a
+    parameter, never from SQL `now()`: the two clocks are independent once this fixture starts,
+    and a stall between them is exactly the flake being removed. `advance()` moves both clocks
     together, forward only, which is the only motion a test may ask for.
+
+    **The control is structural, not per-test.** Every patched read is counted, and at teardown a
+    test that pinned the clock and then never had the APPLICATION read it fails by name. So the
+    marker cannot sit on a case that exercises no clock path (where it would be noise a reader
+    mistakes for coverage), and it cannot silently miss its target either: a pin that stopped
+    reaching `app.auth` — a renamed import, a call site moved to another module — turns the case
+    red instead of quietly restoring the wall clock (MEMNG-296 review round 1).
+
+    A case that deliberately wants the real clock says so with `@pytest.mark.real_clock`; the
+    fixture then patches nothing, counts nothing, and asserts nothing.
     """
     import time as real_time
     from datetime import UTC
@@ -119,6 +131,7 @@ def controlled_clock(monkeypatch):
         def __init__(self) -> None:
             self._instant = real_datetime.now(UTC)
             self._monotonic = real_time.monotonic()
+            self.reads: dict[str, int] = {}
 
         @property
         def monotonic(self) -> float:
@@ -136,24 +149,51 @@ def controlled_clock(monkeypatch):
             self._instant += real_timedelta(seconds=seconds)
             self._monotonic += seconds
 
+        def _record(self, where: str) -> None:
+            self.reads[where] = self.reads.get(where, 0) + 1
+
     clock = ControlledClock()
 
-    class PinnedTime:
-        def monotonic(self) -> float:
-            return clock.monotonic
+    if request.node.get_closest_marker("real_clock") is not None:
+        yield clock  # unpinned by request: the instant is still readable, nothing is patched
+        return
 
-        def __getattr__(self, name: str):
-            return getattr(real_time, name)
+    def pinned_time(where: str):
+        class PinnedTime:
+            def monotonic(self) -> float:
+                clock._record(f"{where}.time.monotonic")
+                return clock.monotonic
 
-    class PinnedDatetime(real_datetime):
-        @classmethod
-        def now(cls, tz=None):  # every pinned call site passes UTC; a naive read is not one
-            return clock.now() if tz is None else clock.now().astimezone(tz)
+            def __getattr__(self, name: str):
+                return getattr(real_time, name)
 
-    monkeypatch.setattr(auth, "time", PinnedTime())
+        return PinnedTime()
+
+    def pinned_datetime(where: str):
+        # One subclass per module, so the spy can say WHICH module read the clock rather than
+        # only that something did.
+        class PinnedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):  # every pinned call site passes UTC; a naive read is not one
+                clock._record(f"{where}.datetime.now")
+                return clock.now() if tz is None else clock.now().astimezone(tz)
+
+        return PinnedDatetime
+
+    monkeypatch.setattr(auth, "time", pinned_time("app.auth"))
     for module in (auth, auth_router, native_auth, management_grant):
-        monkeypatch.setattr(module, "datetime", PinnedDatetime)
-    return clock
+        monkeypatch.setattr(module, "datetime", pinned_datetime(module.__name__))
+
+    yield clock
+
+    if not clock.reads:
+        pytest.fail(
+            "controlled_clock: the application never read the pinned clock during "
+            f"{request.node.nodeid} — either the pin no longer reaches the code under test, or "
+            "this case exercises no clock path and must not be pinned (drop the fixture, or "
+            "mark it @pytest.mark.real_clock)",
+            pytrace=False,
+        )
 
 
 @pytest.fixture

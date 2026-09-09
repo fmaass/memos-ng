@@ -15,10 +15,16 @@ import re
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from app import auth
 from app.main import app
 from fastapi.testclient import TestClient
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+# Every case that drives `_login` reaches `rate_limit()` and its 60-second monotonic window, so
+# the module is pinned wholesale; the two that only read `docker-entrypoint.sh` touch no clock
+# and say so with `real_clock` (MEMNG-296).
+pytestmark = pytest.mark.usefixtures("controlled_clock")
 
 ENTRYPOINT = Path(__file__).resolve().parent.parent / "docker-entrypoint.sh"
 
@@ -69,6 +75,7 @@ def _login(client: TestClient, forwarded_for: str):
 # --- deploy-artifact pin ------------------------------------------------------------------------
 
 
+@pytest.mark.real_clock
 def test_entrypoint_serves_uvicorn_with_forwarded_ip_handling():
     # Dropping either flag silently re-collapses every client into Traefik's single bucket,
     # and nothing else in the repo would notice — so the shipped command line is pinned here.
@@ -77,6 +84,7 @@ def test_entrypoint_serves_uvicorn_with_forwarded_ip_handling():
     assert '--forwarded-allow-ips "$FORWARDED_ALLOW_IPS"' in cmd
 
 
+@pytest.mark.real_clock
 def test_entrypoint_trust_list_is_explicit_and_covers_the_compose_networks():
     trusted = _shipped_trust_list()
     # `*` would trust a forged header from anywhere the socket is reachable — the trust scope

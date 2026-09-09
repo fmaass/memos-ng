@@ -108,11 +108,14 @@ async def test_a_grant_expires_after_the_configured_ttl(adb, monkeypatch, contro
     assert stored == expires_at  # the response and the row agree on the deadline
 
 
+@pytest.mark.real_clock
 def test_the_default_grant_ttl_is_ten_minutes():
     assert settings.MANAGE_GRANT_TTL_S == 600
 
 
-async def test_minting_a_grant_sweeps_every_expired_grant_not_just_the_minter_s(adb):
+async def test_minting_a_grant_sweeps_every_expired_grant_not_just_the_minter_s(
+    adb, controlled_clock
+):
     """The sweep is GLOBAL, like the handoff-code sweep it is modelled on. A per-user sweep would
     leave the rows of a user who never comes back sitting there forever, so the "cannot accumulate
     unbounded" property would simply be false."""
@@ -120,11 +123,11 @@ async def test_minting_a_grant_sweeps_every_expired_grant_not_just_the_minter_s(
     fresh_owner = await _user(adb, "grant_sweep_fresh")
     stale, _ = await management_grant.mint_grant(adb, stale_owner)
     await adb.execute(
-        text(
-            "UPDATE management_grants SET expires_at = now() - interval '1 hour' "
-            "WHERE hashed_grant = :h"
-        ),
-        {"h": management_grant.hash_grant(stale)},
+        text("UPDATE management_grants SET expires_at = :t WHERE hashed_grant = :h"),
+        {
+            "t": controlled_clock.now() - timedelta(hours=1),
+            "h": management_grant.hash_grant(stale),
+        },
     )
     live, _ = await management_grant.mint_grant(adb, stale_owner)
 
@@ -159,6 +162,7 @@ async def test_a_native_login_code_is_stamped_with_its_purpose(adb):
     assert purposes[native_auth.hash_code(manage_code)] == "manage"
 
 
+@pytest.mark.real_clock
 def test_the_purpose_column_defaults_to_login_for_rows_that_predate_it(db_engine):
     """Expand-only: every historical row was a login code, and the server default is what says so
     without a backfill. Inserted WITHOUT the column, the way the pre-migration code wrote it."""
@@ -167,6 +171,9 @@ def test_the_purpose_column_defaults_to_login_for_rows_that_predate_it(db_engine
         "ON CONFLICT (subject) DO NOTHING"
     )
     try:
+        # SQL `now()` is right here and only here: this row is read for its `purpose` column and
+        # never redeemed, so no pinned code ever compares its deadline — and the case runs on the
+        # real clock (`real_clock`) precisely because it touches none.
         _sql(
             "INSERT INTO native_auth_codes (code_hash, user_id, code_challenge, device_name, "
             "expires_at) SELECT 'purpose-default-probe', id, :c, :d, now() + interval '1 minute' "
@@ -369,7 +376,9 @@ def test_a_manage_code_becomes_a_grant_that_is_stored_hashed(grant_oidc, control
     assert expires_at == controlled_clock.now() + timedelta(seconds=settings.MANAGE_GRANT_TTL_S)
     # The wire drops sub-second precision (`to_rfc3339`), and nothing else.
     assert datetime.fromisoformat(body["expires_at"]) == expires_at.replace(microsecond=0)
-    assert _code_row(code)[0][1] is not None  # the code is burned by its redemption
+    # Burned by its redemption, and stamped with the controlled instant — the store's own record
+    # that the consume ran under the pin.
+    assert _code_row(code)[0][1] == controlled_clock.now()
 
 
 def test_a_login_code_cannot_be_redeemed_for_a_grant(grant_oidc):
@@ -436,14 +445,15 @@ def test_a_wrong_verifier_is_refused_and_still_burns_the_manage_code(grant_oidc)
     assert _grant_count(subject) == 0
 
 
-def test_an_expired_manage_code_is_refused(grant_oidc):
-    """Backdated in PostgreSQL rather than with a frozen Python clock: `expires_at > now()` is
-    evaluated by the database, so only a real stored instant tests the real predicate."""
+def test_an_expired_manage_code_is_refused(grant_oidc, controlled_clock):
+    """The deadline is a real STORED instant the running predicate reads — but computed from the
+    controlled clock, never from PostgreSQL's `now()`: the two clocks are independent once the pin
+    starts, and a one-second backdate against the wrong one lands in the pinned future."""
     client, subject = grant_oidc
     code = _handoff_code(client, purpose="manage")
     _sql(
-        "UPDATE native_auth_codes SET expires_at = now() - interval '1 second' "
-        "WHERE code_hash = :h",
+        "UPDATE native_auth_codes SET expires_at = :t WHERE code_hash = :h",
+        t=controlled_clock.now() - timedelta(seconds=1),
         h=native_auth.hash_code(code),
     )
 
@@ -492,6 +502,7 @@ def test_the_native_lanes_the_login_route_does_offer_are_accepted(client, db_eng
     assert _login(client, next="/").status_code == 302  # and the web lane is untouched
 
 
+@pytest.mark.real_clock
 def test_the_manage_grant_route_is_documented_as_anonymous():
     """It takes a code and a verifier, not a credential — the generated clients see only this
     document, and an endpoint that requires nothing has to say so."""
@@ -576,7 +587,7 @@ def _grant_for(subject: str, monkeypatch) -> str:
     return resp.json()["grant"]
 
 
-async def test_authenticate_grant_answers_only_for_a_live_grant(adb):
+async def test_authenticate_grant_answers_only_for_a_live_grant(adb, controlled_clock):
     """Expiry is enforced in the store, not in the caller, so every surface that ever accepts a
     grant inherits the bound from one place."""
     user = await _user(adb, "grant_authn_user")
@@ -587,11 +598,11 @@ async def test_authenticate_grant_answers_only_for_a_live_grant(adb):
     assert await management_grant.authenticate_grant(adb, "not-a-grant-anyone-minted") is None
 
     await adb.execute(
-        text(
-            "UPDATE management_grants SET expires_at = now() - interval '1 second' "
-            "WHERE hashed_grant = :h"
-        ),
-        {"h": management_grant.hash_grant(grant)},
+        text("UPDATE management_grants SET expires_at = :t WHERE hashed_grant = :h"),
+        {
+            "t": controlled_clock.now() - timedelta(seconds=1),
+            "h": management_grant.hash_grant(grant),
+        },
     )
     assert await management_grant.authenticate_grant(adb, grant) is None
 
@@ -680,8 +691,9 @@ def test_grant_expires(grant_oidc, controlled_clock):
     """Three verdicts on ONE grant — usable, refused once its stored deadline is in the past,
     usable again when it is moved back — so only the stored instant can be deciding it.
 
-    Backdated in PostgreSQL rather than with a frozen clock: `expires_at > now()` is evaluated by
-    the database, so only a real stored instant tests the real predicate.
+    A real STORED instant decides all three, since `expires_at` is compared inside the query —
+    but every one of them is computed from the controlled clock rather than PostgreSQL's `now()`,
+    which the pinned code no longer shares a timeline with.
     """
     client, subject = grant_oidc
     grant = _grant(client)
@@ -699,21 +711,21 @@ def test_grant_expires(grant_oidc, controlled_clock):
     assert stored == controlled_clock.now() + timedelta(seconds=settings.MANAGE_GRANT_TTL_S)
 
     _sql(
-        "UPDATE management_grants SET expires_at = now() - interval '1 second' "
-        "WHERE hashed_grant = :h",
+        "UPDATE management_grants SET expires_at = :t WHERE hashed_grant = :h",
+        t=controlled_clock.now() - timedelta(seconds=1),
         h=hashed,
     )
     assert http.get("/api/pats", headers=headers).status_code == 401
 
     _sql(
-        "UPDATE management_grants SET expires_at = now() + interval '1 hour' "
-        "WHERE hashed_grant = :h",
+        "UPDATE management_grants SET expires_at = :t WHERE hashed_grant = :h",
+        t=controlled_clock.now() + timedelta(hours=1),
         h=hashed,
     )
     assert http.get("/api/pats", headers=headers).status_code == 200
 
 
-def test_expired_grant_is_401(grant_oidc):
+def test_expired_grant_is_401(grant_oidc, controlled_clock):
     """Expiry is authentication's answer, so no verb gets through and nothing happens on the way:
     the token that was there before the attempt is still there, unrevoked, afterwards."""
     client, subject = grant_oidc
@@ -722,8 +734,8 @@ def test_expired_grant_is_401(grant_oidc):
     http = _clean_client()
     existing = http.post("/api/pats", json={"name": "survives-the-expiry"}, headers=headers).json()
     _sql(
-        "UPDATE management_grants SET expires_at = now() - interval '1 second' "
-        "WHERE hashed_grant = :h",
+        "UPDATE management_grants SET expires_at = :t WHERE hashed_grant = :h",
+        t=controlled_clock.now() - timedelta(seconds=1),
         h=management_grant.hash_grant(grant),
     )
 
@@ -850,6 +862,7 @@ def test_a_grant_and_a_session_cookie_together_are_refused(logged_in_client, mon
         _sql("DELETE FROM users WHERE subject = :s", s=other)
 
 
+@pytest.mark.real_clock
 def test_the_pat_surface_publishes_exactly_the_two_credentials_it_takes():
     """The generated clients (ADR-0009) see only this document: /api/pats/* takes the session
     cookie or a grant, and a bearer must not appear there in any form."""
