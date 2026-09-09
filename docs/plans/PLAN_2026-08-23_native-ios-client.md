@@ -4,7 +4,7 @@ overview: "Build a native SwiftUI client for memos-ng that doubles as the househ
 scope: major
 project: "memos-ng"
 feature: "native-ios-client"
-status: approved
+status: partial (the client ships on TestFlight from memos-ng-ios; the store-submission phase is still open)
 created: "2026-08-23"
 todos:
   - id: p0-decision-records

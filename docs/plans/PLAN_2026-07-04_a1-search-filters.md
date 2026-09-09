@@ -4,7 +4,7 @@ overview: "A frontend-only filter UI over the memo timeline: tag/visibility/date
 scope: standard
 project: "memos-ng"
 feature: "a1-search-filters"
-status: draft
+status: shipped (frontend/src/components/FilterBar.vue; #28)
 created: "2026-07-04"
 todos:
   - id: "a1-serialize"

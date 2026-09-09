@@ -1,6 +1,6 @@
 # PLAN — Screen/print variant framework (filename-convention renditions)
 
-Status: **DRAFT — review before implementing.** No code is written yet.
+Status: **shipped** (app/services/variants.py; migration db4e13d4f618, attachment_renditions).
 - Rev 1 → Rev 2: Codex adversarial review (3 HIGH + 4 MEDIUM resolved; APPROVE).
 - Rev 2 → Rev 3: independent 3-lens cross-validation (code-fidelity / completeness / security, each finding
   adversarially verified). Core design **confirmed sound**; 9 real gaps folded in (below).

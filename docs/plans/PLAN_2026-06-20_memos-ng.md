@@ -2,7 +2,7 @@
 type: implementation-plan
 project: memos-ng
 feature: Memos-NG — Memos rebuilt on the default web stack
-status: ready-to-build
+status: shipped
 scope: major
 created: 2026-06-20
 last_updated: 2026-06-20
