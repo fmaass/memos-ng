@@ -93,6 +93,12 @@ venv = ".venv"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # Opts a case OUT of `controlled_clock` inside a module that pins it wholesale. The fixture
+    # then patches nothing, so the case runs on the real clock — which is only ever right for one
+    # that reads no clock at all, since a pinned case with no application read fails by name.
+    "real_clock: run this case against the real clock, not the pinned one",
+]
 
 [build-system]
 requires = ["hatchling"]

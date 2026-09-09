@@ -22,7 +22,7 @@ import asyncio
 import base64
 import hashlib
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from html import unescape
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -37,6 +37,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
+
+# Every case in this file mints or redeems a handoff code, and a code lives `NATIVE_CODE_TTL_S`
+# seconds — 120 by default. Measured against the wall clock that window is a stall away from
+# expiring mid-case, so the whole module runs under the controlled clock; a case that asserts
+# something about an instant takes the fixture by name and reads it (MEMNG-296).
+pytestmark = pytest.mark.usefixtures("controlled_clock")
 
 # RFC 7636 Appendix B's published S256 test vector. Hard-coded rather than computed with
 # `s256_challenge`, so a broken implementation of it cannot also produce the expected value.
@@ -283,7 +289,7 @@ def test_an_error_callback_with_a_bad_or_missing_state_is_refused(native_oidc):
 # --- exchanging the code for a device token ---------------------------------------------------
 
 
-def test_exchange_mints_a_device_token_that_works(native_oidc):
+def test_exchange_mints_a_device_token_that_works(native_oidc, controlled_clock):
     client, subject = native_oidc
     code = _handoff_code(client)
 
@@ -304,12 +310,15 @@ def test_exchange_mints_a_device_token_that_works(native_oidc):
     )[0]
     assert name == DEVICE  # the device display name propagates verbatim
     assert expires_at is not None
-    lifetime = expires_at - datetime.now(UTC)
-    assert timedelta(days=364) < lifetime <= timedelta(days=365)
-    assert abs(datetime.fromisoformat(body["expires_at"]) - expires_at) < timedelta(seconds=5)
+    # The mint read the controlled clock, so the deadline is exact rather than roughly a year out:
+    # the stored instant IS the pinned one plus the configured lifetime. That equality is also the
+    # control that the pin took effect on the route.
+    assert expires_at == controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    # The wire drops sub-second precision (`to_rfc3339`), and nothing else.
+    assert datetime.fromisoformat(body["expires_at"]) == expires_at.replace(microsecond=0)
 
 
-def test_a_wrong_verifier_is_refused_and_still_burns_the_code(native_oidc):
+def test_a_wrong_verifier_is_refused_and_still_burns_the_code(native_oidc, controlled_clock):
     """One attempt per code, whatever its outcome: the burn is committed BEFORE the verifier is
     judged, so a mismatch cannot be retried until it succeeds.
     """
@@ -324,7 +333,9 @@ def test_a_wrong_verifier_is_refused_and_still_burns_the_code(native_oidc):
         "SELECT consumed_at FROM native_auth_codes WHERE code_hash = :h",
         h=native_auth.hash_code(code),
     )[0][0]
-    assert consumed_at is not None
+    # Stamped with the controlled instant, read back from the store: the burn ran under the pin,
+    # and it is the same statement that refused the verifier.
+    assert consumed_at == controlled_clock.now()
 
     retry = _exchange(client, code)  # now with the RIGHT verifier
     assert retry.status_code == 400
@@ -343,14 +354,16 @@ def test_a_code_can_only_be_exchanged_once(native_oidc):
     assert _sql("SELECT count(*) FROM pats WHERE name = :n", n=DEVICE)[0][0] == 1
 
 
-def test_an_expired_code_is_refused_as_expired(native_oidc):
-    """Backdated in PostgreSQL rather than with a frozen Python clock: `expires_at > now()` is
-    evaluated by the database, so only a real stored instant tests the real predicate."""
+def test_an_expired_code_is_refused_as_expired(native_oidc, controlled_clock):
+    """The deadline is a real STORED instant the running predicate reads — but computed from the
+    controlled clock, never from PostgreSQL's `now()`: the two clocks are independent once the pin
+    starts, so a backdate measured against the database's is only a second away from landing in
+    the pinned future and reporting this refusal as a live code."""
     client, _ = native_oidc
     code = _handoff_code(client)
     _sql(
-        "UPDATE native_auth_codes SET expires_at = now() - interval '1 second' "
-        "WHERE code_hash = :h",
+        "UPDATE native_auth_codes SET expires_at = :t WHERE code_hash = :h",
+        t=controlled_clock.now() - timedelta(seconds=1),
         h=native_auth.hash_code(code),
     )
 
@@ -360,7 +373,9 @@ def test_an_expired_code_is_refused_as_expired(native_oidc):
     assert _sql("SELECT count(*) FROM pats WHERE name = :n", n=DEVICE)[0][0] == 0
 
 
-def test_a_swept_code_is_indistinguishable_from_one_that_never_existed(native_oidc):
+def test_a_swept_code_is_indistinguishable_from_one_that_never_existed(
+    native_oidc, controlled_clock
+):
     """Past the one-hour grace the row is gone, so the better diagnostic goes with it — both
     answers are terminal for the client, and keeping rows forever to tell them apart would be an
     unbounded table for a distinction nobody acts on."""
@@ -368,7 +383,8 @@ def test_a_swept_code_is_indistinguishable_from_one_that_never_existed(native_oi
     code = _handoff_code(client)
     code_hash = native_auth.hash_code(code)
     _sql(
-        "UPDATE native_auth_codes SET expires_at = now() - interval '2 hours' WHERE code_hash = :h",
+        "UPDATE native_auth_codes SET expires_at = :t WHERE code_hash = :h",
+        t=controlled_clock.now() - timedelta(hours=2),
         h=code_hash,
     )
     assert _exchange(client, code).json()["detail"] == "code_expired"  # still classifiable
@@ -416,7 +432,7 @@ async def test_two_concurrent_exchanges_mint_exactly_one_token(native_oidc):
 TESTCLIENT_HOST = "testclient"
 
 
-def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, frozen_rate_limit_clock):
+def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, controlled_clock):
     """The same `rate_limit()` dependency the login legs carry, on the route that mints the token.
 
     Defence in depth rather than a live hole — a handoff code is single-use, 120-second and
@@ -449,7 +465,7 @@ def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, frozen_ra
 
     # The pin really reached the limiter: twenty stamps, every one of them the frozen instant —
     # the refusal above was decided by the request COUNT, with a window that never advanced.
-    assert set(auth._RL[TESTCLIENT_HOST]) == {frozen_rate_limit_clock}
+    assert set(auth._RL[TESTCLIENT_HOST]) == {controlled_clock.monotonic}
     assert len(auth._RL[TESTCLIENT_HOST]) == 20
 
 
@@ -493,6 +509,7 @@ def test_native_logout_refuses_a_browser_session(logged_in_client):
     assert _sql("SELECT count(*) FROM pats WHERE name = 'survivor'")[0][0] == 1
 
 
+@pytest.mark.real_clock
 def test_native_logout_refuses_an_unauthenticated_caller(client, db_engine):
     assert client.post("/api/auth/native/logout").status_code == 401
 
@@ -506,7 +523,7 @@ def _renew(token: str):
     return anon.post("/api/auth/native/renew", headers={"Authorization": f"Bearer {token}"})
 
 
-def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc):
+def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc, controlled_clock):
     """The point of the endpoint: a phone that keeps using its token never reaches the expiry
     that would sign it out — and the token it presented is dead the moment it is renewed.
     """
@@ -516,7 +533,8 @@ def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc):
     # Backdated to a day out so a successor that merely COPIED the old expiry would fail the
     # lifetime assertion below instead of passing on the mint's own year.
     _sql(
-        "UPDATE pats SET expires_at = now() + interval '1 day' WHERE hashed_token = :h",
+        "UPDATE pats SET expires_at = :t WHERE hashed_token = :h",
+        t=controlled_clock.now() + timedelta(days=1),
         h=auth.hash_token(old),
     )
 
@@ -537,23 +555,27 @@ def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc):
     assert len(rows) == 1  # rotated, never accumulated
     hashed_token, expires_at = rows[0]
     assert hashed_token == auth.hash_token(new)
-    lifetime = expires_at - datetime.now(UTC)
-    assert timedelta(days=364) < lifetime <= timedelta(days=365)
-    assert abs(datetime.fromisoformat(body["expires_at"]) - expires_at) < timedelta(seconds=5)
+    # A full fresh lifetime from the controlled instant, exactly — so the successor was minted
+    # rather than handed the backdated expiry the predecessor was carrying. The equality doubles
+    # as the control that the pin reached the renew route.
+    assert expires_at == controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    assert datetime.fromisoformat(body["expires_at"]) == expires_at.replace(microsecond=0)
 
 
-def test_an_expired_token_is_refused_before_the_renew_logic_runs(native_oidc):
+def test_an_expired_token_is_refused_before_the_renew_logic_runs(native_oidc, controlled_clock):
     """Expiry is authentication's answer, not renewal's — so the expired row is still sitting
     there afterwards, unrotated, with no successor beside it.
 
-    Backdated in PostgreSQL rather than with a frozen clock: only a real stored instant tests the
-    predicate the running code evaluates.
+    A real STORED instant, so the predicate the running code evaluates is the one under test —
+    but computed from the controlled clock rather than PostgreSQL's `now()`, which the pinned code
+    no longer shares a timeline with.
     """
     client, _ = native_oidc
     device = "ExpiredPhone"
     token = _exchange(client, _handoff_code(client, device=device)).json()["token"]
     _sql(
-        "UPDATE pats SET expires_at = now() - interval '1 second' WHERE hashed_token = :h",
+        "UPDATE pats SET expires_at = :t WHERE hashed_token = :h",
+        t=controlled_clock.now() - timedelta(seconds=1),
         h=auth.hash_token(token),
     )
 
@@ -626,6 +648,7 @@ def test_renew_refuses_a_browser_session(logged_in_client):
     assert _sql("SELECT count(*) FROM pats WHERE name = 'session-minted'")[0][0] == 1
 
 
+@pytest.mark.real_clock
 def test_renew_refuses_an_unauthenticated_caller(client, db_engine):
     assert client.post("/api/auth/native/renew").status_code == 401
 
@@ -661,18 +684,22 @@ def _rename(token: str, name):
     )
 
 
-def test_native_token_returns_only_the_presenting_row(native_oidc):
+def test_native_token_returns_only_the_presenting_row(native_oidc, controlled_clock):
     """Keyed on the CREDENTIAL, not on the user: the same account holds both phones, so an
     implementation that answered with "this user's token" would pass for one of them and fail here.
 
-    `last_used` is pinned to now() first — inside the stamp throttle window, so authentication
-    schedules no write of its own — which makes the served value the stored one rather than a
-    field that happens to read None on a token nobody has used twice.
+    `last_used` is stamped with the controlled instant first — inside the stamp throttle window,
+    so authentication schedules no write of its own — which makes the served value the stored one
+    rather than a field that happens to read None on a token nobody has used twice.
     """
     client, _ = native_oidc
     first = _exchange(client, _handoff_code(client, device="PhoneOne")).json()["token"]
     second = _exchange(client, _handoff_code(client, device="PhoneTwo")).json()["token"]
-    _sql("UPDATE pats SET last_used = now() WHERE hashed_token = :h", h=auth.hash_token(first))
+    _sql(
+        "UPDATE pats SET last_used = :t WHERE hashed_token = :h",
+        t=controlled_clock.now(),
+        h=auth.hash_token(first),
+    )
 
     resp = _self_token(first)
     assert resp.status_code == 200, resp.text
@@ -681,14 +708,29 @@ def test_native_token_returns_only_the_presenting_row(native_oidc):
     # `hashed_token` or a plaintext `token` would hand a leaked credential more than it holds.
     assert set(body) == SELF_FIELDS
     assert body["name"] == "PhoneOne"
-    assert abs(datetime.fromisoformat(body["last_used"]) - datetime.now(UTC)) < timedelta(
-        minutes=1
+    # `last_used` was stamped from the controlled instant above, so it comes back as that instant
+    # exactly (the wire drops sub-second precision) rather than within a tolerance of it.
+    assert datetime.fromisoformat(body["last_used"]) == controlled_clock.now().replace(
+        microsecond=0
     )
-    assert abs(datetime.fromisoformat(body["created_at"]) - datetime.now(UTC)) < timedelta(
-        minutes=1
-    )
-    lifetime = datetime.fromisoformat(body["expires_at"]) - datetime.now(UTC)
-    assert timedelta(days=364) < lifetime <= timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    # `created_at` is the COLUMN DEFAULT, stamped by PostgreSQL's own clock, so it is judged
+    # against the database's stored value — never against a frozen-versus-real delta.
+    stored_created = _sql(
+        "SELECT created_at FROM pats WHERE hashed_token = :h", h=auth.hash_token(first)
+    )[0][0]
+    assert datetime.fromisoformat(body["created_at"]) == stored_created.replace(microsecond=0)
+    # `expires_at` the application computed, so it is exact on the wire down to the second the
+    # RFC 3339 encoder keeps.
+    assert datetime.fromisoformat(body["expires_at"]) == (
+        controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    ).replace(microsecond=0)
+    # The control, read from the store rather than from the response: the row this token was
+    # minted into carries the pinned instant to the microsecond, so the mint really did read the
+    # controlled clock and not the wall.
+    stored_expiry = _sql(
+        "SELECT expires_at FROM pats WHERE hashed_token = :h", h=auth.hash_token(first)
+    )[0][0]
+    assert stored_expiry == controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
 
     other = _self_token(second)
     assert other.status_code == 200, other.text
@@ -724,6 +766,7 @@ def test_native_token_refuses_a_session_cookie(logged_in_client):
     ]
 
 
+@pytest.mark.real_clock
 def test_native_token_refuses_an_unauthenticated_caller(client, db_engine):
     assert client.get("/api/auth/native/token").status_code == 401
     assert client.patch("/api/auth/native/token", json={"name": "x"}).status_code == 401
@@ -804,6 +847,7 @@ def _name_bounds(model) -> dict[str, int]:
     }
 
 
+@pytest.mark.real_clock
 def test_rename_validation_mirrors_the_create_route():
     """Two models, one rule: a widened `PatCreate.name` that left this route behind would let a
     device name a token the SPA could not, and the parametrised cases above would still pass."""
@@ -814,17 +858,19 @@ def test_rename_validation_mirrors_the_create_route():
     assert _name_bounds(PatCreate) == {"MinLen": 1, "MaxLen": 255}
 
 
-def test_expired_token_is_401_before_the_route(native_oidc):
+def test_expired_token_is_401_before_the_route(native_oidc, controlled_clock):
     """Expiry is authentication's answer, not the route's — so the row is still sitting there
     afterwards under its old name, which is what proves the handler never ran.
 
-    Backdated in PostgreSQL rather than with a frozen clock: only a real stored instant tests the
-    predicate the running code evaluates.
+    A real STORED instant, so the predicate the running code evaluates is the one under test —
+    but computed from the controlled clock rather than PostgreSQL's `now()`, which the pinned code
+    no longer shares a timeline with.
     """
     client, _ = native_oidc
     token = _exchange(client, _handoff_code(client, device="ExpiredSelfPhone")).json()["token"]
     _sql(
-        "UPDATE pats SET expires_at = now() - interval '1 second' WHERE hashed_token = :h",
+        "UPDATE pats SET expires_at = :t WHERE hashed_token = :h",
+        t=controlled_clock.now() - timedelta(seconds=1),
         h=auth.hash_token(token),
     )
     before = _pat_row(token)
@@ -849,6 +895,7 @@ def test_a_revoked_token_cannot_read_or_rename_itself(native_oidc):
 # --- the two anonymous URLs, and their precedence over the SPA catch-all -----------------------
 
 
+@pytest.mark.real_clock
 def test_the_native_callback_page_beats_the_spa_catch_all(client):
     resp = client.get("/ios/auth/callback")
 
@@ -914,6 +961,7 @@ def test_the_callback_page_hands_a_real_login_back_to_the_app(native_oidc):
     assert page.text.count("memosng://") == 1
 
 
+@pytest.mark.real_clock
 def test_the_callback_page_forwards_exactly_the_parameters_it_was_given(client):
     page = _callback_page(client, code="handoff-abc", state="opaque-state")
 
@@ -922,6 +970,7 @@ def test_the_callback_page_forwards_exactly_the_parameters_it_was_given(client):
     assert parse_qs(url.query) == {"code": ["handoff-abc"], "state": ["opaque-state"]}
 
 
+@pytest.mark.real_clock
 def test_the_callback_page_encodes_values_that_carry_delimiters(client):
     """A value made of the characters that separate parameters has to arrive at the app as ONE
     value: percent-encoded for the URL it sits in, entity-escaped for the attribute around it."""
@@ -937,6 +986,7 @@ def test_the_callback_page_encodes_values_that_carry_delimiters(client):
     }
 
 
+@pytest.mark.real_clock
 def test_a_callback_parameter_cannot_write_markup_into_the_page(client):
     """The values come off a URL anyone can type, and the page renders them into an attribute."""
     hostile = 'x"><script>alert(1)</script>'
@@ -947,6 +997,7 @@ def test_a_callback_parameter_cannot_write_markup_into_the_page(client):
     assert parse_qs(urlsplit(_return_url(page.text)).query) == {"code": [hostile]}
 
 
+@pytest.mark.real_clock
 def test_a_refused_login_reaches_the_app_through_the_same_page(client):
     """The BFF sends a refusal to this URL too (`?error=…`) and the app reads the reason off the
     scheme URL like any other outcome — so the page forwards it, and does not claim a sign-in."""
@@ -958,10 +1009,12 @@ def test_a_refused_login_reaches_the_app_through_the_same_page(client):
     assert "Signed in" in _callback_page(client, code="handoff-abc").text
 
 
+@pytest.mark.real_clock
 def test_the_callback_page_offers_the_bare_scheme_url_when_given_nothing(client):
     assert _return_url(_callback_page(client).text) == RETURN_SCHEME_URL
 
 
+@pytest.mark.real_clock
 def test_the_callback_pages_return_script_is_allowed_to_run(client):
     """The automatic attempt is an inline script and the app-wide policy is `script-src 'self'`,
     which a browser enforces by silently refusing it — leaving the button as the only lane that
@@ -985,12 +1038,14 @@ def test_the_callback_pages_return_script_is_allowed_to_run(client):
     assert client.get("/health").headers["content-security-policy"] == APP_CSP
 
 
+@pytest.mark.real_clock
 def test_the_callback_page_is_never_stored(client):
     """It now renders a live one-shot handoff code into its body; a cache holding that body would
     hand the next reader a credential. The static page it replaced was cacheable."""
     assert _callback_page(client, code="handoff-abc").headers["cache-control"] == "no-store"
 
 
+@pytest.mark.real_clock
 def test_aasa_is_404_while_no_app_claims_this_domain(client):
     assert settings.APPLE_TEAM_ID is None
     resp = client.get("/.well-known/apple-app-site-association")
@@ -999,6 +1054,7 @@ def test_aasa_is_404_while_no_app_claims_this_domain(client):
     assert SPA_ROOT_MARKER not in resp.text  # never the SPA shell, even when there is nothing here
 
 
+@pytest.mark.real_clock
 def test_aasa_claims_the_domain_for_the_configured_app(client, monkeypatch):
     monkeypatch.setattr(settings, "APPLE_TEAM_ID", "ABCDE12345")
     monkeypatch.setattr(settings, "IOS_BUNDLE_ID", "live.discomarder.memosng")
@@ -1011,6 +1067,7 @@ def test_aasa_claims_the_domain_for_the_configured_app(client, monkeypatch):
     }
 
 
+@pytest.mark.real_clock
 def test_aasa_emits_applinks_when_the_switch_asks_for_it(client, monkeypatch):
     monkeypatch.setattr(settings, "APPLE_TEAM_ID", "ABCDE12345")
     monkeypatch.setattr(settings, "IOS_BUNDLE_ID", "live.discomarder.memosng")
@@ -1032,6 +1089,7 @@ def test_aasa_emits_applinks_when_the_switch_asks_for_it(client, monkeypatch):
     assert body["webcredentials"] == {"apps": ["ABCDE12345.live.discomarder.memosng"]}
 
 
+@pytest.mark.real_clock
 def test_the_exchange_is_documented_as_anonymous():
     """The generated clients (ADR-0009) see only this document, and an endpoint that takes no
     credential has to say so — nothing else in the schema would reveal it."""
@@ -1047,6 +1105,7 @@ def test_the_exchange_is_documented_as_anonymous():
 # --- the pure pieces ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_clock
 def test_s256_challenge_matches_the_published_test_vector():
     assert native_auth.s256_challenge(RFC_VERIFIER) == RFC_CHALLENGE
 
@@ -1068,6 +1127,7 @@ def test_s256_challenge_matches_the_published_test_vector():
         (None, False),
     ],
 )
+@pytest.mark.real_clock
 def test_valid_code_challenge(value, expected):
     assert native_auth.valid_code_challenge(value) is expected
 
@@ -1076,10 +1136,12 @@ def test_valid_code_challenge(value, expected):
     "value,expected",
     [("iPhone", True), ("d" * 64, True), ("d" * 65, False), ("", False), (None, False)],
 )
+@pytest.mark.real_clock
 def test_valid_device_name(value, expected):
     assert native_auth.valid_device_name(value) is expected
 
 
+@pytest.mark.real_clock
 def test_aasa_document_emits_only_the_requested_sections():
     assert native_auth.aasa_document("T", "b", []) == {}
     assert native_auth.aasa_document("T", "b", ["webcredentials"]) == {
@@ -1088,6 +1150,7 @@ def test_aasa_document_emits_only_the_requested_sections():
     assert set(native_auth.aasa_document("T", "b", ["applinks"])) == {"applinks"}
 
 
+@pytest.mark.real_clock
 def test_applinks_claims_both_the_callback_and_the_memo_permalink():
     """Drift guard: the app is entitled to two URL families, and losing either is invisible until
     a device stops opening one of them. The callback is what a device login lands on; /m/* is the
@@ -1103,6 +1166,7 @@ def test_applinks_claims_both_the_callback_and_the_memo_permalink():
     assert all(set(c) == {"/"} for c in details[0]["components"])
 
 
+@pytest.mark.real_clock
 def test_verifier_matches_only_its_own_challenge():
     assert native_auth.verifier_matches(RFC_VERIFIER, RFC_CHALLENGE) is True
     assert native_auth.verifier_matches(OTHER_VERIFIER, RFC_CHALLENGE) is False

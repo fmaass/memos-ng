@@ -15,10 +15,16 @@ import re
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from app import auth
 from app.main import app
 from fastapi.testclient import TestClient
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+# Every case that drives `_login` reaches `rate_limit()` and its 60-second monotonic window, so
+# the module is pinned wholesale; the two that only read `docker-entrypoint.sh` touch no clock
+# and say so with `real_clock` (MEMNG-296).
+pytestmark = pytest.mark.usefixtures("controlled_clock")
 
 ENTRYPOINT = Path(__file__).resolve().parent.parent / "docker-entrypoint.sh"
 
@@ -69,6 +75,7 @@ def _login(client: TestClient, forwarded_for: str):
 # --- deploy-artifact pin ------------------------------------------------------------------------
 
 
+@pytest.mark.real_clock
 def test_entrypoint_serves_uvicorn_with_forwarded_ip_handling():
     # Dropping either flag silently re-collapses every client into Traefik's single bucket,
     # and nothing else in the repo would notice — so the shipped command line is pinned here.
@@ -77,6 +84,7 @@ def test_entrypoint_serves_uvicorn_with_forwarded_ip_handling():
     assert '--forwarded-allow-ips "$FORWARDED_ALLOW_IPS"' in cmd
 
 
+@pytest.mark.real_clock
 def test_entrypoint_trust_list_is_explicit_and_covers_the_compose_networks():
     trusted = _shipped_trust_list()
     # `*` would trust a forged header from anywhere the socket is reachable — the trust scope
@@ -92,7 +100,7 @@ def test_entrypoint_trust_list_is_explicit_and_covers_the_compose_networks():
 # --- AC1: buckets are keyed per real client IP ---------------------------------------------------
 
 
-def test_forwarded_clients_get_their_own_buckets():
+def test_forwarded_clients_get_their_own_buckets(controlled_clock):
     client = _behind_proxy()
     assert _login(client, CLIENT_A).status_code == 302
     assert _login(client, CLIENT_B).status_code == 302
@@ -102,36 +110,54 @@ def test_forwarded_clients_get_their_own_buckets():
     assert TRAEFIK not in auth._RL
     assert len(auth._RL[CLIENT_A]) == 1
     assert len(auth._RL[CLIENT_B]) == 1
+    # The pin reached the limiter through the real middleware: every stamp is the controlled
+    # instant, so what these buckets hold is a count and not an elapsed time.
+    assert set(auth._RL[CLIENT_A]) == {controlled_clock.monotonic}
+    assert set(auth._RL[CLIENT_B]) == {controlled_clock.monotonic}
 
 
-def test_same_forwarded_client_shares_one_bucket():
+def test_same_forwarded_client_shares_one_bucket(controlled_clock):
     client = _behind_proxy()
     _login(client, CLIENT_A)
     _login(client, CLIENT_A)
 
     assert set(auth._RL) == {CLIENT_A}
     assert len(auth._RL[CLIENT_A]) == 2
+    # Both stamps are the controlled instant, so the two requests really did share one window.
+    assert set(auth._RL[CLIENT_A]) == {controlled_clock.monotonic}
 
 
-def test_one_noisy_client_cannot_starve_another():
+def test_one_noisy_client_cannot_starve_another(controlled_clock):
     # The actual bug: pre-fix, client A's flood exhausted the shared bucket and B got a 429.
+    # The clock is pinned for the whole flood, so A's own window cannot expire underneath it and
+    # turn the 429 this asserts into a 302.
     client = _behind_proxy()
     for _ in range(20):  # rate_limit()'s default limit
         assert _login(client, CLIENT_A).status_code == 302
     assert _login(client, CLIENT_A).status_code == 429
 
     assert _login(client, CLIENT_B).status_code == 302
+    # The pin held for all twenty: one instant, twenty stamps — A was refused on the count.
+    assert set(auth._RL[CLIENT_A]) == {controlled_clock.monotonic}
+    assert len(auth._RL[CLIENT_A]) == 20
+
+    # A's window is the controlled one: crossing it lets A back in, with B's bucket untouched.
+    controlled_clock.advance(60)
+    assert _login(client, CLIENT_A).status_code == 302
+    assert auth._RL[CLIENT_A] == [controlled_clock.monotonic]
 
 
-def test_forwarded_for_is_ignored_from_an_untrusted_peer():
+def test_forwarded_for_is_ignored_from_an_untrusted_peer(controlled_clock):
     # A direct (non-proxy) caller must not be able to pick its own bucket by asserting a header.
     outsider = _behind_proxy(peer="198.51.100.4")
     assert _login(outsider, "192.0.2.250").status_code == 302
 
     assert set(auth._RL) == {"198.51.100.4"}
+    # The stamp the peer's own bucket took is the controlled instant — the pin reached this leg.
+    assert set(auth._RL["198.51.100.4"]) == {controlled_clock.monotonic}
 
 
-def test_without_proxy_header_handling_every_client_shares_traefiks_bucket():
+def test_without_proxy_header_handling_every_client_shares_traefiks_bucket(controlled_clock):
     # Negative control: the bare app is exactly the pre-fix deployment, and it does collapse
     # the two clients into one bucket — so the assertions above are detecting the middleware,
     # not passing vacuously.
@@ -141,3 +167,6 @@ def test_without_proxy_header_handling_every_client_shares_traefiks_bucket():
 
     assert set(auth._RL) == {TRAEFIK}
     assert len(auth._RL[TRAEFIK]) == 2
+    # Same pin as the positive cases above, so the collapse is the middleware's absence and not
+    # two requests that happened to land in different windows.
+    assert set(auth._RL[TRAEFIK]) == {controlled_clock.monotonic}

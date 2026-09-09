@@ -87,32 +87,113 @@ def _reset_rate_limit():
 
 
 @pytest.fixture
-def frozen_rate_limit_clock(monkeypatch):
-    """Pin the clock `auth.rate_limit()` reads, and hand the test the instant it is pinned to.
+def controlled_clock(monkeypatch, request):
+    """Control every clock the code-redemption and limiter paths read; hand the test the instant.
 
-    The limiter's window is 60 seconds of REAL time, so a burst test that stalls between filling
-    the bucket and asserting the refusal — a loaded box, a debugger, a swapped-out host — would
-    watch its own bucket expire and read a correct 429 as a 400. With the clock pinned the window
-    cannot advance at all, so only the request COUNT can decide the outcome.
+    Two windows decide these tests and neither may be measured in real time. The limiter's is 60
+    seconds of `time.monotonic()`; a handoff code's is `NATIVE_CODE_TTL_S` seconds of wall clock,
+    and a management grant's is `MANAGE_GRANT_TTL_S`. A case that stalls between filling a bucket
+    and asserting the refusal — a loaded box, a debugger, a swapped-out host — would watch its own
+    window expire and read a correct outcome as the wrong one. Pinned, only the request COUNT and
+    the explicit `advance()` can move anything.
 
-    Only `app.auth`'s reference to the module is replaced, and only `monotonic` differs on it:
-    every other attribute is the real `time`, and no other module's notion of time changes.
+    Pinned per module that READS a clock, never globally: only `monotonic` differs on the `time`
+    stand-in and only `now` on the `datetime` one, every other attribute is the real thing, and no
+    module outside this list changes its notion of time.
+
+    The pin starts at the real instant rather than an arbitrary one, so a row the DATABASE stamps
+    with its own `now()` — a `created_at` default — still sits where the pinned code expects it.
+    A test that BACKDATES a row computes the instant from `now()` here and binds it as a
+    parameter, never from SQL `now()`: the two clocks are independent once this fixture starts,
+    and a stall between them is exactly the flake being removed. `advance()` moves both clocks
+    together, forward only, which is the only motion a test may ask for.
+
+    **The control is structural, not per-test.** Every patched read is counted, and at teardown a
+    test that pinned the clock and then never had the APPLICATION read it fails by name. So the
+    marker cannot sit on a case that exercises no clock path (where it would be noise a reader
+    mistakes for coverage), and it cannot silently miss its target either: a pin that stopped
+    reaching `app.auth` — a renamed import, a call site moved to another module — turns the case
+    red instead of quietly restoring the wall clock (MEMNG-296 review round 1).
+
+    A case that deliberately wants the real clock says so with `@pytest.mark.real_clock`; the
+    fixture then patches nothing, counts nothing, and asserts nothing.
     """
     import time as real_time
+    from datetime import UTC
+    from datetime import datetime as real_datetime
+    from datetime import timedelta as real_timedelta
 
     from app import auth
+    from app.routers import auth as auth_router
+    from app.services import management_grant, native_auth
 
-    frozen = 1_000_000.0
+    class ControlledClock:
+        def __init__(self) -> None:
+            self._instant = real_datetime.now(UTC)
+            self._monotonic = real_time.monotonic()
+            self.reads: dict[str, int] = {}
 
-    class FrozenClock:
+        @property
         def monotonic(self) -> float:
-            return frozen
+            """The pinned `time.monotonic()` — the value every limiter stamp taken under the pin
+            carries, so a test can assert the pin reached the code it is exercising."""
+            return self._monotonic
 
-        def __getattr__(self, name: str):
-            return getattr(real_time, name)
+        def now(self):
+            """The pinned `datetime.now(UTC)`."""
+            return self._instant
 
-    monkeypatch.setattr(auth, "time", FrozenClock())
-    return frozen
+        def advance(self, seconds: float) -> None:
+            if seconds < 0:  # a window that reopens by going backwards tests nothing real
+                raise ValueError("a controlled clock only moves forward")
+            self._instant += real_timedelta(seconds=seconds)
+            self._monotonic += seconds
+
+        def _record(self, where: str) -> None:
+            self.reads[where] = self.reads.get(where, 0) + 1
+
+    clock = ControlledClock()
+
+    if request.node.get_closest_marker("real_clock") is not None:
+        yield clock  # unpinned by request: the instant is still readable, nothing is patched
+        return
+
+    def pinned_time(where: str):
+        class PinnedTime:
+            def monotonic(self) -> float:
+                clock._record(f"{where}.time.monotonic")
+                return clock.monotonic
+
+            def __getattr__(self, name: str):
+                return getattr(real_time, name)
+
+        return PinnedTime()
+
+    def pinned_datetime(where: str):
+        # One subclass per module, so the spy can say WHICH module read the clock rather than
+        # only that something did.
+        class PinnedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):  # every pinned call site passes UTC; a naive read is not one
+                clock._record(f"{where}.datetime.now")
+                return clock.now() if tz is None else clock.now().astimezone(tz)
+
+        return PinnedDatetime
+
+    monkeypatch.setattr(auth, "time", pinned_time("app.auth"))
+    for module in (auth, auth_router, native_auth, management_grant):
+        monkeypatch.setattr(module, "datetime", pinned_datetime(module.__name__))
+
+    yield clock
+
+    if not clock.reads:
+        pytest.fail(
+            "controlled_clock: the application never read the pinned clock during "
+            f"{request.node.nodeid} — either the pin no longer reaches the code under test, or "
+            "this case exercises no clock path and must not be pinned (drop the fixture, or "
+            "mark it @pytest.mark.real_clock)",
+            pytrace=False,
+        )
 
 
 @pytest.fixture

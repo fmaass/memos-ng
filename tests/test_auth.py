@@ -1,3 +1,4 @@
+from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import jwt
@@ -8,6 +9,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
+
+# `/api/auth/login` and `/api/auth/callback` both carry `Depends(auth.rate_limit())`, so most of
+# this file reaches a limiter path whether or not it says so — and the limiter's window is 60
+# seconds of `time.monotonic()`. The whole module runs under the controlled clock; the fixture
+# fails any case that pins the clock without the application ever reading it, so the cases that
+# touch no clock at all are marked `real_clock` rather than left silently pinned (MEMNG-296).
+pytestmark = pytest.mark.usefixtures("controlled_clock")
 
 
 def _rsa():
@@ -28,6 +36,7 @@ def _mock_jwks(monkeypatch, public_key):
 # --- protected-by-default + state validation (no DB writes) ---
 
 
+@pytest.mark.real_clock
 def test_user_endpoint_401_without_cookie(client):
     r = client.get("/api/auth/user")
     assert r.status_code == 401
@@ -53,6 +62,7 @@ def test_login_redirects_to_authelia_with_pkce(client):
 # --- id_token signature validation (real RS256) ---
 
 
+@pytest.mark.real_clock
 def test_validate_id_token_accepts_correct_key(monkeypatch):
     priv = _rsa()
     _mock_jwks(monkeypatch, priv.public_key())
@@ -65,6 +75,7 @@ def test_validate_id_token_accepts_correct_key(monkeypatch):
     assert claims["preferred_username"] == "u"
 
 
+@pytest.mark.real_clock
 def test_validate_id_token_rejects_wrong_key(monkeypatch):
     signer, attacker = _rsa(), _rsa()
     _mock_jwks(monkeypatch, attacker.public_key())  # JWKS returns a DIFFERENT key
@@ -135,6 +146,7 @@ def test_callback_creates_session_then_user_then_logout(client, db_engine, monke
         eng.dispose()
 
 
+@pytest.mark.real_clock
 def test_security_headers_present(client):
     r = client.get("/health")
     assert r.headers["X-Content-Type-Options"] == "nosniff"
@@ -155,7 +167,13 @@ def _req(headers: dict, client_host: str = "rl-test") -> "object":
     )
 
 
-def test_rate_limit_blocks_after_threshold():
+def test_rate_limit_blocks_after_threshold(controlled_clock):
+    """The refusal is decided by the request COUNT; the window reopens only on an explicit advance.
+
+    Under the controlled clock the burst cannot outlive its own window between filling the bucket
+    and asking for the refusal, and the recovery below is the window being crossed on purpose
+    rather than the test waiting a real minute.
+    """
     from fastapi import HTTPException
 
     auth._RL.pop("rl-unit", None)
@@ -166,6 +184,15 @@ def test_rate_limit_blocks_after_threshold():
     with pytest.raises(HTTPException) as ei:
         dep(req)
     assert ei.value.status_code == 429
+    # The pin reached the limiter: both stamps are the controlled instant, so nothing but the
+    # count could have decided the 429.
+    assert set(auth._RL["rl-unit"]) == {controlled_clock.monotonic}
+    assert len(auth._RL["rl-unit"]) == 2
+
+    # And the window is that clock's: one advance past it and the bucket is empty again.
+    controlled_clock.advance(60)
+    dep(req)
+    assert auth._RL["rl-unit"] == [controlled_clock.monotonic]
     auth._RL.pop("rl-unit", None)
 
 
@@ -180,6 +207,7 @@ def test_logout_returns_rp_initiated_url(logged_in_client):
     assert "id_token_hint=" in body["logout_url"]
 
 
+@pytest.mark.real_clock
 def test_login_next_rejects_open_redirect(client):
     # A protocol-relative or absolute next must not survive — only same-site local paths.
     from app.routers.auth import _safe_next
@@ -192,6 +220,7 @@ def test_login_next_rejects_open_redirect(client):
     assert _safe_next("") == "/"
 
 
+@pytest.mark.real_clock
 async def test_userinfo_preferred_username_keys_user_not_sub(adb):
     # id_token carries only the opaque sub UUID; userinfo supplies preferred_username.
     # The user must be keyed by the real username, not the UUID (the live bug).
@@ -209,12 +238,14 @@ async def test_userinfo_preferred_username_keys_user_not_sub(adb):
     assert user.display_name == "Fabian" and user.role == "admin"
 
 
+@pytest.mark.real_clock
 async def test_fetch_userinfo_no_access_token_returns_empty():
     from app import auth
 
     assert await auth.fetch_userinfo(None) == {}
 
 
+@pytest.mark.real_clock
 def test_rolling_refresh_due_throttle_boundary():
     # last_seen is refreshed at most once per throttle window — so the front page's concurrent
     # authenticated fan-out doesn't UPDATE+COMMIT the one hot session row on every request.
@@ -232,17 +263,20 @@ def test_rolling_refresh_due_throttle_boundary():
 # --- mutation-killing pins: absolute expiry + present-but-wrong OIDC state ---
 
 
-def test_session_past_absolute_expiry_is_dead(logged_in_client):
+def test_session_past_absolute_expiry_is_dead(logged_in_client, controlled_clock):
     client, subject = logged_in_client
     assert client.get("/api/auth/user").status_code == 200
     eng = create_engine(SYNC_URL)
     with eng.begin() as conn:
         conn.execute(
             text(
-                "UPDATE sessions SET absolute_expiry = now() - interval '1 minute' "
+                "UPDATE sessions SET absolute_expiry = :t "
                 "WHERE user_id = (SELECT id FROM users WHERE subject = :s)"
             ),
-            {"s": subject},
+            # From the controlled clock, not PostgreSQL's: `absolute_expiry <= datetime.now(UTC)`
+            # is evaluated in the pinned application, which no longer shares the database's
+            # timeline.
+            {"t": controlled_clock.now() - timedelta(minutes=1), "s": subject},
         )
     eng.dispose()
     assert client.get("/api/auth/user").status_code == 401
