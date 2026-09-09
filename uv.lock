@@ -768,8 +768,8 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
     { name = "pywebpush", specifier = ">=2.0,<3" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36,<3" },
-    { name = "structlog", specifier = ">=24.4,<27" },
-    { name = "tzdata", specifier = ">=2024.2,<2027" },
+    { name = "structlog", specifier = ">=24.4" },
+    { name = "tzdata", specifier = ">=2024.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
 ]
 

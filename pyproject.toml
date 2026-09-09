@@ -6,7 +6,8 @@ requires-python = ">=3.13"
 dependencies = [
     # Each entry carries an upper bound at the next major of the version uv.lock resolves today, so a
     # rebuild from a stale or regenerated lock cannot silently cross a major-version break. Bounds are
-    # a floor-and-ceiling contract, not the pin — uv.lock is the pin. A new entry gets a bound too.
+    # a floor-and-ceiling contract, not the pin — uv.lock is the pin. A new entry gets a bound too,
+    # unless it is CalVer (see structlog and tzdata).
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
     "sqlalchemy[asyncio]>=2.0.36,<3",
@@ -15,7 +16,9 @@ dependencies = [
     "alembic>=1.14,<2",
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.7,<3",
-    "structlog>=24.4,<27",
+    # CalVer (year.release), so deliberately unbounded: its next "major" is next January, not an API
+    # break, and a bound on it would be a yearly chore protecting nothing. uv.lock is its pin.
+    "structlog>=24.4",
     "prometheus-fastapi-instrumentator>=7.0,<9",
     "python-multipart>=0.0.20,<1",
     "httpx>=0.28,<1",
@@ -42,7 +45,9 @@ dependencies = [
     # python:3.13-slim's zone availability rides on whatever the Debian package graph happens to
     # pull. Declaring it makes ZoneInfo("Europe/Zurich") a resolved fact rather than an
     # observation of one image build.
-    "tzdata>=2024.2,<2027",
+    # CalVer too, and unbounded for a second reason: a ceiling would hold back zone data from the
+    # turn of the year onward — the moment the data exists to correct a zone.
+    "tzdata>=2024.2",
 ]
 
 [dependency-groups]
