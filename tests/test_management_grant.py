@@ -19,7 +19,7 @@ Every case drives the real flow with only the OIDC network calls mocked (the sea
 the case red rather than changing which mock answers.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -33,6 +33,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 
 from tests.conftest import SYNC_URL
+
+# Every case here mints or redeems a handoff code and most of them mint a grant; both are
+# time-bounded (`NATIVE_CODE_TTL_S`, `MANAGE_GRANT_TTL_S`) and neither window may be measured
+# against a wall clock a stall can cross. The whole module runs under the controlled clock; a case
+# that asserts something about an instant takes the fixture by name and reads it (MEMNG-296).
+pytestmark = pytest.mark.usefixtures("controlled_clock")
 
 RFC_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 RFC_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
@@ -79,16 +85,21 @@ async def test_a_grant_is_stored_only_as_a_hash(adb):
     assert grant not in (row.hashed_grant,)
 
 
-async def test_a_grant_expires_after_the_configured_ttl(adb, monkeypatch):
+async def test_a_grant_expires_after_the_configured_ttl(adb, monkeypatch, controlled_clock):
     """The bound is read from settings at mint time, not baked in: a grant authenticates a
-    management session of minutes, and that window is the whole reason it is safe to hand out."""
+    management session of minutes, and that window is the whole reason it is safe to hand out.
+
+    Under the controlled clock the deadline is exact — 42 seconds past the pinned instant, not
+    "42-ish" — so the assertion can no longer be satisfied by a mint that ignored the setting and
+    happened to land inside a tolerance.
+    """
     monkeypatch.setattr(settings, "MANAGE_GRANT_TTL_S", 42)
     user = await _user(adb, "grant_ttl_user")
-    before = datetime.now(UTC)
 
     _, expires_at = await management_grant.mint_grant(adb, user)
 
-    assert timedelta(seconds=42) <= expires_at - before <= timedelta(seconds=52)
+    # Also the control that the pin reached the mint: the instant it read is this one.
+    assert expires_at == controlled_clock.now() + timedelta(seconds=42)
     stored = (
         await adb.execute(
             select(ManagementGrant.expires_at).where(ManagementGrant.user_id == user.id)
@@ -334,7 +345,7 @@ def test_the_management_purpose_never_reaches_the_idp(grant_oidc):
     assert "manage" not in manage.headers["location"]
 
 
-def test_a_manage_code_becomes_a_grant_that_is_stored_hashed(grant_oidc):
+def test_a_manage_code_becomes_a_grant_that_is_stored_hashed(grant_oidc, controlled_clock):
     client, subject = grant_oidc
     code = _handoff_code(client, purpose="manage")
 
@@ -353,11 +364,11 @@ def test_a_manage_code_becomes_a_grant_that_is_stored_hashed(grant_oidc):
     hashed, expires_at = rows[0]
     assert hashed == management_grant.hash_grant(grant)
     assert hashed != grant  # the plaintext is returned once and stored nowhere
-    assert abs(datetime.fromisoformat(body["expires_at"]) - expires_at) < timedelta(seconds=5)
-    ttl = expires_at - datetime.now(UTC)
-    assert timedelta(seconds=settings.MANAGE_GRANT_TTL_S - 60) < ttl <= timedelta(
-        seconds=settings.MANAGE_GRANT_TTL_S
-    )
+    # The stored deadline is the pinned instant plus the configured TTL, exactly — which is both
+    # the TTL assertion and the control that the pin reached the route that minted this grant.
+    assert expires_at == controlled_clock.now() + timedelta(seconds=settings.MANAGE_GRANT_TTL_S)
+    # The wire drops sub-second precision (`to_rfc3339`), and nothing else.
+    assert datetime.fromisoformat(body["expires_at"]) == expires_at.replace(microsecond=0)
     assert _code_row(code)[0][1] is not None  # the code is burned by its redemption
 
 
@@ -496,9 +507,7 @@ def test_the_manage_grant_route_is_documented_as_anonymous():
 TESTCLIENT_HOST = "testclient"
 
 
-def test_the_manage_grant_route_is_rate_limited_like_the_login_legs(
-    grant_oidc, frozen_rate_limit_clock
-):
+def test_the_manage_grant_route_is_rate_limited_like_the_login_legs(grant_oidc, controlled_clock):
     """The same `rate_limit()` dependency the login legs carry, on the step-up lane.
 
     Defence in depth rather than a live hole — a manage code is single-use, 120-second and
@@ -531,7 +540,7 @@ def test_the_manage_grant_route_is_rate_limited_like_the_login_legs(
 
     # The pin really reached the limiter: twenty stamps, every one of them the frozen instant —
     # the refusal above was decided by the request COUNT, with a window that never advanced.
-    assert set(auth._RL[TESTCLIENT_HOST]) == {frozen_rate_limit_clock}
+    assert set(auth._RL[TESTCLIENT_HOST]) == {controlled_clock.monotonic}
     assert len(auth._RL[TESTCLIENT_HOST]) == 20
 
 
@@ -667,7 +676,7 @@ def test_grant_authenticates_pat_management(grant_oidc):
     assert _sql("SELECT count(*) FROM pats WHERE name = 'minted-under-grant'")[0][0] == 0
 
 
-def test_grant_expires(grant_oidc):
+def test_grant_expires(grant_oidc, controlled_clock):
     """Three verdicts on ONE grant — usable, refused once its stored deadline is in the past,
     usable again when it is moved back — so only the stored instant can be deciding it.
 
@@ -684,10 +693,10 @@ def test_grant_expires(grant_oidc):
     stored = _sql("SELECT expires_at FROM management_grants WHERE hashed_grant = :h", h=hashed)[0][
         0
     ]
-    ttl = stored - datetime.now(UTC)
-    assert timedelta(seconds=settings.MANAGE_GRANT_TTL_S - 60) < ttl <= timedelta(
-        seconds=settings.MANAGE_GRANT_TTL_S
-    )
+    # The control that the pin reached the mint behind `_grant()`: the row's deadline is the
+    # pinned instant plus the configured TTL, and the refusal below is the DB moving that stored
+    # instant into the past rather than any time passing here.
+    assert stored == controlled_clock.now() + timedelta(seconds=settings.MANAGE_GRANT_TTL_S)
 
     _sql(
         "UPDATE management_grants SET expires_at = now() - interval '1 second' "

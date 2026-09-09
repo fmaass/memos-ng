@@ -22,7 +22,7 @@ import asyncio
 import base64
 import hashlib
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from html import unescape
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -37,6 +37,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
+
+# Every case in this file mints or redeems a handoff code, and a code lives `NATIVE_CODE_TTL_S`
+# seconds — 120 by default. Measured against the wall clock that window is a stall away from
+# expiring mid-case, so the whole module runs under the controlled clock; a case that asserts
+# something about an instant takes the fixture by name and reads it (MEMNG-296).
+pytestmark = pytest.mark.usefixtures("controlled_clock")
 
 # RFC 7636 Appendix B's published S256 test vector. Hard-coded rather than computed with
 # `s256_challenge`, so a broken implementation of it cannot also produce the expected value.
@@ -283,7 +289,7 @@ def test_an_error_callback_with_a_bad_or_missing_state_is_refused(native_oidc):
 # --- exchanging the code for a device token ---------------------------------------------------
 
 
-def test_exchange_mints_a_device_token_that_works(native_oidc):
+def test_exchange_mints_a_device_token_that_works(native_oidc, controlled_clock):
     client, subject = native_oidc
     code = _handoff_code(client)
 
@@ -304,9 +310,12 @@ def test_exchange_mints_a_device_token_that_works(native_oidc):
     )[0]
     assert name == DEVICE  # the device display name propagates verbatim
     assert expires_at is not None
-    lifetime = expires_at - datetime.now(UTC)
-    assert timedelta(days=364) < lifetime <= timedelta(days=365)
-    assert abs(datetime.fromisoformat(body["expires_at"]) - expires_at) < timedelta(seconds=5)
+    # The mint read the controlled clock, so the deadline is exact rather than roughly a year out:
+    # the stored instant IS the pinned one plus the configured lifetime. That equality is also the
+    # control that the pin took effect on the route.
+    assert expires_at == controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    # The wire drops sub-second precision (`to_rfc3339`), and nothing else.
+    assert datetime.fromisoformat(body["expires_at"]) == expires_at.replace(microsecond=0)
 
 
 def test_a_wrong_verifier_is_refused_and_still_burns_the_code(native_oidc):
@@ -416,7 +425,7 @@ async def test_two_concurrent_exchanges_mint_exactly_one_token(native_oidc):
 TESTCLIENT_HOST = "testclient"
 
 
-def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, frozen_rate_limit_clock):
+def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, controlled_clock):
     """The same `rate_limit()` dependency the login legs carry, on the route that mints the token.
 
     Defence in depth rather than a live hole — a handoff code is single-use, 120-second and
@@ -449,7 +458,7 @@ def test_the_exchange_is_rate_limited_like_the_login_legs(native_oidc, frozen_ra
 
     # The pin really reached the limiter: twenty stamps, every one of them the frozen instant —
     # the refusal above was decided by the request COUNT, with a window that never advanced.
-    assert set(auth._RL[TESTCLIENT_HOST]) == {frozen_rate_limit_clock}
+    assert set(auth._RL[TESTCLIENT_HOST]) == {controlled_clock.monotonic}
     assert len(auth._RL[TESTCLIENT_HOST]) == 20
 
 
@@ -506,7 +515,7 @@ def _renew(token: str):
     return anon.post("/api/auth/native/renew", headers={"Authorization": f"Bearer {token}"})
 
 
-def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc):
+def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc, controlled_clock):
     """The point of the endpoint: a phone that keeps using its token never reaches the expiry
     that would sign it out — and the token it presented is dead the moment it is renewed.
     """
@@ -537,9 +546,11 @@ def test_renew_rotates_the_token_and_refreshes_its_lifetime(native_oidc):
     assert len(rows) == 1  # rotated, never accumulated
     hashed_token, expires_at = rows[0]
     assert hashed_token == auth.hash_token(new)
-    lifetime = expires_at - datetime.now(UTC)
-    assert timedelta(days=364) < lifetime <= timedelta(days=365)
-    assert abs(datetime.fromisoformat(body["expires_at"]) - expires_at) < timedelta(seconds=5)
+    # A full fresh lifetime from the controlled instant, exactly — so the successor was minted
+    # rather than handed the backdated expiry the predecessor was carrying. The equality doubles
+    # as the control that the pin reached the renew route.
+    assert expires_at == controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    assert datetime.fromisoformat(body["expires_at"]) == expires_at.replace(microsecond=0)
 
 
 def test_an_expired_token_is_refused_before_the_renew_logic_runs(native_oidc):
@@ -661,7 +672,7 @@ def _rename(token: str, name):
     )
 
 
-def test_native_token_returns_only_the_presenting_row(native_oidc):
+def test_native_token_returns_only_the_presenting_row(native_oidc, controlled_clock):
     """Keyed on the CREDENTIAL, not on the user: the same account holds both phones, so an
     implementation that answered with "this user's token" would pass for one of them and fail here.
 
@@ -681,14 +692,27 @@ def test_native_token_returns_only_the_presenting_row(native_oidc):
     # `hashed_token` or a plaintext `token` would hand a leaked credential more than it holds.
     assert set(body) == SELF_FIELDS
     assert body["name"] == "PhoneOne"
-    assert abs(datetime.fromisoformat(body["last_used"]) - datetime.now(UTC)) < timedelta(
+    # `last_used` and `created_at` are stamped by POSTGRES (`now()` above, the column default), so
+    # they are judged against the controlled instant with the one minute of slack that separates
+    # the two clocks — never against a wall clock that keeps moving while the case runs.
+    assert abs(datetime.fromisoformat(body["last_used"]) - controlled_clock.now()) < timedelta(
         minutes=1
     )
-    assert abs(datetime.fromisoformat(body["created_at"]) - datetime.now(UTC)) < timedelta(
+    assert abs(datetime.fromisoformat(body["created_at"]) - controlled_clock.now()) < timedelta(
         minutes=1
     )
-    lifetime = datetime.fromisoformat(body["expires_at"]) - datetime.now(UTC)
-    assert timedelta(days=364) < lifetime <= timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    # `expires_at` the application computed, so it is exact on the wire down to the second the
+    # RFC 3339 encoder keeps.
+    assert datetime.fromisoformat(body["expires_at"]) == (
+        controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
+    ).replace(microsecond=0)
+    # The control, read from the store rather than from the response: the row this token was
+    # minted into carries the pinned instant to the microsecond, so the mint really did read the
+    # controlled clock and not the wall.
+    stored_expiry = _sql(
+        "SELECT expires_at FROM pats WHERE hashed_token = :h", h=auth.hash_token(first)
+    )[0][0]
+    assert stored_expiry == controlled_clock.now() + timedelta(days=settings.NATIVE_TOKEN_DAYS)
 
     other = _self_token(second)
     assert other.status_code == 200, other.text

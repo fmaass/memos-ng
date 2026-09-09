@@ -87,32 +87,73 @@ def _reset_rate_limit():
 
 
 @pytest.fixture
-def frozen_rate_limit_clock(monkeypatch):
-    """Pin the clock `auth.rate_limit()` reads, and hand the test the instant it is pinned to.
+def controlled_clock(monkeypatch):
+    """Control every clock the code-redemption and limiter paths read; hand the test the instant.
 
-    The limiter's window is 60 seconds of REAL time, so a burst test that stalls between filling
-    the bucket and asserting the refusal — a loaded box, a debugger, a swapped-out host — would
-    watch its own bucket expire and read a correct 429 as a 400. With the clock pinned the window
-    cannot advance at all, so only the request COUNT can decide the outcome.
+    Two windows decide these tests and neither may be measured in real time. The limiter's is 60
+    seconds of `time.monotonic()`; a handoff code's is `NATIVE_CODE_TTL_S` seconds of wall clock,
+    and a management grant's is `MANAGE_GRANT_TTL_S`. A case that stalls between filling a bucket
+    and asserting the refusal — a loaded box, a debugger, a swapped-out host — would watch its own
+    window expire and read a correct outcome as the wrong one. Pinned, only the request COUNT and
+    the explicit `advance()` can move anything.
 
-    Only `app.auth`'s reference to the module is replaced, and only `monotonic` differs on it:
-    every other attribute is the real `time`, and no other module's notion of time changes.
+    Pinned per module that READS a clock, never globally: only `monotonic` differs on the `time`
+    stand-in and only `now` on the `datetime` one, every other attribute is the real thing, and no
+    module outside this list changes its notion of time.
+
+    The pin starts at the real instant rather than an arbitrary one, so a row the DATABASE stamps
+    with its own `now()` — a `created_at` default, a test's `now() - interval '1 second'`
+    backdating — still sits where the pinned code expects it. `advance()` moves both clocks
+    together, forward only, which is the only motion a test may ask for.
     """
     import time as real_time
+    from datetime import UTC
+    from datetime import datetime as real_datetime
+    from datetime import timedelta as real_timedelta
 
     from app import auth
+    from app.routers import auth as auth_router
+    from app.services import management_grant, native_auth
 
-    frozen = 1_000_000.0
+    class ControlledClock:
+        def __init__(self) -> None:
+            self._instant = real_datetime.now(UTC)
+            self._monotonic = real_time.monotonic()
 
-    class FrozenClock:
+        @property
         def monotonic(self) -> float:
-            return frozen
+            """The pinned `time.monotonic()` — the value every limiter stamp taken under the pin
+            carries, so a test can assert the pin reached the code it is exercising."""
+            return self._monotonic
+
+        def now(self):
+            """The pinned `datetime.now(UTC)`."""
+            return self._instant
+
+        def advance(self, seconds: float) -> None:
+            if seconds < 0:  # a window that reopens by going backwards tests nothing real
+                raise ValueError("a controlled clock only moves forward")
+            self._instant += real_timedelta(seconds=seconds)
+            self._monotonic += seconds
+
+    clock = ControlledClock()
+
+    class PinnedTime:
+        def monotonic(self) -> float:
+            return clock.monotonic
 
         def __getattr__(self, name: str):
             return getattr(real_time, name)
 
-    monkeypatch.setattr(auth, "time", FrozenClock())
-    return frozen
+    class PinnedDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):  # every pinned call site passes UTC; a naive read is not one
+            return clock.now() if tz is None else clock.now().astimezone(tz)
+
+    monkeypatch.setattr(auth, "time", PinnedTime())
+    for module in (auth, auth_router, native_auth, management_grant):
+        monkeypatch.setattr(module, "datetime", PinnedDatetime)
+    return clock
 
 
 @pytest.fixture

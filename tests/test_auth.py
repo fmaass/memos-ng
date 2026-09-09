@@ -155,7 +155,13 @@ def _req(headers: dict, client_host: str = "rl-test") -> "object":
     )
 
 
-def test_rate_limit_blocks_after_threshold():
+def test_rate_limit_blocks_after_threshold(controlled_clock):
+    """The refusal is decided by the request COUNT; the window reopens only on an explicit advance.
+
+    Under the controlled clock the burst cannot outlive its own window between filling the bucket
+    and asking for the refusal, and the recovery below is the window being crossed on purpose
+    rather than the test waiting a real minute.
+    """
     from fastapi import HTTPException
 
     auth._RL.pop("rl-unit", None)
@@ -166,6 +172,15 @@ def test_rate_limit_blocks_after_threshold():
     with pytest.raises(HTTPException) as ei:
         dep(req)
     assert ei.value.status_code == 429
+    # The pin reached the limiter: both stamps are the controlled instant, so nothing but the
+    # count could have decided the 429.
+    assert set(auth._RL["rl-unit"]) == {controlled_clock.monotonic}
+    assert len(auth._RL["rl-unit"]) == 2
+
+    # And the window is that clock's: one advance past it and the bucket is empty again.
+    controlled_clock.advance(60)
+    dep(req)
+    assert auth._RL["rl-unit"] == [controlled_clock.monotonic]
     auth._RL.pop("rl-unit", None)
 
 
