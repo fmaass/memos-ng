@@ -1,6 +1,6 @@
 # PLAN — Human-browsable per-memo originals layout
 
-Status: **DRAFT — review before implementing.** No code yet.
+Status: **shipped** (app/services/storage.py memo_dir; commits 18e83fa, aab8509).
 **Rev 7 — scope cut to "new writes only".** The owner decided the new layout applies ONLY to
 newly-written masters; existing masters never move and there is **no migration**. This deletes the
 entire rev-6 safety machinery — the 661-file migration, the reference-GC, the

@@ -4,7 +4,7 @@ overview: "When a memo tagged #curated carries image attachments, memos-ng autom
 scope: standard
 project: "memos-ng"
 feature: "aura-frame-email"
-status: draft
+status: "superseded by PLAN_2026-07-19_frame-api-upload.md (the SMTP frame path was removed in #32)"
 created: "2026-07-03"
 todos:
   - id: "p0-empirical-probe"

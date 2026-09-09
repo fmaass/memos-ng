@@ -151,7 +151,7 @@ met until its tests exist and pass.
   the shared `memosng` tear each other's tables down mid-run. A concurrent run (parallel agents, or
   an agent alongside you) uses `memosng_test_<suffix>`, which `tests/db_guard.py` allowlists on the
   local hosts: create it with
-  `docker exec memos-ng-dev-db-1 psql -U memosng -d memosng -c "CREATE DATABASE memosng_test_a"`
+  `docker exec memos-ng-db-1 psql -U memosng -d memosng -c "CREATE DATABASE memosng_test_a"`
   (the dev container's `memosng` role is its bootstrap superuser, so it may CREATE DATABASE; the
   same-named prod role on postgres17 has neither SUPERUSER nor CREATEDB), export **both** `DATABASE_URL_SYNC=...` and
   `DATABASE_URL=postgresql+asyncpg://memosng:memosng@localhost:5433/memosng_test_a` at it (the

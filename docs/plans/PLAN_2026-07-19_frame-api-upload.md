@@ -4,7 +4,7 @@ overview: "Replace memos-ng's direct SMTP email delivery to Aura frames with an 
 scope: standard
 project: "memos-ng"
 feature: "frame-api-upload"
-status: draft
+status: "shipped (app/services/frame_share.py; #31, #32)"
 created: "2026-07-19"
 todos:
   - id: "p1-upload-token"
