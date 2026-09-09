@@ -4,7 +4,7 @@ overview: "Critical review of what the migration to memos-ng lost versus the ori
 scope: major
 project: "memos-ng"
 feature: "feature-parity-roadmap"
-status: partial (umbrella roadmap; its items are tracked in windshift workspace MEMNG)
+status: "partial (umbrella roadmap; its items are tracked in windshift workspace MEMNG)"
 created: "2026-07-03"
 todos:
   - id: "tier-a-quick-wins"
