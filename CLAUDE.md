@@ -8,9 +8,9 @@ containers (`memos-nginx`, `memos-imgproxy`, `memos-resizer`) and the Merkur `me
 in-stack `memos-ng-worker` (pyvips + ffmpeg, Postgres `media_jobs` queue) replaces imgproxy +
 resizer + the 5-minute NFS transcoder.
 
-**State: SHIPPED — memos-ng IS production** at `https://memos.discomarder.live`. Cutover is DONE.
-The old `neosmemo/memos` stack is retired. Work now is ticket-scoped maintenance/features, not
-greenfield phases. (The `docs/plans/PLAN_2026-06-20_memos-ng.md` build roadmap is historical;
+**State: SHIPPED — memos-ng IS production** at `https://memos.discomarder.live`; cutover done, the
+old `neosmemo/memos` stack retired. Work is ticket-scoped maintenance/features, not greenfield
+phases. (`docs/plans/PLAN_2026-06-20_memos-ng.md` is the historical build roadmap;
 `fixtures/live-0.29.1/` remains the compat ground truth — see below.)
 
 ### Deployed topology (the "jupiter" host = the local machine, merkur)
@@ -32,8 +32,8 @@ greenfield phases. (The `docs/plans/PLAN_2026-06-20_memos-ng.md` build roadmap i
 
 ## CARDINAL RULE — this IS production; a bad deploy is a real outage
 
-memos-ng serves the household at `memos.discomarder.live` from prod data. There is no separate
-staging. Treat every deploy and every prod DB migration as production-affecting:
+There is no separate staging; every deploy hits household prod data at `memos.discomarder.live`.
+Treat every deploy and every prod DB migration as production-affecting:
 - **Never** `docker compose restart` to pick up code (reuses the old image) — `up -d
   --force-recreate` (hook-enforced; `ALLOW_RESTART=1` only for genuine config reloads).
 - **Never** overwrite `memos-ng:local` without first retagging the running image
@@ -46,11 +46,11 @@ staging. Treat every deploy and every prod DB migration as production-affecting:
 1. **Authelia restart** (any OIDC client change) interrupts *all* household SSO. Changes are
    additive; **run `authelia validate-config` before restart**, in a quiet window. Mirror every
    live change into the sanitized in-repo template the same session.
-2. **Shared Postgres17 + Saturn host.** memos-ng's DB shares hardware with other household
-   services. The real coupling is **thermal** — a transcode storm can trip a host shutdown.
-   Reuse existing derived mp4s (no mass re-transcode); 1-thread throttle; stay <70 °C.
-3. **Traefik** routes per-service (own router) — additive and isolated; a bad router config can
-   still cascade, so do router changes as their own change in a quiet window.
+2. **Shared Postgres17 + Saturn host.** The real coupling is **thermal** — a transcode storm can
+   trip a host shutdown. Reuse existing derived mp4s (no mass re-transcode); 1-thread throttle;
+   stay <70 °C.
+3. **Traefik** routes per-service (own router) — additive and isolated, but a bad router config
+   can still cascade: do router changes as their own change in a quiet window.
 
 ## Architecture
 
@@ -70,12 +70,12 @@ Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
 
 ## Hosts: jupiter (local, runs the app) + Saturn (NAS, runs the DB & holds data)
 
-The app/worker containers run on the **local machine (jupiter)** — deploy there with the
-local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn conventions:
+The app/worker containers run on the **local machine (jupiter)** — deploy there with the local
+`docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn conventions:
 
 - SSH alias: **`ssh saturn.local`** (Host in `~/.ssh/config`, port 27022, user `fabian`).
   **merkur** (`ssh merkur.local`) is the Mac mini M1 **build host for the iOS client** — no app
-  containers run there; **jupiter is the local machine** that runs the app and worker.
+  containers run there.
 - **The orchestrator drives merkur over SSH end-to-end — never hand iOS build/archive/upload
   steps back to the user.** `git pull`, `./bin/generate.sh`, the gate, and the release all run via
   `ssh merkur.local`; export `PATH=/opt/homebrew/bin:$PATH` and
@@ -84,9 +84,8 @@ local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn con
   Store Connect API key + a dedicated `memosng-ci` keychain — codesign can't reach the GUI login
   keychain over SSH, `errSecInternalComponent`); it archives and hand-assembles the IPA because
   Xcode 26.6's `-exportArchive` fails with an opaque `Copy failed`. Distribution to the `household`
-  internal group is automatic. Full procedure: the iOS repo's `docs/TESTFLIGHT.md` §8b. (2026-08-26:
-  two bad TestFlight builds came from hand-driven archives — a checkout 6 commits behind main, then
-  a stale-DerivedData archive with the old avatar — before the build was taken over SSH.)
+  internal group is automatic. Full procedure: the iOS repo's `docs/TESTFLIGHT.md` §8b.
+  (2026-08-26: two bad TestFlight builds came from hand-driven archives.)
 - Non-interactive SSH needs **full paths + sudo** for docker/git:
   `sudo /usr/local/bin/docker …`, `/usr/local/bin/git …`. docker/git are in the sudo
   exclusion list (no password). Other commands (mkdir, tee) have **no** sudo — write via
@@ -107,21 +106,19 @@ local `docker`, no SSH. Saturn hosts Postgres17 and the data volumes. Saturn con
 
 ## G1 compat fixtures — `fixtures/live-0.29.1/`
 
-Live memos 0.29.1 API responses captured 2026-06-20 while prod still runs — ground truth for
-the T4.1 compat contract tests. **Read `fixtures/live-0.29.1/NOTES.md`** — two findings
-deviate from the plan: (F1) no-auth returns 200/PUBLIC-only, **not 401**; (F2) original-file
-fetch over `/file/` 404s today, only derived tiers are HTTP-served. Do not regenerate after
-old memos is stopped.
+Live memos 0.29.1 API responses captured 2026-06-20 — ground truth for the T4.1 compat contract
+tests. **Read `fixtures/live-0.29.1/NOTES.md`** — two findings deviate from the plan: (F1) no-auth
+returns 200/PUBLIC-only, **not 401**; (F2) original-file fetch over `/file/` 404s today, only
+derived tiers are HTTP-served. Do not regenerate after old memos is stopped.
 
 ## Work discipline (ticket-scoped)
 
-The greenfield build is done; work is now ticket-scoped (windshift workspace **MEMNG**, id 16 —
-see the tracker for status, which META never owns). Each ticket ends at its own objective
-verification gate: tests exist and pass, the LOCAL gate is green (below), evidence shown. Finish
-one before starting the next; no half-finished branches left open. For a substantial or
-concurrency/data-critical change, add an independent review before merge (the local gate is the
-floor, not the ceiling). A prod deploy or prod DB migration additionally goes through the plan
-gate first (see CARDINAL RULE).
+Work is ticket-scoped (windshift workspace **MEMNG**, id 16 — see the tracker for status, which
+META never owns). Each ticket ends at its own objective verification gate: tests exist and pass,
+the LOCAL gate is green (below), evidence shown. Finish one before starting the next; no
+half-finished branches left open. For a substantial or concurrency/data-critical change, add an
+independent review before merge (the local gate is the floor, not the ceiling). A prod deploy or
+prod DB migration additionally goes through the plan gate first (see CARDINAL RULE).
 
 ## Tests first (front, back, and center)
 
@@ -137,10 +134,10 @@ met until its tests exist and pass.
 - **Coverage:** every new/changed backend function gets a pytest unit test; every frontend
   view/composable gets a vitest test. Classification/routing heuristics need a case per input
   category, not just the happy path.
-- **Manual verification supplements, never replaces.** Live `curl`/browser checks are evidence
-  on top of tests, not instead of them.
-- **The LOCAL gate is the gate — there is NO CI** (GitHub Actions was abandoned; MEMNG-1
-  cancelled). A task is not done until, run **bare** (never piped — a pipe hides the exit code)
+- **Manual verification supplements, never replaces.** Live `curl`/browser checks are evidence on
+  top of tests.
+- **The LOCAL gate is the gate — there is NO CI** (GitHub Actions abandoned, MEMNG-1 cancelled).
+  A task is not done until, run **bare** (never piped — a pipe hides the exit code)
   and each exit code cited:
   `uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q && uv run alembic check`
   are all green. Never commit while any is RED. The test DB the gate needs: bring it up with
