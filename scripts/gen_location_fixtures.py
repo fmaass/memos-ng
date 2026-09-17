@@ -244,3 +244,257 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --------------------------------------------------------------------------------------------
+# HEIF VARIANTS — built at test runtime, never committed (MEMNG-341)
+# --------------------------------------------------------------------------------------------
+# These are not in FIXTURES: the large one is megabytes of filler (the point of it), and the
+# others differ from `heic-gps.heic` only in how the SAME payload is addressed, so pinning four
+# more binaries by sha256 would buy nothing the builder below does not already say. Each is
+# derived from the committed `heic-gps.heic` rather than authored from scratch, so the image item
+# stays a real HEVC primary that libheif can still open — which is what makes the fallback leg of
+# `capture.heif_exif_from` testable at all.
+
+
+def _iso_boxes(buf: bytes, start: int, end: int) -> list[tuple[bytes, int, int, int]]:
+    """(type, box start, body start, box end) for the ISO-BMFF boxes in `buf[start:end]`.
+
+    Deliberately its own parser rather than the reader's: a fixture built with the code under test
+    proves only that the code agrees with itself.
+    """
+    found: list[tuple[bytes, int, int, int]] = []
+    i = start
+    while i + 8 <= end:
+        size = int.from_bytes(buf[i : i + 4], "big")
+        kind = buf[i + 4 : i + 8]
+        header = 8
+        if size == 1:
+            size = int.from_bytes(buf[i + 8 : i + 16], "big")
+            header = 16
+        elif size == 0:
+            size = end - i
+        if size < header or i + size > end:
+            break
+        found.append((kind, i, i + header, i + size))
+        i += size
+    return found
+
+
+def _box(kind: bytes, payload: bytes) -> bytes:
+    return (8 + len(payload)).to_bytes(4, "big") + kind + payload
+
+
+def _large_box(kind: bytes, payload: bytes) -> bytes:
+    """The 64-bit `size == 1` spelling a >4 GiB `mdat` needs — and the length branch a header
+    walker most easily reads as a 1-byte box."""
+    return (1).to_bytes(4, "big") + kind + (16 + len(payload)).to_bytes(8, "big") + payload
+
+
+def _full_box(kind: bytes, version: int, payload: bytes) -> bytes:
+    return _box(kind, bytes([version]) + b"\x00\x00\x00" + payload)
+
+
+def _iloc(
+    items: list[tuple[int, int, int]],
+    version: int,
+    *,
+    construction: dict[int, int] | None = None,
+    data_reference: dict[int, int] | None = None,
+) -> bytes:
+    """An `iloc` box in its version 0, 1 or 2 spelling, one extent per item.
+
+    `items` is (item_ID, extent_offset, extent_length). `construction` gives an item a
+    construction_method other than 0 (1 = the offset is into `idat`, 2 = into another item), and
+    `data_reference` a non-zero data_reference_index (the extent lives in ANOTHER file) — both
+    only expressible from version 1 up, and both shapes the header walk must decline to read.
+    """
+    construction = construction or {}
+    data_reference = data_reference or {}
+    offset_size, length_size, base_offset_size, index_size = 4, 4, 0, 0
+    body = bytes(
+        [
+            (offset_size << 4) | length_size,
+            (base_offset_size << 4) | (index_size if version in (1, 2) else 0),
+        ]
+    )
+    body += len(items).to_bytes(4 if version == 2 else 2, "big")
+    for item_id, offset, length in items:
+        body += item_id.to_bytes(4 if version == 2 else 2, "big")
+        if version in (1, 2):
+            body += construction.get(item_id, 0).to_bytes(2, "big")
+        body += data_reference.get(item_id, 0).to_bytes(2, "big")
+        body += (1).to_bytes(2, "big")  # extent_count
+        body += offset.to_bytes(offset_size, "big") + length.to_bytes(length_size, "big")
+    return _full_box(b"iloc", version, body)
+
+
+def _source_items(
+    source: bytes, meta_body: int, meta_end: int
+) -> tuple[list[int], dict[int, bytes]]:
+    """The item IDs in file order and each one's payload, out of a version-0 `iloc`.
+
+    Only the shape `heic-gps.heic` actually carries is accepted (4-byte offsets, lengths and base
+    offsets, one extent per item); anything else means the committed fixture changed under this
+    builder and is refused rather than mis-read.
+    """
+    children = {kind: (body, end) for kind, _, body, end in _iso_boxes(source, meta_body, meta_end)}
+    body, _end = children[b"iloc"]
+    assert source[body] == 0, "the committed HEIC's iloc is version 0"
+    assert source[body + 4] == 0x44 and source[body + 5] == 0x40, "4-byte offsets/lengths/bases"
+    count = int.from_bytes(source[body + 6 : body + 8], "big")
+    i = body + 8
+    order: list[int] = []
+    payloads: dict[int, bytes] = {}
+    for _ in range(count):
+        item_id = int.from_bytes(source[i : i + 2], "big")
+        base = int.from_bytes(source[i + 4 : i + 8], "big")
+        extents = int.from_bytes(source[i + 8 : i + 10], "big")
+        assert extents == 1, "one extent per item"
+        offset = int.from_bytes(source[i + 10 : i + 14], "big")
+        length = int.from_bytes(source[i + 14 : i + 18], "big")
+        order.append(item_id)
+        payloads[item_id] = source[base + offset : base + offset + length]
+        i += 18
+    return order, payloads
+
+
+def _heif_variant(
+    source: bytes,
+    *,
+    iloc_version: int = 0,
+    exif_construction: int = 0,
+    exif_data_reference: int = 0,
+    exif_length: int = 0,
+    filler: int = 0,
+    lead_filler: int = 0,
+    trail_filler: int = 0,
+    large_mdat: bool = False,
+) -> bytes:
+    """`heic-gps.heic` re-laid-out: the same items, addressed a different legal way.
+
+    What changes is only HOW the bytes are addressed — the `iloc` version, the Exif item's
+    construction_method, data_reference_index and declared extent LENGTH, how much filler
+    surrounds the payloads, and whether `mdat` carries the 64-bit length. The image item and every
+    property box are carried over untouched, so the result is still a HEIC libheif opens: that is
+    what lets one fixture prove both the header walk and the full read it falls back to.
+    """
+    top = {
+        kind: (start, body, end) for kind, start, body, end in _iso_boxes(source, 0, len(source))
+    }
+    ftyp_start, _ftyp_body, ftyp_end = top[b"ftyp"]
+    _meta_start, meta_body, meta_end = top[b"meta"]
+    ftyp = source[ftyp_start:ftyp_end]
+    children = _iso_boxes(source, meta_body + 4, meta_end)  # meta is a FullBox
+    order, payloads = _source_items(source, meta_body + 4, meta_end)
+    exif_id = _exif_item_id(source, meta_body + 4, meta_end)
+    # Only construction_method 1 MOVES the payload; method 2 is written as a lie about where the
+    # extent lives, which is all a reader that must decline to follow it needs to see.
+    in_idat = exif_construction == 1
+    in_mdat = [item for item in order if not (in_idat and item == exif_id)]
+    construction = {exif_id: exif_construction} if exif_construction else None
+    data_reference = {exif_id: exif_data_reference} if exif_data_reference else None
+    # A 64-bit `free` box BEFORE `meta`: the box a header walker has to skip by its extended
+    # length, and megabytes it must never pull into memory.
+    lead = _large_box(b"free", b"\x00" * lead_filler) if lead_filler else b""
+
+    rows = [(item, 0, len(payloads[item])) for item in order]
+    out = b""
+    for _pass in (1, 2):  # the field widths are fixed, so the second pass only fills the offsets
+        pieces: list[bytes] = []
+        for kind, start, _body, end in children:
+            if kind != b"iloc":
+                pieces.append(source[start:end])
+                continue
+            if in_idat:
+                pieces.append(_box(b"idat", payloads[exif_id]))
+            pieces.append(
+                _iloc(rows, iloc_version, construction=construction, data_reference=data_reference)
+            )
+        meta = _box(b"meta", b"\x00\x00\x00\x00" + b"".join(pieces))
+        mdat_payload = (
+            b"\x00" * filler + b"".join(payloads[i] for i in in_mdat) + b"\x00" * trail_filler
+        )
+        mdat = (_large_box if large_mdat else _box)(b"mdat", mdat_payload)
+        cursor = len(ftyp) + len(lead) + len(meta) + (16 if large_mdat else 8) + filler
+        rows = []
+        for item in order:
+            # The DECLARED length may be a lie (`exif_length`); the layout still uses the real one.
+            declared = exif_length if exif_length and item == exif_id else len(payloads[item])
+            if in_idat and item == exif_id:
+                rows.append((item, 0, declared))  # an offset INTO the idat box
+            else:
+                rows.append((item, cursor, declared))
+                cursor += len(payloads[item])
+        out = ftyp + lead + meta + mdat
+    return out
+
+
+def _exif_item_id(source: bytes, meta_body: int, meta_end: int) -> int:
+    """The `iinf` entry whose item_type is `Exif`, as its item ID."""
+    children = {kind: (body, end) for kind, _, body, end in _iso_boxes(source, meta_body, meta_end)}
+    body, end = children[b"iinf"]
+    for kind, _start, infe_body, _infe_end in _iso_boxes(source, body + 6, end):
+        if kind != b"infe" or source[infe_body] < 2:
+            continue
+        if source[infe_body + 8 : infe_body + 12] == b"Exif":
+            return int.from_bytes(source[infe_body + 4 : infe_body + 6], "big")
+    raise AssertionError("the committed HEIC carries no Exif item")
+
+
+def heic_gps_large(path: Path, *, filler: int = 3 * 1024 * 1024) -> None:
+    """`heic-gps.heic` grown to megabytes: a 64-bit `free` box before `meta`, and megabytes of
+    `mdat` before the payloads, under a 64-bit `mdat` length.
+
+    The file the header walker exists for: a reader that opens it with libheif pays for every one
+    of those bytes over NFS, a reader that walks the boxes pays for the `meta` box and the Exif
+    extent. Not committed — its size IS the fixture.
+    """
+    path.write_bytes(
+        _heif_variant(_source_heic(), filler=filler, lead_filler=1024 * 1024, large_mdat=True)
+    )
+
+
+def heic_gps_iloc(path: Path, version: int) -> None:
+    """`heic-gps.heic` with its `iloc` rewritten in version 0, 1 or 2 — the three spellings a real
+    library carries (1 and 2 add the construction_method, 2 widens the item ID and the count)."""
+    path.write_bytes(_heif_variant(_source_heic(), iloc_version=version))
+
+
+def heic_gps_idat(path: Path) -> None:
+    """`heic-gps.heic` with the Exif item stored in `idat` (construction_method 1).
+
+    Legal, and deliberately NOT followed by the header walk: an idat extent is addressed inside
+    the `meta` box rather than in the file, so the walker answers None and the caller falls back
+    to the full read, which still finds the location. The fixture is what makes that a tested path
+    instead of a claim.
+    """
+    path.write_bytes(_heif_variant(_source_heic(), iloc_version=1, exif_construction=1))
+
+
+def heic_gps_item_offset(path: Path) -> None:
+    """`heic-gps.heic` whose Exif extent claims construction_method 2 (an offset into another
+    item) — the third method, and the second one the walker must decline rather than guess at."""
+    path.write_bytes(_heif_variant(_source_heic(), iloc_version=2, exif_construction=2))
+
+
+def heic_gps_external(path: Path) -> None:
+    """`heic-gps.heic` whose Exif extent names a data_reference_index of 1: the payload is in
+    ANOTHER file entirely, so an offset read against this one would return unrelated bytes."""
+    path.write_bytes(_heif_variant(_source_heic(), iloc_version=1, exif_data_reference=1))
+
+
+def heic_gps_overlong_exif(path: Path, *, length: int = 3 * 1024 * 1024) -> None:
+    """`heic-gps.heic` whose `iloc` claims a MEGABYTES-long Exif extent.
+
+    What a corrupt or hostile item table looks like: the offset is real, the length is not, and a
+    reader that believes it allocates whatever the header asks for. The filler after the payload
+    is there so the overlong read would SUCCEED if the cap were gone — a fixture that simply ran
+    past the end of the file would be declined by the short read instead, and would prove nothing
+    about the cap.
+    """
+    path.write_bytes(_heif_variant(_source_heic(), exif_length=length, trail_filler=length))
+
+
+def _source_heic() -> bytes:
+    return (OUT / "heic-gps.heic").read_bytes()
