@@ -12,6 +12,9 @@ export default createRouter({
   routes: [
     { path: '/', name: 'home', component: HomeView },
     { path: '/explore', name: 'explore', component: () => import('./views/ExploreView.vue') },
+    // The map chunk (MapLibre + pmtiles + the basemap layers) is the heaviest route in the app:
+    // lazy like the rest, so only opening Places pays for it.
+    { path: '/places', name: 'places', component: () => import('./views/PlacesView.vue') },
     { path: '/archived', name: 'archived', component: () => import('./views/ArchivedView.vue') },
     { path: '/resources', name: 'resources', component: () => import('./views/ResourcesView.vue') },
     { path: '/search', name: 'search', component: () => import('./views/SearchView.vue') },
