@@ -52,6 +52,14 @@ const map = shallowRef<MapLibreMap | null>(null)
 const syncMs = ref(0)
 
 const byUid = new Map<string, MapMarker>()
+// What the map is CURRENTLY showing — the timeline's playhead set once playback starts, the full
+// set before that. Every path that re-feeds the source reads this and not `props.markers`: a theme
+// swap re-installs the source (see `styledata`), and re-installing the props would put every pin
+// back mid-playback and jump the timeline to its end.
+let currentMarkers: readonly MapMarker[] = props.markers
+/** Uids that became visible in the latest tick — they land, the standing pins do not. */
+let landingUids = new Set<string>()
+const LANDING_CLASS = 'places-pin--landing'
 const pins = new Map<string, { pin: PinSpec; marker: Marker; element: HTMLElement }>()
 let fitted = false
 
@@ -63,7 +71,9 @@ function source(): GeoJSONSource | undefined {
  * The map's one data entry point. Phase 4's timeline calls this per tick with the playhead's
  * subset — a layer `filter` would hide points without re-clustering them (mapbox-gl-js#2476).
  */
-function setVisibleMarkers(markers: readonly MapMarker[]) {
+function setVisibleMarkers(markers: readonly MapMarker[], landing: readonly string[] = []) {
+  currentMarkers = markers
+  landingUids = new Set(landing)
   source()?.setData(toFeatureCollection(markers))
   sync()
 }
@@ -161,12 +171,35 @@ function sync() {
     paint(entry.element, pin)
   }
 
+  applyLanding()
   syncMs.value = Math.round(performance.now() - started)
   const bounds = instance.getBounds()
   emit(
     'visible-change',
-    props.markers.filter((m) => bounds.contains([m.longitude, m.latitude])).map((m) => m.uid),
+    currentMarkers.filter((m) => bounds.contains([m.longitude, m.latitude])).map((m) => m.uid),
   )
+}
+
+/**
+ * The landing animation, on the pins whose photo arrived in this tick. A cluster lands when its
+ * lead photo is one of them — MapLibre hands the leaves out only on tap, and a round trip per
+ * cluster per tick is exactly the per-tick cost the timeline must not pay.
+ */
+function applyLanding() {
+  for (const { pin, element } of pins.values()) {
+    const landing =
+      landingUids.size > 0 &&
+      (landingUids.has(pin.uid) || pin.uids.some((uid) => landingUids.has(uid)))
+    if (!landing) {
+      element.classList.remove(LANDING_CLASS)
+      continue
+    }
+    // Re-adding a class the element already carries does not replay a CSS animation; a reflow
+    // between the remove and the add does.
+    element.classList.remove(LANDING_CLASS)
+    void element.offsetWidth
+    element.classList.add(LANDING_CLASS)
+  }
 }
 
 /** The opening view: the pins, not the world. Nothing to show means the world at z1. */
@@ -208,7 +241,7 @@ onMounted(async () => {
   instance.addControl(new NavigationControl({ showCompass: false }), 'top-right')
 
   instance.on('load', () => {
-    installMarkerSource(instance, toFeatureCollection(props.markers))
+    installMarkerSource(instance, toFeatureCollection(currentMarkers))
     fitToMarkers()
     fitted = props.markers.length > 0
     sync()
@@ -218,7 +251,7 @@ onMounted(async () => {
   // and `load` never fires again. The installer no-ops while they are there, so this is the one
   // place that notices they are gone, and it re-syncs the pins onto the source it just put back.
   instance.on('styledata', () => {
-    if (installMarkerSource(instance, toFeatureCollection(props.markers))) sync()
+    if (installMarkerSource(instance, toFeatureCollection(currentMarkers))) sync()
   })
   instance.on('moveend', sync)
   instance.on('idle', sync)
@@ -229,6 +262,9 @@ watch(
   (markers) => {
     byUid.clear()
     for (const marker of markers) byUid.set(marker.uid, marker)
+    // A fresh markers query resets the playhead too (PlacesView), so the map goes back to showing
+    // everything — keeping the stale playhead set here would hide pins nothing can bring back.
+    currentMarkers = markers
     if (!map.value?.getSource(SOURCE)) return
     setVisibleMarkers(markers)
     if (!fitted && markers.length) {
@@ -287,6 +323,24 @@ onBeforeUnmount(() => {
   object-fit: cover;
   border-radius: 8px;
   background-size: cover;
+}
+.places-pin--landing {
+  animation: places-pin-land 320ms ease-out;
+}
+@keyframes places-pin-land {
+  from {
+    transform: translateY(-14px) scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .places-pin--landing {
+    animation: none;
+  }
 }
 .places-pin__badge {
   position: absolute;
