@@ -1,7 +1,7 @@
 import { VueQueryPlugin } from '@tanstack/vue-query'
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -26,6 +26,7 @@ const router = createRouter({
   routes: [
     { path: '/', component: stub },
     { path: '/explore', component: stub },
+    { path: '/places', component: stub },
     { path: '/archived', component: stub },
     { path: '/resources', component: stub },
     { path: '/settings', component: stub },
@@ -49,9 +50,20 @@ async function mountShell() {
 describe('AppShell', () => {
   it('renders a nav link for every primary section', async () => {
     const wrapper = await mountShell()
-    for (const label of ['home', 'explore', 'archived', 'resources', 'settings']) {
+    for (const label of ['home', 'explore', 'places', 'archived', 'resources', 'settings']) {
       expect(wrapper.find(`[data-test="nav-${label}"]`).exists()).toBe(true)
     }
+  })
+
+  it('offers Places on the phone drawer too, not only the desktop sidebar', async () => {
+    // The map is a phone feature as much as a desktop one (the in-view grid exists for it), and
+    // the drawer is the only navigation a phone has.
+    const wrapper = await mountShell()
+    await wrapper.find('[data-test="menu-toggle"]').trigger('click')
+    await nextTick()
+
+    const drawer = document.querySelector('[data-test="mobile-drawer"]')
+    expect(drawer?.querySelector('a[href="/places"]')?.textContent).toContain('Places')
   })
 
   it('shows the avatar (not the username text) and a dark-mode toggle', async () => {

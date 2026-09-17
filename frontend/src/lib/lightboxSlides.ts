@@ -9,6 +9,8 @@ export interface LightboxItem {
   uid: string
   mime: string
   mine?: boolean
+  /** The memo this photo hangs on — null for an orphan attachment. The "Show in memo" jump. */
+  memoUid?: string | null
   width?: number | null
   height?: number | null
   thumbnailUrl: string
