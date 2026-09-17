@@ -293,14 +293,21 @@ def _save_jpeg(img: Image.Image, fp: Path | BytesIO, **params: Any) -> None:
             bytes_per_pixel *= 2
 
 
-def _atomic_save(img: Image.Image, dest: Path, *, quality: int = 80, **params: Any) -> None:
+def _atomic_save(
+    img: Image.Image, dest: Path, *, quality: int = 80, tmp: Path | None = None, **params: Any
+) -> None:
     """Encode to a sibling temp and rename it into place, so no reader ever sees a partial tier.
 
     `params` passes the extra JPEG knobs the print rendition needs (subsampling, dpi, icc_profile)
     straight through to Pillow; the screen tiers pass none and keep their encode byte-for-byte.
+
+    `tmp` names the in-flight file explicitly for the one caller that has to REAP it by name after
+    a rolled-back request (the poster override, whose placement is arbitrated by a PosterCopy).
+    Everyone else keeps the sibling `.tmp`, which only the job's own sweep ever enumerates.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    if tmp is None:
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
         _save_jpeg(img, tmp, quality=quality, **params)
     except BaseException:
@@ -747,6 +754,12 @@ def displayed_size(stream: dict) -> tuple[int | None, int | None]:
 
 
 VIDEO_STREAM_MAP = "0:V:0"  # the ONE stream the probe measures and both ffmpeg lanes render
+# Every ffmpeg command this repo runs carries these, and they are a PRIVACY control, not a tidy-up:
+# a QuickTime original's `com.apple.quicktime.location.ISO6709` (or an MP4's `©xyz`) is copied into
+# the output by ffmpeg's default metadata mapping, so before this the derived web tier of a
+# geotagged clip published the household's coordinates to anyone the tier URL reached. A derived
+# artifact carries no metadata at all; the archive master keeps everything (ADR-0008).
+METADATA_STRIP_ARGS = ("-map_metadata", "-1", "-map_chapters", "-1")
 
 
 def select_video_stream(streams: list) -> dict:
@@ -959,6 +972,7 @@ def poster_ffmpeg_cmd(
         src,
         "-map",
         VIDEO_STREAM_MAP,
+        *METADATA_STRIP_ARGS,
         "-vf",
         poster_video_filter(colour),
         "-frames:v",
@@ -1004,6 +1018,26 @@ def process_video_poster(attachment: Attachment) -> dict:
     with Image.open(poster_file) as image:
         meta["blurhash"] = blurhash_pure.encode(image)
     return meta
+
+
+def sanitize_poster_override(src: Path, dest: Path, tmp: Path) -> None:
+    """Publish a CLIENT-SUPPLIED poster as what it is: a derived asset, re-encoded and GPS-free.
+
+    The override lands on the exact path the worker's hero frame would occupy and is served by the
+    same signed poster tier, so it has to obey the same metadata policy as every other derived
+    artifact — and it used to be a byte-for-byte copy, which published whatever the client's camera
+    wrote, coordinates included. Re-encoding through the shared optimized save with
+    `_date_only_exif` is what makes the two paths one policy rather than two.
+
+    Orientation is baked into the pixels (`exif_transpose`) BEFORE the tag is dropped, exactly as
+    the screen tiers do it: a rebuilt date-only EXIF carries no Orientation, so a file that relied
+    on the tag would otherwise be published sideways.
+    """
+    with Image.open(src) as raw:
+        img = ImageOps.exif_transpose(raw).convert("RGB")
+        exif = _date_only_exif(raw)
+        params: dict[str, Any] = {"exif": exif} if exif is not None else {}
+        _atomic_save(img, dest, tmp=tmp, **params)
 
 
 class ThermalDefer(Exception):
@@ -1059,6 +1093,7 @@ def slow_ffmpeg_cmd(src: str, dest: str, threads: int) -> list[str]:
         VIDEO_STREAM_MAP,
         "-map",
         "0:a:0?",
+        *METADATA_STRIP_ARGS,
         "-c:v",
         "libx264",
         "-preset",

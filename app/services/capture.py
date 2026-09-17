@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 import pillow_heif
 import structlog
@@ -172,7 +173,7 @@ def instant_from_movie_header(seconds: int, now: datetime | None = None) -> date
     return instant.replace(microsecond=0)
 
 
-def _png_exif(path: Path) -> bytes | None:
+def png_exif(path: Path) -> bytes | None:
     """The bytes of a PNG's `eXIf` chunk, found by walking the chunk list — or None.
 
     Pillow stops parsing a PNG's header at the first `IDAT`, so `im.info["exif"]` only ever holds
@@ -182,23 +183,29 @@ def _png_exif(path: Path) -> bytes | None:
     never read, only skipped — and only an `eXIf` payload is ever pulled into memory.
     """
     with open(path, "rb") as f:
-        if f.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+        return png_exif_from(f)
+
+
+def png_exif_from(f: BinaryIO) -> bytes | None:
+    """`png_exif` against an ALREADY-OPEN file — the spelling a caller that meters its own reads
+    (services/location.py) needs, since the whole point is that it supplies the file object."""
+    if f.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+        return None
+    while True:
+        header = f.read(8)
+        if len(header) < 8:
             return None
-        while True:
-            header = f.read(8)
-            if len(header) < 8:
+        length = int.from_bytes(header[:4], "big")
+        kind = header[4:8]
+        if kind == b"IEND":
+            return None
+        if kind == b"eXIf":
+            if length > PNG_EXIF_READ_CAP:
                 return None
-            length = int.from_bytes(header[:4], "big")
-            kind = header[4:8]
-            if kind == b"IEND":
-                return None
-            if kind == b"eXIf":
-                if length > PNG_EXIF_READ_CAP:
-                    return None
-                payload = f.read(length)
-                # The same shape the other containers hand over, so one parser reads them all.
-                return b"Exif\x00\x00" + payload
-            f.seek(length + 4, 1)  # payload + CRC, unread
+            payload = f.read(length)
+            # The same shape the other containers hand over, so one parser reads them all.
+            return b"Exif\x00\x00" + payload
+        f.seek(length + 4, 1)  # payload + CRC, unread
 
 
 def _read_image(path: Path) -> CaptureResult:
@@ -227,7 +234,7 @@ def _read_image(path: Path) -> CaptureResult:
         if isinstance(im, TiffImagePlugin.TiffImageFile):
             exif = im.getexif()  # from tag_v2, parsed at open; no sample decode
         else:
-            raw = _png_exif(path) if isinstance(im, PngImagePlugin.PngImageFile) else None
+            raw = png_exif(path) if isinstance(im, PngImagePlugin.PngImageFile) else None
             if raw is None:
                 raw = im.info.get("exif")
             if not raw:
@@ -243,7 +250,7 @@ def _read_image(path: Path) -> CaptureResult:
         return capture_from_exif(ifd.get(DATETIME_ORIGINAL), offset)
 
 
-def _boxes(buf: bytes, start: int = 0, end: int | None = None) -> Iterator[tuple[bytes, int, int]]:
+def boxes(buf: bytes, start: int = 0, end: int | None = None) -> Iterator[tuple[bytes, int, int]]:
     """Walk the ISO-BMFF boxes in `buf[start:end]`, yielding (type, body_start, body_end).
 
     Stops at the first malformed length rather than raising: a truncated or hostile header ends
@@ -268,16 +275,16 @@ def _boxes(buf: bytes, start: int = 0, end: int | None = None) -> Iterator[tuple
         i += size
 
 
-def _child(buf: bytes, start: int, end: int, kind: bytes) -> tuple[int, int] | None:
-    for found, body_start, body_end in _boxes(buf, start, end):
+def child(buf: bytes, start: int, end: int, kind: bytes) -> tuple[int, int] | None:
+    for found, body_start, body_end in boxes(buf, start, end):
         if found == kind:
             return body_start, body_end
     return None
 
 
-def _keys_index(buf: bytes, start: int, end: int) -> dict[str, int]:
+def keys_index(buf: bytes, start: int, end: int) -> dict[str, int]:
     """The `keys` atom's key → 1-based index map (the index an `ilst` child is named by)."""
-    keys = _child(buf, start, end, b"keys")
+    keys = child(buf, start, end, b"keys")
     if keys is None:
         return {}
     body_start, body_end = keys
@@ -294,15 +301,15 @@ def _keys_index(buf: bytes, start: int, end: int) -> dict[str, int]:
     return index
 
 
-def _ilst_value(buf: bytes, start: int, end: int, wanted: int) -> str | None:
+def ilst_value(buf: bytes, start: int, end: int, wanted: int) -> str | None:
     """The UTF-8 payload of the `ilst` entry named by `wanted` (its `keys` index)."""
-    ilst = _child(buf, start, end, b"ilst")
+    ilst = child(buf, start, end, b"ilst")
     if ilst is None:
         return None
-    for kind, body_start, body_end in _boxes(buf, *ilst):
+    for kind, body_start, body_end in boxes(buf, *ilst):
         if int.from_bytes(kind, "big") != wanted:
             continue
-        data = _child(buf, body_start, body_end, b"data")
+        data = child(buf, body_start, body_end, b"data")
         if data is None:
             return None
         payload_start, payload_end = data
@@ -316,16 +323,16 @@ def _creationdate_from_moov(moov: bytes) -> str | None:
     `meta` is a plain container in QuickTime and a full box (4 leading version/flags bytes) in
     ISO-BMFF, and both spellings reach this code from real cameras, so both offsets are tried.
     """
-    for kind, start, end in _boxes(moov):
+    for kind, start, end in boxes(moov):
         if kind != b"meta":
             continue
         for base in (start, start + 4):
             if base >= end:
                 continue
-            wanted = _keys_index(moov, base, end).get(QUICKTIME_CREATIONDATE_KEY)
+            wanted = keys_index(moov, base, end).get(QUICKTIME_CREATIONDATE_KEY)
             if wanted is None:
                 continue
-            value = _ilst_value(moov, base, end, wanted)
+            value = ilst_value(moov, base, end, wanted)
             if value:
                 return value
     return None
@@ -333,7 +340,7 @@ def _creationdate_from_moov(moov: bytes) -> str | None:
 
 def _movie_header_seconds(moov: bytes) -> int | None:
     """`mvhd`'s creation_time, in its own 1904 epoch. Track headers are deliberately not read."""
-    mvhd = _child(moov, 0, len(moov), b"mvhd")
+    mvhd = child(moov, 0, len(moov), b"mvhd")
     if mvhd is None:
         return None
     start, end = mvhd
@@ -347,7 +354,7 @@ def _movie_header_seconds(moov: bytes) -> int | None:
     return int.from_bytes(moov[start + 4 : start + 8], "big")
 
 
-def _read_moov(path: Path) -> bytes | None:
+def read_moov(path: Path) -> bytes | None:
     """The `moov` box's body, found by SEEKING over every other top-level box.
 
     This is the whole reason a video costs no more than a photo here: `mdat` — which is the file,
@@ -355,33 +362,41 @@ def _read_moov(path: Path) -> bytes | None:
     and only up to `MOOV_READ_CAP`.
     """
     with open(path, "rb") as f:
-        while True:
-            head = f.read(8)
-            if len(head) < 8:
+        return read_moov_from(f)
+
+
+def read_moov_from(f: BinaryIO) -> bytes | None:
+    """`read_moov` against an ALREADY-OPEN file — see `png_exif_from`."""
+    while True:
+        head = f.read(8)
+        if len(head) < 8:
+            return None
+        (size,) = struct.unpack_from(">I", head, 0)
+        kind = head[4:8]
+        header = 8
+        if size == 1:
+            ext = f.read(8)
+            if len(ext) < 8:
                 return None
-            (size,) = struct.unpack_from(">I", head, 0)
-            kind = head[4:8]
-            header = 8
-            if size == 1:
-                ext = f.read(8)
-                if len(ext) < 8:
-                    return None
-                (size,) = struct.unpack_from(">Q", ext, 0)
-                header = 16
-            if kind == b"moov":
-                if size == 0:
-                    return f.read(MOOV_READ_CAP + 1)[:MOOV_READ_CAP]
-                body = size - header
-                if body <= 0 or body > MOOV_READ_CAP:
-                    return None
-                return f.read(body)
-            if size == 0 or size < header:  # "to end of file", or nonsense — nothing follows
+            (size,) = struct.unpack_from(">Q", ext, 0)
+            header = 16
+        if kind == b"moov":
+            if size == 0:
+                return f.read(MOOV_READ_CAP + 1)[:MOOV_READ_CAP]
+            body = size - header
+            if body <= 0 or body > MOOV_READ_CAP:
                 return None
-            f.seek(size - header, 1)
+            payload = f.read(body)
+            # A short read is a TRUNCATED file, and a truncated moov parses into a plausible but
+            # arbitrary answer. Reported as "no moov" so a caller can tell damage from silence.
+            return payload if len(payload) == body else None
+        if size == 0 or size < header:  # "to end of file", or nonsense — nothing follows
+            return None
+        f.seek(size - header, 1)
 
 
 def _read_video(path: Path) -> CaptureResult:
-    moov = _read_moov(path)
+    moov = read_moov(path)
     if moov is None:
         return NOTHING
     instant = parse_quicktime_creationdate(_creationdate_from_moov(moov))

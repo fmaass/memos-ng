@@ -48,6 +48,23 @@ def _png(color=(200, 30, 30), size=(64, 48)) -> bytes:
     return buf.getvalue()
 
 
+def _assert_is_the_supplied_picture(published: Path, title_card: bytes) -> None:
+    """The override is RE-ENCODED on publication, not copied: its destination is a derived tier and
+    a derived tier carries no metadata (a client JPEG carries whatever the camera wrote, GPS
+    included — tests/test_location_privacy.py). So the check is the same PICTURE, not the same
+    bytes: identical dimensions, a JPEG, an empty GPS IFD, and the colour it was filled with.
+    """
+    assert published.exists()
+    with Image.open(published) as out, Image.open(io.BytesIO(title_card)) as src:
+        assert out.format == "JPEG"
+        assert out.size == src.size
+        assert dict(out.getexif().get_ifd(0x8825)) == {}
+        for channel, expected in zip(
+            out.convert("RGB").getpixel((0, 0)), src.convert("RGB").getpixel((0, 0)), strict=True
+        ):
+            assert abs(channel - expected) <= 8
+
+
 def _cleanup():
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
@@ -126,7 +143,7 @@ def test_a_poster_override_lands_as_the_tier_and_never_as_an_attachment(
         assert _count("SELECT count(*) FROM attachments") == 1
 
         # The bytes are the client's, verbatim, at the path the worker's hero frame would occupy.
-        assert poster.poster_path(attachment["uid"]).read_bytes() == title_card
+        _assert_is_the_supplied_picture(poster.poster_path(attachment["uid"]), title_card)
         assert not poster.poster_tmp_path(attachment["uid"]).exists()  # renamed into place
 
         # Both uploads are consumed — the poster one included, which is what makes it impossible to
@@ -212,7 +229,7 @@ def test_a_failed_post_leaves_the_poster_retryable_and_no_orphan_tier_file(
         )
         assert retried.status_code == 201, retried.text
         uid = retried.json()["attachments"][0]["uid"]
-        assert poster.poster_path(uid).read_bytes() == title_card
+        _assert_is_the_supplied_picture(poster.poster_path(uid), title_card)
     finally:
         _cleanup()
 
@@ -244,7 +261,7 @@ def test_a_poster_override_lands_across_the_deployed_mount_split(
 
         assert created.status_code == 201, created.text
         uid = created.json()["attachments"][0]["uid"]
-        assert poster.poster_path(uid).read_bytes() == title_card
+        _assert_is_the_supplied_picture(poster.poster_path(uid), title_card)
         assert not poster.poster_tmp_path(uid).exists()
         assert not up_svc.part_path(poster_uid).exists()  # reaped after the commit, as designed
         # The video's own original still travels by RENAME (uploads → originals → the memo folder,
@@ -263,9 +280,7 @@ async def _upload_async(bearer, name, mime, data: bytes) -> str:
     )
     assert opened.status_code == 201, opened.text
     uid = opened.json()["upload_uid"]
-    sent = await bearer.patch(
-        f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"}
-    )
+    sent = await bearer.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
     assert sent.status_code == 200, sent.text
     return uid
 
@@ -286,15 +301,15 @@ async def test_a_cancelled_create_never_strands_the_poster_it_was_copying(
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     started = threading.Event()
     existed_after_copy: list[bool] = []
-    real_copy = up_svc._copy_into_sync
+    real_publish = media.sanitize_poster_override
 
     def slow_copy(src, dest, tmp):
         started.set()
         time.sleep(0.5)  # the window the cancellation lands in
-        real_copy(src, dest, tmp)
+        real_publish(src, dest, tmp)
         existed_after_copy.append(Path(dest).exists())  # the positive control, taken under the lock
 
-    monkeypatch.setattr(up_svc, "_copy_into_sync", slow_copy)
+    monkeypatch.setattr(media, "sanitize_poster_override", slow_copy)
     try:
         title_card = _jpeg(color=(11, 22, 33))
         video_uid = await _upload_async(bearer, "clip.mov", "video/quicktime", VIDEO_BYTES)
@@ -391,7 +406,7 @@ async def test_a_cancel_during_the_post_commit_reap_leaves_the_stored_memo_whole
         assert _count("SELECT count(*) FROM memos") == 1
         assert _count("SELECT count(*) FROM attachments") == 1
         uid = _scalar("SELECT uid FROM attachments")
-        assert poster.poster_path(uid).read_bytes() == title_card
+        _assert_is_the_supplied_picture(poster.poster_path(uid), title_card)
         # The accepted worst case, and the only one: the consumed part file was not reaped.
         assert up_svc.part_path(poster_uid).exists()
     finally:
@@ -430,7 +445,7 @@ def test_a_replayed_keyed_create_answers_with_the_stored_memo_and_consumes_nothi
 
         assert _count("SELECT count(*) FROM memos") == 1
         assert _count("SELECT count(*) FROM attachments") == 1
-        assert poster.poster_path(uid).read_bytes() == title_card
+        _assert_is_the_supplied_picture(poster.poster_path(uid), title_card)
     finally:
         _cleanup()
 
@@ -594,8 +609,15 @@ def _write_clip(path, size="320x240"):
     path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
-            "ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=duration=1:size={size}:rate=5",
-            "-pix_fmt", "yuv420p", str(path),
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=duration=1:size={size}:rate=5",
+            "-pix_fmt",
+            "yuv420p",
+            str(path),
         ],
         capture_output=True,
         check=True,
@@ -609,7 +631,10 @@ def test_the_fast_lane_keeps_a_supplied_poster_and_blurhashes_it(monkeypatch, tm
     clip = tmp_path / "originals" / "clip.mp4"
     _write_clip(clip)
     attachment = Attachment(
-        uid="override1", filename="clip.mp4", mime="video/mp4", size=clip.stat().st_size,
+        uid="override1",
+        filename="clip.mp4",
+        mime="video/mp4",
+        size=clip.stat().st_size,
         storage_path=str(clip),
     )
     title_card = _jpeg(color=(9, 99, 199), size=(128, 96))
@@ -635,7 +660,10 @@ def test_the_fast_lane_still_extracts_a_hero_frame_when_none_was_supplied(monkey
     clip = tmp_path / "originals" / "clip.mp4"
     _write_clip(clip)
     attachment = Attachment(
-        uid="derived1", filename="clip.mp4", mime="video/mp4", size=clip.stat().st_size,
+        uid="derived1",
+        filename="clip.mp4",
+        mime="video/mp4",
+        size=clip.stat().st_size,
         storage_path=str(clip),
     )
     derived = poster.poster_path(attachment.uid)
