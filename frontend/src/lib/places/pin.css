@@ -1,0 +1,63 @@
+/* The pin elements are created imperatively for MapLibre's Marker, so they never carry a scoped
+   style attribute — these rules are global on purpose and namespaced to say so. They live in a
+   stylesheet of their own, next to the builder, because WHERE they may apply is a rule with teeth:
+   the root is MapLibre's to position. */
+.places-pin {
+  display: block;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  cursor: pointer;
+  border: 2px solid var(--p-surface-0, #fff);
+  border-radius: 10px;
+  background: var(--p-surface-200, #e5e7eb);
+  box-shadow: 0 2px 6px rgb(0 0 0 / 45%);
+}
+/* Everything that needs a positioning context or an animation is inside this wrapper: MapLibre
+   writes `position: absolute` and an inline `transform: translate(...)` on the root, and a rule
+   of ours on that same element would either re-flow the pin or override its projection. */
+.places-pin__inner {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.places-pin__thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 8px;
+  background-size: cover;
+}
+.places-pin--landing {
+  animation: places-pin-land 320ms ease-out;
+}
+@keyframes places-pin-land {
+  from {
+    transform: translateY(-14px) scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .places-pin--landing {
+    animation: none;
+  }
+}
+.places-pin__badge {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  min-width: 22px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 20px;
+  color: var(--p-primary-contrast-color, #fff);
+  text-align: center;
+  background: var(--p-primary-color, #6366f1);
+  border-radius: 999px;
+}

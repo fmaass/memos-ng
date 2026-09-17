@@ -6,6 +6,8 @@
 // the pin to its coordinate at the end. The animation therefore belongs to an inner wrapper that
 // MapLibre never touches — and this module is where that rule is stated and tested.
 
+import './pin.css'
+
 export const PIN_CLASS = 'places-pin'
 export const PIN_INNER_CLASS = 'places-pin__inner'
 export const LANDING_CLASS = 'places-pin--landing'

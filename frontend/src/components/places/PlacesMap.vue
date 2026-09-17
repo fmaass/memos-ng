@@ -294,64 +294,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style>
-/* The pin elements are created imperatively for MapLibre's Marker, so they never carry a scoped
-   style attribute — these rules are global on purpose and namespaced to say so. */
-.places-pin {
-  position: relative;
-  display: block;
-  width: 48px;
-  height: 48px;
-  padding: 0;
-  cursor: pointer;
-  border: 2px solid var(--p-surface-0, #fff);
-  border-radius: 10px;
-  background: var(--p-surface-200, #e5e7eb);
-  box-shadow: 0 2px 6px rgb(0 0 0 / 45%);
-}
-.places-pin__thumb {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  border-radius: 8px;
-  background-size: cover;
-}
-.places-pin__inner {
-  display: block;
-  width: 100%;
-  height: 100%;
-}
-/* The animation lives on the wrapper: MapLibre positions the pin ROOT with an inline transform,
-   which a transform animation on that same element would override for its whole run. */
-.places-pin--landing {
-  animation: places-pin-land 320ms ease-out;
-}
-@keyframes places-pin-land {
-  from {
-    transform: translateY(-14px) scale(0.6);
-    opacity: 0;
-  }
-  to {
-    transform: none;
-    opacity: 1;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .places-pin--landing {
-    animation: none;
-  }
-}
-.places-pin__badge {
-  position: absolute;
-  top: -8px;
-  right: -8px;
-  min-width: 22px;
-  padding: 0 5px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 20px;
-  color: var(--p-primary-contrast-color, #fff);
-  text-align: center;
-  background: var(--p-primary-color, #6366f1);
-  border-radius: 999px;
-}
+/* The pin rules moved to `lib/places/pin.css`, next to the builder that creates those elements —
+   what may and may not be styled on a MapLibre marker root is a rule that belongs with it. */
 </style>
+
