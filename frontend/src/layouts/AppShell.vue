@@ -9,7 +9,7 @@ import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
 import { useSettings } from '@/composables/useSettings'
 
-// The five primary destinations, mirroring the original memos sidebar.
+// The primary destinations, mirroring the original memos sidebar. One list, both navigations.
 interface NavItem {
   label: string
   icon: string
@@ -18,6 +18,7 @@ interface NavItem {
 const NAV: NavItem[] = [
   { label: 'Home', icon: 'pi pi-home', to: '/' },
   { label: 'Explore', icon: 'pi pi-compass', to: '/explore' },
+  { label: 'Places', icon: 'pi pi-map', to: '/places' },
   { label: 'Archived', icon: 'pi pi-inbox', to: '/archived' },
   { label: 'Resources', icon: 'pi pi-images', to: '/resources' },
   { label: 'Settings', icon: 'pi pi-cog', to: '/settings' },

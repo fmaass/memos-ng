@@ -14,6 +14,18 @@ describe('routes', () => {
     expect(resolved.matched).toHaveLength(1)
   })
 
+  it('lazy-loads the Places map, unlike the eager cold-open feed', () => {
+    // The map bundle (MapLibre + pmtiles + the basemap layers) is the largest thing the SPA can
+    // load. Opening the feed must not pay for it: only /places may pull that chunk.
+    const resolved = router.resolve('/places')
+    expect(resolved.name).toBe('places')
+
+    const places = router.getRoutes().find((r) => r.name === 'places')
+    const home = router.getRoutes().find((r) => r.name === 'home')
+    expect(typeof places?.components?.default).toBe('function')
+    expect(typeof home?.components?.default).toBe('object')
+  })
+
   it('does not swallow the existing top-level routes', () => {
     expect(router.resolve('/').name).toBe('home')
     expect(router.resolve('/search').name).toBe('search')
