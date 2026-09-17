@@ -60,6 +60,25 @@ describe('pinsFor', () => {
     expect(collapsed?.uids).toEqual(['a', 'b'])
   })
 
+  it('draws one pin per cluster and per photo when tiles repeat a feature', () => {
+    // querySourceFeatures answers from every loaded tile, and a cluster on a tile boundary (or a
+    // point still cached at another zoom) comes back more than once. Counted twice, a cluster of
+    // 12 reads as 24 photos and the map grows a second DOM marker nothing ever removes.
+    const pins = pinsFor(
+      [
+        clusterFeature(7, 12, 8.4, 47.2, 'lead'),
+        clusterFeature(7, 12, 8.4, 47.2, 'lead'),
+        pointFeature('a', 8.9, 47.6),
+        pointFeature('a', 8.9, 47.6),
+      ],
+      { center: [8.4, 47.2] },
+    )
+
+    expect(pins).toHaveLength(2)
+    expect(pins.map((p) => p.count)).toEqual([12, 1])
+    expect(pins[1]?.uids).toEqual(['a'])
+  })
+
   it('caps the DOM markers at the ones nearest the viewport centre', () => {
     const features = Array.from({ length: MAX_DOM_MARKERS + 40 }, (_, i) =>
       pointFeature(`u${i}`, 8.4 + i / 1000, 47.2),

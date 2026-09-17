@@ -54,11 +54,17 @@ export function pinsFor(
 ): PinSpec[] {
   const pins: PinSpec[] = []
   const byCoordinate = new Map<string, PinSpec>()
+  // querySourceFeatures answers from every loaded tile, so a cluster on a tile boundary and a
+  // point still cached at another zoom both come back more than once.
+  const seenClusters = new Set<number>()
+  const seenUids = new Set<string>()
 
   for (const feature of features) {
     const [lng, lat] = feature.geometry.coordinates
     const props = feature.properties
     if (props.cluster && props.cluster_id != null) {
+      if (seenClusters.has(props.cluster_id)) continue
+      seenClusters.add(props.cluster_id)
       pins.push({
         key: `c:${props.cluster_id}`,
         lng,
@@ -70,7 +76,8 @@ export function pinsFor(
       })
       continue
     }
-    if (!props.uid) continue
+    if (!props.uid || seenUids.has(props.uid)) continue
+    seenUids.add(props.uid)
     const key = `p:${coordKey(lat, lng)}`
     const existing = byCoordinate.get(key)
     if (existing) {
