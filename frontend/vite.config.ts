@@ -21,6 +21,12 @@ export default defineConfig({
       registerType: 'autoUpdate',
       injectManifest: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
+        // The map chunk and MapLibre's worker are ~1 MB that only /places needs. Precaching them
+        // would download the whole map on a cold Home, which is exactly what the lazy route
+        // avoids — both are emitted as `map-*.js` (see `worker` and `manualChunks` below).
+        // maplibre's stylesheet lands in the same chunk and is named the same way, so both
+        // extensions are named here: the point is that a cold Home downloads NO map asset.
+        globIgnores: ['**/map-*.js', '**/map-*.css'],
       },
       manifest: {
         name: 'memos-ng',
@@ -55,6 +61,7 @@ export default defineConfig({
         // cold-open critical path small.
         manualChunks(id: string) {
           if (!id.includes('node_modules')) return
+          if (/maplibre-gl|pmtiles|@protomaps|@mapbox|@maplibre/.test(id)) return 'map'
           if (/primevue|@primeuix|primeicons/.test(id)) return 'primevue'
           if (/markdown-it|dompurify|entities|linkifyjs|mdurl|uc\.micro|punycode/.test(id))
             return 'markdown'
@@ -63,6 +70,12 @@ export default defineConfig({
         },
       },
     },
+  },
+  // MapLibre v6 loads its worker from a URL of its own; naming that bundle `map-*` puts it under
+  // the same precache exclusion as the map chunk.
+  worker: {
+    format: 'es',
+    rollupOptions: { output: { entryFileNames: 'assets/map-worker-[hash].js' } },
   },
   resolve: {
     alias: { '@': new URL('./src', import.meta.url).pathname },
