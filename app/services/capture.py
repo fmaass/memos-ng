@@ -235,14 +235,13 @@ def heif_exif_from(f: BinaryIO) -> bytes | None:
     meta = _heif_meta_from(f)
     if meta is None:
         return None
-    body = _heif_children(meta)
-    if body is None:
+    children = _heif_children(meta)
+    if children is None:
         return None
-    start, end = body
-    item = _heif_exif_item(meta, start, end)
+    item = _heif_exif_item(meta, children)
     if item is None:
         return None
-    extent = _heif_extent(meta, start, end, item)
+    extent = _heif_extent(meta, children, item)
     if extent is None:
         return None
     offset, length = extent
@@ -291,105 +290,147 @@ def _heif_meta_from(f: BinaryIO) -> bytes | None:
         f.seek(size - header, 1)
 
 
-def _heif_children(meta: bytes) -> tuple[int, int] | None:
-    """Where `meta`'s child boxes start and end, once its handler says `pict`.
+def _heif_boxes(meta: bytes, start: int, end: int) -> list[tuple[bytes, int, int]] | None:
+    """The boxes in `meta[start:end]` — but only if they TILE it exactly, else None.
 
-    `meta` is a FullBox in ISO-BMFF and a plain container in QuickTime, and the same two spellings
-    the moov walk tries reach this code, so both offsets are tried. The `pict` handler is the
-    check that this `meta` describes IMAGE ITEMS — a `meta` full of iTunes keys has an `iloc` in
-    neither sense, and reading one as if it did is how a walker invents an offset.
+    `boxes` stops at the first length it cannot believe, which is right for a walk that wants
+    whatever it can get. Here the opposite is wanted: a child running past its parent, or a gap
+    after the last one, means the table is partly guesswork, and half a malformed item list is
+    exactly what a reader must not answer from.
     """
-    for start in (4, 0):
-        hdlr = child(meta, start, len(meta), b"hdlr")
-        if hdlr is None:
-            continue
-        body, end = hdlr
-        if body + 12 <= end and meta[body + 8 : body + 12] == b"pict":
-            return start, len(meta)
-    return None
+    found = list(boxes(meta, start, end))
+    covered = found[-1][2] if found else start
+    return found if covered == end else None
 
 
-def _heif_item_types(meta: bytes, start: int, end: int) -> dict[int, bytes]:
-    """Every item's four-character type, out of `iinf`'s `infe` entries.
+def _heif_children(meta: bytes) -> dict[bytes, tuple[int, int]] | None:
+    """`meta`'s child boxes by type, once the box itself can be trusted — else None.
 
-    Only version 2 and 3 entries carry a type at all; the older ones name items without saying
-    what they are, and an item whose type is unknown is never the one this read wants.
+    `meta` is a FullBox and version 0 is the only one anyone has defined; a later one would be a
+    layout this code has never seen, not a detail to read past. The `pict` handler is the check
+    that this `meta` describes IMAGE ITEMS — a `meta` full of iTunes keys (the shape the moov walk
+    beside this one reads) has an `iloc` in no sense at all, and reading one as if it did is how a
+    walker invents an offset.
     """
-    iinf = child(meta, start, end, b"iinf")
+    if len(meta) < 4 or meta[0] != 0:
+        return None
+    found = _heif_boxes(meta, 4, len(meta))
+    if found is None:
+        return None
+    children: dict[bytes, tuple[int, int]] = {}
+    for kind, body, box_end in found:
+        children.setdefault(kind, (body, box_end))  # a duplicate box is the first one's problem
+    hdlr = children.get(b"hdlr")
+    if hdlr is None:
+        return None
+    body, end = hdlr
+    if body + 12 > end or meta[body] != 0 or meta[body + 8 : body + 12] != b"pict":
+        return None
+    return children
+
+
+def _heif_item_types(
+    meta: bytes, children: dict[bytes, tuple[int, int]]
+) -> dict[int, bytes] | None:
+    """Every item's four-character type, out of `iinf`'s `infe` entries — or None.
+
+    The entry count is checked against the entries actually there, in both directions: a count
+    that overstates them leaves a table missing the very item the read wants, and a count that
+    understates them leaves entries nobody validated. Versions 0 and 1 of `infe` name items
+    without saying what they are, so a file built from them is answered by the full read rather
+    than by a guess about which unnamed item holds the Exif.
+    """
+    iinf = children.get(b"iinf")
     if iinf is None:
-        return {}
-    body, body_end = iinf
-    if body >= body_end:
-        return {}
-    entries = body + (6 if meta[body] == 0 else 8)  # version/flags, then a 16- or 32-bit count
+        return None
+    body, end = iinf
+    if body + 4 > end or meta[body] > 1:
+        return None
+    count_size = 2 if meta[body] == 0 else 4
+    if body + 4 + count_size > end:
+        return None
+    declared = int.from_bytes(meta[body + 4 : body + 4 + count_size], "big")
+    entries = _heif_boxes(meta, body + 4 + count_size, end)
+    if entries is None or len(entries) != declared:
+        return None
     types: dict[int, bytes] = {}
-    for kind, info, info_end in boxes(meta, entries, body_end):
+    for kind, info, info_end in entries:
         if kind != b"infe" or info >= info_end:
-            continue
+            return None
         version = meta[info]
-        id_at, type_at = (4, 8) if version == 2 else (4, 10)
-        id_size = 2 if version == 2 else 4
-        if version not in (2, 3) or info + type_at + 4 > info_end:
-            continue
-        types[int.from_bytes(meta[info + id_at : info + id_at + id_size], "big")] = meta[
-            info + type_at : info + type_at + 4
-        ]
+        if version == 2:
+            id_size, type_at = 2, 8
+        elif version == 3:
+            id_size, type_at = 4, 10
+        else:
+            return None
+        if info + type_at + 4 > info_end:
+            return None
+        item = int.from_bytes(meta[info + 4 : info + 4 + id_size], "big")
+        types[item] = meta[info + type_at : info + type_at + 4]
+    if len(types) != declared:  # two entries claiming one item ID: which is which is unknowable
+        return None
     return types
 
 
-def _heif_primary_item(meta: bytes, start: int, end: int) -> int | None:
+def _heif_primary_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int | None:
     """`pitm`'s item ID — WHICH image the file is, when it carries more than one."""
-    pitm = child(meta, start, end, b"pitm")
+    pitm = children.get(b"pitm")
     if pitm is None:
         return None
-    body, body_end = pitm
-    if body >= body_end:
+    body, end = pitm
+    if body >= end or meta[body] > 1:
         return None
     width = 2 if meta[body] == 0 else 4
-    if body + 4 + width > body_end:
+    if body + 4 + width > end:
         return None
     return int.from_bytes(meta[body + 4 : body + 4 + width], "big")
 
 
-def _heif_exif_item(meta: bytes, start: int, end: int) -> int | None:
-    """The item ID of the Exif that describes the PRIMARY image.
+def _heif_exif_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int | None:
+    """The item ID of the Exif that describes the PRIMARY image — or None.
 
-    A file with two images carries two Exif items (`fixtures/auto-memo-date/heic-offset.heic` puts
-    a 2019 decoy on the first one on purpose), and which one belongs to which is stated ONLY by
-    the `cdsc` reference in `iref`. Taking the first Exif item in the file is how a reader answers
-    a confident, wrong date; when the file carries exactly one there is nothing to confuse.
+    Which Exif belongs to which image is stated ONLY by the `cdsc` reference in `iref`, and that
+    holds however many Exif items the file carries: a HEIC with two images and ONE Exif item is a
+    file whose single Exif may well describe the secondary (`heic-offset.heic` becomes exactly
+    that when the primary's entry is retyped, and libheif then reports no Exif for the primary at
+    all). Treating "only one" as "the primary's" dates the memo from the wrong picture, and bytes
+    returned are past every fallback there is — so the reference is required, never inferred.
     """
-    items = [item for item, kind in _heif_item_types(meta, start, end).items() if kind == b"Exif"]
-    if not items:
+    types = _heif_item_types(meta, children)
+    if types is None:
         return None
-    if len(items) == 1:
-        return items[0]
-    primary = _heif_primary_item(meta, start, end)
-    iref = child(meta, start, end, b"iref")
-    if primary is None or iref is None:
+    items = [item for item, kind in types.items() if kind == b"Exif"]
+    primary = _heif_primary_item(meta, children)
+    iref = children.get(b"iref")
+    if not items or primary is None or iref is None:
         return None
-    body, body_end = iref
-    if body >= body_end:
+    body, end = iref
+    if body + 4 > end or meta[body] > 1:
         return None
     width = 2 if meta[body] == 0 else 4
-    for kind, ref, ref_end in boxes(meta, body + 4, body_end):
-        if kind != b"cdsc" or ref + width + 2 > ref_end:
-            continue
+    references = _heif_boxes(meta, body + 4, end)
+    if references is None:
+        return None
+    for kind, ref, ref_end in references:
+        if ref + width + 2 > ref_end:
+            return None
         source = int.from_bytes(meta[ref : ref + width], "big")
-        if source not in items:
-            continue
         count = int.from_bytes(meta[ref + width : ref + width + 2], "big")
-        described = ref + width + 2
-        for _ in range(count):
-            if described + width > ref_end:
-                break
-            if int.from_bytes(meta[described : described + width], "big") == primary:
+        if ref + width + 2 + count * width != ref_end:  # the count and the bytes must agree
+            return None
+        if kind != b"cdsc" or source not in items:
+            continue
+        for index in range(count):
+            at = ref + width + 2 + index * width
+            if int.from_bytes(meta[at : at + width], "big") == primary:
                 return source
-            described += width
     return None
 
 
-def _heif_extent(meta: bytes, start: int, end: int, item: int) -> tuple[int, int] | None:
+def _heif_extent(
+    meta: bytes, children: dict[bytes, tuple[int, int]], item: int
+) -> tuple[int, int] | None:
     """Where one item's bytes are, as a (file offset, length) — or None when they are not there.
 
     `iloc` is the one box in this walk whose field WIDTHS are themselves data: offsets, lengths,
@@ -399,7 +440,7 @@ def _heif_extent(meta: bytes, start: int, end: int, item: int) -> tuple[int, int
     an unknown width or a construction_method other than 0 (the payload is in `idat`, or inside
     another item) answers None instead of a number.
     """
-    iloc = child(meta, start, end, b"iloc")
+    iloc = children.get(b"iloc")
     if iloc is None:
         return None
     body, body_end = iloc
@@ -446,11 +487,13 @@ def _heif_extent(meta: bytes, start: int, end: int, item: int) -> tuple[int, int
         # split extent would have to be stitched. None of the three is a header read of this file.
         if method != 0 or reference != 0 or extents != 1:
             return None
+        # The index is SKIPPED, and the length is measured from the end of the OFFSET — not from
+        # the end of the whole extent, which would read `index_size` bytes too far and turn a
+        # declared 32 into billions.
         cursor += index_size
         offset = int.from_bytes(meta[cursor : cursor + offset_size], "big") if offset_size else 0
-        length = (
-            int.from_bytes(meta[cursor + offset_size : cursor + span], "big") if length_size else 0
-        )
+        at = cursor + offset_size
+        length = int.from_bytes(meta[at : at + length_size], "big") if length_size else 0
         return base + offset, length
     return None
 

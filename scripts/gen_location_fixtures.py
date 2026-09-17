@@ -301,6 +301,7 @@ def _iloc(
     *,
     construction: dict[int, int] | None = None,
     data_reference: dict[int, int] | None = None,
+    index_size: int = 0,
 ) -> bytes:
     """An `iloc` box in its version 0, 1 or 2 spelling, one extent per item.
 
@@ -308,10 +309,14 @@ def _iloc(
     construction_method other than 0 (1 = the offset is into `idat`, 2 = into another item), and
     `data_reference` a non-zero data_reference_index (the extent lives in ANOTHER file) — both
     only expressible from version 1 up, and both shapes the header walk must decline to read.
+    `index_size` widens the per-extent `extent_index` field that versions 1 and 2 may carry: it
+    sits BEFORE the offset and the length, and a reader that forgets it decodes the wrong number.
     """
     construction = construction or {}
     data_reference = data_reference or {}
-    offset_size, length_size, base_offset_size, index_size = 4, 4, 0, 0
+    offset_size, length_size, base_offset_size = 4, 4, 0
+    if version == 0:
+        index_size = 0
     body = bytes(
         [
             (offset_size << 4) | length_size,
@@ -325,6 +330,8 @@ def _iloc(
             body += construction.get(item_id, 0).to_bytes(2, "big")
         body += data_reference.get(item_id, 0).to_bytes(2, "big")
         body += (1).to_bytes(2, "big")  # extent_count
+        if index_size:
+            body += (1).to_bytes(index_size, "big")  # extent_index, 1-based
         body += offset.to_bytes(offset_size, "big") + length.to_bytes(length_size, "big")
     return _full_box(b"iloc", version, body)
 
@@ -366,6 +373,7 @@ def _heif_variant(
     exif_construction: int = 0,
     exif_data_reference: int = 0,
     exif_length: int = 0,
+    index_size: int = 0,
     filler: int = 0,
     lead_filler: int = 0,
     trail_filler: int = 0,
@@ -409,7 +417,13 @@ def _heif_variant(
             if in_idat:
                 pieces.append(_box(b"idat", payloads[exif_id]))
             pieces.append(
-                _iloc(rows, iloc_version, construction=construction, data_reference=data_reference)
+                _iloc(
+                    rows,
+                    iloc_version,
+                    construction=construction,
+                    data_reference=data_reference,
+                    index_size=index_size,
+                )
             )
         meta = _box(b"meta", b"\x00\x00\x00\x00" + b"".join(pieces))
         mdat_payload = (
@@ -494,6 +508,113 @@ def heic_gps_overlong_exif(path: Path, *, length: int = 3 * 1024 * 1024) -> None
     about the cap.
     """
     path.write_bytes(_heif_variant(_source_heic(), exif_length=length, trail_filler=length))
+
+
+def heic_gps_index_size(path: Path, version: int, index_size: int) -> None:
+    """`heic-gps.heic` whose extents carry an `extent_index` of 4 or 8 bytes.
+
+    Versions 1 and 2 of `iloc` may put an index before every extent's offset and length. Its width
+    is declared once, in a nibble, and a reader that skips it — or that measures the length from
+    the wrong end of it — decodes a length of billions from a file of hundreds of bytes.
+    """
+    path.write_bytes(_heif_variant(_source_heic(), iloc_version=version, index_size=index_size))
+
+
+# The in-place damages: a byte or two rewritten in a file that is otherwise laid out correctly, so
+# every offset in it stays valid and libheif can still open it. That is what makes them a test of
+# what the READER does with a structure it cannot trust, rather than of whether a file is readable.
+DAMAGES = {
+    "meta-version": ("meta", 0, b"\x01"),  # a `meta` FullBox version nobody has defined
+    "iinf-version": ("iinf", 0, b"\x02"),
+    "pitm-version": ("pitm", 0, b"\x02"),
+    "iref-version": ("iref", 0, b"\x02"),
+    "iloc-version": ("iloc", 0, b"\x03"),
+    "iinf-count": ("iinf", 4, b"\x00\x09"),  # nine entries declared, two present
+}
+
+
+def heic_gps_damaged(path: Path, damage: str) -> None:
+    """`heic-gps.heic` with one structural lie in its `meta` box — see `DAMAGES`."""
+    buf = bytearray(_heif_variant(_source_heic(), iloc_version=1))
+    kind, at, replacement = DAMAGES[damage]
+    if damage == "meta-version":
+        _, _, meta_body, _ = next(b for b in _iso_boxes(buf, 0, len(buf)) if b[0] == b"meta")
+        buf[meta_body + at : meta_body + at + len(replacement)] = replacement
+    else:
+        box = _meta_child(buf, kind.encode())
+        buf[box + at : box + at + len(replacement)] = replacement
+    path.write_bytes(bytes(buf))
+
+
+def heic_gps_infe_overrun(path: Path) -> None:
+    """`heic-gps.heic` whose LAST `infe` declares a size running past the end of `iinf`.
+
+    The entry list stops short and the table that comes out of it is partial — a reader that hands
+    on what it collected answers from half a file it already knows is malformed.
+    """
+    buf = bytearray(_heif_variant(_source_heic(), iloc_version=1))
+    iinf = _meta_child(buf, b"iinf")
+    end = _meta_child_end(buf, b"iinf")
+    entries = _iso_boxes(buf, iinf + 6, end)
+    last = entries[-1]
+    size = last[3] - last[1] + 64
+    buf[last[1] : last[1] + 4] = size.to_bytes(4, "big")
+    path.write_bytes(bytes(buf))
+
+
+def heic_exif_describes_secondary(path: Path) -> None:
+    """`heic-offset.heic` reduced to ONE Exif item — the one describing the SECONDARY image.
+
+    That file carries two images and two Exif items, `pitm` naming the second image and `cdsc`
+    linking one Exif to each. Retyping the primary's Exif entry leaves a file with exactly one
+    Exif item that belongs to the image nobody asked for; every byte offset stays where it was, so
+    libheif still opens it. A reader that treats "only one Exif item" as "the primary's Exif"
+    answers this file with the wrong image's metadata, and returning bytes leaves the caller no
+    fallback to be saved by.
+    """
+    source = Path(__file__).resolve().parent.parent / "fixtures" / "auto-memo-date"
+    buf = bytearray((source / "heic-offset.heic").read_bytes())
+    primary = _heif_primary(buf)
+    described = _heif_described_by(buf)
+    for item, describes in described.items():
+        if describes == primary:
+            _retype_item(buf, item, b"mime")  # a four-character type, so nothing moves
+    path.write_bytes(bytes(buf))
+
+
+def _heif_primary(buf: bytes) -> int:
+    pitm = _meta_child(buf, b"pitm")
+    return int.from_bytes(buf[pitm + 4 : pitm + 6], "big")
+
+
+def _heif_described_by(buf: bytes) -> dict[int, int]:
+    """Each `cdsc` reference as {describing item: described item}."""
+    iref, end = _meta_child(buf, b"iref"), _meta_child_end(buf, b"iref")
+    links = {}
+    for kind, _start, body, _box_end in _iso_boxes(buf, iref + 4, end):
+        if kind == b"cdsc":
+            links[int.from_bytes(buf[body : body + 2], "big")] = int.from_bytes(
+                buf[body + 4 : body + 6], "big"
+            )
+    return links
+
+
+def _retype_item(buf: bytearray, item: int, kind: bytes) -> None:
+    iinf, end = _meta_child(buf, b"iinf"), _meta_child_end(buf, b"iinf")
+    for found, _start, body, _box_end in _iso_boxes(buf, iinf + 6, end):
+        if found == b"infe" and int.from_bytes(buf[body + 4 : body + 6], "big") == item:
+            buf[body + 8 : body + 12] = kind
+
+
+def _meta_child(buf: bytes, kind: bytes) -> int:
+    """Where one `meta` child box's BODY starts (its FullBox version byte, for the damages)."""
+    _, _, meta_body, meta_end = next(b for b in _iso_boxes(buf, 0, len(buf)) if b[0] == b"meta")
+    return next(b for b in _iso_boxes(buf, meta_body + 4, meta_end) if b[0] == kind)[2]
+
+
+def _meta_child_end(buf: bytes, kind: bytes) -> int:
+    _, _, meta_body, meta_end = next(b for b in _iso_boxes(buf, 0, len(buf)) if b[0] == b"meta")
+    return next(b for b in _iso_boxes(buf, meta_body + 4, meta_end) if b[0] == kind)[3]
 
 
 def _source_heic() -> bytes:

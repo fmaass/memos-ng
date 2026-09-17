@@ -189,13 +189,84 @@ def test_the_capture_read_logs_its_own_fallback(heifs):
     assert events[0]["mime"] == HEIC_MIME
 
 
-def test_a_readable_heic_logs_no_fallback_at_all(heifs):
-    # The positive control for the two cases above: the event fires on the fallback and only
-    # there, so its presence in a log really does mean the header walk declined a file.
+@pytest.mark.parametrize("name", ["iloc0", "iloc1", "iloc2", "large"])
+def test_a_file_the_headers_can_address_logs_no_fallback_at_all(heifs, name):
+    # The positive control for the cases above, and the guard on the measurement: the event fires
+    # on the fallback and only there, so its ABSENCE here is what says the cheap numbers were
+    # measured on the header path rather than on a full read that quietly answered instead.
     with capture_logs() as logs:
-        assert _read(heifs["iloc0"]) == EXPECTED
-        capture.read_capture(heifs["iloc0"], HEIC_MIME)
+        assert _read(heifs[name]) == EXPECTED
+        capture.read_capture(heifs[name], HEIC_MIME)
     assert [entry for entry in logs if "heif_fallback" in str(entry.get("event"))] == []
+
+
+# --------------------------------------------------------------------------------------------
+# Whose metadata is it — and a structure that cannot be trusted at all
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_lone_exif_item_describing_a_secondary_image_is_declined(tmp_path):
+    # One Exif item in the file does NOT make it the primary's: `heic-offset.heic` carries two
+    # images, and retyping the entry that describes the primary leaves a single Exif belonging to
+    # the image nobody asked for. libheif reports no Exif for the primary at all, so a walker that
+    # hands those bytes over does not merely cost a fallback — it dates the memo from the wrong
+    # picture (2019 instead of nothing), and a returned value is past every fallback there is.
+    path = tmp_path / "secondary.heic"
+    gen.heic_exif_describes_secondary(path)
+    with Image.open(path) as im:
+        assert im.info.get("exif") is None, "the fixture must leave the primary without an Exif"
+    assert _walk(path) is None
+
+    with capture_logs() as logs:
+        assert capture.read_capture(path, HEIC_MIME) == capture.NOTHING  # what Pillow answers
+    assert [entry for entry in logs if entry.get("event") == "capture.heif_fallback"]
+
+
+@pytest.mark.parametrize(
+    ("version", "index_size"), [(1, 0), (1, 4), (1, 8), (2, 0), (2, 4), (2, 8)]
+)
+def test_an_extent_index_does_not_move_the_declared_length(tmp_path, version, index_size):
+    # Versions 1 and 2 may put an `extent_index` before each extent's offset and length, and its
+    # width is declared in a nibble. Measuring the length from the wrong end of it reads four or
+    # eight bytes too far: a declared 32 followed by the next box decodes as 137438953480, which
+    # the cap then declines — the whole HEIC library falls back, silently and for good.
+    path = tmp_path / f"index-{version}-{index_size}.heic"
+    gen.heic_gps_index_size(path, version, index_size)
+    with Image.open(path) as im:
+        expected = im.info.get("exif")
+    assert expected, "the fixture must carry an Exif item for this to prove anything"
+
+    walked = _walk(path)
+    assert walked == expected
+    assert len(walked or b"") == len(expected)  # the LENGTH is the field that mis-decodes
+
+
+@pytest.mark.parametrize("damage", [*sorted(gen.DAMAGES), "infe-overrun"])
+def test_a_structure_the_walker_cannot_trust_is_declined(tmp_path, damage):
+    # An undefined FullBox version, an entry count that does not match the entries, a child box
+    # running past its parent: each leaves a table that is partly guesswork, and a reader that
+    # answers from one has already decided which half of a malformed file to believe. The rule is
+    # the same for all of them — hand the file to the reader that can judge it whole.
+    path = tmp_path / f"{damage}.heic"
+    if damage == "infe-overrun":
+        gen.heic_gps_infe_overrun(path)
+    else:
+        gen.heic_gps_damaged(path, damage)
+    assert _walk(path) is None
+
+    # And the file's fate stays whatever the FULL read makes of it, which is the fate it had
+    # before this walk existed: an answer where libheif can still read the file, a raise where it
+    # cannot — never the walker's guess in either case.
+    try:
+        with Image.open(path) as im:
+            pillow_reads_it = im.info.get("exif") is not None
+    except OSError:
+        pillow_reads_it = False
+    if pillow_reads_it:
+        assert _read(path) == EXPECTED
+    else:
+        with pytest.raises(OSError):
+            location.read_location(path, HEIC_MIME)
 
 
 def test_a_truncated_meta_is_declined_and_the_file_stays_unreadable(heifs, tmp_path):
