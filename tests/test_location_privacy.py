@@ -374,9 +374,8 @@ async def test_failing_statement_never_quotes_the_coordinate_it_carried(adb):
 
 @pytest.mark.asyncio
 async def test_backfill_write_failure_names_the_row_and_no_coordinate(monkeypatch):
-    from sqlalchemy.exc import IntegrityError
-
     from app.scripts import backfill_location as bf
+    from sqlalchemy.exc import IntegrityError
 
     leaky = IntegrityError(
         "UPDATE attachments SET latitude=%(latitude)s, longitude=%(longitude)s",
@@ -399,7 +398,10 @@ async def test_backfill_write_failure_names_the_row_and_no_coordinate(monkeypatc
 
     monkeypatch.setattr(bf, "async_session", lambda: _Session())
     candidate = bf.Candidate(
-        id=1, uid="privacy-att", mime="image/jpeg", storage_path=str(BINARIES / "jpeg-north-east.jpg")
+        id=1,
+        uid="privacy-att",
+        mime="image/jpeg",
+        storage_path=str(BINARIES / "jpeg-north-east.jpg"),
     )
 
     with capture_logs() as logs:
