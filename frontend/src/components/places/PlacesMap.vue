@@ -22,6 +22,7 @@ import { useDarkMode } from '@/composables/useDarkMode'
 import { bboxOf, type MapMarker, toFeatureCollection } from '@/lib/places/geo'
 import { blurhashToDataUrl } from '@/lib/media'
 import { badgeText, type PinSpec, pinsFor, type SourceFeature, syncMarkers } from '@/lib/places/markers'
+import { createPinElement, setLanding } from '@/lib/places/pin'
 import { installMarkerSource, MARKERS_SOURCE } from '@/lib/places/source'
 import { ATTRIBUTION, buildStyle, type MapManifest } from '@/lib/places/style'
 
@@ -61,7 +62,6 @@ const byUid = new Map<string, MapMarker>()
 let currentMarkers: readonly MapMarker[] = props.markers
 /** Uids that became visible in the latest tick — they land, the standing pins do not. */
 let landingUids = new Set<string>()
-const LANDING_CLASS = 'places-pin--landing'
 const pins = new Map<string, { pin: PinSpec; marker: Marker; element: HTMLElement }>()
 let fitted = false
 
@@ -85,8 +85,10 @@ defineExpose({ setVisibleMarkers, zoomToCluster })
 
 function paint(element: HTMLElement, pin: PinSpec) {
   const lead = byUid.get(pin.uid)
-  const image = element.querySelector('img')
-  const badge = element.querySelector('span')
+  // By class, not by tag: the badge and the thumbnail sit inside a wrapper element that is itself
+  // a span (the landing animation's home), which `querySelector('span')` would find first.
+  const image = element.querySelector<HTMLImageElement>('.places-pin__thumb')
+  const badge = element.querySelector<HTMLElement>('.places-pin__badge')
   if (image && lead) {
     const placeholder = blurhashToDataUrl(lead.blurhash)
     if (placeholder) image.style.backgroundImage = `url(${placeholder})`
@@ -104,17 +106,8 @@ function paint(element: HTMLElement, pin: PinSpec) {
 }
 
 function elementFor(pin: PinSpec): HTMLElement {
-  const element = document.createElement('button')
-  element.type = 'button'
-  element.className = 'places-pin'
+  const element = createPinElement()
   element.dataset.key = pin.key
-  element.dataset.test = 'places-pin'
-  const image = document.createElement('img')
-  image.className = 'places-pin__thumb'
-  image.alt = ''
-  const badge = document.createElement('span')
-  badge.className = 'places-pin__badge'
-  element.append(image, badge)
   element.addEventListener('click', (event) => {
     event.stopPropagation()
     void openPin(element.dataset.key ?? '')
@@ -191,18 +184,11 @@ function sync() {
  */
 function applyLanding() {
   for (const { pin, element } of pins.values()) {
-    const landing =
+    setLanding(
+      element,
       landingUids.size > 0 &&
-      (landingUids.has(pin.uid) || pin.uids.some((uid) => landingUids.has(uid)))
-    if (!landing) {
-      element.classList.remove(LANDING_CLASS)
-      continue
-    }
-    // Re-adding a class the element already carries does not replay a CSS animation; a reflow
-    // between the remove and the add does.
-    element.classList.remove(LANDING_CLASS)
-    void element.offsetWidth
-    element.classList.add(LANDING_CLASS)
+        (landingUids.has(pin.uid) || pin.uids.some((uid) => landingUids.has(uid))),
+    )
   }
 }
 
@@ -329,6 +315,13 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   background-size: cover;
 }
+.places-pin__inner {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+/* The animation lives on the wrapper: MapLibre positions the pin ROOT with an inline transform,
+   which a transform animation on that same element would override for its whole run. */
 .places-pin--landing {
   animation: places-pin-land 320ms ease-out;
 }

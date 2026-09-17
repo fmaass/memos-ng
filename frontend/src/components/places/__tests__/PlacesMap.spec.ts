@@ -185,9 +185,12 @@ describe('PlacesMap timeline seam', () => {
     maplibre.state.elements = []
     vm.setVisibleMarkers([jan, feb], ['feb'])
     const landed = maplibre.state.elements.find(({ lngLat }) => lngLat[0] === 8.9)?.element
-    expect(landed?.classList.contains('places-pin--landing')).toBe(true)
+    const inner = (el?: HTMLElement) => el?.querySelector('.places-pin__inner')
+    // The class goes on the wrapper — the root carries MapLibre's positioning transform.
+    expect(inner(landed)?.classList.contains('places-pin--landing')).toBe(true)
+    expect(landed?.classList.contains('places-pin--landing')).toBe(false)
     // The pin that was already on the map does not land a second time.
-    expect(standing?.classList.contains('places-pin--landing')).toBe(false)
+    expect(inner(standing)?.classList.contains('places-pin--landing')).toBe(false)
     wrapper.unmount()
   })
 })
