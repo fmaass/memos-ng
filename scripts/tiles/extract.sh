@@ -131,7 +131,14 @@ publish() {
             echo "extract.sh: ${name} is already published and verifies — skipping"
             return 0
         fi
-        echo "extract.sh: ${name} exists but does not verify — re-extracting" >&2
+        # A published name is never rewritten, not even to repair it. Clients cache an archive's
+        # directory against its URL and a file response reads its size and timestamp separately
+        # from its bytes, so replacing the contents under a name that is already in circulation
+        # hands somebody new bytes with an old map of where things are in them. A damaged archive
+        # is an operator's decision: move it out of the way and re-run.
+        echo "extract.sh: ${TILES_DIR}/${name} exists but does not verify." >&2
+        echo "extract.sh: a published name is never rewritten — move that file away by hand, then re-run." >&2
+        exit 2
     fi
     rm -f "${TILES_DIR}/${name}.tmp"
     echo "extract.sh: extracting ${name} from ${SOURCE}"
@@ -157,8 +164,16 @@ publish "$DETAIL_NAME" "${SELECTOR[@]}" --maxzoom="$DETAIL_ZOOM"
 prune planet
 prune detail
 
-# BUILD is rewritten last, so it never describes an archive that is not there yet. fetch-assets.sh
-# appends its own pinned revision to this file.
+# BUILD is rewritten last, so it never describes an archive that is not there yet.
+#
+# The style assets have their own lifecycle: fetch-assets.sh records which revision of them is
+# being served by appending `assets_*` lines here, and those files stay on disk across a
+# re-extract. Rewriting this file wholesale would drop the record while the assets it describes
+# are still being served, so the existing lines are carried over verbatim.
+ASSETS_LINES=""
+if [ -f "${TILES_DIR}/BUILD" ]; then
+    ASSETS_LINES="$(grep '^assets_' "${TILES_DIR}/BUILD" || true)"
+fi
 {
     echo "build=${BUILD}"
     echo "source=${SOURCE}"
@@ -173,6 +188,7 @@ prune detail
     echo "detail_size=$(stat -c%s "${TILES_DIR}/${DETAIL_NAME}")"
     echo "detail_maxzoom=${DETAIL_ZOOM}"
     echo "extracted_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [ -n "$ASSETS_LINES" ] && echo "$ASSETS_LINES"
 } > "${TILES_DIR}/BUILD.tmp"
 mv "${TILES_DIR}/BUILD.tmp" "${TILES_DIR}/BUILD"
 
