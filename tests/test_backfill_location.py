@@ -9,11 +9,12 @@ library into `'unreadable'` in a few seconds.
 
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
 from app.scripts import backfill_location as bf
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from structlog.testing import capture_logs
 
 from tests.conftest import SYNC_URL
@@ -190,6 +191,25 @@ async def test_a_success_between_failures_resets_the_counter(seeded):
     assert bf.exit_code(stats) == 0
 
 
+async def test_a_stalled_read_is_cut_off_and_counts_as_a_failure(seeded, monkeypatch):
+    # A hung NFS read raises nothing: without a deadline the row never commits, the twenty-failure
+    # stop never fires, and the run is simply gone — the one failure mode a `--sleep`d overnight
+    # backfill actually meets.
+    seeded([("stalled", WITH_GPS, None)])
+
+    def _never_returns(path, mime):
+        time.sleep(2)
+        raise AssertionError("the deadline should have cut this read off")
+
+    monkeypatch.setattr(bf.location, "read_location", _never_returns)
+    monkeypatch.setattr(bf, "READ_TIMEOUT_S", 0.05)
+
+    stats = await bf.run_backfill(await bf.load_candidates(execute=True), execute=True)
+
+    assert (stats.failed, stats.sources["unreadable"]) == (1, 1)
+    assert _read_back()["stalled"] == (None, None, "unreadable")
+
+
 async def test_a_hot_host_defers_instead_of_reading(seeded, monkeypatch):
     seeded([("hot", WITH_GPS, None)])
     answers = iter([True, True, False])
@@ -200,6 +220,40 @@ async def test_a_hot_host_defers_instead_of_reading(seeded, monkeypatch):
 
     assert stats.deferred == 2
     assert stats.located == 1
+
+
+async def test_no_connection_stays_checked_out_while_the_files_are_read(seeded, monkeypatch):
+    # The worklist is read up front and the session released, because the loop that follows is
+    # hours of NFS reads: a connection held across it sits idle long enough to be reaped
+    # server-side, and on the shared Postgres it is a slot production cannot have back. Observed
+    # at the moment of each read rather than asserted about the code.
+    from app.database import engine
+
+    seeded([("held1", WITH_GPS, None), ("held2", WITH_GPS, None)])
+    checked_out = {"now": 0}
+    take = lambda *_a: checked_out.__setitem__("now", checked_out["now"] + 1)  # noqa: E731
+    give = lambda *_a: checked_out.__setitem__("now", checked_out["now"] - 1)  # noqa: E731
+    event.listen(engine.sync_engine, "checkout", take)
+    event.listen(engine.sync_engine, "checkin", give)
+    observed: list[int] = []
+    real = bf.location.read_location
+
+    def _probe(path, mime):
+        observed.append(checked_out["now"])
+        return real(path, mime)
+
+    try:
+        monkeypatch.setattr(bf.location, "read_location", _probe)
+        stats = await bf.run_backfill(await bf.load_candidates(execute=True), execute=True)
+    finally:
+        event.remove(engine.sync_engine, "checkout", take)
+        event.remove(engine.sync_engine, "checkin", give)
+
+    assert observed == [0, 0], f"a connection was held across the file loop: {observed}"
+    # Positive controls: the probe really ran, the reads really happened, and the counter really
+    # counts — the per-row write after each read must have taken one.
+    assert stats.located == 2
+    assert checked_out["now"] == 0
 
 
 # --- what it prints -----------------------------------------------------------------------------

@@ -20,6 +20,9 @@ Two safety properties are worth stating because the rehearsal depends on them:
   reads and by `--sleep`, and the bytes-read counter in the summary is the evidence that the reads
   really are header-sized.
 
+pillow-heif reads the ENTIRE HEIC file when it opens one, so the bytes-read counter shows
+full-file reads for HEIC originals and header-sized reads for everything else.
+
 No coordinate is ever printed or logged: the summary carries counts, sources, bytes and a ranking
 of 1° cells whose identities are withheld. `--regions-out` writes those cells as GeoJSON, which is
 the one artefact that does carry them — it is the basemap extraction's input, not a report.
@@ -40,11 +43,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import structlog
-from anyio import to_thread
+from anyio import fail_after, to_thread
 from app.database import async_session
 from app.models import Attachment, AttachmentStatus
 from app.services import location
 from app.services.media import too_hot
+from app.services.uploads import CAPTURE_READ_TIMEOUT_S
 from sqlalchemy import Select, or_, select, update
 
 logger = structlog.get_logger(__name__)
@@ -55,6 +59,10 @@ MAX_CONSECUTIVE_FAILURES = 20
 
 # How long a hot host is given to cool before the row is reconsidered.
 THERMAL_SLEEP_S = 30.0
+
+# The upload path's deadline, deliberately the same number: a stalled NFS read raises nothing, so
+# without it `run_sync` waits forever and neither the per-row commit nor the stop above ever runs.
+READ_TIMEOUT_S = CAPTURE_READ_TIMEOUT_S
 
 CELL_DEGREES = 1
 CELL_BUFFER_DEGREES = 0.5
@@ -183,8 +191,19 @@ async def run_backfill(
         found: location.LocationResult | None = None
         with location.measuring() as meter:
             try:
-                found = await to_thread.run_sync(
-                    location.read_location, candidate.storage_path, candidate.mime
+                with fail_after(READ_TIMEOUT_S):
+                    found = await to_thread.run_sync(
+                        location.read_location,
+                        candidate.storage_path,
+                        candidate.mime,
+                        abandon_on_cancel=True,
+                    )
+            except TimeoutError:
+                source = location.SOURCE_UNREADABLE
+                stats.failed += 1
+                consecutive_failures += 1
+                logger.warning(
+                    "backfill_location.read_timeout", uid=candidate.uid, mime=candidate.mime
                 )
             except Exception as exc:
                 source = location.SOURCE_UNREADABLE
