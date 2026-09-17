@@ -1,6 +1,8 @@
 # The repo-carried mutation controls (MEMNG-267), read by scripts/check-mutations.sh.
-# Tab-separated: patch<TAB>marker<TAB>expected_failed (space-separated test ids)<TAB>sqlstate (optional).
+# Tab-separated: patch<TAB>marker<TAB>expected_failed (space-separated test ids)<TAB>sqlstate (optional)
+#               <TAB>module (optional; empty = tests/test_lock_protocol_concurrency.py).
 # expected_failed is the EXACT set of FAILED ids the module must report under that marker.
 tests/mutations/no_r7a.patch	no_r7a	test_stale_claim_recovery_and_a_two_attachment_patch_do_not_cycle test_the_recovery_sweep_locks_its_terminal_attachments_ascending_before_it_writes	40P01
 tests/mutations/no_named_arm.patch	no_named_arm	test_a_create_naming_an_attachment_and_deduping_onto_another_does_not_cycle_with_recovery test_pass_zero_locks_the_named_and_the_dedup_attachment_in_one_ascending_statement	40P01
 tests/mutations/c5b_merge_answers.patch	c5b_merge_answers	test_a_missing_attachment_upload_still_answers_409_when_a_poster_is_also_named	
+tests/mutations/location_sign.patch	location_sign	test_binary_fixture_reads_exactly_what_the_artefact_promises[heic-gps.heic] test_binary_fixture_reads_exactly_what_the_artefact_promises[jpeg-south-west.jpg] test_binary_fixture_reads_exactly_what_the_artefact_promises[png-exif-after-idat.png] test_binary_fixture_reads_exactly_what_the_artefact_promises[tiff-gps.tif] test_the_ref_decides_the_sign[values1-S--12.5] test_the_ref_decides_the_sign[values3-W--45.25] test_the_ref_decides_the_sign[values7-s--12.5] test_the_png_path_never_decodes_pixels		tests/test_location.py

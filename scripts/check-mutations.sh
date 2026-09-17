@@ -52,10 +52,11 @@ merely unset in the manifest) as the positive control; it must exit 0.
 One line is printed per mutation (`<marker>: PASS|FAIL — <reason>`), then a summary line.
 The exit status is non-zero if the control, any row, or any revert failed.
 
-The manifest is tab-separated: patch<TAB>marker<TAB>expected_failed<TAB>sqlstate. expected_failed
-is a space-separated list of test ids — a bare id is read as a node of the module above, and an
-id containing `::` is read as a full node id. sqlstate is optional. Blank lines and lines
-starting with `#` are ignored.
+The manifest is tab-separated: patch<TAB>marker<TAB>expected_failed<TAB>sqlstate<TAB>module.
+expected_failed is a space-separated list of test ids — a bare id is read as a node of THAT ROW's
+module, and an id containing `::` is read as a full node id. sqlstate and module are optional; an
+empty module means the default module above. Every distinct module gets its own positive control
+before the loop. Blank lines and lines starting with `#` are ignored.
 
 The pytest output of every run is kept in a temporary directory whose path is printed, so a FAIL
 can be read afterwards; the JUnit reports themselves are deleted on exit, having been read.
@@ -122,6 +123,7 @@ count_in_summary() {
 # Prints `<marker>: PASS|FAIL — …` and returns 0 only for a run that behaved as the row names it.
 judge_run() {
     local marker="$1" rc="$2" log="$3" xml="$4" expected="$5" sqlstate="$6"
+    local module="${7:-$MODULE}"
     local reasons=() failure_ids=() error_ids=() case_list=() entry kind id
     local actual_ids expected_ids extra missing summary failed_n errors_n n
 
@@ -169,7 +171,7 @@ judge_run() {
     expected_ids=$(
         # shellcheck disable=SC2086  # expected_failed is a space-separated list; splitting is the point
         for id in $expected; do
-            case "$id" in *::*) printf '%s\n' "$id" ;; *) printf '%s::%s\n' "$MODULE" "$id" ;; esac
+            case "$id" in *::*) printf '%s\n' "$id" ;; *) printf '%s::%s\n' "$module" "$id" ;; esac
         done | LC_ALL=C sort -u
     )
     if [ "$actual_ids" != "$expected_ids" ]; then
@@ -383,6 +385,15 @@ toplevel=$(git rev-parse --show-toplevel 2> /dev/null) || die "not a git reposit
 [ -f "$MODULE" ] || die "no $MODULE"
 command -v uv > /dev/null 2>&1 || die "uv is not on PATH"
 
+# Fields are split by python, not by `read`, and EMPTY ones are preserved: bash's `read` with
+# IFS=$'\t' treats adjacent tabs as ONE separator, so the first row with no sqlstate would put its
+# module in the sqlstate column and silently run against the default module instead.
+parse_row() {
+    python3 -c 'import sys
+fields = sys.argv[1].split("\t")
+print("\n".join((fields + [""] * 5)[:5]))' "$1"
+}
+
 rows=()
 while IFS= read -r line; do
     case "$line" in '' | '#'*) continue ;; esac
@@ -396,11 +407,17 @@ markers=()
 expecteds=()
 sqlstates=()
 targets=()
+modules=()
 for line in "${rows[@]}"; do
-    IFS=$'\t' read -r patch marker expected sqlstate <<< "$line"
-    sqlstate=${sqlstate:-}
+    mapfile -t fields < <(parse_row "$line")
+    patch="${fields[0]}"
+    marker="${fields[1]}"
+    expected="${fields[2]}"
+    sqlstate="${fields[3]}"
+    module="${fields[4]:-$MODULE}"
     [ -n "${patch:-}" ] && [ -n "${marker:-}" ] && [ -n "${expected:-}" ] ||
         die "malformed row in $MANIFEST: $line"
+    [ -f "$module" ] || die "$marker names module $module, which does not exist"
     [ -f "$patch" ] || die "no patch file $patch (named in $MANIFEST)"
     target=$(grep -m1 '^+++ b/' "$patch" | sed 's#^+++ b/##')
     [ -n "$target" ] || die "$patch names no target file (+++ b/...)"
@@ -414,6 +431,7 @@ for line in "${rows[@]}"; do
     expecteds+=("$expected")
     sqlstates+=("$sqlstate")
     targets+=("$target")
+    modules+=("$module")
 done
 
 logdir=$(mktemp -d) || die "mktemp -d failed"
@@ -483,16 +501,22 @@ trap 'on_signal TERM' TERM
 # ------------------------------------------------------------------------------------------
 # positive control: the module is green on the tree as it stands
 # ------------------------------------------------------------------------------------------
-echo "control: running $MODULE with $MARKER_VAR removed from the environment (must exit 0)"
-env -u "$MARKER_VAR" uv run pytest -q "$MODULE" > "$logdir/control.log" 2>&1 < /dev/null
-control_rc=$?
-if [ "$control_rc" -eq 0 ]; then
-    echo "control: PASS — the unmutated module exits 0"
-else
-    echo "control: FAIL — the unmutated module exited $control_rc, so no mutation verdict is meaningful (see $logdir/control.log)"
-    echo "SUMMARY: 0/${#patches[@]} mutations checked, control FAILED"
-    exit 1
-fi
+# One control per DISTINCT module: a verdict about a mutation is only meaningful against a module
+# that is green without it, and the rows no longer share one.
+mapfile -t control_modules < <(printf '%s\n' "${modules[@]}" | LC_ALL=C sort -u)
+for control_module in "${control_modules[@]}"; do
+    control_log="$logdir/control-$(printf '%s' "$control_module" | tr '/.' '__').log"
+    echo "control: running $control_module with $MARKER_VAR removed from the environment (must exit 0)"
+    env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null
+    control_rc=$?
+    if [ "$control_rc" -eq 0 ]; then
+        echo "control: PASS — the unmutated $control_module exits 0"
+    else
+        echo "control: FAIL — the unmutated $control_module exited $control_rc, so no mutation verdict is meaningful (see $control_log)"
+        echo "SUMMARY: 0/${#patches[@]} mutations checked, control FAILED"
+        exit 1
+    fi
+done
 
 # ------------------------------------------------------------------------------------------
 # one mutation per row
@@ -503,6 +527,7 @@ for i in "${!patches[@]}"; do
     expected="${expecteds[$i]}"
     sqlstate="${sqlstates[$i]}"
     target="${targets[$i]}"
+    module="${modules[$i]}"
     log="$logdir/$marker.log"
     xml="$xmldir/$marker.xml"
 
@@ -521,7 +546,7 @@ for i in "${!patches[@]}"; do
     fi
 
     env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
-        "$MODULE" > "$log" 2>&1 < /dev/null
+        "$module" > "$log" 2>&1 < /dev/null
     rc=$?
 
     if ! revert_applied; then
@@ -530,7 +555,7 @@ for i in "${!patches[@]}"; do
         exit 1
     fi
 
-    judge_run "$marker" "$rc" "$log" "$xml" "$expected" "$sqlstate" ||
+    judge_run "$marker" "$rc" "$log" "$xml" "$expected" "$sqlstate" "$module" ||
         failures=$((failures + 1))
 done
 

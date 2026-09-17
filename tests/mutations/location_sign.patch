@@ -1,0 +1,17 @@
+Drop the southern/western negation: every coordinate reads as if the ref said N/E.
+
+The failure this control proves a test can see is silent and geographic — a library shot in the
+southern hemisphere lands mirrored across the equator, with no error anywhere — so the probes it
+must turn red are the S/W fixture and the ref-sign unit case, and nothing else.
+
+--- a/app/services/location.py
++++ b/app/services/location.py
+@@ -167,7 +167,7 @@
+             return None
+         total += part / scale
+     letter = str(ref).strip()[:1].upper() if isinstance(ref, str) else ""
+-    return -total if letter in ("S", "W") else total
++    return total
+ 
+ 
+ def location_from_pair(
