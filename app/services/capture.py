@@ -7,7 +7,9 @@ module different from the EXIF code already in `services/media.py`:
 * **Metadata only.** An image is opened lazily and only its EXIF header is read — no `.load()`,
   no decode. A video is walked atom by atom with `seek`, so the `mdat` (the samples, i.e. the
   whole file for a 4K clip) is never read: only the `moov` box reaches memory, and only up to
-  `MOOV_READ_CAP`.
+  `MOOV_READ_CAP`. A HEIC is walked the same way (`heif_exif_from`), because opening one costs
+  the WHOLE file — pillow-heif parses the image payload to open it, and only the `meta` box and
+  the Exif item's own extent are wanted, capped by `HEIF_EXIF_READ_CAP`.
 * **A date-tag WHITELIST.** Exactly three EXIF tags and one QuickTime key are read. GPS and
   everything else is neither read nor logged, and no failure ever carries metadata content into a
   log line — only the exception's type.
@@ -64,6 +66,15 @@ MOOV_READ_CAP = 8 * 1024 * 1024
 # A PNG's eXIf chunk is metadata; the same reasoning (and the same generosity) as the moov cap.
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_EXIF_READ_CAP = 2 * 1024 * 1024
+# A HEIF's `meta` box and its Exif item are metadata too, and the cap bounds BOTH: the box this
+# walk parses in memory, and the one extent it then reads out of the file.
+HEIF_EXIF_READ_CAP = 2 * 1024 * 1024
+# The mimes `uploads.detect_heif_mime` puts on an ISOBMFF still. AVIF is deliberately absent: it
+# is the same container and the walk would work, but nothing in this repo has an AVIF fixture to
+# hold that claim to, and a wrong Exif item is a wrong DATE rather than an error.
+HEIF_MIMES = frozenset({"image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"})
+EXIF_PREFIX = b"Exif\x00\x00"
+TIFF_MAGIC = (b"II*\x00", b"MM\x00*")
 
 _EXIF_DATETIME = "%Y:%m:%d %H:%M:%S"
 _OFFSET = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
@@ -101,8 +112,7 @@ def parse_exif_datetime(raw: object) -> str | None:
     except ValueError:
         return None
     return (
-        f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
-        f"T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+        f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
     )
 
 
@@ -208,15 +218,288 @@ def png_exif_from(f: BinaryIO) -> bytes | None:
         f.seek(length + 4, 1)  # payload + CRC, unread
 
 
-def _read_image(path: Path) -> CaptureResult:
+def heif_exif_from(f: BinaryIO) -> bytes | None:
+    """A HEIF/HEIC's Exif payload, found by walking its boxes and reading ONE extent — or None.
+
+    pillow-heif parses the WHOLE file to open it, image payload included, so asking Pillow for
+    `im.info["exif"]` costs a 4 MB read for four kilobytes of metadata — over NFS that is what put
+    the location backfill and the upload's 5 s read budget at the mercy of the mount. The box walk
+    is the same trick `read_moov_from` plays on a video: every box but `meta` is SEEKED over,
+    `mdat` is never read, and only the Exif item's own extent reaches memory.
+
+    None means "not answerable from the headers", never "no Exif": an item addressed inside `idat`
+    or relative to another item, an extent in a second file, a split extent, a cap overrun, a
+    truncated or hostile header. The caller falls back to the full read, which is slower and
+    always right — correctness is not the thing being traded away here.
+    """
+    meta = _heif_meta_from(f)
+    if meta is None:
+        return None
+    body = _heif_children(meta)
+    if body is None:
+        return None
+    start, end = body
+    item = _heif_exif_item(meta, start, end)
+    if item is None:
+        return None
+    extent = _heif_extent(meta, start, end, item)
+    if extent is None:
+        return None
+    offset, length = extent
+    if not 4 < length <= HEIF_EXIF_READ_CAP:
+        return None
+    f.seek(offset)
+    raw = f.read(length)
+    if len(raw) != length:  # a truncated file, and a truncated Exif parses into plausible noise
+        return None
+    return _heif_exif_payload(raw)
+
+
+def _heif_meta_from(f: BinaryIO) -> bytes | None:
+    """The `meta` box's body, found by SEEKING over every other top-level box.
+
+    The same walk as `read_moov_from`, for the box a still image keeps its item table in.
+
+    The first box must be `ftyp`: it is what says this is an ISOBMFF file at all, and refusing
+    anything else is what keeps a JPEG or a stream of noise from being walked as one.
+    """
+    first = True
+    while True:
+        head = f.read(8)
+        if len(head) < 8:
+            return None
+        (size,) = struct.unpack_from(">I", head, 0)
+        kind = head[4:8]
+        header = 8
+        if size == 1:
+            ext = f.read(8)
+            if len(ext) < 8:
+                return None
+            (size,) = struct.unpack_from(">Q", ext, 0)
+            header = 16
+        if first and kind != b"ftyp":
+            return None
+        first = False
+        if kind == b"meta":
+            payload_size = size - header
+            if size == 0 or payload_size <= 0 or payload_size > HEIF_EXIF_READ_CAP:
+                return None
+            payload = f.read(payload_size)
+            return payload if len(payload) == payload_size else None
+        if size == 0 or size < header:  # "to end of file", or nonsense — nothing follows
+            return None
+        f.seek(size - header, 1)
+
+
+def _heif_children(meta: bytes) -> tuple[int, int] | None:
+    """Where `meta`'s child boxes start and end, once its handler says `pict`.
+
+    `meta` is a FullBox in ISO-BMFF and a plain container in QuickTime, and the same two spellings
+    the moov walk tries reach this code, so both offsets are tried. The `pict` handler is the
+    check that this `meta` describes IMAGE ITEMS — a `meta` full of iTunes keys has an `iloc` in
+    neither sense, and reading one as if it did is how a walker invents an offset.
+    """
+    for start in (4, 0):
+        hdlr = child(meta, start, len(meta), b"hdlr")
+        if hdlr is None:
+            continue
+        body, end = hdlr
+        if body + 12 <= end and meta[body + 8 : body + 12] == b"pict":
+            return start, len(meta)
+    return None
+
+
+def _heif_item_types(meta: bytes, start: int, end: int) -> dict[int, bytes]:
+    """Every item's four-character type, out of `iinf`'s `infe` entries.
+
+    Only version 2 and 3 entries carry a type at all; the older ones name items without saying
+    what they are, and an item whose type is unknown is never the one this read wants.
+    """
+    iinf = child(meta, start, end, b"iinf")
+    if iinf is None:
+        return {}
+    body, body_end = iinf
+    if body >= body_end:
+        return {}
+    entries = body + (6 if meta[body] == 0 else 8)  # version/flags, then a 16- or 32-bit count
+    types: dict[int, bytes] = {}
+    for kind, info, info_end in boxes(meta, entries, body_end):
+        if kind != b"infe" or info >= info_end:
+            continue
+        version = meta[info]
+        id_at, type_at = (4, 8) if version == 2 else (4, 10)
+        id_size = 2 if version == 2 else 4
+        if version not in (2, 3) or info + type_at + 4 > info_end:
+            continue
+        types[int.from_bytes(meta[info + id_at : info + id_at + id_size], "big")] = meta[
+            info + type_at : info + type_at + 4
+        ]
+    return types
+
+
+def _heif_primary_item(meta: bytes, start: int, end: int) -> int | None:
+    """`pitm`'s item ID — WHICH image the file is, when it carries more than one."""
+    pitm = child(meta, start, end, b"pitm")
+    if pitm is None:
+        return None
+    body, body_end = pitm
+    if body >= body_end:
+        return None
+    width = 2 if meta[body] == 0 else 4
+    if body + 4 + width > body_end:
+        return None
+    return int.from_bytes(meta[body + 4 : body + 4 + width], "big")
+
+
+def _heif_exif_item(meta: bytes, start: int, end: int) -> int | None:
+    """The item ID of the Exif that describes the PRIMARY image.
+
+    A file with two images carries two Exif items (`fixtures/auto-memo-date/heic-offset.heic` puts
+    a 2019 decoy on the first one on purpose), and which one belongs to which is stated ONLY by
+    the `cdsc` reference in `iref`. Taking the first Exif item in the file is how a reader answers
+    a confident, wrong date; when the file carries exactly one there is nothing to confuse.
+    """
+    items = [item for item, kind in _heif_item_types(meta, start, end).items() if kind == b"Exif"]
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0]
+    primary = _heif_primary_item(meta, start, end)
+    iref = child(meta, start, end, b"iref")
+    if primary is None or iref is None:
+        return None
+    body, body_end = iref
+    if body >= body_end:
+        return None
+    width = 2 if meta[body] == 0 else 4
+    for kind, ref, ref_end in boxes(meta, body + 4, body_end):
+        if kind != b"cdsc" or ref + width + 2 > ref_end:
+            continue
+        source = int.from_bytes(meta[ref : ref + width], "big")
+        if source not in items:
+            continue
+        count = int.from_bytes(meta[ref + width : ref + width + 2], "big")
+        described = ref + width + 2
+        for _ in range(count):
+            if described + width > ref_end:
+                break
+            if int.from_bytes(meta[described : described + width], "big") == primary:
+                return source
+            described += width
+    return None
+
+
+def _heif_extent(meta: bytes, start: int, end: int, item: int) -> tuple[int, int] | None:
+    """Where one item's bytes are, as a (file offset, length) — or None when they are not there.
+
+    `iloc` is the one box in this walk whose field WIDTHS are themselves data: offsets, lengths,
+    base offsets and extent indices are each 0, 4 or 8 bytes wide as the header says, and the item
+    IDs and the count widen again in version 2. Reading a later version with the earlier widths
+    lands mid-field and yields an offset that is pure fiction, which is why an unknown version,
+    an unknown width or a construction_method other than 0 (the payload is in `idat`, or inside
+    another item) answers None instead of a number.
+    """
+    iloc = child(meta, start, end, b"iloc")
+    if iloc is None:
+        return None
+    body, body_end = iloc
+    if body + 6 > body_end:
+        return None
+    version = meta[body]
+    if version > 2:
+        return None
+    offset_size, length_size = meta[body + 4] >> 4, meta[body + 4] & 0xF
+    base_size = meta[body + 5] >> 4
+    index_size = (meta[body + 5] & 0xF) if version in (1, 2) else 0
+    if any(width not in (0, 4, 8) for width in (offset_size, length_size, base_size, index_size)):
+        return None
+    id_size = 4 if version == 2 else 2
+    cursor = body + 6
+    count_size = 4 if version == 2 else 2
+    if cursor + count_size > body_end:
+        return None
+    count = int.from_bytes(meta[cursor : cursor + count_size], "big")
+    cursor += count_size
+    for _ in range(count):
+        head = id_size + (2 if version in (1, 2) else 0) + 2 + base_size + 2
+        if cursor + head > body_end:
+            return None
+        current = int.from_bytes(meta[cursor : cursor + id_size], "big")
+        cursor += id_size
+        method = 0
+        if version in (1, 2):
+            method = meta[cursor + 1] & 0x0F
+            cursor += 2
+        reference = int.from_bytes(meta[cursor : cursor + 2], "big")
+        cursor += 2
+        base = int.from_bytes(meta[cursor : cursor + base_size], "big") if base_size else 0
+        cursor += base_size
+        extents = int.from_bytes(meta[cursor : cursor + 2], "big")
+        cursor += 2
+        span = index_size + offset_size + length_size
+        if cursor + extents * span > body_end:
+            return None
+        if current != item:
+            cursor += extents * span
+            continue
+        # construction_method 0 is a FILE offset; a data_reference_index names ANOTHER file; and a
+        # split extent would have to be stitched. None of the three is a header read of this file.
+        if method != 0 or reference != 0 or extents != 1:
+            return None
+        cursor += index_size
+        offset = int.from_bytes(meta[cursor : cursor + offset_size], "big") if offset_size else 0
+        length = (
+            int.from_bytes(meta[cursor + offset_size : cursor + span], "big") if length_size else 0
+        )
+        return base + offset, length
+    return None
+
+
+def _heif_exif_payload(raw: bytes) -> bytes | None:
+    """One Exif item's extent as the payload a parser takes, or None if it is not one.
+
+    The extent is an ExifDataBlock: a 4-byte `exif_tiff_header_offset` and then the payload. The
+    four bytes are dropped rather than followed, because that is byte-for-byte what pillow-heif
+    hands over in `im.info["exif"]` — the whole point is that the two readers are interchangeable.
+    A payload that is neither APP1-prefixed nor a TIFF header is refused: an offset read from a
+    file that turned out not to be shaped as assumed must never be handed on as metadata.
+    """
+    payload = raw[4:]
+    if payload.startswith(EXIF_PREFIX) or payload[:4] in TIFF_MAGIC:
+        return payload
+    skip = int.from_bytes(raw[:4], "big")
+    if 8 + skip <= len(raw) and raw[4 + skip : 8 + skip] in TIFF_MAGIC:
+        return raw[4 + skip :]
+    return None
+
+
+def _whitelisted_tags(exif: Image.Exif) -> CaptureResult:
+    """The three date tags out of an already-parsed Exif, and nothing else.
+
+    The whitelist is enforced by asking for ONE sub-IFD: `get_ifd(0x8769)` parses the Exif IFD and
+    nothing else, so the GPS IFD (0x8825) is never even walked. Parsing that IFD in memory and
+    reading three tags out of it — then discarding the rest with the object — IS what the
+    whitelist means: no other tag reaches a caller, a log line, or the database.
+    """
+    ifd = exif.get_ifd(EXIF_IFD)
+    offset = ifd.get(OFFSET_TIME_ORIGINAL)
+    if offset is None:
+        offset = ifd.get(OFFSET_TIME)
+    return capture_from_exif(ifd.get(DATETIME_ORIGINAL), offset)
+
+
+def _read_image(path: Path, mime: str) -> CaptureResult:
     """The PRIMARY image's whitelisted EXIF tags, read from metadata the OPEN already parsed.
 
     Two containers, two places that metadata lives:
 
-    * JPEG / HEIF — `im.info["exif"]` is the raw APP1/HEIF-exif payload the format plugin picked
-      up while parsing the header. For a HEIC that is the PRIMARY item's payload, which is NOT
-      necessarily the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a different
-      date on its first item on purpose).
+    * JPEG — `im.info["exif"]` is the raw APP1 payload the plugin picked up while parsing the
+      header.
+    * HEIF / HEIC — the box walk above (`heif_exif_from`), because an OPEN costs the whole file
+      here: pillow-heif parses the image payload too. It reads the PRIMARY item's Exif, which is
+      NOT necessarily the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a
+      different date on its first item on purpose). When the walk declines, the open is the
+      fallback and answers exactly as it always did.
     * PNG — the chunk list is walked here (`_png_exif`), because Pillow stops at IDAT and an eXIf
       chunk is equally legal on the far side of it.
     * TIFF — there is no such payload: the EXIF tags live in the file's own first IFD, which
@@ -225,11 +508,19 @@ def _read_image(path: Path) -> CaptureResult:
       to `load()` and decode the pixels of every photo that has no date, which is the one thing
       this module promises never to do.
 
-    The whitelist is enforced by asking for ONE sub-IFD: `get_ifd(0x8769)` parses the Exif IFD and
-    nothing else, so the GPS IFD (0x8825) is never even walked. Parsing that IFD in memory and
-    reading three tags out of it — then discarding the rest with the object — IS what the
-    whitelist means: no other tag reaches a caller, a log line, or the database.
+    The whitelist itself is `_whitelisted_tags`, which both paths end in.
     """
+    if mime in HEIF_MIMES:
+        with open(path, "rb") as f:
+            raw = heif_exif_from(f)
+        if raw is not None:
+            exif = Image.Exif()
+            exif.load(raw)
+            return _whitelisted_tags(exif)
+        # The mime and nothing else: this is the one HEIC in a thousand whose Exif the headers
+        # cannot address, and knowing how often that happens is worth a line. A value out of the
+        # metadata never is.
+        logger.info("capture.heif_fallback", mime=mime)
     with Image.open(path) as im:
         if isinstance(im, TiffImagePlugin.TiffImageFile):
             exif = im.getexif()  # from tag_v2, parsed at open; no sample decode
@@ -243,11 +534,7 @@ def _read_image(path: Path) -> CaptureResult:
             exif.load(raw)
         # Inside the `with`: a TIFF's Exif object resolves the sub-IFD by seeking in the FILE, so
         # the handle has to still be open. (A standalone Exif built from bytes does not care.)
-        ifd = exif.get_ifd(EXIF_IFD)
-        offset = ifd.get(OFFSET_TIME_ORIGINAL)
-        if offset is None:
-            offset = ifd.get(OFFSET_TIME)
-        return capture_from_exif(ifd.get(DATETIME_ORIGINAL), offset)
+        return _whitelisted_tags(exif)
 
 
 def boxes(buf: bytes, start: int = 0, end: int | None = None) -> Iterator[tuple[bytes, int, int]]:
@@ -420,7 +707,7 @@ def read_capture(path: str | Path, mime: str) -> CaptureResult:
     """
     try:
         if mime.startswith("image/"):
-            return _read_image(Path(path))
+            return _read_image(Path(path), mime)
         if mime.startswith("video/"):
             return _read_video(Path(path))
     except Exception as exc:  # noqa: BLE001 — a metadata read must never fail an upload

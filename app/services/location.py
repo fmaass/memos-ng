@@ -7,16 +7,19 @@ read coordinates is here, where the privacy rules can be stated once and held to
 The rules that make it safe to store a coordinate at all:
 
 * **Metadata only, no decode.** An image's raw EXIF payload is taken exactly the way capture takes
-  it — `im.info["exif"]` for JPEG/HEIF, the eXIf CHUNK WALKER for PNG, `tag_v2` for TIFF — and
-  parsed with a standalone `Image.Exif`, so no path can fall through to `load()`. Asking Pillow
-  for `getexif()` on a PNG whose eXIf chunk sits after IDAT decodes every pixel of every photo in
-  the library that has no location; that is the bug this module is shaped around.
-* **Headers only for video.** The `moov` box is located by SEEKING over every other top-level box
-  (`capture.read_moov_from`), so an 18 GB clip on an NFS mount costs a header read. `measuring()`
-  meters exactly that, and the backfill reports the total.
-* **Nothing is logged.** This module emits no log events at all. A coordinate reaches Postgres and
-  `GET /api/map/markers`, and nothing else — not a log line, not a derived tier, not another API
-  body. The cheapest way to keep that true is to have no place here that could print one.
+  it — `im.info["exif"]` for JPEG, the ISOBMFF BOX WALKER for HEIF/HEIC, the eXIf CHUNK WALKER for
+  PNG, `tag_v2` for TIFF — and parsed with a standalone `Image.Exif`, so no path can fall through
+  to `load()`. Asking Pillow for `getexif()` on a PNG whose eXIf chunk sits after IDAT decodes
+  every pixel of every photo in the library that has no location; that is the bug this module is
+  shaped around.
+* **Headers only for video AND for HEIC.** The `moov` box is located by SEEKING over every other
+  top-level box (`capture.read_moov_from`), so an 18 GB clip on an NFS mount costs a header read;
+  a HEIC's Exif item is found the same way (`capture.heif_exif_from`), because OPENING one parses
+  the whole file. `measuring()` meters exactly that, and the backfill reports the total.
+* **No value is ever logged.** The one event this module emits is `location.heif_fallback`, which
+  carries the mime and nothing else — it says a HEIC's headers could not address its Exif, which
+  is a fact about the CONTAINER. A coordinate reaches Postgres and `GET /api/map/markers`, and
+  nothing else: not a log line, not a derived tier, not another API body.
 
 Absence is a normal answer and a DIFFERENT fact from failure: `None` means the file was read and
 carried no usable location (the caller stores `'none'`), while an unreadable original raises and
@@ -34,11 +37,14 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 import pillow_heif
+import structlog
 from PIL import Image, PngImagePlugin, TiffImagePlugin
 
 from app.services import capture
 
 pillow_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
+
+logger = structlog.get_logger()
 
 # The ONE sub-IFD this module reads. Nothing else out of an image reaches a caller.
 GPS_IFD = 0x8825
@@ -225,8 +231,19 @@ def parse_iso6709(text: object) -> LocationResult | None:
     return location_from_pair(latitude, longitude, SOURCE_QUICKTIME)
 
 
-def _read_image(f: BinaryIO) -> LocationResult | None:
+def _read_image(f: BinaryIO, mime: str) -> LocationResult | None:
     """The image's GPS IFD, from metadata the open already parsed — see the module docstring."""
+    if mime in capture.HEIF_MIMES:
+        # BEFORE the open: opening a HEIC parses the whole file, which is the cost this read
+        # exists to avoid. A payload the headers cannot address falls through to that open, so
+        # the answer is never worse than it was — only the cheap case got cheaper.
+        raw = capture.heif_exif_from(f)
+        if raw is not None:
+            exif = Image.Exif()
+            exif.load(raw)
+            return location_from_gps_ifd(exif.get_ifd(GPS_IFD))
+        logger.info("location.heif_fallback", mime=mime)
+        f.seek(0)  # the walk left the handle wherever it stopped
     with Image.open(f) as im:
         if isinstance(im, TiffImagePlugin.TiffImageFile):
             exif = im.getexif()  # from tag_v2, parsed at open; no sample decode
@@ -302,7 +319,7 @@ def read_location(path: str | Path, mime: str) -> LocationResult | None:
     target = Path(path)
     if mime.startswith("image/"):
         with _opened(target) as f:
-            return _read_image(f)
+            return _read_image(f, mime)
     if mime.startswith("video/"):
         with _opened(target) as f:
             return _read_video(f)
