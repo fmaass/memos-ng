@@ -1,0 +1,17 @@
+Believe an `iinf` whose declared entry count does not match the entries it holds.
+
+A count that overstates the entries leaves a table missing items the file said it has; the read
+then answers from the half of a malformed structure it happened to parse, while libheif judges the
+same file whole. The probe is the fixture whose `iinf` declares nine entries over two.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -351,7 +351,7 @@ def _heif_item_types(
+         return None
+     declared = int.from_bytes(meta[body + 4 : body + 4 + count_size], "big")
+     entries = _heif_boxes(meta, body + 4 + count_size, end)
+-    if entries is None or len(entries) != declared:
++    if entries is None:
+         return None
+     types: dict[int, bytes] = {}
+     for kind, info, info_end in entries:

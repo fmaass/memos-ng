@@ -1,0 +1,22 @@
+Measure an extent's length from the end of the whole extent instead of the end of its offset.
+
+Versions 1 and 2 of `iloc` may put an `extent_index` before each offset and length, and the slice
+that spans it reads `index_size` bytes too far: a declared length of 32 followed by the next box
+decodes as billions, the cap declines it, and every HEIC in the library quietly falls back to the
+full read this walk exists to avoid. Nothing raises, which is why the probes are the index-size
+cases — and only those: an `iloc` with no index is measured correctly either way.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -492,8 +492,9 @@ def _heif_extent(
+         # declared 32 into billions.
+         cursor += index_size
+         offset = int.from_bytes(meta[cursor : cursor + offset_size], "big") if offset_size else 0
+-        at = cursor + offset_size
+-        length = int.from_bytes(meta[at : at + length_size], "big") if length_size else 0
++        length = (
++            int.from_bytes(meta[cursor + offset_size : cursor + span], "big") if length_size else 0
++        )
+         return base + offset, length
+     return None
+ 

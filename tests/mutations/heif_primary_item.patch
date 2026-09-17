@@ -1,19 +1,18 @@
-Take the FIRST Exif item in the file instead of the one describing the primary image.
+Answer with the first Exif item in the file instead of the one describing the primary image.
 
-A HEIC with two images carries two Exif items, and only the `cdsc` reference in `iref` says which
-belongs to which. The failure this control proves a test can see is silent and wrong rather than
-absent — the memo is dated from the decoy item, with no error anywhere — so the probe it must turn
-red is the four-item fixture's capture date, and nothing else.
+Which Exif belongs to which image is stated ONLY by the `cdsc` reference in `iref`. The failure
+this control proves a test can see is silent and wrong rather than absent — a memo dated from the
+decoy item, or from a secondary image whose metadata libheif does not even offer for the primary —
+so the probes it must turn red are the four-item fixture's capture date and the lone-secondary
+fixture, and nothing else.
 
 --- a/app/services/capture.py
 +++ b/app/services/capture.py
-@@ -362,8 +362,7 @@
-     items = [item for item, kind in _heif_item_types(meta, start, end).items() if kind == b"Exif"]
-     if not items:
+@@ -405,6 +405,7 @@ def _heif_exif_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int
+     iref = children.get(b"iref")
+     if not items or primary is None or iref is None:
          return None
--    if len(items) == 1:
--        return items[0]
 +    return items[0]
-     primary = _heif_primary_item(meta, start, end)
-     iref = child(meta, start, end, b"iref")
-     if primary is None or iref is None:
+     body, end = iref
+     if body + 4 > end or meta[body] > 1:
+         return None

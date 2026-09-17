@@ -1,0 +1,18 @@
+Read a `meta` box whose FullBox version is one nobody has defined.
+
+Version 0 is the only `meta` there is; a later one would be a layout this code has never seen, and
+reading its children at the offset version 0 puts them at is how a walker parses a table that is
+not there. The probe is the fixture whose `meta` claims version 1 — it must be handed to the full
+read, which judges the file whole, rather than answered from.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -312,7 +312,7 @@ def _heif_children(meta: bytes) -> dict[bytes, tuple[int, int]] | None:
+     beside this one reads) has an `iloc` in no sense at all, and reading one as if it did is how a
+     walker invents an offset.
+     """
+-    if len(meta) < 4 or meta[0] != 0:
++    if len(meta) < 4:
+         return None
+     found = _heif_boxes(meta, 4, len(meta))
+     if found is None:
