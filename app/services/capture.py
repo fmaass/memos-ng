@@ -386,7 +386,10 @@ def read_moov_from(f: BinaryIO) -> bytes | None:
             body = size - header
             if body <= 0 or body > MOOV_READ_CAP:
                 return None
-            return f.read(body)
+            payload = f.read(body)
+            # A short read is a TRUNCATED file, and a truncated moov parses into a plausible but
+            # arbitrary answer. Reported as "no moov" so a caller can tell damage from silence.
+            return payload if len(payload) == body else None
         if size == 0 or size < header:  # "to end of file", or nonsense — nothing follows
             return None
         f.seek(size - header, 1)

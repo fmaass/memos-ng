@@ -72,6 +72,14 @@ _ISO6709 = re.compile(
 )
 
 
+class UnreadableOriginal(OSError):
+    """The original could not be read at all — as opposed to read and carrying no location.
+
+    An OSError because that is what the rest of this module raises for the same outcome (a missing
+    file, an unopenable image), and every caller already treats the two alike.
+    """
+
+
 @dataclass(frozen=True)
 class LocationResult:
     """Where one file says it was taken. Degrees, WGS 84, and where the value came from."""
@@ -277,7 +285,10 @@ def _iso6709_from_moov(moov: bytes) -> str | None:
 def _read_video(f: BinaryIO) -> LocationResult | None:
     moov = capture.read_moov_from(f)
     if moov is None:
-        return None
+        # No moov box, a truncated one, or bytes that are no container at all. Every mp4/mov that
+        # can be played has one, so this is damage, not silence — and the two settle differently:
+        # see `read_location`. Answering None here would write the file off as 'none' forever.
+        raise UnreadableOriginal("no readable moov box")
     return parse_iso6709(_iso6709_from_moov(moov))
 
 

@@ -224,3 +224,39 @@ def test_the_meter_counts_what_an_image_read_costs():
     with location.measuring() as meter:
         assert location.read_location(BINARIES / "jpeg-north-east.jpg", "image/jpeg") is not None
     assert 0 < meter.bytes_read < 64 * 1024
+
+
+# --------------------------------------------------------------------------------------------
+# "Read and silent" is not "could not be read"
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("case", "payload", "mime"),
+    [
+        ("an empty video", b"", "video/quicktime"),
+        ("a header cut mid-box", (BINARIES / "mov-iso6709.mov").read_bytes()[:6], "video/mp4"),
+        ("a moov cut short", (BINARIES / "mov-iso6709.mov").read_bytes()[:100], "video/quicktime"),
+        ("bytes that are no container", b"not a video at all, not even close", "video/mp4"),
+        ("an empty image", b"", "image/jpeg"),
+        ("a JPEG cut short", (BINARIES / "jpeg-north-east.jpg").read_bytes()[:700], "image/jpeg"),
+        ("bytes that are no image", b"\x00" * 64, "image/png"),
+    ],
+    ids=lambda value: value if isinstance(value, str) and " " in value else None,
+)
+def test_a_file_that_cannot_be_read_raises_instead_of_answering_none(tmp_path, case, payload, mime):
+    # The two answers have DIFFERENT retry fates: None settles as 'none' and is never looked at
+    # again, while a raise settles as 'unreadable' and --retry-unreadable comes back for it. A
+    # truncated file that answered None would be written off forever on the strength of damage.
+    broken = tmp_path / "broken.bin"
+    broken.write_bytes(payload)
+
+    with pytest.raises(Exception):  # noqa: B017, PT011 — the CLASS is the contract, not the type
+        location.read_location(broken, mime)
+
+
+def test_a_container_that_parsed_and_simply_holds_no_location_answers_none():
+    # The positive control for the case above: this file is whole, and "whole and silent" is the
+    # one shape that may settle as 'none'.
+    assert location.read_location(BINARIES / "mov-no-location.mov", "video/quicktime") is None
+    assert location.read_location(BINARIES / "jpeg-no-gps.jpg", "image/jpeg") is None
