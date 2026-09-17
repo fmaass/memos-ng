@@ -190,6 +190,12 @@ INLINE_AUTH_SECURITY: dict[tuple[str, str], list[dict[str, list[str]]]] = {
     ("GET", "/api/attachments/{uid}/rendition/{variant_key}"): USER_SECURITY,
     ("GET", "/api/attachments/{uid}/{tier}"): SIGNED_OR_USER_SECURITY,
     ("GET", "/file/attachments/{uid}/{filename}"): OPTIONAL_PAT_SECURITY,
+    # The basemap routes authenticate in the handler for a reason of their own: an archive
+    # transfer must not hold a pool connection for its duration (app/routers/map.py).
+    ("GET", "/api/map/manifest"): USER_SECURITY,
+    ("GET", "/api/map/tiles/{name}"): USER_SECURITY,
+    ("HEAD", "/api/map/tiles/{name}"): USER_SECURITY,
+    ("GET", "/api/map/assets/{path}"): USER_SECURITY,
 }
 
 # Operations that take no credential at all. An /api/* operation that is in neither this set nor

@@ -14,6 +14,18 @@ from app.models import Attachment
 from app.services import poster, printready
 
 
+def tiles_dir() -> Path:
+    """Where the basemap archives and style assets are published.
+
+    Settings-driven with a derived default rather than a constant, for the same reason the tier
+    paths above are computed per call: tests and the dev server move DATA_ROOT, and a value frozen
+    at import time would keep pointing at the directory that was configured when the module loaded.
+    """
+    if settings.TILES_DIR:
+        return Path(settings.TILES_DIR)
+    return Path(settings.DATA_ROOT) / "assets" / "tiles"
+
+
 def derived_tier_path(uid: str, tier: str) -> tuple[Path, str] | None:
     """Derived tiers resolve from the uid alone (no DB row) — used by the signed fast path."""
     assets = Path(settings.DATA_ROOT) / "assets"

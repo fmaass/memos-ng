@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     # Storage — bind-mounted at /app/data in the container (layout identical to old memos).
     DATA_ROOT: str = "./data"
 
+    # Where the self-hosted basemap lives: the PMTiles archives plus the fonts and sprites the
+    # style needs. Empty means "<DATA_ROOT>/assets/tiles", i.e. the fast derived-asset volume
+    # rather than the originals share — a map client reads an archive by byte range, so this
+    # directory is hit far more often than any single media file. Resolved per call
+    # (services/asset_paths.tiles_dir) so an override of DATA_ROOT moves the tiles with it.
+    TILES_DIR: str = ""
+
     # DB connection pool (prod only — dev/test use NullPool so per-test event loops are safe).
     # memos-ng SHARES Postgres17 with prod; cap total connections (pool_size + max_overflow) so a
     # request burst can't exhaust the shared slots (TooManyConnectionsError starves prod too).
