@@ -706,6 +706,101 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/map/assets/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Serve Basemap Asset
+         * @description Serve one map style asset — a glyph range or a sprite sheet.
+         */
+        get: operations["serve_basemap_asset_api_map_assets__path__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/map/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Basemap Manifest
+         * @description List the basemap archives this server currently offers.
+         *
+         *     Never cached: it is the pointer that changes when new map data is published, and a client
+         *     holding a stale copy would keep asking for an archive that has been superseded.
+         */
+        get: operations["basemap_manifest_api_map_manifest_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/map/markers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Markers
+         * @description Every located photo the caller may see, oldest first.
+         */
+        get: operations["list_markers_api_map_markers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/map/tiles/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Serve Basemap Archive
+         * @description Serve one basemap archive, by byte range.
+         *
+         *     A map client fetches a few kilobytes per tile out of a multi-gigabyte file, so a ranged request
+         *     is the normal case: it answers 206 and states the range it served, a range that starts past the
+         *     end of the archive answers 416, and a request without a range header answers the whole file.
+         */
+        get: operations["serve_basemap_archive_api_map_tiles__name__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        /**
+         * Serve Basemap Archive
+         * @description Serve one basemap archive, by byte range.
+         *
+         *     A map client fetches a few kilobytes per tile out of a multi-gigabyte file, so a ranged request
+         *     is the normal case: it answers 206 and states the range it served, a range that starts past the
+         *     end of the archive answers 416, and a request without a range header answers the whole file.
+         */
+        head: operations["serve_basemap_archive_api_map_tiles__name__head"];
+        patch?: never;
+        trace?: never;
+    };
     "/api/members": {
         parameters: {
             query?: never;
@@ -1833,6 +1928,103 @@ export interface components {
             expires_at: string;
             /** Grant */
             grant: string;
+        };
+        /**
+         * MapArchive
+         * @description One published basemap archive.
+         */
+        MapArchive: {
+            /** Name */
+            name: string;
+            /** Size */
+            size: number;
+            /** Url */
+            url: string;
+        };
+        /**
+         * MapManifest
+         * @description Which basemap archives are available, and the date of the data they were cut from.
+         *
+         *     `detail` is null when no region archive has been published; a client renders the world archive
+         *     alone rather than nothing at all.
+         */
+        MapManifest: {
+            /** Build */
+            build: string | null;
+            detail: components["schemas"]["MapArchive"] | null;
+            planet: components["schemas"]["MapArchive"] | null;
+        };
+        /**
+         * MapMarker
+         * @description One located attachment: the feed's ref, plus where and when.
+         *
+         *     The coordinate lives on THIS model alone. `AttachmentRef` — which every memo body carries —
+         *     deliberately does not grow one, so a reader of `/api/memos` learns nothing about where a
+         *     photo was taken.
+         */
+        MapMarker: {
+            /** Blurhash */
+            blurhash: string | null;
+            /** Capture Civil */
+            capture_civil: string | null;
+            /**
+             * Capture Instant
+             * Format: date-time
+             */
+            capture_instant: string | null;
+            /** Capture Source */
+            capture_source: string | null;
+            /** Downloadurl */
+            downloadUrl: string;
+            /** Duration */
+            duration: number | null;
+            /** Haslegacyprint */
+            hasLegacyPrint: boolean;
+            /** Hasprint */
+            hasPrint: boolean;
+            /** Height */
+            height: number | null;
+            /** Latitude */
+            latitude: number;
+            /** Longitude */
+            longitude: number;
+            /** Memo Uid */
+            memo_uid: string;
+            /** Mime */
+            mime: string;
+            /** Mine */
+            mine: boolean;
+            /** Position */
+            position: number | null;
+            /** Posterurl */
+            posterUrl: string;
+            /** Previewurl */
+            previewUrl: string;
+            /** Printurl */
+            printUrl: string;
+            /** Renditions */
+            renditions: components["schemas"]["RenditionItem"][];
+            /** Sha256 */
+            sha256: string | null;
+            status: components["schemas"]["AttachmentStatus"];
+            /**
+             * Taken At
+             * Format: date-time
+             */
+            taken_at: string;
+            /** Thumbnailurl */
+            thumbnailUrl: string;
+            /** Uid */
+            uid: string;
+            /** Weburl */
+            webUrl: string;
+            /** Width */
+            width: number | null;
+        };
+        /** MapMarkerList */
+        MapMarkerList: {
+            /** Markers */
+            markers: components["schemas"]["MapMarker"][];
         };
         /**
          * MemberOut
@@ -3312,6 +3504,139 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PhotobookManifestOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    serve_basemap_asset_api_map_assets__path__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    basemap_manifest_api_map_manifest_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MapManifest"];
+                };
+            };
+        };
+    };
+    list_markers_api_map_markers_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MapMarkerList"];
+                };
+            };
+        };
+    };
+    serve_basemap_archive_api_map_tiles__name__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    serve_basemap_archive_api_map_tiles__name__head: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */

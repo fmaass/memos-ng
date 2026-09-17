@@ -1,10 +1,14 @@
-"""The self-hosted basemap: the vector-tile archives and the fonts and sprites the style needs.
+"""The map: where the household's photos were taken, and the basemap they are drawn on.
 
-Nothing here talks to a third party, which is the point: a map view otherwise announces every
-place the household has been to whoever hosts the tiles. The archives are produced offline by
-`scripts/tiles/extract.sh` and served straight off disk from here.
+Two halves that only meet in the client. `/markers` is the ONE route that serves a stored
+coordinate — deliberately parameterless, because the client clusters on the device off the whole
+body, so there is no bbox or zoom argument to get wrong and no way to ask this route a question
+whose answer differs from the feed's. The rest serves the vector-tile archives and the fonts and
+sprites the style needs, straight off disk: nothing here talks to a third party, which is the
+point, since a map view otherwise announces every place the household has been to whoever hosts
+the tiles. The archives are produced offline by `scripts/tiles/extract.sh`.
 
-Three things about the shape of these routes are deliberate:
+Three things about the shape of the archive routes are deliberate:
 
 * **The file name IS the version.** A PMTiles client caches an archive's header and directory per
   URL, and a directory that says "this tile is absent" is never re-fetched — so republishing under
@@ -14,7 +18,8 @@ Three things about the shape of these routes are deliberate:
 * **The transfer holds no database connection.** Authentication is a short-lived session opened
   and closed before the response object is built, not a yield-based dependency: an archive is
   gigabytes, and a handful of concurrent downloads holding pool connections for their duration is
-  how the shared instance runs out of them.
+  how the shared instance runs out of them. (The markers route is an ordinary short query and uses
+  the ordinary dependency.)
 * **The existence check precedes the response.** Starlette's `FileResponse` stats the path while
   it is already sending, so a missing file there raises inside the streaming layer and surfaces as
   a 500. Checking first makes an absent archive the 404 it actually is.
@@ -23,20 +28,25 @@ Three things about the shape of these routes are deliberate:
 import mimetypes
 import re
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from anyio import to_thread
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
-from app.database import async_session
+from app.api_types import Rfc3339Datetime
+from app.database import async_session, get_session
+from app.models import Attachment, User
+from app.routers.memos import AttachmentRef, _att_ref
+from app.services import map_markers
 from app.services.asset_paths import tiles_dir
 
 router = APIRouter(prefix="/api/map", tags=["map"])
 
-# The only names this route will serve. `planet-<build>` covers the whole world at low zoom;
+# The only names the archive route will serve. `planet-<build>` covers the whole world at low zoom;
 # `detail-<build>-<spec>` covers the regions that have pins, at street zoom. Both version parts are
 # hex-and-dashes, so the pattern admits exactly what the extraction script publishes and nothing
 # that could name another file on disk.
@@ -51,6 +61,24 @@ ARCHIVE_MEDIA_TYPE = "application/octet-stream"
 # Glyph ranges are protocol buffers; `mimetypes` has no entry for the extension and would fall back
 # to octet-stream, which some clients refuse to parse.
 GLYPH_MEDIA_TYPE = "application/x-protobuf"
+
+
+class MapMarker(AttachmentRef):
+    """One located attachment: the feed's ref, plus where and when.
+
+    The coordinate lives on THIS model alone. `AttachmentRef` — which every memo body carries —
+    deliberately does not grow one, so a reader of `/api/memos` learns nothing about where a
+    photo was taken.
+    """
+
+    memo_uid: str
+    latitude: float
+    longitude: float
+    taken_at: Rfc3339Datetime
+
+
+class MapMarkerList(BaseModel):
+    markers: list[MapMarker]
 
 
 class MapArchive(BaseModel):
@@ -71,6 +99,17 @@ class MapManifest(BaseModel):
     build: str | None
     planet: MapArchive | None
     detail: MapArchive | None
+
+
+def _marker(att: Attachment, memo_uid: str, taken_at, user_id: int) -> MapMarker:
+    assert att.latitude is not None and att.longitude is not None  # noqa: S101 — the query's filter
+    return MapMarker(
+        **_att_ref(att, user_id).model_dump(),
+        memo_uid=memo_uid,
+        latitude=att.latitude,
+        longitude=att.longitude,
+        taken_at=taken_at,
+    )
 
 
 def _archive_path_sync(name: str) -> Path | None:
@@ -156,6 +195,18 @@ async def _authenticate(request: Request) -> None:
     # docstring on connection lifetime.
     async with async_session() as db:
         await auth.require_user(request, db)
+
+
+@router.get("/markers", response_model=MapMarkerList)
+async def list_markers(
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> MapMarkerList:
+    """Every located photo the caller may see, oldest first."""
+    rows = await map_markers.located_markers(db, user)
+    return MapMarkerList(
+        markers=[_marker(att, memo_uid, when, user.id) for att, memo_uid, when in rows]
+    )
 
 
 @router.get("/manifest", response_model=MapManifest)

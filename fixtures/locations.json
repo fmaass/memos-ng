@@ -1,0 +1,140 @@
+{
+  "schema": 1,
+  "generator": "the binaries under fixtures/locations/ are written by scripts/gen_location_fixtures.py",
+  "fictional": "EVERY coordinate in this artefact and in the files it pins is INVENTED — points in open ocean, chosen so no fixture can disclose a real household location.",
+  "rules": "LOCATION READ (app/services/location.py). Images: the GPS IFD (0x8825) of the RAW EXIF payload, taken the way services/capture.py takes it — im.info['exif'] for JPEG/HEIF, the eXIf chunk walker for PNG, tag_v2 for TIFF — and parsed with Image.Exif().load(raw) then get_ifd(0x8825), so no path decodes a pixel. GPSLatitude/GPSLongitude are 1 to 3 rationals (degrees[, minutes[, seconds]]); GPSLatitudeRef/GPSLongitudeRef decide the sign, S and W negating, a missing ref reading as N/E. A zero denominator, a NaN, a magnitude out of range (|lat| > 90, |lon| > 180) or exactly (0, 0) is NO location. Videos: com.apple.quicktime.location.ISO6709 from moov/meta (keys + ilst) first, else ©xyz from moov/udta (a QuickTime text atom: 2-byte length, 2-byte language, then the string); both are ISO 6709 decimal, ±DD.DDDD±DDD.DDDD[±alt][CRS]/, the altitude and any CRS suffix ignored. location_source is 'exif' or 'quicktime' when a location was read, 'none' when the file was read and carried none, 'unreadable' when the original could not be read at all (retryable). A coordinate reaches Postgres and GET /api/map/markers and nothing else — no log line, no derived tier, print, poster or transcoded video, no other API body.",
+  "binaries": {
+    "jpeg-north-east.jpg": {
+      "mime": "image/jpeg",
+      "note": "N/E refs, whole degrees and minutes.",
+      "expect": {
+        "latitude": 12.5,
+        "longitude": 45.25,
+        "location_source": "exif"
+      },
+      "sha256": "2eb1e08e407f932069d5d2d8722dbcc1a86c5346bc9308a831bf502b186760c3",
+      "size": 771
+    },
+    "jpeg-south-west.jpg": {
+      "mime": "image/jpeg",
+      "note": "S/W refs negate the same magnitudes — the sign rule.",
+      "expect": {
+        "latitude": -33.75,
+        "longitude": -25.5,
+        "location_source": "exif"
+      },
+      "sha256": "28e74bdd2ae82d7e11c6d2bf7c0ac616258849ddc4a07d633cebd4b03aad7db0",
+      "size": 770
+    },
+    "jpeg-no-gps.jpg": {
+      "mime": "image/jpeg",
+      "note": "no GPS IFD at all: read, and no location.",
+      "expect": {
+        "latitude": null,
+        "longitude": null,
+        "location_source": "none"
+      },
+      "sha256": "af3ab32296cf0330d29d2edbcd50c5d3a3bc8f56ba382a80d26f3a400fc03d32",
+      "size": 633
+    },
+    "jpeg-null-island.jpg": {
+      "mime": "image/jpeg",
+      "note": "exactly (0,0) — the no-fix value, never a photograph.",
+      "expect": {
+        "latitude": null,
+        "longitude": null,
+        "location_source": "none"
+      },
+      "sha256": "c15af974f406fd5105f5765e78b0a0d4384027c51d9be8459d6d969a73fb7164",
+      "size": 768
+    },
+    "jpeg-zero-denominator.jpg": {
+      "mime": "image/jpeg",
+      "note": "rationals with a zero denominator (NaN), and no ZeroDivisionError.",
+      "expect": {
+        "latitude": null,
+        "longitude": null,
+        "location_source": "none"
+      },
+      "sha256": "8be7b5c27b44db477379de4b78ed6ec5c53b1d8f03f3bbb47cf8efb9b2f3db29",
+      "size": 770
+    },
+    "jpeg-missing-refs.jpg": {
+      "mime": "image/jpeg",
+      "note": "no ref tags → north and east, the EXIF default.",
+      "expect": {
+        "latitude": 12.5,
+        "longitude": 45.25,
+        "location_source": "exif"
+      },
+      "sha256": "f11eaeb96e142403f2c424f31567d95f7488766edfa0ad083d446c868b678f5e",
+      "size": 746
+    },
+    "png-exif-after-idat.png": {
+      "mime": "image/png",
+      "note": "the eXIf chunk sits AFTER IDAT — invisible to the header parse, and getexif() would decode the pixels.",
+      "expect": {
+        "latitude": 5.0,
+        "longitude": -30.0,
+        "location_source": "exif"
+      },
+      "sha256": "96136782e2b9dce3d3fd6c6d61435ba33e6f7236553d7148d104cd56da9bd21b",
+      "size": 217
+    },
+    "tiff-gps.tif": {
+      "mime": "image/tiff",
+      "note": "a TIFF's GPS IFD lives in its own first IFD (tag_v2).",
+      "expect": {
+        "latitude": -7.25,
+        "longitude": 80.5,
+        "location_source": "exif"
+      },
+      "sha256": "ac53df767d2053d7ac035112878061970baf2f30528252ddd6cde03342a07492",
+      "size": 446
+    },
+    "heic-gps.heic": {
+      "mime": "image/heic",
+      "note": "HEIC carries the same EXIF payload as a JPEG.",
+      "expect": {
+        "latitude": 20.0,
+        "longitude": -150.0,
+        "location_source": "exif"
+      },
+      "sha256": "b450d597534d183402033d19ca1e6e85835684002ffb107aec78dfa30680b492",
+      "size": 668
+    },
+    "mov-iso6709.mov": {
+      "mime": "video/quicktime",
+      "note": "com.apple.quicktime.location.ISO6709 under moov/meta, WITH an altitude component.",
+      "expect": {
+        "latitude": 40.1,
+        "longitude": -20.2,
+        "location_source": "quicktime"
+      },
+      "sha256": "1a4630c6306b92e88522df8ba5d7f1ff585ae0d5b0c370956156d95637927e26",
+      "size": 1797
+    },
+    "mp4-xyz.mp4": {
+      "mime": "video/mp4",
+      "note": "©xyz under moov/udta — a QuickTime text atom, not a data sub-box.",
+      "expect": {
+        "latitude": 10.5,
+        "longitude": 150.5,
+        "location_source": "quicktime"
+      },
+      "sha256": "e3c27ca44c4551ee9ef43c5c3fe4ec8924e5b26a12a66fe6308626c4ec7ffcc6",
+      "size": 1730
+    },
+    "mov-no-location.mov": {
+      "mime": "video/quicktime",
+      "note": "no location key anywhere.",
+      "expect": {
+        "latitude": null,
+        "longitude": null,
+        "location_source": "none"
+      },
+      "sha256": "94ec789007eb876b14adc1c461f2af052f92ede9fc3c08d3224aab642fe932b3",
+      "size": 1647
+    }
+  }
+}

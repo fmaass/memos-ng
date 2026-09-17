@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     WORKER_SCHEMA_GATE_TIMEOUT_S: int = 300
     WORKER_SCHEMA_GATE_INTERVAL_S: float = 1.0
 
+    # Rolling BACK across an expand-only migration. The previous image cannot start normally on a
+    # database at a newer revision: the app entrypoint would run `alembic upgrade head` against a
+    # graph that does not contain that revision ("Can't locate revision"), and the worker's schema
+    # gate would wait for a head it will never see. With this set, the entrypoint skips the
+    # migration and the gate accepts a head its own graph does not know — which, by construction,
+    # can only be a NEWER one. It is never set in normal operation; it is set on the rollback
+    # deploy and cleared on the roll-forward (RELEASING.md, "Rollback across a migration").
+    ROLLBACK_MODE: bool = False
+
     # Web push (VAPID) — T2.5. Empty keys = push disabled (every send is a no-op), so the
     # pipeline runs unchanged without VAPID configured. Generate a keypair with `vapid --gen`
     # (py-vapid) and set both halves via the stack .env in prod.

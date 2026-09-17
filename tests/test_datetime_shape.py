@@ -272,6 +272,8 @@ EXPECTED_DATETIME_FIELDS = {
     ("DigestSettingsOut", "updated_at"),
     ("ExportSettingsOut", "updated_at"),
     ("ManageGrantOut", "expires_at"),
+    ("MapMarker", "capture_instant"),
+    ("MapMarker", "taken_at"),
     ("MemoOut", "archived_at"),
     ("MemoOut", "created_at"),
     ("MemoOut", "updated_at"),

@@ -61,6 +61,50 @@ no longer lost: the next worker start re-queues any claim older than `FRAME_CLAI
 accepted — aura-frames dedups by sha256, so an unchanged photo does not duplicate (MEMNG-35). Still
 deploy in a quiet window — worker heartbeat fresh and no active job in the log tail.
 
+### Rollback across a migration
+
+The retag above is not enough once the release carried a migration. Migrations here are
+**expand-only** (new columns nullable, new constraints additive), so the previous image's code runs
+against the migrated schema unchanged — but it cannot START on it: `docker-entrypoint.sh` migrates
+to its own bundled head, and the revision the newer image wrote is not in the older image's graph
+("Can't locate revision"), while the worker's schema gate (`app/migrations.py`) waits for a head
+equal to its own and therefore waits for ever. **Production never downgrades**; the rollback keeps
+the new columns.
+
+From 1.7.0 onwards that is one environment variable: set `ROLLBACK_MODE=1` on both services in the
+stack compose, retag as above, and `docker compose up -d --force-recreate`. The entrypoint then
+skips the migration and the gate accepts a head its graph does not know, with one warning line.
+Clear the variable on the roll-forward.
+
+Rolling back TO an image built before 1.7.0 has no such flag, so the old app is started through an
+overlay instead. `compose.rollback.yml` in the stack repo, used as
+`docker compose -f docker-compose.yml -f compose.rollback.yml up -d --force-recreate`:
+
+```yaml
+services:
+  app:
+    # The entrypoint's uvicorn line, reproduced WITHOUT the alembic call. The forwarded-IP default
+    # has to be reproduced with it: uvicorn otherwise trusts 127.0.0.1 alone, every request keeps
+    # Traefik's address, and the per-IP login limiter collapses into one household-wide bucket
+    # (MEMNG-28). Dollar signs are doubled so Compose passes them to the shell, not its own
+    # interpolation.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        FORWARDED_ALLOW_IPS="$${FORWARDED_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}";
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+        --proxy-headers --forwarded-allow-ips "$$FORWARDED_ALLOW_IPS"
+  worker:
+    # Stopped for the rollback window rather than started against a schema its gate refuses. Jobs
+    # queue; nothing is lost. Derivations, frame sharing, digests and cleanup wait, while uploads
+    # keep working and stay pending/processing until the roll-forward drains the queue.
+    scale: 0
+```
+
+After a roll-forward, re-run any backfill the newer release depends on for the rows the OLD code
+created in the meantime (for 1.7.0: `python -m app.scripts.backfill_location --execute`).
+
 ## Acceptance probes (real surface: https://memos.discomarder.live)
 
 1. `GET /health` → `{"status":"ok","version":"<version>+<short-sha>","db":"ok"}` (version read

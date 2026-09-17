@@ -105,9 +105,9 @@ app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
 app.router.routes.extend(members_router.router.routes)
+app.router.routes.extend(map_router.router.routes)
 app.router.routes.extend(admin_digest_router.router.routes)
 app.router.routes.extend(admin_export_router.router.routes)
-app.router.routes.extend(map_router.router.routes)
 # Compat (/api/v1/*, /file/*) must precede the /api/* fallback and the SPA catch-all.
 app.router.routes.extend(compat_router.router.routes)
 # Likewise the two non-/api native-login URLs (/.well-known/apple-app-site-association,

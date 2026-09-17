@@ -8,6 +8,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    Double,
     Enum,
     ForeignKey,
     Index,
@@ -245,6 +246,17 @@ class Attachment(Base):
     capture_instant: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     capture_civil: Mapped[str | None] = mapped_column(String(32))
     capture_source: Mapped[str | None] = mapped_column(String(16))
+    # WHERE the file says it was taken, read from its own metadata at upload completion and by the
+    # one-off backfill (app/services/location.py). Degrees, WGS 84. These three are the ONLY place
+    # a coordinate is stored, and `GET /api/map/markers` is the only place one is served: no tier,
+    # print, poster, transcode, export body or log line carries them (Places, ADR pending).
+    # `location_source` distinguishes four states NULL cannot: NULL = never read, 'none' = read and
+    # the file carried none, 'unreadable' = the original could not be read (retryable), 'exif' /
+    # 'quicktime' = where the value came from. The pair is both-or-neither and in range, enforced
+    # by CHECKs rather than by the writer alone, because the backfill is a script.
+    latitude: Mapped[float | None] = mapped_column(Double)
+    longitude: Mapped[float | None] = mapped_column(Double)
+    location_source: Mapped[str | None] = mapped_column(String(16))
     # 0-based place in this memo's attachment order, written at finalize from the order the client
     # declared (`upload_uids`). NULL on every row that predates the column, and on an attachment
     # that belongs to no memo.
@@ -270,6 +282,20 @@ class Attachment(Base):
     # row order, which nothing guarantees after an UPDATE moves a row.
     renditions: Mapped[list["AttachmentRendition"]] = relationship(
         lazy="selectin", cascade="all, delete-orphan", order_by="AttachmentRendition.id"
+    )
+
+    __table_args__ = (
+        # Half a coordinate is not a location: a row with one column set would put a marker at an
+        # implied zero, which is a real place in the Atlantic.
+        CheckConstraint(
+            "(latitude IS NULL) = (longitude IS NULL)", name="ck_attachments_location_pair"
+        ),
+        # A degree value outside these bounds is a parse that went wrong, not a place on Earth.
+        CheckConstraint(
+            "latitude IS NULL OR ("
+            "latitude >= -90 AND latitude <= 90 AND longitude >= -180 AND longitude <= 180)",
+            name="ck_attachments_location_range",
+        ),
     )
 
 

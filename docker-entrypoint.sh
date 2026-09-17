@@ -16,7 +16,15 @@ fi
 # Override with FORWARDED_ALLOW_IPS to narrow it (e.g. Traefik's exact container IP).
 FORWARDED_ALLOW_IPS="${FORWARDED_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}"
 
-# App: migrate then serve.
-alembic upgrade head
+# App: migrate then serve — unless this is a ROLLBACK onto a database a newer image already
+# migrated. This image's migration graph does not contain that revision, so migrating to the
+# bundled head would fail outright ("Can't locate revision") and the container would never serve. It
+# is expand-only by policy, so the newer columns are simply ignored by this code. Set on the
+# rollback deploy, cleared on the roll-forward (RELEASING.md, "Rollback across a migration").
+if [ "${ROLLBACK_MODE:-0}" = "1" ]; then
+    echo "ROLLBACK_MODE=1: not migrating; the schema is newer than this image"
+else
+    alembic upgrade head
+fi
 exec uvicorn app.main:app --host 0.0.0.0 --port 8000 \
     --proxy-headers --forwarded-allow-ips "$FORWARDED_ALLOW_IPS"

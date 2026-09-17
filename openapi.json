@@ -1544,6 +1544,192 @@
         "title": "MapManifest",
         "type": "object"
       },
+      "MapMarker": {
+        "description": "One located attachment: the feed's ref, plus where and when.\n\nThe coordinate lives on THIS model alone. `AttachmentRef` \u2014 which every memo body carries \u2014\ndeliberately does not grow one, so a reader of `/api/memos` learns nothing about where a\nphoto was taken.",
+        "properties": {
+          "blurhash": {
+            "title": "Blurhash",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_civil": {
+            "title": "Capture Civil",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_instant": {
+            "format": "date-time",
+            "title": "Capture Instant",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capture_source": {
+            "title": "Capture Source",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "downloadUrl": {
+            "title": "Downloadurl",
+            "type": "string"
+          },
+          "duration": {
+            "title": "Duration",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "hasLegacyPrint": {
+            "title": "Haslegacyprint",
+            "type": "boolean"
+          },
+          "hasPrint": {
+            "title": "Hasprint",
+            "type": "boolean"
+          },
+          "height": {
+            "title": "Height",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "latitude": {
+            "title": "Latitude",
+            "type": "number"
+          },
+          "longitude": {
+            "title": "Longitude",
+            "type": "number"
+          },
+          "memo_uid": {
+            "title": "Memo Uid",
+            "type": "string"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "mine": {
+            "title": "Mine",
+            "type": "boolean"
+          },
+          "position": {
+            "title": "Position",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "posterUrl": {
+            "title": "Posterurl",
+            "type": "string"
+          },
+          "previewUrl": {
+            "title": "Previewurl",
+            "type": "string"
+          },
+          "printUrl": {
+            "title": "Printurl",
+            "type": "string"
+          },
+          "renditions": {
+            "items": {
+              "$ref": "#/components/schemas/RenditionItem"
+            },
+            "title": "Renditions",
+            "type": "array"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "taken_at": {
+            "format": "date-time",
+            "title": "Taken At",
+            "type": "string"
+          },
+          "thumbnailUrl": {
+            "title": "Thumbnailurl",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "webUrl": {
+            "title": "Weburl",
+            "type": "string"
+          },
+          "width": {
+            "title": "Width",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "uid",
+          "mime",
+          "status",
+          "blurhash",
+          "width",
+          "height",
+          "duration",
+          "sha256",
+          "capture_instant",
+          "capture_civil",
+          "capture_source",
+          "mine",
+          "hasPrint",
+          "hasLegacyPrint",
+          "renditions",
+          "position",
+          "thumbnailUrl",
+          "previewUrl",
+          "webUrl",
+          "posterUrl",
+          "downloadUrl",
+          "printUrl",
+          "memo_uid",
+          "latitude",
+          "longitude",
+          "taken_at"
+        ],
+        "title": "MapMarker",
+        "type": "object"
+      },
+      "MapMarkerList": {
+        "properties": {
+          "markers": {
+            "items": {
+              "$ref": "#/components/schemas/MapMarker"
+            },
+            "title": "Markers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "markers"
+        ],
+        "title": "MapMarkerList",
+        "type": "object"
+      },
       "MemberOut": {
         "description": "One household member, in the field shapes `/api/auth/user` already uses for the caller.\n\nA deliberate subset of `UserOut`: `email` and `role` are the account's own business and no\nclient needs them to draw a filter row, so they are not published about OTHER people here.\n`avatar` is whatever the settings feature stores \u2014 a `data:image/\u2026` URL (nothing else is\naccepted, capped at 256 KB) or, for an account carried over from old memos, the path string\nthat came with it \u2014 and null for a member who never set one. It is\npassed through verbatim rather than normalised, so the value a client renders for a member is\nthe same one `/api/auth/user` hands that member for themselves.",
         "properties": {
@@ -4500,6 +4686,36 @@
           }
         ],
         "summary": "Basemap Manifest",
+        "tags": [
+          "map"
+        ]
+      }
+    },
+    "/api/map/markers": {
+      "get": {
+        "description": "Every located photo the caller may see, oldest first.",
+        "operationId": "list_markers_api_map_markers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapMarkerList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Markers",
         "tags": [
           "map"
         ]

@@ -30,7 +30,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import capture, poster, storage
+from app.services import capture, location, poster, storage
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -143,12 +143,26 @@ class PosterCopy:
     _discarded: bool = False
 
     def publish(self) -> None:
-        """Put the bytes in place. Runs in a worker thread, which nothing can interrupt — so this
-        either finishes or fails, and never stops half way at someone else's request."""
+        """Put the picture in place. Runs in a worker thread, which nothing can interrupt — so this
+        either finishes or fails, and never stops half way at someone else's request.
+
+        Re-encoded, not copied: the destination is a DERIVED tier served to anyone the signed
+        poster URL reaches, and a client JPEG carries whatever its camera wrote — coordinates
+        included. `media.sanitize_poster_override` is the same date-only save every other derived
+        asset goes through, and it keeps the copy's cross-device shape (a temp inside the
+        DESTINATION directory, then a within-device rename), which is what the EXDEV incident
+        behind `_copy_into_sync` bought.
+
+        The import is deferred because `app/services/media.py` is the worker's module by design
+        (see the split documented in `app/services/poster.py`): the app process pays for it only
+        when a request actually brings a poster along.
+        """
+        from app.services import media
+
         with self._lock:
             if self._discarded:
                 return  # the write unwound before this got its turn: publish nothing at all
-            _copy_into_sync(Path(self.part), Path(self.placed), Path(self.tmp))
+            media.sanitize_poster_override(Path(self.part), Path(self.placed), Path(self.tmp))
             self._published = True
 
     def discard(self) -> list[str]:
@@ -837,6 +851,37 @@ async def ensure_capture(db: AsyncSession, upload: Upload) -> Upload | None:
     return locked
 
 
+async def _read_location(dest: Path, mime: str) -> tuple[float | None, float | None, str]:
+    """This attachment's coordinates, read from its FINAL path — or why there are none.
+
+    Deliberately not on the `uploads` row, where the capture date lives: a capture date is read
+    when the last chunk lands and is wanted by the composer before a memo exists, while a location
+    is wanted only by the map and belongs to the attachment. Keeping it off the session means an
+    upload row — which outlives a cancelled compose, and which several endpoints serialize — can
+    never carry a coordinate at all.
+
+    One header read, in a worker thread, under the capture read's deadline. A timeout or an
+    unreadable original settles as `'unreadable'`, which `backfill_location.py --retry-unreadable`
+    re-reads later; it never fails the upload, because a stored photo with no pin is a far better
+    outcome than a refused one. The warning carries the mime and the exception TYPE only — a
+    location read never puts a value in a log line.
+    """
+    try:
+        with fail_after(CAPTURE_READ_TIMEOUT_S):
+            found = await to_thread.run_sync(
+                location.read_location, dest, mime, abandon_on_cancel=True
+            )
+    except TimeoutError:
+        logger.warning("location.read_timeout", mime=mime)
+        return None, None, location.SOURCE_UNREADABLE
+    except Exception as exc:  # noqa: BLE001 — a metadata read must never fail an upload
+        logger.warning("location.read_failed", mime=mime, error=type(exc).__name__)
+        return None, None, location.SOURCE_UNREADABLE
+    if found is None:
+        return None, None, location.SOURCE_NONE
+    return found.latitude, found.longitude, found.source
+
+
 async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
@@ -1239,6 +1284,7 @@ async def finalize(
     await to_thread.run_sync(_tracked_move_into_sync, track, dest)  # mkdir + os.replace in one hop
 
     is_video = mime.startswith("video/")
+    latitude, longitude, location_source = await _read_location(dest, mime)
     attachment = Attachment(
         uid=secrets.token_urlsafe(16),
         owner_id=owner_id,
@@ -1252,6 +1298,11 @@ async def finalize(
         capture_instant=upload.capture_instant,
         capture_civil=upload.capture_civil,
         capture_source=upload.capture_source,
+        # WHERE the file says it was taken, read ONCE here, from the final path, and stored on this
+        # row alone — never on the upload session (see `_read_location`).
+        latitude=latitude,
+        longitude=longitude,
+        location_source=location_source,
         status=AttachmentStatus.pending if is_video else AttachmentStatus.processing,
         storage_path=str(dest),
         # width/height/duration are filled by the worker fast lane (T2.2 pyvips/ffprobe).
