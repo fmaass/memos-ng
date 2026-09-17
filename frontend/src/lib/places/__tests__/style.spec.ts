@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { ATTRIBUTION, buildStyle, type MapManifest } from '@/lib/places/style'
+import { ATTRIBUTION, buildStyle, GLYPHS_URL, type MapManifest } from '@/lib/places/style'
 
 const PLANET = { name: 'planet-20260916.pmtiles', url: '/api/map/tiles/planet-20260916.pmtiles', size: 1 }
 const DETAIL = {
@@ -8,7 +8,11 @@ const DETAIL = {
   url: '/api/map/tiles/detail-20260916-a7e95f1d.pmtiles',
   size: 2,
 }
-const BOTH: MapManifest = { build: '20260916', planet: PLANET, detail: DETAIL }
+// No assets revision recorded: the shared fixture is the plain case, and the cases that
+// exercise the versioned asset URLs state their own commit.
+const BOTH: MapManifest = { build: '20260916', assets_commit: null, planet: PLANET, detail: DETAIL }
+const ASSETS_COMMIT = '028c18f713baecad011301ff7a69acc39bcc2ae7'
+const OTHER_COMMIT = 'f19c4a0b6d2e5a78c3b1049fd7e6a2158bc0d34e'
 
 /** Every string in the style that could make the browser issue a request. */
 function urlish(style: unknown): string[] {
@@ -74,7 +78,10 @@ describe('buildStyle', () => {
   it('overzooms the planet archive when no detail archive is published', () => {
     // An overzoomed basemap beats a blank one: without the detail archive, capping the planet
     // layers at z8 would leave every zoom past it empty.
-    const style = buildStyle({ build: '20260916', planet: PLANET, detail: null }, 'dark')
+    const style = buildStyle(
+      { build: '20260916', assets_commit: null, planet: PLANET, detail: null },
+      'dark',
+    )
 
     expect(style.sources.detail).toBeUndefined()
     expect(style.layers.every((l) => !('source' in l) || l.source === 'planet')).toBe(true)
@@ -83,7 +90,7 @@ describe('buildStyle', () => {
 
   it('still renders a map background when no archive exists at all', () => {
     // The route must not depend on the basemap: markers and the grid are the feature.
-    const style = buildStyle({ build: null, planet: null, detail: null }, 'light')
+    const style = buildStyle({ build: null, assets_commit: null, planet: null, detail: null }, 'light')
 
     expect(style.sources).toEqual({})
     expect(style.layers.map((l) => l.type)).toEqual(['background'])
@@ -92,5 +99,35 @@ describe('buildStyle', () => {
   it('names the data it draws without linking anywhere', () => {
     expect(ATTRIBUTION).toBe('© OpenStreetMap contributors © Protomaps')
     expect(JSON.stringify(buildStyle(BOTH, 'dark'))).not.toContain('attribution')
+  })
+
+  it('versions the glyph and sprite URLs with the assets revision being served', () => {
+    // fetch-assets.sh overwrites fonts/ and sprites/ in place, and the asset route answers with a
+    // week of `immutable`. Without the revision in the URL a browser keeps last week's glyphs for
+    // a week after the pin moved; with it, the bump IS a new URL and the old copy is simply never
+    // asked for again.
+    const style = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'dark')
+
+    expect(style.glyphs).toBe('/api/map/assets/fonts/{fontstack}/{range}.pbf?v=028c18f7')
+    expect(style.sprite).toBe('/api/map/assets/sprites/v4/dark?v=028c18f7')
+  })
+
+  it('moves every asset URL when the assets revision changes', () => {
+    const before = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'light')
+    const after = buildStyle({ ...BOTH, assets_commit: OTHER_COMMIT }, 'light')
+
+    expect(after.glyphs).not.toBe(before.glyphs)
+    expect(after.sprite).not.toBe(before.sprite)
+    expect(after.glyphs).toContain(`?v=${OTHER_COMMIT.slice(0, 8)}`)
+    expect(after.sprite).toContain(`?v=${OTHER_COMMIT.slice(0, 8)}`)
+    // The archives are untouched by it: their name already carries their version.
+    expect(after.sources).toEqual(before.sources)
+  })
+
+  it('omits the version query when no assets revision was recorded', () => {
+    const style = buildStyle(BOTH, 'dark')
+
+    expect(style.glyphs).toBe(GLYPHS_URL)
+    expect(style.sprite).toBe('/api/map/assets/sprites/v4/dark')
   })
 })

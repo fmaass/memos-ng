@@ -272,13 +272,56 @@ def test_a_new_generation_takes_over_the_manifest_while_the_previous_file_stays(
     assert client.get(_tile(DETAIL)).status_code == 200
 
 
+# --- the assets revision the style versions its URLs with ------------------------------------
+
+ASSETS_COMMIT = "028c18f713baecad011301ff7a69acc39bcc2ae7"
+
+
+def test_the_manifest_states_which_assets_revision_is_being_served(logged_in_client, tiles_dir):
+    """The glyphs and sprites are overwritten IN PLACE at fixed paths when their pin is bumped, so
+    nothing about their URL changes on its own. The manifest carrying the recorded commit is what
+    lets the style put it in the URL, which is the only thing that can end a week-long immutable
+    cache of the previous revision."""
+    client, _ = logged_in_client
+    (tiles_dir / "BUILD").write_text(
+        f"build=20260917\nassets_repo=protomaps/basemaps-assets\nassets_commit={ASSETS_COMMIT}\n"
+    )
+    body = client.get("/api/map/manifest").json()
+    assert body["assets_commit"] == ASSETS_COMMIT
+    assert body["build"] == "20260917"  # the other keys of the same file still read
+
+
+def test_an_unrecorded_assets_revision_is_reported_absent_rather_than_guessed(
+    logged_in_client, tiles_dir
+):
+    """A tiles directory whose assets were never fetched has no pin to state. Null rather than a
+    placeholder: the style omits the query entirely instead of versioning URLs against a value
+    that describes nothing."""
+    client, _ = logged_in_client
+    assert "assets_" not in (tiles_dir / "BUILD").read_text()
+    assert client.get("/api/map/manifest").json()["assets_commit"] is None
+
+
+def test_a_style_asset_is_cached_for_a_week_only_because_its_url_carries_the_revision(
+    logged_in_client, tiles_dir
+):
+    """`immutable` on a path that IS rewritten in place (fetch-assets.sh overwrites fonts/ and
+    sprites/) is only truthful while the client asks under a URL that changes with the pin. The
+    header and the versioned query are one decision, so the header is asserted here and the query
+    in the style's own spec."""
+    client, _ = logged_in_client
+    r = client.get(f"/api/map/assets/sprites/v4/light.json?v={ASSETS_COMMIT[:8]}")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "private, max-age=604800, immutable"
+
+
 def test_an_empty_tiles_directory_reports_nothing_rather_than_failing(
     logged_in_client, tmp_path, monkeypatch
 ):
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "TILES_DIR", str(tmp_path / "never-extracted"))
     body = client.get("/api/map/manifest").json()
-    assert body == {"build": None, "planet": None, "detail": None}
+    assert body == {"build": None, "assets_commit": None, "planet": None, "detail": None}
 
 
 def test_the_tiles_directory_defaults_to_the_derived_asset_volume(monkeypatch):

@@ -17,6 +17,19 @@ export const ATTRIBUTION = '© OpenStreetMap contributors © Protomaps'
 export const GLYPHS_URL = '/api/map/assets/fonts/{fontstack}/{range}.pbf'
 
 /**
+ * The asset URL a client should ask for, given the assets revision the manifest reported.
+ *
+ * The archives carry their version in the file NAME; the glyphs and sprites cannot — the style
+ * references them by fixed path and `fetch-assets.sh` overwrites them in place when its pin moves.
+ * The route still answers them with a week of `immutable`, so the query is what makes that
+ * truthful: a bumped pin is a URL nobody has cached. With no revision recorded there is nothing to
+ * version against, and a made-up value would cache just as wrongly, so the URL is left bare.
+ */
+export function versionedAssetUrl(url: string, assetsCommit: string | null | undefined): string {
+  return assetsCommit ? `${url}?v=${assetsCommit.slice(0, 8)}` : url
+}
+
+/**
  * Where the world archive stops and the region archive takes over. The planet archive is cut at
  * z7 and the detail archive covers z0–15, so z8 is the seam: below it the world, above it the
  * places the pins are.
@@ -80,8 +93,8 @@ export function buildStyle(manifest: MapManifest, flavorName: MapFlavor): StyleS
 
   return {
     version: 8,
-    glyphs: GLYPHS_URL,
-    sprite: `/api/map/assets/sprites/v4/${flavorName}`,
+    glyphs: versionedAssetUrl(GLYPHS_URL, manifest.assets_commit),
+    sprite: versionedAssetUrl(`/api/map/assets/sprites/v4/${flavorName}`, manifest.assets_commit),
     sources,
     layers: styleLayers,
   }

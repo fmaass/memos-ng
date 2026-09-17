@@ -716,6 +716,11 @@ export interface paths {
         /**
          * Serve Basemap Asset
          * @description Serve one map style asset — a glyph range or a sprite sheet.
+         *
+         *     Cached as long as an archive, and for a different reason: these paths ARE rewritten in place
+         *     when the assets pin is bumped, so a week of immutable caching is only truthful because the
+         *     style asks for them under a URL carrying the revision the manifest reported. A request's query
+         *     string is not part of the file lookup; it is the cache key.
          */
         get: operations["serve_basemap_asset_api_map_assets__path__get"];
         put?: never;
@@ -1947,8 +1952,16 @@ export interface components {
          *
          *     `detail` is null when no region archive has been published; a client renders the world archive
          *     alone rather than nothing at all.
+         *
+         *     `assets_commit` is the revision of the style's fonts and sprites currently on disk. Unlike an
+         *     archive, those files are overwritten IN PLACE at fixed paths when their pin is bumped, so
+         *     nothing about their URL would change — and they are served as cacheable for a week. Handing
+         *     the client the revision is what lets the style version the URLs it builds, which is the only
+         *     thing that can retire a cached copy of the previous ones.
          */
         MapManifest: {
+            /** Assets Commit */
+            assets_commit: string | null;
             /** Build */
             build: string | null;
             detail: components["schemas"]["MapArchive"] | null;

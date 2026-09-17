@@ -94,9 +94,16 @@ class MapManifest(BaseModel):
 
     `detail` is null when no region archive has been published; a client renders the world archive
     alone rather than nothing at all.
+
+    `assets_commit` is the revision of the style's fonts and sprites currently on disk. Unlike an
+    archive, those files are overwritten IN PLACE at fixed paths when their pin is bumped, so
+    nothing about their URL would change — and they are served as cacheable for a week. Handing
+    the client the revision is what lets the style version the URLs it builds, which is the only
+    thing that can retire a cached copy of the previous ones.
     """
 
     build: str | None
+    assets_commit: str | None
     planet: MapArchive | None
     detail: MapArchive | None
 
@@ -165,16 +172,24 @@ def _newest_archive(entries: list[Path], kind: str) -> dict[str, Any] | None:
     }
 
 
-def _build_date(root: Path) -> str | None:
+def _build_meta(root: Path) -> dict[str, str]:
+    """The tiles directory's BUILD file as key/value pairs, or nothing at all.
+
+    Two scripts append to this one file — `extract.sh` writes the archive lines and carries the
+    `assets_*` lines over verbatim, `fetch-assets.sh` rewrites the `assets_*` lines and leaves the
+    rest — so reading it wholesale is what keeps the manifest in step with both of them. A missing
+    file is an empty mapping: a host that has never extracted reports absences, not an error.
+    """
     try:
         text = (root / "BUILD").read_text()
     except OSError:
-        return None
+        return {}
+    meta: dict[str, str] = {}
     for line in text.splitlines():
-        key, _, value = line.partition("=")
-        if key.strip() == "build":
-            return value.strip() or None
-    return None
+        key, separator, value = line.partition("=")
+        if separator:
+            meta[key.strip()] = value.strip()
+    return meta
 
 
 def _manifest_sync() -> dict[str, Any]:
@@ -183,8 +198,10 @@ def _manifest_sync() -> dict[str, Any]:
         entries = [p for p in root.iterdir() if p.is_file()]
     except OSError:  # never extracted on this host yet — an empty manifest, not an error
         entries = []
+    meta = _build_meta(root)
     return {
-        "build": _build_date(root),
+        "build": meta.get("build") or None,
+        "assets_commit": meta.get("assets_commit") or None,
         "planet": _newest_archive(entries, "planet"),
         "detail": _newest_archive(entries, "detail"),
     }
@@ -245,7 +262,13 @@ async def serve_basemap_archive(name: str, request: Request) -> FileResponse:
 
 @router.get("/assets/{path:path}")
 async def serve_basemap_asset(path: str, request: Request) -> FileResponse:
-    """Serve one map style asset — a glyph range or a sprite sheet."""
+    """Serve one map style asset — a glyph range or a sprite sheet.
+
+    Cached as long as an archive, and for a different reason: these paths ARE rewritten in place
+    when the assets pin is bumped, so a week of immutable caching is only truthful because the
+    style asks for them under a URL carrying the revision the manifest reported. A request's query
+    string is not part of the file lookup; it is the cache key.
+    """
     await _authenticate(request)
     resolved = await to_thread.run_sync(_asset_path_sync, path)
     if resolved is None:

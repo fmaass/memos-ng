@@ -1506,8 +1506,15 @@
         "type": "object"
       },
       "MapManifest": {
-        "description": "Which basemap archives are available, and the date of the data they were cut from.\n\n`detail` is null when no region archive has been published; a client renders the world archive\nalone rather than nothing at all.",
+        "description": "Which basemap archives are available, and the date of the data they were cut from.\n\n`detail` is null when no region archive has been published; a client renders the world archive\nalone rather than nothing at all.\n\n`assets_commit` is the revision of the style's fonts and sprites currently on disk. Unlike an\narchive, those files are overwritten IN PLACE at fixed paths when their pin is bumped, so\nnothing about their URL would change \u2014 and they are served as cacheable for a week. Handing\nthe client the revision is what lets the style version the URLs it builds, which is the only\nthing that can retire a cached copy of the previous ones.",
         "properties": {
+          "assets_commit": {
+            "title": "Assets Commit",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "build": {
             "title": "Build",
             "type": [
@@ -1538,6 +1545,7 @@
         },
         "required": [
           "build",
+          "assets_commit",
           "planet",
           "detail"
         ],
@@ -4614,7 +4622,7 @@
     },
     "/api/map/assets/{path}": {
       "get": {
-        "description": "Serve one map style asset \u2014 a glyph range or a sprite sheet.",
+        "description": "Serve one map style asset \u2014 a glyph range or a sprite sheet.\n\nCached as long as an archive, and for a different reason: these paths ARE rewritten in place\nwhen the assets pin is bumped, so a week of immutable caching is only truthful because the\nstyle asks for them under a URL carrying the revision the manifest reported. A request's query\nstring is not part of the file lookup; it is the cache key.",
         "operationId": "serve_basemap_asset_api_map_assets__path__get",
         "parameters": [
           {
