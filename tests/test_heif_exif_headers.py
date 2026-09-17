@@ -91,9 +91,7 @@ def test_a_multi_megabyte_heic_costs_a_header_read_not_the_file(heifs):
         answer = _read(path)
 
     assert answer == EXPECTED
-    assert meter.bytes_read < 64 * 1024, (
-        f"read {meter.bytes_read} bytes of a {size}-byte HEIC"
-    )
+    assert meter.bytes_read < 64 * 1024, f"read {meter.bytes_read} bytes of a {size}-byte HEIC"
 
 
 def test_the_filler_megabytes_are_seeked_over_and_never_read(heifs):

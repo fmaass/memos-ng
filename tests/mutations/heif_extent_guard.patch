@@ -1,0 +1,21 @@
+Follow an extent whatever its construction_method and data_reference_index say.
+
+construction_method 1 and 2 address the payload inside `idat` or inside another item, and a
+non-zero data_reference_index puts it in a DIFFERENT file; the offsets they carry are meaningless
+against this one. A reader that follows them anyway hands on whatever bytes happen to sit there,
+which is why the probes this control must turn red are the item-offset and external-reference
+fixtures — the walk answering with bytes it should not have followed, and the fallback event
+never firing for the file whose read it silently took over. The idat fixture is NOT among them: it
+is declined a second time by the payload check, which is the point of having both guards.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -444,7 +444,7 @@ def _heif_extent(meta: bytes, start: int, end: int, item: int) -> tuple[int, int
+             continue
+         # construction_method 0 is a FILE offset; a data_reference_index names ANOTHER file; and a
+         # split extent would have to be stitched. None of the three is a header read of this file.
+-        if method != 0 or reference != 0 or extents != 1:
++        if extents != 1:
+             return None
+         cursor += index_size
+         offset = int.from_bytes(meta[cursor : cursor + offset_size], "big") if offset_size else 0

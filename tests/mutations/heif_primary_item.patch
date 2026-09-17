@@ -1,0 +1,19 @@
+Take the FIRST Exif item in the file instead of the one describing the primary image.
+
+A HEIC with two images carries two Exif items, and only the `cdsc` reference in `iref` says which
+belongs to which. The failure this control proves a test can see is silent and wrong rather than
+absent — the memo is dated from the decoy item, with no error anywhere — so the probe it must turn
+red is the four-item fixture's capture date, and nothing else.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -362,8 +362,7 @@
+     items = [item for item, kind in _heif_item_types(meta, start, end).items() if kind == b"Exif"]
+     if not items:
+         return None
+-    if len(items) == 1:
+-        return items[0]
++    return items[0]
+     primary = _heif_primary_item(meta, start, end)
+     iref = child(meta, start, end, b"iref")
+     if primary is None or iref is None:
