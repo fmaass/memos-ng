@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from app.scripts import backfill_location as bf
+from app.services import location
 from sqlalchemy import create_engine, event, text
 from structlog.testing import capture_logs
 
@@ -195,17 +196,28 @@ async def test_a_stalled_read_is_cut_off_and_counts_as_a_failure(seeded, monkeyp
     # A hung NFS read raises nothing: without a deadline the row never commits, the twenty-failure
     # stop never fires, and the run is simply gone — the one failure mode a `--sleep`d overnight
     # backfill actually meets.
+    #
+    # The stub eventually SUCCEEDS, which is what makes this a test of the deadline rather than of
+    # the generic failure branch: a stub that raised would settle as 'unreadable' either way, so
+    # the assertions below would hold with the deadline deleted. Because it succeeds, the only way
+    # the row can read 'unreadable' is a cut-off — and the elapsed time says the cut-off happened
+    # when the deadline said, not when the read finished.
     seeded([("stalled", WITH_GPS, None)])
+    slept = 2.0
+    deadline = 0.05
 
-    def _never_returns(path, mime):
-        time.sleep(2)
-        raise AssertionError("the deadline should have cut this read off")
+    def _answers_far_too_late(path, mime):
+        time.sleep(slept)
+        return location.LocationResult(latitude=12.5, longitude=45.25, source="exif")
 
-    monkeypatch.setattr(bf.location, "read_location", _never_returns)
-    monkeypatch.setattr(bf, "READ_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(bf.location, "read_location", _answers_far_too_late)
+    monkeypatch.setattr(bf, "READ_TIMEOUT_S", deadline)
 
+    started = time.monotonic()
     stats = await bf.run_backfill(await bf.load_candidates(execute=True), execute=True)
+    elapsed = time.monotonic() - started
 
+    assert elapsed < slept / 2, f"the run waited {elapsed:.2f}s for a read it should have cut off"
     assert (stats.failed, stats.sources["unreadable"]) == (1, 1)
     assert _read_back()["stalled"] == (None, None, "unreadable")
 
