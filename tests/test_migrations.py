@@ -6,6 +6,8 @@ catches up, the worker loop is gated on it, and only the app entrypoint runs ale
 """
 
 import inspect
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -146,10 +148,51 @@ async def test_rollback_mode_still_waits_for_a_head_the_graph_KNOWS(monkeypatch)
     assert polls.calls > 1
 
 
-def test_the_entrypoint_skips_the_migration_under_rollback_mode():
-    entrypoint = (REPO / "docker-entrypoint.sh").read_text()
-    _, sep, app_path = entrypoint.partition("exec python -m app.worker")
-    assert sep
-    assert "ROLLBACK_MODE" in app_path, "the app path must honour the rollback flag"
-    # The migration is still THE app path's job when the flag is absent: one migrator, unchanged.
-    assert app_path.count("alembic upgrade head") == 1
+def _run_entrypoint(tmp_path: Path, **env: str) -> list[str]:
+    """RUN docker-entrypoint.sh with alembic and uvicorn shimmed, and report what it invoked.
+
+    Executed rather than grepped: the text of a shell script is not its behaviour, and the failure
+    this guards against — a rollback deploy whose container migrates the database backwards and
+    never serves — is a behaviour. The shims are first on PATH, log their argv and exit 0, so the
+    script runs to its final `exec` in milliseconds and touches nothing.
+    """
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    log = tmp_path / "invoked.log"
+    for name in ("alembic", "uvicorn"):
+        shim = shim_dir / name
+        shim.write_text(f'#!/bin/sh\necho "{name} $*" >> "$INVOKED_LOG"\nexit 0\n')
+        shim.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "docker-entrypoint.sh"],
+        cwd=REPO,
+        env={
+            "PATH": f"{shim_dir}:{os.environ['PATH']}",
+            "INVOKED_LOG": str(log),
+            "HOME": str(tmp_path),
+            **env,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_the_entrypoint_skips_the_migration_under_rollback_mode(tmp_path):
+    invoked = _run_entrypoint(tmp_path, ROLLBACK_MODE="1")
+
+    assert not [line for line in invoked if line.startswith("alembic")], (
+        "a rolled-back image migrating the database is the outage this flag exists to prevent"
+    )
+    # ...and it still SERVES. "Ran no migration" would also be true of a container that crashed.
+    assert [line for line in invoked if line.startswith("uvicorn")]
+
+
+def test_the_entrypoint_migrates_exactly_once_before_serving_without_the_flag(tmp_path):
+    invoked = _run_entrypoint(tmp_path)
+
+    assert [line.split()[0] for line in invoked] == ["alembic", "uvicorn"], invoked
+    assert invoked[0] == "alembic upgrade head"
