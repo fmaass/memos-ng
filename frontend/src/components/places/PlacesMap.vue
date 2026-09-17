@@ -22,6 +22,7 @@ import { useDarkMode } from '@/composables/useDarkMode'
 import { bboxOf, type MapMarker, toFeatureCollection } from '@/lib/places/geo'
 import { blurhashToDataUrl } from '@/lib/media'
 import { badgeText, type PinSpec, pinsFor, type SourceFeature, syncMarkers } from '@/lib/places/markers'
+import { installMarkerSource, MARKERS_SOURCE } from '@/lib/places/source'
 import { ATTRIBUTION, buildStyle, type MapManifest } from '@/lib/places/style'
 
 const props = defineProps<{ markers: MapMarker[] }>()
@@ -31,7 +32,7 @@ const emit = defineEmits<{
   'visible-change': [uids: string[]]
 }>()
 
-const SOURCE = 'markers'
+const SOURCE = MARKERS_SOURCE
 const EMPTY_MANIFEST: MapManifest = { build: null, planet: null, detail: null }
 
 // The pmtiles protocol is a MapLibre global, not a per-map one: registering it twice throws.
@@ -207,27 +208,17 @@ onMounted(async () => {
   instance.addControl(new NavigationControl({ showCompass: false }), 'top-right')
 
   instance.on('load', () => {
-    instance.addSource(SOURCE, {
-      type: 'geojson',
-      data: toFeatureCollection(props.markers),
-      cluster: true,
-      clusterRadius: 40,
-      clusterMaxZoom: 17,
-      // The lead photo of a cluster, carried by the cluster itself: the alternative is a
-      // getClusterLeaves round trip per pin on every pan.
-      clusterProperties: { uid: [['coalesce', ['accumulated'], ['get', 'uid']], ['get', 'uid']] },
-    })
-    // Nothing draws this layer (opacity 0) — it exists because MapLibre only loads a source's
-    // tiles, and therefore only clusters, for a layer that uses it. The pins are DOM markers.
-    instance.addLayer({
-      id: 'markers-probe',
-      type: 'circle',
-      source: SOURCE,
-      paint: { 'circle-radius': 1, 'circle-opacity': 0 },
-    })
+    installMarkerSource(instance, toFeatureCollection(props.markers))
     fitToMarkers()
     fitted = props.markers.length > 0
     sync()
+  })
+  // Every style the map takes on needs the markers put back: `setStyle` (the theme toggle) hands
+  // MapLibre a style that knows nothing of them, its diff drops the source and the probe layer,
+  // and `load` never fires again. The installer no-ops while they are there, so this is the one
+  // place that notices they are gone, and it re-syncs the pins onto the source it just put back.
+  instance.on('styledata', () => {
+    if (installMarkerSource(instance, toFeatureCollection(props.markers))) sync()
   })
   instance.on('moveend', sync)
   instance.on('idle', sync)
@@ -248,7 +239,8 @@ watch(
   { immediate: true },
 )
 
-// The basemap flavour follows the app's theme; the markers and the camera survive the swap.
+// The basemap flavour follows the app's theme. The camera survives the swap on its own; the
+// markers are put back by the `styledata` handler above.
 watch(isDark, async (dark) => {
   const instance = map.value
   if (!instance) return
