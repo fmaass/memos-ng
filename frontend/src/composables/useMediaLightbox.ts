@@ -25,6 +25,8 @@ export interface LightboxHandlers {
   /** Attach or replace the photo's print master (the caller owns any confirmation + upload). */
   onAttachPrint?: (payload: AttachPrintPayload) => void
   onRemovePrint?: (payload: { uid: string; variantKey: string }) => void
+  /** Leave the viewer for the memo the current photo hangs on (the Places map opens it this way). */
+  onShowInMemo?: (memoUid: string) => void
   /** Resolve a photo's print master (with measured dimensions), or null when it has none. */
   loadPrintMaster?: (uid: string) => Promise<PrintMasterInfo | null>
 }
@@ -205,6 +207,37 @@ export function useMediaLightbox() {
               handlers.onDelete?.(cur.uid)
               pswp.close()
             }
+          },
+        })
+      }
+
+      if (handlers.onShowInMemo) {
+        pswp.ui?.registerElement({
+          name: 'show-in-memo',
+          order: 17, // after delete (16), still left of close (20)
+          isButton: true,
+          appendTo: 'bar',
+          html: {
+            isCustomSVG: true,
+            inner:
+              '<path transform="translate(4 4)" d="M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z" id="pswp__icn-show-in-memo"/>',
+            outlineID: 'pswp__icn-show-in-memo',
+          },
+          onInit: (el) => {
+            el.setAttribute('aria-label', 'Show in memo')
+            el.dataset.test = 'pswp-show-in-memo'
+            // A photo reached from Resources carries no memo: the button would navigate nowhere.
+            const sync = () => {
+              el.style.display = items[pswp.currIndex]?.memoUid ? 'block' : 'none'
+            }
+            pswp.on('change', sync)
+            sync()
+          },
+          onClick: () => {
+            const memoUid = items[pswp.currIndex]?.memoUid
+            if (!memoUid) return
+            handlers.onShowInMemo?.(memoUid)
+            pswp.close()
           },
         })
       }
