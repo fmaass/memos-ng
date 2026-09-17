@@ -1481,6 +1481,69 @@
         "title": "ManageGrantOut",
         "type": "object"
       },
+      "MapArchive": {
+        "description": "One published basemap archive.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "url",
+          "size"
+        ],
+        "title": "MapArchive",
+        "type": "object"
+      },
+      "MapManifest": {
+        "description": "Which basemap archives are available, and the date of the data they were cut from.\n\n`detail` is null when no region archive has been published; a client renders the world archive\nalone rather than nothing at all.",
+        "properties": {
+          "build": {
+            "title": "Build",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MapArchive"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "planet": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MapArchive"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "build",
+          "planet",
+          "detail"
+        ],
+        "title": "MapManifest",
+        "type": "object"
+      },
       "MapMarker": {
         "description": "One located attachment: the feed's ref, plus where and when.\n\nThe coordinate lives on THIS model alone. `AttachmentRef` \u2014 which every memo body carries \u2014\ndeliberately does not grow one, so a reader of `/api/memos` learns nothing about where a\nphoto was taken.",
         "properties": {
@@ -4549,6 +4612,85 @@
         ]
       }
     },
+    "/api/map/assets/{path}": {
+      "get": {
+        "description": "Serve one map style asset \u2014 a glyph range or a sprite sheet.",
+        "operationId": "serve_basemap_asset_api_map_assets__path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Serve Basemap Asset",
+        "tags": [
+          "map"
+        ]
+      }
+    },
+    "/api/map/manifest": {
+      "get": {
+        "description": "List the basemap archives this server currently offers.\n\nNever cached: it is the pointer that changes when new map data is published, and a client\nholding a stale copy would keep asking for an archive that has been superseded.",
+        "operationId": "basemap_manifest_api_map_manifest_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapManifest"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Basemap Manifest",
+        "tags": [
+          "map"
+        ]
+      }
+    },
     "/api/map/markers": {
       "get": {
         "description": "Every located photo the caller may see, oldest first.",
@@ -4574,6 +4716,102 @@
           }
         ],
         "summary": "List Markers",
+        "tags": [
+          "map"
+        ]
+      }
+    },
+    "/api/map/tiles/{name}": {
+      "get": {
+        "description": "Serve one basemap archive, by byte range.\n\nA map client fetches a few kilobytes per tile out of a multi-gigabyte file, so a ranged request\nis the normal case: it answers 206 and states the range it served, a range that starts past the\nend of the archive answers 416, and a request without a range header answers the whole file.",
+        "operationId": "serve_basemap_archive_api_map_tiles__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Serve Basemap Archive",
+        "tags": [
+          "map"
+        ]
+      },
+      "head": {
+        "description": "Serve one basemap archive, by byte range.\n\nA map client fetches a few kilobytes per tile out of a multi-gigabyte file, so a ranged request\nis the normal case: it answers 206 and states the range it served, a range that starts past the\nend of the archive answers 416, and a request without a range header answers the whole file.",
+        "operationId": "serve_basemap_archive_api_map_tiles__name__head",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Serve Basemap Archive",
         "tags": [
           "map"
         ]

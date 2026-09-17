@@ -9,9 +9,14 @@ would let the two copies drift — which is how a directive goes missing on exac
 import base64
 import hashlib
 
+# `worker-src 'self' blob:` is what lets the map render: MapLibre decodes vector tiles in web
+# workers it starts from blob URLs, and under `default-src 'self'` alone the browser refuses them
+# and the map comes up blank. It is deliberately NOT `child-src`: this policy names no `frame-src`,
+# so `child-src` would become the frame policy as well and widen something nobody asked about.
 CSP = (
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
     "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; "
+    "worker-src 'self' blob:; "
     "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 )
 
