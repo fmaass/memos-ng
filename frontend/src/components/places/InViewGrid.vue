@@ -4,14 +4,15 @@ import { computed } from 'vue'
 
 import type { MapMarker } from '@/lib/places/geo'
 import { blurhashToDataUrl } from '@/lib/media'
+import { newestFirst } from '@/lib/places/order'
 
 const props = defineProps<{ markers: MapMarker[]; filtered: boolean }>()
-const emit = defineEmits<{ open: [index: number]; reset: [] }>()
+// The tapped photo travels by uid, never by position: the tiles are sorted and the caller's list
+// is not, so an index would open a different photo in the viewer.
+const emit = defineEmits<{ open: [uid: string]; reset: [] }>()
 
 // Newest first: the map is the filter, and what the phone shows under it reads like the feed.
-const ordered = computed(() =>
-  [...props.markers].sort((a, b) => Date.parse(b.taken_at) - Date.parse(a.taken_at)),
-)
+const ordered = computed(() => newestFirst(props.markers))
 
 function source(marker: MapMarker): string {
   return marker.mime.startsWith('video/') ? marker.posterUrl : marker.thumbnailUrl
@@ -35,12 +36,12 @@ function source(marker: MapMarker): string {
     </div>
     <div class="grid grid-cols-3 gap-1">
       <button
-        v-for="(marker, index) in ordered"
+        v-for="marker in ordered"
         :key="marker.uid"
         type="button"
         class="aspect-square overflow-hidden rounded bg-surface-200 dark:bg-surface-800"
         data-test="in-view-tile"
-        @click="emit('open', index)"
+        @click="emit('open', marker.uid)"
       >
         <img
           :src="source(marker)"

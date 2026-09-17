@@ -11,6 +11,7 @@ import { useApi } from '@/composables/useApi'
 import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import type { MapMarker } from '@/lib/places/geo'
 import { memoPath, toLightboxItems } from '@/lib/places/lightbox'
+import { viewerTarget } from '@/lib/places/order'
 
 const api = useApi()
 const router = useRouter()
@@ -54,10 +55,14 @@ function openViewer(list: MapMarker[], index: number) {
   })
 }
 
+/** A pin or a grid tile names the photo it shows; the viewer opens on the order it is shown in. */
+function openByUid(markers: MapMarker[], uid: string) {
+  const target = viewerTarget(markers, uid)
+  openViewer(target.list, target.index)
+}
+
 function onPointOpen(uid: string) {
-  const list = inView.value
-  const index = list.findIndex((m) => m.uid === uid)
-  openViewer(list, index < 0 ? 0 : index)
+  openByUid(inView.value, uid)
 }
 
 function onClusterOpen(payload: { clusterId: number | null; uids: string[] }) {
@@ -120,7 +125,7 @@ const drawerOpen = computed({
       class="min-h-0 flex-1 overflow-y-auto"
       :markers="gridMarkers"
       :filtered="selection !== null"
-      @open="openViewer(gridMarkers, $event)"
+      @open="openByUid(gridMarkers, $event)"
       @reset="selection = null"
     />
     <ClusterDrawer
