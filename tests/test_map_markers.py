@@ -277,3 +277,129 @@ def test_the_generated_schema_describes_the_endpoint_and_the_marker():
     assert {"memo_uid", "latitude", "longitude", "taken_at"} <= set(marker)
     # ...and the coordinate is on the MARKER alone: the feed's ref must not have grown one.
     assert "latitude" not in schema["components"]["schemas"]["AttachmentRef"]["properties"]
+
+
+# --------------------------------------------------------------------------------------------
+# The body against the schema the SPA is generated from
+# --------------------------------------------------------------------------------------------
+
+
+def _deref(schema: dict, node: dict) -> dict:
+    """Follow a local `$ref` to the component it names."""
+    ref = node.get("$ref")
+    if ref is None:
+        return node
+    target: object = schema
+    for part in ref.removeprefix("#/").split("/"):
+        target = target[part]  # type: ignore[index]
+    return _deref(schema, target)  # type: ignore[arg-type]
+
+
+_JSON_TYPES: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def _violations(schema: dict, node: dict, value: object, path: str) -> list[str]:
+    """Every way `value` disagrees with `node`. A tiny reader of `required` + `type`/`anyOf`.
+
+    Hand-rolled rather than `jsonschema`: this repo has no such dependency, and a contract test
+    that requires adding one to the RUNTIME image would be paid for on every deploy.
+    """
+    node = _deref(schema, node)
+    if "anyOf" in node:
+        if any(not _violations(schema, option, value, path) for option in node["anyOf"]):
+            return []
+        return [f"{path}: {value!r} matches none of the declared alternatives"]
+    kind = node.get("type")
+    if isinstance(kind, list):  # OpenAPI 3.1 spells a nullable leaf as a list of types
+        if any(not _violations(schema, {**node, "type": one}, value, path) for one in kind):
+            return []
+        return [f"{path}: {value!r} is none of {kind}"]
+    if kind == "object" or "properties" in node:
+        if not isinstance(value, dict):
+            return [f"{path}: expected an object, got {type(value).__name__}"]
+        found: list[str] = []
+        for name in node.get("required", []):
+            if name not in value:
+                found.append(f"{path}.{name}: required by the schema and absent from the body")
+        for name, sub in node.get("properties", {}).items():
+            if name in value:
+                found += _violations(schema, sub, value[name], f"{path}.{name}")
+        return found
+    if kind == "array":
+        if not isinstance(value, list):
+            return [f"{path}: expected an array, got {type(value).__name__}"]
+        found = []
+        for index, item in enumerate(value):
+            found += _violations(schema, node.get("items", {}), item, f"{path}[{index}]")
+        return found
+    if kind is None:
+        return []
+    if kind in ("integer", "number") and isinstance(value, bool):
+        return [f"{path}: a boolean is not a {kind}"]
+    if not isinstance(value, _JSON_TYPES[kind]):
+        return [f"{path}: expected {kind}, got {type(value).__name__}"]
+    return []
+
+
+def test_the_validator_itself_reports_a_missing_required_property():
+    # The positive control for the two cases below: a validator that always answers "no
+    # violations" would pass them both with the route serving anything at all.
+    schema = json.loads(OPENAPI.read_text())
+    marker = _deref(schema, {"$ref": "#/components/schemas/MapMarker"})
+    assert "uid" in marker["required"]
+    assert _violations(schema, marker, {}, "MapMarker")
+    assert _violations(schema, {"type": "number"}, "12.5", "lat")
+    assert _violations(schema, {"$ref": "#/components/schemas/MapMarker"}, [], "MapMarker")
+
+
+def test_the_served_body_validates_against_the_generated_schema(logged_in_client):
+    # What the SPA's generated types promise, checked against what the route actually answers —
+    # including every nullable property, which a response serialized without its nulls would drop.
+    client, subject = logged_in_client
+    schema = json.loads(OPENAPI.read_text())
+    eng = create_engine(SYNC_URL)
+    try:
+        with eng.begin() as c:
+            owner_id = c.execute(
+                text("SELECT id FROM users WHERE subject = :s"), {"s": subject}
+            ).scalar_one()
+            memo_id = c.execute(
+                text(
+                    "INSERT INTO memos"
+                    " (uid, owner_id, content, visibility, pinned, created_at, updated_at)"
+                    " VALUES ('memo-schema', :o, 'somewhere', 'PUBLIC', false, now(), now())"
+                    " RETURNING id"
+                ),
+                {"o": owner_id},
+            ).scalar_one()
+            c.execute(
+                text(
+                    "INSERT INTO attachments"
+                    " (uid, owner_id, memo_id, filename, mime, size, status, storage_path,"
+                    "  latitude, longitude, location_source)"
+                    " VALUES ('schema1', :o, :m, 's.jpg', 'image/jpeg', 1, 'ready', '/nowhere',"
+                    "  -33.75, -25.5, 'exif')"
+                ),
+                {"o": owner_id, "m": memo_id},
+            )
+
+        answered = client.get("/api/map/markers")
+        assert answered.status_code == 200
+        body = answered.json()
+        assert len(body["markers"]) == 1, "an empty list would validate vacuously"
+
+        found = _violations(
+            schema, {"$ref": "#/components/schemas/MapMarkerList"}, body, "MapMarkerList"
+        )
+        assert found == []
+    finally:
+        eng.dispose()
+        _wipe()

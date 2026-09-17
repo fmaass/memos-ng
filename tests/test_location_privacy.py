@@ -19,6 +19,7 @@ Every coordinate used here comes from `fixtures/locations.json`, and every coord
 fictional (open ocean) — see `scripts/gen_location_fixtures.py`.
 """
 
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -213,6 +214,44 @@ def _upload(client, name, mime, data: bytes) -> str:
     r = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
     assert r.status_code == 200, r.text
     return uid
+
+
+def test_a_poster_override_uploaded_through_the_api_is_served_without_its_gps(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # The end-to-end case for the override lane: a client's own JPEG, which carries whatever its
+    # camera wrote, becomes a DERIVED tier. Driven through the real upload + create routes and
+    # read back from the SERVED poster URL, because the leak would be in what is served, not in
+    # what a helper returns.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        located_jpeg = (BINARIES / "jpeg-north-east.jpg").read_bytes()
+        assert _gps_ifd(BINARIES / "jpeg-north-east.jpg"), "the source must carry GPS to prove this"
+
+        video_uid = _upload(client, "clip.mov", "video/quicktime", bytes(range(256)) * 400)
+        poster_uid = _upload(client, "title.jpg", "image/jpeg", located_jpeg)
+        created = client.post(
+            "/api/memos",
+            json={
+                "visibility": "PUBLIC",
+                "content": "the monthly video",
+                "upload_uids": [video_uid],
+                "video_posters": {video_uid: poster_uid},
+            },
+        )
+        assert created.status_code == 201, created.text
+        [attachment] = created.json()["attachments"]
+
+        served = client.get(attachment["posterUrl"])
+        assert served.status_code == 200, served.text
+        assert served.headers["content-type"].startswith("image/")
+        with Image.open(io.BytesIO(served.content)) as poster:
+            assert dict(poster.getexif().get_ifd(GPS_IFD)) == {}
+        for spelling in LEAKED_SPELLINGS:
+            assert spelling.encode() not in served.content
+    finally:
+        _cleanup()
 
 
 def test_no_other_api_body_and_no_log_line_carries_a_coordinate(
