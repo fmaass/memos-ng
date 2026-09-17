@@ -148,6 +148,8 @@ describe('PlacesMap timeline seam', () => {
       jan,
     ])
     expect(uidsIn(maplibre.state.map?.sources.get(MARKERS_SOURCE)?.data)).toEqual(['jan'])
+    // The per-tick cost the plan asks to be measured is read off the DOM, as Phase 3's sync is.
+    expect(wrapper.attributes('data-set-data-ms')).toMatch(/^\d+$/)
     wrapper.unmount()
   })
 

@@ -50,6 +50,8 @@ const container = ref<HTMLElement | null>(null)
 const map = shallowRef<MapLibreMap | null>(null)
 /** Milliseconds the last marker sync took — read off the DOM by the performance check. */
 const syncMs = ref(0)
+/** Milliseconds the last `setData` took: the timeline's per-tick cost, the plan's known-unknown. */
+const setDataMs = ref(0)
 
 const byUid = new Map<string, MapMarker>()
 // What the map is CURRENTLY showing — the timeline's playhead set once playback starts, the full
@@ -74,7 +76,9 @@ function source(): GeoJSONSource | undefined {
 function setVisibleMarkers(markers: readonly MapMarker[], landing: readonly string[] = []) {
   currentMarkers = markers
   landingUids = new Set(landing)
+  const started = performance.now()
   source()?.setData(toFeatureCollection(markers))
+  setDataMs.value = Math.round(performance.now() - started)
   sync()
 }
 defineExpose({ setVisibleMarkers, zoomToCluster })
@@ -297,6 +301,7 @@ onBeforeUnmount(() => {
     class="h-full w-full"
     data-test="places-map"
     :data-sync-ms="syncMs"
+    :data-set-data-ms="setDataMs"
     role="application"
     aria-label="Map of where the photos were taken"
   />
