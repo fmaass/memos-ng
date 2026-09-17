@@ -131,13 +131,16 @@ publish() {
             echo "extract.sh: ${name} is already published and verifies — skipping"
             return 0
         fi
-        # A published name is never rewritten, not even to repair it. Clients cache an archive's
-        # directory against its URL and a file response reads its size and timestamp separately
-        # from its bytes, so replacing the contents under a name that is already in circulation
-        # hands somebody new bytes with an old map of where things are in them. A damaged archive
-        # is an operator's decision: move it out of the way and re-run.
+        # A published name is never rewritten, not even to repair it, and never deleted either.
+        # Clients cache an archive's directory against its URL and a file response reads its size
+        # and timestamp separately from its bytes, so replacing the contents under a name that is
+        # already in circulation hands somebody new bytes with an old map of where things are in
+        # them — and deleting it takes the map away from clients mid-session. The way out is
+        # forward: extract again under a build date nobody has seen, which produces a new name,
+        # and let the manifest move to it.
         echo "extract.sh: ${TILES_DIR}/${name} exists but does not verify." >&2
-        echo "extract.sh: a published name is never rewritten — move that file away by hand, then re-run." >&2
+        echo "extract.sh: a published name is never rewritten or deleted." >&2
+        echo "extract.sh: re-run with a fresh build name (--build <newer YYYYMMDD>) — the repaired archive is published beside this one, and the manifest moves to it." >&2
         exit 2
     fi
     rm -f "${TILES_DIR}/${name}.tmp"

@@ -17,6 +17,7 @@ resources. Three properties are load-bearing and each has a failure that looks l
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -342,3 +343,46 @@ def test_the_policy_gains_the_worker_directive_and_nothing_else(client):
     assert "worker-src 'self' blob:" in directives
     assert [d for d in directives if d != "worker-src 'self' blob:"] == list(CSP_BEFORE)
     assert not re.search(r"\b(child|frame)-src\b", served)
+
+
+# --- the extraction script's one refusal ------------------------------------------------------
+
+EXTRACT_SH = Path(__file__).resolve().parent.parent / "scripts" / "tiles" / "extract.sh"
+
+
+def test_a_published_archive_that_stops_verifying_is_refused_never_rewritten(tmp_path):
+    """The script may not repair an archive under the name it was published as.
+
+    A client caches that archive's directory against its URL and a file response reads size and
+    timestamp separately from bytes, so new bytes under an old name hand somebody a map of where
+    things are that no longer matches — and deleting the file instead takes the basemap away from
+    whoever is mid-session on it. So the refusal has to point FORWARD, at a fresh build name, and
+    the message is asserted here because it is the entire remedy an operator gets.
+
+    The extraction tool is a dependency, stubbed so it reports the archive as bad without a
+    network round-trip; the script's own control flow runs in full.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    published = tiles / "planet-20260916.pmtiles"
+    published.write_bytes(b"not a valid archive any more")
+    before = published.read_bytes()
+
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "docker"
+    stub.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = verify ] && exit 1; done\nexit 0\n')
+    stub.chmod(0o755)
+
+    run = subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), "--build", "20260916", "--dev", "small"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode == 2, (run.returncode, run.stdout, run.stderr)
+    assert "never rewritten or deleted" in run.stderr, run.stderr
+    assert "--build <newer YYYYMMDD>" in run.stderr, run.stderr
+    assert published.read_bytes() == before  # not repaired, not truncated, not touched
+    assert list(tiles.glob("*.tmp")) == []  # and nothing half-written left behind
