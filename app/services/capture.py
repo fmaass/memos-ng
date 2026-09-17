@@ -368,7 +368,7 @@ def _heif_item_types(
             return None
         item = int.from_bytes(meta[info + 4 : info + 4 + id_size], "big")
         types[item] = meta[info + type_at : info + type_at + 4]
-    if len(types) != declared:  # two entries claiming one item ID: which is which is unknowable
+    if len(types) != len(entries):  # two entries claiming one ID: which is which is unknowable
         return None
     return types
 
