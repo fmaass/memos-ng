@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { buildHistogram, type TimelineState } from '@/lib/places/timeline'
+import { buildHistogram, reduce, type TimelineState } from '@/lib/places/timeline'
 import {
   BAR_HEIGHT,
   BAR_WIDTH,
@@ -141,6 +141,20 @@ describe('timelineKeyAction', () => {
     expect(timelineKeyAction('x', paused, document.body)).toBeNull()
   })
 
+  it('stands back for the photo viewer, which owns the arrows while it is open', () => {
+    const paused = state()
+    expect(timelineKeyAction('ArrowRight', paused, document.body, { viewerOpen: true })).toBeNull()
+    expect(timelineKeyAction(' ', paused, document.body, { viewerOpen: true })).toBeNull()
+    // PhotoSwipe handles the arrows at document level; the event still bubbles to the window.
+    expect(
+      timelineKeyAction('ArrowLeft', paused, document.body, { defaultPrevented: true }),
+    ).toBeNull()
+    expect(timelineKeyAction('ArrowLeft', paused, document.body, {})).toEqual({
+      type: 'seek',
+      index: -1,
+    })
+  })
+
   it('leaves every key alone while a field has focus', () => {
     const paused = state()
     for (const tag of ['input', 'textarea', 'select']) {
@@ -181,6 +195,33 @@ describe('createTicker', () => {
   })
 
   it('keeps one interval for every speed: speed advances buckets, not the clock', () => {
-    expect(TICK_MS).toBe(600)
+    // The clock is constant and the STRIDE is what 2× and 4× change — a speed-dependent interval
+    // would do more `setData` per second instead of covering more months per tick.
+    vi.useFakeTimers()
+    let playback: TimelineState = { ...state({ playing: true }), bucketCount: 400 }
+    const ticks: number[] = []
+    const ticker = createTicker(() => {
+      playback = reduce(playback, { type: 'tick' })
+      ticks.push(playback.index)
+    })
+    ticker.start()
+    vi.advanceTimersByTime(TICK_MS * 4)
+    expect(ticks).toEqual([1, 2, 3, 4]) // 1×: four ticks, stride 1
+
+    playback = reduce(playback, { type: 'setSpeed', speed: 4 })
+    vi.advanceTimersByTime(TICK_MS * 4)
+    expect(ticks).toHaveLength(8) // same clock
+    expect(ticks.slice(4)).toEqual([8, 12, 16, 20]) // stride 4
+
+    playback = reduce(playback, { type: 'setSpeed', speed: 2 })
+    vi.advanceTimersByTime(TICK_MS * 2)
+    expect(ticks).toHaveLength(10)
+    expect(ticks.slice(8)).toEqual([22, 24])
+
+    ticker.stop()
+    expect(ticker.running).toBe(false)
+    vi.advanceTimersByTime(TICK_MS * 10)
+    expect(ticks).toHaveLength(10) // stop() after a speed change leaves no timer behind
+    vi.useRealTimers()
   })
 })
