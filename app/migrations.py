@@ -46,6 +46,17 @@ class SchemaGateTimeout(RuntimeError):
     """The live schema never reached the code's expected head within the gate's budget."""
 
 
+def known_revisions() -> set[str]:
+    """Every revision id THIS image's migration scripts describe.
+
+    A head outside this set was written by a migration this image does not carry, which — since
+    revisions only ever move forward — means a NEWER image migrated the database. That is exactly
+    the rollback case, and it is the only thing ROLLBACK_MODE lets through.
+    """
+    script = ScriptDirectory.from_config(Config(str(_ALEMBIC_INI)))
+    return {revision.revision for revision in script.walk_revisions()}
+
+
 def expected_head() -> str:
     """The migration head THIS image was built with (the newest revision in alembic/versions).
 
@@ -91,6 +102,13 @@ async def wait_for_migrated_schema(
                     if announced_wait:
                         logger.info("worker_schema_gate_cleared", head=want)
                     return want
+                if have is not None and settings.ROLLBACK_MODE and have not in known_revisions():
+                    # A rollback: the schema is AHEAD of this image, and the expand-only migration
+                    # it carries leaves every column this code reads in place. Waiting would pin
+                    # the worker off for the whole rollback window for nothing. Announced once,
+                    # loudly, because it is the one state in which the gate proves nothing.
+                    logger.warning("worker_schema_gate_rollback_mode", have=have, want=want)
+                    return have
                 if not announced_wait:  # log the wait once, not every poll
                     logger.info("worker_schema_gate_waiting", have=have, want=want, budget_s=budget)
                     announced_wait = True

@@ -9,9 +9,31 @@ import inspect
 from pathlib import Path
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from app import migrations, worker
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def _fixed_head(value: str | None):
+    async def _head() -> str | None:
+        return value
+
+    return _head
+
+
+def _counting_head(value: str | None):
+    """A stand-in `current_db_head` that records how often the gate actually polled it."""
+
+    class _Head:
+        calls = 0
+
+        async def __call__(self) -> str | None:
+            _Head.calls += 1
+            return value
+
+    return _Head()
 
 
 async def test_expected_head_matches_the_migrated_db(db_engine):
@@ -52,7 +74,7 @@ async def test_current_db_head_returns_none_on_db_error(monkeypatch):
             return False
 
         async def execute(self, *a, **k):
-            raise SQLAlchemyError("relation \"alembic_version\" does not exist")
+            raise SQLAlchemyError('relation "alembic_version" does not exist')
 
     monkeypatch.setattr(migrations, "async_session", lambda: _BoomSession())
     assert await migrations.current_db_head() is None
@@ -77,3 +99,57 @@ def test_only_the_app_entrypoint_runs_alembic():
     assert sep, "docker-entrypoint.sh no longer has the worker exec this pin anchors on"
     assert "alembic" not in worker_branch, "the worker path must NOT run alembic"
     assert app_path.count("alembic upgrade head") == 1, "the app path is the one and only migrator"
+
+
+# --- ROLLBACK_MODE: the previous image has to be able to start on a NEWER schema ----------------
+#
+# Expand-only migrations mean a rollback keeps the new columns and runs the old code against them.
+# Two things stop that today: the app entrypoint runs `alembic upgrade head` unconditionally (the
+# old image's graph does not contain the new revision → "Can't locate revision"), and this gate
+# waits for a head EQUAL to the old image's (→ an endless wait). ROLLBACK_MODE=1 is what the NEXT
+# rollback uses instead of a compose overlay; the overlay in RELEASING.md is for the one release
+# that ships this flag, whose previous image does not have it yet.
+
+
+async def test_the_gate_accepts_an_unknown_db_head_under_rollback_mode(monkeypatch):
+    # A revision this image's graph has never heard of is, by construction, a NEWER one: nothing
+    # else could have written it. Under ROLLBACK_MODE the worker proceeds against it.
+    unknown = "ffffffffffff"
+    monkeypatch.setattr(migrations, "current_db_head", _fixed_head(unknown))
+    monkeypatch.setattr(migrations.settings, "ROLLBACK_MODE", True)
+    assert await migrations.wait_for_migrated_schema(budget_s=5, interval=0.01) == unknown
+
+
+async def test_the_gate_keeps_waiting_on_an_unknown_db_head_without_rollback_mode(monkeypatch):
+    # The default is unchanged and still fails safe: without the flag the same schema is one this
+    # code must not drain against, so the budget runs out and the worker exits for Docker to
+    # restart. The poll counter is the proof it WAITED rather than returning some other way.
+    polls = _counting_head("ffffffffffff")
+    monkeypatch.setattr(migrations, "current_db_head", polls)
+    monkeypatch.setattr(migrations.settings, "ROLLBACK_MODE", False)
+    with pytest.raises(migrations.SchemaGateTimeout):
+        await migrations.wait_for_migrated_schema(budget_s=0.3, interval=0.05)
+    assert polls.calls > 1
+
+
+async def test_rollback_mode_still_waits_for_a_head_the_graph_KNOWS(monkeypatch):
+    # The flag is not "skip the gate". A DB at an OLDER known revision is a migration in flight —
+    # exactly the case MEMNG-86 exists for — and the worker waits for it, flag or no flag.
+    script = ScriptDirectory.from_config(Config(str(REPO / "alembic.ini")))
+    revisions = [rev.revision for rev in script.walk_revisions()]
+    older = revisions[1]  # the revision before this image's head
+    polls = _counting_head(older)
+    monkeypatch.setattr(migrations, "current_db_head", polls)
+    monkeypatch.setattr(migrations.settings, "ROLLBACK_MODE", True)
+    with pytest.raises(migrations.SchemaGateTimeout):
+        await migrations.wait_for_migrated_schema(budget_s=0.3, interval=0.05)
+    assert polls.calls > 1
+
+
+def test_the_entrypoint_skips_the_migration_under_rollback_mode():
+    entrypoint = (REPO / "docker-entrypoint.sh").read_text()
+    _, sep, app_path = entrypoint.partition("exec python -m app.worker")
+    assert sep
+    assert "ROLLBACK_MODE" in app_path, "the app path must honour the rollback flag"
+    # The migration is still THE app path's job when the flag is absent: one migrator, unchanged.
+    assert app_path.count("alembic upgrade head") == 1
