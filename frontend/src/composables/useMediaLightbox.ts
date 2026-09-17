@@ -1,4 +1,5 @@
 import PhotoSwipeLightbox from 'photoswipe/lightbox'
+import { ref } from 'vue'
 import PhotoSwipe from 'photoswipe'
 import 'photoswipe/style.css'
 import './mediaLightbox.css'
@@ -52,6 +53,10 @@ function safeInset(side: 'top' | 'bottom' | 'left' | 'right'): number {
  */
 export function useMediaLightbox() {
   let lightbox: PhotoSwipeLightbox | null = null
+  // Whether the viewer currently owns the screen. Callers with their own keyboard shortcuts (the
+  // Places timeline) have to stand back while it is open: PhotoSwipe handles the arrows at
+  // document level and the event still reaches a window listener afterwards.
+  const isOpen = ref(false)
   let addPrintInput: HTMLInputElement | null = null
   // Re-render the print row from outside (the view refetched and the master may have changed).
   let refreshPrint: (() => void) | null = null
@@ -379,8 +384,12 @@ export function useMediaLightbox() {
       syncPrintUi()
     }
 
+    lightbox.on('close', () => {
+      isOpen.value = false
+    })
     lightbox.init()
     lightbox.loadAndOpen(index)
+    isOpen.value = true
   }
 
   // A reusable hidden file input for picking a print master.
@@ -404,6 +413,7 @@ export function useMediaLightbox() {
   function destroy() {
     lightbox?.destroy()
     lightbox = null
+    isOpen.value = false
     refreshPrint = null
     addPrintInput?.remove()
     addPrintInput = null
@@ -414,5 +424,5 @@ export function useMediaLightbox() {
     refreshPrint?.()
   }
 
-  return { open, destroy, refreshPrintMaster }
+  return { open, destroy, refreshPrintMaster, isOpen }
 }

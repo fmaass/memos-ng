@@ -20,6 +20,15 @@ vi.mock('@tanstack/vue-query', async () => {
 })
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
 
+// PhotoSwipe cannot open in happy-dom; what this view owes it is a pause and the keyboard.
+const lightbox = vi.hoisted(() => ({
+  open: vi.fn(),
+  destroy: vi.fn(),
+  refreshPrintMaster: vi.fn(),
+  isOpen: { value: false },
+}))
+vi.mock('@/composables/useMediaLightbox', () => ({ useMediaLightbox: () => lightbox }))
+
 const setVisibleMarkers = vi.fn()
 const zoomToCluster = vi.fn()
 /** The map, reduced to the seam the view drives: it records what it was handed per tick. */
@@ -78,6 +87,8 @@ function press(key: string, target: EventTarget = window) {
 beforeEach(() => {
   query.markers = ALL
   setVisibleMarkers.mockClear()
+  lightbox.open.mockClear()
+  lightbox.isOpen.value = false
 })
 afterEach(() => {
   vi.useRealTimers()
@@ -155,6 +166,52 @@ describe('PlacesView timeline wiring', () => {
     vi.advanceTimersByTime(600)
     await wrapper.vm.$nextTick()
     expect(setVisibleMarkers.mock.calls.at(-1)?.[1]).toEqual(['feb'])
+    wrapper.unmount()
+  })
+
+  it('pauses playback when a photo opens, and does not resume on its own', async () => {
+    vi.useFakeTimers()
+    const wrapper = mountView()
+    await wrapper.vm.$nextTick()
+    press(' ')
+    await wrapper.vm.$nextTick()
+    vi.advanceTimersByTime(600)
+    await wrapper.vm.$nextTick()
+
+    // The viewer shows a snapshot of the list it was opened with; a playhead that kept moving
+    // would take photos out of the map and the grid while they are still on screen.
+    wrapper.findComponent(MapStub).vm.$emit('point-open', 'jan')
+    await wrapper.vm.$nextTick()
+    expect(lightbox.open).toHaveBeenCalledTimes(1)
+    const opened = { calls: setVisibleMarkers.mock.calls.length, shown: lastShown() }
+    vi.advanceTimersByTime(3000)
+    await wrapper.vm.$nextTick()
+    // The clock is off: no further tick reached the map, and the playhead stands where it was.
+    expect(setVisibleMarkers.mock.calls.length).toBe(opened.calls)
+    expect(lastShown()).toEqual(opened.shown)
+    wrapper.unmount()
+  })
+
+  it('leaves the arrows to the photo viewer while it is open', async () => {
+    const wrapper = mountView()
+    await wrapper.vm.$nextTick()
+    lightbox.isOpen.value = true
+    press('ArrowLeft')
+    await wrapper.vm.$nextTick()
+    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
+    wrapper.unmount()
+  })
+
+  it('leaves alone a keystroke another handler has already claimed', async () => {
+    const wrapper = mountView()
+    await wrapper.vm.$nextTick()
+    // PhotoSwipe answers the arrows on `document` and the event still reaches the window.
+    const claim = (event: Event) => event.preventDefault()
+    document.addEventListener('keydown', claim)
+    press('ArrowLeft', document.body)
+    document.removeEventListener('keydown', claim)
+    await wrapper.vm.$nextTick()
+    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
     wrapper.unmount()
   })
 

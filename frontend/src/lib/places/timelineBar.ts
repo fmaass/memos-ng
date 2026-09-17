@@ -152,11 +152,21 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return element.isContentEditable === true || element.getAttribute?.('contenteditable') === 'true'
 }
 
+/** What else on the page may already own the keystroke. */
+export interface KeyContext {
+  /** Another handler has claimed it — PhotoSwipe takes the arrows at document level. */
+  defaultPrevented?: boolean
+  /** The photo viewer is on screen: it owns space and the arrows until it closes. */
+  viewerOpen?: boolean
+}
+
 export function timelineKeyAction(
   key: string,
   state: TimelineState,
   target: EventTarget | null,
+  context: KeyContext = {},
 ): TimelineAction | null {
+  if (context.defaultPrevented || context.viewerOpen) return null
   if (isTypingTarget(target)) return null
   return actionForKey(key, state)
 }

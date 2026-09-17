@@ -79,7 +79,10 @@ watch(
 )
 
 function onKeydown(event: KeyboardEvent) {
-  const action = timelineKeyAction(event.key, playhead.value, event.target)
+  const action = timelineKeyAction(event.key, playhead.value, event.target, {
+    defaultPrevented: event.defaultPrevented,
+    viewerOpen: lightbox.isOpen.value,
+  })
   if (!action) return
   event.preventDefault() // space would otherwise scroll the page under the map
   dispatch(action)
@@ -110,6 +113,10 @@ const lightbox = useMediaLightbox()
 onUnmounted(() => lightbox.destroy())
 
 function openViewer(list: MapMarker[], index: number) {
+  // The viewer holds the list it was opened with. A playhead that kept advancing would drop
+  // photos out of the map, the drawer and the grid while the viewer still shows them — and in
+  // 12-month mode take them away entirely. Opening pauses; closing does not resume by itself.
+  dispatch({ type: 'pause' })
   lightbox.open(toLightboxItems(list), index, {
     onShowInMemo: (memoUid) => {
       void router.push(memoPath({ memo_uid: memoUid }))
