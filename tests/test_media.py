@@ -307,6 +307,12 @@ def test_poster_cmd_without_colour_is_the_command_this_repo_has_always_run():
         "/in.mov",
         "-map",
         "0:V:0",
+        # A derived artifact carries no metadata: a geotagged source used to publish its
+        # coordinates through this lane (tests/test_location_privacy.py).
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
         "-vf",
         "thumbnail=100",
         "-frames:v",
