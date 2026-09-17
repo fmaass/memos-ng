@@ -307,3 +307,107 @@ def test_the_uploads_table_gained_no_location_column(db_engine):
     assert {"latitude", "longitude", "location_source"} & columns == set()
     attachment_columns = {c["name"] for c in inspect(db_engine).get_columns("attachments")}
     assert {"latitude", "longitude", "location_source"} <= attachment_columns
+
+
+# --- the DATABASE ERROR PATH: a statement that fails carries its parameters ------------------
+# A coordinate is a bound parameter of every write that stores one. SQLAlchemy quotes bound
+# parameters into the exception message by default, which then reaches a traceback, a log handler
+# and the backfill's stdout — the one place left where a value could leave the machine.
+
+NORTH_EAST = ARTEFACT["binaries"]["jpeg-north-east.jpg"]["expect"]
+
+
+@pytest.mark.asyncio
+async def test_failing_statement_never_quotes_the_coordinate_it_carried(adb):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    owner = (
+        await adb.execute(
+            text(
+                "INSERT INTO users (subject, display_name, role, created_at)"
+                " VALUES ('privacy-owner', 'privacy-owner', 'user', now()) RETURNING id"
+            )
+        )
+    ).scalar_one()
+    memo = (
+        await adb.execute(
+            text(
+                "INSERT INTO memos (uid, owner_id, content, visibility, pinned, created_at,"
+                " updated_at) VALUES ('privacy-memo', :o, '', 'PRIVATE', false, now(), now())"
+                " RETURNING id"
+            ),
+            {"o": owner},
+        )
+    ).scalar_one()
+    attachment = (
+        await adb.execute(
+            text(
+                "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status,"
+                " storage_path, position, created_at) VALUES ('privacy-att', :o, :m, 'a.jpg',"
+                " 'image/jpeg', 1, 'ready', '/dev/null', 0, now()) RETURNING id"
+            ),
+            {"o": owner, "m": memo},
+        )
+    ).scalar_one()
+
+    # Half a pair violates ck_attachments_location_pair, so this statement fails WITH a coordinate
+    # among its parameters — the shape of every real failure that could leak one.
+    with pytest.raises(SQLAlchemyError) as caught:
+        await adb.execute(
+            text("UPDATE attachments SET latitude = :lat WHERE id = :id"),
+            {"lat": NORTH_EAST["latitude"], "id": attachment},
+        )
+    message = f"{caught.value!s}\n{caught.value!r}"
+    assert "ck_attachments_location_pair" in message  # positive control: the failure IS reported
+    # What SQLAlchemy itself echoes — the bound parameters, i.e. the coordinates — is gone.
+    assert "[SQL parameters hidden due to hide_parameters=True]" in message
+    assert "[parameters:" not in message
+    for spelling in LEAKED_SPELLINGS:
+        assert f"latitude = {spelling}" not in message
+        assert f"({spelling}," not in message
+    # What remains is PostgreSQL's own "Failing row contains" DETAIL, which the server sends with
+    # every check violation and no client setting suppresses. That residue is why no
+    # coordinate-writing path may let a SQLAlchemyError's MESSAGE travel: `_store` answers it
+    # below, with the uid alone (see the next case).
+    assert "Failing row contains" in message
+
+
+@pytest.mark.asyncio
+async def test_backfill_write_failure_names_the_row_and_no_coordinate(monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from app.scripts import backfill_location as bf
+
+    leaky = IntegrityError(
+        "UPDATE attachments SET latitude=%(latitude)s, longitude=%(longitude)s",
+        {"latitude": NORTH_EAST["latitude"], "longitude": NORTH_EAST["longitude"]},
+        Exception("ck_attachments_location_pair"),
+    )
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, *args, **kwargs):
+            raise leaky
+
+        async def commit(self):  # pragma: no cover - never reached
+            raise AssertionError("commit after a failed execute")
+
+    monkeypatch.setattr(bf, "async_session", lambda: _Session())
+    candidate = bf.Candidate(
+        id=1, uid="privacy-att", mime="image/jpeg", storage_path=str(BINARIES / "jpeg-north-east.jpg")
+    )
+
+    with capture_logs() as logs:
+        stats = await bf.run_backfill([candidate], execute=True)
+
+    assert stats.failed == 1  # the write failure counts, like a read failure does
+    written = [line for line in logs if line["event"] == "backfill_location.write_failed"]
+    assert written and written[0]["uid"] == "privacy-att"
+    rendered = json.dumps(logs, default=str)
+    for spelling in LEAKED_SPELLINGS:
+        assert spelling not in rendered
