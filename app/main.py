@@ -81,6 +81,7 @@ from app.routers import assets as assets_router  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
 from app.routers import compat as compat_router  # noqa: E402
 from app.routers import export as export_router  # noqa: E402
+from app.routers import map as map_router  # noqa: E402
 from app.routers import members as members_router  # noqa: E402
 from app.routers import memos as memos_router  # noqa: E402
 from app.routers import native as native_router  # noqa: E402
@@ -106,6 +107,7 @@ app.router.routes.extend(settings_router.router.routes)
 app.router.routes.extend(members_router.router.routes)
 app.router.routes.extend(admin_digest_router.router.routes)
 app.router.routes.extend(admin_export_router.router.routes)
+app.router.routes.extend(map_router.router.routes)
 # Compat (/api/v1/*, /file/*) must precede the /api/* fallback and the SPA catch-all.
 app.router.routes.extend(compat_router.router.routes)
 # Likewise the two non-/api native-login URLs (/.well-known/apple-app-site-association,
@@ -188,6 +190,12 @@ INLINE_AUTH_SECURITY: dict[tuple[str, str], list[dict[str, list[str]]]] = {
     ("GET", "/api/attachments/{uid}/rendition/{variant_key}"): USER_SECURITY,
     ("GET", "/api/attachments/{uid}/{tier}"): SIGNED_OR_USER_SECURITY,
     ("GET", "/file/attachments/{uid}/{filename}"): OPTIONAL_PAT_SECURITY,
+    # The basemap routes authenticate in the handler for a reason of their own: an archive
+    # transfer must not hold a pool connection for its duration (app/routers/map.py).
+    ("GET", "/api/map/manifest"): USER_SECURITY,
+    ("GET", "/api/map/tiles/{name}"): USER_SECURITY,
+    ("HEAD", "/api/map/tiles/{name}"): USER_SECURITY,
+    ("GET", "/api/map/assets/{path}"): USER_SECURITY,
 }
 
 # Operations that take no credential at all. An /api/* operation that is in neither this set nor
