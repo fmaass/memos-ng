@@ -68,6 +68,15 @@ Treat every deploy and every prod DB migration as production-affecting:
   (`command: worker`; its limits live in the stack compose, which is the authority — `cpus: 8`,
   `mem_limit: 8g` since the 2026-07-15 move to jupiter). Queue = Postgres `media_jobs`
   with `FOR UPDATE SKIP LOCKED`. HEIC/HEVC originals kept as archive master (ADR-0008).
+  The one worker process drains the queue with **two in-process consumers**, routed by a
+  claim-time predicate: `transcode` (a slow-lane `derive` job whose attachment is a video) and
+  `light` (everything else), so a long transcode no longer parks the photos behind it. One slot
+  each (`WORKER_TRANSCODE_SLOTS=1`, `WORKER_LIGHT_SLOTS=1`; more than 1 is refused at startup),
+  checked against `WORKER_CPU_BUDGET=8` at a measured `WORKER_TRANSCODE_CPU_COST=3` per transcode
+  by `worker.validate_worker_slots()`. `worker.run()` is the supervisor and owns the heartbeat: it
+  stamps only while both consumers are alive, under their error streak, and inside their
+  inactivity bound (`WORKER_TRANSCODE_STALL_SECONDS=3905`, `WORKER_LIGHT_STALL_SECONDS=900`).
+  `claimed_by` ends in `/transcode` or `/light`.
 
 Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
 
@@ -187,7 +196,8 @@ met until its tests exist and pass.
 - Book **1648** "memos-ng — Features": Session Reviews chapter **2689**, Decisions chapter **2690**,
   Lessons Learned page **1664**.
 - Plan pages: **1649** (historical build roadmap), **1884** (feature-parity roadmap), **3151**
-  (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17).
+  (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17),
+  **3844** (media worker class consumers, 2026-09-18).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
 - Release records (book level): **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,

@@ -6,6 +6,12 @@ CPU-heavy H.264 transcode). Deployed as ONE in-stack worker running both lanes, 
 atomically with the app container from the same compose stack — schema and code move together,
 so no mixed-version worker ever runs against a newer app. (The Saturn-fast/Merkur-slow split
 this replaced is historical; see ADR-0006.)
+
+Inside that one process the queue is drained by two consumer tasks, not one serial loop: the
+`transcode` class (a slow-lane derive job on a video) and the `light` class (everything else),
+each claiming only its own class, so a transcode that runs for minutes cannot hold the photos
+queued behind it. run() supervises them and owns the heartbeat, which is why the stamp can stop
+for a consumer that died or went quiet while the other is still working.
 """
 
 import asyncio
