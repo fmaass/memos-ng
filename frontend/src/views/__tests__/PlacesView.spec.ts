@@ -1,6 +1,6 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
-import { defineComponent, h } from 'vue'
+import { defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { marker } from '@/lib/places/__tests__/fixtures'
@@ -13,10 +13,20 @@ const feb = marker({ uid: 'feb', memo_uid: 'm-feb', taken_at: '2025-02-15T12:00:
 const mar = marker({ uid: 'mar', memo_uid: 'm-mar', taken_at: '2025-03-15T12:00:00Z' })
 const ALL = [jan, feb, mar]
 
-const query = vi.hoisted(() => ({ markers: [] as MapMarker[] }))
+// The markers query, drivable: the view has to distinguish an unanswered request from an empty
+// library, so a test must be able to hold it unanswered and then answer it.
+const query = vi.hoisted(() => ({
+  markers: [] as MapMarker[],
+  state: null as null | { data: unknown; isPending: unknown; isError: unknown },
+}))
 vi.mock('@tanstack/vue-query', async () => {
   const { ref } = await import('vue')
-  return { useQuery: () => ({ data: ref({ markers: query.markers }), isPending: ref(false) }) }
+  return {
+    useQuery: () => {
+      if (query.state) return query.state
+      return { data: ref({ markers: query.markers }), isPending: ref(false), isError: ref(false) }
+    },
+  }
 })
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
 
@@ -225,6 +235,64 @@ describe('PlacesView timeline wiring', () => {
     await wrapper.vm.$nextTick()
     expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
     input.remove()
+    wrapper.unmount()
+  })
+})
+
+describe('what the map says before the markers arrive', () => {
+  // 1.7.0 rendered "No photo here knows where it was taken yet" from the absence of markers
+  // alone, so it claimed it while the 1.1 MB markers request was still in flight — the feature
+  // read as "found nothing" for the first seconds of every cold open.
+  function mountWith(state: { markers?: MapMarker[]; isPending: boolean; isError: boolean }) {
+    const data = ref(state.markers ? { markers: state.markers } : undefined)
+    const isPending = ref(state.isPending)
+    const isError = ref(state.isError)
+    query.state = { data, isPending, isError }
+    const wrapper = mountView()
+    return { wrapper, data, isPending, isError }
+  }
+
+  afterEach(() => {
+    query.state = null
+  })
+
+  it('says nothing about an empty library while the request is still in flight', () => {
+    const { wrapper } = mountWith({ isPending: true, isError: false })
+
+    expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="places-loading"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('tells a failed request apart from an empty library', () => {
+    const { wrapper } = mountWith({ markers: [], isPending: false, isError: true })
+
+    expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="places-error"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('says the library is empty once the query has settled with nothing', () => {
+    const { wrapper } = mountWith({ markers: [], isPending: false, isError: false })
+
+    expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="places-error"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('shows the pins, and no message, when markers arrive LATE', async () => {
+    // The map is mounted before the data exists — the sequence every cold open takes. The empty
+    // state may not appear at any point of it.
+    const { wrapper, data, isPending } = mountWith({ isPending: true, isError: false })
+    expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
+
+    data.value = { markers: ALL }
+    isPending.value = false
+    await nextTick()
+
+    expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="places-error"]').exists()).toBe(false)
+    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
     wrapper.unmount()
   })
 })
