@@ -429,3 +429,120 @@ def test_a_published_archive_that_stops_verifying_is_refused_never_rewritten(tmp
     assert "--build <newer YYYYMMDD>" in run.stderr, run.stderr
     assert published.read_bytes() == before  # not repaired, not truncated, not touched
     assert list(tiles.glob("*.tmp")) == []  # and nothing half-written left behind
+
+
+# --- the extraction script's pruning ----------------------------------------------------------
+
+DOCKER_STUB = """#!/bin/sh
+# Plays `docker run ... protomaps/go-pmtiles <subcommand>`: an extract writes the archive it was
+# asked for, a verify accepts it. The tiles directory is learned from the -v mount the script
+# passes, exactly as the real tool learns it, so a script that stopped mounting it would fail here.
+tiles=""
+for a in "$@"; do
+  case "$a" in *:/tiles) tiles="${a%:/tiles}" ;; esac
+done
+mode=""
+src=""
+out=""
+for a in "$@"; do
+  if [ -z "$mode" ]; then
+    case "$a" in extract|verify|show) mode="$a" ;; esac
+    continue
+  fi
+  case "$a" in -*) continue ;; esac
+  if [ "$mode" = extract ]; then
+    if [ -z "$src" ]; then src="$a"; elif [ -z "$out" ]; then out="$a"; fi
+  fi
+done
+if [ "$mode" = extract ]; then
+  [ -n "$out" ] || exit 3
+  [ -n "$tiles" ] || exit 3
+  printf 'PMTiles-stub-archive' > "${tiles}/$(basename "$out")"
+fi
+exit 0
+"""
+
+
+def _stub_docker(tmp_path: Path) -> Path:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "docker"
+    stub.write_text(DOCKER_STUB)
+    stub.chmod(0o755)
+    return stub_dir
+
+
+def _seed_archive(tiles: Path, name: str, when: int) -> Path:
+    """One previously published archive, stamped with the mtime publication order is read from."""
+    path = tiles / name
+    path.write_bytes(b"a published archive")
+    os.utime(path, (when, when))
+    return path
+
+
+def _run_extract(tiles: Path, stub_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), *args],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}"},
+    )
+
+
+def test_publishing_keeps_the_new_generation_and_the_one_it_replaced_and_no_more(tmp_path):
+    """Two generations of each kind survive an extraction, and they are the right two.
+
+    The previous generation has to stay: a client mid-session holds its directory and keeps
+    range-reading that exact file, so deleting it in the run that replaces it breaks the map for
+    whoever is looking at it. Everything older than that is unreachable — the manifest names only
+    the newest — and keeping it would grow a multi-gigabyte directory without bound. The real
+    script runs; only the extraction tool is stubbed.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    oldest_planet = _seed_archive(tiles, "planet-20260901.pmtiles", 1_000_000_000)
+    older_planet = _seed_archive(tiles, "planet-20260908.pmtiles", 1_100_000_000)
+    previous_planet = _seed_archive(tiles, "planet-20260915.pmtiles", 1_200_000_000)
+    oldest_detail = _seed_archive(tiles, "detail-20260901-aaaaaaaa.pmtiles", 1_000_000_000)
+    older_detail = _seed_archive(tiles, "detail-20260908-bbbbbbbb.pmtiles", 1_100_000_000)
+    previous_detail = _seed_archive(tiles, "detail-20260915-cccccccc.pmtiles", 1_200_000_000)
+
+    run = _run_extract(tiles, stub_dir, "--build", "20260917", "--dev", "small")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    published_planet = tiles / "planet-20260917.pmtiles"
+    assert published_planet.is_file(), run.stdout  # positive control: something WAS published
+    [published_detail] = [
+        p
+        for p in tiles.glob("detail-20260917-*.pmtiles")
+        if p.name not in {oldest_detail.name, older_detail.name, previous_detail.name}
+    ]
+
+    assert sorted(p.name for p in tiles.glob("planet-*.pmtiles")) == sorted(
+        [published_planet.name, previous_planet.name]
+    )
+    assert sorted(p.name for p in tiles.glob("detail-*.pmtiles")) == sorted(
+        [published_detail.name, previous_detail.name]
+    )
+    for gone in (oldest_planet, older_planet, oldest_detail, older_detail):
+        assert not gone.exists(), gone.name
+
+
+def test_a_kind_with_nothing_to_supersede_loses_nothing(tmp_path):
+    """The other branch: below the keep count, pruning removes nothing at all. Without this case a
+    prune that deleted the previous generation on every run would still pass the case above."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    only_planet = _seed_archive(tiles, "planet-20260915.pmtiles", 1_200_000_000)
+    only_detail = _seed_archive(tiles, "detail-20260915-cccccccc.pmtiles", 1_200_000_000)
+
+    run = _run_extract(tiles, stub_dir, "--build", "20260917", "--dev", "small")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    assert only_planet.exists()
+    assert only_detail.exists()
+    assert len(list(tiles.glob("planet-*.pmtiles"))) == 2
+    assert len(list(tiles.glob("detail-*.pmtiles"))) == 2
+    assert "removing superseded" not in run.stdout
