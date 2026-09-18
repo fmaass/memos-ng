@@ -777,6 +777,9 @@ async def test_recover_safe_swallows_errors(monkeypatch):
 def test_worker_loop_wires_stale_claim_recovery():
     # Wiring pin (like the upload reaper's): recovery that nothing calls fixes nothing. It must run
     # at STARTUP (the deploy --force-recreate that caused the strand) and again inside the loop.
+    # Both stayed in run() when the media drain moved into the per-class consumers, so this pin
+    # anchors unchanged — run()'s `while True:` is now the SUPERVISOR's loop, and the frame-share
+    # recovery is one of the things it still owns.
     import inspect
 
     head, sep, loop = inspect.getsource(worker.run).partition("while True:")

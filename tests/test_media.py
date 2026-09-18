@@ -502,12 +502,18 @@ async def test_failure_record_commit_error_leaves_job_for_the_stale_sweep(
 def test_worker_loop_wires_the_media_drain():
     # Wiring pin (like the frame-share recovery's): a guard the loop does not call guards
     # nothing. The media branch must go through run_media_drain, not a bare session + run_once.
+    # Moved from run() to consume_media with the per-class consumer split: the drain loop now
+    # lives in the consumer, so a pin left on run() would go on passing with the media queue
+    # drained by nobody — hence the second half, which pins the supervisor to SPAWN the consumers.
     import inspect
 
-    _, sep, loop = inspect.getsource(worker.run).partition("while True:")
-    assert sep, "worker.run no longer has the drain loop this pin anchors on"
-    assert "run_media_drain()" in loop
+    _, sep, loop = inspect.getsource(worker.consume_media).partition("while True:")
+    assert sep, "worker.consume_media no longer has the drain loop this pin anchors on"
+    assert "run_media_drain(" in loop
     assert "run_once(" not in loop  # never called unguarded from the loop
+    supervisor = inspect.getsource(worker.run)
+    assert "consume_media(" in supervisor, "the supervisor must spawn the media consumers"
+    assert "create_task(" in supervisor, "…as tasks, or nothing drains while the supervisor waits"
 
 
 # --- video rotation (MEMNG-40 / #37) -------------------------------------------------------

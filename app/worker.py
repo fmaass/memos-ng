@@ -870,8 +870,45 @@ class _DrainHealth:
         return self._streak
 
 
+class _Watermark:
+    """The last moment a consumer was observably alive, read by the supervisor's beat gate.
+
+    Death and systemic error are what `_DrainHealth` and `task.done()` see; a consumer suspended
+    forever INSIDE an awaited operation is neither — it is simply never heard from again. Without
+    this the supervisor would keep reporting a hung worker healthy, which is the hole the old
+    single-job loop closed only by accident (it could not stamp while it was stuck).
+    """
+
+    def __init__(self) -> None:
+        self.at = time.time()
+
+    def stamp(self) -> None:
+        self.at = time.time()
+
+
+async def consume_media(job_class: JobClass, health: _DrainHealth, watermark: _Watermark) -> None:
+    """Drain ONE class forever. One of these runs per class, each in its own task.
+
+    The watermark is stamped on BOTH sides of the drain, so an idle pass and a thermally deferred
+    pass re-stamp it: neither is a stall, and only a pass that never comes back lets the elapsed
+    time grow. `health` is this consumer's own, never shared — a shared one would let this
+    consumer's success reset the other's error streak and hide a class that fails systemically.
+    """
+    while True:
+        watermark.stamp()
+        status = await run_media_drain(job_class)  # own session, all errors isolated from the task
+        watermark.stamp()
+        health.record(status)
+        if status != "processed":  # idle/deferred/error → back off, like the old single loop
+            await asyncio.sleep(POLL_SECONDS)
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
+    # Before anything is spawned or stamped: a configuration this release cannot honour must fail
+    # loud and leave no trace of liveness behind, or the healthcheck would read the refusal as a
+    # healthy worker for one whole bar.
+    validate_worker_slots()
     # Say what the thermal guard is actually reading, ONCE per process and here rather than in the
     # guard: this runs before any consumer task exists, so it needs no latch, no lock and no
     # module-level "have I logged this" flag that two concurrent drains could race on — and it
@@ -895,58 +932,117 @@ async def run() -> None:
     # draining anything new.
     await run_frame_share_recover_safe()
     await run_media_recover_safe()
-    health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
+    # One consumer task per class, each with its OWN health and watermark. The supervisor keeps a
+    # strong reference to every task: a task only weakly referenced by the loop can be garbage
+    # collected mid-drain, and the teardown below needs them anyway.
+    stall_bounds: dict[JobClass, int] = {
+        "transcode": settings.WORKER_TRANSCODE_STALL_SECONDS,
+        "light": settings.WORKER_LIGHT_STALL_SECONDS,
+    }
+    consumers: dict[JobClass, tuple[asyncio.Task[None], _DrainHealth, _Watermark]] = {}
+    spawn_classes: tuple[JobClass, ...] = ("transcode", "light")
+    for job_class in spawn_classes:
+        job_health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
+        job_watermark = _Watermark()
+        consumers[job_class] = (
+            asyncio.create_task(
+                consume_media(job_class, job_health, job_watermark),
+                name=f"media-consumer-{job_class}",
+            ),
+            job_health,
+            job_watermark,
+        )
     last_reap = 0.0
-    while True:
-        status = await run_media_drain()  # own session, all errors isolated from this loop
-        health.record(status)
-        # Heartbeat honesty (MEMNG-90): stamp only while the media loop is not hard-erroring in a
-        # streak, so a systemically failing worker (e.g. DB down) trips the healthcheck instead of
-        # looking alive.
-        if health.healthy:
-            beat()  # blocking-ok: the liveness stamp itself — see beat()
-        else:
-            logger.error("worker_unhealthy_error_streak", streak=health.streak)
-        # Drain a frame-share job opportunistically in its own session (like reap): the album upload
-        # is decoupled from the media job's transaction so an upload error can't poison media work.
-        frame_status = await run_frame_share_drain()
-        if health.healthy:
-            beat()  # blocking-ok: the liveness stamp itself — see beat()
-        # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues draining
-        # immediately — see spawn_digest for why this is never awaited here. A manual row the
-        # admin API committed is picked up FIRST and by the same spawn: while one is in flight the
-        # gate answers not-due anyway (its local_date is in the ledger), so the order costs a
-        # scheduled run nothing and gives an operator's "Run now" the shortest path to starting.
-        if not digest_task_in_flight():
-            manual_run_id = await adopt_manual_digest()
-            if manual_run_id is not None:
-                if spawn_claimed_digest(manual_run_id):
-                    logger.info("digest_run_spawned", trigger="manual", run_id=manual_run_id)
-            elif await digest_is_due():
-                if spawn_digest():
-                    logger.info("digest_run_spawned", trigger="scheduled")
-        if time.time() - last_reap > REAP_INTERVAL_SECONDS:
-            reaped = await reap_expired_committed()
-            if reaped:
-                logger.info("uploads_reaped", count=reaped)
-            # Piggybacks the reap cadence: a claim orphaned by something other than a restart
-            # (an OOM-killed send that leaves the worker alive) is recovered within the hour —
-            # frame-share and media alike.
-            await run_frame_share_recover_safe()
-            await run_media_recover_safe()
-            # Same cadence for the progress side channel: a killed worker cannot clear its own
-            # row, so the anti-join sweep keeps the table bounded by what is actually running.
-            await sweep_job_progress_safe()
-            # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
-            # close: a stored video whose poster the unwind discarded gets its fast lane back.
-            await run_commit_race_reconcile_safe()
-            # The digest's two sweeps ride the same cadence: a run whose process died is marked
-            # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
-            # is deleted from Dropbox.
-            await sweep_digest_safe()
-            last_reap = time.time()
-        if status != "processed" and frame_status != "processed":  # idle/deferred → back off
-            await asyncio.sleep(POLL_SECONDS)
+    try:
+        while True:
+            # Heartbeat honesty (MEMNG-90), now asked of every consumer rather than of one serial
+            # loop: the stamp means "all media work is being drained", so ONE bad consumer has to
+            # stop it. Three ways a consumer stops counting as alive — a streak of escaped errors,
+            # having exited, and having gone quiet past its class's bound — each logged distinctly
+            # so the log says which one it was.
+            now = time.time()
+            healthy = True
+            for job_class, (task, job_health, job_watermark) in consumers.items():
+                if not job_health.healthy:
+                    logger.error(
+                        "worker_unhealthy_error_streak",
+                        job_class=job_class,
+                        streak=job_health.streak,
+                    )
+                    healthy = False
+                if task.done():
+                    logger.error("worker_consumer_exited", job_class=job_class)
+                    healthy = False
+                elapsed = now - job_watermark.at
+                if elapsed > stall_bounds[job_class]:
+                    logger.error(
+                        "worker_consumer_stalled",
+                        job_class=job_class,
+                        elapsed_seconds=round(elapsed, 1),
+                        bound_seconds=stall_bounds[job_class],
+                    )
+                    healthy = False
+            if healthy:
+                beat()  # blocking-ok: the liveness stamp itself — see beat()
+            # Drain a frame-share job opportunistically in its own session (like reap): the album
+            # upload is decoupled from the media job's transaction so an upload error can't poison
+            # media work.
+            frame_status = await run_frame_share_drain()
+            if healthy:
+                beat()  # blocking-ok: the liveness stamp itself — see beat()
+            # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues
+            # immediately — see spawn_digest for why this is never awaited here. A manual row the
+            # admin API committed is picked up FIRST and by the same spawn: while one is in flight
+            # the gate answers not-due anyway (its local_date is in the ledger), so the order costs
+            # a scheduled run nothing and gives an operator's "Run now" the shortest path to
+            # starting.
+            if not digest_task_in_flight():
+                manual_run_id = await adopt_manual_digest()
+                if manual_run_id is not None:
+                    if spawn_claimed_digest(manual_run_id):
+                        logger.info("digest_run_spawned", trigger="manual", run_id=manual_run_id)
+                elif await digest_is_due():
+                    if spawn_digest():
+                        logger.info("digest_run_spawned", trigger="scheduled")
+            if time.time() - last_reap > REAP_INTERVAL_SECONDS:
+                reaped = await reap_expired_committed()
+                if reaped:
+                    logger.info("uploads_reaped", count=reaped)
+                # Piggybacks the reap cadence: a claim orphaned by something other than a restart
+                # (an OOM-killed send that leaves the worker alive) is recovered within the hour —
+                # frame-share and media alike.
+                await run_frame_share_recover_safe()
+                await run_media_recover_safe()
+                # Same cadence for the progress side channel: a killed worker cannot clear its own
+                # row, so the anti-join sweep keeps the table bounded by what is actually running.
+                await sweep_job_progress_safe()
+                # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
+                # close: a stored video whose poster the unwind discarded gets its fast lane back.
+                await run_commit_race_reconcile_safe()
+                # The digest's two sweeps ride the same cadence: a run whose process died is marked
+                # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
+                # is deleted from Dropbox.
+                await sweep_digest_safe()
+                last_reap = time.time()
+            if frame_status != "processed":  # idle/deferred → back off
+                # The media term is gone from this condition with the media drain: the consumers
+                # pace themselves on their own backoff now, and the supervisor's own pass is cheap.
+                await asyncio.sleep(POLL_SECONDS)
+    finally:
+        # Teardown, not signal handling: every caller that cancels run() (the loop tests do) would
+        # otherwise leave a consumer draining against patched collaborators or a closed session.
+        for task, _, _ in consumers.values():
+            task.cancel()
+        for task, _, _ in consumers.values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass  # the cancellation this teardown just requested, and only that one
+            except Exception:
+                # A consumer that had ALREADY died: its exception is retrieved here rather than
+                # left to surface as an unretrieved-task warning, and it must not mask the
+                # shutdown that is in progress.
+                logger.exception("worker_consumer_teardown_error")
 
 
 def main() -> None:

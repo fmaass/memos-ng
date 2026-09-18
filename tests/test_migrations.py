@@ -84,12 +84,15 @@ async def test_current_db_head_returns_none_on_db_error(monkeypatch):
 
 def test_worker_run_gates_on_schema_before_recovery_and_loop():
     # Wiring pin (like the frame-share recovery pins): the gate must sit BEFORE the startup recovery
-    # sweep and the drain loop, or it guards nothing.
+    # sweep and the drain loop, or it guards nothing. With the per-class consumer split the loop is
+    # no longer the only thing that touches the schema — the consumer SPAWN is pinned behind the
+    # gate too, or the consumers would claim against the old schema while the gate still waits.
     src = inspect.getsource(worker.run)
     head, sep, tail = src.partition("wait_for_migrated_schema()")
     assert sep, "worker.run no longer calls the schema gate"
     assert "run_frame_share_recover_safe()" in tail, "recovery sweep must run AFTER the schema gate"
-    assert "while True:" in tail, "the drain loop must run AFTER the schema gate"
+    assert "while True:" in tail, "the supervisor loop must run AFTER the schema gate"
+    assert "consume_media(" in tail, "the consumers must be spawned AFTER the schema gate"
 
 
 def test_only_the_app_entrypoint_runs_alembic():

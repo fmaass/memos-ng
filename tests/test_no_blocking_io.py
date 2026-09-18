@@ -111,9 +111,14 @@ MARKER = "blocking-ok:"
 EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
     {
         # --- worker process only: app/worker.py and app/services/media.py are imported by nothing
-        # else under app/ (verified), so none of this runs on the request loop. worker.run() is a
-        # strictly sequential single-job loop with no concurrent tasks, so an off-loop hop here
-        # would delay nobody.
+        # else under app/ (verified), so none of this runs on the request loop. worker.run() is no
+        # longer a single-job loop — it is the SUPERVISOR, and concurrent consumer tasks now share
+        # its event loop — so the old justification ("no concurrent tasks, delays nobody") is
+        # retired. The stamp stays inline for two reasons that survive the split: the supervisor
+        # holds no job work of its own, so the write delays only the supervisor's own next pass;
+        # and a heartbeat deferred to a thread can be reordered behind the very stall it exists to
+        # make visible (see beat()). The consumers' own CPU-bound blocking-ok sites below DO now
+        # delay the other consumer, and that back-pressure is the accepted trade of the split.
         ("app/worker.py", "run", "beat"): 3,
         ("app/services/media.py", "guard_publish", "discard_outputs"): 1,
         ("app/services/media.py", "process_slow", "too_hot"): 1,
