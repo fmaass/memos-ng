@@ -16,6 +16,7 @@ from pathlib import Path
 from app.config import settings
 from app.database import async_session
 from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, Memo, User
+from app.services import memos as memo_service
 from app.services import poster, reclaim
 from app.services.asset_paths import all_asset_paths
 from app.services.reclaim import (
@@ -26,7 +27,7 @@ from app.services.reclaim import (
     unlink_paths,
 )
 from sqlalchemy import create_engine, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from tests.conftest import SYNC_URL
 
@@ -374,6 +375,70 @@ async def test_the_async_skip_path_reports_instead_of_exploding(db_engine, monke
         assert result.outcome == "skipped_ineligible"
         assert original.exists()
         assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [(att_id,)]
+    finally:
+        eng.dispose()
+        _cleanup()
+
+
+async def test_the_orphaned_reclaim_honours_a_relink_committed_after_the_memo_delete(
+    db_engine, monkeypatch, tmp_path
+):
+    """MEMNG-297, the async half: the route's session ALREADY holds the attachment instance.
+
+    `delete_memo` nulls the FK on the loaded children in this very session and the sessionmaker does
+    not expire on commit, so `memo_id` is None on that instance whatever the database now says. A
+    re-attach committed by another connection between the memo delete's commit and the locked
+    re-select must still reach `_ineligible()` — otherwise the route deletes a photo that belongs to
+    a live memo again, one identity-map hit away from the script's defect.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    eng = create_engine(SYNC_URL)
+    try:
+        with Session(eng) as seed:
+            owner = User(subject="asyncrelink_owner", role="user")
+            seed.add(owner)
+            seed.flush()
+            doomed = Memo(uid="asyncrelink_doomed", owner_id=owner.id, content="x")
+            live = Memo(uid="asyncrelink_live", owner_id=owner.id, content="y")
+            seed.add_all([doomed, live])
+            seed.flush()
+            att = _seed_orphan(seed, tmp_path, "asyncrelink", memo_id=doomed.id)
+            seed.commit()
+            att_id, doomed_id, live_id = att.id, doomed.id, live.id
+            original = Path(att.storage_path)
+
+        seen: list[int | None] = []
+        real_ineligible = reclaim._ineligible
+
+        def spy(att_arg, mode):  # the decision point, not just the end state
+            seen.append(att_arg.memo_id)
+            return real_ineligible(att_arg, mode)
+
+        monkeypatch.setattr(reclaim, "_ineligible", spy)
+
+        async with async_session() as db:
+            memo = (
+                await db.execute(
+                    select(Memo).where(Memo.id == doomed_id).options(selectinload(Memo.attachments))
+                )
+            ).scalar_one()
+            orphaned = await memo_service.delete_memo(db, memo)
+            assert orphaned == [att_id]
+            await db.commit()  # PHASE 1 exactly as app/routers/memos.py runs it
+
+            with Session(eng) as claimer:  # …and the photo is re-attached, on its own connection
+                claimer.execute(
+                    text("UPDATE attachments SET memo_id = :m WHERE id = :a"),
+                    {"m": live_id, "a": att_id},
+                )
+                claimer.commit()
+
+            result = await reclaim.reclaim_attachment(db, att_id, reclaim.Revalidate.ORPHANED)
+
+        assert seen == [live_id], "the revalidation decided about a memo_id that had passed"
+        assert result.outcome == "skipped_ineligible"
+        assert original.exists(), "a live memo's photo was deleted"
+        assert _rows("SELECT memo_id FROM attachments WHERE id=:a", a=att_id) == [(live_id,)]
     finally:
         eng.dispose()
         _cleanup()
