@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -16,6 +17,7 @@ from typing import Any, Literal
 
 import pillow_heif
 import structlog
+from anyio import to_thread
 from PIL import Image, ImageChops, ImageCms, ImageFile, ImageOps, ImageStat
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
@@ -1531,8 +1533,8 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
     Slow lane and thermally deferred like the transcode, for the same reason: a 40-60 MP decode +
     LANCZOS reduction + q92 encode is seconds of full-core CPU on a NAS that is shared with
     production and bounded by heat, and a book asks for a few hundred of them at once. The worker
-    drains one job at a time and Pillow encodes on the calling thread, so "single-threaded and
-    throttled" is what this already is — nothing here fans out.
+    drains one slow-lane job at a time and the encode below occupies exactly one worker thread, so
+    "single-threaded and throttled" is what this already is — nothing here fans out.
 
     It publishes an EXTRA tier for a photo that is already `ready`, so unlike every other job it
     changes no attachment column and no status: a print rendition that never gets made must not
@@ -1557,9 +1559,41 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
             # rather than guess a profile and publish bytes nobody asked for.
             raise RuntimeError(f"job {job.id} names an unknown print profile {job.profile_key!r}")
         profile = parsed
-    # blocking-ok: this IS the worker's job — a CPU-bound decode/encode that would still occupy
-    # the process in a thread. Nothing else is queued on this loop to yield to.
-    process_printready(attachment, profile)
+    # Off the loop, because "nothing else is queued on this loop" stopped being true: the worker
+    # process now runs TWO consumers plus the supervisor on one event loop. Held inline, a
+    # multi-second 40-60 MP decode/LANCZOS/q92 encode freezes the transcode consumer's progress
+    # writes and the supervisor's heartbeat for its whole duration — and a book asks for a few
+    # hundred renditions in a row. The CPU cost is unchanged; only the loop is given back.
+    # `attachment` may cross to the thread because process_printready reads nothing that can
+    # touch the session: uid, storage_path, captured_at, id, and the selectin-loaded `renditions`
+    # collection (app/models.py:283) — all already loaded, and expire_on_commit=False
+    # (app/database.py:39) keeps them loaded across process_job's pre-derive commit.
+    # The wait-out is NOT anyio's `abandon_on_cancel=False`: that shield only covers cancel-scope
+    # cancellation, and the worker's teardown cancels each consumer task natively
+    # (app/worker.py: `task.cancel()`), which goes straight through it. A thread cannot be
+    # interrupted, so an abandoned encode keeps resizing and os.replace-ing the rendition into its
+    # final path after the coroutine is gone — past the guard_publish below, which is what fences
+    # a photo deleted mid-job. Shielding restores the ordering the inline call had for free: a
+    # stop that lands during an encode is delivered only once the thread is done. A printready job
+    # is claimed by the LIGHT consumer — the transcode class is slow-lane `derive` on a video
+    # attachment and this is neither (app/worker.py:201-220) — and that consumer runs one job at a
+    # time (WORKER_LIGHT_SLOTS=1), so a stop waits out exactly one rendition's remaining encode.
+    # Nothing the thread does may escape that wait: a CancelledError from a second stop, and the
+    # encode's own failure just as much, since either one leaving this block would REPLACE the
+    # cancellation — and run_once would then book a job failure and keep the consumer looping with
+    # its one cancellation already spent. A failed encode is dropped here on purpose: the job is
+    # not marked, so it is simply re-run after the stop. The cancellation is re-raised, never
+    # swallowed.
+    encode = asyncio.create_task(to_thread.run_sync(process_printready, attachment, profile))
+    try:
+        await asyncio.shield(encode)
+    except asyncio.CancelledError:
+        while not encode.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(encode)  # re-shielded: a second stop must not win either
+        if not encode.cancelled():
+            encode.exception()  # retrieved, so a failed encode is not logged as never-retrieved
+        raise
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
     await guard_publish(db, job, attachment)
