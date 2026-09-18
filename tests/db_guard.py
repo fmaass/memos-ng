@@ -135,6 +135,10 @@ BOOTSTRAP_LOCK_OBJID = BOOTSTRAP_LOCK_KEY & 0xFFFFFFFF
 # The holder writes its OS pid here, because a backend pid names a Postgres process nobody can
 # act on: what the reader of a refusal needs is the pytest run to wait for or kill.
 APPLICATION_NAME_PREFIX = "memosng-pytest:"
+# …followed by the holder's pid NAMESPACE, because a bare pid means nothing across one.
+NAMESPACE_SEPARATOR = "@"
+# What Postgres stores of an application_name (NAMEDATALEN - 1); more is silently cut off.
+APPLICATION_NAME_MAX_BYTES = 63
 # SEQUENTIAL runs must never trip over each other, and a handoff is not instantaneous: a session
 # lock is released when Postgres notices the holder's socket is gone, which is milliseconds after
 # the process dies, not before. scripts/check-mutations.sh starts the next `uv run pytest` the
@@ -167,12 +171,46 @@ WHERE l.locktype = 'advisory'
 LIMIT 1
 """
 
+# The same row, restricted to this very backend: it answers "do I still hold it", not "does
+# anyone".
+_OWNERSHIP_SQL = """
+SELECT 1
+FROM pg_locks
+WHERE locktype = 'advisory'
+  AND granted
+  AND classid = :classid
+  AND objid = :objid
+  AND objsubid = 1
+  AND pid = pg_backend_pid()
+  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+"""
+
 # The lock lives on THIS connection for as long as the process does. Session-level, not
 # transaction-level, and deliberately never released by a statement: a run that dies — crash,
 # SIGKILL, a pulled plug — releases it by losing its socket, which is the whole reason the lock
 # is taken on a connection of its own rather than on a pooled one the suite also writes through.
 _lock_connection: Connection | None = None
 _lock_engine: Engine | None = None
+
+
+def _connection_still_holds_the_lock(conn: Connection) -> bool:
+    """Ask Postgres, in one round-trip, whether THIS backend still owns the lock.
+
+    The answer cannot come from memory. A session-level lock lives on its session, and a
+    server restart or a `pg_terminate_backend` takes both away without telling this process;
+    a run that then trusted its own bookkeeping would go on to DROP SCHEMA under whoever
+    claimed the database in the meantime. A dead connection raises here, which is the same
+    answer as a missing row: not held.
+    """
+    try:
+        return bool(
+            conn.execute(
+                text(_OWNERSHIP_SQL),
+                {"classid": BOOTSTRAP_LOCK_CLASSID, "objid": BOOTSTRAP_LOCK_OBJID},
+            ).scalar()
+        )
+    except Exception:
+        return False
 
 
 def _holder_is_on_this_host(row: Row[Any]) -> bool:
@@ -189,14 +227,62 @@ def _holder_is_on_this_host(row: Row[Any]) -> bool:
     return row.client_addr is not None and row.client_addr == row.my_addr
 
 
-def _holder_process_is_gone(row: Row[Any]) -> bool:
-    """True only when application_name names a pid that provably does not exist here."""
-    name = row.application_name or ""
-    if not name.startswith(APPLICATION_NAME_PREFIX) or not _holder_is_on_this_host(row):
-        return False
+def _pid_namespace() -> str:
+    """This process's pid namespace, as the kernel names it, or "" where that is unreadable."""
     try:
-        pid = int(name[len(APPLICATION_NAME_PREFIX) :])
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
+def _application_name(pid: int | None = None) -> str:
+    """`memosng-pytest:<pid>@<pid namespace>`, e.g. memosng-pytest:1234567@pid:[4026531836].
+
+    The pid alone is ambiguous: two runners in separate pid namespaces behind one client
+    address — containers on host networking, a published port — are indistinguishable to
+    Postgres, and reading a live holder's pid as "gone" would put a live run's backend in the
+    remedy line. The namespace makes the pid checkable or visibly not ours. The prefix stays
+    exactly `memosng-pytest:<pid>`, which the refusal and its tests read; a name that would
+    exceed what Postgres keeps (63 bytes) drops the namespace rather than being truncated into
+    a lie, and then simply never qualifies for the dead-holder wording.
+    """
+    base = f"{APPLICATION_NAME_PREFIX}{os.getpid() if pid is None else pid}"
+    namespace = _pid_namespace()
+    if not namespace:
+        return base
+    name = f"{base}{NAMESPACE_SEPARATOR}{namespace}"
+    return name if len(name.encode()) <= APPLICATION_NAME_MAX_BYTES else base
+
+
+def _parse_application_name(name: str) -> tuple[int | None, str | None]:
+    """(pid, namespace) out of an application_name, either part None when it is not there."""
+    if not name.startswith(APPLICATION_NAME_PREFIX):
+        return None, None
+    pid_text, separator, namespace = name[len(APPLICATION_NAME_PREFIX) :].partition(
+        NAMESPACE_SEPARATOR
+    )
+    try:
+        pid = int(pid_text)
     except ValueError:
+        return None, None
+    return pid, (namespace if separator else None)
+
+
+def _holder_process_is_gone(row: Row[Any]) -> bool:
+    """True only when application_name names a pid that provably does not exist here.
+
+    Both conditions are required and neither replaces the other: the namespace id says the pid
+    is from the same pid namespace as ours, the client address says the connection comes from
+    the same side of the container boundary. A namespace id is an inode number, unique only
+    within one kernel — two machines can show the same one — so the address keeps a remote
+    holder from ever reaching the pid check.
+    """
+    pid, namespace = _parse_application_name(row.application_name or "")
+    if pid is None or namespace is None:
+        return False  # an older run, or a platform where the namespace is unreadable
+    if not namespace or namespace != _pid_namespace():
+        return False
+    if not _holder_is_on_this_host(row):
         return False
     try:
         os.kill(pid, 0)
@@ -222,6 +308,7 @@ def _refusal_message(database: str, conn: Connection) -> str:
     else:
         name = row.application_name or "<no application_name>"
         holder = f"by {name} (Postgres backend pid {row.pid}, connected since {row.backend_start})"
+        holder_pid, _ = _parse_application_name(name)
         if _holder_process_is_gone(row):
             # Truthful, because "wait for the other run" is advice about a run that no longer
             # exists. The lock is not stolen and the backend is not terminated from here: an
@@ -229,7 +316,7 @@ def _refusal_message(database: str, conn: Connection) -> str:
             return (
                 "Refusing the destructive test bootstrap: the test database "
                 f"{database} is still claimed {holder}, but process "
-                f"{name[len(APPLICATION_NAME_PREFIX) :]} is not running on this host — that "
+                f"{holder_pid} is not running on this host — that "
                 "pytest is gone and only its Postgres backend still holds the lock. Nothing "
                 "here steals a lock; release it with: docker exec "
                 f'{DEV_DB_CONTAINER} psql -U memosng -d {database} -c "SELECT '
@@ -260,7 +347,12 @@ def acquire_bootstrap_lock(url: str | URL, *, tolerate_unreachable: bool = False
     """
     global _lock_connection, _lock_engine
     if _lock_connection is not None:
-        return True
+        if _connection_still_holds_the_lock(_lock_connection):
+            return True
+        # Postgres was restarted, or the backend was terminated: the lock went with the
+        # session, and a sibling may own the database by now. Remembering that we took it once
+        # is not holding it — drop the corpse and go through the full acquisition again.
+        release_bootstrap_lock()
     parsed = make_url(url) if isinstance(url, str) else url
     engine = create_engine(
         parsed,
@@ -269,7 +361,7 @@ def acquire_bootstrap_lock(url: str | URL, *, tolerate_unreachable: bool = False
         poolclass=NullPool,
         isolation_level="AUTOCOMMIT",
         connect_args={
-            "application_name": f"{APPLICATION_NAME_PREFIX}{os.getpid()}",
+            "application_name": _application_name(),
             "connect_timeout": CONNECT_TIMEOUT_SECONDS,
         },
     )

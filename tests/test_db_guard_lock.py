@@ -74,6 +74,53 @@ def test_bootstraps_the_schema(db_engine):
     assert db_engine is not None
 """
 
+# Re-entry after the lock connection died. The claim is made, its backend is terminated from a
+# second connection (what a Postgres restart does to every session at once), and the claim is
+# then made again — with or without a sibling that grabbed the database in between.
+REENTRY_PROBE = """
+import os
+import sys
+import time
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
+
+from tests import db_guard
+
+dsn = os.environ["DATABASE_URL_SYNC"]
+mode = sys.argv[1]
+
+assert db_guard.acquire_bootstrap_lock(dsn) is True
+lock_conn = db_guard._lock_connection
+assert lock_conn is not None
+backend_pid = lock_conn.execute(text("SELECT pg_backend_pid()")).scalar()
+
+killer = create_engine(dsn, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+with killer.connect() as conn:
+    conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": backend_pid})
+
+sibling = create_engine(
+    dsn,
+    poolclass=NullPool,
+    isolation_level="AUTOCOMMIT",
+    connect_args={"application_name": db_guard._application_name()},
+)
+if mode == "sibling":
+    held = sibling.connect()
+    deadline = time.monotonic() + 30
+    while not held.execute(
+        text("SELECT pg_try_advisory_lock(:key)"), {"key": db_guard.BOOTSTRAP_LOCK_KEY}
+    ).scalar():
+        assert time.monotonic() < deadline, "the terminated backend never let the lock go"
+        time.sleep(0.05)
+    print("SIBLING HOLDS IT")
+
+try:
+    print("RETURNED:", db_guard.acquire_bootstrap_lock(dsn))
+except RuntimeError as exc:
+    print("REFUSED:", exc)
+"""
+
 # A module that never opens the database — the case that has to survive a stopped Postgres.
 DATABASE_FREE_SESSION = """
 def test_needs_no_database():
@@ -90,14 +137,15 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 import tests.conftest as conftest
-from tests.db_guard import APPLICATION_NAME_PREFIX, BOOTSTRAP_LOCK_KEY
+from tests import db_guard
+from tests.db_guard import BOOTSTRAP_LOCK_KEY
 
 dsn = os.environ["DATABASE_URL_SYNC"]
 sibling = create_engine(
     dsn,
     poolclass=NullPool,
     isolation_level="AUTOCOMMIT",
-    connect_args={"application_name": APPLICATION_NAME_PREFIX + str(os.getpid())},
+    connect_args={"application_name": db_guard._application_name()},
 )
 held = sibling.connect()
 assert held.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": BOOTSTRAP_LOCK_KEY}).scalar()
@@ -333,9 +381,42 @@ def _refusal_against(database: str) -> str:
         engine.dispose()
 
 
+def _reentry_probe(tmp_path: Path, mode: str) -> str:
+    probe = tmp_path / "reentry_probe.py"
+    probe.write_text(REENTRY_PROBE)
+    with _scratch_database() as database:
+        done = subprocess.run(
+            [sys.executable, str(probe), mode],
+            cwd=REPO_ROOT,
+            env=_session_env(database),
+            capture_output=True,
+            text=True,
+            timeout=LOCK_HANDOFF_GRACE_SECONDS + 120,
+        )
+    output = done.stdout + done.stderr
+    assert done.returncode == 0, output
+    return output
+
+
+def test_a_claim_whose_connection_died_is_not_trusted_when_a_sibling_took_over(tmp_path: Path):
+    # Holding the lock is a property of a live session, not of this process's memory: once the
+    # backend is gone the database is anyone's, and re-entry must find that out from Postgres.
+    output = _reentry_probe(tmp_path, "sibling")
+    assert "SIBLING HOLDS IT" in output, output
+    assert "REFUSED: Refusing the destructive test bootstrap" in output, output
+    assert "RETURNED:" not in output, output
+
+
+def test_a_claim_whose_connection_died_is_taken_again_when_nobody_else_holds_it(tmp_path: Path):
+    # The other half: re-entry after a lost connection is not an error, it is a fresh claim.
+    output = _reentry_probe(tmp_path, "alone")
+    assert "RETURNED: True" in output, output
+    assert "REFUSED" not in output, output
+
+
 def test_a_live_holder_is_described_as_a_run_to_wait_for():
     with _scratch_database() as database:
-        with _lock_held_as(database, f"{APPLICATION_NAME_PREFIX}{os.getpid()}"):
+        with _lock_held_as(database, db_guard._application_name()):
             message = _refusal_against(database)
     assert "is already claimed by" in message
     assert "export both" in message
@@ -350,13 +431,46 @@ def test_a_holder_whose_process_is_gone_is_named_as_gone_with_the_remedy():
     with pytest.raises(ProcessLookupError):
         os.kill(corpse.pid, 0)
     with _scratch_database() as database:
-        with _lock_held_as(database, f"{APPLICATION_NAME_PREFIX}{corpse.pid}") as backend_pid:
+        with _lock_held_as(database, db_guard._application_name(corpse.pid)) as backend_pid:
             message = _refusal_against(database)
     assert f"process {corpse.pid} is not running on this host" in message
     assert f"pg_terminate_backend({backend_pid})" in message
     assert DEV_DB_CONTAINER in message
     # It says the run is gone rather than telling the reader to wait for it.
     assert "the other run is not using" not in message
+
+
+def test_a_dead_pid_from_another_namespace_keeps_the_live_wording():
+    # Two runners in separate pid namespaces behind one client address look identical to
+    # Postgres. The pid of a LIVE holder over there may well be free over here, and naming its
+    # backend in a `pg_terminate_backend` line would be an instruction to kill a running suite.
+    corpse = subprocess.Popen([sys.executable, "-c", "pass"])
+    corpse.wait()
+    elsewhere = f"{APPLICATION_NAME_PREFIX}{corpse.pid}@pid:[4026500000]"
+    assert elsewhere != db_guard._application_name(corpse.pid)
+    with _scratch_database() as database:
+        with _lock_held_as(database, elsewhere):
+            message = _refusal_against(database)
+    assert "is already claimed by" in message
+    assert "is not running on this host" not in message
+
+
+def test_a_holder_without_a_namespace_in_its_name_keeps_the_live_wording():
+    # An older run, or a platform where /proc/self/ns/pid cannot be read: nothing about its pid
+    # is checkable, so it is described as the live run it may well be.
+    corpse = subprocess.Popen([sys.executable, "-c", "pass"])
+    corpse.wait()
+    with _scratch_database() as database:
+        with _lock_held_as(database, f"{APPLICATION_NAME_PREFIX}{corpse.pid}"):
+            message = _refusal_against(database)
+    assert "is already claimed by" in message
+    assert "is not running on this host" not in message
+
+
+def test_the_application_name_stays_inside_what_postgres_keeps():
+    name = db_guard._application_name(1234567)
+    assert name.startswith(f"{APPLICATION_NAME_PREFIX}1234567")
+    assert len(name.encode()) <= db_guard.APPLICATION_NAME_MAX_BYTES, name
 
 
 def _marker_note(database: str) -> str | None:
