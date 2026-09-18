@@ -1,36 +1,22 @@
 <script setup lang="ts">
 import { useQuery } from '@tanstack/vue-query'
 import Skeleton from 'primevue/skeleton'
-import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, useTemplateRef } from 'vue'
 import { useRouter } from 'vue-router'
 
 import ClusterDrawer from '@/components/places/ClusterDrawer.vue'
 import InViewGrid from '@/components/places/InViewGrid.vue'
 import PlacesMap from '@/components/places/PlacesMap.vue'
-import TimelineBar from '@/components/places/TimelineBar.vue'
 import { useApi } from '@/composables/useApi'
 import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import type { MapMarker } from '@/lib/places/geo'
 import { memoPath, toLightboxItems } from '@/lib/places/lightbox'
 import { viewerTarget } from '@/lib/places/order'
-import {
-  applyPlayhead,
-  buildHistogram,
-  initialState,
-  reduce,
-  type TimelineAction,
-  type TimelineState,
-} from '@/lib/places/timeline'
 import { placesStatus } from '@/lib/places/state'
-import { createTicker, timelineKeyAction } from '@/lib/places/timelineBar'
 
 const api = useApi()
 const router = useRouter()
 const mapRef = useTemplateRef<InstanceType<typeof PlacesMap>>('map')
-// The timeline bar is an overlay on the map pane, so the map has to know what it covers to keep
-// the first fit from putting pins underneath it (PlacesMap's `overlay` prop, `fitPadding`).
-const barRef = useTemplateRef<InstanceType<typeof TimelineBar>>('bar')
-const barElement = computed(() => (barRef.value?.$el as HTMLElement | undefined) ?? null)
 
 const { data, isPending, isError } = useQuery({
   queryKey: ['map', 'markers'],
@@ -53,70 +39,16 @@ const status = computed(() =>
 )
 const byUid = computed(() => new Map(markers.value.map((m) => [m.uid, m])))
 
-// The timeline is a FILTER, exactly like the map's viewport: one playhead decides which photos
-// exist for the map, the drawer and the grid. The reducer owns every transition (lib/places/
-// timeline.ts) — this view only drives it with a clock, the keyboard and the bar.
-const histogram = computed(() => buildHistogram(markers.value))
-const playhead = ref<TimelineState>(initialState(histogram.value))
-const previous = ref<TimelineState | null>(null)
-watch(histogram, (next) => {
-  previous.value = null
-  playhead.value = initialState(next)
-})
-
-const view = computed(() =>
-  applyPlayhead(markers.value, playhead.value, {
-    previous: previous.value,
-    histogram: histogram.value,
-  }),
-)
-const shownUids = computed(() => new Set(view.value.markers.map((m) => m.uid)))
-
-function dispatch(action: TimelineAction) {
-  const next = reduce(playhead.value, action)
-  if (next === playhead.value) return
-  previous.value = playhead.value
-  playhead.value = next
-}
-
-// One `setData` per tick, with the pins that arrived in it — a MapLibre layer filter would hide
-// points without re-clustering them, and the camera never moves: the pins land, the view holds.
-watch(view, (current) => mapRef.value?.setVisibleMarkers(current.markers, current.landing), {
-  flush: 'post',
-})
-
-// Speed advances BUCKETS, never the clock: one tick is one `setData` at 1×, 2× and 4× alike.
-const ticker = createTicker(() => dispatch({ type: 'tick' }))
-watch(
-  () => playhead.value.playing,
-  (playing) => (playing ? ticker.start() : ticker.stop()),
-)
-
-function onKeydown(event: KeyboardEvent) {
-  const action = timelineKeyAction(event.key, playhead.value, event.target, {
-    defaultPrevented: event.defaultPrevented,
-    viewerOpen: lightbox.isOpen.value,
-  })
-  if (!action) return
-  event.preventDefault() // space would otherwise scroll the page under the map
-  dispatch(action)
-}
-
 // What the map currently has in frame, and — when a cluster was tapped — the photos behind that
-// one pin. ONE filtered set: the drawer, the phone grid and the viewer all read it, which is the
-// seam the timeline (Phase 4) narrows further.
+// one pin. ONE set: the drawer, the phone grid and the viewer all read it.
 const visibleUids = ref<string[]>([])
 const selection = ref<{ clusterId: number | null; uids: string[] } | null>(null)
 
-// The one place a list of uids becomes photos — and the one place the playhead is applied to them.
-// A cluster's leaves come from tiles MapLibre clustered before the playhead moved, and the map's
-// in-view report is a list of uids too: both must be read through the timeline's filter.
+// The one place a list of uids becomes photos: a cluster's leaves as MapLibre hands them out on
+// tap, and the map's in-view report, are both lists of uids and nothing more.
 function resolve(uids: readonly string[]): MapMarker[] {
   const lookup = byUid.value
-  const shown = shownUids.value
-  return uids
-    .map((uid) => lookup.get(uid))
-    .filter((m): m is MapMarker => !!m && shown.has(m.uid))
+  return uids.map((uid) => lookup.get(uid)).filter((m): m is MapMarker => !!m)
 }
 
 const inView = computed(() => resolve(visibleUids.value))
@@ -127,10 +59,6 @@ const lightbox = useMediaLightbox()
 onUnmounted(() => lightbox.destroy())
 
 function openViewer(list: MapMarker[], index: number) {
-  // The viewer holds the list it was opened with. A playhead that kept advancing would drop
-  // photos out of the map, the drawer and the grid while the viewer still shows them — and in
-  // 12-month mode take them away entirely. Opening pauses; closing does not resume by itself.
-  dispatch({ type: 'pause' })
   lightbox.open(toLightboxItems(list), index, {
     onShowInMemo: (memoUid) => {
       void router.push(memoPath({ memo_uid: memoUid }))
@@ -168,15 +96,9 @@ onMounted(() => {
   media = window.matchMedia('(max-width: 767px)')
   syncPhone()
   media.addEventListener('change', syncPhone)
-  window.addEventListener('keydown', onKeydown)
-  // The map is created with the full set; saying so once here makes this view the single source
-  // of what the map shows, from the first frame rather than from the first tick.
-  mapRef.value?.setVisibleMarkers(view.value.markers, view.value.landing)
 })
 onBeforeUnmount(() => {
   media?.removeEventListener('change', syncPhone)
-  window.removeEventListener('keydown', onKeydown)
-  ticker.stop()
 })
 
 const drawerOpen = computed({
@@ -193,7 +115,6 @@ const drawerOpen = computed({
       <PlacesMap
         ref="map"
         :markers="markers"
-        :overlay="barElement"
         @cluster-open="onClusterOpen"
         @point-open="onPointOpen"
         @visible-change="visibleUids = $event"
@@ -202,15 +123,6 @@ const drawerOpen = computed({
         v-if="status === 'pending'"
         class="!absolute inset-0 !h-full !w-full"
         data-test="places-loading"
-      />
-      <TimelineBar
-        v-if="markers.length"
-        ref="bar"
-        class="absolute inset-x-2 bottom-2 z-10 md:inset-x-4 md:bottom-4"
-        :histogram="histogram"
-        :state="playhead"
-        :phone="isPhone"
-        @action="dispatch"
       />
       <p
         v-if="status === 'empty'"

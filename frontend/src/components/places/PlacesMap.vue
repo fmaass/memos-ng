@@ -15,24 +15,19 @@ import {
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { Protocol } from 'pmtiles'
-import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { useDarkMode } from '@/composables/useDarkMode'
-import { bboxOf, fitPadding, type MapMarker, toFeatureCollection } from '@/lib/places/geo'
+import { bboxOf, FIT_PADDING, type MapMarker, toFeatureCollection } from '@/lib/places/geo'
 import { blurhashToDataUrl } from '@/lib/media'
 import { badgeText, type PinSpec, pinsFor, type SourceFeature, syncMarkers } from '@/lib/places/markers'
-import { createPinElement, setLanding } from '@/lib/places/pin'
+import { createPinElement } from '@/lib/places/pin'
 import { installMarkerSource, MARKERS_SOURCE } from '@/lib/places/source'
 import { ATTRIBUTION, buildStyle, type MapManifest } from '@/lib/places/style'
 
 const props = defineProps<{
   markers: MapMarker[]
-  /**
-   * An element drawn ON TOP of the map pane — the timeline bar. The first fit reserves what it
-   * covers, so no pin lands underneath it; see `fitPadding`.
-   */
-  overlay?: HTMLElement | null
 }>()
 const emit = defineEmits<{
   'cluster-open': [payload: { clusterId: number | null; uids: string[] }]
@@ -64,17 +59,8 @@ const container = ref<HTMLElement | null>(null)
 const map = shallowRef<MapLibreMap | null>(null)
 /** Milliseconds the last marker sync took — read off the DOM by the performance check. */
 const syncMs = ref(0)
-/** Milliseconds the last `setData` took: the timeline's per-tick cost, the plan's known-unknown. */
-const setDataMs = ref(0)
 
 const byUid = new Map<string, MapMarker>()
-// What the map is CURRENTLY showing — the timeline's playhead set once playback starts, the full
-// set before that. Every path that re-feeds the source reads this and not `props.markers`: a theme
-// swap re-installs the source (see `styledata`), and re-installing the props would put every pin
-// back mid-playback and jump the timeline to its end.
-let currentMarkers: readonly MapMarker[] = props.markers
-/** Uids that became visible in the latest tick — they land, the standing pins do not. */
-let landingUids = new Set<string>()
 const pins = new Map<string, { pin: PinSpec; marker: Marker; element: HTMLElement }>()
 let fitted = false
 
@@ -83,23 +69,19 @@ function source(): GeoJSONSource | undefined {
 }
 
 /**
- * The map's one data entry point. Phase 4's timeline calls this per tick with the playhead's
- * subset — a layer `filter` would hide points without re-clustering them (mapbox-gl-js#2476).
+ * The map's one data entry point: the `markers` prop, handed to the clustering source so MapLibre
+ * re-clusters them — a layer `filter` would hide points without re-clustering (mapbox-gl-js#2476).
  */
-function setVisibleMarkers(markers: readonly MapMarker[], landing: readonly string[] = []) {
-  currentMarkers = markers
-  landingUids = new Set(landing)
-  const started = performance.now()
+function feedSource(markers: readonly MapMarker[]) {
   source()?.setData(toFeatureCollection(markers))
-  setDataMs.value = Math.round(performance.now() - started)
   sync()
 }
-defineExpose({ setVisibleMarkers, zoomToCluster })
+defineExpose({ zoomToCluster })
 
 function paint(element: HTMLElement, pin: PinSpec) {
   const lead = byUid.get(pin.uid)
   // By class, not by tag: the badge and the thumbnail sit inside a wrapper element that is itself
-  // a span (the landing animation's home), which `querySelector('span')` would find first.
+  // a span (the wrapper the badge is positioned against), which `querySelector('span')` finds first.
   const image = element.querySelector<HTMLImageElement>('.places-pin__thumb')
   const badge = element.querySelector<HTMLElement>('.places-pin__badge')
   if (image && lead) {
@@ -181,28 +163,12 @@ function sync() {
     paint(entry.element, pin)
   }
 
-  applyLanding()
   syncMs.value = Math.round(performance.now() - started)
   const bounds = instance.getBounds()
   emit(
     'visible-change',
-    currentMarkers.filter((m) => bounds.contains([m.longitude, m.latitude])).map((m) => m.uid),
+    props.markers.filter((m) => bounds.contains([m.longitude, m.latitude])).map((m) => m.uid),
   )
-}
-
-/**
- * The landing animation, on the pins whose photo arrived in this tick. A cluster lands when its
- * lead photo is one of them — MapLibre hands the leaves out only on tap, and a round trip per
- * cluster per tick is exactly the per-tick cost the timeline must not pay.
- */
-function applyLanding() {
-  for (const { pin, element } of pins.values()) {
-    setLanding(
-      element,
-      landingUids.size > 0 &&
-        (landingUids.has(pin.uid) || pin.uids.some((uid) => landingUids.has(uid))),
-    )
-  }
 }
 
 /** The opening view: the pins, not the world. Nothing to show means the world at z1. */
@@ -214,12 +180,12 @@ function fitToMarkers() {
     instance.jumpTo({ center: [0, 20], zoom: 1 })
     return
   }
-  // Measured on every fit, never a constant: the bar is a different height on a phone and
-  // grows again when its controls wrap.
-  const padding = fitPadding(
-    instance.getContainer().getBoundingClientRect(),
-    props.overlay?.getBoundingClientRect() ?? null,
-  )
+  const padding = {
+    top: FIT_PADDING,
+    right: FIT_PADDING,
+    bottom: FIT_PADDING,
+    left: FIT_PADDING,
+  }
   instance.fitBounds(box, { padding, maxZoom: 15, animate: false })
 }
 
@@ -250,7 +216,7 @@ onMounted(async () => {
   instance.addControl(new NavigationControl({ showCompass: false }), 'top-right')
 
   instance.on('load', () => {
-    installMarkerSource(instance, toFeatureCollection(currentMarkers))
+    installMarkerSource(instance, toFeatureCollection(props.markers))
     fitToMarkers()
     fitted = props.markers.length > 0
     sync()
@@ -260,7 +226,7 @@ onMounted(async () => {
   // and `load` never fires again. The installer no-ops while they are there, so this is the one
   // place that notices they are gone, and it re-syncs the pins onto the source it just put back.
   instance.on('styledata', () => {
-    if (installMarkerSource(instance, toFeatureCollection(currentMarkers))) sync()
+    if (installMarkerSource(instance, toFeatureCollection(props.markers))) sync()
   })
   instance.on('moveend', sync)
   instance.on('idle', sync)
@@ -268,19 +234,12 @@ onMounted(async () => {
 
 watch(
   () => props.markers,
-  async (markers) => {
+  (markers) => {
     byUid.clear()
     for (const marker of markers) byUid.set(marker.uid, marker)
-    // A fresh markers query resets the playhead too (PlacesView), so the map goes back to showing
-    // everything — keeping the stale playhead set here would hide pins nothing can bring back.
-    currentMarkers = markers
     if (!map.value?.getSource(SOURCE)) return
-    setVisibleMarkers(markers)
+    feedSource(markers)
     if (!fitted && markers.length) {
-      // After the DOM has caught up with these markers: the overlay this fit must reserve is
-      // rendered by the same arrival (`v-if="markers.length"`), so fitting in the same tick
-      // would measure a bar that is not there yet and reserve nothing.
-      await nextTick()
       fitToMarkers()
       fitted = true
     }
@@ -310,7 +269,6 @@ onBeforeUnmount(() => {
     class="h-full w-full"
     data-test="places-map"
     :data-sync-ms="syncMs"
-    :data-set-data-ms="setDataMs"
     role="application"
     aria-label="Map of where the photos were taken"
   />

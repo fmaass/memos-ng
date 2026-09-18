@@ -16,7 +16,6 @@ export interface SourceFeature {
     point_count?: number
     /** The cluster's lead photo (clusterProperties), or the point's own attachment. */
     uid?: string
-    t?: number
   }
 }
 

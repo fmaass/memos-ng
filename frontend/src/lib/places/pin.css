@@ -29,24 +29,6 @@
   border-radius: 8px;
   background-size: cover;
 }
-.places-pin--landing {
-  animation: places-pin-land 320ms ease-out;
-}
-@keyframes places-pin-land {
-  from {
-    transform: translateY(-14px) scale(0.6);
-    opacity: 0;
-  }
-  to {
-    transform: none;
-    opacity: 1;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .places-pin--landing {
-    animation: none;
-  }
-}
 .places-pin__badge {
   position: absolute;
   top: -8px;

@@ -11,8 +11,6 @@ export type MapMarker = components['schemas']['MapMarker']
 /** What travels into the clustering source — and, on every `setData`, into MapLibre's worker. */
 export interface MarkerProps {
   uid: string
-  /** taken_at as epoch millis: the timeline filters on a number, never on a parsed string. */
-  t: number
 }
 
 export type Bbox = [west: number, south: number, east: number, north: number]
@@ -39,7 +37,7 @@ export function toFeatureCollection(
     features: markers.map((m) => ({
       type: 'Feature',
       geometry: { type: 'Point', coordinates: [m.longitude, m.latitude] },
-      properties: { uid: m.uid, t: Date.parse(m.taken_at) },
+      properties: { uid: m.uid },
     })),
   }
 }
@@ -91,64 +89,3 @@ export function groupByCoordinate(markers: readonly MapMarker[]): CoordinateGrou
 
 /** The breathing room the first view keeps around the outermost pins, per side. */
 export const FIT_PADDING = 50
-
-/**
- * The least map the first view may be left with once the reservation is taken off it. A pane
- * shorter than the overlay it carries would otherwise be padded out of existence, and
- * `fitBounds` has no box to solve for.
- */
-const MIN_FIT_SPAN = 40
-
-/** Only the sides of a DOMRect this module needs — so a test can state one as a literal. */
-export interface PaneRect {
-  top: number
-  bottom: number
-  left: number
-  right: number
-  height: number
-}
-
-export interface FitPadding {
-  top: number
-  right: number
-  bottom: number
-  left: number
-}
-
-/**
- * What `fitBounds` must keep free, given the pane and the overlay drawn on top of it.
- *
- * The timeline bar is absolutely positioned over the map pane, so every pixel it covers is a
- * pixel a uniform padding will happily put a pin under: live at 1440x900 two of eight pins
- * landed behind it, unclickable. The reservation is MEASURED from the overlay on each fit
- * rather than named as a constant — the bar is a different height on a phone and grows again
- * when its controls wrap.
- *
- * The contract is deliberately narrow: this reserves for a BOTTOM-ANCHORED overlay that really
- * intersects the pane on BOTH axes, and for nothing else. An overlay clear of the pane (the
- * phone's in-view grid, below the map), one beside it, one entirely above it, and one anchored
- * at the TOP of it all reserve nothing and leave the uniform padding exactly as it was. A top
- * bar or a side panel would need a different side reserved, and inferring which from a
- * rectangle would quietly mis-fit the one overlay the map actually has.
- */
-export function fitPadding(
-  pane: PaneRect,
-  overlay: PaneRect | null,
-  base: number = FIT_PADDING,
-): FitPadding {
-  // Both axes, or an overlay that shares only a y-range with the pane (a side panel) would
-  // reserve as if it covered it; and only a bottom-anchored one, or a banner above the pane
-  // would reserve the whole pane height and swallow it.
-  const intersects =
-    !!overlay &&
-    overlay.right > pane.left &&
-    overlay.left < pane.right &&
-    overlay.bottom > pane.top &&
-    overlay.top < pane.bottom
-  const anchoredBottom = !!overlay && intersects && overlay.bottom > (pane.top + pane.bottom) / 2
-  const overlap =
-    overlay && anchoredBottom ? Math.max(0, pane.bottom - Math.max(overlay.top, pane.top)) : 0
-  const top = Math.min(base, Math.max(0, (pane.height - MIN_FIT_SPAN) / 2))
-  const room = pane.height - MIN_FIT_SPAN - top
-  return { top, right: base, bottom: Math.max(0, Math.min(base + overlap, room)), left: base }
-}
