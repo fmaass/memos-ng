@@ -68,13 +68,31 @@ class Settings(BaseSettings):
     UPLOAD_EXPIRY_HOURS: int = 24
     MAX_UPLOAD_MIB: int = 1024  # prod parity (system_setting MAX_UPLOAD_SIZE_MIB)
 
-    # Slow-lane transcode + thermal guard (T2.3). Saturn is thermally bound: defer the
-    # H.264 transcode while the SoC is above THERMAL_MAX_C. The default is Saturn's real CPU
-    # sensor (k10temp) — `/sys/class/thermal/thermal_zone*` does NOT exist on this Synology, so
-    # the old default silently read nothing and the guard failed OPEN (the 80 °C near-miss).
-    # On dev/CI this path is absent → read returns None → guard is a no-op (correct for dev).
-    THERMAL_ZONE: str = "/sys/class/hwmon/hwmon0/temp1_input"
-    THERMAL_MAX_C: int = 70
+    # Slow-lane transcode + thermal guard (T2.3): defer the H.264 transcode while the CPU package
+    # is above THERMAL_MAX_C.
+    #
+    # THERMAL_ZONE empty = resolve the sensor BY NAME (media.resolve_thermal_sensor: the coretemp
+    # chip's `Package id 0` input). Set it to a path and that path wins, unresolved — which is how
+    # a host whose sensor cannot be found by name is configured, Saturn's k10temp among them
+    # (`/sys/class/hwmon/hwmon0/temp1_input` there, and it publishes no temp*_label at all, so
+    # name resolution could only pick it by index — the thing this default exists to stop).
+    # The override does not escape the guard's plausibility bound: a reading outside 0 < °C <= 150
+    # is treated as a failed measurement (UNKNOWN), so a sensor whose legitimate working range
+    # leaves that window cannot be used here.
+    #
+    # THE HOST THESE NUMBERS DESCRIBE IS JUPITER — an i9-13900H, and the machine every transcode
+    # has run on since the worker moved off Saturn on 2026-07-15. Measured there 2026-09-18 on the
+    # package sensor, one real transcode of a synthetic 1080p clip under the worker's own cpus: 8
+    # limit: 81 °C peak with no transcode running at all (ordinary household load), 85 °C peak at
+    # one encoder thread, mean 87.5 °C and peak 92 °C at eight, against a critical limit of 100 °C.
+    # A package under a transcode is simply a hot package; 90 °C is the owner's threshold for this
+    # host (2026-09-18), chosen with those numbers in hand.
+    #
+    # The 70 °C that stood here belonged to the PREVIOUS host: Saturn, a Synology that shuts down
+    # fast when hot. It was never measured against a CPU package and carrying it over would stall
+    # every media job on jupiter, where an idle-ish package already crosses it.
+    THERMAL_ZONE: str = ""
+    THERMAL_MAX_C: int = 90
     MEDIA_MAX_ATTEMPTS: int = 3
     # Wall-clock ceiling for ONE slow-lane transcode (MEMNG-38). ffmpeg can wedge — a truncated
     # stream, a stalled read on the bind-mounted share — and unbounded it holds the worker's only
