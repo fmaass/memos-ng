@@ -14,10 +14,12 @@ import socket
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app import migrations
 from app.config import settings
@@ -46,6 +48,71 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
 ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message helps nobody
+
+# A claim-time PREDICATE, not a column and not a row value: nothing is stored, and the class exists
+# only in the WHERE of a claim and as the name of the consumer that issued it. That is what lets
+# the split ship with no migration and no new enum value, and what makes a rollback image — whose
+# claim has no class term — drain the very same rows serially.
+JobClass = Literal["transcode", "light"]
+# Both in-flight states block a successor, so there is no window between an earlier job's claim and
+# its commit. Terminal states never block. `claimed` is unused by the media queue (claim_one writes
+# `processing`) and is listed for safety, matching the reconcile path's own in-flight set.
+IN_FLIGHT_STATES = (JobState.queued, JobState.claimed, JobState.processing)
+
+
+def validate_worker_slots() -> None:
+    """Refuse a consumer configuration this release cannot honour. Fails loud at startup.
+
+    The product being checked is a CPU BUDGET, never a thread count — see WORKER_TRANSCODE_CPU_COST
+    for why `slots x FFMPEG_THREADS` would bound nothing.
+    """
+    slots = {
+        "WORKER_TRANSCODE_SLOTS": settings.WORKER_TRANSCODE_SLOTS,
+        "WORKER_LIGHT_SLOTS": settings.WORKER_LIGHT_SLOTS,
+    }
+    for name, count in slots.items():
+        if count < 1:
+            raise ValueError(
+                f"{name}={count}: a zero-slot class starves that class silently — one worker "
+                "process is the whole deployment, so nothing else would ever drain it"
+            )
+        if count > 1:
+            raise ValueError(
+                f"{name}={count}: slots above 1 are not supported in this release (uid-keyed temp "
+                "files, synchronous image work on the event loop, and a 5+5 connection pool all "
+                "have to be addressed first)"
+            )
+
+    demand = (
+        settings.WORKER_TRANSCODE_SLOTS * settings.WORKER_TRANSCODE_CPU_COST
+        + settings.WORKER_LIGHT_SLOTS
+    )
+    if demand > settings.WORKER_CPU_BUDGET:
+        raise ValueError(
+            f"configured consumers need {demand} cores but WORKER_CPU_BUDGET="
+            f"{settings.WORKER_CPU_BUDGET}"
+        )
+    if settings.WORKER_TRANSCODE_CPU_COST < settings.FFMPEG_THREADS:
+        raise ValueError(
+            f"WORKER_TRANSCODE_CPU_COST={settings.WORKER_TRANSCODE_CPU_COST} is below "
+            f"FFMPEG_THREADS={settings.FFMPEG_THREADS}: the nominal encoder threads alone already "
+            "exceed the measured per-transcode cost the budget is computed from"
+        )
+
+    bounds = {
+        "WORKER_TRANSCODE_STALL_SECONDS": settings.WORKER_TRANSCODE_STALL_SECONDS,
+        "WORKER_LIGHT_STALL_SECONDS": settings.WORKER_LIGHT_STALL_SECONDS,
+    }
+    for name, bound in bounds.items():
+        if bound <= POLL_SECONDS:
+            raise ValueError(f"{name}={bound} must exceed POLL_SECONDS={POLL_SECONDS}")
+        if bound >= settings.MEDIA_CLAIM_STALE_SECONDS:
+            # Past the horizon the stale sweep would requeue a job the supervisor has not yet
+            # given up on, and the two recoveries would fight over the same row.
+            raise ValueError(
+                f"{name}={bound} must stay below "
+                f"MEDIA_CLAIM_STALE_SECONDS={settings.MEDIA_CLAIM_STALE_SECONDS}"
+            )
 
 
 def parse_worker_lanes(raw: str) -> list[JobLane]:
@@ -87,18 +154,85 @@ def beat() -> None:
     path.write_text(str(time.time()))
 
 
-async def claim_one(db: AsyncSession, lanes: list[JobLane] | None = None) -> MediaJob | None:
+def _transcode_class_predicate():
+    """The TRANSCODE class: a slow-lane derive job whose attachment is a video.
+
+    A correlated EXISTS in WHERE, never a join. Postgres applies a locking clause only to rows
+    coming from the outer query's FROM list, so this subquery takes no lock at all — `attachments`
+    is read unlocked and the job-then-attachment order every co-holding path acquires in stays
+    untouched. A join would pull `attachments` into that FROM and lock it too.
+    """
+    return and_(
+        MediaJob.lane == JobLane.slow,
+        MediaJob.kind == JobKind.derive,
+        select(1)
+        .where(Attachment.id == MediaJob.attachment_id, Attachment.mime.like("video/%"))
+        .correlate(MediaJob)
+        .exists(),
+    )
+
+
+def class_predicate(job_class: JobClass):
+    """The claim-time predicate for one class. `light` is the EXACT NEGATION of `transcode`.
+
+    Written as a negation rather than as a positive list so the two classes partition the queue
+    with no gap and no overlap: a row whose attachment is already gone (media_jobs carries no
+    foreign key) matches no positive mime list, and would fall through both classes forever. As
+    the negation it lands in `light`, where the existing discard path retires it.
+    """
+    predicate = _transcode_class_predicate()
+    return predicate if job_class == "transcode" else ~predicate
+
+
+def _order_guard(lanes: list[JobLane]):
+    """No job may be claimed while an EARLIER job for the same attachment is still in flight.
+
+    Two consumers make this necessary: the repository importer writes a fast poster job and a slow
+    transcode job for one underived video in a single flush, with no ordering between them, and
+    those two jobs' attachment-status writes are not order-independent — whichever finished last
+    would decide what the owner sees. The serial loop gave this ordering away for free; the guard
+    restores it explicitly rather than arguing the pair cannot arise.
+
+    Scoped by `prior.lane IN (lanes)` on purpose: a worker orders only against jobs it could itself
+    claim, so a lower-id job in a lane nobody here drains cannot block its successor forever.
+    """
+    prior = aliased(MediaJob, name="prior")
+    return ~(
+        select(1)
+        .where(
+            prior.attachment_id == MediaJob.attachment_id,
+            prior.id < MediaJob.id,
+            prior.state.in_(IN_FLIGHT_STATES),
+            prior.lane.in_(lanes),
+        )
+        .correlate(MediaJob)
+        .exists()
+    )
+
+
+async def claim_one(
+    db: AsyncSession,
+    lanes: list[JobLane] | None = None,
+    job_class: JobClass | None = None,
+) -> MediaJob | None:
     """Atomically claim the next queued job in this worker's lanes; concurrent workers skip a
-    locked row. `lanes` defaults to the configured WORKER_LANES — the Saturn worker drains
-    `fast`, the Merkur worker drains `slow`, so a job is claimed by exactly one of them."""
+    locked row. `lanes` defaults to the configured WORKER_LANES, so a job is claimed by exactly
+    one worker. `job_class` narrows the claim to one consumer's class; omitted, the statement is
+    today's — which is what keeps every existing caller and its call shape honest."""
     if lanes is None:
         lanes = parse_worker_lanes(settings.WORKER_LANES)
+    where = [MediaJob.state == JobState.queued, MediaJob.lane.in_(lanes), _order_guard(lanes)]
+    if job_class is not None:
+        where.append(class_predicate(job_class))
+    # The locking clause stays lexically HERE, and `of=MediaJob` is written out so the intent —
+    # lock the queue row and nothing else — survives a later edit to the subqueries above. The
+    # lock census names this one site by its enclosing def, so moving it would move the census.
     stmt = (
         select(MediaJob)
-        .where(MediaJob.state == JobState.queued, MediaJob.lane.in_(lanes))
+        .where(*where)
         .order_by(MediaJob.id)
         .limit(1)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=MediaJob)
     )
     job = (await db.execute(stmt)).scalar_one_or_none()
     if job is not None:
