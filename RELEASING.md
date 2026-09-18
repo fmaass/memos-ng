@@ -140,7 +140,8 @@ then the detail archive's regions sidecar, then the detail archive, then `BUILD`
 written to a `.tmp` and renamed, so no half-written file is ever served, `BUILD` never names an
 archive that is not there yet, and a published name is never rewritten or repaired under its own
 name. Names do leave, by one route only: `prune` removes generations older than the previous one,
-together with their regions sidecars, once no client can still be reading them.
+together with their regions sidecars. It keeps the newest two of each kind by publication time and
+does not check whether a client is still reading an older one.
 
 ## Acceptance probes (real surface: https://memos.discomarder.live)
 
