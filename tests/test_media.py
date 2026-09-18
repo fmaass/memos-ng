@@ -1033,7 +1033,7 @@ def test_result_commits_when_processing_outlasts_idle_in_transaction_timeout(
     aid, jid = _seed("image/png", str(tmp_path / "x.png"))
 
     async def _slow(db, job):
-        await asyncio.sleep(0.4)  # longer than the 150 ms idle timeout set below
+        await asyncio.sleep(2.5)  # longer than the 1 s idle timeout set below
         att = (
             await db.execute(select(Attachment).where(Attachment.id == job.attachment_id))
         ).scalar_one()
@@ -1045,7 +1045,13 @@ def test_result_commits_when_processing_outlasts_idle_in_transaction_timeout(
 
         async def _go():
             async with async_session() as db:
-                await db.execute(text("SET idle_in_transaction_session_timeout = '150ms'"))
+                # The timeout has to be set on the connection that makes the claim, so this SET and
+                # the claim share one transaction (the test engine is NullPool: a commit here would
+                # close the connection and take the setting with it, and the test could no longer
+                # fail). That transaction is therefore idle between its statements, and at 150 ms
+                # a loaded host's scheduling gap alone got the connection killed before the worker
+                # had done anything. 1 s leaves that gap room; the work outlasts it 2.5 to 1.
+                await db.execute(text("SET idle_in_transaction_session_timeout = '1s'"))
                 return await worker.run_once(db)
 
         assert asyncio.run(_go()) == "processed"
