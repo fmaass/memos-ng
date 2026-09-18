@@ -53,9 +53,42 @@ class Settings(BaseSettings):
     ASSET_URL_TTL: int = 7200  # seconds a signed URL stays valid
     ASSET_URL_BUCKET: int = 3600  # mint bucket → URLs stable within the window (browser cache hits)
 
-    # Media worker thermal/concurrency guards (Saturn is thermally bound — see plan §3).
+    # Media worker thermal/concurrency guards (the worker host is thermally bound — see plan §3).
     FFMPEG_THREADS: int = 1
-    WORKER_CONCURRENCY: int = 1
+
+    # The worker drains its queue with two in-process consumers, one per claim CLASS: `transcode`
+    # (a slow-lane derive job whose attachment is a video) and `light` (everything else). One slot
+    # each, so a long transcode can no longer park every photo behind it. Validated once at startup
+    # by worker.validate_worker_slots().
+    WORKER_TRANSCODE_SLOTS: int = 1
+    WORKER_LIGHT_SLOTS: int = 1
+    # The CPU the worker container actually has. The validator checks the configured consumers fit
+    # inside it; it is a budget the worker refuses to exceed, not a limit it can impose on ffmpeg.
+    WORKER_CPU_BUDGET: int = 8
+    # What ONE transcode really costs, MEASURED rather than nominal: a nominal one-thread transcode
+    # was observed at 242 % CPU in production on 2026-09-18, so its honest cost is 3 cores.
+    # Deliberately NOT `FFMPEG_THREADS`: `-threads` sits AFTER `-i` in slow_ffmpeg_cmd, which makes
+    # it an OUTPUT option bounding libx264 alone, while decode and filter threads stay on ffmpeg's
+    # own auto-selection. So `slots x FFMPEG_THREADS` would be a thread count that bounds nothing;
+    # this product is a CPU BUDGET. The validator refuses a cost below FFMPEG_THREADS, which is
+    # what stops the arithmetic being decorative.
+    WORKER_TRANSCODE_CPU_COST: int = 3
+    # INACTIVITY bounds, per consumer, read by the supervisor before it stamps the heartbeat: a
+    # consumer suspended forever inside an awaited operation is neither finished nor erroring, so
+    # bounding death alone would let the supervisor keep reporting a hung worker healthy.
+    # Composed from numbers that exist in the source: SLOW_TRANSCODE_TIMEOUT_S (3600) +
+    # KILL_GRACE_SECONDS (5) + a stated 300 s margin for the lock-and-publish tail that follows the
+    # transcode under no worker-side deadline. It stays under MEDIA_CLAIM_STALE_SECONDS so a
+    # container healed at this bound is recovered by the sweep that already exists.
+    WORKER_TRANSCODE_STALL_SECONDS: int = 3905
+    # A POLICY number, stated honestly as one: the light class has NO upper bound in the source —
+    # only its sub-steps do (ffprobe 30 s, poster encode 60 s), while the Pillow/libheif decode and
+    # encode are wrapped by no timeout at all. It is anchored on the two numbers that do exist: it
+    # is half the 1800 s worker healthcheck bar, so the supervisor stops stamping with a full bar of
+    # margin before autoheal fires, and it sits far above the only light-class cost this deployment
+    # has measured: 23 HEIC derives in 14 s on 2026-09-18, i.e. about 0.6 s each ON AVERAGE. That
+    # is a batch figure; no per-job maximum was recorded. No source-derived light bound is claimed.
+    WORKER_LIGHT_STALL_SECONDS: int = 900
 
     # Which media lanes a worker drains. Default = both (single-worker dev/CI + the original
     # in-stack Saturn worker). The Merkur offload runs a second worker with WORKER_LANES=slow

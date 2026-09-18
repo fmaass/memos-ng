@@ -68,6 +68,16 @@ Treat every deploy and every prod DB migration as production-affecting:
   (`command: worker`; its limits live in the stack compose, which is the authority — `cpus: 8`,
   `mem_limit: 8g` since the 2026-07-15 move to jupiter). Queue = Postgres `media_jobs`
   with `FOR UPDATE SKIP LOCKED`. HEIC/HEVC originals kept as archive master (ADR-0008).
+  The one worker process drains the queue with **two in-process consumers**, routed by a
+  claim-time predicate: `transcode` (a slow-lane `derive` job whose attachment is a video) and
+  `light` (everything else), so a long transcode no longer parks the photos behind it. One slot
+  each (`WORKER_TRANSCODE_SLOTS=1`, `WORKER_LIGHT_SLOTS=1`; more than 1 is refused at startup),
+  checked against `WORKER_CPU_BUDGET=8` at a measured `WORKER_TRANSCODE_CPU_COST=3` per transcode
+  by `worker.validate_worker_slots()`. `worker.run()` is the supervisor and owns the heartbeat:
+  after one stamp at startup (before the consumers exist) it stamps only while both consumers
+  are alive, under their error streak, and inside their inactivity bound
+  (`WORKER_TRANSCODE_STALL_SECONDS=3905`, `WORKER_LIGHT_STALL_SECONDS=900`). `claimed_by` ends in
+  `/transcode` or `/light`.
 
 Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.
 

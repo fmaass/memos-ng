@@ -6,6 +6,12 @@ CPU-heavy H.264 transcode). Deployed as ONE in-stack worker running both lanes, 
 atomically with the app container from the same compose stack — schema and code move together,
 so no mixed-version worker ever runs against a newer app. (The Saturn-fast/Merkur-slow split
 this replaced is historical; see ADR-0006.)
+
+Inside that one process the queue is drained by two consumer tasks, not one serial loop: the
+`transcode` class (a slow-lane derive job on a video) and the `light` class (everything else),
+each claiming only its own class, so a transcode that runs for minutes cannot hold the photos
+queued behind it. run() supervises them and owns the heartbeat, which is why the stamp can stop
+for a consumer that died or went quiet while the other is still working.
 """
 
 import asyncio
@@ -14,10 +20,12 @@ import socket
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app import migrations
 from app.config import settings
@@ -46,6 +54,96 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
 ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message helps nobody
+
+# A claim-time PREDICATE, not a column and not a row value: nothing is stored, and the class exists
+# only in the WHERE of a claim and as the name of the consumer that issued it. That is what lets
+# the split ship with no migration and no new enum value, and what makes a rollback image — whose
+# claim has no class term — drain the very same rows serially.
+JobClass = Literal["transcode", "light"]
+# Both in-flight states block a successor, so there is no window between an earlier job's claim and
+# its commit: a claimer reading its own snapshot still sees the predecessor as `queued`. Terminal
+# states never block.
+#
+# Deliberately NARROWER than reconcile's IN_FLIGHT_JOBS, which also lists `claimed`: there the
+# extra state only SUPPRESSES a requeue, while here it would WITHHOLD a claim. Nothing in the
+# media queue ever writes `claimed` (the claim writes `processing`) and nothing would ever clear it
+# (the claim selects `queued`, the stale sweep selects `processing`), so waiting on it would strand
+# every later job of that attachment for good.
+IN_FLIGHT_STATES = (JobState.queued, JobState.processing)
+
+
+def validate_worker_slots() -> None:
+    """Refuse a consumer configuration this release cannot honour. Fails loud at startup.
+
+    The product being checked is a CPU BUDGET, never a thread count — see WORKER_TRANSCODE_CPU_COST
+    for why `slots x FFMPEG_THREADS` would bound nothing.
+    """
+    slots = {
+        "WORKER_TRANSCODE_SLOTS": settings.WORKER_TRANSCODE_SLOTS,
+        "WORKER_LIGHT_SLOTS": settings.WORKER_LIGHT_SLOTS,
+    }
+    for name, count in slots.items():
+        if count < 1:
+            raise ValueError(
+                f"{name}={count}: a zero-slot class starves that class silently — one worker "
+                "process is the whole deployment, so nothing else would ever drain it"
+            )
+        if count > 1:
+            raise ValueError(
+                f"{name}={count}: slots above 1 are not supported in this release (uid-keyed temp "
+                "files, synchronous image work on the event loop, and a 5+5 connection pool all "
+                "have to be addressed first)"
+            )
+
+    # Checked BEFORE the arithmetic below, which a nonpositive number would quietly defeat: a
+    # negative cost is SUBTRACTED from the demand and lets any configuration through.
+    if settings.WORKER_TRANSCODE_CPU_COST < 1:
+        raise ValueError(
+            f"WORKER_TRANSCODE_CPU_COST={settings.WORKER_TRANSCODE_CPU_COST} must be at least 1: "
+            "a transcode cannot cost no cores, and a negative cost would cancel the budget out"
+        )
+    if settings.WORKER_CPU_BUDGET < 1:
+        raise ValueError(
+            f"WORKER_CPU_BUDGET={settings.WORKER_CPU_BUDGET} must be at least 1: a worker with no "
+            "cores to spend cannot run a consumer at all"
+        )
+    if settings.FFMPEG_THREADS < 1:
+        raise ValueError(
+            f"FFMPEG_THREADS={settings.FFMPEG_THREADS} must be at least 1: 0 is ffmpeg's "
+            "'choose the thread count yourself', which leaves the CPU budget below with no "
+            "encoder figure to be checked against"
+        )
+
+    demand = (
+        settings.WORKER_TRANSCODE_SLOTS * settings.WORKER_TRANSCODE_CPU_COST
+        + settings.WORKER_LIGHT_SLOTS
+    )
+    if demand > settings.WORKER_CPU_BUDGET:
+        raise ValueError(
+            f"configured consumers need {demand} cores but WORKER_CPU_BUDGET="
+            f"{settings.WORKER_CPU_BUDGET}"
+        )
+    if settings.WORKER_TRANSCODE_CPU_COST < settings.FFMPEG_THREADS:
+        raise ValueError(
+            f"WORKER_TRANSCODE_CPU_COST={settings.WORKER_TRANSCODE_CPU_COST} is below "
+            f"FFMPEG_THREADS={settings.FFMPEG_THREADS}: the nominal encoder threads alone already "
+            "exceed the measured per-transcode cost the budget is computed from"
+        )
+
+    bounds = {
+        "WORKER_TRANSCODE_STALL_SECONDS": settings.WORKER_TRANSCODE_STALL_SECONDS,
+        "WORKER_LIGHT_STALL_SECONDS": settings.WORKER_LIGHT_STALL_SECONDS,
+    }
+    for name, bound in bounds.items():
+        if bound <= POLL_SECONDS:
+            raise ValueError(f"{name}={bound} must exceed POLL_SECONDS={POLL_SECONDS}")
+        if bound >= settings.MEDIA_CLAIM_STALE_SECONDS:
+            # Past the horizon the stale sweep would requeue a job the supervisor has not yet
+            # given up on, and the two recoveries would fight over the same row.
+            raise ValueError(
+                f"{name}={bound} must stay below "
+                f"MEDIA_CLAIM_STALE_SECONDS={settings.MEDIA_CLAIM_STALE_SECONDS}"
+            )
 
 
 def parse_worker_lanes(raw: str) -> list[JobLane]:
@@ -87,23 +185,98 @@ def beat() -> None:
     path.write_text(str(time.time()))
 
 
-async def claim_one(db: AsyncSession, lanes: list[JobLane] | None = None) -> MediaJob | None:
+def _transcode_class_predicate():
+    """The TRANSCODE class: a slow-lane derive job whose attachment is a video.
+
+    A correlated EXISTS in WHERE, never a join. Postgres applies a locking clause only to rows
+    coming from the outer query's FROM list, so this subquery takes no lock at all — `attachments`
+    is read unlocked and the job-then-attachment order every co-holding path acquires in stays
+    untouched.
+
+    A join would put `attachments` in that FROM list, where a bare locking clause would lock it
+    too; the `of=MediaJob` the claim carries would in fact stop that. The subquery form is kept
+    because it needs no such care, and because it leaves the claim's FROM list — and with it the
+    lock census that is keyed on this statement — exactly as it already was.
+    """
+    return and_(
+        MediaJob.lane == JobLane.slow,
+        MediaJob.kind == JobKind.derive,
+        select(1)
+        .where(Attachment.id == MediaJob.attachment_id, Attachment.mime.like("video/%"))
+        .correlate(MediaJob)
+        .exists(),
+    )
+
+
+def class_predicate(job_class: JobClass):
+    """The claim-time predicate for one class. `light` is the EXACT NEGATION of `transcode`.
+
+    Written as a negation rather than as a positive list so the two classes partition the queue
+    with no gap and no overlap: a row whose attachment is already gone (media_jobs carries no
+    foreign key) matches no positive mime list, and would fall through both classes forever. As
+    the negation it lands in `light`, where the existing discard path retires it.
+    """
+    predicate = _transcode_class_predicate()
+    return predicate if job_class == "transcode" else ~predicate
+
+
+def _order_guard(lanes: list[JobLane]):
+    """No job may be claimed while an EARLIER job for the same attachment is still in flight.
+
+    Two consumers make this necessary: the repository importer writes a fast poster job and a slow
+    transcode job for one underived video in a single flush, with no ordering between them, and
+    those two jobs' attachment-status writes are not order-independent — whichever finished last
+    would decide what the owner sees. The serial loop gave this ordering away for free; the guard
+    restores it explicitly rather than arguing the pair cannot arise.
+
+    Scoped by `prior.lane IN (lanes)` on purpose: a worker orders only against jobs it could itself
+    claim, so a lower-id job in a lane nobody here drains cannot block its successor forever.
+    """
+    prior = aliased(MediaJob, name="prior")
+    return ~(
+        select(1)
+        .where(
+            prior.attachment_id == MediaJob.attachment_id,
+            prior.id < MediaJob.id,
+            prior.state.in_(IN_FLIGHT_STATES),
+            prior.lane.in_(lanes),
+        )
+        .correlate(MediaJob)
+        .exists()
+    )
+
+
+async def claim_one(
+    db: AsyncSession,
+    lanes: list[JobLane] | None = None,
+    job_class: JobClass | None = None,
+) -> MediaJob | None:
     """Atomically claim the next queued job in this worker's lanes; concurrent workers skip a
-    locked row. `lanes` defaults to the configured WORKER_LANES — the Saturn worker drains
-    `fast`, the Merkur worker drains `slow`, so a job is claimed by exactly one of them."""
+    locked row. `lanes` defaults to the configured WORKER_LANES, so a job is claimed by exactly
+    one worker. `job_class` narrows the claim to one consumer's class; omitted, the statement is
+    today's — which is what keeps every existing caller and its call shape honest."""
     if lanes is None:
         lanes = parse_worker_lanes(settings.WORKER_LANES)
+    where = [MediaJob.state == JobState.queued, MediaJob.lane.in_(lanes), _order_guard(lanes)]
+    if job_class is not None:
+        where.append(class_predicate(job_class))
+    # The locking clause stays lexically HERE, and `of=MediaJob` is written out so the intent —
+    # lock the queue row and nothing else — survives a later edit to the subqueries above. The
+    # lock census names this one site by its enclosing def, so moving it would move the census.
     stmt = (
         select(MediaJob)
-        .where(MediaJob.state == JobState.queued, MediaJob.lane.in_(lanes))
+        .where(*where)
         .order_by(MediaJob.id)
         .limit(1)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=MediaJob)
     )
     job = (await db.execute(stmt)).scalar_one_or_none()
     if job is not None:
         job.state = JobState.processing
-        job.claimed_by = WORKER_ID
+        # The class is a claim-time predicate and lives on no column, so the only place a claimed
+        # row can say WHICH consumer took it is the claim identity: a stale `processing` row is
+        # otherwise indistinguishable between the two consumers of one worker process.
+        job.claimed_by = WORKER_ID if job_class is None else f"{WORKER_ID}/{job_class}"
         await db.flush()
     return job
 
@@ -246,7 +419,7 @@ async def _discard_claim(db: AsyncSession, job_id: int, attachment_id: int, reas
     logger.info("media_job_discarded", job_id=job_id, attachment_id=attachment_id, reason=reason)
 
 
-async def run_once(db: AsyncSession) -> str:
+async def run_once(db: AsyncSession, job_class: JobClass | None = None) -> str:
     """Claim one job, COMMIT the claim, then process it in a SEPARATE transaction (MEMNG-90).
     Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off).
 
@@ -269,7 +442,9 @@ async def run_once(db: AsyncSession) -> str:
         )
         await db.rollback()  # nothing claimed — drop the empty transaction
         return "deferred"
-    job = await claim_one(db)
+    # The class travels down ONLY when one was given: with none, this is byte-for-byte today's
+    # call, which is what lets a caller that knows nothing of classes keep working unchanged.
+    job = await claim_one(db) if job_class is None else await claim_one(db, job_class=job_class)
     if job is None:
         await db.rollback()
         return "idle"
@@ -315,8 +490,10 @@ async def run_once(db: AsyncSession) -> str:
         await media.clear_progress(job_id)
 
 
-async def run_media_drain() -> str:
+async def run_media_drain(job_class: JobClass | None = None) -> str:
     """Drain one media job in its own session, isolating ALL errors from run()'s loop.
+
+    `job_class` narrows the drain to one consumer's class; omitted, the drain is today's.
 
     The same boundary guard run_frame_share_drain applies to the optional frame feature, now
     applied to the media branch itself (MEMNG-39). run_once handles a *job* raising; this handles
@@ -331,7 +508,10 @@ async def run_media_drain() -> str:
     """
     try:
         async with async_session() as db:
-            return await run_once(db)
+            # Same forwarding rule as run_once: no class given, no keyword passed on.
+            if job_class is None:
+                return await run_once(db)
+            return await run_once(db, job_class=job_class)
     except Exception:
         logger.exception("media.drain_error")
         return "error"
@@ -696,8 +876,118 @@ class _DrainHealth:
         return self._streak
 
 
+def _now() -> float:
+    """The one clock the watermarks and the liveness verdict read.
+
+    An indirection, not a wrapper for its own sake: the stall bound is the only part of the
+    supervisor whose verdict depends on how much time has passed, so a proof of it has to be able
+    to decide when time moves. Reading `time.time()` directly made those tests measure the host's
+    scheduler instead: a pause longer than the bound failed them with nothing wrong.
+    """
+    return time.time()
+
+
+class _Watermark:
+    """The last moment a consumer was observably alive, read by the supervisor's beat gate.
+
+    Death and systemic error are what `_DrainHealth` and `task.done()` see; a consumer suspended
+    forever INSIDE an awaited operation is neither — it is simply never heard from again. Without
+    this the supervisor would keep reporting a hung worker healthy, which is the hole the old
+    single-job loop closed only by accident (it could not stamp while it was stuck).
+    """
+
+    def __init__(self) -> None:
+        self.at = _now()
+
+    def stamp(self) -> None:
+        self.at = _now()
+
+
+async def consume_media(job_class: JobClass, health: _DrainHealth, watermark: _Watermark) -> None:
+    """Drain ONE class forever. One of these runs per class, each in its own task.
+
+    The watermark is stamped on BOTH sides of the drain, so an idle pass and a thermally deferred
+    pass re-stamp it: neither is a stall, and only a pass that never comes back lets the elapsed
+    time grow. `health` is this consumer's own, never shared — a shared one would let this
+    consumer's success reset the other's error streak and hide a class that fails systemically.
+    """
+    while True:
+        watermark.stamp()
+        status = await run_media_drain(job_class)  # own session, all errors isolated from the task
+        watermark.stamp()
+        health.record(status)
+        if status != "processed":  # idle/deferred/error → back off, like the old single loop
+            await asyncio.sleep(POLL_SECONDS)
+
+
+_Consumers = dict[JobClass, tuple[asyncio.Task[None], _DrainHealth, _Watermark]]
+
+
+def _consumers_healthy(
+    consumers: _Consumers,
+    stall_bounds: dict[JobClass, int],
+    reported_exits: set[JobClass],
+    *,
+    report: bool,
+) -> bool:
+    """Is every consumer alive, draining and being heard from RIGHT NOW?
+
+    Heartbeat honesty asked of every consumer rather than of one serial loop: the stamp means "all
+    media work is being drained", so ONE bad consumer has to stop it. Three ways a consumer stops
+    counting as alive — a streak of escaped errors, having exited, and having gone quiet past its
+    class's bound — each logged distinctly so the log says which one it was.
+
+    The verdict is a function of the moment it is asked for, which is why it lives here instead of
+    in a variable: a pass asks twice, either side of an await, and holding the first answer over
+    the second would stamp a consumer that died while the supervisor was waiting. `report` is what
+    makes asking twice affordable — only the first verdict of a pass speaks, so the log keeps
+    saying each condition once per pass and no faster.
+    """
+    now = _now()
+    healthy = True
+    for job_class, (task, job_health, job_watermark) in consumers.items():
+        if not job_health.healthy:
+            if report:
+                logger.error(
+                    "worker_unhealthy_error_streak",
+                    job_class=job_class,
+                    streak=job_health.streak,
+                )
+            healthy = False
+        if task.done():
+            if report and job_class in reported_exits:
+                logger.error("worker_consumer_exited", job_class=job_class)
+            elif report:
+                reported_exits.add(job_class)
+                # The one line that can carry WHY the class stopped: nothing else retrieves this
+                # exception until the supervisor itself is torn down, so a worker that keeps
+                # running would otherwise log a dead class without ever naming what killed it.
+                # Once only — repeating the traceback every ten seconds would bury the rest.
+                logger.error(
+                    "worker_consumer_exited",
+                    job_class=job_class,
+                    exc_info=None if task.cancelled() else task.exception(),
+                )
+            healthy = False
+        elapsed = now - job_watermark.at
+        if elapsed > stall_bounds[job_class]:
+            if report:
+                logger.error(
+                    "worker_consumer_stalled",
+                    job_class=job_class,
+                    elapsed_seconds=round(elapsed, 1),
+                    bound_seconds=stall_bounds[job_class],
+                )
+            healthy = False
+    return healthy
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
+    # Before anything is spawned or stamped: a configuration this release cannot honour must fail
+    # loud and leave no trace of liveness behind, or the healthcheck would read the refusal as a
+    # healthy worker for one whole bar.
+    validate_worker_slots()
     # Say what the thermal guard is actually reading, ONCE per process and here rather than in the
     # guard: this runs before any consumer task exists, so it needs no latch, no lock and no
     # module-level "have I logged this" flag that two concurrent drains could race on — and it
@@ -721,58 +1011,96 @@ async def run() -> None:
     # draining anything new.
     await run_frame_share_recover_safe()
     await run_media_recover_safe()
-    health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
+    # One consumer task per class, each with its OWN health and watermark. The supervisor keeps a
+    # strong reference to every task: a task only weakly referenced by the loop can be garbage
+    # collected mid-drain, and the teardown below needs them anyway.
+    stall_bounds: dict[JobClass, int] = {
+        "transcode": settings.WORKER_TRANSCODE_STALL_SECONDS,
+        "light": settings.WORKER_LIGHT_STALL_SECONDS,
+    }
+    consumers: _Consumers = {}
+    spawn_classes: tuple[JobClass, ...] = ("transcode", "light")
+    for job_class in spawn_classes:
+        job_health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
+        job_watermark = _Watermark()
+        consumers[job_class] = (
+            asyncio.create_task(
+                consume_media(job_class, job_health, job_watermark),
+                name=f"media-consumer-{job_class}",
+            ),
+            job_health,
+            job_watermark,
+        )
     last_reap = 0.0
-    while True:
-        status = await run_media_drain()  # own session, all errors isolated from this loop
-        health.record(status)
-        # Heartbeat honesty (MEMNG-90): stamp only while the media loop is not hard-erroring in a
-        # streak, so a systemically failing worker (e.g. DB down) trips the healthcheck instead of
-        # looking alive.
-        if health.healthy:
-            beat()  # blocking-ok: the liveness stamp itself — see beat()
-        else:
-            logger.error("worker_unhealthy_error_streak", streak=health.streak)
-        # Drain a frame-share job opportunistically in its own session (like reap): the album upload
-        # is decoupled from the media job's transaction so an upload error can't poison media work.
-        frame_status = await run_frame_share_drain()
-        if health.healthy:
-            beat()  # blocking-ok: the liveness stamp itself — see beat()
-        # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues draining
-        # immediately — see spawn_digest for why this is never awaited here. A manual row the
-        # admin API committed is picked up FIRST and by the same spawn: while one is in flight the
-        # gate answers not-due anyway (its local_date is in the ledger), so the order costs a
-        # scheduled run nothing and gives an operator's "Run now" the shortest path to starting.
-        if not digest_task_in_flight():
-            manual_run_id = await adopt_manual_digest()
-            if manual_run_id is not None:
-                if spawn_claimed_digest(manual_run_id):
-                    logger.info("digest_run_spawned", trigger="manual", run_id=manual_run_id)
-            elif await digest_is_due():
-                if spawn_digest():
-                    logger.info("digest_run_spawned", trigger="scheduled")
-        if time.time() - last_reap > REAP_INTERVAL_SECONDS:
-            reaped = await reap_expired_committed()
-            if reaped:
-                logger.info("uploads_reaped", count=reaped)
-            # Piggybacks the reap cadence: a claim orphaned by something other than a restart
-            # (an OOM-killed send that leaves the worker alive) is recovered within the hour —
-            # frame-share and media alike.
-            await run_frame_share_recover_safe()
-            await run_media_recover_safe()
-            # Same cadence for the progress side channel: a killed worker cannot clear its own
-            # row, so the anti-join sweep keeps the table bounded by what is actually running.
-            await sweep_job_progress_safe()
-            # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
-            # close: a stored video whose poster the unwind discarded gets its fast lane back.
-            await run_commit_race_reconcile_safe()
-            # The digest's two sweeps ride the same cadence: a run whose process died is marked
-            # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
-            # is deleted from Dropbox.
-            await sweep_digest_safe()
-            last_reap = time.time()
-        if status != "processed" and frame_status != "processed":  # idle/deferred → back off
-            await asyncio.sleep(POLL_SECONDS)
+    # Which classes have already had their exit reported with the cause attached. A local, because
+    # it belongs to this supervisor's run and must not outlive it.
+    reported_exits: set[JobClass] = set()
+    try:
+        while True:
+            if _consumers_healthy(consumers, stall_bounds, reported_exits, report=True):
+                beat()  # blocking-ok: the liveness stamp itself — see beat()
+            # Drain a frame-share job opportunistically in its own session (like reap): the album
+            # upload is decoupled from the media job's transaction so an upload error can't poison
+            # media work.
+            frame_status = await run_frame_share_drain()
+            # Ask again, silently, on a fresh clock: the drain above is an await of unbounded
+            # length, and a consumer that dies, crosses its bound or reaches its error streak
+            # inside it would otherwise be stamped alive on a verdict taken before it happened.
+            if _consumers_healthy(consumers, stall_bounds, reported_exits, report=False):
+                beat()  # blocking-ok: the liveness stamp itself — see beat()
+            # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues
+            # immediately — see spawn_digest for why this is never awaited here. A manual row the
+            # admin API committed is picked up FIRST and by the same spawn: while one is in flight
+            # the gate answers not-due anyway (its local_date is in the ledger), so the order costs
+            # a scheduled run nothing and gives an operator's "Run now" the shortest path to
+            # starting.
+            if not digest_task_in_flight():
+                manual_run_id = await adopt_manual_digest()
+                if manual_run_id is not None:
+                    if spawn_claimed_digest(manual_run_id):
+                        logger.info("digest_run_spawned", trigger="manual", run_id=manual_run_id)
+                elif await digest_is_due():
+                    if spawn_digest():
+                        logger.info("digest_run_spawned", trigger="scheduled")
+            if time.time() - last_reap > REAP_INTERVAL_SECONDS:
+                reaped = await reap_expired_committed()
+                if reaped:
+                    logger.info("uploads_reaped", count=reaped)
+                # Piggybacks the reap cadence: a claim orphaned by something other than a restart
+                # (an OOM-killed send that leaves the worker alive) is recovered within the hour —
+                # frame-share and media alike.
+                await run_frame_share_recover_safe()
+                await run_media_recover_safe()
+                # Same cadence for the progress side channel: a killed worker cannot clear its own
+                # row, so the anti-join sweep keeps the table bounded by what is actually running.
+                await sweep_job_progress_safe()
+                # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
+                # close: a stored video whose poster the unwind discarded gets its fast lane back.
+                await run_commit_race_reconcile_safe()
+                # The digest's two sweeps ride the same cadence: a run whose process died is marked
+                # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
+                # is deleted from Dropbox.
+                await sweep_digest_safe()
+                last_reap = time.time()
+            if frame_status != "processed":  # idle/deferred → back off
+                # The media term is gone from this condition with the media drain: the consumers
+                # pace themselves on their own backoff now, and the supervisor's own pass is cheap.
+                await asyncio.sleep(POLL_SECONDS)
+    finally:
+        # Teardown, not signal handling: every caller that cancels run() (the loop tests do) would
+        # otherwise leave a consumer draining against patched collaborators or a closed session.
+        for task, _, _ in consumers.values():
+            task.cancel()
+        for task, _, _ in consumers.values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass  # the cancellation this teardown just requested, and only that one
+            except Exception:
+                # A consumer that had ALREADY died: its exception is retrieved here rather than
+                # left to surface as an unretrieved-task warning, and it must not mask the
+                # shutdown that is in progress.
+                logger.exception("worker_consumer_teardown_error")
 
 
 def main() -> None:

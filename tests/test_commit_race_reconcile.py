@@ -224,3 +224,65 @@ async def test_the_scan_is_bounded_and_says_when_it_stopped_short(
         assert full.scanned == 2 and full.truncated is False
     finally:
         await _finish(adb)
+
+
+async def test_a_live_transcode_is_not_mistaken_for_a_poster_job(
+    pat_client, adb, monkeypatch, tmp_path
+):
+    """A `processing` slow-lane job holds the sweep off (MEMNG-361).
+
+    With the media queue drained by two class-routed consumers, a video's transcode can sit in
+    `processing` for the length of a real encode while its poster is missing — the commit-race
+    shape, now with a claim that stays durable for the whole job rather than for one transaction.
+    The sweep must read that claim as "the pipeline still has this attachment" and add nothing: a
+    fast job enqueued underneath a live slow one is work nobody asked for, and the claim's own
+    order guard would hold it behind the transcode anyway.
+
+    The second half is the control: with the transcode finished, the very same estate IS requeued,
+    so the first assertion is about the in-flight state and not about a sweep that found nothing.
+    """
+    bearer, _, _ = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        video_uid = await _upload(bearer, "clip.mov", "video/quicktime", VIDEO_BYTES)
+        poster_uid = await _upload(bearer, "title.jpg", "image/jpeg", _jpeg())
+        made = await bearer.post(
+            "/api/memos",
+            json={
+                "content": "a video mid-transcode",
+                "visibility": "PUBLIC",
+                "upload_uids": [video_uid],
+                "video_posters": {video_uid: poster_uid},
+            },
+        )
+        assert made.status_code == 201, made.text
+        uid = made.json()["attachments"][0]["uid"]
+        attachment_id = _one("SELECT id FROM attachments")  # the API speaks uids, the queue ids
+
+        # The poster the create placed is gone, and the fast lane that would replace it has already
+        # run: without an in-flight job this is exactly the shape the sweep repairs.
+        poster.poster_path(uid).unlink()
+        await adb.execute(update(MediaJob).values(state=JobState.done))
+        transcode = MediaJob(
+            attachment_id=attachment_id, lane=JobLane.slow, state=JobState.processing
+        )
+        adb.add(transcode)
+        await adb.flush()
+
+        held_off = await reconcile_commit_races(adb)
+        assert held_off.posters_requeued == []
+        assert (
+            len(
+                (await adb.execute(select(MediaJob).where(MediaJob.lane == JobLane.fast)))
+                .scalars()
+                .all()
+            )
+            == 1
+        )  # still just the create's own finished job
+
+        transcode.state = JobState.done  # the control: the encode lands, nothing is in flight
+        await adb.flush()
+        after = await reconcile_commit_races(adb)
+        assert after.posters_requeued == [uid]
+    finally:
+        await _finish(adb)

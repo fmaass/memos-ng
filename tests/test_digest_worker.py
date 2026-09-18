@@ -174,7 +174,7 @@ async def test_the_loop_keeps_draining_and_beating_while_a_digest_is_in_flight(e
     drains = {"n": 0}
     transport = FakeTransport(delay=1.0)
 
-    async def counted_media_drain() -> str:
+    async def counted_media_drain(job_class=None) -> str:
         drains["n"] += 1
         return "idle"
 
@@ -300,7 +300,7 @@ async def test_a_failing_stale_sweep_leaves_the_loop_running(env, monkeypatch):
     async def exploding_sweep(*args, **kwargs) -> int:
         raise RuntimeError("simulated database outage in the stale sweep")
 
-    async def counted_media_drain() -> str:
+    async def counted_media_drain(job_class=None) -> str:
         drains["n"] += 1
         return "idle"
 
