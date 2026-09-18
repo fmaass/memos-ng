@@ -169,8 +169,10 @@ met until its tests exist and pass.
   app's async engine reads the latter; a mismatch is refused at collection), and
   `DROP DATABASE memosng_test_a` when the run is done.
 - **Local gates can't see the slim image.** When a change touches `pyproject.toml` deps or the
-  `Dockerfile`, run a local `docker build` BEFORE deploy — `python:3.13-slim` has no compiler, so
-  C-extension wheels (e.g. blurhash-python) fail there but not on your dev machine.
+  `Dockerfile`, run a local image build BEFORE deploy — `python:3.13-slim` has no compiler, so
+  C-extension wheels (e.g. blurhash-python) fail there but not on your dev machine. Every image
+  build goes through `scripts/build-image.sh <version>+<short-sha>`, never a bare `docker build`:
+  it shares a lock with `scripts/check-mutations.sh` and refuses a tree that differs from `HEAD`.
 
 ## Conventions
 
@@ -197,7 +199,8 @@ met until its tests exist and pass.
 - Book **1648** "memos-ng — Features": Session Reviews chapter **2689**, Decisions chapter **2690**,
   Lessons Learned page **1664**.
 - Plan pages: **1649** (historical build roadmap), **1884** (feature-parity roadmap), **3151**
-  (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17).
+  (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17),
+  **3844** (two class-routed worker consumers, 2026-09-18).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
 - Release records (book level): **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
