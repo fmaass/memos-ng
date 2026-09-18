@@ -10,12 +10,12 @@ declined a second time by the payload check, which is the point of having both g
 
 --- a/app/services/capture.py
 +++ b/app/services/capture.py
-@@ -485,7 +485,7 @@ def _heif_extent(
+@@ -496,7 +496,7 @@ def _heif_extent(
              continue
          # construction_method 0 is a FILE offset; a data_reference_index names ANOTHER file; and a
          # split extent would have to be stitched. None of the three is a header read of this file.
--        if method != 0 or reference != 0 or extents != 1:
-+        if extents != 1:
+-        if method != 0 or reference != 0 or extents != 1 or found is not None:
++        if extents != 1 or found is not None:
              return None
          # The index is SKIPPED, and the length is measured from the end of the OFFSET — not from
          # the end of the whole extent, which would read `index_size` bytes too far and turn a
