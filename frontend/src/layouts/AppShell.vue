@@ -4,6 +4,7 @@ import Drawer from 'primevue/drawer'
 import { ref, watch } from 'vue'
 
 import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
+import ConnectionBanner from '@/components/ConnectionBanner.vue'
 import TagList from '@/components/TagList.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
@@ -91,6 +92,8 @@ const mobileOpen = ref(false)
     </Drawer>
 
     <div class="flex-1 flex flex-col min-w-0">
+      <ConnectionBanner />
+
       <!-- iOS standalone draws under the status bar/Dynamic Island (viewport-fit=cover +
            black-translucent), so pad the chrome with the safe-area insets — 0 in normal browsers,
            non-zero only in that context, so it needs no display-mode gating. -->

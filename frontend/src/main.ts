@@ -8,6 +8,7 @@ import { createApp } from 'vue'
 
 import { registerSW } from 'virtual:pwa-register'
 
+import { installReachability } from './api/reachability'
 import App from './App.vue'
 import router from './router'
 import './style.css'
@@ -15,6 +16,9 @@ import 'primeicons/primeicons.css'
 
 // Register the app-shell + Web Push service worker; autoUpdate swaps in new versions.
 registerSW({ immediate: true })
+
+// Reachability drives TanStack Query's online state from here on, not `navigator.onLine`.
+installReachability()
 
 // Brand primary = indigo (matches the PWA manifest theme_color #6366f1); raw Aura
 // otherwise defaults to emerald, which is off-brand.
