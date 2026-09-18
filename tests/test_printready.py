@@ -7,6 +7,7 @@ none of them re-derives an expected value with the code under test.
 """
 
 import asyncio
+import gc
 import os
 import random
 import secrets
@@ -799,6 +800,57 @@ async def test_a_stop_during_the_encode_waits_for_the_thread(adb, monkeypatch, t
 
     assert left.is_set(), "the stop returned while the encode thread was still writing"
     assert task.cancelled()  # and the cancellation is still delivered, never swallowed
+
+
+async def test_a_stop_still_wins_when_the_waited_out_encode_fails(adb, monkeypatch, tmp_path):
+    # The wait-out must not let the thread's OWN outcome escape. An encode that raises while the
+    # stop is waiting for it would otherwise replace the CancelledError: run_once's `except
+    # Exception` would book a job failure and the consumer would carry on looping with its one
+    # cancellation already consumed, leaving the supervisor waiting for a task that never ends.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    att = await _persisted(adb, tmp_path, source=_png(tmp_path / "cancel-fail.png"))
+    job = MediaJob(
+        attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=JobState.queued
+    )
+    adb.add(job)
+    await adb.flush()
+
+    entered = threading.Event()
+    left = threading.Event()
+
+    def _failing_encode(attachment, profile=None) -> Path:
+        entered.set()
+        time.sleep(0.4)
+        left.set()
+        raise RuntimeError("the encode died while the stop was waiting for it")
+
+    monkeypatch.setattr(media, "process_printready", _failing_encode)
+
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        task = asyncio.create_task(media.process_printready_job(adb, job, att))
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        task.cancel()
+        outcome: BaseException | None = None
+        try:
+            await task
+        except BaseException as exc:  # noqa: BLE001 — the outcome IS the assertion
+            outcome = exc
+
+        assert isinstance(outcome, asyncio.CancelledError), (
+            f"the encode's own failure replaced the stop: {outcome!r}"
+        )
+        assert left.is_set()  # and it still waited the thread out
+        assert task.cancelled()
+        gc.collect()  # a dropped encode failure would be reported here, from Task.__del__
+        assert not [c for c in unhandled if "never retrieved" in c.get("message", "")]
+    finally:
+        loop.set_exception_handler(previous)
 
 
 async def test_the_upload_pipeline_never_generates_the_print_tier(adb, monkeypatch, tmp_path):

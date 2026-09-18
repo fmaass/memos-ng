@@ -1574,15 +1574,22 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
     # interrupted, so an abandoned encode keeps resizing and os.replace-ing the rendition into its
     # final path after the coroutine is gone — past the guard_publish below, which is what fences
     # a photo deleted mid-job. Shielding restores the ordering the inline call had for free: a
-    # stop that lands during an encode is delivered only once the thread is done, which bounds a
-    # worker stop by the remaining encode time of the ONE rendition in flight (one slow-lane slot,
-    # so never more than one at a time). The cancellation itself is re-raised, never swallowed.
+    # stop that lands during an encode is delivered only once the thread is done. A printready job
+    # is claimed by the LIGHT consumer — the transcode class is slow-lane `derive` on a video
+    # attachment and this is neither (app/worker.py:201-220) — and that consumer runs one job at a
+    # time (WORKER_LIGHT_SLOTS=1), so a stop waits out exactly one rendition's remaining encode.
+    # Nothing the thread does may escape that wait: a CancelledError from a second stop, and the
+    # encode's own failure just as much, since either one leaving this block would REPLACE the
+    # cancellation — and run_once would then book a job failure and keep the consumer looping with
+    # its one cancellation already spent. A failed encode is dropped here on purpose: the job is
+    # not marked, so it is simply re-run after the stop. The cancellation is re-raised, never
+    # swallowed.
     encode = asyncio.create_task(to_thread.run_sync(process_printready, attachment, profile))
     try:
         await asyncio.shield(encode)
     except asyncio.CancelledError:
         while not encode.done():
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await asyncio.shield(encode)  # re-shielded: a second stop must not win either
         if not encode.cancelled():
             encode.exception()  # retrieved, so a failed encode is not logged as never-retrieved
