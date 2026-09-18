@@ -2,6 +2,11 @@
 # Publish the self-hosted basemap archives into a tiles directory.
 #
 #   extract.sh <tiles-dir> <regions.geojson> [--build YYYYMMDD] [--dev small|large]
+#                                            [--user uid:gid]
+#
+# --user is the numeric uid:gid the go-pmtiles container runs as; it defaults to the caller's own,
+# which is what an ordinary local tiles directory wants. Publishing into the production tiles share
+# needs its owner, --user 1027:100 (see THE CONTAINER USER below).
 #
 # Produces two PMTiles archives cut from the Protomaps daily planet build:
 #   planet-<build>.pmtiles          the whole world, z0-7  — always renders something
@@ -19,6 +24,16 @@
 # WHY THE PREVIOUS GENERATION STAYS. A client that is mid-session holds the previous archive's
 # directory and will keep reading that file; deleting it in the same run that replaces it would
 # break exactly those readers. Only generations OLDER than the previous one are removed.
+#
+# THE CONTAINER USER. The archives are written by the go-pmtiles container, not by this shell, and
+# on the production tiles share those are two different questions. The share is an NFS-mounted
+# Synology export whose ACL decides by numeric uid and MASKS the unix mode: the directory is mode
+# 0777 owned 1000:1000, yet a container running as 1000:1000 is refused
+# ("open /tiles/<name>.tmp: permission denied") while the share's owner 1027:100 — the uid the app
+# and worker containers run as — is accepted. fetch-assets.sh never hit this because it writes from
+# the host shell, which the export treats differently, and so do this script's own renames and the
+# BUILD file. Only the extraction needs the override, and it needs it on every invocation: one call
+# left at the caller's uid is one permission denied, mid-publish.
 #
 # TOOL FLAGS — read off `go-pmtiles v1.31.2` itself (2026-09-17, image digest
 # sha256:06574f01f55a78f78f887bc7ebf729a5c093c0d6e17d9876300cfcb0758b59d3), not assumed:
@@ -46,7 +61,7 @@ DEV_SMALL_BBOX="8.4470,47.3200,8.6250,47.4350"
 DEV_LARGE_BBOX="8.3570,47.1590,8.9850,47.6950"
 
 usage() {
-    sed -n '2,6p' "$0" >&2
+    sed -n '2,9p' "$0" >&2
     exit 2
 }
 
@@ -54,11 +69,18 @@ TILES_DIR=""
 REGIONS=""
 BUILD=""
 DEV=""
+# Empty means "the caller's own", resolved after parsing. An exported PMTILES_USER is deliberately
+# NOT honoured: which uid wrote a published archive is part of what the release log has to show, so
+# it comes from the command line an operator can read back, not from an invisible environment.
+PMTILES_USER=""
+USER_GIVEN=0
+VALID=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --build) BUILD="${2:-}"; shift 2 ;;
         --dev) DEV="${2:-}"; shift 2 ;;
+        --user) PMTILES_USER="${2:-}"; USER_GIVEN=1; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "extract.sh: unknown option $1" >&2; usage ;;
         *)
@@ -71,6 +93,24 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$TILES_DIR" ] || usage
+
+# Checked before anything starts: docker would take a user NAME and resolve it inside an image that
+# has no user database, and the share's ACL matches the numeric id in any case — both fail late and
+# opaquely, halfway through a multi-gigabyte extract. `--user ""` is a refusal, not a fallback: a
+# variable that expanded to nothing is the mistake most worth catching.
+if [ "$USER_GIVEN" = 1 ]; then
+    case "$PMTILES_USER" in
+        *[!0-9:]*|*:*:*|:*|*:|*[!:]*[!0-9:]*) VALID=0 ;;
+        *:*) VALID=1 ;;
+        *) VALID=0 ;;
+    esac
+    if [ "$VALID" != 1 ]; then
+        echo "extract.sh: --user must be a numeric uid:gid (the production tiles share is 1027:100)" >&2
+        exit 2
+    fi
+else
+    PMTILES_USER="$(id -u):$(id -g)"
+fi
 case "$DEV" in
     "")
         [ -n "$REGIONS" ] || usage
@@ -112,13 +152,14 @@ PLANET_NAME="planet-${BUILD}.pmtiles"
 DETAIL_NAME="detail-${BUILD}-${SHA8}.pmtiles"
 
 pmtiles() {
-    # --user keeps the produced archives owned by the caller rather than by root. The tiles
-    # directory is mounted at /tiles and the regions file's directory read-only at /work.
+    # --user keeps the produced archives owned by the caller rather than by root, and on the
+    # production share it is what makes the write possible at all (see THE CONTAINER USER). The
+    # tiles directory is mounted at /tiles and the regions file's directory read-only at /work.
     local mounts=(-v "${TILES_DIR}:/tiles")
     if [ -z "$DEV" ]; then
         mounts+=(-v "$(cd "$(dirname "$REGIONS")" && pwd):/work:ro")
     fi
-    docker run --rm --user "$(id -u):$(id -g)" "${mounts[@]}" "$PMTILES_IMAGE" "$@"
+    docker run --rm --user "$PMTILES_USER" "${mounts[@]}" "$PMTILES_IMAGE" "$@"
 }
 
 # One archive, published atomically: write to a temporary name, verify the STRUCTURE of what was

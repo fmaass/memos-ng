@@ -106,6 +106,24 @@ services:
 After a roll-forward, re-run any backfill the newer release depends on for the rows the OLD code
 created in the meantime (for 1.7.0: `python -m app.scripts.backfill_location --execute`).
 
+## Basemap archives (only when the map's tiles are being republished)
+
+Not part of an ordinary release: the PMTiles archives live on the tiles share and outlive the
+image. When a release does republish them, `scripts/tiles/extract.sh` writes them through a
+go-pmtiles container, and **the production tiles share accepts a container write only from the
+share's owner**:
+
+    scripts/tiles/extract.sh <tiles-dir> <regions.geojson> --user 1027:100
+
+The share is an NFS-mounted Synology export whose ACL decides by numeric uid and masks the unix
+mode, so the 0777 directory still refuses a container running as the caller ("permission denied"
+on the `.tmp`), while `1027:100` — the uid the app and worker containers run as — is accepted. The
+flag defaults to the caller's own uid:gid, which is right for a local directory and wrong for the
+share; `fetch-assets.sh` needs nothing because it writes from the host shell. The publish order is
+the script's and stays as it is: planet, then the detail archive's regions sidecar, then the detail
+archive, then `BUILD` last — each written to a `.tmp` and renamed, so no half-written file is ever
+served and `BUILD` never names an archive that is not there yet.
+
 ## Acceptance probes (real surface: https://memos.discomarder.live)
 
 1. `GET /health` → `{"status":"ok","version":"<version>+<short-sha>","db":"ok"}` (version read

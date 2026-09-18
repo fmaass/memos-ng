@@ -516,6 +516,13 @@ DOCKER_STUB = """#!/bin/sh
 # Plays `docker run ... protomaps/go-pmtiles <subcommand>`: an extract writes the archive it was
 # asked for, a verify accepts it. The tiles directory is learned from the -v mount the script
 # passes, exactly as the real tool learns it, so a script that stopped mounting it would fail here.
+#
+# With PMTILES_STUB_ARGV set it also appends its own argv to that file, one argument per line and
+# a `--` between invocations: the only way to see what the script actually handed `docker run`.
+if [ -n "${PMTILES_STUB_ARGV:-}" ]; then
+  for a in "$@"; do printf '%s\\n' "$a" >> "$PMTILES_STUB_ARGV"; done
+  printf -- '--\\n' >> "$PMTILES_STUB_ARGV"
+fi
 tiles=""
 for a in "$@"; do
   case "$a" in *:/tiles) tiles="${a%:/tiles}" ;; esac
@@ -559,13 +566,143 @@ def _seed_archive(tiles: Path, name: str, when: int) -> Path:
     return path
 
 
-def _run_extract(tiles: Path, stub_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run_extract(
+    tiles: Path,
+    stub_dir: Path,
+    *args: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", str(EXTRACT_SH), str(tiles), *args],
         capture_output=True,
         text=True,
-        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}"},
+        env={
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ['PATH']}",
+            **(extra_env or {}),
+        },
     )
+
+
+def _recorded_invocations(argv_log: Path) -> list[list[str]]:
+    """The stub's argv log, split back into one list per `docker run` the script issued."""
+    calls: list[list[str]] = []
+    current: list[str] = []
+    for line in argv_log.read_text().splitlines():
+        if line == "--":
+            calls.append(current)
+            current = []
+        else:
+            current.append(line)
+    return calls
+
+
+def _user_argument(argv: list[str]) -> str | None:
+    """The value docker would act on: the LAST --user, since a later one wins."""
+    found = None
+    for flag, value in zip(argv, argv[1:], strict=False):
+        if flag == "--user":
+            found = value
+    return found
+
+
+# --- the extraction script's container user (MEMNG-353) ---------------------------------------
+
+
+def test_the_container_user_defaults_to_the_caller_so_a_local_directory_is_unchanged(tmp_path):
+    """No --user: every container still runs as the caller, which is what keeps the archives owned
+    by whoever ran the script on an ordinary local directory. This is the control for the override
+    test below — without it, a change that hard-coded the production share's uid would still pass
+    that one while silently breaking every developer's extract."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    argv_log = tmp_path / "argv.log"
+
+    run = _run_extract(
+        tiles,
+        stub_dir,
+        "--build",
+        "20260917",
+        "--dev",
+        "small",
+        extra_env={"PMTILES_STUB_ARGV": str(argv_log)},
+    )
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    calls = _recorded_invocations(argv_log)
+    assert len(calls) == 4, calls  # planet extract+verify, detail extract+verify
+    assert {_user_argument(c) for c in calls} == {f"{os.getuid()}:{os.getgid()}"}
+
+
+def test_the_container_user_override_reaches_every_container_invocation(tmp_path):
+    """--user is the whole point of the ticket, so what is asserted is the argv `docker run` got.
+
+    On the production tiles share the go-pmtiles container can only write as the share's owner —
+    the export's ACL decides by numeric uid and masks the unix mode, so a container running as the
+    caller is refused on a 0777 directory. A test that only checked the script's exit code would
+    pass with the flag parsed and then dropped, which is exactly the bug; hence a stub `docker` on
+    PATH that records its own argv, and an assertion that EVERY invocation carries the override —
+    one un-overridden call is one permission denied, and the publish stops there.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    argv_log = tmp_path / "argv.log"
+
+    run = _run_extract(
+        tiles,
+        stub_dir,
+        "--build",
+        "20260917",
+        "--dev",
+        "small",
+        "--user",
+        "1027:100",
+        extra_env={"PMTILES_STUB_ARGV": str(argv_log)},
+    )
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    calls = _recorded_invocations(argv_log)
+    assert len(calls) == 4, calls
+    assert {_user_argument(c) for c in calls} == {"1027:100"}
+    # and the caller's own id is nowhere in the argv any more, not even as a leftover earlier flag
+    assert not any(f"{os.getuid()}:{os.getgid()}" in c for c in calls), calls
+    # positive control: the archives were still published, so the assertions above ran against a
+    # real end-to-end publish rather than a run that died before reaching the container
+    assert (tiles / "planet-20260917.pmtiles").is_file(), run.stdout
+    assert list(tiles.glob("detail-20260917-*.pmtiles")), run.stdout
+
+
+@pytest.mark.parametrize("value", ["root", "1027", "1027:100:1", "1027:staff", ""])
+def test_a_container_user_that_is_not_numeric_uid_gid_is_refused_before_anything_runs(
+    tmp_path, value
+):
+    """The share's ACL matches a numeric uid; the go-pmtiles image carries no user database, so a
+    name resolves to nothing inside it. Both failures surface late and opaquely — a permission
+    denied halfway through a multi-gigabyte extract — so the shape is checked at parse time, before
+    any container starts."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    argv_log = tmp_path / "argv.log"
+
+    run = _run_extract(
+        tiles,
+        stub_dir,
+        "--build",
+        "20260917",
+        "--dev",
+        "small",
+        "--user",
+        value,
+        extra_env={"PMTILES_STUB_ARGV": str(argv_log)},
+    )
+
+    assert run.returncode == 2, (run.returncode, run.stdout, run.stderr)
+    assert "--user must be a numeric uid:gid" in run.stderr, run.stderr
+    assert not argv_log.exists(), "a container ran before the value was rejected"
+    assert list(tiles.iterdir()) == [], list(tiles.iterdir())
 
 
 def test_publishing_keeps_the_new_generation_and_the_one_it_replaced_and_no_more(tmp_path):
