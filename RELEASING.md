@@ -69,8 +69,8 @@ npm ci && npm run build && npm run smoke:places
 
 A real headless Chromium opens the PRODUCTION build at `/places` on a desktop viewport
 (1440x900) and a phone one (390x844) against synthetic committed fixtures, and exits non-zero on
-any console error, any failed request, and any first-view pin that falls outside the map pane or
-behind the timeline bar, and on any request that leaves the smoke's own origin. The font route
+any console error, any failed request, any first-view pin that falls outside the map pane, any
+timeline bar on the page at all, and any request that leaves the smoke's own origin. The font route
 is checked by a fetch from the page at the versioned address the style builds — the template's
 own shape is pinned by the unit tests in `style.spec.ts`, and with no basemap archive in the
 fixtures MapLibre issues no glyph request of its own. It exists because happy-dom cannot run
