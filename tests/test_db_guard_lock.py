@@ -13,6 +13,8 @@ suite's own database would destroy the run asserting the behaviour.
 
 import contextlib
 import os
+import re
+import socket
 import subprocess
 import sys
 import time
@@ -24,8 +26,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.pool import NullPool
 
+from tests import db_guard
 from tests.conftest import SYNC_URL
-from tests.db_guard import APPLICATION_NAME_PREFIX, LOCK_HANDOFF_GRACE_SECONDS
+from tests.db_guard import (
+    APPLICATION_NAME_PREFIX,
+    BOOTSTRAP_LOCK_KEY,
+    DEV_DB_CONTAINER,
+    LOCK_HANDOFF_GRACE_SECONDS,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 READY_TIMEOUT = 120.0
@@ -64,6 +72,49 @@ def test_park_holding_the_bootstrap_lock():
 BOOTSTRAPPING_SESSION = """
 def test_bootstraps_the_schema(db_engine):
     assert db_engine is not None
+"""
+
+# A module that never opens the database — the case that has to survive a stopped Postgres.
+DATABASE_FREE_SESSION = """
+def test_needs_no_database():
+    assert 2 + 2 == 4
+"""
+
+# Session start never runs here: a plain interpreter, driving the fixture body that drops the
+# schema, with a sibling already holding the lock. It is the point-of-use claim under test, so
+# the marker table printed at the end is the proof that no drop happened.
+FIXTURE_CLAIM_PROBE = """
+import os
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
+
+import tests.conftest as conftest
+from tests.db_guard import APPLICATION_NAME_PREFIX, BOOTSTRAP_LOCK_KEY
+
+dsn = os.environ["DATABASE_URL_SYNC"]
+sibling = create_engine(
+    dsn,
+    poolclass=NullPool,
+    isolation_level="AUTOCOMMIT",
+    connect_args={"application_name": APPLICATION_NAME_PREFIX + str(os.getpid())},
+)
+held = sibling.connect()
+assert held.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": BOOTSTRAP_LOCK_KEY}).scalar()
+
+marker = create_engine(dsn, poolclass=NullPool)
+with marker.begin() as conn:
+    conn.execute(text("CREATE TABLE lock_marker (note text)"))
+    conn.execute(text("INSERT INTO lock_marker VALUES ('the sibling was here')"))
+
+try:
+    next(conftest.db_engine.__wrapped__())
+except RuntimeError as exc:
+    print("REFUSED:", exc)
+else:
+    print("ADMITTED: the fixture bootstrapped without holding the lock")
+with marker.connect() as conn:
+    print("MARKER:", conn.execute(text("SELECT to_regclass('public.lock_marker')")).scalar())
 """
 
 
@@ -174,7 +225,9 @@ def test_a_second_session_refuses_instead_of_dropping_the_running_one_s_schema(t
             # traceback out of a half-run session.
             assert second.returncode == 4, output
             assert "Refusing the destructive test bootstrap" in output
-            assert "passed" not in output, "a test ran; the refusal came too late"
+            # Nothing was collected or run: a session that got as far as running a test prints
+            # an outcome summary ("1 passed in 0.3s", "1 failed in 0.3s") whatever the verdict.
+            assert not re.search(r"\b\d+ (passed|failed|error|skipped|xfailed)\b", output), output
             # The holder is named by the pid a human can act on, not only by a backend pid.
             assert f"{APPLICATION_NAME_PREFIX}{holder_pid}" in output
 
@@ -193,6 +246,117 @@ def test_a_second_session_refuses_instead_of_dropping_the_running_one_s_schema(t
         # the handoff scripts/check-mutations.sh makes between modules must not be refused.
         third = _run_session(bootstrap_file, database, timeout=300)
         assert third.returncode == 0, third.stdout + third.stderr
+
+
+def _closed_local_port() -> int:
+    """A localhost port with nothing listening: a connect there is refused, not hung."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_a_database_free_run_survives_a_database_that_is_not_there(tmp_path: Path):
+    # Before the lock existed, `pytest tests/test_db_guard.py`, `--collect-only` and any run
+    # that never opens Postgres worked with the server stopped. A claim that cannot be made is
+    # not a refusal: nobody else can be holding a database nothing can reach.
+    test_file = tmp_path / "test_database_free.py"
+    test_file.write_text(DATABASE_FREE_SESSION)
+    port = _closed_local_port()
+    dead = make_url(SYNC_URL).set(host="127.0.0.1", port=port, database="memosng_test_no_server")
+    env = {
+        **os.environ,
+        "DATABASE_URL_SYNC": dead.render_as_string(hide_password=False),
+        "DATABASE_URL": dead.set(drivername="postgresql+asyncpg").render_as_string(
+            hide_password=False
+        ),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    done = subprocess.run(
+        _session_argv(test_file),
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "1 passed" in done.stdout
+
+
+def test_the_drop_path_refuses_even_when_session_start_never_claimed(tmp_path: Path):
+    # The invariant is not "a session claims the database" but "no DROP SCHEMA without the
+    # claim". This drives the fixture body in a process where no session hook ever ran.
+    probe = tmp_path / "fixture_claim_probe.py"
+    probe.write_text(FIXTURE_CLAIM_PROBE)
+    with _scratch_database() as database:
+        done = subprocess.run(
+            [sys.executable, str(probe)],
+            cwd=REPO_ROOT,
+            env=_session_env(database),
+            capture_output=True,
+            text=True,
+            timeout=LOCK_HANDOFF_GRACE_SECONDS + 120,
+        )
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert "REFUSED: Refusing the destructive test bootstrap" in output, output
+        # And it refused instead of dropping: the sibling's table is still there.
+        assert "MARKER: lock_marker" in output, output
+
+
+@contextlib.contextmanager
+def _lock_held_as(database: str, application_name: str) -> Iterator[int]:
+    """Hold the bootstrap lock on `database` under a chosen application_name; yield backend pid."""
+    engine = create_engine(
+        _scratch_url(database, "postgresql+psycopg2"),
+        poolclass=NullPool,
+        isolation_level="AUTOCOMMIT",
+        connect_args={"application_name": application_name},
+    )
+    conn = engine.connect()
+    try:
+        assert conn.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": BOOTSTRAP_LOCK_KEY}
+        ).scalar()
+        yield int(conn.execute(text("SELECT pg_backend_pid()")).scalar() or 0)
+    finally:
+        conn.close()
+        engine.dispose()
+
+
+def _refusal_against(database: str) -> str:
+    engine = create_engine(_scratch_url(database, "postgresql+psycopg2"), poolclass=NullPool)
+    try:
+        with engine.connect() as conn:
+            return db_guard._refusal_message(database, conn)
+    finally:
+        engine.dispose()
+
+
+def test_a_live_holder_is_described_as_a_run_to_wait_for():
+    with _scratch_database() as database:
+        with _lock_held_as(database, f"{APPLICATION_NAME_PREFIX}{os.getpid()}"):
+            message = _refusal_against(database)
+    assert "is already claimed by" in message
+    assert "export both" in message
+    assert "is not running on this host" not in message
+
+
+def test_a_holder_whose_process_is_gone_is_named_as_gone_with_the_remedy():
+    # A real lingering backend: the lock is held by a connection whose application_name carries
+    # a pid that has provably exited, which is what a SIGKILLed run leaves behind.
+    corpse = subprocess.Popen([sys.executable, "-c", "pass"])
+    corpse.wait()
+    with pytest.raises(ProcessLookupError):
+        os.kill(corpse.pid, 0)
+    with _scratch_database() as database:
+        with _lock_held_as(database, f"{APPLICATION_NAME_PREFIX}{corpse.pid}") as backend_pid:
+            message = _refusal_against(database)
+    assert f"process {corpse.pid} is not running on this host" in message
+    assert f"pg_terminate_backend({backend_pid})" in message
+    assert DEV_DB_CONTAINER in message
+    # It says the run is gone rather than telling the reader to wait for it.
+    assert "the other run is not using" not in message
 
 
 def _marker_note(database: str) -> str | None:

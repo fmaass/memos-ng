@@ -43,9 +43,13 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     prove the URL guards fire before any engine connects — must not take the parent suite's
     database away from it. This hook runs before collection and long before `db_engine` builds
     an engine, so a refusal here happens with the other run's schema still untouched.
+
+    A database that is not reachable yet is not a refusal: plenty of runs never open it at all,
+    and those worked with Postgres stopped before this lock existed. Such a run proceeds
+    unlocked and `db_engine` makes the claim before it drops anything.
     """
     try:
-        acquire_bootstrap_lock(SYNC_URL)
+        acquire_bootstrap_lock(SYNC_URL, tolerate_unreachable=True)
     except RuntimeError as exc:
         # Reported as a usage error: `ERROR: <message>` and exit 4, rather than the
         # INTERNALERROR traceback a bare raise in a hook produces, which reads like a crash.
@@ -63,6 +67,11 @@ def db_engine():
     Drops + recreates `public`, then runs `alembic upgrade head` — so this fixture
     also exercises the migration end-to-end, not just the ORM metadata.
     """
+    # The claim, at the point of use. Normally session start made it already and this is a
+    # no-op; it is repeated here because that call is allowed to find the database down, and
+    # the invariant this lock exists for is not "a session claims the database" but "no DROP
+    # SCHEMA without the claim" — including a database that came up in between.
+    acquire_bootstrap_lock(SYNC_URL)
     engine = create_engine(SYNC_URL)
     with engine.begin() as conn:
         conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
