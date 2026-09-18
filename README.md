@@ -189,6 +189,84 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.7.0
+
+- `/places` puts every located photo and video on a map. The coordinates come from the originals
+  the library already holds: each one is read once at upload, from the file's own metadata, and
+  kept in three nullable columns on the attachment row. Nothing else ever sees a coordinate — the
+  markers are served through one authenticated endpoint, the derived tiers and prints keep
+  stripping GPS, every transcode and poster now drops container metadata, and the log lines carry
+  counts rather than values.
+- The basemap is served from the app's own disk, so the browser asks no third party for a map: two
+  immutable PMTiles archives cut from the daily Protomaps build (the whole world to z7, street
+  detail to z15 over the regions that actually hold pins) plus the style's fonts and sprites,
+  pinned by commit and versioned in their URLs so a bumped pin reaches a client instead of sitting
+  behind a week-long immutable cache header.
+- The map itself clusters the pins natively and fits its first view to them. A cluster opens a
+  drawer with its photos and a Zoom-in button; a single pin opens the lightbox, which offers "Show
+  in memo". On a phone the map acts as a filter above a grid of the photos in view. The map chunk
+  and its worker load only on `/places` and are kept out of the service worker's precache.
+- A bar under the map plays the located photos through time: a per-month histogram with
+  proportional year ticks, a playhead that moves at 1×, 2× or 4×, and a choice between
+  accumulating the pins and a rolling twelve-month window. Each step hands the map the playhead's
+  subset, so the clusters are re-computed rather than filtered, and the in-view grid and the phone
+  layout follow the playhead. Opening the photo viewer pauses playback.
+- A HEIC original's Exif is read from its box headers instead of through a full decode: the walker
+  follows the file's boxes to the primary image's Exif item and reads only that extent. On the 4 MB
+  fixture that is 597 bytes instead of 4,195,036, so the read deadline no longer depends on the
+  size of the picture, and a layout the walker does not handle falls back to the existing full read
+  rather than losing a date or a location.
+- Every optimized JPEG save sizes libjpeg's write buffer for the call — bytes per pixel over the
+  16-pixel blocks a JPEG actually codes, plus the Exif and colour-profile payloads — and grows it
+  and re-encodes if it still overflows. A high-entropy image that used to fail the print or mail
+  encode with "broken data stream when writing image file" now saves, and optimize stays on.
+- Both native exchange endpoints, the login exchange and the step-up exchange, carry the same rate
+  limit as the login legs: twenty requests per sixty-second window per client address, refused with
+  429. Defence in depth — a handoff code was already single-use and bound to its verifier.
+- A memo's attachments publish the capture read the server already performed: `capture_instant`,
+  `capture_civil` and `capture_source` are additive and nullable beside the unchanged
+  `captured_at`, so a client can tell an exact date from an approximate one after the fact, and the
+  memo card and permalink show the memo's date plainly.
+- The OpenAPI document was narrowed to what the server already does, and rewritten for the clients
+  that read it: the 404 a vanished memo answers on PATCH and DELETE is declared, the upload-offset
+  HEAD is declared bodyless, the four native self-service routes are published as bearer-only, and
+  every exported description now says what a thing means to a client instead of carrying tracker
+  keys, repository paths or internal names. One wire-visible consequence: a session-cookie caller
+  sending an invalid body to the native self-service lane is answered 401 before body validation,
+  where it used to see 422.
+- Every runtime dependency gained an upper bound one major above the version the lock resolves
+  (structlog and tzdata stay unbounded on purpose — their major is a calendar year, and a ceiling
+  would hold back time-zone data), and the image build takes uv from a pinned tag and digest rather
+  than `latest`.
+- `ruff format` is adopted across `app/`, `tests/` and `scripts/` with its settings written down,
+  and `ruff format --check` joins the gate, so restyling noise stops riding along in diffs.
+- The tests that redeem a handoff code or exercise the limiter run against a controlled clock that
+  proves itself: the fixture counts every application read of the pinned clock and fails a test by
+  name when the application never read it.
+- `reconcile --victim <id>` exits nonzero with the reason on stderr when it reclaims nothing — 2
+  for an empty leaked set or an id outside it, 3 for a victim another run took first, 1 for a file
+  that could not be removed — instead of reporting success for a run that did nothing.
+
+Operator notes:
+
+- One expand-only migration, `d3f81b06c9a4`: three nullable columns on `attachments` (`latitude`,
+  `longitude`, `location_source`) and two CHECK constraints, one forbidding half a coordinate and
+  one refusing an out-of-range magnitude. Both hold trivially for every existing row, all of which
+  read NULL.
+- The existing library's coordinates come from a one-off run of
+  `python -m app.scripts.backfill_location`, which is a dry run unless given `--execute`, resumes
+  where a killed run stopped (`location_source` is its ledger), and with `--regions-out` writes the
+  GeoJSON of the 1° cells holding pins — the input the basemap extraction needs.
+- The basemap is published before the map is useful: `scripts/tiles/fetch-assets.sh <tiles-dir>`
+  for the fonts and sprites, `scripts/tiles/extract.sh <tiles-dir> <regions.geojson>` for the two
+  archives. The directory is `<DATA_ROOT>/assets/tiles` unless `TILES_DIR` overrides it.
+- Rolling back across this migration is one environment variable from 1.7.0 onwards:
+  `ROLLBACK_MODE=1` on both services makes the entrypoint skip the migration and the worker's
+  schema gate accept a head its graph does not know. Production never downgrades; the rollback
+  keeps the new columns. See RELEASING.md § "Rollback across a migration".
+- The Content-Security-Policy gained `worker-src 'self' blob:`, which is what lets MapLibre decode
+  vector tiles in a web worker, and nothing else.
+
 ### v1.6.2
 
 - Every path that finalizes or consumes an upload now takes its row locks in one total order — the
