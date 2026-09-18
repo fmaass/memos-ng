@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -1037,16 +1038,99 @@ class ThermalDefer(Exception):
     """Raised to re-queue a slow job when the host is too hot (not a failure)."""
 
 
-def read_temp_millideg() -> int | None:
+# The package sensor is resolved BY NAME, never by hwmon index. /sys/class/hwmon/hwmonN is handed
+# out in probe order and moves across boots, and on jupiter index 0 is `acpitz` — an ambient zone
+# that sits near 28 °C and never moves — while the CPU package is a different chip entirely. That
+# is how this guard spent the whole jupiter era reading a number that could not rise: a backfill
+# ran with the package above 80 °C and deferred nothing.
+#
+# HWMON_ROOT is a module constant so a test can point the entire resolution at a fake tree; nothing
+# in this module ever reads the running machine's /sys when it is patched. All three functions are
+# pure reads with no cache and no shared state: two concurrent job consumers calling them at the
+# same moment cannot interfere, and the scan is a handful of small sysfs reads against a directory
+# the kernel keeps in memory — orders of magnitude cheaper than the transcode it guards, which is
+# why there is deliberately no memoisation to invalidate or to race on.
+HWMON_ROOT = Path("/sys/class/hwmon")
+THERMAL_CHIP = "coretemp"  # Intel's per-package driver; jupiter's CPU
+THERMAL_INPUT_LABEL = "Package id 0"  # the whole-package reading, not one core's
+
+
+class ThermalState(StrEnum):
+    """What the guard can honestly say about the host.
+
+    UNKNOWN is its own answer and never collapses into COOL: "no sensor" and "measured, and cool"
+    are different facts, and the failure this exists to prevent is the second being reported when
+    only the first is true.
+    """
+
+    COOL = "cool"
+    HOT = "hot"
+    UNKNOWN = "unknown"
+
+
+def resolve_thermal_sensor() -> Path | None:
+    """The CPU package temperature input on this host, or None when there is no such sensor.
+
+    None is the honest answer on a dev machine, in a container without /sys, or on a CPU whose
+    driver names things differently (Saturn's k10temp publishes no labels at all) — and it means
+    UNKNOWN, not cool. Every read is guarded: sysfs entries can disappear between the scan and the
+    open, and an unreadable chip must not take the whole resolution down with it.
+    """
     try:
-        return int(Path(settings.THERMAL_ZONE).read_text().strip())
+        chips = sorted(HWMON_ROOT.iterdir())
+    except OSError:
+        return None
+    for chip in chips:
+        try:
+            if (chip / "name").read_text().strip() != THERMAL_CHIP:
+                continue
+            labels = sorted(chip.glob("temp*_label"))
+        except OSError:
+            continue
+        for label in labels:
+            try:
+                if label.read_text().strip() != THERMAL_INPUT_LABEL:
+                    continue
+            except OSError:
+                continue
+            candidate = label.with_name(label.name.removesuffix("_label") + "_input")
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def thermal_sensor() -> Path | None:
+    """Which file the guard reads. An explicit THERMAL_ZONE wins, unresolved and unchecked: it is
+    how a host this module cannot name its way to is configured, so it must not be second-guessed
+    by the name resolution it exists to bypass."""
+    if settings.THERMAL_ZONE:
+        return Path(settings.THERMAL_ZONE)
+    return resolve_thermal_sensor()
+
+
+def read_temp_millideg() -> int | None:
+    sensor = thermal_sensor()
+    if sensor is None:
+        return None
+    try:
+        return int(sensor.read_text().strip())
     except (OSError, ValueError):
-        return None  # no thermal zone (local/CI) → guard is a no-op
+        return None  # configured but unreadable is UNKNOWN too, not cool
+
+
+def thermal_state() -> ThermalState:
+    temp = read_temp_millideg()
+    if temp is None:
+        return ThermalState.UNKNOWN
+    return ThermalState.HOT if temp > settings.THERMAL_MAX_C * 1000 else ThermalState.COOL
 
 
 def too_hot() -> bool:
-    temp = read_temp_millideg()
-    return temp is not None and temp > settings.THERMAL_MAX_C * 1000
+    """Whether work must be deferred. UNKNOWN is NOT a defer: a host with no sensor (dev, CI, a
+    container without /sys) has to keep draining its queue, and the previous behaviour of this
+    guard — silently failing open — is only dangerous when it is also silent. So the tri-state is
+    reported separately by thermal_state(), and the worker says which one it started with."""
+    return thermal_state() is ThermalState.HOT
 
 
 def parse_progress(line: str, duration: float | None) -> int | None:

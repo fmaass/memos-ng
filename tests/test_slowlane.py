@@ -155,7 +155,10 @@ def test_progress_parser():
 
 async def test_thermal_guard_defers(adb, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    monkeypatch.setattr(media, "read_temp_millideg", lambda: 80_000)  # 80°C
+    # Above the threshold, whatever it is set to — pinning a literal here is what made this
+    # test pass 80 °C off as hot and then silently stop testing anything when the host's
+    # threshold moved to 90.
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: (settings.THERMAL_MAX_C + 10) * 1000)
     att = Attachment(
         uid="hot1",
         filename="v.mp4",
