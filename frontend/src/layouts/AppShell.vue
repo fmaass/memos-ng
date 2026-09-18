@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import Drawer from 'primevue/drawer'
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
 import ConnectionBanner from '@/components/ConnectionBanner.vue'
@@ -42,6 +42,18 @@ function onToggleTheme() {
 }
 
 const mobileOpen = ref(false)
+
+// True while the connection banner (or its recovery notice) is drawing the first row of chrome.
+const chromeRowShown = ref(false)
+
+// iOS standalone draws under the status bar/Dynamic Island (viewport-fit=cover +
+// black-translucent), so the chrome pads with the safe-area insets — 0 in normal browsers,
+// non-zero only in that context, so it needs no display-mode gating. Exactly ONE row pays the
+// top inset: whichever is currently the top of the chrome. Both paying it would double the gap
+// under the notch the moment the banner appears.
+const headerInsetClass = computed(() =>
+  chromeRowShown.value ? 'pt-0' : 'pt-[env(safe-area-inset-top)]',
+)
 </script>
 
 <template>
@@ -92,43 +104,51 @@ const mobileOpen = ref(false)
     </Drawer>
 
     <div class="flex-1 flex flex-col min-w-0">
-      <ConnectionBanner />
-
-      <!-- iOS standalone draws under the status bar/Dynamic Island (viewport-fit=cover +
-           black-translucent), so pad the chrome with the safe-area insets — 0 in normal browsers,
-           non-zero only in that context, so it needs no display-mode gating. -->
-      <header
-        class="flex items-center gap-2 min-h-14 border-b border-surface-200 dark:border-surface-700 pt-[env(safe-area-inset-top)] pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))] sticky top-0 z-30 bg-surface-50/90 backdrop-blur-sm dark:bg-surface-950/90"
+      <!-- Banner and header stick as ONE block: this app is normally scrolled deep into the
+           timeline, and a banner left in the layout flow would have scrolled away long before
+           the connection drops. The chrome simply grows by a row while it shows, so it still
+           covers none of the header's controls. The background and blur live here so both rows
+           share them in either theme. -->
+      <div
+        class="sticky top-0 z-30 bg-surface-50/90 backdrop-blur-sm dark:bg-surface-950/90"
+        data-test="app-chrome"
       >
-        <Button
-          class="md:hidden"
-          text
-          rounded
-          icon="pi pi-bars"
-          aria-label="Open menu"
-          data-test="menu-toggle"
-          @click="mobileOpen = true"
-        />
-        <div class="flex-1" />
-        <RouterLink to="/search" aria-label="Search" data-test="nav-search">
-          <Button text rounded icon="pi pi-search" aria-label="Search" />
-        </RouterLink>
-        <Button
-          text
-          rounded
-          :icon="isDark ? 'pi pi-sun' : 'pi pi-moon'"
-          :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
-          data-test="dark-toggle"
-          @click="onToggleTheme"
-        />
-        <img
-          v-if="user?.avatar"
-          :src="user.avatar"
-          class="w-7 h-7 rounded-full object-cover"
-          alt="avatar"
-          data-test="header-avatar"
-        />
-      </header>
+        <ConnectionBanner @occupied="chromeRowShown = $event" />
+
+        <header
+          class="flex items-center gap-2 min-h-14 border-b border-surface-200 dark:border-surface-700 pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))]"
+          :class="headerInsetClass"
+        >
+          <Button
+            class="md:hidden"
+            text
+            rounded
+            icon="pi pi-bars"
+            aria-label="Open menu"
+            data-test="menu-toggle"
+            @click="mobileOpen = true"
+          />
+          <div class="flex-1" />
+          <RouterLink to="/search" aria-label="Search" data-test="nav-search">
+            <Button text rounded icon="pi pi-search" aria-label="Search" />
+          </RouterLink>
+          <Button
+            text
+            rounded
+            :icon="isDark ? 'pi pi-sun' : 'pi pi-moon'"
+            :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
+            data-test="dark-toggle"
+            @click="onToggleTheme"
+          />
+          <img
+            v-if="user?.avatar"
+            :src="user.avatar"
+            class="w-7 h-7 rounded-full object-cover"
+            alt="avatar"
+            data-test="header-avatar"
+          />
+        </header>
+      </div>
 
       <main class="flex-1 min-w-0 pb-[env(safe-area-inset-bottom)]">
         <slot />
