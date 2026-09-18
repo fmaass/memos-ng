@@ -29,6 +29,36 @@ a registry — the deploy image is built locally (below), so there is no `ghcr.i
 Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
 agreement is enforced *before* tagging via the checker's `--tag`.
 
+### The Places browser smoke — mandatory for every release that touches `frontend/`
+
+Any release whose range touches anything under `frontend/` additionally runs, from `frontend/`,
+bare. The rule is the whole directory on purpose. A list of map files cannot be kept true: the
+view is assembled from modules the rest of the app shares (the API client, the dark-mode switch
+that picks the map's style, the media helpers, the lightbox), and the likeliest way to break the
+map is a `maplibre-gl` bump in `package.json`, which touches no map file at all. The 1.7.1
+fit-padding fix touched `frontend/src/views/PlacesView.vue`, outside every `places/` directory.
+The smoke costs little: it ran in 13 s here, on top of a build the release makes anyway.
+
+The command:
+
+```
+npm ci && npm run build && npm run smoke:places
+```
+
+A real headless Chromium opens the PRODUCTION build at `/places` on a desktop viewport
+(1440x900) and a phone one (390x844) against synthetic committed fixtures, and exits non-zero on
+any console error, any failed request, and any first-view pin that falls outside the map pane or
+behind the timeline bar, and on any request that leaves the smoke's own origin. The font route
+is checked by a fetch from the page at the versioned address the style builds — the template's
+own shape is pinned by the unit tests in `style.spec.ts`, and with no basemap archive in the
+fixtures MapLibre issues no glyph request of its own. It exists because happy-dom cannot run
+MapLibre: 1.7.0 shipped a
+basemap with no icons and pins hidden under the bar past 913 green unit tests and two audit
+rounds. The browser is found via `PLACES_SMOKE_CHROME`, else the newest Playwright build under
+`PLAYWRIGHT_BROWSERS_PATH`/`~/.cache/ms-playwright`, else a system Chromium; with none it fails
+with a message saying so. `playwright-core` is a devDependency and downloads no browser on
+install.
+
 ## Migrations
 
 Alembic. Applied automatically at app-container boot (`docker-entrypoint.sh` runs
