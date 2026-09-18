@@ -196,16 +196,19 @@ All settings come from the environment (or a `.env` file). Key variables — see
   the cluster drawer and the viewer all stay, and the whole located set is on the map at once.
   The playhead, its histogram, the play/speed controls and their keyboard shortcuts are gone, and
   the drawer and the grid read the same one set the map shows.
-- A worker told to stop hands its in-flight media work back to the queue. On the SIGTERM a
+- A worker told to stop tries to hand its in-flight media work back to the queue. On the SIGTERM a
   `--force-recreate` sends, the supervisor tears both consumers down and each cancelled job's row
-  returns to `queued` with its attempt count untouched — provided that row is still `processing`
-  under this worker's own claim, so a job that had already finished, failed or been deleted is left
-  as it is. The next worker start re-runs the requeued job, and the per-attachment order guard then
-  stops withholding that attachment's later jobs. The stop path's bounds are designed, not
-  guaranteed, and docker's stop grace is 10 seconds. A stop that outlasts the grace
-  ends in SIGKILL, and a claim that was in flight then stays `processing` until the stale-claim
-  sweep requeues it — `MEDIA_CLAIM_STALE_SECONDS` (7200 s) plus up to one sweep interval. Deploy
-  the worker in a quiet window, which is what keeps that case off the table.
+  is put back to `queued` with its attempt count untouched — provided that row is still
+  `processing` under this worker's own claim, so a job that had already finished, failed or been
+  deleted is left as it is. The next worker start re-runs the requeued job, and the per-attachment
+  order guard then stops withholding that attachment's later jobs. The hand-back is an attempt,
+  not a guarantee. Its bounds are designed, not guaranteed, and docker's stop grace is 10 seconds:
+  a stop that outlasts the grace ends in SIGKILL. One window is known to be uncovered even inside
+  the grace: a stop that lands while the claim itself is being committed can leave that job
+  `processing` although the worker exits cleanly. In both cases the claim stays `processing`
+  until the stale-claim sweep requeues it — `MEDIA_CLAIM_STALE_SECONDS` (7200 s) plus up to one
+  sweep interval — and that recovery charges the job an attempt. Deploy the worker in a quiet
+  window, which is what keeps both cases off the table.
 - Every housekeeping step the worker supervisor awaits has a total bound. Each of those steps is
   time between two heartbeat stamps, so an unbounded one — the hosted-media retention sweep
   against a slow remote is the case this was raised on — could let the healthcheck call a working
@@ -217,7 +220,9 @@ All settings come from the environment (or a `.env` file). Key variables — see
   progress writes and the supervisor's heartbeat; it now occupies one worker thread instead, at
   the same CPU cost. A stop waits out the rendition already being encoded: a thread cannot be
   interrupted, and an abandoned one would go on writing the rendition into its final path after
-  the coroutine that fences a photo deleted mid-job is gone.
+  the coroutine that fences a photo deleted mid-job is gone. Known limit: on that stop path the
+  fence itself does not run. A photo deleted during the very encode a stop is waiting out
+  keeps that one print rendition on disk; no row points at it and no route serves it.
 - The reclaim reads the attachment's current state under its own lock. It re-selected the row FOR
   UPDATE but then decided from the copy the caller's session had already loaded, so a photo
   re-attached to another memo mid-run was deleted anyway and the read-back reported success. Both
