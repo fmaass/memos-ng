@@ -779,11 +779,15 @@ async def test_a_stop_during_the_encode_waits_for_the_thread(adb, monkeypatch, t
     await adb.flush()
 
     entered = threading.Event()
+    release = threading.Event()
     left = threading.Event()
 
     def _slow_encode(attachment, profile=None) -> Path:
+        # Held by the TEST, not by a sleep: a timed encode on a loaded host can finish before the
+        # cancellation is delivered, and the wait-out would then be skipped by a test that still
+        # passed. The timeout only bounds a broken test — it fails the assertions, never hangs.
         entered.set()
-        time.sleep(0.4)
+        release.wait(5)
         left.set()
         return printready.printready_path(attachment.uid, profile)
 
@@ -795,6 +799,14 @@ async def test_a_stop_during_the_encode_waits_for_the_thread(adb, monkeypatch, t
     assert await asyncio.to_thread(entered.wait, 5)
 
     task.cancel()
+    # `cancel()` queues the job task's resumption with call_soon, so yielding the loop hands it
+    # the CancelledError — FIFO scheduling, not elapsed time, which is what makes this
+    # independent of host load. The ticks are yields, not a sleep, so nothing here is timed.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done(), "the cancelled await returned while the encode thread was running"
+
+    release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 
@@ -817,11 +829,16 @@ async def test_a_stop_still_wins_when_the_waited_out_encode_fails(adb, monkeypat
     await adb.flush()
 
     entered = threading.Event()
+    release = threading.Event()
     left = threading.Event()
 
     def _failing_encode(attachment, profile=None) -> Path:
+        # Same gating as the test above, and here it is what the test IS: the encode must fail
+        # while the cancellation is already parked in the wait-out. Timed, it could fail first on
+        # a loaded host, `encode.done()` would be true, the wait-out loop would be skipped, and
+        # the test would pass against the very shape it exists to reject.
         entered.set()
-        time.sleep(0.4)
+        release.wait(5)
         left.set()
         raise RuntimeError("the encode died while the stop was waiting for it")
 
@@ -836,6 +853,13 @@ async def test_a_stop_still_wins_when_the_waited_out_encode_fails(adb, monkeypat
         assert await asyncio.to_thread(entered.wait, 5)
 
         task.cancel()
+        # FIFO scheduling, not elapsed time: cancel() queues the resumption, so these yields hand
+        # the job task its CancelledError and park it in the wait-out regardless of host load.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done(), "the stop returned before the encode had failed"
+
+        release.set()
         outcome: BaseException | None = None
         try:
             await task
