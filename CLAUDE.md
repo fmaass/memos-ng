@@ -202,7 +202,7 @@ met until its tests exist and pass.
   (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17),
   **3844** (two class-routed worker consumers, 2026-09-18).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
-- Release records (book level): **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
+- Release records (book level): **3846** (v1.7.1, 2026-09-18), **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
   ADR-0013 **2316**, ADR-0014 **2584**, ADR-0015 **3152** (native client; PAT bearer; HTTPS
   callback brokered by the BFF), ADR-0016 **3209** (universal links skipped — the custom scheme is
