@@ -302,8 +302,9 @@ describe('the speed control, end to end', () => {
   // The reducer was already proven: `tick` advances 1, 2 and 4 buckets at speeds 1, 2 and 4.
   // What had never been proven is the chain around it — that a click on the REAL PrimeVue
   // control emits, that the view dispatches it, and that the player then steps by that many
-  // buckets per tick. In the live pass 1x and 2x finished a four-bucket library in the same
-  // three steps, which four buckets cannot distinguish; this drives 24.
+  // buckets per tick. The live pass showed the same three transition timestamps at 1× and at
+  // 2× over a four-bucket library — too few buckets to tell the two speeds apart. This drives
+  // 24, where they cannot look alike.
   const MANY = Array.from({ length: 24 }, (_, i) =>
     marker({
       uid: `m${i}`,
@@ -312,7 +313,7 @@ describe('the speed control, end to end', () => {
     }),
   )
 
-  /** One marker per month and `accumulate` mode: the count on the map IS the playhead index. */
+  /** One marker per month and `accumulate` mode: the count on the map is the playhead index + 1. */
   function playheadIndex(): number {
     return lastShown().length - 1
   }
@@ -368,24 +369,37 @@ describe('the speed control, end to end', () => {
     wrapper.unmount()
   })
 
-  it('does not run the clock faster — the interval is the same at every speed', async () => {
-    // Speed advances BUCKETS; one tick is one `setData` at 1x, 2x and 4x alike. A speed that
-    // shortened the interval would cost the map a redraw per step instead.
-    const wrapper = mountView()
-    await wrapper.find('[data-test="timeline-play"]').trigger('click')
-    await stepsOver(1)
-    const before = setVisibleMarkers.mock.calls.length
+  // Speed advances BUCKETS; one tick is one `setData` at 1×, 2× and 4× alike. A speed that
+  // shortened the interval would cost the map a redraw per step instead — so each faster speed
+  // gets the boundary itself: a 599 ms clock at 2× alone must not slip through on 4×'s pass.
+  const CLOCK_CASES: Array<[label: string, option: number, expected: number]> = [
+    ['2×', 1, 3],
+    ['4×', 2, 5],
+  ]
 
-    await wrapper.findAll('[data-test="timeline-speed"] .p-togglebutton')[2]?.trigger('click')
-    await nextTick()
-    setVisibleMarkers.mockClear()
-    vi.advanceTimersByTime(TICK_MS - 1)
-    await nextTick()
-    expect(setVisibleMarkers).not.toHaveBeenCalled()
-    vi.advanceTimersByTime(1)
-    await nextTick()
-    expect(playheadIndex()).toBe(5)
-    expect(before).toBeGreaterThan(0)
-    wrapper.unmount()
-  })
+  it.each(CLOCK_CASES)(
+    'does not run the clock faster at %s — one redraw per tick, no sooner',
+    async (label, option, expected) => {
+      const wrapper = mountView()
+      await wrapper.find('[data-test="timeline-play"]').trigger('click')
+      await stepsOver(1)
+      expect(setVisibleMarkers.mock.calls.length).toBeGreaterThan(0)
+
+      const speeds = wrapper.findAll('[data-test="timeline-speed"] .p-togglebutton')
+      expect(speeds[option]?.text()).toBe(label)
+      await speeds[option]?.trigger('click')
+      await nextTick()
+
+      setVisibleMarkers.mockClear()
+      vi.advanceTimersByTime(TICK_MS - 1)
+      await nextTick()
+      expect(setVisibleMarkers).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(1)
+      await nextTick()
+      expect(setVisibleMarkers).toHaveBeenCalledTimes(1)
+      expect(playheadIndex()).toBe(expected)
+      wrapper.unmount()
+    },
+  )
 })
