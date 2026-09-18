@@ -192,17 +192,17 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ### v1.7.2
 
-- `/places` no longer carries a timeline. The map itself is unchanged: pins, clusters, the cluster
-  drawer and the viewer all stay, and the whole located set is on the map at once. The playhead,
-  its histogram, the play/speed controls and their keyboard shortcuts are gone, and the drawer and
-  the grid read the same one set the map shows.
+- `/places` no longer carries a timeline. The map keeps everything it showed: pins, clusters,
+  the cluster drawer and the viewer all stay, and the whole located set is on the map at once.
+  The playhead, its histogram, the play/speed controls and their keyboard shortcuts are gone, and
+  the drawer and the grid read the same one set the map shows.
 - A worker told to stop hands its in-flight media work back to the queue. On the SIGTERM a
   `--force-recreate` sends, the supervisor tears both consumers down and each cancelled job's row
   returns to `queued` with its attempt count untouched — provided that row is still `processing`
   under this worker's own claim, so a job that had already finished, failed or been deleted is left
   as it is. The next worker start re-runs the requeued job, and the per-attachment order guard then
-  stops withholding that attachment's later jobs. The limit is honest: the stop path's bounds are
-  designed, not guaranteed, and docker's stop grace is 10 seconds. A stop that outlasts the grace
+  stops withholding that attachment's later jobs. The stop path's bounds are designed, not
+  guaranteed, and docker's stop grace is 10 seconds. A stop that outlasts the grace
   ends in SIGKILL, and a claim that was in flight then stays `processing` until the stale-claim
   sweep requeues it — `MEDIA_CLAIM_STALE_SECONDS` (7200 s) plus up to one sweep interval. Deploy
   the worker in a quiet window, which is what keeps that case off the table.
@@ -223,10 +223,11 @@ All settings come from the environment (or a `.env` file). Key variables — see
   re-attached to another memo mid-run was deleted anyway and the read-back reported success. Both
   implementations now read the row's current columns under the lock, which is what makes the
   re-read a revalidation rather than a formality.
-- The app's loggers stay alive when alembic loads inside the app process. Alembic configures
-  logging through `fileConfig`, which by default disables every logger that already exists, and in
-  the app process those loggers carry the privacy filters — so the migration run at container boot
-  could silently switch redaction off.
+- Alembic no longer disables loggers that already exist. It configures logging through
+  `fileConfig`, which by default switches off every logger created before it runs. The migration
+  at container boot was never affected, since it runs in its own process before the server
+  starts; a process that loads `alembic/env.py` after the app's logging is set up, as the test
+  suite does, lost those loggers. `alembic/env.py` now passes `disable_existing_loggers=False`.
 - The web client says so when the server stops answering: a banner offering an immediate retry
   while requests keep failing, and a short notice once it is reachable again. The verdict comes
   only from real traffic — a request's outcome, or the health probe — never from
