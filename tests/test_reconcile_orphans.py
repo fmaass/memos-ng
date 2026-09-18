@@ -21,6 +21,7 @@ from app.models import (
     User,
     Visibility,
 )
+from app.services import reclaim as reclaim_service
 from app.services.asset_paths import all_asset_paths
 from app.services.reclaim import Revalidate, reclaim_attachment_sync
 from scripts.reconcile_orphan_attachments import leaked_orphans, main, read_back
@@ -238,6 +239,95 @@ def test_a_victim_another_run_already_took_is_skipped_and_exits_nonzero(
         assert str(leaked_id) in err and "NOT reclaimed" in err
         # This run unlinked nothing: it never got as far as owning the row.
         assert seeded["paths"]["dated"].exists()
+    finally:
+        session.close()
+        _cleanup()
+
+
+def _memo_id_of(att_id: int) -> int | None:
+    """Read the row's `memo_id` on a connection of its own — never through a session that may
+    answer from its identity map, which is the very thing under test here."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text("SELECT memo_id FROM attachments WHERE id = :a"), {"a": att_id}
+        ).all()
+    eng.dispose()
+    assert len(rows) == 1, f"attachment {att_id} was DELETED: {rows}"
+    return rows[0][0]
+
+
+def _spy_on_the_revalidation(monkeypatch) -> list[int | None]:
+    """Record the `memo_id` `_ineligible` was actually asked about, decision by decision.
+
+    The end state alone cannot tell a fix from a coincidence: a run that stands down for the wrong
+    reason leaves the same surviving row. This is the decision point itself.
+    """
+    seen: list[int | None] = []
+    real = reclaim_service._ineligible
+
+    def spy(att, mode):
+        seen.append(att.memo_id)
+        return real(att, mode)
+
+    monkeypatch.setattr(reclaim_service, "_ineligible", spy)
+    return seen
+
+
+def test_a_relink_committed_after_the_candidate_scan_is_honoured(
+    db_engine, monkeypatch, tmp_path, capsys
+):
+    """MEMNG-297 — the run's own session already holds the row, so the locked re-select must read
+    the row's CURRENT state rather than the identity map's.
+
+    `main()` loads every candidate in `leaked_orphans()`. A user re-attaching that photo commits
+    `memo_id` from another connection while the run is in flight; the reclaim then re-selects the
+    row FOR UPDATE — and if that select is answered out of the identity map, `_ineligible()` decides
+    about a `memo_id` that has passed and a live memo's photo is deleted with a successful-looking
+    read-back. The relink has to reach the decision.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL_SYNC", SYNC_URL)
+    session = _session(db_engine)
+    try:
+        seeded = _seed(session, tmp_path)
+        session.commit()
+        leaked_id = seeded["leaked"].id
+        live_memo_id = seeded["linked"].memo_id  # the memo the photo is re-attached to
+        assert live_memo_id is not None
+        assert _memo_id_of(leaked_id) is None  # the control: a genuine orphan when the run lists it
+        session.close()  # the script opens its own session; nothing of ours holds these rows
+
+        seen = _spy_on_the_revalidation(monkeypatch)
+        real_reclaim = script.reclaim_attachment_sync
+
+        def relink_then_reclaim(sess, att_id, mode, **kwargs):
+            # AFTER the candidate scan, BEFORE the locked revalidation: a second, independent
+            # connection re-attaches the photo and COMMITS. Same instant as a dedup-claiming
+            # upload; the reclaim below is the real one, on the run's own session.
+            other = create_engine(SYNC_URL)
+            with other.begin() as conn:
+                conn.execute(
+                    text("UPDATE attachments SET memo_id = :m WHERE id = :a"),
+                    {"m": live_memo_id, "a": att_id},
+                )
+            other.dispose()
+            return real_reclaim(sess, att_id, mode, **kwargs)
+
+        monkeypatch.setattr(script, "reclaim_attachment_sync", relink_then_reclaim)
+
+        code = main(["--victim", str(leaked_id)])
+        out, err = capsys.readouterr()
+
+        # The decision point: the revalidation saw the relink, not the state the scan captured.
+        assert seen == [live_memo_id], out + err
+        # …and therefore reported it as ineligible rather than reclaiming it.
+        assert code != 0, out + err
+        assert "skipped_ineligible" in err and "NOT reclaimed" in err
+        assert "SKIPPED" in out
+        # The row survives, relinked, with its bytes — read back on a fresh connection.
+        assert _memo_id_of(leaked_id) == live_memo_id
+        assert seeded["paths"]["dated"].exists(), "a live memo's photo was deleted"
     finally:
         session.close()
         _cleanup()

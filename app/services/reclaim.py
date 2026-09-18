@@ -185,8 +185,19 @@ async def reclaim_attachment(
         .execution_options(synchronize_session=False)
     )
     # 2. …then the attachment row, locked and revalidated against the caller's own premise.
+    #    `populate_existing`: the caller's session has usually already loaded this row — the memo
+    #    delete nulls the FK on its loaded attachments and the sessionmaker does not expire on
+    #    commit — so without it the lock is taken in the database while `_ineligible` decides from
+    #    the identity map, about a `memo_id` that has passed. A relink committed in between would be
+    #    deleted anyway (MEMNG-297). Reading the row's CURRENT state under the lock IS the
+    #    revalidation.
     att = (
-        await db.execute(select(Attachment).where(Attachment.id == attachment_id).with_for_update())
+        await db.execute(
+            select(Attachment)
+            .where(Attachment.id == attachment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one_or_none()
     if att is None:
         await db.commit()
@@ -258,7 +269,10 @@ def reclaim_attachment_sync(
         .execution_options(synchronize_session=False)
     )
     att = session.execute(
-        select(Attachment).where(Attachment.id == attachment_id).with_for_update()
+        select(Attachment)
+        .where(Attachment.id == attachment_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)  # current state under the lock — see above
     ).scalar_one_or_none()
     if att is None:
         session.commit()
