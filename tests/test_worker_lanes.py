@@ -6,6 +6,7 @@ from app import worker
 from app.config import Settings, settings
 from app.database import async_session
 from app.models import Attachment, AttachmentStatus, JobKind, JobLane, JobState, MediaJob
+from app.services import media
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 
@@ -575,9 +576,101 @@ def test_a_nonpositive_ffmpeg_thread_count_is_refused(slot_settings, value):
         worker.validate_worker_slots()
 
 
-def test_the_deployed_configuration_validates():
-    # The real production shape, read off the deployed environment: both lanes on one worker, one
-    # encoder thread, and every setting this change adds left on its in-code default.
+def test_the_deployed_configuration_validates(slot_settings):
+    # The real production shape: both lanes on one worker, one encoder thread, every setting this
+    # change adds left on its in-code default. Pinned through the fixture and off the field
+    # defaults rather than read ambient, so an env var in whatever shell runs the suite cannot
+    # decide this verdict — the deployed shape is what is under test, not this machine's.
+    defaults = {name: field.default for name, field in Settings.model_fields.items()}
+    slot_settings(WORKER_LANES=defaults["WORKER_LANES"], FFMPEG_THREADS=defaults["FFMPEG_THREADS"])
     assert worker.parse_worker_lanes(settings.WORKER_LANES) == [JobLane.fast, JobLane.slow]
     assert settings.FFMPEG_THREADS == 1
     worker.validate_worker_slots()
+
+
+# ---------------------------------------------------------------------------
+# The class a consumer drains with travels DOWN to the claim, and the claim
+# records it: `claimed_by` carries the class, so a stale row names the consumer
+# that abandoned it even though the class is stored nowhere on the row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stub_the_work_behind_the_claim(monkeypatch):
+    """Replace what happens AFTER the claim, so a case can read the claim back.
+
+    Only collaborators behind run_once are stubbed — the media pipeline and the terminal push.
+    The path under test (run_media_drain -> run_once -> claim_one) runs for real, against the
+    real database, which is the whole point of these cases.
+    """
+
+    async def _no_work(db, job):
+        return None
+
+    async def _no_notify(attachment_id):
+        return None
+
+    monkeypatch.setattr(media, "process_job", _no_work)
+    monkeypatch.setattr(worker, "_notify_terminal_safe", _no_notify)
+
+
+def _claim_of(jid: int) -> tuple[str | None, str]:
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        claimed_by, state = c.execute(
+            text("SELECT claimed_by, state FROM media_jobs WHERE id=:j"), {"j": jid}
+        ).one()
+    eng.dispose()
+    return claimed_by, state
+
+
+async def test_a_claim_made_through_a_class_records_that_class(adb, stub_the_work_behind_the_claim):
+    job = await _seed_job(adb, lane=JobLane.fast, mime="image/jpeg")
+    assert await worker.run_once(adb, job_class="light") == "processed"
+    await adb.refresh(job)
+    assert job.claimed_by == f"{worker.WORKER_ID}/light"
+
+
+async def test_a_claim_made_with_no_class_records_the_bare_worker_id(
+    adb, stub_the_work_behind_the_claim
+):
+    job = await _seed_job(adb, lane=JobLane.fast, mime="image/jpeg")
+    assert await worker.run_once(adb) == "processed"
+    await adb.refresh(job)
+    # No suffix without a class: a rollback image, whose claim has no class at all, writes rows
+    # that read exactly like this one.
+    assert job.claimed_by == worker.WORKER_ID
+
+
+@pytest.mark.parametrize(
+    ("job_class", "mine", "other"),
+    [
+        ("transcode", ("video/mp4", JobLane.slow), ("image/jpeg", JobLane.fast)),
+        ("light", ("image/jpeg", JobLane.fast), ("video/mp4", JobLane.slow)),
+    ],
+)
+def test_a_drain_of_one_class_never_claims_the_other_class(
+    stub_the_work_behind_the_claim, job_class, mine, other
+):
+    """The class reaches the claim through the DRAIN, not only through run_once directly."""
+    mine_aid, mine_jid = _seed_committed(mine[0], mine[1])
+    other_aid, other_jid = _seed_committed(other[0], other[1])
+
+    async def _drain():
+        # Bounded, because the drain claims the lowest queued id first and this database is
+        # shared with the rest of the suite; a leftover row would make this loop fail loudly
+        # rather than silently pass.
+        for _ in range(5):
+            await worker.run_media_drain(job_class)
+            if _claim_of(mine_jid)[0] is not None:
+                return
+
+    try:
+        asyncio.run(_drain())
+        claimed_by, state = _claim_of(mine_jid)
+        assert claimed_by is not None and claimed_by.endswith(f"/{job_class}")
+        assert state != "queued"
+        other_claimed_by, other_state = _claim_of(other_jid)
+        assert other_claimed_by is None and other_state == "queued"  # the other class, untouched
+    finally:
+        _cleanup_committed([mine_aid, other_aid], [mine_jid, other_jid])

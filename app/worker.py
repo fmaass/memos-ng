@@ -59,10 +59,10 @@ JobClass = Literal["transcode", "light"]
 # states never block.
 #
 # Deliberately NARROWER than reconcile's IN_FLIGHT_JOBS, which also lists `claimed`: there the
-# extra state only SUPPRESSES a requeue, so including a state nothing produces is harmless, while
-# here it would WITHHOLD a claim. Nothing in the media queue ever writes `claimed` (the claim
-# writes `processing`) and nothing would ever clear it (the claim selects `queued`, the stale sweep
-# selects `processing`), so waiting on it would strand every later job of that attachment for good.
+# extra state only SUPPRESSES a requeue, while here it would WITHHOLD a claim. Nothing in the
+# media queue ever writes `claimed` (the claim writes `processing`) and nothing would ever clear it
+# (the claim selects `queued`, the stale sweep selects `processing`), so waiting on it would strand
+# every later job of that attachment for good.
 IN_FLIGHT_STATES = (JobState.queued, JobState.processing)
 
 
@@ -267,7 +267,10 @@ async def claim_one(
     job = (await db.execute(stmt)).scalar_one_or_none()
     if job is not None:
         job.state = JobState.processing
-        job.claimed_by = WORKER_ID
+        # The class is a claim-time predicate and lives on no column, so the only place a claimed
+        # row can say WHICH consumer took it is the claim identity: a stale `processing` row is
+        # otherwise indistinguishable between the two consumers of one worker process.
+        job.claimed_by = WORKER_ID if job_class is None else f"{WORKER_ID}/{job_class}"
         await db.flush()
     return job
 
@@ -410,7 +413,7 @@ async def _discard_claim(db: AsyncSession, job_id: int, attachment_id: int, reas
     logger.info("media_job_discarded", job_id=job_id, attachment_id=attachment_id, reason=reason)
 
 
-async def run_once(db: AsyncSession) -> str:
+async def run_once(db: AsyncSession, job_class: JobClass | None = None) -> str:
     """Claim one job, COMMIT the claim, then process it in a SEPARATE transaction (MEMNG-90).
     Returns 'processed' | 'idle' | 'deferred' (deferred → caller backs off).
 
@@ -433,7 +436,9 @@ async def run_once(db: AsyncSession) -> str:
         )
         await db.rollback()  # nothing claimed — drop the empty transaction
         return "deferred"
-    job = await claim_one(db)
+    # The class travels down ONLY when one was given: with none, this is byte-for-byte today's
+    # call, which is what lets a caller that knows nothing of classes keep working unchanged.
+    job = await claim_one(db) if job_class is None else await claim_one(db, job_class=job_class)
     if job is None:
         await db.rollback()
         return "idle"
@@ -479,8 +484,10 @@ async def run_once(db: AsyncSession) -> str:
         await media.clear_progress(job_id)
 
 
-async def run_media_drain() -> str:
+async def run_media_drain(job_class: JobClass | None = None) -> str:
     """Drain one media job in its own session, isolating ALL errors from run()'s loop.
+
+    `job_class` narrows the drain to one consumer's class; omitted, the drain is today's.
 
     The same boundary guard run_frame_share_drain applies to the optional frame feature, now
     applied to the media branch itself (MEMNG-39). run_once handles a *job* raising; this handles
@@ -495,7 +502,10 @@ async def run_media_drain() -> str:
     """
     try:
         async with async_session() as db:
-            return await run_once(db)
+            # Same forwarding rule as run_once: no class given, no keyword passed on.
+            if job_class is None:
+                return await run_once(db)
+            return await run_once(db, job_class=job_class)
     except Exception:
         logger.exception("media.drain_error")
         return "error"

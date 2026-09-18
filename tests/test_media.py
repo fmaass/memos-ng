@@ -3,6 +3,7 @@ import json
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -406,6 +407,21 @@ async def test_poisoned_job_recorded_failed_and_worker_keeps_draining(
         _cleanup(poison_aid, good_aid)
 
 
+def _exception_snapshot(seen: list[BaseException | None]):
+    """A capturing processor that records the exception IN FLIGHT as each entry is logged.
+
+    `logger.exception` under capture_logs records `exc_info=True` — a flag, not the exception — so
+    an assertion on the captured entry alone cannot say WHICH exception was isolated, and any
+    other error raised on the way in (a call-shape TypeError, say) would satisfy it just as well.
+    """
+
+    def snapshot(logger, method_name, event_dict):
+        seen.append(sys.exc_info()[1])
+        return event_dict
+
+    return snapshot
+
+
 async def test_run_media_drain_isolates_and_logs_an_escaping_error(monkeypatch):
     # The loop guard: anything raising OUTSIDE run_once's own handler (claim_one, the failure
     # record's commit, the session context manager's exit) must be logged and converted to a
@@ -414,9 +430,18 @@ async def test_run_media_drain_isolates_and_logs_an_escaping_error(monkeypatch):
         raise RuntimeError("claim exploded")
 
     monkeypatch.setattr(worker, "run_once", boom)
-    with capture_logs() as caps:
+    active: list[BaseException | None] = []
+    with capture_logs(processors=[_exception_snapshot(active)]) as caps:
         assert await worker.run_media_drain() == "error"  # backs off, keeps running
     assert any(c["event"] == "media.drain_error" and c.get("exc_info") for c in caps)
+    isolated = [
+        exc
+        for entry, exc in zip(caps, active, strict=True)
+        if entry["event"] == "media.drain_error"
+    ]
+    # Name the exception that was isolated, not merely that one was: this is the drain's contract.
+    assert len(isolated) == 1
+    assert isinstance(isolated[0], RuntimeError) and str(isolated[0]) == "claim exploded"
 
 
 async def test_run_media_drain_does_not_swallow_cancellation(monkeypatch):
