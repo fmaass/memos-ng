@@ -83,7 +83,7 @@ overlay instead. `compose.rollback.yml` in the stack repo, used as
 
 ```yaml
 services:
-  app:
+  memos-ng-app:
     # The entrypoint's uvicorn line, reproduced WITHOUT the alembic call. The forwarded-IP default
     # has to be reproduced with it: uvicorn otherwise trusts 127.0.0.1 alone, every request keeps
     # Traefik's address, and the per-IP login limiter collapses into one household-wide bucket
@@ -96,7 +96,7 @@ services:
         FORWARDED_ALLOW_IPS="$${FORWARDED_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}";
         exec uvicorn app.main:app --host 0.0.0.0 --port 8000
         --proxy-headers --forwarded-allow-ips "$$FORWARDED_ALLOW_IPS"
-  worker:
+  memos-ng-worker:
     # Stopped for the rollback window rather than started against a schema its gate refuses. Jobs
     # queue; nothing is lost. Derivations, frame sharing, digests and cleanup wait, while uploads
     # keep working and stay pending/processing until the roll-forward drains the queue.
