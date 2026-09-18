@@ -13,10 +13,15 @@ only the codec is not.
 """
 
 import asyncio
+import contextlib
 import json
+import os
 import secrets
+import signal
 import sys
+import time
 from collections import deque
+from pathlib import Path
 from typing import cast
 
 from app import worker
@@ -24,6 +29,7 @@ from app.config import settings
 from app.database import async_session
 from app.routers.assets import _ready_meta, _user_snapshot, media_event_stream
 from app.services import media
+from PIL import Image
 from sqlalchemy import create_engine, text
 from structlog.testing import capture_logs
 
@@ -480,3 +486,228 @@ async def test_worker_sweep_isolates_its_errors(monkeypatch):
     monkeypatch.setattr(media, "sweep_stale_progress", _explode)
 
     assert await worker.sweep_job_progress_safe() == 0
+
+
+# --- head-of-line blocking: one parked transcode must not hold the light class up --------------
+
+
+def _parked_cmd(gate: Path):
+    """Stub argv factory for a transcode that PARKS until the test opens a gate FILE.
+
+    A file gate, not a sleep: the test releases the transcode at a moment it chooses, and nothing
+    here depends on how loaded the machine is. The pid is written next to the output so the
+    teardown can prove no parked stub outlived its test.
+    """
+    script = (
+        "import os, sys, time\n"
+        "open(sys.argv[1] + '.started', 'w').write(str(os.getpid()))\n"
+        "while not os.path.exists(sys.argv[2]):\n"
+        "    time.sleep(0.02)\n"
+        "open(sys.argv[1], 'w').write('ok')\n"
+    )
+
+    def cmd(src: str, dest: str, threads: int) -> list[str]:
+        return [sys.executable, "-c", script, dest, str(gate)]
+
+    return cmd
+
+
+def _parked_pids(root: Path) -> list[int]:
+    pids = []
+    for marker in root.rglob("*.started"):
+        try:
+            pids.append(int(marker.read_text().strip()))
+        except (OSError, ValueError):
+            continue
+    return pids
+
+
+def _reap_parked(root: Path) -> None:
+    """Teardown net: a stub still parked when its test ends is killed, identified by its OWN argv
+    so a recycled pid can never be the victim."""
+    deadline = time.monotonic() + 10
+    for pid in _parked_pids(root):
+        while time.monotonic() < deadline:
+            try:
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except OSError:
+                break  # gone, or reaped by the event loop
+            if b"sys.argv[1] + '.started'" not in argv:
+                break  # some other process now owns this pid
+            time.sleep(0.05)
+        else:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+async def _until(done, what: str, give_up_after: float = 90.0) -> None:
+    """Wait on OBSERVED state, never on a clock: poll until `done()` holds. The bound is a failure
+    message, not a measurement — several suites share this machine and a fixed sleep would be a
+    verdict about its load rather than about the worker."""
+    try:
+        # noqa ASYNC110: the thing being waited on is a row another SESSION commits and a file a
+        # SUBPROCESS writes — neither can set an asyncio.Event in this loop's process.
+        async with asyncio.timeout(give_up_after):
+            while not done():  # noqa: ASYNC110
+                await asyncio.sleep(0.02)
+    except TimeoutError:
+        raise AssertionError(f"timed out waiting for {what}") from None
+
+
+def _read_claim(jid: int) -> tuple[str, int, str | None]:
+    """State, attempts and the claim identity as ANOTHER session sees them."""
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        row = c.execute(
+            text("SELECT state, attempts, claimed_by FROM media_jobs WHERE id=:j"), {"j": jid}
+        ).one()
+    eng.dispose()
+    return row[0], row[1], row[2]
+
+
+def _seed_head_of_line_queue(subject: str, root: Path) -> dict[str, int | str]:
+    """Two slow videos then one image, ids ascending in that order — the shape AC1 is about.
+
+    With one transcode slot the two videos cannot both run, so the image is behind BOTH of them in
+    id order: it can only finish first if the light consumer claims by class rather than by queue
+    position.
+    """
+    ids: dict[str, int | str] = {}
+    videos = []
+    for name in ("a", "b"):
+        src = root / "originals" / f"v{name}.mp4"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes(b"stub source")
+        videos.append(str(src))
+    uid_img = f"prog-img-{secrets.token_urlsafe(6)}"
+    img = root / "originals" / f"{uid_img}.png"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (900, 600), (30, 90, 160)).save(img, "PNG")
+
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": subject})
+        owner = c.execute(
+            text("INSERT INTO users (subject, role) VALUES (:s,'user') RETURNING id"),
+            {"s": subject},
+        ).scalar_one()
+        for name, path in zip(("a", "b"), videos, strict=True):
+            uid = f"prog-v{name}-{secrets.token_urlsafe(6)}"
+            aid = c.execute(
+                text(
+                    "INSERT INTO attachments "
+                    "(uid, owner_id, filename, mime, size, status, storage_path, duration) "
+                    "VALUES (:u,:o,'v.mp4','video/mp4',1,'processing',:sp,1.0) RETURNING id"
+                ),
+                {"u": uid, "o": owner, "sp": path},
+            ).scalar_one()
+            jid = c.execute(
+                text(
+                    "INSERT INTO media_jobs (attachment_id, lane, state, attempts, progress_pct) "
+                    "VALUES (:a, 'slow', 'queued', 0, 0) RETURNING id"
+                ),
+                {"a": aid},
+            ).scalar_one()
+            ids[f"aid_{name}"], ids[f"jid_{name}"], ids[f"uid_{name}"] = aid, jid, uid
+        aid_c = c.execute(
+            text(
+                "INSERT INTO attachments "
+                "(uid, owner_id, filename, mime, size, status, storage_path) "
+                "VALUES (:u,:o,'i.png','image/png',:sz,'processing',:sp) RETURNING id"
+            ),
+            {"u": uid_img, "o": owner, "sz": img.stat().st_size, "sp": str(img)},
+        ).scalar_one()
+        jid_c = c.execute(
+            text(
+                "INSERT INTO media_jobs (attachment_id, lane, state, attempts, progress_pct) "
+                "VALUES (:a, 'fast', 'queued', 0, 0) RETURNING id"
+            ),
+            {"a": aid_c},
+        ).scalar_one()
+    eng.dispose()
+    ids["aid_c"], ids["jid_c"], ids["uid_c"] = aid_c, jid_c, uid_img
+    return ids
+
+
+def _start_consumers(*classes: str) -> list[asyncio.Task[None]]:
+    """The real consumers, one per class, each with its OWN health and watermark — exactly what
+    worker.run() spawns, driven here against the real database."""
+    return [
+        asyncio.create_task(
+            worker.consume_media(
+                cast(worker.JobClass, job_class),
+                worker._DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK),
+                worker._Watermark(),
+            ),
+            name=f"media-consumer-{job_class}",
+        )
+        for job_class in classes
+    ]
+
+
+async def _stop(tasks: list[asyncio.Task[None]]) -> None:
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_a_parked_transcode_never_blocks_the_light_class_behind_it(monkeypatch, tmp_path):
+    """AC1: with TWO videos parked ahead of it in the queue, an image still finishes.
+
+    One consumer per class, one transcode slot: video A holds the slot, video B waits its turn,
+    and the image — LAST in id order, behind both — is drained by the light consumer while the
+    transcode is still running. A single unclassed loop, or two unclassed consumers, would have
+    the image waiting behind at least one transcode; two unclassed consumers take BOTH videos and
+    the image never starts at all.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 300)  # the park is not a timeout test
+    monkeypatch.setattr(worker, "POLL_SECONDS", 0.05)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)  # thermal guard off (dev host)
+    gate = tmp_path / "release-the-transcode"
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _parked_cmd(gate))
+    subject = "head_of_line_owner"
+    ids = _seed_head_of_line_queue(subject, tmp_path)
+    jid_a, jid_b, jid_c = cast(int, ids["jid_a"]), cast(int, ids["jid_b"]), cast(int, ids["jid_c"])
+    tiers = [tmp_path / "assets" / tier / f"{ids['uid_c']}.jpg" for tier in ("thumbs", "mobile")]
+
+    tasks = _start_consumers("transcode", "light")
+    try:
+        await _until(
+            lambda: (
+                (
+                    (tmp_path / "assets" / "web" / f"{ids['uid_a']}.tmp.mp4.started").exists()
+                    and _read_claim(jid_c)[0] == "done"
+                )
+                # …or the queue has already gone wrong: video B claimed means both consumers took
+                # transcodes, which the assertions below then name precisely instead of timing out.
+                or _read_claim(jid_b)[0] != "queued"
+            ),
+            "video A's transcode to start and the image job to finish",
+        )
+
+        # Taken while the gate is STILL CLOSED: video A cannot have finished, so every state below
+        # is the state of a queue with a transcode in flight.
+        state_a, _, claimed_a = _read_claim(jid_a)
+        state_b, _, _ = _read_claim(jid_b)
+        state_c, attempts_c, claimed_c = _read_claim(jid_c)
+        assert state_a == "processing", state_a
+        assert state_b == "queued", (  # AC3: at most one ffmpeg transcode at a time
+            f"video B is {state_b}: a second transcode started while the first held the slot"
+        )
+        assert (state_c, attempts_c) == ("done", 0), (state_c, attempts_c)
+        assert all(tier.exists() for tier in tiers), [str(t) for t in tiers]
+        assert claimed_c is not None and claimed_c.endswith("/light"), claimed_c
+        assert claimed_a is not None and claimed_a.endswith("/transcode"), claimed_a
+
+        gate.write_text("go")  # release video A; B is claimed next and runs the same stub
+        await _until(lambda: _read_claim(jid_a)[0] == "done", "video A to finish")
+        await _until(lambda: _read_claim(jid_b)[0] == "done", "video B to be claimed and finish")
+        assert cast(str, _read_claim(jid_b)[2]).endswith("/transcode")
+    finally:
+        gate.write_text("go")  # whatever the body did, no stub stays parked
+        await _stop(tasks)
+        _reap_parked(tmp_path)
+        _cleanup(subject, cast(int, ids["aid_a"]), cast(int, ids["aid_b"]), cast(int, ids["aid_c"]))
