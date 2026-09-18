@@ -18,7 +18,6 @@ import app.logging_privacy as logging_privacy
 import pytest
 import structlog
 from app.logging_privacy import (
-    KEY_DETAIL_REDACTION,
     ROW_DETAIL_REDACTION,
     RowDetailFilter,
     configure_logging,
@@ -51,15 +50,18 @@ def test_a_failing_row_detail_is_replaced_and_the_constraint_survives():
     assert "Failing row contains" not in scrubbed
     assert "12.5" not in scrubbed
     assert "probe-a" not in scrubbed
-    # What a reader needs to act on the failure is untouched.
+    # What a reader needs to act on the failure precedes the detail and is untouched.
     assert "ck_attachments_location_pair" in scrubbed
-    assert "[SQL: UPDATE attachments SET latitude = $1 WHERE id = $2]" in scrubbed
-    assert "hide_parameters=True" in scrubbed
+    assert "new row for relation" in scrubbed
+    # Everything AFTER the detail goes with it: no textual boundary can tell a diagnostic field
+    # from a value that merely spells one.
+    assert "[SQL:" not in scrubbed
+    assert scrubbed.endswith(ROW_DETAIL_REDACTION)
 
 
 def test_a_unique_violation_key_detail_is_replaced_the_same_way():
     scrubbed = redact_row_details(KEY_VIOLATION)
-    assert KEY_DETAIL_REDACTION in scrubbed
+    assert ROW_DETAIL_REDACTION in scrubbed
     assert "12.5" not in scrubbed
     assert "probe-a" not in scrubbed
     assert "ix_attachments_uid" in scrubbed
@@ -83,6 +85,7 @@ def test_the_detail_is_scrubbed_inside_a_multiline_traceback_and_the_frames_surv
     assert "in do_execute" in scrubbed
     assert "cursor.execute(statement, parameters)" in scrubbed
     assert scrubbed.count(ROW_DETAIL_REDACTION) == 1
+    assert "[SQL:" not in scrubbed
 
 
 def test_the_detail_is_scrubbed_when_a_repr_escaped_it_onto_one_line():
@@ -249,7 +252,7 @@ def test_a_value_with_a_real_newline_does_not_end_the_scrub_early():
     assert "8.1" not in scrubbed
     assert "name.jpg" not in scrubbed
     assert "ck_attachments_location_pair" in scrubbed
-    assert "[SQL: UPDATE attachments SET latitude = $1 WHERE id = $2]" in scrubbed
+    assert "[SQL:" not in scrubbed  # deliberately lost with everything after the detail
 
 
 def test_a_value_with_an_escaped_newline_does_not_end_the_scrub_early():
@@ -270,10 +273,10 @@ def test_a_value_containing_a_closing_paren_and_period_does_not_end_the_scrub_ea
     assert "12.5" not in scrubbed
     assert "8.1" not in scrubbed
     assert "holiday" not in scrubbed
-    assert "[SQL: UPDATE attachments SET latitude = $1]" in scrubbed
+    assert "[SQL:" not in scrubbed
 
 
-def test_a_chained_traceback_after_the_detail_survives_the_scrub():
+def test_a_chained_traceback_after_the_detail_goes_with_it():
     text = (
         "Traceback (most recent call last):\n"
         '  File "asyncpg/protocol.py", line 1, in execute\n'
@@ -290,8 +293,12 @@ def test_a_chained_traceback_after_the_detail_survives_the_scrub():
     scrubbed = redact_row_details(text)
     assert "12.5" not in scrubbed
     assert "8.1" not in scrubbed
-    assert "The above exception was the direct cause of the following exception:" in scrubbed
-    assert "app/services/location.py" in scrubbed
+    # A row value may spell any of these itself, so what follows the detail cannot be trusted to
+    # be diagnostics; the second traceback is the price.
+    assert "The above exception was the direct cause of the following exception:" not in scrubbed
+    assert "app/services/location.py" not in scrubbed
+    # Everything BEFORE it — the failing frame, the constraint — is what a reader needs.
+    assert "asyncpg/protocol.py" in scrubbed
     assert "ck_attachments_location_pair" in scrubbed
 
 
@@ -399,4 +406,100 @@ def test_a_handler_attached_after_configure_logging_is_covered_too():
         logger.removeHandler(handler)
     rendered = buffer.getvalue()
     assert "12.5" not in rendered
+    assert "ck_attachments_location_pair" in rendered
+
+
+# --- a value may SPELL a boundary; only "everything after DETAIL:" is safe ---------------------
+# Values are stored verbatim, so a filename can contain "HINT:", "[SQL:", or a whole traceback.
+# A scrub that stops at the first boundary-looking text stops inside the row, which is how the
+# reviewers got "HINT: name.jpg, image/jpeg, 12.5, 8.1)." back out of a log line.
+
+CONSTRAINT = 'violates check constraint "ck_attachments_location_pair"'
+BOUNDARY_LOOKALIKES = {
+    "hint_after_a_real_newline": (
+        f'new row for relation "attachments" {CONSTRAINT}\n'
+        "DETAIL:  Failing row contains (1767, photo\nHINT: name.jpg, image/jpeg, 12.5, 8.1).\n"
+        "[SQL: UPDATE attachments SET latitude = $1]\n"
+    ),
+    "hint_after_an_escaped_newline": (
+        f'new row for relation "attachments" {CONSTRAINT}\\n'
+        "DETAIL:  Failing row contains (1767, holiday\\nHINT:photo.jpg, 12.5, 8.1).\\n"
+    ),
+    "sql_echo_inside_a_value": (
+        f'new row for relation "attachments" {CONSTRAINT}\n'
+        "DETAIL:  Failing row contains (1767, [SQL: select 1].png, image/jpeg, 12.5, 8.1).\n"
+    ),
+    "chained_traceback_after_the_detail": (
+        f"asyncpg.exceptions.CheckViolationError: new row {CONSTRAINT}\n"
+        "DETAIL:  Failing row contains (1767, a.jpg, 12.5, 8.1).\n"
+        "\nThe above exception was the direct cause of the following exception:\n\n"
+        "Traceback (most recent call last):\n"
+        '  File "app/services/location.py", line 42, in store\n'
+    ),
+}
+
+
+def _through_the_record_factory(text: str) -> str:
+    """A record built the ordinary way, on a logger that carries no filter of its own."""
+    configure_logging()
+    logger = logging.getLogger("app.probe.boundary")
+    logger.disabled = False
+    logger.propagate = False
+    logger.setLevel(logging.ERROR)
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    logger.addHandler(handler)
+    try:
+        logger.error(text)
+    finally:
+        logger.removeHandler(handler)
+    return buffer.getvalue()
+
+
+def _through_the_uvicorn_filter(text: str) -> str:
+    """A record built WITHOUT the factory — `makeLogRecord` calls the class directly — so this
+    exercises the filter on its own."""
+    configure_logging()
+    logger = logging.getLogger("uvicorn.error")
+    logger.disabled = False
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    try:
+        logger.handle(
+            logging.makeLogRecord(
+                {
+                    "name": "uvicorn.error",
+                    "levelno": logging.ERROR,
+                    "levelname": "ERROR",
+                    "msg": text,
+                }
+            )
+        )
+    finally:
+        logger.removeHandler(handler)
+    return buffer.getvalue()
+
+
+def _through_the_structlog_processor(text: str) -> str:
+    configure_logging()
+    return str(redact_processor(None, "error", f"[error] write_failed uid=probe-a\n{text}"))
+
+
+@pytest.mark.parametrize(
+    "render",
+    [_through_the_record_factory, _through_the_uvicorn_filter, _through_the_structlog_processor],
+    ids=["record_factory", "uvicorn_filter", "structlog_processor"],
+)
+@pytest.mark.parametrize("case", sorted(BOUNDARY_LOOKALIKES))
+def test_a_boundary_spelled_inside_a_value_does_not_end_the_scrub(render, case):
+    rendered = render(BOUNDARY_LOOKALIKES[case])
+    assert "12.5" not in rendered
+    assert "8.1" not in rendered
+    assert "HINT:" not in rendered
+    assert "[SQL:" not in rendered
+    # Nothing at all survives the detail, so nothing that follows can be a value.
+    assert rendered.rstrip().endswith(ROW_DETAIL_REDACTION)
+    # The failure is still named by what precedes the detail.
     assert "ck_attachments_location_pair" in rendered

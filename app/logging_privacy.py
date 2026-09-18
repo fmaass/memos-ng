@@ -9,7 +9,7 @@ site controls. The invariant is "no coordinate value in any log line", so the sc
 boundary where an exception is RENDERED, once, for every path:
 
 * structlog — a processor appended AFTER the renderer, so it sees the finished line including the
-  formatted traceback;
+  formatted traceback (a chain that renders to a dict is scrubbed value by value);
 * stdlib logging — a filter on the root and uvicorn loggers, which pre-renders `exc_info` into
   `record.exc_text` (the Formatter then reuses that text instead of re-formatting) and scrubs the
   message and its args too.
@@ -25,50 +25,27 @@ from typing import Any
 import structlog
 
 ROW_DETAIL_REDACTION = "DETAIL: [row hidden]"
-KEY_DETAIL_REDACTION = "DETAIL: [key hidden]"
-
-# A row is redacted WHOLE or not at all, whatever its values contain: a filename is stored
-# verbatim, so a value may hold a newline (real, or spelled `\n` by repr and by a traceback's
-# source line), a `).`, a `%`. Anchoring the scrub to the line or to the first `).` leaves the
-# rest of the row — and the coordinates — standing. So the match runs from `DETAIL:` ACROSS
-# lines until the next thing that is certainly not part of the row: one of PostgreSQL's own
-# following fields, SQLAlchemy's statement echo, or the next traceback. Nothing recognizable
-# follows? Then it eats the rest of the text — dropping too much beats dropping too little.
-_BOUNDARIES = (
-    "HINT:",
-    "CONTEXT:",
-    "SCHEMA NAME:",
-    "TABLE NAME:",
-    "COLUMN NAME:",
-    "CONSTRAINT NAME:",
-    "DATATYPE NAME:",
-    "STATEMENT:",
-    "DETAIL:",
-    "[SQL:",
-    "[parameters:",
-    "(Background on this error at:",
-    "Traceback (most recent call last)",
-    "The above exception",
-    "During handling",
-)
-_BOUNDARY = "|".join(re.escape(token) for token in _BOUNDARIES)
-# The gap before a boundary may be blank lines in either spelling.
-_TERMINATOR = rf"(?=(?:\\n|\n)(?:\\n|\s)*(?:{_BOUNDARY}))"
-_ROW_DETAIL = re.compile(rf"DETAIL:[ \t]*Failing row contains \(.*?(?:{_TERMINATOR}|\Z)", re.DOTALL)
-_KEY_DETAIL = re.compile(rf"DETAIL:[ \t]*Key \(.*?(?:{_TERMINATOR}|\Z)", re.DOTALL)
+# From the first `DETAIL:` to the END of the text. Not a line, not "up to the next diagnostic
+# field": a value is stored verbatim, so a filename can contain a newline, a `).`, `HINT:`,
+# `[SQL:`, or a whole traceback, and NO textual rule can tell the row's contents from the
+# server's own fields that follow it. Every boundary this could key on is a string a value may
+# spell itself, so the only sound answer is to drop everything after the detail begins.
+_DETAIL = re.compile(r"DETAIL:.*\Z", re.DOTALL)
 
 
 def redact_row_details(text: str) -> str:
-    """Replace every PostgreSQL row/key DETAIL in `text` with a fixed marker.
+    """Replace the detail, and everything after it, with one marker.
 
-    Everything else — the constraint name, the SQLSTATE, the statement, the traceback frames —
-    is left exactly as it was: the point is to keep the failure diagnosable while the values are
-    gone.
+    Kept, because it all precedes the detail: the primary message, the constraint name, the
+    SQLSTATE, and any traceback frames rendered above it — which is what a reader acts on.
+
+    Deliberately lost with the row: SQLAlchemy's `[SQL: …]` statement echo (whose values
+    `hide_parameters=True` has already stripped, so what is lost is the statement text alone) and
+    any chained traceback rendered after the detail. That is the price of not trusting a boundary.
     """
     if "DETAIL:" not in text:
         return text
-    text = _ROW_DETAIL.sub(ROW_DETAIL_REDACTION, text)
-    return _KEY_DETAIL.sub(KEY_DETAIL_REDACTION, text)
+    return _DETAIL.sub(ROW_DETAIL_REDACTION, text, count=1)
 
 
 def redact_processor(logger: Any, method_name: str, event: Any) -> Any:
