@@ -22,12 +22,14 @@ from app import auth
 from app.config import settings
 from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
+from app.logging_privacy import configure_logging
 from app.security_headers import CSP
 from app.services import management_grant
 from app.services.cursors import InvalidCursor
 from app.services.digest import metrics as digest_metrics
 from app.version import __version__
 
+configure_logging()  # before the first log line: a rendered row detail cannot be taken back
 logger = structlog.get_logger(__name__)
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"

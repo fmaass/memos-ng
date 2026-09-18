@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import migrations
 from app.config import settings
 from app.database import async_session
+from app.logging_privacy import configure_logging
 from app.models import (
     Attachment,
     AttachmentStatus,
@@ -38,6 +39,7 @@ from app.services.digest import runner as digest_runner
 from app.services.uploads import reap_expired_committed
 from app.version import __version__
 
+configure_logging()  # the worker is where a coordinate is written, so it renders logs the same way
 logger = structlog.get_logger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"

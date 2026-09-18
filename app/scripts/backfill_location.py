@@ -45,12 +45,15 @@ from pathlib import Path
 import structlog
 from anyio import fail_after, to_thread
 from app.database import async_session
+from app.logging_privacy import configure_logging
 from app.models import Attachment, AttachmentStatus
 from app.services import location
 from app.services.media import too_hot
 from app.services.uploads import CAPTURE_READ_TIMEOUT_S
 from sqlalchemy import Select, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
+configure_logging()
 logger = structlog.get_logger(__name__)
 
 # A dead NFS mount fails every read at once. Without a stop, one such run would rewrite the whole
@@ -161,19 +164,31 @@ async def load_candidates(
         ]
 
 
-async def _store(candidate: Candidate, found: location.LocationResult | None, source: str) -> None:
-    """One row, one transaction — a killed run keeps every row it has already read."""
-    async with async_session() as db:
-        await db.execute(
-            update(Attachment)
-            .where(Attachment.id == candidate.id)
-            .values(
-                latitude=found.latitude if found else None,
-                longitude=found.longitude if found else None,
-                location_source=source,
+async def _store(candidate: Candidate, found: location.LocationResult | None, source: str) -> bool:
+    """One row, one transaction — a killed run keeps every row it has already read.
+
+    A write that fails carries the coordinate as a bound parameter, so the exception is answered
+    here and never re-raised: the row is named by uid, the failure by its type, and the value stays
+    in the database it never left. False means the run counts a failure, as a failed read does.
+    """
+    try:
+        async with async_session() as db:
+            await db.execute(
+                update(Attachment)
+                .where(Attachment.id == candidate.id)
+                .values(
+                    latitude=found.latitude if found else None,
+                    longitude=found.longitude if found else None,
+                    location_source=source,
+                )
             )
+            await db.commit()
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "backfill_location.write_failed", uid=candidate.uid, error=type(exc).__name__
         )
-        await db.commit()
+        return False
+    return True
 
 
 async def run_backfill(
@@ -189,6 +204,9 @@ async def run_backfill(
 
         stats.processed += 1
         found: location.LocationResult | None = None
+        # A row counts as failed until its WRITE has landed: resetting on the read alone let a
+        # run whose every store failed walk the whole library without ever tripping the stop.
+        row_failed = False
         with location.measuring() as meter:
             try:
                 with fail_after(READ_TIMEOUT_S):
@@ -201,14 +219,14 @@ async def run_backfill(
             except TimeoutError:
                 source = location.SOURCE_UNREADABLE
                 stats.failed += 1
-                consecutive_failures += 1
+                row_failed = True
                 logger.warning(
                     "backfill_location.read_timeout", uid=candidate.uid, mime=candidate.mime
                 )
             except Exception as exc:
                 source = location.SOURCE_UNREADABLE
                 stats.failed += 1
-                consecutive_failures += 1
+                row_failed = True
                 logger.warning(
                     "backfill_location.unreadable",
                     uid=candidate.uid,
@@ -217,7 +235,6 @@ async def run_backfill(
                 )
             else:
                 source = found.source if found else location.SOURCE_NONE
-                consecutive_failures = 0
         stats.bytes_read += meter.bytes_read
         stats.sources[source] += 1
         # Counts and sources only: the value this run just read is the one thing a log may not
@@ -233,8 +250,10 @@ async def run_backfill(
             stats.located += 1
             stats.cells[cell_of(found)] += 1
 
-        if execute:
-            await _store(candidate, found, source)
+        if execute and not await _store(candidate, found, source):
+            stats.failed += 1
+            row_failed = True
+        consecutive_failures = consecutive_failures + 1 if row_failed else 0
 
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             stats.stopped_after_failures = True
