@@ -4,11 +4,10 @@
 //   npm run build && npm run smoke:places
 //
 // It exists because happy-dom cannot run MapLibre. In 1.7.0, 913 green unit tests and two audit
-// rounds shipped a map with no icons (the sprite address was root-relative, and MapLibre refuses
-// a sprite URL it cannot parse as absolute) and a first view that put pins underneath the
-// timeline bar. Both are console-or-geometry facts a browser sees in a second and a DOM double
-// cannot see at all. So: any console error fails, and any first-view pin outside the visible,
-// unobscured map pane fails — on a desktop viewport and on a phone one.
+// rounds shipped a map with no icons: the sprite address was root-relative, and MapLibre refuses
+// a sprite URL it cannot parse as absolute. That is a console-or-geometry fact a browser sees in
+// a second and a DOM double cannot see at all. So: any console error fails, and any first-view
+// pin outside the visible map pane fails — on a desktop viewport and on a phone one.
 //
 // Browser: a Chromium the machine already has. `PLACES_SMOKE_CHROME` wins; otherwise the newest
 // Playwright browser build under `PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`, then
@@ -88,7 +87,8 @@ async function runViewport(browser, viewport) {
     const pane = document.querySelector('[data-test="places-map"]')
     return {
       pane: rect(pane),
-      bar: rect(document.querySelector('[data-test="timeline-bar"]')),
+      // The timeline is gone: nothing may draw a bar over the pane again.
+      timelineBars: document.querySelectorAll('[data-test="timeline-bar"]').length,
       pins: [...document.querySelectorAll('.maplibregl-marker')].map(rect),
     }
   })
@@ -98,8 +98,9 @@ async function runViewport(browser, viewport) {
   const label = `[${viewport.label} ${viewport.width}x${viewport.height}]`
   check(!!seen.pane, `${label} no map pane rendered`)
   check(seen.pins.length > 0, `${label} no pins rendered — the smoke proves nothing without them`)
+  check(seen.timelineBars === 0, `${label} a timeline bar is on the page (${seen.timelineBars})`)
 
-  // Every pin of the FIRST view must be inside the pane and clear of the bar drawn over it.
+  // Every pin of the FIRST view must be inside the pane.
   if (seen.pane) {
     for (const pin of seen.pins) {
       const inside =
@@ -108,14 +109,6 @@ async function runViewport(browser, viewport) {
         pin.x + pin.w <= seen.pane.x + seen.pane.w &&
         pin.y + pin.h <= seen.pane.y + seen.pane.h
       check(inside, `${label} pin at ${JSON.stringify(pin)} is outside the map pane ${JSON.stringify(seen.pane)}`)
-      if (seen.bar) {
-        const obscured =
-          pin.x + pin.w > seen.bar.x &&
-          pin.x < seen.bar.x + seen.bar.w &&
-          pin.y + pin.h > seen.bar.y &&
-          pin.y < seen.bar.y + seen.bar.h
-        check(!obscured, `${label} pin at ${JSON.stringify(pin)} is behind the timeline bar ${JSON.stringify(seen.bar)}`)
-      }
     }
   }
 
@@ -190,7 +183,7 @@ async function runViewport(browser, viewport) {
   process.stdout.write(
     `${label} pins ${seen.pins.length}, console errors ${consoleErrors.length}, ` +
       `failed requests ${failedResponses.length}, foreign requests ${foreign.length}, ` +
-      `bar ${JSON.stringify(seen.bar)}\n`,
+      `timeline bars ${seen.timelineBars}\n`,
   )
 }
 

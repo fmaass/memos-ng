@@ -138,14 +138,6 @@ function uidsIn(data: Data | undefined): string[] {
   return (data?.features ?? []).map((feature) => feature.properties.uid)
 }
 
-/** A stand-in for the timeline bar: an element whose rect the fit has to reserve. */
-function overlayElement(rect: { top: number; bottom: number; left: number; right: number }) {
-  const element = document.createElement('div')
-  element.getBoundingClientRect = () =>
-    ({ ...rect, height: rect.bottom - rect.top, width: rect.right - rect.left }) as DOMRect
-  return element
-}
-
 async function mountMap() {
   const wrapper = mount(PlacesMap, { props: { markers: [jan, feb] } })
   await flushPromises()
@@ -158,56 +150,29 @@ beforeEach(() => {
   maplibre.state.elements = []
 })
 
-describe('PlacesMap timeline seam', () => {
-  it('feeds the source exactly the set the playhead exposes', async () => {
+describe('PlacesMap data seam', () => {
+  it('feeds the source exactly the markers it is given', async () => {
     const wrapper = await mountMap()
-    ;(wrapper.vm as unknown as { setVisibleMarkers: (m: unknown[]) => void }).setVisibleMarkers([
-      jan,
-    ])
+    await wrapper.setProps({ markers: [jan] })
     expect(uidsIn(maplibre.state.map?.sources.get(MARKERS_SOURCE)?.data)).toEqual(['jan'])
-    // The per-tick cost the plan asks to be measured is read off the DOM, as Phase 3's sync is.
-    expect(wrapper.attributes('data-set-data-ms')).toMatch(/^\d+$/)
     wrapper.unmount()
   })
 
-  it('puts the playhead set back after a theme swap, not every pin', async () => {
-    // The re-install on `styledata` is what survives `setStyle`; feeding it the props would
-    // silently restore every pin mid-playback and the map would jump to the end of the timeline.
+  it('puts the markers back after a theme swap', async () => {
+    // The re-install on `styledata` is what survives `setStyle`: MapLibre's style diff drops the
+    // source and the probe layer, and `load` never fires a second time.
     const wrapper = await mountMap()
-    ;(wrapper.vm as unknown as { setVisibleMarkers: (m: unknown[]) => void }).setVisibleMarkers([
-      jan,
-    ])
+    await wrapper.setProps({ markers: [jan] })
     maplibre.state.map?.setStyle()
     expect(maplibre.state.map?.styleSwaps).toBe(1)
     expect(uidsIn(maplibre.state.map?.sources.get(MARKERS_SOURCE)?.data)).toEqual(['jan'])
     wrapper.unmount()
   })
 
-  it('reports as in view only the pins the playhead exposes', async () => {
+  it('reports as in view the pins the map currently holds', async () => {
     const wrapper = await mountMap()
-    ;(wrapper.vm as unknown as { setVisibleMarkers: (m: unknown[]) => void }).setVisibleMarkers([
-      jan,
-    ])
+    await wrapper.setProps({ markers: [jan] })
     expect(wrapper.emitted('visible-change')?.at(-1)).toEqual([['jan']])
-    wrapper.unmount()
-  })
-
-  it('marks the pins that arrived in this tick so they can land', async () => {
-    const wrapper = await mountMap()
-    const vm = wrapper.vm as unknown as {
-      setVisibleMarkers: (m: unknown[], landing?: string[]) => void
-    }
-    vm.setVisibleMarkers([jan])
-    const standing = maplibre.state.elements.find(({ lngLat }) => lngLat[0] === 8.1)?.element
-    maplibre.state.elements = []
-    vm.setVisibleMarkers([jan, feb], ['feb'])
-    const landed = maplibre.state.elements.find(({ lngLat }) => lngLat[0] === 8.9)?.element
-    const inner = (el?: HTMLElement) => el?.querySelector('.places-pin__inner')
-    // The class goes on the wrapper — the root carries MapLibre's positioning transform.
-    expect(inner(landed)?.classList.contains('places-pin--landing')).toBe(true)
-    expect(landed?.classList.contains('places-pin--landing')).toBe(false)
-    // The pin that was already on the map does not land a second time.
-    expect(inner(standing)?.classList.contains('places-pin--landing')).toBe(false)
     wrapper.unmount()
   })
 })
@@ -235,22 +200,7 @@ describe('PlacesMap pin payload', () => {
 })
 
 describe('the first fit', () => {
-  it('reserves the overlay drawn on the pane, so no pin lands under it', async () => {
-    // Live at 1440x900 the uniform padding put 2 of 8 pins at y 826 behind a bar occupying
-    // y 812-884: visible, and impossible to click.
-    const bar = overlayElement({ top: 812, bottom: 884, left: 256, right: 1424 })
-    const wrapper = mount(PlacesMap, { props: { markers: [jan, feb], overlay: bar } })
-    await flushPromises()
-    maplibre.state.map?.fire('load')
-    await flushPromises()
-
-    const padding = maplibre.state.map?.fits.at(-1)?.padding as { bottom: number; top: number }
-    expect(padding.bottom).toBe(FIT_PADDING + (PANE.bottom - 812))
-    expect(padding.top).toBe(FIT_PADDING)
-    wrapper.unmount()
-  })
-
-  it('keeps the uniform padding when nothing overlays the pane', async () => {
+  it('frames the pins with the uniform padding, reserving no band of the pane', async () => {
     const wrapper = mount(PlacesMap, { props: { markers: [jan, feb] } })
     await flushPromises()
     maplibre.state.map?.fire('load')

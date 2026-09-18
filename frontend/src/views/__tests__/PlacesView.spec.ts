@@ -1,14 +1,12 @@
-import { mount } from '@vue/test-utils'
+import { mount, type VueWrapper } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import { defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { marker } from '@/lib/places/__tests__/fixtures'
 import type { MapMarker } from '@/lib/places/geo'
-import { TICK_MS } from '@/lib/places/timelineBar'
 
-// Three months apart so every bucket boundary in the assertions is a real calendar month in
-// Europe/Zurich, and the middle one proves the playhead is not just "all or nothing".
+// Three months apart, so a set that was filtered by anything would show it.
 const jan = marker({ uid: 'jan', memo_uid: 'm-jan', taken_at: '2025-01-15T12:00:00Z' })
 const feb = marker({ uid: 'feb', memo_uid: 'm-feb', taken_at: '2025-02-15T12:00:00Z' })
 const mar = marker({ uid: 'mar', memo_uid: 'm-mar', taken_at: '2025-03-15T12:00:00Z' })
@@ -31,24 +29,22 @@ vi.mock('@tanstack/vue-query', async () => {
 })
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
 
-// PhotoSwipe cannot open in happy-dom; what this view owes it is a pause and the keyboard.
+// PhotoSwipe cannot open in happy-dom; what this view owes it is the list it opens on.
 const lightbox = vi.hoisted(() => ({
   open: vi.fn(),
   destroy: vi.fn(),
   refreshPrintMaster: vi.fn(),
-  isOpen: { value: false },
 }))
 vi.mock('@/composables/useMediaLightbox', () => ({ useMediaLightbox: () => lightbox }))
 
-const setVisibleMarkers = vi.fn()
 const zoomToCluster = vi.fn()
-/** The map, reduced to the seam the view drives: it records what it was handed per tick. */
+/** The map, reduced to the seam the view drives: it keeps the marker set it was handed. */
 const MapStub = defineComponent({
   name: 'PlacesMap',
   props: { markers: { type: Array, default: () => [] } },
   emits: ['cluster-open', 'point-open', 'visible-change'],
   setup(_props, { expose }) {
-    expose({ setVisibleMarkers, zoomToCluster })
+    expose({ zoomToCluster })
     return () => h('div', { 'data-test': 'map-stub' })
   },
 })
@@ -62,10 +58,9 @@ const listStub = (name: string, testId: string) =>
 function uidsOf(list: unknown): string[] {
   return (list as MapMarker[]).map((m) => m.uid)
 }
-/** The set the map was last told to show. */
-function lastShown(): string[] {
-  const call = setVisibleMarkers.mock.calls.at(-1)
-  return call ? uidsOf(call[0]) : []
+/** The set the map is showing: the view hands it over as a prop, nothing narrows it. */
+function shownOnMap(wrapper: VueWrapper): string[] {
+  return uidsOf(wrapper.findComponent(MapStub).props('markers'))
 }
 
 function mountView(phone = false) {
@@ -91,151 +86,56 @@ function mountView(phone = false) {
 // Imported after the mocks so the component picks them up.
 const { default: PlacesView } = await import('@/views/PlacesView.vue')
 
-function press(key: string, target: EventTarget = window) {
-  target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }))
-}
-
 beforeEach(() => {
   query.markers = ALL
-  setVisibleMarkers.mockClear()
   lightbox.open.mockClear()
-  lightbox.isOpen.value = false
-})
-afterEach(() => {
-  vi.useRealTimers()
 })
 
-describe('PlacesView timeline wiring', () => {
-  it('opens showing every pin: the playhead parks at the newest bucket', async () => {
+describe('PlacesView map wiring', () => {
+  it('shows every located photo on the map, and no timeline bar', async () => {
+    // The timeline was removed: nothing filters the marker set any more, and no bar is drawn
+    // over the pane. Both halves have to hold — a bar without a filter would be just as wrong.
     const wrapper = mountView()
     await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
+    expect(shownOnMap(wrapper)).toEqual(['jan', 'feb', 'mar'])
+    expect(wrapper.find('[data-test="timeline-bar"]').exists()).toBe(false)
     wrapper.unmount()
   })
 
-  it('steps back a bucket on ArrowLeft and hands the map the narrower set', async () => {
+  it('shows the drawer the photos behind the pin that was tapped', async () => {
     const wrapper = mountView()
     await wrapper.vm.$nextTick()
-    press('ArrowLeft')
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb'])
-    wrapper.unmount()
-  })
-
-  it('shows the drawer only the photos the playhead exposes', async () => {
-    const wrapper = mountView()
-    await wrapper.vm.$nextTick()
-    // A cluster tap names every leaf under the pin — including ones the playhead hides, because
-    // MapLibre keeps tiles it has already clustered. The drawer must still read the filtered set.
     wrapper.findComponent(MapStub).vm.$emit('cluster-open', {
       clusterId: 7,
       uids: ['jan', 'feb', 'mar'],
     })
-    press('ArrowLeft')
     await wrapper.vm.$nextTick()
-    expect(wrapper.find('[data-test="drawer-stub"]').text()).toBe('2')
+    expect(wrapper.find('[data-test="drawer-stub"]').text()).toBe('3')
     wrapper.unmount()
   })
 
-  it('shows the phone grid only the photos the playhead exposes', async () => {
+  it('shows the phone grid the photos the map reports in view', async () => {
     const wrapper = mountView(true)
     await wrapper.vm.$nextTick()
-    wrapper.findComponent(MapStub).vm.$emit('visible-change', ['jan', 'feb', 'mar'])
-    press('ArrowLeft')
+    wrapper.findComponent(MapStub).vm.$emit('visible-change', ['jan', 'feb'])
     await wrapper.vm.$nextTick()
     expect(wrapper.find('[data-test="grid-stub"]').text()).toBe('2')
     wrapper.unmount()
   })
 
-  it('plays from the start and lands one bucket per tick, in date order', async () => {
-    vi.useFakeTimers()
+  it('opens the viewer on the photos in view when a single pin is tapped', async () => {
     const wrapper = mountView()
     await wrapper.vm.$nextTick()
-    press(' ')
+    wrapper.findComponent(MapStub).vm.$emit('visible-change', ['jan', 'feb', 'mar'])
     await wrapper.vm.$nextTick()
-    // Play from the parked end means replay from the first bucket, not "advance nowhere".
-    expect(lastShown()).toEqual(['jan'])
-    vi.advanceTimersByTime(600)
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb'])
-    vi.advanceTimersByTime(600)
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
-    // The end pauses: no further ticks change anything.
-    vi.advanceTimersByTime(3000)
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
-    wrapper.unmount()
-  })
-
-  it('tells the map which pins are new in the tick, so they can land', async () => {
-    vi.useFakeTimers()
-    const wrapper = mountView()
-    await wrapper.vm.$nextTick()
-    press(' ')
-    await wrapper.vm.$nextTick() // the ticker starts on the state change, not on the keystroke
-    vi.advanceTimersByTime(600)
-    await wrapper.vm.$nextTick()
-    expect(setVisibleMarkers.mock.calls.at(-1)?.[1]).toEqual(['feb'])
-    wrapper.unmount()
-  })
-
-  it('pauses playback when a photo opens, and does not resume on its own', async () => {
-    vi.useFakeTimers()
-    const wrapper = mountView()
-    await wrapper.vm.$nextTick()
-    press(' ')
-    await wrapper.vm.$nextTick()
-    vi.advanceTimersByTime(600)
+    wrapper.findComponent(MapStub).vm.$emit('point-open', 'feb')
     await wrapper.vm.$nextTick()
 
-    // The viewer shows a snapshot of the list it was opened with; a playhead that kept moving
-    // would take photos out of the map and the grid while they are still on screen.
-    wrapper.findComponent(MapStub).vm.$emit('point-open', 'jan')
-    await wrapper.vm.$nextTick()
     expect(lightbox.open).toHaveBeenCalledTimes(1)
-    const opened = { calls: setVisibleMarkers.mock.calls.length, shown: lastShown() }
-    vi.advanceTimersByTime(3000)
-    await wrapper.vm.$nextTick()
-    // The clock is off: no further tick reached the map, and the playhead stands where it was.
-    expect(setVisibleMarkers.mock.calls.length).toBe(opened.calls)
-    expect(lastShown()).toEqual(opened.shown)
-    wrapper.unmount()
-  })
-
-  it('leaves the arrows to the photo viewer while it is open', async () => {
-    const wrapper = mountView()
-    await wrapper.vm.$nextTick()
-    lightbox.isOpen.value = true
-    press('ArrowLeft')
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
-    wrapper.unmount()
-  })
-
-  it('leaves alone a keystroke another handler has already claimed', async () => {
-    const wrapper = mountView()
-    await wrapper.vm.$nextTick()
-    // PhotoSwipe answers the arrows on `document` and the event still reaches the window.
-    const claim = (event: Event) => event.preventDefault()
-    document.addEventListener('keydown', claim)
-    press('ArrowLeft', document.body)
-    document.removeEventListener('keydown', claim)
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
-    wrapper.unmount()
-  })
-
-  it('leaves the keys to whoever is typing', async () => {
-    const wrapper = mountView()
-    await wrapper.vm.$nextTick()
-    const input = document.createElement('input')
-    document.body.append(input)
-    input.focus()
-    press(' ', input)
-    await wrapper.vm.$nextTick()
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
-    input.remove()
+    const [items, index] = lightbox.open.mock.calls[0] as [unknown[], number]
+    // Newest first (`viewerTarget`): mar, feb, jan — the tapped photo is the middle one.
+    expect(items).toHaveLength(3)
+    expect(index).toBe(1)
     wrapper.unmount()
   })
 })
@@ -293,113 +193,7 @@ describe('what the map says before the markers arrive', () => {
 
     expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="places-error"]').exists()).toBe(false)
-    expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
+    expect(shownOnMap(wrapper)).toEqual(['jan', 'feb', 'mar'])
     wrapper.unmount()
   })
-})
-
-describe('the speed control, end to end', () => {
-  // The reducer was already proven: `tick` advances 1, 2 and 4 buckets at speeds 1, 2 and 4.
-  // What had never been proven is the chain around it — that a click on the REAL PrimeVue
-  // control emits, that the view dispatches it, and that the player then steps by that many
-  // buckets per tick. The live pass showed the same three transition timestamps at 1× and at
-  // 2× over a four-bucket library — too few buckets to tell the two speeds apart. This drives
-  // 24, where they cannot look alike.
-  const MANY = Array.from({ length: 24 }, (_, i) =>
-    marker({
-      uid: `m${i}`,
-      memo_uid: `mm${i}`,
-      taken_at: `${2024 + Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, '0')}-15T12:00:00Z`,
-    }),
-  )
-
-  /** One marker per month and `accumulate` mode: the count on the map is the playhead index + 1. */
-  function playheadIndex(): number {
-    return lastShown().length - 1
-  }
-
-  async function stepsOver(ticks: number): Promise<number[]> {
-    const seen: number[] = []
-    for (let i = 0; i < ticks; i += 1) {
-      vi.advanceTimersByTime(TICK_MS)
-      await nextTick()
-      seen.push(playheadIndex())
-    }
-    return seen
-  }
-
-  beforeEach(() => {
-    query.markers = MANY
-    vi.useFakeTimers()
-  })
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
-  it('steps one bucket per tick at 1x and two at 2x, after a click on the desktop control', async () => {
-    const wrapper = mountView()
-    await wrapper.find('[data-test="timeline-play"]').trigger('click')
-
-    const atOne = await stepsOver(4)
-    expect(atOne).toEqual([1, 2, 3, 4])
-
-    const speeds = wrapper.findAll('[data-test="timeline-speed"] .p-togglebutton')
-    expect(speeds.map((option) => option.text())).toEqual(['1×', '2×', '4×'])
-    await speeds[1]?.trigger('click')
-    await nextTick()
-
-    const atTwo = await stepsOver(4)
-    expect(atTwo).toEqual([6, 8, 10, 12])
-    wrapper.unmount()
-  })
-
-  it('steps two buckets per tick after a tap on the phone speed chip', async () => {
-    const wrapper = mountView(true)
-    await wrapper.find('[data-test="timeline-play"]').trigger('click')
-
-    expect(await stepsOver(2)).toEqual([1, 2])
-
-    const chip = wrapper.find('[data-test="timeline-speed-chip"]')
-    expect(chip.text()).toBe('1×')
-    await chip.trigger('click')
-    await nextTick()
-    expect(wrapper.find('[data-test="timeline-speed-chip"]').text()).toBe('2×')
-
-    expect(await stepsOver(2)).toEqual([4, 6])
-    wrapper.unmount()
-  })
-
-  // Speed advances BUCKETS; one tick is one `setData` at 1×, 2× and 4× alike. A speed that
-  // shortened the interval would cost the map a redraw per step instead — so each faster speed
-  // gets the boundary itself: a 599 ms clock at 2× alone must not slip through on 4×'s pass.
-  const CLOCK_CASES: Array<[label: string, option: number, expected: number]> = [
-    ['2×', 1, 3],
-    ['4×', 2, 5],
-  ]
-
-  it.each(CLOCK_CASES)(
-    'does not run the clock faster at %s — one redraw per tick, no sooner',
-    async (label, option, expected) => {
-      const wrapper = mountView()
-      await wrapper.find('[data-test="timeline-play"]').trigger('click')
-      await stepsOver(1)
-      expect(setVisibleMarkers.mock.calls.length).toBeGreaterThan(0)
-
-      const speeds = wrapper.findAll('[data-test="timeline-speed"] .p-togglebutton')
-      expect(speeds[option]?.text()).toBe(label)
-      await speeds[option]?.trigger('click')
-      await nextTick()
-
-      setVisibleMarkers.mockClear()
-      vi.advanceTimersByTime(TICK_MS - 1)
-      await nextTick()
-      expect(setVisibleMarkers).not.toHaveBeenCalled()
-
-      vi.advanceTimersByTime(1)
-      await nextTick()
-      expect(setVisibleMarkers).toHaveBeenCalledTimes(1)
-      expect(playheadIndex()).toBe(expected)
-      wrapper.unmount()
-    },
-  )
 })
