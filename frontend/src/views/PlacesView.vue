@@ -21,6 +21,7 @@ import {
   type TimelineAction,
   type TimelineState,
 } from '@/lib/places/timeline'
+import { placesStatus } from '@/lib/places/state'
 import { createTicker, timelineKeyAction } from '@/lib/places/timelineBar'
 
 const api = useApi()
@@ -31,7 +32,7 @@ const mapRef = useTemplateRef<InstanceType<typeof PlacesMap>>('map')
 const barRef = useTemplateRef<InstanceType<typeof TimelineBar>>('bar')
 const barElement = computed(() => (barRef.value?.$el as HTMLElement | undefined) ?? null)
 
-const { data, isPending } = useQuery({
+const { data, isPending, isError } = useQuery({
   queryKey: ['map', 'markers'],
   queryFn: async () => {
     const { data, error } = await api.GET('/api/map/markers')
@@ -41,6 +42,15 @@ const { data, isPending } = useQuery({
 })
 
 const markers = computed<MapMarker[]>(() => data.value?.markers ?? [])
+// Pending, failed and genuinely empty are three different things to tell a viewer, and counting
+// markers cannot tell them apart — see `placesStatus`.
+const status = computed(() =>
+  placesStatus({
+    isPending: isPending.value,
+    isError: isError.value,
+    markerCount: markers.value.length,
+  }),
+)
 const byUid = computed(() => new Map(markers.value.map((m) => [m.uid, m])))
 
 // The timeline is a FILTER, exactly like the map's viewport: one playhead decides which photos
@@ -189,7 +199,7 @@ const drawerOpen = computed({
         @visible-change="visibleUids = $event"
       />
       <Skeleton
-        v-if="isPending"
+        v-if="status === 'pending'"
         class="!absolute inset-0 !h-full !w-full"
         data-test="places-loading"
       />
@@ -203,11 +213,18 @@ const drawerOpen = computed({
         @action="dispatch"
       />
       <p
-        v-else-if="!markers.length"
+        v-if="status === 'empty'"
         class="pointer-events-none absolute inset-0 flex items-center justify-center p-6 text-center text-muted-color"
         data-test="places-empty"
       >
         No photo here knows where it was taken yet.
+      </p>
+      <p
+        v-else-if="status === 'error'"
+        class="pointer-events-none absolute inset-0 flex items-center justify-center p-6 text-center text-muted-color"
+        data-test="places-error"
+      >
+        The map could not be loaded. Try again in a moment.
       </p>
     </div>
 
