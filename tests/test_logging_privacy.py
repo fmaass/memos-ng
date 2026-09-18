@@ -276,7 +276,7 @@ def test_a_value_containing_a_closing_paren_and_period_does_not_end_the_scrub_ea
 def test_a_chained_traceback_after_the_detail_survives_the_scrub():
     text = (
         "Traceback (most recent call last):\n"
-        "  File \"asyncpg/protocol.py\", line 1, in execute\n"
+        '  File "asyncpg/protocol.py", line 1, in execute\n'
         "asyncpg.exceptions.CheckViolationError: new row violates check constraint"
         ' "ck_attachments_location_pair"\n'
         "DETAIL:  Failing row contains (1767, a.jpg, 12.5, 8.1).\n"
