@@ -112,15 +112,25 @@ export function classifyStatus(status: number): ReachabilitySignal {
 
 /** What a rejected fetch says about reachability. */
 export function classifyFailure(error: unknown): ReachabilitySignal {
-  if (error instanceof Error) {
-    // `AbortSignal.timeout()` rejects with TimeoutError — the server had its chance and took it.
-    // A plain AbortError is the app cancelling its own request, which proves nothing about the
-    // server and must never feed the verdict.
-    if (error.name === 'TimeoutError') return 'timeout'
-    if (error.name === 'AbortError') return 'request-cancelled'
-  }
+  // Read `name` off the object rather than testing `instanceof Error`: a rejected fetch and an
+  // aborted one arrive as a DOMException, whose relationship to Error differs between the
+  // browser, Node and the test DOM. The name is the part every one of them agrees on.
+  const name =
+    typeof error === 'object' && error !== null && 'name' in error
+      ? String((error as { name: unknown }).name)
+      : ''
+  // `AbortSignal.timeout()` rejects with TimeoutError — the server had its chance and took it.
+  // A plain AbortError is the app cancelling its own request, which proves nothing about the
+  // server and must never feed the verdict.
+  if (name === 'TimeoutError') return 'timeout'
+  if (name === 'AbortError') return 'request-cancelled'
   if (error instanceof TypeError) return 'network-error'
   return 'other-error'
+}
+
+/** Whether this signal is the server having answered — the only proof of reachability there is. */
+export function provesReachable(signal: ReachabilitySignal): boolean {
+  return ANSWERED_SIGNALS.has(signal)
 }
 
 export interface ReachabilityDecision {

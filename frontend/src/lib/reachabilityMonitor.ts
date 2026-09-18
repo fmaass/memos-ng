@@ -1,5 +1,7 @@
 import {
   initialReachabilityState,
+  probeDelayMs,
+  provesReachable,
   reduceReachability,
   type ReachabilityEffect,
   type ReachabilitySignal,
@@ -43,9 +45,11 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
   let probing = false
   let paused = false
   let disposed = false
-  // Bumped every time the server proves itself reachable. A probe carries the generation it was
-  // started in, so one that was still in flight when a real request answered is discarded rather
-  // than being allowed to fail the server all over again.
+  // Bumped on EVERY piece of evidence that the server answered, not only on the transition back
+  // to `reachable`. A probe carries the generation it was started in, so one still in flight when
+  // something newer answered is discarded rather than being allowed to fail the server on a
+  // verdict about a moment that has passed. Bumping only on the transition left the probes that
+  // start without one — a stream error asking its question while already reachable — unprotected.
   let generation = 0
   const listeners = new Set<(status: ReachabilityStatus) => void>()
 
@@ -53,6 +57,17 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
     if (timer === null) return
     deps.clearTimer(timer)
     timer = null
+  }
+
+  const schedule = (delayMs: number) => {
+    // A pending probe keeps its deadline. Rescheduling on every new failure let a stream of
+    // failures arriving faster than the backoff push the probe out for ever, so the server was
+    // never asked again and the banner stayed up after it came back.
+    if (paused || disposed || probing || timer !== null) return
+    timer = deps.setTimer(() => {
+      timer = null
+      void runProbe()
+    }, delayMs)
   }
 
   const runProbe = async () => {
@@ -68,7 +83,19 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
       result = 'probe-failed'
     }
     probing = false
-    if (disposed || startedIn !== generation) return
+    if (disposed) return
+    if (startedIn !== generation) {
+      // The answer is about a moment that has passed, so it may not be reported. But if the
+      // server has stopped answering AGAIN since this probe left, dropping it silently would
+      // leave nothing pending at all: every `probe-now` and `probe-in` the new outage emitted
+      // was skipped precisely BECAUSE this probe was in flight. Once the state reaches
+      // `unreachable` the query layer is paused, so no other traffic would ever wake it and the
+      // banner would stay up until someone pressed Retry. A timer rather than an immediate
+      // probe: the new outage's own failures have already earned their backoff, and jumping it
+      // would hammer a server that has just shown it can answer.
+      if (state.status !== 'reachable') schedule(probeDelayMs(state.failures - 1))
+      return
+    }
     report(result)
   }
 
@@ -83,14 +110,7 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
         cancelTimer()
         void runProbe()
       } else if (effect.type === 'probe-in') {
-        // A pending probe keeps its deadline. Rescheduling on every new failure let a stream of
-        // failures arriving faster than the backoff push the probe out for ever, so the server
-        // was never asked again and the banner stayed up after it came back.
-        if (paused || disposed || probing || timer !== null) continue
-        timer = deps.setTimer(() => {
-          timer = null
-          void runProbe()
-        }, effect.delayMs)
+        schedule(effect.delayMs)
       } else if (effect.type === 'refetch') {
         deps.onRecover?.()
       }
@@ -102,7 +122,9 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
     const previous = state.status
     const decision = reduceReachability(state, signal, deps.now())
     state = decision.state
-    if (previous !== 'reachable' && state.status === 'reachable') generation++
+    // After the staleness check in runProbe, never before it: a probe's own `probe-ok` must not
+    // be discarded by the very bump it causes.
+    if (provesReachable(signal)) generation++
     apply(decision.effects)
     if (state.status !== previous) {
       for (const listener of listeners) listener(state.status)

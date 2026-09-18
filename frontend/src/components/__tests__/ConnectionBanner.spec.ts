@@ -113,6 +113,16 @@ describe('ConnectionBanner', () => {
     expect(wrapper.emitted('occupied')?.at(-1)).toEqual([false])
   })
 
+  it('drops the pending recovery timer when it is unmounted', async () => {
+    const { wrapper, clock } = mountWith('unreachable')
+    status.value = 'reachable'
+    await wrapper.vm.$nextTick()
+    expect(clock.pending()).not.toBeNull()
+
+    wrapper.unmount()
+    expect(clock.pending()).toBeNull()
+  })
+
   it('"Retry now" asks for an immediate probe', async () => {
     retryNow.mockClear()
     const { wrapper } = mountWith('unreachable')

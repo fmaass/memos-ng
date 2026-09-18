@@ -5,11 +5,19 @@ import { createReachabilityMonitor, type ProbeResult } from '@/lib/reachabilityM
 
 // A fake clock and a fake timer queue: the debounce and the backoff are measured, never slept
 // through. Timers fire only when the test advances the clock past their due time.
-function harness(probeResults: ProbeResult[] = []) {
+function harness(probeResults: ProbeResult[] = [], opts: { deferred?: boolean } = {}) {
   let now = 0
   let nextId = 1
   const pending = new Map<number, { at: number; fn: () => void }>()
-  const probe = vi.fn(async () => probeResults.shift() ?? 'probe-failed')
+  // `deferred` hands the test the probe's resolve function, so a probe can be left in flight
+  // across other events — which is the only way to drive the staleness sequences at all.
+  let settleProbe: ((result: ProbeResult) => void) | null = null
+  const probe = vi.fn(() => {
+    if (!opts.deferred) return Promise.resolve(probeResults.shift() ?? 'probe-failed')
+    return new Promise<ProbeResult>((resolve) => {
+      settleProbe = resolve
+    })
+  })
   const onRecover = vi.fn()
 
   const monitor = createReachabilityMonitor({
@@ -42,6 +50,12 @@ function harness(probeResults: ProbeResult[] = []) {
     probe,
     onRecover,
     advance,
+    settle: async (result: ProbeResult) => {
+      const resolve = settleProbe
+      settleProbe = null
+      resolve?.(result)
+      await flush()
+    },
     scheduled: () => [...pending.values()].map((t) => t.at - now),
     setNow: (value: number) => {
       now = value
@@ -191,14 +205,62 @@ describe('createReachabilityMonitor', () => {
   })
 
   it('never condemns the server on stream errors alone — the probe answers', async () => {
-    // An EventSource error has no status behind it, so it may only prompt the question.
-    const h = harness(Array.from({ length: 20 }, () => 'probe-ok' as ProbeResult))
-    for (let i = 0; i < 20; i++) {
-      h.monitor.report('stream-error')
-      await flush()
-    }
-    expect(h.probe.mock.calls.length).toBeGreaterThan(0)
+    // An EventSource error has no status behind it, so it may only prompt the question. Two of
+    // them, further apart than the debounce window, would be an outage if they counted as
+    // failures — the probe answering `probe-ok` in between is what keeps the verdict honest.
+    const h = harness([], { deferred: true })
+    h.monitor.report('stream-error')
+    expect(h.probe).toHaveBeenCalledTimes(1)
+
+    await h.advance(4_000)
+    h.monitor.report('stream-error')
     expect(h.monitor.status()).toBe('reachable')
+
+    await h.settle('probe-ok')
+    await h.advance(4_000)
+    h.monitor.report('stream-error')
+    await h.settle('probe-ok')
+    expect(h.monitor.status()).toBe('reachable')
+    expect(h.monitor.snapshot().failures).toBe(0)
+  })
+
+  it('leaves a probe pending when a stale result is dropped during a NEW outage', async () => {
+    // The hole that stuck the banner: a probe in flight makes every probe-now/probe-in a no-op,
+    // and its own result is then discarded as stale — so nothing at all remained scheduled, and
+    // with the query layer paused no other traffic would ever wake it.
+    const h = harness([], { deferred: true })
+    h.monitor.report('network-error')
+    expect(h.probe).toHaveBeenCalledTimes(1)
+
+    h.monitor.report('success')
+    expect(h.monitor.status()).toBe('reachable')
+
+    h.monitor.report('network-error')
+    await h.advance(4_000)
+    h.monitor.report('network-error')
+    expect(h.monitor.status()).toBe('unreachable')
+    expect(h.scheduled()).toEqual([])
+
+    await h.settle('probe-failed')
+    expect(h.scheduled()).toHaveLength(1)
+
+    await h.advance(h.scheduled()[0])
+    await h.settle('probe-ok')
+    expect(h.monitor.status()).toBe('reachable')
+  })
+
+  it('does not let a probe started while reachable overrule a later success', async () => {
+    // A stream error starts a probe without any state transition, so nothing marked that probe's
+    // verdict as superseded when a real request answered in the meantime.
+    const h = harness([], { deferred: true })
+    h.monitor.report('stream-error')
+    expect(h.probe).toHaveBeenCalledTimes(1)
+
+    h.monitor.report('success')
+    await h.settle('probe-failed')
+
+    expect(h.monitor.status()).toBe('reachable')
+    expect(h.monitor.snapshot().failures).toBe(0)
   })
 
   it('discards a probe still in flight when a real request proved the server back', async () => {

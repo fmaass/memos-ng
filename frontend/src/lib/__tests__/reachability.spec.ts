@@ -98,14 +98,28 @@ describe('reduceReachability — a case per category', () => {
     expect(suspectAfter('probe-failed').status).toBe('suspect')
   })
 
+  // Driven through classifyFailure with real error objects, because the classification IS the
+  // defect: feeding the reducer a literal 'request-cancelled' would prove nothing about what an
+  // aborted fetch actually turns into.
+  function applySequence(errors: unknown[], times: number[]) {
+    let state = fresh
+    errors.forEach((error, i) => {
+      state = reduceReachability(state, classifyFailure(error), times[i]).state
+    })
+    return state
+  }
+
   it('two requests the app cancelled itself never add up to an outage', () => {
-    // The sequence that would otherwise condemn a perfectly healthy server: cancel one request
-    // now, cancel another once the debounce window has passed.
-    const first = reduceReachability(fresh, 'request-cancelled', 0)
-    expect(first).toEqual({ state: fresh, effects: [] })
-    const second = reduceReachability(first.state, 'request-cancelled', 3_000)
-    expect(second.state.status).toBe('reachable')
-    expect(second.state.failures).toBe(0)
+    const cancelled = () => new DOMException('The user aborted a request.', 'AbortError')
+    const state = applySequence([cancelled(), cancelled()], [0, 3_000])
+    expect(state.status).toBe('reachable')
+    expect(state.failures).toBe(0)
+  })
+
+  it('but two real timeouts across the same window do condemn the server', () => {
+    // The contrast that proves the first case is about cancellation and not about the debounce.
+    const timedOut = () => new DOMException('The operation timed out.', 'TimeoutError')
+    expect(applySequence([timedOut(), timedOut()], [0, 3_000]).status).toBe('unreachable')
   })
 
   it('a stream error asks the probe rather than passing judgement', () => {
