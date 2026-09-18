@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # a host whose sensor cannot be found by name is configured, Saturn's k10temp among them
     # (`/sys/class/hwmon/hwmon0/temp1_input` there, and it publishes no temp*_label at all, so
     # name resolution could only pick it by index — the thing this default exists to stop).
+    # The override does not escape the guard's plausibility bound: a reading outside 0 < °C <= 150
+    # is treated as a failed measurement (UNKNOWN), so a sensor whose legitimate working range
+    # leaves that window cannot be used here.
     #
     # THE HOST THESE NUMBERS DESCRIBE IS JUPITER — an i9-13900H, and the machine every transcode
     # has run on since the worker moved off Saturn on 2026-07-15. Measured there 2026-09-18 on the

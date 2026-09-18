@@ -139,6 +139,44 @@ def test_a_labelled_input_whose_reading_file_is_missing_is_unknown(hwmon):
     assert media.thermal_state() is media.ThermalState.UNKNOWN
 
 
+def _stat_denied_on(monkeypatch, denied: Path) -> None:
+    """Make the existence check on ONE path fail the way a kernel can fail it.
+
+    `Path.exists()` swallows ENOENT and friends but re-raises every other OSError — EACCES on a
+    restricted sysfs mount, EIO from a driver that went away. This patches the boundary the guard
+    calls, not the guard: every other path still gets the real answer.
+    """
+    real_exists = Path.exists
+
+    def exists(self: Path, *args, **kwargs) -> bool:
+        if self == denied:
+            raise PermissionError(13, "Permission denied")
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+
+def test_a_candidate_whose_existence_cannot_be_checked_is_skipped(hwmon, monkeypatch):
+    """The scan goes on. An unreadable candidate must behave like every other unreadable entry —
+    skipped, not fatal — because the resolver's first caller is the worker's startup line: an
+    exception escaping here does not degrade the guard, it stops the worker from starting."""
+    _chip(hwmon, 0, "coretemp", temp1=("Package id 0", "88000"))
+    _chip(hwmon, 4, "coretemp", temp1=("Package id 0", "93000"))
+    _stat_denied_on(monkeypatch, hwmon / "hwmon0" / "temp1_input")
+
+    assert media.resolve_thermal_sensor() == hwmon / "hwmon4" / "temp1_input"
+    assert media.thermal_state() is media.ThermalState.HOT
+
+
+def test_a_candidate_whose_existence_cannot_be_checked_and_no_other_is_unknown(hwmon, monkeypatch):
+    _chip(hwmon, 0, "coretemp", temp1=("Package id 0", "88000"))
+    _stat_denied_on(monkeypatch, hwmon / "hwmon0" / "temp1_input")
+
+    assert media.resolve_thermal_sensor() is None
+    assert media.thermal_state() is media.ThermalState.UNKNOWN
+    assert media.too_hot() is False
+
+
 def test_an_unreadable_sensor_is_unknown_not_cool(hwmon):
     """Resolution succeeded and the READ failed — permissions, a vanished file, a driver returning
     something that is not a number. The distinction matters because this is the state a monitoring
@@ -229,12 +267,13 @@ def test_an_undecodable_name_with_nothing_else_is_unknown(hwmon):
 
 
 @pytest.mark.parametrize("reading", ["0", "-1", "-40000", "999000", "150001"])
-def test_a_reading_that_is_not_a_temperature_is_unknown(hwmon, reading):
-    """Both ends are failure modes that would otherwise read as a decision. 0 and negatives are
-    what a disconnected or misread sensor reports, and they sit below every threshold — "cool"
-    about a host nothing measured, which is the exact bug this guard exists to stop. An absurd
-    positive is above every threshold for ever, and backfill_location waits in `while too_hot()`,
-    so it would never finish."""
+def test_a_reading_outside_this_guards_plausible_range_is_unknown(hwmon, reading):
+    """Outside the range a CPU package or host zone produces on a running machine — not a claim
+    that 0 °C or 200 °C is never a real temperature somewhere. Both ends are failure modes that
+    would otherwise read as a decision here. 0 and negatives are what a disconnected or misread
+    sensor reports, and they sit below every threshold — "cool" about a host nothing measured,
+    which is the exact bug this guard exists to stop. An absurd positive is above every threshold
+    for ever, and backfill_location waits in `while too_hot()`, so it would never finish."""
     _chip(hwmon, 0, "coretemp", temp1=("Package id 0", reading))
 
     assert media.read_temp_millideg() is None

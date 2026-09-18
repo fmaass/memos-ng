@@ -1055,13 +1055,16 @@ class ThermalDefer(Exception):
 HWMON_ROOT = Path("/sys/class/hwmon")
 THERMAL_CHIP = "coretemp"  # Intel's per-package driver; jupiter's CPU
 THERMAL_INPUT_LABEL = "Package id 0"  # the whole-package reading, not one core's
-# A reading outside this range is not a temperature, so it is UNKNOWN rather than a verdict. Both
-# ends are failure modes that would otherwise read as a decision: a disconnected or misread sensor
-# reports 0 or a negative sentinel, which lands below any threshold and says "cool" about a host
-# nothing measured; and an absurd positive is permanently above any threshold, which would leave
-# backfill_location's `while too_hot()` waiting for a machine that is never going to cool. Nothing
-# real sits above 150 °C — this package's own critical limit is 100 °C — and silicon that did
-# would have shut itself down long before.
+# The bound is a statement about what THIS guard reads — a CPU package sensor, or the host zone a
+# THERMAL_ZONE override names — and not about sensors in general: 0 °C and readings above 150 °C
+# are perfectly real elsewhere. A running machine's package is neither, so a reading outside the
+# range here is a failure to measure and the guard answers UNKNOWN instead of a verdict. Both ends
+# would otherwise read as a decision: a disconnected or misread sensor reports 0 or a negative
+# sentinel, which lands below any threshold and says "cool" about a host nothing measured; and an
+# absurd positive is permanently above any threshold, which would leave backfill_location's
+# `while too_hot()` waiting for a machine that is never going to cool. (This package's own critical
+# limit is 100 °C.) The bound applies to an explicit THERMAL_ZONE as well, so a sensor whose
+# legitimate working range leaves 0–150 °C cannot be used with this guard.
 THERMAL_MIN_PLAUSIBLE_MILLIDEG = 1
 THERMAL_MAX_PLAUSIBLE_MILLIDEG = 150_000
 
@@ -1086,8 +1089,9 @@ def resolve_thermal_sensor() -> Path | None:
     driver names things differently (Saturn's k10temp publishes no labels at all) — and it means
     UNKNOWN, not cool.
 
-    Every read is guarded, and against ValueError as well as OSError: sysfs entries can disappear
-    between the scan and the open, and a chip whose `name` or label is not valid UTF-8 raises
+    Every read is guarded — the candidate's existence check included — and against ValueError as
+    well as OSError: sysfs entries can disappear between the scan and the open, and a chip whose
+    `name` or label is not valid UTF-8 raises
     UnicodeDecodeError, which is a ValueError and would otherwise escape this function entirely.
     The first caller is the worker's startup line, before the schema gate — an exception there does
     not degrade the guard, it stops the worker from starting. One unreadable chip is skipped; the
@@ -1111,7 +1115,14 @@ def resolve_thermal_sensor() -> Path | None:
             except (OSError, ValueError):
                 continue
             candidate = label.with_name(label.name.removesuffix("_label") + "_input")
-            if candidate.exists():
+            try:
+                found = candidate.exists()
+            except OSError:
+                # exists() answers False for ENOENT and re-raises everything else — EACCES on a
+                # restricted sysfs mount, EIO from a driver that went away. Those are unreadable
+                # candidates like any other, not a reason to take the worker down.
+                continue
+            if found:
                 return candidate
     return None
 
@@ -1134,7 +1145,7 @@ def read_temp_millideg() -> int | None:
     except (OSError, ValueError):
         return None  # configured but unreadable is UNKNOWN too, not cool
     if not THERMAL_MIN_PLAUSIBLE_MILLIDEG <= milli <= THERMAL_MAX_PLAUSIBLE_MILLIDEG:
-        return None  # a number, but not a temperature — see the bound's comment
+        return None  # a number, but not one this guard's sensors produce — see the bound's comment
     return milli
 
 
