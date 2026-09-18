@@ -117,6 +117,32 @@ describe('syncMarkers', () => {
     expect(diff.add).toEqual([])
   })
 
+  it('updates a pin whose photos changed while its lead, count and place did not', () => {
+    // One photo deleted and another taken at the same spot between two syncs: [a,b] becomes [a,c]
+    // with the same lead, the same count and the same coordinate. Judged on count, lead and place
+    // alone the pin looks untouched, and the tap then hands the drawer the photo that is gone
+    // instead of the one that arrived.
+    const before: PinSpec = { key: 'p:1', lng: 1, lat: 1, count: 2, uid: 'a', clusterId: null, uids: ['a', 'b'] }
+    const after: PinSpec = { ...before, uids: ['a', 'c'] }
+
+    const diff = syncMarkers(new Map([['p:1', before]]), [after])
+
+    expect(diff.update).toEqual([after])
+    expect(diff.add).toEqual([])
+    expect(diff.remove).toEqual([])
+  })
+
+  it('leaves a pin holding the same photos in the same order alone', () => {
+    // The repaint is the frame budget: membership that did not move must not cost one.
+    const pin: PinSpec = { key: 'p:1', lng: 1, lat: 1, count: 2, uid: 'a', clusterId: null, uids: ['a', 'b'] }
+
+    const diff = syncMarkers(new Map([['p:1', pin]]), [{ ...pin, uids: ['a', 'b'] }])
+
+    expect(diff.update).toEqual([])
+    expect(diff.add).toEqual([])
+    expect(diff.remove).toEqual([])
+  })
+
   it('updates a pin whose count, lead photo or position moved, and leaves an identical one alone', () => {
     // A cluster id survives a zoom change while its count and centroid do not — repainting only
     // what changed is what keeps the sync inside one frame.

@@ -108,6 +108,17 @@ export interface MarkerDiff {
   remove: string[]
 }
 
+/**
+ * The photos behind two pins, compared in order. A deletion answered by an arrival at the same
+ * coordinate leaves the lead, the count and the place untouched while the members move — and the
+ * members are what a tap hands the drawer, so an unrefreshed pin opens on a photo that is gone.
+ * Order counts because the drawer lists the photos in it, and `pinsFor` builds it deterministically
+ * from the order the source was fed.
+ */
+function sameUids(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((uid, i) => uid === b[i])
+}
+
 /** What to add, repaint and drop so the map shows `desired` — the repaint is the frame budget. */
 export function syncMarkers(current: ReadonlyMap<string, PinSpec>, desired: readonly PinSpec[]): MarkerDiff {
   const add: PinSpec[] = []
@@ -122,7 +133,8 @@ export function syncMarkers(current: ReadonlyMap<string, PinSpec>, desired: read
       existing.count !== pin.count ||
       existing.uid !== pin.uid ||
       existing.lng !== pin.lng ||
-      existing.lat !== pin.lat
+      existing.lat !== pin.lat ||
+      !sameUids(existing.uids, pin.uids)
     )
       update.push(pin)
   }
