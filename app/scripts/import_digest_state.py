@@ -492,9 +492,7 @@ async def ensure_import_run(db: AsyncSession, *, local_date: date) -> int:
             status=DigestRunStatus.sent,
             local_date=local_date,
         )
-        .on_conflict_do_nothing(
-            index_elements=["trigger"], index_where=text("trigger = 'import'")
-        )
+        .on_conflict_do_nothing(index_elements=["trigger"], index_where=text("trigger = 'import'"))
     )
     return (
         await db.execute(select(DigestRun.id).where(DigestRun.trigger == IMPORT_TRIGGER))

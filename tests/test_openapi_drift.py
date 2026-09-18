@@ -138,9 +138,7 @@ def test_reference_and_wider_unions_are_not_rewritten():
     from app.main import collapse_nullable_anyof
 
     document = {
-        "ref_plus_null": {
-            "anyOf": [{"$ref": "#/components/schemas/Visibility"}, {"type": "null"}]
-        },
+        "ref_plus_null": {"anyOf": [{"$ref": "#/components/schemas/Visibility"}, {"type": "null"}]},
         "three_arm": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
         "union": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
         "already_a_type_array": {"type": ["string", "null"]},

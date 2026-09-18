@@ -35,7 +35,10 @@ def test_canonical_origin_is_derived_from_the_oidc_redirect_uri(monkeypatch):
     ("url", "expected"),
     [
         ("https://memos-ng.discomarder.live", "https://memos-ng.discomarder.live"),
-        ("https://memos-ng.discomarder.live/api/auth/callback", "https://memos-ng.discomarder.live"),
+        (
+            "https://memos-ng.discomarder.live/api/auth/callback",
+            "https://memos-ng.discomarder.live",
+        ),
         ("http://localhost:5173/x?y=1", "http://localhost:5173"),
         ("https://MEMOS-NG.Discomarder.Live/", "https://memos-ng.discomarder.live"),
         ("/api/memos", ""),  # not absolute → no origin at all
@@ -84,7 +87,9 @@ def test_http_default_port_normalizes_the_same_way(monkeypatch):
 
 
 def test_a_non_default_port_is_significant_and_must_match_exactly(monkeypatch):
-    monkeypatch.setattr(settings, "OIDC_REDIRECT_URI", "https://memos-ng.example:8443/api/auth/callback")
+    monkeypatch.setattr(
+        settings, "OIDC_REDIRECT_URI", "https://memos-ng.example:8443/api/auth/callback"
+    )
     assert canonical_origin() == "https://memos-ng.example:8443"
     assert csrf_reject_reason("POST", {"origin": "https://memos-ng.example:8443"}, COOKIE) is None
     # The port is NOT stripped: the same host on another (or no) port is a different origin.

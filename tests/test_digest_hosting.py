@@ -11,7 +11,6 @@ its 600 s timeout, so a run that stamped liveness once per FILE could go fifteen
 mid-upload and be swept while alive. `on_operation` must fire after every HTTP call.
 """
 
-
 import httpx
 import pytest
 from app.config import settings as app_settings
@@ -288,9 +287,7 @@ def _candidate_with_video(uid: str, attachment_id: int) -> Candidate:
         content="",
         created_at=datetime(2026, 7, 1, tzinfo=UTC),
         videos=[
-            MediaRef(
-                attachment_id=attachment_id, uid=uid, filename="clip.mp4", mime="video/mp4"
-            )
+            MediaRef(attachment_id=attachment_id, uid=uid, filename="clip.mp4", mime="video/mp4")
         ],
     )
 
@@ -429,9 +426,7 @@ def _candidate_with_image(uid: str, attachment_id: int) -> Candidate:
         content="",
         created_at=datetime(2026, 7, 1, tzinfo=UTC),
         images=[
-            MediaRef(
-                attachment_id=attachment_id, uid=uid, filename="p.jpg", mime="image/jpeg"
-            )
+            MediaRef(attachment_id=attachment_id, uid=uid, filename="p.jpg", mime="image/jpeg")
         ],
     )
 
@@ -695,9 +690,7 @@ async def test_only_a_not_found_tagged_409_counts_as_already_deleted():
     await host.delete("/memos-mail/run/a.mp4")  # returns: nothing left to delete
 
     for summary in ("path_write/conflict/file", "too_many_write_operations/.."):
-        refused = _Script(
-            {hosting.TOKEN_URL: _token_ok(), hosting.DELETE_URL: _conflict(summary)}
-        )
+        refused = _Script({hosting.TOKEN_URL: _token_ok(), hosting.DELETE_URL: _conflict(summary)})
         host = _host(refused)
         await host.refresh()
         with pytest.raises(hosting.DropboxError, match="delete failed"):

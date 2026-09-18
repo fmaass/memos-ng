@@ -431,9 +431,7 @@ async def test_a_terminal_job_does_not_block_a_later_request(adb, monkeypatch, t
     att = await _persisted(adb, tmp_path, source=_png(tmp_path / "c.png"))
     for state in (JobState.done, JobState.failed):
         adb.add(
-            MediaJob(
-                attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=state
-            )
+            MediaJob(attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=state)
         )
     await adb.flush()
 
@@ -477,9 +475,7 @@ async def test_a_rendition_older_than_its_source_is_rebuilt(adb, monkeypatch, tm
     assert result.enqueued == (att.id,)
 
 
-async def test_a_future_stamped_rendition_cannot_mask_a_replaced_source(
-    adb, monkeypatch, tmp_path
-):
+async def test_a_future_stamped_rendition_cannot_mask_a_replaced_source(adb, monkeypatch, tmp_path):
     # The other direction of the stamp problem: capture time descends from the client-supplied
     # upload last_modified, which nothing bounds — a broken client clock stamps the rendition
     # YEARS ahead. If freshness trusted mtime, that rendition would read "fresh" forever and a
@@ -528,9 +524,7 @@ async def test_enqueue_refuses_what_can_never_produce_a_rendition(adb, monkeypat
     assert await _jobs_for(adb, video.id) == [] and await _jobs_for(adb, gone.id) == []
 
 
-async def test_enqueue_prefers_the_print_master_as_the_freshness_source(
-    adb, monkeypatch, tmp_path
-):
+async def test_enqueue_prefers_the_print_master_as_the_freshness_source(adb, monkeypatch, tmp_path):
     # The rendition derives from the print master, so it is the master's age that decides whether
     # the file on disk is current — an original touched later is irrelevant.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))

@@ -155,7 +155,6 @@ async def test_a_multi_part_subject_names_the_part(env):
     ]
 
 
-
 async def test_the_sent_mail_carries_no_link_back_to_memos_ng(env):
     """AC 4, end to end and against a fixture memo that CONTAINS one — the production corpus was
     measured on 2026-08-30 as 0 of 245 memos containing any http(s) URL, so an assertion over the
@@ -190,9 +189,7 @@ async def test_everything_deferred_ends_the_run_deferred(env):
     subject, data_root = env
     async with async_session() as db:
         user = await seed_user(db, subject=subject)
-        memo = await seed_memo(
-            db, user, visibility=Visibility.PUBLIC, created_at=datetime.now(UTC)
-        )
+        memo = await seed_memo(db, user, visibility=Visibility.PUBLIC, created_at=datetime.now(UTC))
         await seed_attachment(db, user, memo, mime="image/jpeg")  # no thumb on disk
         await db.commit()
     transport = FakeTransport()
@@ -308,9 +305,7 @@ async def test_a_manual_run_conflicts_with_an_in_flight_scheduled_one(env):
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 1)
     async with async_session() as db:
-        await digest_runner.open_run(
-            db, trigger=DigestTrigger.scheduled, local_date=NOW.date()
-        )
+        await digest_runner.open_run(db, trigger=DigestTrigger.scheduled, local_date=NOW.date())
     transport = FakeTransport()
     with pytest.raises(digest_runner.RunSkipped):
         await digest_runner.run_digest(
@@ -325,12 +320,8 @@ async def test_two_concurrent_manual_runs_leave_one_in_flight_row(env):
     await _seed_photo_memos(subject, data_root, 1)
     first, second = FakeTransport(delay=0.05), FakeTransport(delay=0.05)
     outcomes = await asyncio.gather(
-        digest_runner.run_digest(
-            trigger=DigestTrigger.manual, transport=first, now_utc=NOW
-        ),
-        digest_runner.run_digest(
-            trigger=DigestTrigger.manual, transport=second, now_utc=NOW
-        ),
+        digest_runner.run_digest(trigger=DigestTrigger.manual, transport=first, now_utc=NOW),
+        digest_runner.run_digest(trigger=DigestTrigger.manual, transport=second, now_utc=NOW),
         return_exceptions=True,
     )
     assert len([o for o in outcomes if isinstance(o, digest_runner.RunSkipped)]) == 1
@@ -613,9 +604,7 @@ async def _seed_video_memo(subject: str, data_root):
             visibility=Visibility.PUBLIC,
             created_at=datetime(2026, 6, 20, 10, 0, tzinfo=UTC),
         )
-        attachment = await seed_attachment(
-            db, user, memo, mime="video/mp4", filename="clip.mp4"
-        )
+        attachment = await seed_attachment(db, user, memo, mime="video/mp4", filename="clip.mp4")
         await db.commit()
         write_web_mp4(data_root, attachment.uid, b"MP4" * 10)
         write_poster(data_root, attachment.uid)
@@ -639,9 +628,7 @@ async def test_a_hosted_video_is_recorded_and_never_attached(env):
     assert len(rows) == 1 and rows[0]["attachment_id"] == attachment_id
     assert rows[0]["kind"] == "video"
     message = transport.sent[0].message
-    assert not any(
-        part.get_content_type().startswith("video/") for part in message.walk()
-    )
+    assert not any(part.get_content_type().startswith("video/") for part in message.walk())
     body = html_part(message)
     assert "dropbox.example" in body
     assert "cid:poster-" in body  # the poster and its play badge
@@ -682,9 +669,7 @@ async def test_hosting_unavailable_produces_an_inline_only_mail_and_a_log_line(e
     assert "cid:poster-" not in body
     # The LINE, not a line: "logged, never fatal" is the contract, and asserting an unrelated
     # event (`digest.run_finished`, which every run emits) would make this test unfalsifiable.
-    hosting_events = [
-        entry for entry in logs if entry["event"] == "digest.hosting_unavailable"
-    ]
+    hosting_events = [entry for entry in logs if entry["event"] == "digest.hosting_unavailable"]
     assert len(hosting_events) == 1, [entry["event"] for entry in logs]
     assert hosting_events[0]["run_id"] == result.run_id
     assert hosting_events[0]["log_level"] == "warning"
@@ -703,13 +688,11 @@ async def test_the_retention_sweep_deletes_and_stamps(env):
     )
     dropbox_path = hosted_rows()[0]["dropbox_path"]
 
-    assert await digest_runner.sweep_hosted_media_safe(
-        host_factory=host_factory_for(host)
-    ) == 0  # nothing is old enough yet
+    assert (
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
+    )  # nothing is old enough yet
     age_hosted_media(attachment_id, days=31)
-    assert await digest_runner.sweep_hosted_media_safe(
-        host_factory=host_factory_for(host)
-    ) == 1
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
     assert host.deletes == [dropbox_path]
     row = hosted_rows()[0]
     assert row["swept_at"] is not None
@@ -739,9 +722,7 @@ async def test_the_retention_sweep_does_nothing_without_a_host(env):
         transport=FakeTransport(), host_factory=host_factory_for(FakeHost()), now_utc=NOW
     )
     age_hosted_media(attachment_id, days=31)
-    assert await digest_runner.sweep_hosted_media_safe(
-        host_factory=host_factory_for(None)
-    ) == 0
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(None)) == 0
     assert hosted_rows()[0]["swept_at"] is None  # never stamped for a file still on Dropbox
 
 
@@ -768,9 +749,7 @@ async def test_a_test_send_reaches_only_the_given_address_and_hosts_nothing(env)
     set_digest_settings(hosting_enabled=True)
     host = FakeHost()
     transport = FakeTransport()
-    count = await digest_runner.test_send(
-        address="admin@x", transport=transport, now_utc=NOW
-    )
+    count = await digest_runner.test_send(address="admin@x", transport=transport, now_utc=NOW)
     assert count == 1
     assert [mail.recipients for mail in transport.sent] == [["admin@x"]]
     for address in RECIPIENTS:
@@ -803,9 +782,7 @@ async def test_a_test_send_uses_an_ALREADY_hosted_link_without_uploading(env):
 
 async def test_a_test_send_always_sends_even_with_an_empty_selection(env):
     transport = FakeTransport()
-    count = await digest_runner.test_send(
-        address="admin@x", transport=transport, now_utc=NOW
-    )
+    count = await digest_runner.test_send(address="admin@x", transport=transport, now_utc=NOW)
     assert count == 0
     assert len(transport.sent) == 1
     assert "No memos selected." in html_part(transport.sent[0].message)
@@ -840,9 +817,7 @@ async def test_the_safe_entry_point_swallows_a_skip(env):
     subject, data_root = env
     await _seed_photo_memos(subject, data_root, 1)
     async with async_session() as db:
-        await digest_runner.open_run(
-            db, trigger=DigestTrigger.manual, local_date=NOW.date()
-        )
+        await digest_runner.open_run(db, trigger=DigestTrigger.manual, local_date=NOW.date())
     assert await digest_runner.run_scheduled_digest_safe(now_utc=NOW) is None
     assert len(run_rows()) == 1
 
@@ -927,9 +902,7 @@ async def test_a_test_or_import_run_today_does_not_block_the_scheduled_one(env):
     await _seed_photo_memos(subject, data_root, 1)
     async with async_session() as db:
         for trigger in (DigestTrigger.test, DigestTrigger.import_):
-            run_id = await digest_runner.open_run(
-                db, trigger=trigger, local_date=NOW.date()
-            )
+            run_id = await digest_runner.open_run(db, trigger=trigger, local_date=NOW.date())
             await digest_runner.finish_run(db, run_id, status=digest_runner.SENT)
     transport = FakeTransport()
     result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
@@ -970,9 +943,7 @@ async def test_a_test_send_to_the_sender_address_is_refused(env):
     deliver nothing — a probe that lies is worse than no probe."""
     transport = FakeTransport()
     with pytest.raises(digest_runner.SenderIsRecipient):
-        await digest_runner.test_send(
-            address=SENDER.upper(), transport=transport, now_utc=NOW
-        )
+        await digest_runner.test_send(address=SENDER.upper(), transport=transport, now_utc=NOW)
     assert transport.sent == []
 
 
@@ -980,9 +951,7 @@ async def test_a_test_send_to_the_sender_address_is_refused_even_when_empty(env)
     """The `empty=True` probe takes an earlier branch; the guard must sit in front of both."""
     transport = FakeTransport()
     with pytest.raises(digest_runner.SenderIsRecipient):
-        await digest_runner.test_send(
-            address=SENDER, empty=True, transport=transport, now_utc=NOW
-        )
+        await digest_runner.test_send(address=SENDER, empty=True, transport=transport, now_utc=NOW)
     assert transport.sent == []
 
 
@@ -1029,9 +998,7 @@ async def test_the_retention_sweep_closes_its_host(env):
     )
     age_hosted_media(attachment_id, days=31)
     closed_before = host.closed
-    assert await digest_runner.sweep_hosted_media_safe(
-        host_factory=host_factory_for(host)
-    ) == 1
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
     assert host.closed == closed_before + 1
 
 

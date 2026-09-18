@@ -493,9 +493,7 @@ async def test_two_patches_visiting_two_dedup_targets_in_opposite_orders_do_not_
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
-        await _two_batches_in_opposite_orders(
-            client, monkeypatch, tmp_path, second_is_create=False
-        )
+        await _two_batches_in_opposite_orders(client, monkeypatch, tmp_path, second_is_create=False)
     finally:
         _cleanup()
 
@@ -532,9 +530,10 @@ async def test_batch_dedup_and_legacy_attachment_linking_do_not_cycle(
         )
         low = _memo_attachment_uids(memo["uid"])[0]
         high = _unlinked_attachment(client, "high.png", high_bytes)
-        assert _one("SELECT id FROM attachments WHERE uid = :u", u=low)[0] < _one(
-            "SELECT id FROM attachments WHERE uid = :u", u=high
-        )[0]
+        assert (
+            _one("SELECT id FROM attachments WHERE uid = :u", u=low)[0]
+            < _one("SELECT id FROM attachments WHERE uid = :u", u=high)[0]
+        )
         dedup_upload = _upload(client, "again.png", high_bytes)
 
         park = Park()
@@ -596,9 +595,7 @@ async def test_rendition_attach_and_standalone_finalize_sharing_bytes_do_not_cyc
             await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
             waiting = set(_lock_waiters())
             attach = asyncio.create_task(
-                attacher.post(
-                    f"/api/attachments/{target}/renditions", json={"upload_uid": upload}
-                )
+                attacher.post(f"/api/attachments/{target}/renditions", json={"upload_uid": upload})
             )
             await _wait_for_a_new_lock_wait(waiting)
             park.release.set()
@@ -640,9 +637,7 @@ async def test_rendition_attach_and_standalone_finalize_do_not_cycle_with_the_at
 
         async with _async_client(client) as attacher, _async_client(client) as standalone:
             attach = asyncio.create_task(
-                attacher.post(
-                    f"/api/attachments/{target}/renditions", json={"upload_uid": upload}
-                )
+                attacher.post(f"/api/attachments/{target}/renditions", json={"upload_uid": upload})
             )
             await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
             waiting = set(_lock_waiters())
@@ -1040,9 +1035,7 @@ def _seed_stale_terminal_job(attachment_uid: str, *, seconds_stale: int = 10) ->
             attachment_id = c.execute(
                 text("SELECT id FROM attachments WHERE uid = :u"), {"u": attachment_uid}
             ).scalar_one()
-            c.execute(
-                text("DELETE FROM media_jobs WHERE attachment_id = :a"), {"a": attachment_id}
-            )
+            c.execute(text("DELETE FROM media_jobs WHERE attachment_id = :a"), {"a": attachment_id})
             return c.execute(
                 text(
                     "INSERT INTO media_jobs "
@@ -1073,9 +1066,10 @@ async def _recovery_beside_a_print_only_patch(client, monkeypatch, *, capture_sq
         ],
     )
     low, high = _memo_attachment_uids(memo["uid"])
-    assert _one("SELECT id FROM attachments WHERE uid = :u", u=low)[0] < _one(
-        "SELECT id FROM attachments WHERE uid = :u", u=high
-    )[0]
+    assert (
+        _one("SELECT id FROM attachments WHERE uid = :u", u=low)[0]
+        < _one("SELECT id FROM attachments WHERE uid = :u", u=high)[0]
+    )
     # The HIGH-id attachment's job is inserted first, so it carries the LOWER media_jobs.id and the
     # sweep reaches it first — the inversion the protocol has to survive.
     high_job = _seed_stale_terminal_job(high)
@@ -1615,8 +1609,7 @@ async def test_the_expiry_reaper_serializes_behind_a_parked_finalize_holding_its
         with eng.begin() as c:
             c.execute(
                 text(
-                    "UPDATE uploads SET expires_at = now() - interval '1 day' "
-                    "WHERE upload_uid = :u"
+                    "UPDATE uploads SET expires_at = now() - interval '1 day' WHERE upload_uid = :u"
                 ),
                 {"u": uid},
             )
@@ -1679,8 +1672,7 @@ async def test_the_expiry_reaper_does_not_unlink_a_part_the_finalize_has_not_mov
         with eng.begin() as c:
             c.execute(
                 text(
-                    "UPDATE uploads SET expires_at = now() - interval \'1 day\' "
-                    "WHERE upload_uid = :u"
+                    "UPDATE uploads SET expires_at = now() - interval '1 day' WHERE upload_uid = :u"
                 ),
                 {"u": uid},
             )
@@ -1797,9 +1789,7 @@ async def test_rendition_deletion_and_multipart_print_run_beside_a_parked_attach
         )
         assert key == "print"
         assert Path(path).read_bytes() == replacement  # the attach's file, not the deleted one
-        print_path = _one(
-            "SELECT print_path FROM attachments WHERE uid = :u", u=held_target
-        )[0]
+        print_path = _one("SELECT print_path FROM attachments WHERE uid = :u", u=held_target)[0]
         assert print_path is not None
         assert Path(print_path).read_bytes() == print_bytes
     finally:

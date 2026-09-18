@@ -111,8 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
-        "--victim", type=int, metavar="ID", help="reclaim exactly this attachment id, with a "
-        "row-and-file read-back — run this before --apply"
+        "--victim",
+        type=int,
+        metavar="ID",
+        help="reclaim exactly this attachment id, with a "
+        "row-and-file read-back — run this before --apply",
     )
     mode.add_argument("--apply", action="store_true", help="reclaim every listed orphan")
     args = parser.parse_args(argv)
@@ -169,8 +172,10 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     if not read_back(session, att.id, paths):
                         failures += 1
-                print(f"\nreclaimed={len(found) - skipped - failures} skipped={skipped} "
-                      f"failed={failures}")
+                print(
+                    f"\nreclaimed={len(found) - skipped - failures} skipped={skipped} "
+                    f"failed={failures}"
+                )
                 return 1 if failures else 0
 
             print("\nDRY RUN — nothing was changed. Re-run with --victim <id>, then --apply.")

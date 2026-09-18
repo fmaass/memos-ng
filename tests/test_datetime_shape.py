@@ -41,9 +41,7 @@ from tests.conftest import SYNC_URL
 CANONICAL = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 # Anything a reader would take for a timestamp, in any RFC 3339 spelling — the net that catches a
 # field still serialising the old way.
-TIMESTAMP_ISH = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$"
-)
+TIMESTAMP_ISH = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$")
 # Carries microseconds on purpose: the value that used to serialise differently from a whole one.
 SAMPLE = datetime(2026, 8, 21, 20, 41, 49, 443210, tzinfo=UTC)
 
@@ -323,9 +321,9 @@ def test_a_bare_datetime_field_would_fail_the_sweep():
     class Bypass(BaseModel):
         stamp: datetime
 
-    rendered = TypeAdapter(
-        Bypass.model_fields["stamp"].rebuild_annotation()
-    ).dump_python(SAMPLE, mode="json")
+    rendered = TypeAdapter(Bypass.model_fields["stamp"].rebuild_annotation()).dump_python(
+        SAMPLE, mode="json"
+    )
     assert not CANONICAL.match(rendered), rendered
 
 
@@ -342,9 +340,9 @@ def test_the_committed_openapi_still_publishes_date_time_for_every_swept_field()
     import json
     from pathlib import Path
 
-    schemas = json.loads(
-        (Path(__file__).resolve().parent.parent / "openapi.json").read_text()
-    )["components"]["schemas"]
+    schemas = json.loads((Path(__file__).resolve().parent.parent / "openapi.json").read_text())[
+        "components"
+    ]["schemas"]
     for model, field in sorted(EXPECTED_DATETIME_FIELDS):
         published = schemas[model]["properties"][field]
         assert published["format"] == "date-time", (model, field, published)

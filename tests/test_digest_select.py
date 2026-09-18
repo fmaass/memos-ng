@@ -166,9 +166,7 @@ async def test_the_start_date_is_a_LOCAL_day_boundary(adb):
     """`start_date` is a date the admin typed in the panel; comparing it as a UTC midnight would
     admit (or exclude) the two hours either side of it in Europe/Zurich."""
     user = await seed_user(adb)
-    just_before = await seed_memo(
-        adb, user, created_at=datetime(2026, 5, 31, 21, 59, tzinfo=UTC)
-    )
+    just_before = await seed_memo(adb, user, created_at=datetime(2026, 5, 31, 21, 59, tzinfo=UTC))
     just_after = await seed_memo(adb, user, created_at=datetime(2026, 5, 31, 22, 1, tzinfo=UTC))
     found = {c.memo_id for c in await digest_select.load_candidates(adb, _settings())}
     assert just_after.id in found
@@ -187,9 +185,7 @@ async def test_a_memo_with_a_delivery_row_is_excluded(adb):
         )
     )
     await adb.execute(
-        text(
-            "INSERT INTO digest_deliveries (memo_id, run_id) VALUES (:memo_id, :run_id)"
-        ),
+        text("INSERT INTO digest_deliveries (memo_id, run_id) VALUES (:memo_id, :run_id)"),
         {"memo_id": delivered.id, "run_id": run_id},
     )
     await adb.flush()

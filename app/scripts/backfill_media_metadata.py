@@ -313,13 +313,9 @@ async def run_backfill(
 ) -> BackfillStats:
     candidates = await load_candidates(db)
     eligible, unsupported = partition(candidates)
-    stats = BackfillStats(
-        candidates=len(candidates), skipped_unsupported_mime=len(unsupported)
-    )
+    stats = BackfillStats(candidates=len(candidates), skipped_unsupported_mime=len(unsupported))
     for att in unsupported:
-        logger.info(
-            "backfill.unsupported_mime", attachment_id=att.id, uid=att.uid, mime=att.mime
-        )
+        logger.info("backfill.unsupported_mime", attachment_id=att.id, uid=att.uid, mime=att.mime)
 
     for att in eligible if limit is None else eligible[: max(limit, 0)]:
         stats.processed += 1

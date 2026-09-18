@@ -235,8 +235,7 @@ async def test_the_ledger_row_survives_the_attachment_and_is_still_swept(env):
     engine.dispose()
     swept_host = FakeHost()
     assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(swept_host))
-        == 1
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(swept_host)) == 1
     )
     assert swept_host.deletes == [dropbox_path]
     assert _rows_now()[0]["status"] == "swept"
@@ -254,9 +253,7 @@ async def test_a_stale_pending_row_whose_object_landed_is_recorded_as_uploaded(e
     )
     age_hosted_claim(ledger_id, minutes=90)
     host = FakeHost()
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     assert host.probes == ["/memos-mail/run/orphan.mp4"]
     assert host.deletes == []
     row = _rows_now()[0]
@@ -273,9 +270,7 @@ async def test_a_stale_pending_row_whose_object_never_landed_is_swept(env):
     )
     age_hosted_claim(ledger_id, minutes=90)
     host = FakeHost(absent={"/memos-mail/run/never.mp4"})
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
     assert host.deletes == []  # nothing to delete: it was never there
     row = _rows_now()[0]
     assert row["status"] == "swept"
@@ -286,13 +281,9 @@ async def test_a_fresh_pending_row_is_left_alone(env):
     """A live upload is a pending row too. Reconciling one out from under a running upload session
     (600 s per operation is legitimate) would be the sweep inventing the very orphan it exists to
     prevent, so the threshold sits well above the longest single operation."""
-    insert_hosted_row(
-        kind="video", dropbox_path="/memos-mail/run/inflight.mp4", status="pending"
-    )
+    insert_hosted_row(kind="video", dropbox_path="/memos-mail/run/inflight.mp4", status="pending")
     host = FakeHost()
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     assert host.probes == []
     assert _rows_now()[0]["status"] == "pending"
 
@@ -338,9 +329,7 @@ async def test_a_pending_row_is_re_opened_by_a_later_claim_on_the_same_path(env)
     )
     assert again == ledger_id
     host = FakeHost()
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     assert host.probes == []  # the re-claim reset the clock; nothing is stale
 
 
@@ -362,8 +351,7 @@ async def test_a_swept_row_is_never_re_opened_by_a_later_claim(env):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "UPDATE digest_hosted_media SET status = 'swept', swept_at = now() "
-                "WHERE id = :id"
+                "UPDATE digest_hosted_media SET status = 'swept', swept_at = now() WHERE id = :id"
             ),
             {"id": ledger_id},
         )
@@ -400,9 +388,7 @@ async def test_a_pending_row_under_a_live_run_is_never_reconciled(env):
     )
     age_hosted_claim(ledger_id, minutes=180)  # far past the settling floor
     host = FakeHost()
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     assert host.probes == []  # not even asked about
     assert _rows_now()[0]["status"] == "pending"
 
@@ -420,9 +406,7 @@ async def test_a_pending_row_under_a_dead_run_is_reconciled(env):
     )
     age_hosted_claim(ledger_id, minutes=180)
     host = FakeHost(absent={"/memos-mail/run/dead.mp4"})
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 1
     assert host.probes == ["/memos-mail/run/dead.mp4"]
     assert _rows_now()[0]["status"] == "swept"
 
@@ -439,15 +423,13 @@ async def test_a_pending_row_under_a_finished_run_is_reconciled(env):
     )
     age_hosted_claim(ledger_id, minutes=180)
     host = FakeHost()
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     assert host.probes == ["/memos-mail/run/left.mp4"]
     assert _rows_now()[0]["status"] == "uploaded"  # the object was there after all
 
 
 async def test_a_probe_that_cannot_answer_leaves_the_row_exactly_as_it_was(env):
-    """"Unknown" is not "absent". A 409 with some other tag, a 5xx or a timeout says nothing about
+    """ "Unknown" is not "absent". A 409 with some other tag, a 5xx or a timeout says nothing about
     whether the object exists, and resolving the row on that guess is how a live file stops being
     findable. The row is left for the next pass, and the failure is logged once."""
     from structlog.testing import capture_logs
@@ -470,10 +452,7 @@ async def test_a_probe_that_cannot_answer_leaves_the_row_exactly_as_it_was(env):
 
     host = _UnknownProbe()
     with capture_logs() as logs:
-        assert (
-            await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host))
-            == 0
-        )
+        assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(host)) == 0
     assert host.probes == ["/memos-mail/run/unknown.mp4"]
     assert _rows_now()[0]["status"] == "pending"
     probe_failures = [
@@ -525,9 +504,7 @@ async def test_a_crash_between_the_upload_and_the_mark_is_reconciled_without_re_
 
     # The run that died is still in flight, so nothing is reconciled while it might be alive…
     quiet = FakeHost()
-    assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(quiet)) == 0
-    )
+    assert await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(quiet)) == 0
     assert quiet.probes == []
 
     # …until the stale-run sweep closes it, which is the same 15 minutes of silence.
@@ -541,8 +518,7 @@ async def test_a_crash_between_the_upload_and_the_mark_is_reconciled_without_re_
 
     recovering = FakeHost()  # `remote_exists` answers True: the object is there
     assert (
-        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(recovering))
-        == 0
+        await digest_runner.sweep_hosted_media_safe(host_factory=host_factory_for(recovering)) == 0
     )
     assert recovering.probes == [dropbox_path]
     assert recovering.uploads == []  # nothing is uploaded a second time
@@ -693,7 +669,5 @@ async def test_a_test_send_writes_no_ledger_row_at_all(env):
 async def test_a_manual_claim_writes_no_ledger_row_either(env):
     """The 202 path commits a run row and nothing else — the hosting pass belongs to the worker."""
     async with async_session() as db:
-        await digest_runner.open_run(
-            db, trigger=DigestTrigger.manual, local_date=NOW.date()
-        )
+        await digest_runner.open_run(db, trigger=DigestTrigger.manual, local_date=NOW.date())
     assert _rows_now() == []

@@ -34,8 +34,8 @@ from app.services.memos import decode_cursor, visible_clause
 router = APIRouter(tags=["compat"])
 
 VIDEO_EXTS = (".mov", ".mp4", ".m4v", ".webm", ".avi", ".mkv")
-TAG_IN_RE = re.compile(r'tag\s+in\s+\[([^\]]*)\]')
-TAG_EQ_RE = re.compile(r'tag\s*==')
+TAG_IN_RE = re.compile(r"tag\s+in\s+\[([^\]]*)\]")
+TAG_EQ_RE = re.compile(r"tag\s*==")
 
 
 async def optional_user(request: Request, db: Annotated[AsyncSession, Depends(get_session)]):
@@ -93,9 +93,7 @@ def _compat_memo(memo: Memo) -> dict[str, Any]:
         "pinned": memo.pinned,
         "attachments": [_compat_attachment(a, name) for a in memo.attachments],
         "relations": [],
-        "reactions": [
-            {"emoji": r.emoji, "creator": f"users/{r.user_id}"} for r in memo.reactions
-        ],
+        "reactions": [{"emoji": r.emoji, "creator": f"users/{r.user_id}"} for r in memo.reactions],
         "property": _property(memo.content),
         "snippet": memo.content[:200],
     }
@@ -113,7 +111,7 @@ def _parse_filter(filter_str: str | None) -> list[str]:
     m = TAG_IN_RE.search(filter_str)
     if not m:
         return []
-    return [s.strip().strip('"\'') for s in m.group(1).split(",") if s.strip()]
+    return [s.strip().strip("\"'") for s in m.group(1).split(",") if s.strip()]
 
 
 def _encode_token(memo: Memo) -> str:
@@ -146,10 +144,7 @@ async def list_memos_compat(
 
     limit = max(1, min(pageSize, 100))
     stmt = (
-        select(Memo)
-        .where(*conds)
-        .order_by(Memo.created_at.desc(), Memo.id.desc())
-        .limit(limit + 1)
+        select(Memo).where(*conds).order_by(Memo.created_at.desc(), Memo.id.desc()).limit(limit + 1)
     )
     rows = (await db.execute(stmt)).scalars().all()
     has_more = len(rows) > limit
@@ -168,8 +163,7 @@ async def get_memo_compat(
     if memo is None:
         raise HTTPException(status_code=404, detail="memo not found")
     visible = memo.visibility == Visibility.PUBLIC or (
-        user is not None
-        and (memo.owner_id == user.id or memo.visibility != Visibility.PRIVATE)
+        user is not None and (memo.owner_id == user.id or memo.visibility != Visibility.PRIVATE)
     )
     if not visible:
         raise HTTPException(status_code=404, detail="memo not found")
@@ -236,6 +230,4 @@ async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail
     # No shared cache may store these: the same URL is authorized per-caller now, and a
     # PUBLIC→PRIVATE flip must take effect on the very next request rather than being replayed
     # from a cache that outlives the flip.
-    return FileResponse(
-        path, media_type=media_type, headers={"Cache-Control": "private, no-store"}
-    )
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, no-store"})

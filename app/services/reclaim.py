@@ -186,9 +186,7 @@ async def reclaim_attachment(
     )
     # 2. …then the attachment row, locked and revalidated against the caller's own premise.
     att = (
-        await db.execute(
-            select(Attachment).where(Attachment.id == attachment_id).with_for_update()
-        )
+        await db.execute(select(Attachment).where(Attachment.id == attachment_id).with_for_update())
     ).scalar_one_or_none()
     if att is None:
         await db.commit()

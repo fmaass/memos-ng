@@ -100,9 +100,7 @@ def test_pat_lifetime_becomes_an_absolute_expiry(logged_in_client):
     # app/api_types.py): the stored deadline keeps its microseconds and is what expiry is judged
     # against, while the RENDERED one is floored, so a client can see up to a second less than it
     # was granted — never more, which is the safe direction for a deadline.
-    assert (
-        timedelta(days=30, seconds=-1) <= expires_at - before <= timedelta(days=30, seconds=60)
-    )
+    assert timedelta(days=30, seconds=-1) <= expires_at - before <= timedelta(days=30, seconds=60)
     listed = client.get("/api/pats").json()
     assert datetime.fromisoformat(listed[0]["expires_at"]) == expires_at
 
@@ -120,9 +118,7 @@ async def test_authenticate_pat_refuses_an_expired_token(adb):
         adb, u, "expired", expires_at=datetime.now(UTC) - timedelta(seconds=1)
     )
     assert await auth.authenticate_pat(adb, token) is None
-    _, live = await svc.create_pat(
-        adb, u, "live", expires_at=datetime.now(UTC) + timedelta(days=1)
-    )
+    _, live = await svc.create_pat(adb, u, "live", expires_at=datetime.now(UTC) + timedelta(days=1))
     got = await auth.authenticate_pat(adb, live)
     assert got is not None and got.id == u.id
     await auth.drain_pat_stamp_tasks()

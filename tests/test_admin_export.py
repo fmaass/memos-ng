@@ -340,7 +340,5 @@ def test_the_route_is_on_the_session_lane_like_every_other_admin_surface():
     nothing else, which is what `require_admin` in DEPENDENCY_SECURITY says."""
     paths = app.openapi()["paths"]
     for method in ("get", "put"):
-        assert paths[f"{PREFIX}/settings"][method]["security"] == [
-            {"sessionCookie": []}
-        ], method
+        assert paths[f"{PREFIX}/settings"][method]["security"] == [{"sessionCookie": []}], method
     assert app_settings.is_production is False  # the schema is only exported outside production

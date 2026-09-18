@@ -33,8 +33,12 @@ def _set_frame_api(monkeypatch, *, url=FRAME_API_URL, album=FRAME_ALBUM_ID, toke
 
 def _img(owner_id: int, uid: str, mime: str = "image/jpeg") -> Attachment:
     return Attachment(
-        uid=uid, owner_id=owner_id, filename=f"{uid}.jpg", mime=mime,
-        size=1, status=AttachmentStatus.ready,
+        uid=uid,
+        owner_id=owner_id,
+        filename=f"{uid}.jpg",
+        mime=mime,
+        size=1,
+        status=AttachmentStatus.ready,
     )
 
 
@@ -42,8 +46,10 @@ async def _configured_user(adb, monkeypatch, subject: str = "alice") -> User:
     """A user + server config with the frame-share feature fully enabled (album HTTP upload)."""
     _set_frame_api(monkeypatch)
     u = User(
-        subject=subject, role="user",
-        frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
+        subject=subject,
+        role="user",
+        frame_send_to="frame@send.auraframes.com",
+        frame_send_from="sender@me.com",
     )
     adb.add(u)
     await adb.flush()
@@ -82,10 +88,17 @@ async def _curated_memo_with_job(adb, monkeypatch, subject="alice"):
 @pytest.mark.parametrize(
     "mime,expected",
     [
-        ("image/jpeg", True), ("image/png", True), ("image/heic", True),
-        ("image/tiff", True), ("image/webp", True), ("IMAGE/JPEG", True),
-        ("video/mp4", False), ("video/quicktime", False), ("application/pdf", False),
-        ("image/svg+xml", False), ("", False),
+        ("image/jpeg", True),
+        ("image/png", True),
+        ("image/heic", True),
+        ("image/tiff", True),
+        ("image/webp", True),
+        ("IMAGE/JPEG", True),
+        ("video/mp4", False),
+        ("video/quicktime", False),
+        ("application/pdf", False),
+        ("image/svg+xml", False),
+        ("", False),
     ],
 )
 def test_is_frame_image(mime, expected):
@@ -100,7 +113,10 @@ async def test_curated_images_enqueue_one_job_per_image(adb, monkeypatch):
     adb.add_all([_img(u.id, "i1"), _img(u.id, "i2")])
     await adb.flush()
     memo = await svc.create_memo(
-        adb, u, content="nice shots #curated", visibility=Visibility.PRIVATE,
+        adb,
+        u,
+        content="nice shots #curated",
+        visibility=Visibility.PRIVATE,
         attachment_uids=["i1", "i2"],
     )
     assert await maybe_enqueue_frame_shares(adb, memo, u) == 2
@@ -110,8 +126,12 @@ async def test_curated_images_enqueue_one_job_per_image(adb, monkeypatch):
 async def test_curated_video_only_no_jobs(adb, monkeypatch):
     u = await _configured_user(adb, monkeypatch)
     v = Attachment(
-        uid="v1", owner_id=u.id, filename="v.mp4", mime="video/mp4",
-        size=1, status=AttachmentStatus.ready,
+        uid="v1",
+        owner_id=u.id,
+        filename="v.mp4",
+        mime="video/mp4",
+        size=1,
+        status=AttachmentStatus.ready,
     )
     adb.add(v)
     await adb.flush()
@@ -265,8 +285,10 @@ async def test_frame_api_unset_no_jobs(adb, monkeypatch):
     # Feature disabled (album API not configured) → no jobs enqueued even for a curated image.
     _set_frame_api(monkeypatch, url="", album=0, token="")
     u = User(
-        subject="alice", role="user",
-        frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
+        subject="alice",
+        role="user",
+        frame_send_to="frame@send.auraframes.com",
+        frame_send_from="sender@me.com",
     )
     adb.add(u)
     await adb.flush()
@@ -283,9 +305,9 @@ async def test_frame_api_unset_no_jobs(adb, monkeypatch):
     "url,album,token,expected",
     [
         ("http://frame.local", 7, "tok", True),  # all three set → enabled
-        ("", 7, "tok", False),                    # URL unset → disabled
+        ("", 7, "tok", False),  # URL unset → disabled
         ("http://frame.local", 0, "tok", False),  # album id zero → disabled
-        ("http://frame.local", 7, "", False),     # token unset → disabled
+        ("http://frame.local", 7, "", False),  # token unset → disabled
     ],
 )
 def test_frame_api_configured_requires_all_three(monkeypatch, url, album, token, expected):

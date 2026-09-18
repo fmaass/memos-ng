@@ -124,9 +124,7 @@ async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -
                     "memo_id": ins.excluded.memo_id,
                     "user_id": ins.excluded.user_id,
                 },
-                where=FrameShareJob.state.in_(
-                    [FrameShareState.skipped, FrameShareState.failed]
-                ),
+                where=FrameShareJob.state.in_([FrameShareState.skipped, FrameShareState.failed]),
             ).returning(FrameShareJob.id)
         )
         if result.first() is not None:
@@ -234,9 +232,7 @@ def _is_transient_http_error(exc: Exception) -> bool:
     return False
 
 
-async def _revalidate(
-    db: AsyncSession, job: FrameShareJob
-) -> tuple[Attachment, Memo, User] | None:
+async def _revalidate(db: AsyncSession, job: FrameShareJob) -> tuple[Attachment, Memo, User] | None:
     """Best-effort send-time revalidation (see plan D2 — NOT lock-held across the upload call).
     Returns (attachment, memo, owner) if the job is still eligible, else None → the worker marks it
     `skipped`. Catches every realistic case: memo deleted / un-#curated / attachment unlinked /
@@ -340,7 +336,9 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
     except Exception as exc:
         written = await _write_claimed_outcome(
-            db, job, lease,
+            db,
+            job,
+            lease,
             attempts=job.attempts + 1,
             state=FrameShareState.failed,
             error=str(exc)[:500],
@@ -371,12 +369,12 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
             )
             if not written:
                 return "lease_lost"
-            logger.warning(
-                "frame_share.failed", job_id=job.id, attempts=job.attempts, error=safe
-            )
+            logger.warning("frame_share.failed", job_id=job.id, attempts=job.attempts, error=safe)
             return "failed"
         written = await _write_claimed_outcome(
-            db, job, lease,
+            db,
+            job,
+            lease,
             attempts=attempts,
             error=safe,
             state=FrameShareState.queued,  # retry later
@@ -385,9 +383,7 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         )
         if not written:
             return "lease_lost"
-        logger.warning(
-            "frame_share.retry", job_id=job.id, attempts=job.attempts, error=safe
-        )
+        logger.warning("frame_share.retry", job_id=job.id, attempts=job.attempts, error=safe)
         return "retry"
     written = await _write_claimed_outcome(
         db, job, lease, state=FrameShareState.sent, sent_at=datetime.now(UTC)
@@ -456,16 +452,12 @@ async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -
         if job.attempts >= FRAME_MAX_ATTEMPTS:
             job.state = FrameShareState.failed  # terminal + visible, never a silent drop
             job.error = f"stale claim recovery gave up after {job.attempts} attempts"
-            logger.warning(
-                "frame_share.stale_claim_failed", job_id=job.id, attempts=job.attempts
-            )
+            logger.warning("frame_share.stale_claim_failed", job_id=job.id, attempts=job.attempts)
             continue
         job.state = FrameShareState.queued
         job.next_attempt_at = None  # due immediately: a crash is not a backoff signal
         job.error = "recovered from stale claim (worker interrupted mid-send)"
-        logger.warning(
-            "frame_share.stale_claim_requeued", job_id=job.id, attempts=job.attempts
-        )
+        logger.warning("frame_share.stale_claim_requeued", job_id=job.id, attempts=job.attempts)
     await db.flush()
     return len(rows)
 

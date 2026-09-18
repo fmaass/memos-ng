@@ -229,14 +229,24 @@ def test_is_transient_http_error(exc, expected):
 
 
 async def _make_claimed(
-    adb, monkeypatch, tmp_path, *, content="pics #curated", mime="image/jpeg",
-    write_file=True, configured=True, subject=None, filename="photo.jpg",
+    adb,
+    monkeypatch,
+    tmp_path,
+    *,
+    content="pics #curated",
+    mime="image/jpeg",
+    write_file=True,
+    configured=True,
+    subject=None,
+    filename="photo.jpg",
 ):
     if configured:
         _frame_api_settings(monkeypatch)
     u = User(
-        subject=subject or f"u-{secrets.token_hex(4)}", role="user",
-        frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
+        subject=subject or f"u-{secrets.token_hex(4)}",
+        role="user",
+        frame_send_to="frame@send.auraframes.com",
+        frame_send_from="sender@me.com",
     )
     adb.add(u)
     await adb.flush()
@@ -246,8 +256,13 @@ async def _make_claimed(
         _write_jpeg(f, (64, 48))
         storage = str(f)
     att = Attachment(
-        uid=secrets.token_urlsafe(8), owner_id=u.id, filename=filename, mime=mime,
-        size=1, status=AttachmentStatus.ready, storage_path=storage,
+        uid=secrets.token_urlsafe(8),
+        owner_id=u.id,
+        filename=filename,
+        mime=mime,
+        size=1,
+        status=AttachmentStatus.ready,
+        storage_path=storage,
         captured_at=datetime(2024, 5, 5, tzinfo=UTC),
     )
     adb.add(att)
@@ -256,8 +271,11 @@ async def _make_claimed(
         adb, u, content=content, visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
     )
     job = FrameShareJob(
-        attachment_id=att.id, memo_id=memo.id, user_id=u.id,
-        state=FrameShareState.claimed, attempts=0,
+        attachment_id=att.id,
+        memo_id=memo.id,
+        user_id=u.id,
+        state=FrameShareState.claimed,
+        attempts=0,
     )
     adb.add(job)
     await adb.flush()
@@ -288,26 +306,42 @@ async def test_process_stamps_memo_date_not_captured_at(adb, monkeypatch, tmp_pa
     _mock_album(monkeypatch, status=201, captured=captured)
     _frame_api_settings(monkeypatch)
     u = User(
-        subject=f"u-{secrets.token_hex(4)}", role="user",
-        frame_send_to="f@send.auraframes.com", frame_send_from="s@me.com",
+        subject=f"u-{secrets.token_hex(4)}",
+        role="user",
+        frame_send_to="f@send.auraframes.com",
+        frame_send_from="s@me.com",
     )
     adb.add(u)
     await adb.flush()
     src = tmp_path / "src.png"
     Image.new("RGB", (50, 40), (1, 2, 3)).save(src, "PNG")  # PNG source → no EXIF
     att = Attachment(
-        uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/png",
-        size=1, status=AttachmentStatus.ready, storage_path=str(src),
+        uid=secrets.token_urlsafe(8),
+        owner_id=u.id,
+        filename="p.jpg",
+        mime="image/png",
+        size=1,
+        status=AttachmentStatus.ready,
+        storage_path=str(src),
         captured_at=datetime(2020, 1, 1, tzinfo=UTC),  # deliberately WRONG/old
     )
     adb.add(att)
     await adb.flush()
     memo = await memos_svc.create_memo(
-        adb, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid],
+        adb,
+        u,
+        content="#curated",
+        visibility=Visibility.PRIVATE,
+        attachment_uids=[att.uid],
         created_at=datetime(2026, 5, 12, 9, 30, 0, tzinfo=UTC),  # the intended frame date
     )
-    job = FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
-                        state=FrameShareState.claimed, attempts=0)
+    job = FrameShareJob(
+        attachment_id=att.id,
+        memo_id=memo.id,
+        user_id=u.id,
+        state=FrameShareState.claimed,
+        attempts=0,
+    )
     adb.add(job)
     await adb.flush()
     assert await fs.process_claimed_job(adb, job) == "sent"
@@ -463,8 +497,13 @@ async def test_full_flow_enqueue_then_upload_marks_sent(adb, monkeypatch, tmp_pa
     src = tmp_path / "sunset.png"
     Image.new("RGB", (120, 80), (10, 20, 30)).save(src, "PNG")
     att = Attachment(
-        uid=secrets.token_urlsafe(8), owner_id=u.id, filename="sunset.png", mime="image/png",
-        size=1, status=AttachmentStatus.ready, storage_path=str(src),
+        uid=secrets.token_urlsafe(8),
+        owner_id=u.id,
+        filename="sunset.png",
+        mime="image/png",
+        size=1,
+        status=AttachmentStatus.ready,
+        storage_path=str(src),
     )
     adb.add(att)
     await adb.flush()
@@ -533,23 +572,37 @@ async def test_run_frame_share_once_end_to_end_marks_sent(monkeypatch, tmp_path,
     try:
         async with async_session() as db:
             u = User(
-                subject=subject, role="user",
-                frame_send_to="frame@send.auraframes.com", frame_send_from="sender@me.com",
+                subject=subject,
+                role="user",
+                frame_send_to="frame@send.auraframes.com",
+                frame_send_from="sender@me.com",
             )
             db.add(u)
             await db.flush()
             user_id = u.id
             att = Attachment(
-                uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
-                size=1, status=AttachmentStatus.ready, storage_path=str(f),
+                uid=secrets.token_urlsafe(8),
+                owner_id=u.id,
+                filename="p.jpg",
+                mime="image/jpeg",
+                size=1,
+                status=AttachmentStatus.ready,
+                storage_path=str(f),
             )
             db.add(att)
             await db.flush()
             memo = await memos_svc.create_memo(
                 db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
             )
-            db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
-                                 state=FrameShareState.queued, attempts=0))
+            db.add(
+                FrameShareJob(
+                    attachment_id=att.id,
+                    memo_id=memo.id,
+                    user_id=u.id,
+                    state=FrameShareState.queued,
+                    attempts=0,
+                )
+            )
             await db.commit()
 
         async with async_session() as db:
@@ -593,16 +646,28 @@ async def test_crash_after_claim_commit_is_recovered_and_reclaimable(
             await db.flush()
             user_id = u.id
             att = Attachment(
-                uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
-                size=1, status=AttachmentStatus.ready, storage_path=str(f),
+                uid=secrets.token_urlsafe(8),
+                owner_id=u.id,
+                filename="p.jpg",
+                mime="image/jpeg",
+                size=1,
+                status=AttachmentStatus.ready,
+                storage_path=str(f),
             )
             db.add(att)
             await db.flush()
             memo = await memos_svc.create_memo(
                 db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
             )
-            db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
-                                 state=FrameShareState.queued, attempts=0))
+            db.add(
+                FrameShareJob(
+                    attachment_id=att.id,
+                    memo_id=memo.id,
+                    user_id=u.id,
+                    state=FrameShareState.queued,
+                    attempts=0,
+                )
+            )
             await db.commit()
 
         # The crash: claim + commit the tombstone (worker.run_frame_share_once's commit BEFORE the
@@ -734,16 +799,28 @@ async def _commit_queued_job(subject, storage, *, attempts=0):
         db.add(u)
         await db.flush()
         att = Attachment(
-            uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
-            size=1, status=AttachmentStatus.ready, storage_path=storage,
+            uid=secrets.token_urlsafe(8),
+            owner_id=u.id,
+            filename="p.jpg",
+            mime="image/jpeg",
+            size=1,
+            status=AttachmentStatus.ready,
+            storage_path=storage,
         )
         db.add(att)
         await db.flush()
         memo = await memos_svc.create_memo(
             db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
         )
-        db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
-                             state=FrameShareState.queued, attempts=attempts))
+        db.add(
+            FrameShareJob(
+                attachment_id=att.id,
+                memo_id=memo.id,
+                user_id=u.id,
+                state=FrameShareState.queued,
+                attempts=attempts,
+            )
+        )
         await db.commit()
         return u.id
 
@@ -876,23 +953,37 @@ async def test_unconfigured_worker_leaves_frame_jobs_queued(monkeypatch, tmp_pat
     try:
         async with async_session() as db:
             u = User(
-                subject=subject, role="user",
-                frame_send_to="frame@send.auraframes.com", frame_send_from="me@me.com",
+                subject=subject,
+                role="user",
+                frame_send_to="frame@send.auraframes.com",
+                frame_send_from="me@me.com",
             )
             db.add(u)
             await db.flush()
             user_id = u.id
             att = Attachment(
-                uid=secrets.token_urlsafe(8), owner_id=u.id, filename="p.jpg", mime="image/jpeg",
-                size=1, status=AttachmentStatus.ready, storage_path=str(f),
+                uid=secrets.token_urlsafe(8),
+                owner_id=u.id,
+                filename="p.jpg",
+                mime="image/jpeg",
+                size=1,
+                status=AttachmentStatus.ready,
+                storage_path=str(f),
             )
             db.add(att)
             await db.flush()
             memo = await memos_svc.create_memo(
                 db, u, content="#curated", visibility=Visibility.PRIVATE, attachment_uids=[att.uid]
             )
-            db.add(FrameShareJob(attachment_id=att.id, memo_id=memo.id, user_id=u.id,
-                                 state=FrameShareState.queued, attempts=0))
+            db.add(
+                FrameShareJob(
+                    attachment_id=att.id,
+                    memo_id=memo.id,
+                    user_id=u.id,
+                    state=FrameShareState.queued,
+                    attempts=0,
+                )
+            )
             await db.commit()
 
         async with async_session() as db:

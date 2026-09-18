@@ -104,9 +104,7 @@ async def test_an_in_flight_run_makes_the_gate_false_before_the_index_has_to_dec
     "a second worker does not even try" the ordinary case rather than a race that usually loses."""
     set_digest_settings(enabled=True, send_time="00:00")
     async with async_session() as db:
-        await digest_runner.open_run(
-            db, trigger="scheduled", local_date=await _today_local()
-        )
+        await digest_runner.open_run(db, trigger="scheduled", local_date=await _today_local())
     assert await worker.digest_is_due() is False
 
 
@@ -115,9 +113,7 @@ async def test_a_test_run_does_not_count_as_todays_attempt(env):
     send."""
     set_digest_settings(enabled=True, send_time="00:00")
     async with async_session() as db:
-        run_id = await digest_runner.open_run(
-            db, trigger="test", local_date=await _today_local()
-        )
+        run_id = await digest_runner.open_run(db, trigger="test", local_date=await _today_local())
         await digest_runner.finish_run(db, run_id, status=digest_runner.SENT)
     assert await worker.digest_is_due() is True
 
@@ -210,9 +206,7 @@ async def test_the_loop_keeps_draining_and_beating_while_a_digest_is_in_flight(e
     async def scheduled_with_fake_smtp():
         return await real_scheduled_run(transport=transport)
 
-    monkeypatch.setattr(
-        digest_runner, "run_scheduled_digest_safe", scheduled_with_fake_smtp
-    )
+    monkeypatch.setattr(digest_runner, "run_scheduled_digest_safe", scheduled_with_fake_smtp)
 
     loop_task = asyncio.create_task(worker.run())
     try:
@@ -364,9 +358,7 @@ async def test_the_worker_adopts_and_executes_a_manual_run_the_api_committed(env
     await _seed_one_memo(subject, data_root)
     set_digest_settings(enabled=True, start_date="2026-06-01")
     async with async_session() as db:
-        run_id = await digest_runner.open_run(
-            db, trigger="manual", local_date=await _today_local()
-        )
+        run_id = await digest_runner.open_run(db, trigger="manual", local_date=await _today_local())
 
     adopted = await worker.adopt_manual_digest()
     assert adopted == run_id
@@ -391,9 +383,7 @@ async def test_the_loop_gate_spawns_a_claimed_manual_run(env, monkeypatch):
     is which entry point the loop chooses and with which id — the run itself is exercised above.
     """
     async with async_session() as db:
-        run_id = await digest_runner.open_run(
-            db, trigger="manual", local_date=await _today_local()
-        )
+        run_id = await digest_runner.open_run(db, trigger="manual", local_date=await _today_local())
     seen: list[int] = []
     done = asyncio.Event()
 
@@ -415,9 +405,7 @@ async def test_a_manual_row_already_being_run_is_not_adopted_a_second_time(env):
     """A heartbeat is what "somebody is running this" means, so a row that has one is somebody
     else's — including one the stale sweep has not yet judged."""
     async with async_session() as db:
-        run_id = await digest_runner.open_run(
-            db, trigger="manual", local_date=await _today_local()
-        )
+        run_id = await digest_runner.open_run(db, trigger="manual", local_date=await _today_local())
         assert await digest_runner.claim_run(db, run_id) is True
     assert await worker.adopt_manual_digest() is None
 
@@ -426,7 +414,5 @@ async def test_a_scheduled_row_is_never_adopted_as_a_manual_one(env):
     """Positive control on the trigger predicate: a scheduled run belongs to the gate, and
     adopting it here would run today's digest twice through two different entry points."""
     async with async_session() as db:
-        await digest_runner.open_run(
-            db, trigger="scheduled", local_date=await _today_local()
-        )
+        await digest_runner.open_run(db, trigger="scheduled", local_date=await _today_local())
     assert await worker.adopt_manual_digest() is None

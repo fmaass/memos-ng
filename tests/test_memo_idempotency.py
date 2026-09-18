@@ -33,9 +33,13 @@ def _memo_uids_with_key(key: str) -> list[str]:
     "did a second memo get created" — the feed would also have to be paged to prove absence."""
     eng = create_engine(SYNC_URL)
     with eng.connect() as c:
-        rows = c.execute(
-            text("SELECT uid FROM memos WHERE idempotency_key = :k ORDER BY id"), {"k": key}
-        ).scalars().all()
+        rows = (
+            c.execute(
+                text("SELECT uid FROM memos WHERE idempotency_key = :k ORDER BY id"), {"k": key}
+            )
+            .scalars()
+            .all()
+        )
     eng.dispose()
     return list(rows)
 

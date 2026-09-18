@@ -198,9 +198,7 @@ def grant_credential(request: Request) -> str | None:
     return _scheme_credential(request, management_grant.GRANT_SCHEME)
 
 
-async def require_session_user(
-    request: Request, db: AsyncSession = Depends(get_session)
-) -> User:
+async def require_session_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
     """Authenticate the browser session, and ONLY that.
 
     A request carrying a bearer header is refused here before the cookie is read (Decision 6):

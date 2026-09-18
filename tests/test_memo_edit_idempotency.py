@@ -424,9 +424,7 @@ async def test_a_race_on_someone_elses_constraint_is_not_dressed_up_as_a_raced_e
             timeout=30,
         )
         assert entered == 2  # both really did reach the tag insert; nothing took a shortcut
-        codes = sorted(
-            r.status_code for r in (first, second) if not isinstance(r, BaseException)
-        )
+        codes = sorted(r.status_code for r in (first, second) if not isinstance(r, BaseException))
         # One edit lands. The loser's tag collision is NOT laundered into 503 edit_raced — the
         # single answer this test exists to forbid.
         outcomes = (codes, getattr(first, "text", first), getattr(second, "text", second))

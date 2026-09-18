@@ -290,9 +290,7 @@ async def claim_part(db: AsyncSession, run_id: int, part_index: int) -> bool:
     return claimed is not None
 
 
-async def record_progress(
-    db: AsyncSession, run_id: int, *, parts: int, recipients: int
-) -> bool:
+async def record_progress(db: AsyncSession, run_id: int, *, parts: int, recipients: int) -> bool:
     updated = await db.scalar(
         sa_text(
             "UPDATE digest_runs SET parts = :parts, recipients = :recipients, "
@@ -447,9 +445,7 @@ async def load_export_config(db: AsyncSession) -> ExportConfig:
 
 async def enabled_recipients(db: AsyncSession) -> list[str]:
     rows = await db.execute(
-        sa_text(
-            "SELECT email FROM digest_recipients WHERE enabled IS TRUE ORDER BY email ASC"
-        )
+        sa_text("SELECT email FROM digest_recipients WHERE enabled IS TRUE ORDER BY email ASC")
     )
     return [row[0] for row in rows]
 
@@ -461,9 +457,7 @@ async def last_ledger_local_date(db: AsyncSession) -> date | None:
     the unique index ever has to — the index guarantees it, this makes it the ordinary case.
     """
     return await db.scalar(
-        sa_text(
-            f"SELECT max(local_date) FROM digest_runs WHERE trigger IN {_LEDGER_TRIGGER_SQL}"
-        )
+        sa_text(f"SELECT max(local_date) FROM digest_runs WHERE trigger IN {_LEDGER_TRIGGER_SQL}")
     )
 
 
@@ -667,9 +661,7 @@ async def print_grade_sources(
         return {}
     async with session_factory() as db:
         rows = list(
-            (await db.execute(select(Attachment).where(Attachment.id.in_(ids))))
-            .scalars()
-            .unique()
+            (await db.execute(select(Attachment).where(Attachment.id.in_(ids)))).scalars().unique()
         )
         db.expunge_all()
     attachments = {row.id: row for row in rows}
@@ -808,9 +800,7 @@ def part_payload(
     part = rendered.parts[part_index - 1]
     total = len(rendered.parts)
     cards = part.cards()
-    subject = render.subject_for(
-        settings.mail_title, rendered.date_range, part_index, total
-    )
+    subject = render.subject_for(settings.mail_title, rendered.date_range, part_index, total)
     html = render.render_html(
         part.day_groups,
         subject=subject,
@@ -1341,9 +1331,7 @@ async def preview(
         export = await load_export_config(db)
     moment = now_utc or datetime.now(UTC)
     selection = await selection_mod.select_for_run(session_factory, settings, moment)
-    rendered = await build_digest(
-        session_factory, settings, selection, export=export, host=None
-    )
+    rendered = await build_digest(session_factory, settings, selection, export=export, host=None)
     return rendered, settings
 
 
@@ -1395,9 +1383,7 @@ async def test_send(
         return 0
 
     selection = await selection_mod.select_for_run(session_factory, settings, moment)
-    rendered = await build_digest(
-        session_factory, settings, selection, export=export, host=None
-    )
+    rendered = await build_digest(session_factory, settings, selection, export=export, host=None)
     if not rendered.parts:
         html, plain = render.render_empty(settings.mail_title)
         message = build_message(
@@ -1413,9 +1399,7 @@ async def test_send(
 
     memo_count = 0
     for part_index in range(1, len(rendered.parts) + 1):
-        subject, html, plain, images, memo_ids, _ = part_payload(
-            rendered, part_index, settings
-        )
+        subject, html, plain, images, memo_ids, _ = part_payload(rendered, part_index, settings)
         message = build_message(
             subject=subject,
             from_email=sender,

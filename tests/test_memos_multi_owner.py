@@ -87,9 +87,7 @@ async def test_a_single_owner_still_answers_the_way_a_bare_string_did(adb):
     as_string, _, total_string = await svc.list_memos(
         adb, reader, owner="mowner_a", with_total=True
     )
-    as_list, _, total_list = await svc.list_memos(
-        adb, reader, owner=["mowner_a"], with_total=True
-    )
+    as_list, _, total_list = await svc.list_memos(adb, reader, owner=["mowner_a"], with_total=True)
     assert [m.uid for m in as_string] == [m.uid for m in as_list] == [made["mowner_a"].uid]
     assert total_string == total_list == 1
 

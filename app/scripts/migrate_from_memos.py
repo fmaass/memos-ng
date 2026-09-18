@@ -254,7 +254,7 @@ def read_old(source_dsn: str) -> dict[str, Any]:  # pragma: no cover - exercised
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, username, role, email, nickname, avatar_url FROM \"user\" "
+                'SELECT id, username, role, email, nickname, avatar_url FROM "user" '
                 "WHERE row_status = 'NORMAL'"
             )
             user_cols = ("id", "username", "role", "email", "nickname", "avatar_url")
@@ -286,8 +286,16 @@ def read_old(source_dsn: str) -> dict[str, Any]:  # pragma: no cover - exercised
                 "visibility, pinned, payload FROM memo"
             )
             cols = (
-                "id", "uid", "creator_id", "created_ts", "updated_ts", "row_status",
-                "content", "visibility", "pinned", "payload",
+                "id",
+                "uid",
+                "creator_id",
+                "created_ts",
+                "updated_ts",
+                "row_status",
+                "content",
+                "visibility",
+                "pinned",
+                "payload",
             )
             out["memos"] = [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
             cur.execute(

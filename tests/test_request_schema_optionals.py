@@ -91,9 +91,9 @@ def test_memo_create_takes_absent_and_explicit_visibility_and_rejects_null(logge
 
 def test_memo_patch_takes_absent_and_explicit_visibility_and_rejects_null(logged_in_client):
     client, _ = logged_in_client
-    uid = client.post(
-        "/api/memos", json={"content": "patch me", "visibility": "PRIVATE"}
-    ).json()["uid"]
+    uid = client.post("/api/memos", json={"content": "patch me", "visibility": "PRIVATE"}).json()[
+        "uid"
+    ]
 
     absent = client.patch(f"/api/memos/{uid}", json={"content": "content only"})
     assert absent.status_code == 200

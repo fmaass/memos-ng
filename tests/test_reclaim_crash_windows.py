@@ -349,9 +349,7 @@ def test_deleting_an_unlinked_attachment_by_name_still_works(
         _cleanup()
 
 
-async def test_the_async_skip_path_reports_instead_of_exploding(
-    db_engine, monkeypatch, tmp_path
-):
+async def test_the_async_skip_path_reports_instead_of_exploding(db_engine, monkeypatch, tmp_path):
     """The memo-delete reclaim meeting a row a concurrent upload has re-claimed: it must stand down
     and SAY so. Reading anything off the row after the rollback that releases it would refresh an
     expired column from an async session that cannot await here — MissingGreenlet, i.e. a 500,
@@ -515,9 +513,11 @@ def _names_bound_to_attachment(scope: ast.AST) -> set[str]:
     bound: set[str] = set()
     if isinstance(scope, FUNCTION_NODES):
         for arg in [*scope.args.args, *scope.args.kwonlyargs]:
-            names = {n.id for n in ast.walk(arg.annotation) if isinstance(n, ast.Name)} if (
-                arg.annotation is not None
-            ) else set()
+            names = (
+                {n.id for n in ast.walk(arg.annotation) if isinstance(n, ast.Name)}
+                if (arg.annotation is not None)
+                else set()
+            )
             if "Attachment" in names:
                 bound.add(arg.arg)
     for node in ast.walk(scope):

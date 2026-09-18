@@ -484,9 +484,7 @@ def _reactions(memo: Memo, user_id: int) -> list[ReactionSummary]:
         counts[r.emoji] = counts.get(r.emoji, 0) + 1
         if r.user_id == user_id:
             mine.add(r.emoji)
-    return [
-        ReactionSummary(emoji=e, count=c, reacted=e in mine) for e, c in sorted(counts.items())
-    ]
+    return [ReactionSummary(emoji=e, count=c, reacted=e in mine) for e, c in sorted(counts.items())]
 
 
 def _out(memo: Memo, user_id: int) -> MemoOut:
@@ -882,6 +880,7 @@ async def create_memo(
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
         # before this feature existed.
         return _out(await attempt(), owner_id)
+
     async def rollback_for_retry() -> None:
         await db.rollback()
         # `user` itself outlives the rollback and the next attempt still hands it to create_memo

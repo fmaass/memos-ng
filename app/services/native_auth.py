@@ -107,9 +107,7 @@ async def mint_code(
     cleaned by exactly the traffic that grows it.
     """
     now = datetime.now(UTC)
-    await db.execute(
-        delete(NativeAuthCode).where(NativeAuthCode.expires_at < now - _SWEEP_GRACE)
-    )
+    await db.execute(delete(NativeAuthCode).where(NativeAuthCode.expires_at < now - _SWEEP_GRACE))
     code = secrets.token_urlsafe(32)
     db.add(
         NativeAuthCode(

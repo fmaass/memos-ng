@@ -120,12 +120,8 @@ class SmtplibTransport:
     def __init__(self, settings: SmtpSettings) -> None:
         self._settings = settings
 
-    async def send(
-        self, message: MIMEMultipart, sender: str, recipients: list[str]
-    ) -> Refusals:
-        return await to_thread.run_sync(
-            _send_sync, self._settings, message, sender, recipients
-        )
+    async def send(self, message: MIMEMultipart, sender: str, recipients: list[str]) -> Refusals:
+        return await to_thread.run_sync(_send_sync, self._settings, message, sender, recipients)
 
 
 def accepted_count(recipients: list[str], refusals: Refusals) -> int:

@@ -134,9 +134,7 @@ async def test_minting_a_grant_sweeps_every_expired_grant_not_just_the_minter_s(
     # A DIFFERENT user's mint is what runs the sweep — the whole point of "global".
     await management_grant.mint_grant(adb, fresh_owner)
 
-    survivors = set(
-        (await adb.execute(select(ManagementGrant.hashed_grant))).scalars().all()
-    )
+    survivors = set((await adb.execute(select(ManagementGrant.hashed_grant))).scalars().all())
     assert management_grant.hash_grant(stale) not in survivors
     assert management_grant.hash_grant(live) in survivors  # the sweep took only the dead one
 
@@ -189,9 +187,7 @@ def test_the_purpose_column_defaults_to_login_for_rows_that_predate_it(db_engine
         _sql("DELETE FROM users WHERE subject = 'code_purpose_default'")
 
 
-@pytest.mark.parametrize(
-    "purpose", [native_auth.PURPOSE_LOGIN, native_auth.PURPOSE_MANAGE]
-)
+@pytest.mark.parametrize("purpose", [native_auth.PURPOSE_LOGIN, native_auth.PURPOSE_MANAGE])
 async def test_consume_code_only_matches_its_own_purpose(adb, purpose):
     """The purpose rides in the atomic consume's WHERE, so a wrong-purpose attempt matches nothing
     — refusal and consumption cannot diverge, and the code survives to be used properly."""
@@ -277,9 +273,7 @@ def _manage_grant(client, code: str, verifier: str = RFC_VERIFIER):
 
 
 def _exchange(client, code: str, verifier: str = RFC_VERIFIER):
-    return client.post(
-        "/api/auth/native/exchange", json={"code": code, "code_verifier": verifier}
-    )
+    return client.post("/api/auth/native/exchange", json={"code": code, "code_verifier": verifier})
 
 
 def _grant(client) -> str:
@@ -743,8 +737,13 @@ def test_expired_grant_is_401(grant_oidc, controlled_clock):
     assert http.post("/api/pats", json={"name": "after"}, headers=headers).status_code == 401
     assert http.delete(f"/api/pats/{existing['id']}", headers=headers).status_code == 401
 
-    names = [r[0] for r in _sql("SELECT name FROM pats WHERE user_id = (SELECT id FROM users "
-                                "WHERE subject = :s)", s=subject)]
+    names = [
+        r[0]
+        for r in _sql(
+            "SELECT name FROM pats WHERE user_id = (SELECT id FROM users WHERE subject = :s)",
+            s=subject,
+        )
+    ]
     assert names == ["survives-the-expiry"]
 
 
@@ -770,9 +769,7 @@ def test_grant_is_scoped_to_its_own_user(grant_oidc, monkeypatch):
     client, _ = grant_oidc
     other = "test_grant_other_user"
     try:
-        others_token = _exchange(
-            client, _handoff_code(client, device="OtherPhone")
-        ).json()["token"]
+        others_token = _exchange(client, _handoff_code(client, device="OtherPhone")).json()["token"]
         others_pat_id = _sql(
             "SELECT id FROM pats WHERE hashed_token = :h", h=auth.hash_token(others_token)
         )[0][0]
@@ -785,9 +782,12 @@ def test_grant_is_scoped_to_its_own_user(grant_oidc, monkeypatch):
         assert listed.json() == []  # the other account's phone is not this account's business
 
         assert http.delete(f"/api/pats/{others_pat_id}", headers=headers).status_code == 404
-        assert _sql(
-            "SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(others_token)
-        )[0][0] == 1
+        assert (
+            _sql(
+                "SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(others_token)
+            )[0][0]
+            == 1
+        )
         assert (
             _clean_client()
             .get("/api/memos", headers={"Authorization": f"Bearer {others_token}"})

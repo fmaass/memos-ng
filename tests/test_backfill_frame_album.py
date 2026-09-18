@@ -81,7 +81,7 @@ async def test_execute_uploads_with_jpg_name_and_memo_date(tmp_path):
     up, rr = _Upload(), _Render()
     stats = await bf._upload_targets(targets, execute=True, render=rr, upload=up)
     assert stats.uploaded == 1 and stats.failed == 0
-    (name, jpeg), = up.calls
+    ((name, jpeg),) = up.calls
     assert name == "café.jpg"  # the screen render is a .jpg named from the original stem
     assert rr.calls == [(str(tmp_path / "café.png"), MEMO_DATE)]  # photo_date = memo.created_at
     assert jpeg == b"JPEG:" + str(tmp_path / "café.png").encode()
@@ -127,8 +127,14 @@ async def test_load_curated_targets_selects_only_curated_screen_images(adb):
 
     def _att(uid: str, mime: str, path: str) -> Attachment:
         return Attachment(
-            uid=uid, owner_id=user.id, memo_id=memo.id, filename=f"{uid}",
-            mime=mime, size=1, status=AttachmentStatus.ready, storage_path=path,
+            uid=uid,
+            owner_id=user.id,
+            memo_id=memo.id,
+            filename=f"{uid}",
+            mime=mime,
+            size=1,
+            status=AttachmentStatus.ready,
+            storage_path=path,
         )
 
     jpeg = _att("a-jpg", "image/jpeg", "/data/a.jpg")  # selected
@@ -144,8 +150,12 @@ async def test_load_curated_targets_selects_only_curated_screen_images(adb):
     jpeg.print_mime = "image/tiff"
     adb.add(
         AttachmentRendition(
-            attachment_id=jpeg.id, variant_key="print", filename="a-print.tif",
-            mime="image/tiff", size=1, storage_path="/data/print/a.tif",
+            attachment_id=jpeg.id,
+            variant_key="print",
+            filename="a-print.tif",
+            mime="image/tiff",
+            size=1,
+            storage_path="/data/print/a.tif",
         )
     )
 
@@ -155,8 +165,14 @@ async def test_load_curated_targets_selects_only_curated_screen_images(adb):
     await adb.flush()
     adb.add(
         Attachment(
-            uid="a-other", owner_id=user.id, memo_id=other.id, filename="other.jpg",
-            mime="image/jpeg", size=1, status=AttachmentStatus.ready, storage_path="/data/o.jpg",
+            uid="a-other",
+            owner_id=user.id,
+            memo_id=other.id,
+            filename="other.jpg",
+            mime="image/jpeg",
+            size=1,
+            status=AttachmentStatus.ready,
+            storage_path="/data/o.jpg",
         )
     )
     await adb.flush()

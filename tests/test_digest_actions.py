@@ -123,9 +123,7 @@ async def test_preview_names_the_deferred_memos_and_why(env, admin_client):
     subject, data_root = env
     async with async_session() as db:
         user = await seed_user(db, subject=subject)
-        memo = await seed_memo(
-            db, user, visibility=Visibility.PUBLIC, created_at=datetime.now(UTC)
-        )
+        memo = await seed_memo(db, user, visibility=Visibility.PUBLIC, created_at=datetime.now(UTC))
         await seed_attachment(db, user, memo, mime="image/jpeg")  # no thumb on disk
         await db.commit()
         deferred_uid = memo.uid
@@ -145,9 +143,7 @@ async def test_preview_of_an_empty_selection_still_renders_a_body(env, admin_cli
 
 async def test_preview_strips_a_memos_ng_link(env, admin_client):
     subject, data_root = env
-    await _seed_memo_with_photo(
-        subject, data_root, content=f"see [it](https://{MEMOS_HOST}/m/abc)"
-    )
+    await _seed_memo_with_photo(subject, data_root, content=f"see [it](https://{MEMOS_HOST}/m/abc)")
     client, _ = admin_client
     assert MEMOS_HOST not in client.get(f"{PREFIX}/preview").json()["html"]
 
@@ -168,9 +164,7 @@ async def test_a_test_send_goes_to_the_calling_admin_only(env, admin_client, cap
     assert "a@example.com" not in capture_sends.sent[0].message.as_string()
 
 
-async def test_a_test_send_writes_no_run_row_and_no_hosted_media(
-    env, admin_client, capture_sends
-):
+async def test_a_test_send_writes_no_run_row_and_no_hosted_media(env, admin_client, capture_sends):
     """A6: a probe must never create a Dropbox file the registry does not know about, or one the
     retention sweep would later have to guess at."""
     subject, data_root = env
@@ -257,9 +251,9 @@ async def test_run_now_claims_the_run_and_sends_nothing_itself(env, admin_client
     assert response.headers["location"] == f"{PREFIX}/runs/{body['id']}"
 
     # The row is in flight and UNADOPTED — no heartbeat, because nothing has started it yet.
-    assert [
-        (row["trigger"], row["status"], row["heartbeat_at"]) for row in run_rows()
-    ] == [(DigestTrigger.manual, None, None)]
+    assert [(row["trigger"], row["status"], row["heartbeat_at"]) for row in run_rows()] == [
+        (DigestTrigger.manual, None, None)
+    ]
     assert capture_sends.sent == []
     from tests.digest_support import delivery_rows
 
@@ -328,7 +322,7 @@ async def test_a_guard_that_bites_writes_a_failed_row_rather_than_refusing_the_c
 async def test_the_test_send_handler_refreshes_the_metrics_snapshot(
     env, admin_client, capture_sends
 ):
-    """"The metrics change after a send" has to be probeable without a 60-second wait, which is
+    """ "The metrics change after a send" has to be probeable without a 60-second wait, which is
     what `refresh_now()` at the end of the test-send handler is for.
 
     Run-now no longer refreshes anything, and that is correct rather than an omission: at the

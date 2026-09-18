@@ -270,13 +270,17 @@ def _job(att_id: int, state: str, kind: str = JobKind.printready) -> None:
 def _jobs_for(att_id: int, kind: str = JobKind.printready) -> list[str]:
     eng = _engine()
     with eng.begin() as c:
-        rows = c.execute(
-            text(
-                "SELECT state::text FROM media_jobs WHERE attachment_id=:a AND kind=:k"
-                " ORDER BY id"
-            ),
-            {"a": att_id, "k": str(kind)},
-        ).scalars().all()
+        rows = (
+            c.execute(
+                text(
+                    "SELECT state::text FROM media_jobs WHERE attachment_id=:a AND kind=:k"
+                    " ORDER BY id"
+                ),
+                {"a": att_id, "k": str(kind)},
+            )
+            .scalars()
+            .all()
+        )
     eng.dispose()
     return list(rows)
 
@@ -309,13 +313,18 @@ def _job_profile_keys(att_id: int) -> list[str | None]:
     """Each printready job's `profile_key`, in id order — the snapshot the worker will encode at."""
     eng = _engine()
     with eng.begin() as c:
-        rows = c.execute(
-            text(
-                "SELECT profile_key FROM media_jobs WHERE attachment_id=:a AND kind='printready'"
-                " ORDER BY id"
-            ),
-            {"a": att_id},
-        ).scalars().all()
+        rows = (
+            c.execute(
+                text(
+                    "SELECT profile_key FROM media_jobs"
+                    " WHERE attachment_id=:a AND kind='printready'"
+                    " ORDER BY id"
+                ),
+                {"a": att_id},
+            )
+            .scalars()
+            .all()
+        )
     eng.dispose()
     return list(rows)
 
@@ -528,11 +537,17 @@ def test_selection_excludes_non_photo_attachments(logged_in_client, tmp_path, mo
     memo = _memo(client, "mixed media #curated")
     photo = _attach(memo["uid"], "pb-mime-jpg", subject, storage_path=_source(tmp_path, "a.jpg"))
     svg = _attach(
-        memo["uid"], "pb-mime-svg", subject, storage_path=_source(tmp_path, "b.svg"),
+        memo["uid"],
+        "pb-mime-svg",
+        subject,
+        storage_path=_source(tmp_path, "b.svg"),
         mime="image/svg+xml",
     )
     video = _attach(
-        memo["uid"], "pb-mime-mp4", subject, storage_path=_source(tmp_path, "c.mp4"),
+        memo["uid"],
+        "pb-mime-mp4",
+        subject,
+        storage_path=_source(tmp_path, "c.mp4"),
         mime="video/mp4",
     )
     try:
@@ -634,8 +649,12 @@ def test_manifest_reports_a_ready_photo_from_its_real_rendition(
     client, subject = logged_in_client
     memo = _memo(client, "ready photo #curated")
     aid = _attach(
-        memo["uid"], "pb-ready-1", subject,
-        storage_path=_source(tmp_path, "big.jpg"), width=8000, height=4000,
+        memo["uid"],
+        "pb-ready-1",
+        subject,
+        storage_path=_source(tmp_path, "big.jpg"),
+        width=8000,
+        height=4000,
     )
     _rendition(tmp_path, "pb-ready-1", (400, 200))
     try:
@@ -664,8 +683,12 @@ def test_manifest_projects_dpi_for_a_photo_that_is_not_generated_yet(
     client, subject = logged_in_client
     memo = _memo(client, "not generated yet #curated")
     aid = _attach(
-        memo["uid"], "pb-proj-1", subject,
-        storage_path=_source(tmp_path, "huge.jpg"), width=9504, height=6336,
+        memo["uid"],
+        "pb-proj-1",
+        subject,
+        storage_path=_source(tmp_path, "huge.jpg"),
+        width=9504,
+        height=6336,
     )
     try:
         body = _manifest(client)
@@ -699,8 +722,12 @@ def test_a_pending_projection_uses_the_print_master_that_will_actually_render(
     client, subject = logged_in_client
     memo = _memo(client, "edited crop #curated")
     aid = _attach(
-        memo["uid"], "pb-master-1", subject,
-        storage_path=_source(tmp_path, "huge-original.jpg"), width=9504, height=6336,
+        memo["uid"],
+        "pb-master-1",
+        subject,
+        storage_path=_source(tmp_path, "huge-original.jpg"),
+        width=9504,
+        height=6336,
     )
     _print_master(aid, _real_jpeg(tmp_path / "masters" / "crop.jpg", (800, 600)))
     try:
@@ -726,8 +753,12 @@ def test_a_projection_reports_unknown_rather_than_the_wrong_photos_dimensions(
     client, subject = logged_in_client
     memo = _memo(client, "unreadable crop #curated")
     aid = _attach(
-        memo["uid"], "pb-master-2", subject,
-        storage_path=_source(tmp_path, "orig2.jpg"), width=9504, height=6336,
+        memo["uid"],
+        "pb-master-2",
+        subject,
+        storage_path=_source(tmp_path, "orig2.jpg"),
+        width=9504,
+        height=6336,
     )
     master = tmp_path / "masters" / "not-an-image.jpg"
     master.parent.mkdir(parents=True, exist_ok=True)
@@ -761,7 +792,11 @@ def test_manifest_reports_an_unavailable_photo_when_the_source_is_gone(
 
     assert body["photos"][0]["status"] == "unavailable"
     assert body["totals"] == {
-        "selected": 1, "ready": 0, "pending": 0, "failed": 0, "unavailable": 1
+        "selected": 1,
+        "ready": 0,
+        "pending": 0,
+        "failed": 0,
+        "unavailable": 1,
     }
     assert _jobs_for(aid) == []  # nothing to derive from — never queue a job that can only fail
 
@@ -813,7 +848,11 @@ def test_totals_count_every_member_once(logged_in_client, tmp_path, monkeypatch)
         _cleanup(ready, pending, failed, gone)
 
     assert body["totals"] == {
-        "selected": 4, "ready": 1, "pending": 1, "failed": 1, "unavailable": 1
+        "selected": 4,
+        "ready": 1,
+        "pending": 1,
+        "failed": 1,
+        "unavailable": 1,
     }
     assert sum(body["totals"][k] for k in ("ready", "pending", "failed", "unavailable")) == 4
 
@@ -1049,7 +1088,10 @@ def test_zip_carries_ready_renditions_under_their_numbered_names(
     memo = _memo(client, "one ready photo #curated")
     _set_created(memo["uid"], datetime(2026, 1, 31, 9, 0, tzinfo=UTC))
     aid = _attach(
-        memo["uid"], "pb-zip-1", subject, storage_path=_source(tmp_path, "a.jpg"),
+        memo["uid"],
+        "pb-zip-1",
+        subject,
+        storage_path=_source(tmp_path, "a.jpg"),
         captured_at=datetime(2019, 7, 4, 12, 30, tzinfo=UTC),
     )
     payload = _rendition(tmp_path, "pb-zip-1").read_bytes()
@@ -1177,9 +1219,7 @@ def test_numbering_is_stable_while_the_book_is_still_building(
     assert [p["status"] for p in after["photos"]] == ["ready", "ready"]
 
 
-def test_zip_of_an_empty_selection_is_a_valid_archive(
-    logged_in_client, tmp_path, monkeypatch
-):
+def test_zip_of_an_empty_selection_is_a_valid_archive(logged_in_client, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     client, _ = logged_in_client
 
@@ -1317,7 +1357,11 @@ def test_an_untagged_export_of_an_empty_range_is_an_empty_book(
 
     assert body["photos"] == []
     assert body["totals"] == {
-        "selected": 0, "ready": 0, "pending": 0, "failed": 0, "unavailable": 0
+        "selected": 0,
+        "ready": 0,
+        "pending": 0,
+        "failed": 0,
+        "unavailable": 0,
     }
     assert body["tag"] is None
 
@@ -1444,13 +1488,19 @@ def test_a_profile_no_longer_configured_is_refused(logged_in_client, default_set
     whatever settings name), and anything else would let a caller queue arbitrary 60 MP encodes."""
     client, _ = logged_in_client
     _settings(print_long_edge=5000)
-    assert client.get(
-        "/api/exports/photobook", params={"profile": "print-4096-q95-dates-rgb"}
-    ).status_code == 422
+    assert (
+        client.get(
+            "/api/exports/photobook", params={"profile": "print-4096-q95-dates-rgb"}
+        ).status_code
+        == 422
+    )
     # A well-formed key for a profile that simply is not this deployment's is refused too.
-    assert client.get(
-        "/api/exports/photobook", params={"profile": "print-orig-q92-strip-gray"}
-    ).status_code == 422
+    assert (
+        client.get(
+            "/api/exports/photobook", params={"profile": "print-orig-q92-strip-gray"}
+        ).status_code
+        == 422
+    )
 
 
 def test_a_non_default_profile_derives_beside_the_default_and_never_over_it(
@@ -1526,9 +1576,7 @@ def test_one_profiles_failure_does_not_condemn_another(
         _settings(print_long_edge=5000)
         at_5000 = _manifest(client, profile="print-5000-q92-strip-gray")
         at_default = _manifest(client, profile="print-4096")
-        default_jobs = [
-            key for key in _job_profile_keys(aid) if key != "print-5000-q92-strip-gray"
-        ]
+        default_jobs = [key for key in _job_profile_keys(aid) if key != "print-5000-q92-strip-gray"]
     finally:
         _cleanup(aid)
 
@@ -1548,9 +1596,7 @@ def test_a_legacy_job_row_with_no_profile_key_is_the_default_profile(
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     client, subject = logged_in_client
     memo = _memo(client, "an old job row #curated")
-    aid = _attach(
-        memo["uid"], "pb-prof-4", subject, storage_path=_source(tmp_path, "legacy.jpg")
-    )
+    aid = _attach(memo["uid"], "pb-prof-4", subject, storage_path=_source(tmp_path, "legacy.jpg"))
     try:
         _job(aid, "queued")  # _job writes no profile_key, exactly like a pre-MEMNG-238 row
         _set_job_profile(aid, None)

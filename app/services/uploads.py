@@ -572,9 +572,7 @@ async def append_stream(
         await to_thread.run_sync(_unlink_sync, spool)
 
 
-async def append_chunk(
-    db: AsyncSession, upload: Upload, offset: int, data: bytes
-) -> Upload | None:
+async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: bytes) -> Upload | None:
     """Append an already-materialized `data` chunk — the in-process path (migration, tests).
     Network callers use append_stream so the bytes are never held whole in RAM."""
 

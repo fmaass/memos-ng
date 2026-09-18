@@ -87,8 +87,9 @@ def _seed_other_owner_attachment(uid: str, mime: str = "image/png"):
     with eng.begin() as c:
         c.execute(text("DELETE FROM users WHERE subject='print_other_owner'"))
         oid = c.execute(
-            text("INSERT INTO users (subject, role) VALUES ('print_other_owner','user') "
-                 "RETURNING id")
+            text(
+                "INSERT INTO users (subject, role) VALUES ('print_other_owner','user') RETURNING id"
+            )
         ).scalar_one()
         c.execute(
             text(
@@ -385,9 +386,9 @@ def test_remove_drops_the_row_and_the_file(logged_in_client, monkeypatch, tmp_pa
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         _, att = _memo_with_photo(client)
-        assert _attach(
-            client, att["uid"], _upload(client, "m.png", _png(12, 12))
-        ).status_code == 201
+        assert (
+            _attach(client, att["uid"], _upload(client, "m.png", _png(12, 12))).status_code == 201
+        )
         path = Path(_rendition_rows(att["uid"])[0][3])
 
         r = client.delete(f"/api/attachments/{att['uid']}/rendition/print")

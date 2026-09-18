@@ -297,7 +297,14 @@ def test_partition_keeps_only_the_raster_allowlist():
     eligible, unsupported = bf.partition(candidates)
 
     assert [att.uid for att in eligible] == [
-        "jpeg", "png", "gif", "webp", "heic", "heif", "tiff", "bmp",
+        "jpeg",
+        "png",
+        "gif",
+        "webp",
+        "heic",
+        "heif",
+        "tiff",
+        "bmp",
     ]
     assert [att.uid for att in unsupported] == ["svg", "avif", "octet", "weird"]
 

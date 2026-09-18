@@ -82,8 +82,7 @@ def _seed(storage_path: str | None = None) -> int:
         ).scalar_one()
         pat_id = c.execute(
             text(
-                "INSERT INTO pats (hashed_token, name, user_id) "
-                "VALUES (:h,'sat',:u) RETURNING id"
+                "INSERT INTO pats (hashed_token, name, user_id) VALUES (:h,'sat',:u) RETURNING id"
             ),
             {"h": hashlib.sha256(TOKEN.encode()).hexdigest(), "u": uid},
         ).scalar_one()

@@ -120,9 +120,7 @@ async def _upload_targets(
             filename = Path(att.filename).stem + ".jpg"
             await upload(filename, jpeg)
             stats.uploaded += 1
-            logger.info(
-                "backfill.uploaded", memo_id=memo.id, attachment_id=att.id, bytes=len(jpeg)
-            )
+            logger.info("backfill.uploaded", memo_id=memo.id, attachment_id=att.id, bytes=len(jpeg))
         except Exception as exc:  # per-item isolation: one bad photo never aborts the whole run
             stats.failed += 1
             logger.warning(

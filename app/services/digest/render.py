@@ -48,9 +48,36 @@ GRID_IMAGE_WIDTH = 262  # a card with two or more, in the two-column grid
 
 # The satellite's allow-lists, unchanged (`app/render.py:22-39`).
 ALLOWED_TAGS = [
-    "a", "abbr", "b", "blockquote", "br", "code", "em", "h1", "h2", "h3",
-    "h4", "h5", "h6", "hr", "i", "img", "li", "ol", "p", "pre", "strong",
-    "sub", "sup", "table", "tbody", "td", "th", "thead", "tr", "ul",
+    "a",
+    "abbr",
+    "b",
+    "blockquote",
+    "br",
+    "code",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "i",
+    "img",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "strong",
+    "sub",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul",
 ]
 ALLOWED_ATTRS: dict[str, list[str]] = {
     "a": ["href", "title"],
@@ -324,9 +351,7 @@ def _encode_files_sync(paths: list[Path], profile: MailProfile) -> dict[Path, me
     return encoded
 
 
-async def read_card_images(
-    paths: list[Path], profile: MailProfile
-) -> dict[Path, media.MailImage]:
+async def read_card_images(paths: list[Path], profile: MailProfile) -> dict[Path, media.MailImage]:
     """Every inline image of the run, encoded to the MAIL profile it was handed.
 
     The profile is a parameter and never a lookup: it is the run's snapshot, read once before any
@@ -387,9 +412,7 @@ def build_cards(
         for video in candidate.videos[:max_videos_per_memo]:
             url = links.by_attachment.get(video.attachment_id)
             if url is None:
-                status = (
-                    PROCESSING if video.attachment_id in links.processing else NOT_HOSTED
-                )
+                status = PROCESSING if video.attachment_id in links.processing else NOT_HOSTED
                 card.videos.append(CardVideo(filename=video.filename, status=status))
                 continue
             poster_cid = None

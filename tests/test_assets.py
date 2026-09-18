@@ -210,9 +210,7 @@ def _seed_job(aid, lane, state, pct, live_pct=None):
         ).scalar_one()
         if live_pct is not None:
             c.execute(
-                text(
-                    "INSERT INTO media_job_progress (job_id, progress_pct) VALUES (:j, :p)"
-                ),
+                text("INSERT INTO media_job_progress (job_id, progress_pct) VALUES (:j, :p)"),
                 {"j": jid, "p": live_pct},
             )
     eng.dispose()
@@ -838,6 +836,7 @@ def test_a_cursor_replayed_under_the_other_order_just_continues_from_that_id(log
     finally:
         _cleanup(*aids)
 
+
 # --- HMAC-signed asset URLs: the DB-free serve fast path ---
 import time as _time  # noqa: E402
 
@@ -905,13 +904,16 @@ def test_pat_can_download_original(logged_in_client, monkeypatch, tmp_path):
         Image.new("RGB", (40, 40), (9, 9, 9)).save(orig, "JPEG")
         eng = create_engine(SYNC_URL)
         with eng.begin() as c:
-            c.execute(text("UPDATE attachments SET storage_path=:p WHERE uid='att-pat-orig'"),
-                      {"p": str(orig)})
+            c.execute(
+                text("UPDATE attachments SET storage_path=:p WHERE uid='att-pat-orig'"),
+                {"p": str(orig)},
+            )
         eng.dispose()
 
         anon = TestClient(app, raise_server_exceptions=False)  # no session cookie, PAT only
-        r = anon.get("/api/attachments/att-pat-orig/original",
-                     headers={"Authorization": f"Bearer {pat}"})
+        r = anon.get(
+            "/api/attachments/att-pat-orig/original", headers={"Authorization": f"Bearer {pat}"}
+        )
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("image/")
         assert anon.get("/api/attachments/att-pat-orig/original").status_code == 401  # no auth
