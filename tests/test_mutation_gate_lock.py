@@ -165,18 +165,26 @@ def _release(fifo: Path, timeout: float = 30, required: bool = True) -> bool:
 class Reaper:
     """Everything a test starts, torn down by a finalizer that runs whatever the body did.
 
-    Order matters and so does exception-safety. The processes a test started are killed by pid
-    first, each bounded and each independent of the others, then the stub grandchildren that
-    recorded their own pids (each checked against its /proc cmdline first, so a recycled pid
-    cannot be a stranger's process); only then is every gated FIFO written, so a stub blocked on
-    a read that nobody was ever going to answer is woken rather than left behind. A failing
-    assertion must fail its test, not park a reader for the rest of the session.
+    The order below is the order the code runs, and each step is independent of the last.
+
+      1. the processes the test started are killed by pid, each bounded, each in its own `try`;
+      2. every gated FIFO is written, so a stub already blocked on a read that nobody was ever
+         going to answer is woken and can leave on its own;
+      3. every grandchild that recorded its pid is SIGKILLed — but only after its /proc cmdline
+         is read and found to name this sandbox (see `_cmdline_names`), because a recorded pid
+         may since have been recycled and must never be a stranger's process;
+      4. ONE bounded wait for exactly those killed pids.
+
+    Step 3 is what makes this a teardown rather than a hope: a stub that published its readiness
+    and was descheduled before opening its FIFO is not woken by step 2 at all — it opens the FIFO
+    afterwards and blocks for the rest of the session. Only a signal ends it. Steps 2 and 3 are
+    both kept because they answer different cases, and step 2 first costs nothing.
     """
 
     def __init__(self) -> None:
         self.procs: list[subprocess.Popen[str]] = []
         self.fifos: list[Path] = []
-        self.pid_files: list[Path] = []
+        self.pid_files: list[tuple[Path, Path]] = []
 
     def watch(self, proc: subprocess.Popen[str]) -> subprocess.Popen[str]:
         self.procs.append(proc)
@@ -186,30 +194,64 @@ class Reaper:
         self.fifos.append(fifo)
         return fifo
 
-    def children(self, pid_file: Path) -> Path:
-        """A file the stubs append their own pids to: grandchildren this process cannot wait on."""
-        self.pid_files.append(pid_file)
+    def children(self, pid_file: Path, root: Path) -> Path:
+        """A file the stubs append their own pids to: grandchildren this process cannot wait on.
+
+        `root` is the sandbox those pids belong to. It is passed in, never guessed from the cwd,
+        and it is what every recorded pid is checked against before it is signalled.
+        """
+        self.pid_files.append((pid_file, root))
         return pid_file
 
-    def close(self) -> None:
-        for proc in self.procs:
+    def close(self, wait_timeout: float = 30) -> None:
+        """Steps 1-4 of the class docstring, in that order. `wait_timeout` bounds step 4 only."""
+        for proc in self.procs:  # 1
             try:
                 if proc.poll() is None:
                     proc.kill()
                 proc.wait(timeout=60)
             except Exception:  # noqa: BLE001 — one stuck process must not skip the rest
                 pass
-        for fifo in self.fifos:
+        for fifo in self.fifos:  # 2
             try:
                 _release(fifo, timeout=1, required=False)
             except Exception:  # noqa: BLE001 — cleanup, not an assertion
                 pass
-        for pid_file in self.pid_files:
-            try:
-                pids = [int(line) for line in pid_file.read_text().split()]
-            except Exception:  # noqa: BLE001
-                continue
-            _wait_until(lambda pids=pids: not any(_alive(pid) for pid in pids), 30)
+        killed: list[int] = []
+        for pid_file, root in self.pid_files:  # 3
+            for pid in _recorded_pids(pid_file):
+                if not _cmdline_names(pid, root):
+                    continue  # gone, or recycled into something that is not ours
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(pid)
+                except OSError:  # noqa: PERF203 — it exited between the check and the signal
+                    pass
+        _wait_until(lambda: not any(_alive(pid) for pid in killed), wait_timeout)  # 4
+
+
+def _recorded_pids(pid_file: Path) -> list[int]:
+    try:
+        return [int(line) for line in pid_file.read_text().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def _cmdline_names(pid: int, root: Path) -> bool:
+    """Does this pid's argv name a path in the throwaway tree belonging to `root`?
+
+    The tree is the sandbox repository at `root` plus its sibling stub directory `<root>-bin`,
+    where the `uv` and `docker` stubs live — so an argument counts when it starts with `<root>/`
+    or `<root>-`. Both live under pytest's `tmp_path` for this test alone, so nothing outside it
+    can match: not another test's sandbox, not a recycled pid belonging to a stranger, and not
+    pytest itself, whose own argv names none of these paths.
+    """
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return False  # it is already gone, which is the outcome we wanted anyway
+    prefix = str(root)
+    return any(arg.startswith((prefix + "/", prefix + "-")) for arg in argv)
 
 
 def _alive(pid: int) -> bool:
@@ -409,7 +451,7 @@ def test_a_build_waits_for_the_lock_and_says_so(sandbox: Sandbox, reaper: Reaper
     """
     ready, fifo = sandbox.gate_on_control()
     reaper.gate(fifo)
-    reaper.children(Path(sandbox.env["UV_PIDS"]))
+    reaper.children(Path(sandbox.env["UV_PIDS"]), sandbox.root)
     gate = reaper.watch(sandbox.popen("scripts/check-mutations.sh"))
     assert _wait_until(ready.exists, 60), "the gate never reached its control run"
     assert _lock_is_held(sandbox.lock)
@@ -472,7 +514,7 @@ def test_a_child_that_outlives_a_killed_run_does_not_keep_the_lock(
     """
     ready, fifo = sandbox.gate_on_control()
     reaper.gate(fifo)
-    reaper.children(Path(sandbox.env["UV_PIDS"]))
+    reaper.children(Path(sandbox.env["UV_PIDS"]), sandbox.root)
     sandbox.env["UV_IGNORE_TERM"] = "1"
     gate = reaper.watch(sandbox.popen("scripts/check-mutations.sh"))
     assert _wait_until(ready.exists, 60), "the gate never reached its control run"
@@ -545,7 +587,7 @@ def test_a_run_in_one_worktree_does_not_block_a_run_in_another(
     assert first.lock != second.lock
     ready, fifo = first.gate_on_control()
     reaper.gate(fifo)
-    reaper.children(Path(first.env["UV_PIDS"]))
+    reaper.children(Path(first.env["UV_PIDS"]), first.root)
     reaper.watch(first.popen("scripts/check-mutations.sh"))
     assert _wait_until(ready.exists, 60), "the first run never reached its control run"
     assert _lock_is_held(first.lock)
@@ -561,3 +603,81 @@ def test_the_release_procedure_builds_through_the_script(sandbox: Sandbox) -> No
     assert "scripts/build-image.sh <version>+<short-sha>" in releasing
     assert re.search(r"docker build[^\n]*-t memos-ng:local", releasing) is None
     assert BUILD_IMAGE.stat().st_mode & 0o111, "the documented script is not executable"
+
+
+# --------------------------------------------------------------------------------------------
+# the teardown itself, which the rest of this file depends on
+# --------------------------------------------------------------------------------------------
+
+
+def _blocker(root: Path) -> Path:
+    """A stand-in for a stub that published its pid and then blocked opening a FIFO for ever.
+
+    It is started detached — an intermediate shell backgrounds it and exits — so the process the
+    reaper has to deal with is an orphan and not a child of pytest. That matters: a child killed
+    but not waited on stays a zombie, and a zombie still answers signal 0, so `_alive` would say
+    "alive" for a pid the reaper had already dealt with and this test would prove nothing.
+    """
+    script = root / "blocker.sh"
+    script.write_text('#!/bin/sh\nprintf \'%s\\n\' "$$" >> "$1"\nread -r _ < "$2"\n')
+    script.chmod(0o755)
+    return script
+
+
+def _start_detached(script: Path, pid_file: Path, fifo: Path) -> None:
+    subprocess.run(
+        ["sh", "-c", '"$1" "$2" "$3" &', "sh", str(script), str(pid_file), str(fifo)],
+        check=True,
+        timeout=60,
+    )
+
+
+def _kill_recorded(pid_file: Path) -> None:
+    for pid in _recorded_pids(pid_file):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:  # noqa: PERF203 — already gone
+            pass
+
+
+def test_the_reaper_kills_a_recorded_grandchild_it_never_started(sandbox: Sandbox) -> None:
+    """The teardown's own test. Nothing here is registered with `watch()` and the FIFO is
+    registered with nobody, so the only thing that can end this process is the verified kill —
+    which is exactly the case that hung the suite before: a stub that recorded its readiness, was
+    descheduled, and opened its FIFO only after the release had already come and gone."""
+    pid_file = sandbox.root.parent / "blocker.pids"
+    pid_file.touch()
+    fifo = sandbox.root.parent / "blocker-fifo"
+    os.mkfifo(fifo)
+    reap = Reaper()
+    reap.children(pid_file, sandbox.root)
+    try:
+        _start_detached(_blocker(sandbox.root), pid_file, fifo)
+        assert _wait_until(lambda: _recorded_pids(pid_file) != [], 30), "it never recorded a pid"
+        pid = _recorded_pids(pid_file)[0]
+        assert _alive(pid), "the control: it is running before the teardown"
+
+        reap.close(wait_timeout=1)
+
+        assert not _alive(pid), "the reaper left a blocked grandchild behind"
+    finally:
+        _kill_recorded(pid_file)
+
+
+def test_the_reaper_leaves_a_recorded_pid_that_is_not_this_sandbox_alone(sandbox: Sandbox) -> None:
+    """The other half: the kill is verified, not blanket. A pid file is written by processes that
+    have already exited, and pids are recycled — signalling one whose argv does not name this
+    sandbox would eventually kill a stranger's process, which is far worse than a leaked stub."""
+    pid_file = sandbox.root.parent / "outsider.pids"
+    outsider = subprocess.Popen(["sleep", "60"])  # started outside the sandbox, reaped below
+    try:
+        pid_file.write_text(f"{outsider.pid}\n")
+        reap = Reaper()
+        reap.children(pid_file, sandbox.root)
+
+        reap.close(wait_timeout=1)
+
+        assert outsider.poll() is None, "the reaper killed a process that was not its own"
+    finally:
+        outsider.kill()
+        outsider.wait(timeout=60)
