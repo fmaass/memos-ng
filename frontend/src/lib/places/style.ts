@@ -30,6 +30,30 @@ export function versionedAssetUrl(url: string, assetsCommit: string | null | und
 }
 
 /**
+ * The absolute, same-origin form of one style asset address.
+ *
+ * MapLibre parses the sprite address with `new URL(url)` and NO base (`normalizeSpriteURL` in
+ * `load_sprite.ts`), so a root-relative address throws `Invalid sprite URL …, must be absolute`
+ * and the whole sheet — every icon on the basemap — silently never loads. It does not parse the
+ * glyph template at all, which is why labels kept rendering while the icons vanished; both are
+ * given the same absolute form here so neither can drift back to one MapLibre refuses.
+ *
+ * Concatenation rather than `new URL(path, origin)`: the glyph address carries `{fontstack}` and
+ * `{range}` placeholders, the WHATWG URL parser percent-encodes the braces, and MapLibre's own
+ * substitution is a plain string replace that would then match nothing.
+ *
+ * The origin comes from the page itself, which is what keeps "absolute" from meaning "somewhere
+ * else": there is no input here a caller could point at another host.
+ */
+export function sameOriginUrl(path: string, origin: string): string {
+  return `${origin}${path}`
+}
+
+function pageOrigin(): string {
+  return typeof window === 'undefined' ? '' : window.location.origin
+}
+
+/**
  * Where the world archive stops and the region archive takes over. The planet archive is cut at
  * z7 and the detail archive covers z0–15, so z8 is the seam: below it the world, above it the
  * places the pins are.
@@ -75,7 +99,11 @@ function background(flavor: Flavor): LayerSpecification {
  * one past z8. With no archive at all the style is the background colour alone — the pins, the
  * drawer and the grid are the feature, and a missing basemap may not take them down with it.
  */
-export function buildStyle(manifest: MapManifest, flavorName: MapFlavor): StyleSpecification {
+export function buildStyle(
+  manifest: MapManifest,
+  flavorName: MapFlavor,
+  origin: string = pageOrigin(),
+): StyleSpecification {
   const flavor = namedFlavor(flavorName)
   const sources: Record<string, SourceSpecification> = {}
   const styleLayers: LayerSpecification[] = [background(flavor)]
@@ -93,8 +121,11 @@ export function buildStyle(manifest: MapManifest, flavorName: MapFlavor): StyleS
 
   return {
     version: 8,
-    glyphs: versionedAssetUrl(GLYPHS_URL, manifest.assets_commit),
-    sprite: versionedAssetUrl(`/api/map/assets/sprites/v4/${flavorName}`, manifest.assets_commit),
+    glyphs: sameOriginUrl(versionedAssetUrl(GLYPHS_URL, manifest.assets_commit), origin),
+    sprite: sameOriginUrl(
+      versionedAssetUrl(`/api/map/assets/sprites/v4/${flavorName}`, manifest.assets_commit),
+      origin,
+    ),
     sources,
     layers: styleLayers,
   }

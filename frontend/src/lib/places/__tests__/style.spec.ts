@@ -19,6 +19,8 @@ const BOTH: MapManifest = {
 }
 const ASSETS_COMMIT = '028c18f713baecad011301ff7a69acc39bcc2ae7'
 const OTHER_COMMIT = 'f19c4a0b6d2e5a78c3b1049fd7e6a2158bc0d34e'
+/** A stand-in for the page's origin, so the assertions do not depend on the test host's URL. */
+const ORIGIN = 'https://example.invalid'
 
 /** Every string in the style that could make the browser issue a request. */
 function urlish(style: unknown): string[] {
@@ -35,20 +37,57 @@ describe('buildStyle', () => {
     // A single third-party host in the style tells that host every map the household opens —
     // the reason the basemap is self-hosted at all.
     for (const flavor of ['dark', 'light'] as const) {
-      const urls = urlish(buildStyle(BOTH, flavor))
+      const urls = urlish(buildStyle(BOTH, flavor, ORIGIN))
 
       expect(urls.length).toBeGreaterThan(0)
-      expect(urls.filter((u) => /^https?:\/\//i.test(u))).toEqual([])
       for (const url of urls) {
-        expect(url).toMatch(/^(pmtiles:\/\/)?\/api\/map\//)
+        expect(url).toMatch(
+          new RegExp(`^(pmtiles://)?(${ORIGIN.replace('.', '\\.')})?/api/map/`),
+        )
       }
     }
   })
 
   it('serves glyphs and sprites from the asset route, per flavor', () => {
-    expect(buildStyle(BOTH, 'dark').glyphs).toBe('/api/map/assets/fonts/{fontstack}/{range}.pbf')
-    expect(buildStyle(BOTH, 'dark').sprite).toBe('/api/map/assets/sprites/v4/dark')
-    expect(buildStyle(BOTH, 'light').sprite).toBe('/api/map/assets/sprites/v4/light')
+    expect(buildStyle(BOTH, 'dark', ORIGIN).glyphs).toBe(
+      `${ORIGIN}/api/map/assets/fonts/{fontstack}/{range}.pbf`,
+    )
+    expect(buildStyle(BOTH, 'dark', ORIGIN).sprite).toBe(`${ORIGIN}/api/map/assets/sprites/v4/dark`)
+    expect(buildStyle(BOTH, 'light', ORIGIN).sprite).toBe(
+      `${ORIGIN}/api/map/assets/sprites/v4/light`,
+    )
+  })
+
+  it('hands MapLibre an absolute, same-origin address for the sprite AND the glyphs', () => {
+    // MapLibre parses the sprite address with `new URL(url)` and no base
+    // (load_sprite.ts, `normalizeSpriteURL`): a root-relative address throws
+    // `Invalid sprite URL …, must be absolute` and the whole sheet — every icon on the
+    // basemap — silently never loads. It does not parse the glyph template, which is why
+    // labels kept rendering while the icons vanished; both are pinned here so neither can
+    // regress to a form MapLibre refuses.
+    for (const flavor of ['dark', 'light'] as const) {
+      const style = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, flavor, ORIGIN)
+
+      for (const url of [style.sprite, style.glyphs]) {
+        expect(typeof url).toBe('string')
+        expect(() => new URL(url as string)).not.toThrow()
+        expect(new URL(url as string).origin).toBe(ORIGIN)
+      }
+      // The glyph address is a TEMPLATE: MapLibre substitutes `{fontstack}` and `{range}` by
+      // plain string replacement, and a WHATWG-URL round trip percent-encodes the braces, after
+      // which the substitution silently no longer matches and every label disappears.
+      expect(style.glyphs).toContain('{fontstack}')
+      expect(style.glyphs).toContain('{range}')
+    }
+  })
+
+  it('takes its origin from the page, so no address can point at another host', () => {
+    // The default is the origin the app is being served from — the guarantee that self-hosting
+    // the basemap actually holds: an absolute URL is only safe because its host is this one.
+    const style = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'dark')
+
+    expect(new URL(style.sprite as string).origin).toBe(window.location.origin)
+    expect(new URL(style.glyphs as string).origin).toBe(window.location.origin)
   })
 
   it('reads both archives through the pmtiles protocol at their versioned names', () => {
@@ -115,15 +154,15 @@ describe('buildStyle', () => {
     // week of `immutable`. Without the revision in the URL a browser keeps last week's glyphs for
     // a week after the pin moved; with it, the bump IS a new URL and the old copy is simply never
     // asked for again.
-    const style = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'dark')
+    const style = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'dark', ORIGIN)
 
-    expect(style.glyphs).toBe('/api/map/assets/fonts/{fontstack}/{range}.pbf?v=028c18f7')
-    expect(style.sprite).toBe('/api/map/assets/sprites/v4/dark?v=028c18f7')
+    expect(style.glyphs).toBe(`${ORIGIN}/api/map/assets/fonts/{fontstack}/{range}.pbf?v=028c18f7`)
+    expect(style.sprite).toBe(`${ORIGIN}/api/map/assets/sprites/v4/dark?v=028c18f7`)
   })
 
   it('moves every asset URL when the assets revision changes', () => {
-    const before = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'light')
-    const after = buildStyle({ ...BOTH, assets_commit: OTHER_COMMIT }, 'light')
+    const before = buildStyle({ ...BOTH, assets_commit: ASSETS_COMMIT }, 'light', ORIGIN)
+    const after = buildStyle({ ...BOTH, assets_commit: OTHER_COMMIT }, 'light', ORIGIN)
 
     expect(after.glyphs).not.toBe(before.glyphs)
     expect(after.sprite).not.toBe(before.sprite)
@@ -134,9 +173,9 @@ describe('buildStyle', () => {
   })
 
   it('omits the version query when no assets revision was recorded', () => {
-    const style = buildStyle(BOTH, 'dark')
+    const style = buildStyle(BOTH, 'dark', ORIGIN)
 
-    expect(style.glyphs).toBe(GLYPHS_URL)
-    expect(style.sprite).toBe('/api/map/assets/sprites/v4/dark')
+    expect(style.glyphs).toBe(`${ORIGIN}${GLYPHS_URL}`)
+    expect(style.sprite).toBe(`${ORIGIN}/api/map/assets/sprites/v4/dark`)
   })
 })
