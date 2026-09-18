@@ -29,10 +29,20 @@ a registry — the deploy image is built locally (below), so there is no `ghcr.i
 Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
 agreement is enforced *before* tagging via the checker's `--tag`.
 
-### The Places browser smoke — mandatory for changes under `frontend/src/**/places/`
+### The Places browser smoke — mandatory for changes to the map view
 
-Any release whose range touches `frontend/src/**/places/` (the map view, its components or its
-pure libraries) additionally runs, from `frontend/`, bare:
+Any release whose range touches the map view additionally runs, from `frontend/`, bare. A
+`places/` directory glob is not enough: the pane and the timeline-bar overlay whose geometry the
+smoke checks live in `PlacesView.vue`, outside any such directory — the 1.7.1 fit-padding fix
+touched exactly that file. The paths are:
+
+- `frontend/src/views/PlacesView.vue` — the view that assembles the pane, the overlay and the grid
+- `frontend/src/components/places/**` — the map, the timeline bar, the drawer, the in-view grid
+- `frontend/src/lib/places/**` — the style, the geometry, the timeline reducer, the pin builder
+- `frontend/src/lib/media.ts` and `frontend/src/composables/useMediaLightbox.ts` — shared with the
+  rest of the app, but the map's pins and its lightbox are built out of them
+
+The command:
 
 ```
 npm ci && npm run build && npm run smoke:places
@@ -41,7 +51,11 @@ npm ci && npm run build && npm run smoke:places
 A real headless Chromium opens the PRODUCTION build at `/places` on a desktop viewport
 (1440x900) and a phone one (390x844) against synthetic committed fixtures, and exits non-zero on
 any console error, any failed request, and any first-view pin that falls outside the map pane or
-behind the timeline bar. It exists because happy-dom cannot run MapLibre: 1.7.0 shipped a
+behind the timeline bar, and on any request that leaves the smoke's own origin. The font route
+is checked by a fetch from the page at the versioned address the style builds — the template's
+own shape is pinned by the unit tests in `style.spec.ts`, and with no basemap archive in the
+fixtures MapLibre issues no glyph request of its own. It exists because happy-dom cannot run
+MapLibre: 1.7.0 shipped a
 basemap with no icons and pins hidden under the bar past 913 green unit tests and two audit
 rounds. The browser is found via `PLACES_SMOKE_CHROME`, else the newest Playwright build under
 `PLAYWRIGHT_BROWSERS_PATH`/`~/.cache/ms-playwright`, else a system Chromium; with none it fails

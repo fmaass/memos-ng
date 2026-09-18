@@ -19,7 +19,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright-core'
 
-import { createSmokeServer } from './server.mjs'
+import { createSmokeServer, SMOKE_MANIFEST } from './server.mjs'
 
 const VIEWPORTS = [
   { label: 'desktop', width: 1440, height: 900 },
@@ -96,8 +96,6 @@ async function runViewport(browser, viewport) {
   const origin = `http://127.0.0.1:${PORT}`
 
   const label = `[${viewport.label} ${viewport.width}x${viewport.height}]`
-  check(consoleErrors.length === 0, `${label} console errors (${consoleErrors.length}): ${consoleErrors.join(' | ')}`)
-  check(failedResponses.length === 0, `${label} requests that failed: ${failedResponses.join(' | ')}`)
   check(!!seen.pane, `${label} no map pane rendered`)
   check(seen.pins.length > 0, `${label} no pins rendered — the smoke proves nothing without them`)
 
@@ -137,29 +135,63 @@ async function runViewport(browser, viewport) {
     sprites.some((url) => url.endsWith('.json') || url.includes('.json?')),
     `${label} sprite index was never fetched: ${sprites.join(' | ')}`,
   )
-  // The glyph address: fetched from the page itself, at the very URL the style carries. The
-  // style has no symbol layer here (no basemap archive is committed), so MapLibre issues no
-  // glyph request of its own — what this proves is that the address the app builds is absolute,
-  // on this origin, and answers. Its shape is pinned by the unit tests in style.spec.ts.
-  const glyphs = await page.evaluate(async (base) => {
-    const template = `${base}/api/map/assets/fonts/{fontstack}/{range}.pbf`
-    const url = template.replace('{fontstack}', 'Noto%20Sans%20Regular').replace('{range}', '0-255')
+  // Not a MapLibre request: this style has no symbol layer (no basemap archive is committed),
+  // so MapLibre asks for no glyph range at all here. What this proves is narrower and worth
+  // stating exactly — the font route answers 200 on this origin, at the versioned address the
+  // style builds, fetched from the page itself. The TEMPLATE's shape (absolute, same-origin,
+  // `{fontstack}` and `{range}` intact) is pinned by the unit tests in `style.spec.ts`; reading
+  // it off the live style would need a test-only hook in production code, which is not worth it.
+  const glyphs = await page.evaluate(async ([base, revision]) => {
+    const query = revision ? `?v=${revision.slice(0, 8)}` : ''
+    const url = `${base}/api/map/assets/fonts/Noto%20Sans%20Regular/0-255.pbf${query}`
     try {
       return { url, status: (await fetch(url)).status }
     } catch {
       return { url, status: 0 }
     }
-  }, origin)
+  }, [origin, SMOKE_MANIFEST.assets_commit])
   check(glyphs.status === 200, `${label} glyph range did not answer from this origin: ${glyphs.url} (${glyphs.status})`)
 
   if (SHOTS) {
     mkdirSync(SHOTS, { recursive: true })
     await page.screenshot({ path: join(SHOTS, `places-smoke-${viewport.label}.png`) })
   }
-  process.stdout.write(
-    `${label} pins ${seen.pins.length}, console errors ${consoleErrors.length}, bar ${JSON.stringify(seen.bar)}\n`,
-  )
+  // LAST, and after everything above that can still produce one: the screenshot, the glyph
+  // fetch and the page's own late work all happen after the settle window, and an error there
+  // used to be printed in the summary and never fail the run.
   await context.close()
+  check(
+    consoleErrors.length === 0,
+    `${label} console errors (${consoleErrors.length}): ${consoleErrors.join(' | ')}`,
+  )
+  check(
+    failedResponses.length === 0,
+    `${label} requests that failed: ${failedResponses.join(' | ')}`,
+  )
+  // Self-hosting the basemap is only worth anything if the page asks NOTHING of anyone else:
+  // one foreign request would tell that host every place the household has been. Non-network
+  // schemes carry no such request.
+  const foreign = [
+    ...new Set(
+      requests.filter((url) => {
+        if (/^(data|blob|about):/i.test(url)) return false
+        try {
+          return new URL(url).origin !== origin
+        } catch {
+          return true
+        }
+      }),
+    ),
+  ]
+  check(foreign.length === 0, `${label} requests left this origin: ${foreign.join(' | ')}`)
+
+  // Printed from the very arrays the checks above read, so the line cannot disagree with the
+  // verdict.
+  process.stdout.write(
+    `${label} pins ${seen.pins.length}, console errors ${consoleErrors.length}, ` +
+      `failed requests ${failedResponses.length}, foreign requests ${foreign.length}, ` +
+      `bar ${JSON.stringify(seen.bar)}\n`,
+  )
 }
 
 const { server } = createSmokeServer()

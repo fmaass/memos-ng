@@ -81,6 +81,19 @@ export function synthesizeMarkers(count = 8, months = 4) {
   })
 }
 
+/**
+ * The manifest the fixture serves. Exported because the style versions its asset addresses with
+ * `assets_commit`, and the runner's font-route probe has to ask for the same address the style
+ * would build — including that query.
+ */
+export const SMOKE_MANIFEST = {
+  build: '00000000',
+  assets_commit: '0123456789abcdef0123456789abcdef01234567',
+  planet: null,
+  detail: null,
+  uncovered: null,
+}
+
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'Cache-Control': 'no-store', ...headers })
   res.end(body)
@@ -117,13 +130,7 @@ export function createSmokeServer({ markers = 8, months = 4 } = {}) {
       // style is then the background colour plus the sprite and glyph addresses — which is all
       // this smoke needs, because the sprite is fetched eagerly at style load and that fetch is
       // the defect class (`Invalid sprite URL …, must be absolute`).
-      return json(res, {
-        build: '00000000',
-        assets_commit: '0123456789abcdef0123456789abcdef01234567',
-        planet: null,
-        detail: null,
-        uncovered: null,
-      })
+      return json(res, SMOKE_MANIFEST)
     }
     if (path === '/api/map/markers') return json(res, { markers: synthesizeMarkers(markers, months) })
     if (path.startsWith('/api/map/assets/sprites/')) {
