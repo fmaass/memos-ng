@@ -182,7 +182,7 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | `PAT_LAST_USED_THROTTLE_S` | `300` | min interval between PAT `last_used` stamps (same hot-row reason, for a satellite's media burst) |
 | `ASSET_URL_SECRET` | derived from `SESSION_SECRET` | HMAC key for signed media URLs (`_PREV` = rotation slot) |
 | `WORKER_LANES` | `fast,slow` | which media lanes a worker drains (`fast` = thumbs/posters, `slow` = transcode) |
-| `THERMAL_ZONE` / `THERMAL_MAX_C` | k10temp sensor / `70` | defer transcode while the (heat-bound) host is hot |
+| `THERMAL_ZONE` / `THERMAL_MAX_C` | empty (the `coretemp` `Package id 0` sensor, resolved by name) / `90` | defer media work while the CPU package is above the limit; a path in `THERMAL_ZONE` overrides the by-name lookup |
 | `SLOW_TRANSCODE_TIMEOUT_S` | `3600` | ceiling for one slow-lane transcode; on expiry the ffmpeg process tree is killed and the job fails visibly instead of holding the worker slot |
 | `MAX_UPLOAD_MIB` | `1024` | upload size cap |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | empty (push disabled) | Web Push (VAPID) keypair |
@@ -197,8 +197,8 @@ All settings come from the environment (or a `.env` file). Key variables — see
   the page's own origin for the sprite and the glyphs, and the unit tests pin both.
 - The first view of `/places` keeps every pin clear of the timeline bar. The padding of the first
   fit is measured from the overlay that really covers the map, per side, on desktop and phone.
-- "No located photos" appears only once the markers have been asked for and came back empty. While
-  they load that message stays away, and a failed request has a message of its own.
+- The empty-map message appears only once the markers have been asked for and came back empty.
+  While they load that message stays away, and a failed request has a message of its own.
 - Photos uploaded while a long video is transcoding no longer wait for it. The one worker process
   drains the queue with two consumers, `transcode` (a slow-lane `derive` job on a video) and
   `light` (everything else), split by a predicate at claim time; nothing is stored, so there is no
