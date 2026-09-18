@@ -14,6 +14,12 @@ from app.config import settings
 #    discards stale connections; recycle avoids long-lived ones.
 #  - DEV/TEST: NullPool (fresh connection per checkout). asyncpg connections are event-loop-bound
 #    and pytest-asyncio uses a per-test loop — a pooled connection would cross loops and error.
+# Both branches share these: a bound parameter of a failing statement is quoted into the exception
+# message by default, and the parameters of an attachment write ARE the coordinates. That message
+# reaches tracebacks, log handlers and the backfill's stdout — the last way a coordinate could
+# leave the machine (the Places privacy invariant). One mapping so the two branches cannot drift.
+_SHARED_ENGINE_KWARGS: dict[str, object] = {"future": True, "hide_parameters": True}
+
 if settings.is_production:
     engine = create_async_engine(
         settings.DATABASE_URL,
@@ -22,10 +28,14 @@ if settings.is_production:
         pool_recycle=settings.DB_POOL_RECYCLE,
         pool_timeout=settings.DB_POOL_TIMEOUT,
         pool_pre_ping=True,
-        future=True,
+        **_SHARED_ENGINE_KWARGS,  # type: ignore[arg-type]
     )
 else:
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool, future=True)
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        poolclass=NullPool,
+        **_SHARED_ENGINE_KWARGS,  # type: ignore[arg-type]
+    )
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

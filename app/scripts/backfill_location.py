@@ -50,6 +50,7 @@ from app.services import location
 from app.services.media import too_hot
 from app.services.uploads import CAPTURE_READ_TIMEOUT_S
 from sqlalchemy import Select, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 logger = structlog.get_logger(__name__)
 
@@ -161,19 +162,31 @@ async def load_candidates(
         ]
 
 
-async def _store(candidate: Candidate, found: location.LocationResult | None, source: str) -> None:
-    """One row, one transaction — a killed run keeps every row it has already read."""
-    async with async_session() as db:
-        await db.execute(
-            update(Attachment)
-            .where(Attachment.id == candidate.id)
-            .values(
-                latitude=found.latitude if found else None,
-                longitude=found.longitude if found else None,
-                location_source=source,
+async def _store(candidate: Candidate, found: location.LocationResult | None, source: str) -> bool:
+    """One row, one transaction — a killed run keeps every row it has already read.
+
+    A write that fails carries the coordinate as a bound parameter, so the exception is answered
+    here and never re-raised: the row is named by uid, the failure by its type, and the value stays
+    in the database it never left. False means the run counts a failure, as a failed read does.
+    """
+    try:
+        async with async_session() as db:
+            await db.execute(
+                update(Attachment)
+                .where(Attachment.id == candidate.id)
+                .values(
+                    latitude=found.latitude if found else None,
+                    longitude=found.longitude if found else None,
+                    location_source=source,
+                )
             )
+            await db.commit()
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "backfill_location.write_failed", uid=candidate.uid, error=type(exc).__name__
         )
-        await db.commit()
+        return False
+    return True
 
 
 async def run_backfill(
@@ -233,8 +246,9 @@ async def run_backfill(
             stats.located += 1
             stats.cells[cell_of(found)] += 1
 
-        if execute:
-            await _store(candidate, found, source)
+        if execute and not await _store(candidate, found, source):
+            stats.failed += 1
+            consecutive_failures += 1
 
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             stats.stopped_after_failures = True
