@@ -7,10 +7,12 @@ none of them re-derives an expected value with the code under test.
 """
 
 import asyncio
+import gc
 import os
 import random
 import secrets
 import struct
+import threading
 import time
 from datetime import UTC, datetime
 from io import BytesIO
@@ -710,6 +712,169 @@ async def test_a_print_job_dispatches_by_kind_not_by_lane(adb, monkeypatch, tmp_
     assert printready.printready_path(att.uid).exists()
     assert not (tmp_path / "assets" / "thumbs" / f"{att.uid}.jpg").exists()
     assert att.blurhash is None and att.width is None  # the photo's own columns are untouched
+
+
+async def test_the_encode_does_not_freeze_the_event_loop(adb, monkeypatch, tmp_path):
+    # The worker runs two consumers plus the supervisor on ONE loop (MEMNG-241 split), so a
+    # print encode held on the loop thread freezes the transcode consumer's progress writes and
+    # the supervisor's heartbeat for its whole duration — seconds, per rendition, a few hundred
+    # renditions per book. What is asserted is therefore the loop STILL RUNNING while the encode
+    # is in the middle of blocking, not merely finishing afterwards.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    att = await _persisted(adb, tmp_path, source=_png(tmp_path / "offloop.png"))
+    job = MediaJob(
+        attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=JobState.queued
+    )
+    adb.add(job)
+    await adb.flush()
+
+    block_s = 0.4
+    loop_thread = threading.get_ident()
+    encode_threads: list[int] = []
+    began: list[float] = []
+    finished: list[float] = []
+
+    def _slow_encode(attachment, profile=None) -> Path:
+        # A CPU-bound encode's stand-in: a blocking sleep that offers the loop no yield point,
+        # exactly like Pillow's decode/resize/save.
+        encode_threads.append(threading.get_ident())
+        began.append(time.monotonic())
+        time.sleep(block_s)
+        finished.append(time.monotonic())
+        return printready.printready_path(attachment.uid, profile)
+
+    monkeypatch.setattr(media, "process_printready", _slow_encode)
+
+    ticks: list[float] = []
+
+    async def _ticker() -> None:
+        # Bounded by the stub's own duration so a regression fails on the assertions below
+        # instead of hanging the suite.
+        deadline = time.monotonic() + block_s * 5
+        while not finished and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            ticks.append(time.monotonic())
+
+    await asyncio.gather(media.process_printready_job(adb, job, att), _ticker())
+
+    during = [t for t in ticks if began[0] < t < finished[0]]
+    assert len(during) >= 3, f"the loop ran {len(during)} times while the encode blocked"
+    assert encode_threads and encode_threads[0] != loop_thread  # ran on a worker thread
+
+
+async def test_a_stop_during_the_encode_waits_for_the_thread(adb, monkeypatch, tmp_path):
+    # The worker's teardown cancels each consumer task natively (app/worker.py: `task.cancel()`),
+    # and a native cancel is delivered straight through anyio's abandon_on_cancel=False shield.
+    # A thread cannot be interrupted, so the encode goes on resizing and os.replace-ing the
+    # rendition into its final path after the coroutine is gone — with no guard_publish left to
+    # fence it. The inline call could not be cut short; the off-loop hop must keep that ordering.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    att = await _persisted(adb, tmp_path, source=_png(tmp_path / "cancel.png"))
+    job = MediaJob(
+        attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=JobState.queued
+    )
+    adb.add(job)
+    await adb.flush()
+
+    entered = threading.Event()
+    release = threading.Event()
+    left = threading.Event()
+
+    def _slow_encode(attachment, profile=None) -> Path:
+        # Held by the TEST, not by a sleep: a timed encode on a loaded host can finish before the
+        # cancellation is delivered, and the wait-out would then be skipped by a test that still
+        # passed. The timeout only bounds a broken test — it fails the assertions, never hangs.
+        entered.set()
+        release.wait(5)
+        left.set()
+        return printready.printready_path(attachment.uid, profile)
+
+    monkeypatch.setattr(media, "process_printready", _slow_encode)
+
+    task = asyncio.create_task(media.process_printready_job(adb, job, att))
+    # Waited for off the loop (the stub sets a threading.Event from its own thread), so the stop
+    # below lands with the encode mid-flight rather than before it has started.
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    task.cancel()
+    # `cancel()` queues the job task's resumption with call_soon, so yielding the loop hands it
+    # the CancelledError — FIFO scheduling, not elapsed time, which is what makes this
+    # independent of host load. The ticks are yields, not a sleep, so nothing here is timed.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done(), "the cancelled await returned while the encode thread was running"
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert left.is_set(), "the stop returned while the encode thread was still writing"
+    assert task.cancelled()  # and the cancellation is still delivered, never swallowed
+
+
+async def test_a_stop_still_wins_when_the_waited_out_encode_fails(adb, monkeypatch, tmp_path):
+    # The wait-out must not let the thread's OWN outcome escape. An encode that raises while the
+    # stop is waiting for it would otherwise replace the CancelledError: run_once's `except
+    # Exception` would book a job failure and the consumer would carry on looping with its one
+    # cancellation already consumed, leaving the supervisor waiting for a task that never ends.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    att = await _persisted(adb, tmp_path, source=_png(tmp_path / "cancel-fail.png"))
+    job = MediaJob(
+        attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=JobState.queued
+    )
+    adb.add(job)
+    await adb.flush()
+
+    entered = threading.Event()
+    release = threading.Event()
+    left = threading.Event()
+
+    def _failing_encode(attachment, profile=None) -> Path:
+        # Same gating as the test above, and here it is what the test IS: the encode must fail
+        # while the cancellation is already parked in the wait-out. Timed, it could fail first on
+        # a loaded host, `encode.done()` would be true, the wait-out loop would be skipped, and
+        # the test would pass against the very shape it exists to reject.
+        entered.set()
+        release.wait(5)
+        left.set()
+        raise RuntimeError("the encode died while the stop was waiting for it")
+
+    monkeypatch.setattr(media, "process_printready", _failing_encode)
+
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        task = asyncio.create_task(media.process_printready_job(adb, job, att))
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        task.cancel()
+        # FIFO scheduling, not elapsed time: cancel() queues the resumption, so these yields hand
+        # the job task its CancelledError and park it in the wait-out regardless of host load.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done(), "the stop returned before the encode had failed"
+
+        release.set()
+        outcome: BaseException | None = None
+        try:
+            await task
+        except BaseException as exc:  # noqa: BLE001 — the outcome IS the assertion
+            outcome = exc
+
+        assert isinstance(outcome, asyncio.CancelledError), (
+            f"the encode's own failure replaced the stop: {outcome!r}"
+        )
+        assert left.is_set()  # and it still waited the thread out
+        assert task.cancelled()
+        gc.collect()  # a dropped encode failure would be reported here, from Task.__del__
+        assert not [c for c in unhandled if "never retrieved" in c.get("message", "")]
+    finally:
+        loop.set_exception_handler(previous)
 
 
 async def test_the_upload_pipeline_never_generates_the_print_tier(adb, monkeypatch, tmp_path):

@@ -111,11 +111,43 @@ Rollback: retag the previous image `memos-ng:rollback-<short-sha>` *before* over
 `APP_VERSION` env lines and `docker compose up -d --force-recreate` (compose always deploys the
 `memos-ng:local` tag; reverting only the env var would restart the BAD image under the old name).
 
-Recreating the worker kills any in-flight transcode/frame job. A frame job interrupted mid-send is
-no longer lost: the next worker start re-queues any claim older than `FRAME_CLAIM_STALE_MINUTES`
-(15 by default) and retries it, at the price of a possible re-upload of a photo the album already
-accepted — aura-frames dedups by sha256, so an unchanged photo does not duplicate (MEMNG-35). Still
-deploy in a quiet window — worker heartbeat fresh and no active job in the log tail.
+Recreating the worker stops any in-flight media job, and a **deliberate** stop now puts that work
+back in the queue instead of stranding it. `docker compose up -d --force-recreate` sends SIGTERM to
+the worker process (the entrypoint `exec`s it, so the signal arrives at Python); the supervisor
+tears both consumers down, and each cancelled job's row goes back to `queued` with its attempt
+count untouched — provided the row is still `processing` under that worker's own claim, so a job
+that had already finished (or failed, or been deleted) is left exactly as it is. The requeued job
+is therefore re-runnable by the next worker start, and once it has run, the per-attachment order
+guard stops withholding that attachment's later jobs.
+
+That happens inside docker's stop grace, which is **10 s**: the stack compose sets no
+`stop_grace_period`, so the default applies. The bounds the stop was designed against: the
+transcode's own tree stop first (SIGTERM to the ffmpeg process group, `media.KILL_GRACE_SECONDS` =
+5 s), then up to 3 s for the requeue write (`worker.CANCEL_REQUEUE_TIMEOUT_SECONDS`), then up to
+1 s for the progress row (`worker.CANCEL_PROGRESS_CLEAR_SECONDS`) — 9 s of the 10, with both
+consumers running their own in parallel. These are **designed bounds, not hard caps**: an ffmpeg
+that ignores SIGTERM also needs the SIGKILL step, which adds another 5 s, and nothing in the
+process can bound the kernel.
+
+The 9 s bounds the **consumers' stop path only**. What comes after it is not measured and is not
+bounded by this code: the consumers' database sessions closing, asyncpg tearing down a connection
+whose operation was cancelled, the supervisor unwinding, and `asyncio.run()`'s own shutdown of any
+task still left (which re-cancels an abandoned requeue write and does not honour its 3 s bound).
+Docker's SIGKILL at the end of the grace is the only deadline over the stop as a whole — and a
+second SIGTERM sent meanwhile is deliberately a no-op, so it does not shorten anything either.
+
+**Past the grace nothing can be written**: docker sends SIGKILL. That strands a row only if a
+claim was actually in flight — a worker sitting idle leaves nothing behind. A claim that was in
+flight stays `processing` (exactly as after an OOM kill or a host crash) until a sweep requeues
+it: `MEDIA_CLAIM_STALE_SECONDS` (7200 s) is the age at which a claim becomes eligible, and the
+next sweep after that requeues it, so the delay is that threshold plus up to one sweep interval.
+While such a row stands, the order guard withholds that attachment's later jobs.
+
+A frame job interrupted mid-send is not lost either: the next worker start re-queues any claim
+older than `FRAME_CLAIM_STALE_MINUTES` (15 by default) and retries it, at the price of a possible
+re-upload of a photo the album already accepted — aura-frames dedups by sha256, so an unchanged
+photo does not duplicate (MEMNG-35). Still deploy in a quiet window — worker heartbeat fresh and no
+active job in the log tail: a quiet window is what keeps the SIGKILL case off the table.
 
 ### Rollback across a migration
 
