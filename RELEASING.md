@@ -24,7 +24,20 @@ uv run ruff format --check app/ tests/ scripts/ && uv run pytest -q &&
 uv run alembic check && scripts/check-mutations.sh`, plus the frontend suite (`npx vitest run`)
 and the version checker above. `scripts/check-mutations.sh` runs the repo-carried mutation
 controls: each patch in `tests/mutations/` is applied in place with a sha256-proven revert and
-must fail exactly the probes `tests/mutations/expected.tsv` names. Images are never pulled from
+must fail exactly the probes `tests/mutations/expected.tsv` names.
+
+**The mutation run and the image build must not overlap**, because for a few seconds at a time
+the checkout on disk *is* mutated source, and `docker build` copies whatever it finds. Both take
+the same lock — `mutation-gate.lock` in this working tree's git directory — so run either one and
+the other sorts itself out. They behave differently on purpose: the build **waits** (it just
+starts later, and is then built from correct source), while the mutation script **refuses at
+once** with `another process holds the mutation gate lock`, exit 2, having patched nothing —
+a gate that blocked silently for minutes would read as a hang. A build that is waiting prints
+nothing until the lock frees, which looks like a stall; that is the lock, and the mutation run
+holding it prints its progress in the other terminal. The lock is per working tree, so a build
+in one worktree and a mutation run in another never wait for each other. It is released by the
+kernel when the holding process exits, including on a kill, so a crashed run leaves nothing to
+clean up. Images are never pulled from
 a registry — the deploy image is built locally (below), so there is no `ghcr.io` push and no
 Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
 agreement is enforced *before* tagging via the checker's `--tag`.
@@ -73,7 +86,10 @@ Host **jupiter** (the stack runs where the repo lives). Stack:
 `/opt/jupiter-stacks/stacks/memos-ng/docker-compose.yml`, containers `memos-ng-app` +
 `memos-ng-worker`, image **`memos-ng:local`** built locally:
 
-    docker build --build-arg APP_VERSION=<version>+<short-sha> -t memos-ng:local .
+    flock "$(git rev-parse --absolute-git-dir)/mutation-gate.lock" docker build --build-arg APP_VERSION=<version>+<short-sha> -t memos-ng:local .
+
+The `flock` prefix is not optional: it is what keeps this build from reading a checkout that a
+mutation run is patching in place (see the gate section above). Run it from the repository root.
 
 `APP_VERSION` is **also hardcoded in the stack compose `environment:` for both containers** and
 must be updated to the same string in the same deploy — the compose env is the runtime authority

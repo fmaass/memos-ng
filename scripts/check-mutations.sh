@@ -22,6 +22,25 @@ that checkout while it runs — another reader sees mutated source, another writ
 The patch is reversed on interrupt too (EXIT/INT/TERM), and every revert is proved by sha256; if
 one cannot be proved the script stops and names the file to restore by hand.
 
+TWO GUARDS, AND THEY COVER DIFFERENT HAZARDS. Neither substitutes for the other:
+
+  * the uncommitted-changes refusal below is about STATE — an author's unsaved edit to a file a
+    patch touches, which this script's revert would overwrite. It reads the tree once, at the
+    start, and a clean tree satisfies it.
+  * the lock is about TIME — another process reading or writing the same tree WHILE a patch is
+    applied. A clean tree says nothing about that: during a release the tree is clean and a
+    `docker build` with this checkout as its context is reading every file in it. That is not
+    hypothetical: during the 1.7.0 release this script had app/services/uploads.py patched while a
+    build read the same tree, and only a 103-file sha256 comparison afterwards established that the
+    image was clean.
+
+The lock is `mutation-gate.lock` in this working tree's own git directory, taken with flock and
+held for the whole run. The build takes the same lock (see RELEASING.md) and waits for it; this
+script does NOT wait — it refuses immediately, because a gate that silently blocks for minutes
+reads as a hang, while a build that waits simply starts later and is still correct. The lock is
+released by the kernel when this process exits, on every path including a kill, so there is no
+release step that can be forgotten or skipped.
+
 Run from the repository root. For every row of tests/mutations/expected.tsv the script:
 
   * refuses to start if the file that row's patch touches has uncommitted changes, so the
@@ -381,6 +400,24 @@ fi
 # ------------------------------------------------------------------------------------------
 toplevel=$(git rev-parse --show-toplevel 2> /dev/null) || die "not a git repository"
 [ "$toplevel" = "$PWD" ] || die "run from the repository root ($toplevel), not $PWD"
+
+# --absolute-git-dir, not --git-common-dir: what has to be serialised is one WORKING TREE, because
+# that is what a patch is applied to and what a build reads as its context. The common dir is
+# shared by every linked worktree of this repository, so a lock there would make a mutation run in
+# one worktree block a build in another that cannot see its patches at all — two agents on two
+# worktrees queueing behind each other for nothing. The per-worktree git dir is exactly the scope
+# of the hazard. (Plain --git-dir prints a bare `.git` in a main checkout, which would resolve
+# against whatever directory the caller happened to be in; the absolute form is the same answer,
+# spelled so it cannot drift.)
+gitdir=$(git rev-parse --absolute-git-dir 2> /dev/null) || die "cannot locate the git directory"
+LOCKFILE="$gitdir/mutation-gate.lock"
+exec 9> "$LOCKFILE" || die "cannot open the mutation gate lock at $LOCKFILE"
+if ! flock -n 9; then
+    printf 'check-mutations: another process holds the mutation gate lock (%s).\n' "$LOCKFILE" >&2
+    printf 'check-mutations: a build reading this checkout and a mutation run patching it must not overlap.\n' >&2
+    printf 'check-mutations: nothing was patched. Wait for it to finish and run this again.\n' >&2
+    exit 2
+fi
 [ -f "$MANIFEST" ] || die "no manifest at $MANIFEST"
 [ -f "$MODULE" ] || die "no $MODULE"
 command -v uv > /dev/null 2>&1 || die "uv is not on PATH"
@@ -507,7 +544,11 @@ mapfile -t control_modules < <(printf '%s\n' "${modules[@]}" | LC_ALL=C sort -u)
 for control_module in "${control_modules[@]}"; do
     control_log="$logdir/control-$(printf '%s' "$control_module" | tr '/.' '__').log"
     echo "control: running $control_module with $MARKER_VAR removed from the environment (must exit 0)"
-    env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null
+    # 9>&- : the lock is THIS process's hold, and a pytest child must not extend it past our own
+    # exit. Without it a run killed mid-flight would leave the lock held by the surviving child
+    # until that child finished — and the tree it would be guarding has already been reverted by
+    # the trap. It also keeps `--selftest` honest: leg 5 kills a run and leg 6 starts another.
+    env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null 9>&-
     control_rc=$?
     if [ "$control_rc" -eq 0 ]; then
         echo "control: PASS — the unmutated $control_module exits 0"
@@ -546,7 +587,7 @@ for i in "${!patches[@]}"; do
     fi
 
     env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
-        "$module" > "$log" 2>&1 < /dev/null
+        "$module" > "$log" 2>&1 < /dev/null 9>&-
     rc=$?
 
     if ! revert_applied; then
