@@ -45,8 +45,11 @@ and then refuses, naming the files, if any tracked file differs from `HEAD`. Res
 by hand (`git checkout -- <file>`) — `scripts/check-mutations.sh` names it when a revert could not
 be proved — and run the build again. Images are never pulled from
 a registry — the deploy image is built locally (below), so there is no `ghcr.io` push and no
-Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
-agreement is enforced *before* tagging via the checker's `--tag`.
+Trivy gate. To catch slim-image/wheel breakage before a deploy without touching the deploy tag,
+build under another name: `IMAGE_TAG=memos-ng:compile-check-<short-sha> scripts/build-image.sh
+<version>+<short-sha>` — same lock, same `HEAD` comparison, and `memos-ng:local` stays what is
+running. Remove that tag afterwards. Tag agreement is enforced *before* tagging via the checker's
+`--tag`.
 
 ### The Places browser smoke — mandatory for every release that touches `frontend/`
 
@@ -84,7 +87,56 @@ Alembic. Applied automatically at app-container boot (`docker-entrypoint.sh` run
 `alembic upgrade head` before uvicorn). Release review: inspect
 `git diff <prev-tag>..HEAD -- alembic/`; any migration in the delta requires a rehearsal against
 populated production-like Postgres **and** a fresh `pg_dump` of `memosng` (shared postgres17
-cluster) before deploy.
+cluster) before deploy. The dump is the step below.
+
+### The production backup step (before any release that carries a migration)
+
+Run from jupiter, before the deploy, and cite the artifact in the release record. The dump is a
+read of production; nothing here writes to it.
+
+```bash
+ver=<version>                                   # e.g. 1.8.0
+d=~/backups/memosng-pre-$ver-$(date +%Y%m%d)
+mkdir -p "$d" && chmod 700 "$d"
+f=$d/memosng-pre-$ver.dump
+
+# 1. the dump: custom format, streamed over ssh (-n: ssh must not read this shell's stdin)
+ssh -n saturn.local 'sudo /usr/local/bin/docker exec postgres17 pg_dump -U memosng -d memosng -Fc' > "$f"
+echo "pg_dump exit: $?"                       # must be 0: a failed dump leaves a file behind too
+chmod 600 "$f"
+sha256sum "$f" > "$f.sha256"
+
+# 2. the table of contents, read with the dev container's pg_restore (same major version)
+docker exec -i memos-ng-db-1 pg_restore -l < "$f" > "$f.toc"
+chmod 600 "$f.sha256" "$f.toc"
+grep -c 'TABLE DATA' "$f.toc"                   # one per table; 24 on 2026-09-18
+```
+
+A dump that was never restored is not a backup. Restore it into a throwaway database in the DEV
+container (never into postgres17), compare it with production, and drop it:
+
+```bash
+docker exec memos-ng-db-1 psql -U memosng -d memosng -c "CREATE DATABASE memosng_restore_probe"
+docker exec -i memos-ng-db-1 pg_restore --no-owner --no-privileges -U memosng -d memosng_restore_probe < "$f"
+docker exec memos-ng-db-1 psql -U memosng -d memosng_restore_probe -Atc \
+  "SELECT (SELECT count(*) FROM information_schema.tables
+            WHERE table_schema='public' AND table_type='BASE TABLE'),
+          (SELECT count(*) FROM memos), (SELECT count(*) FROM attachments),
+          (SELECT version_num FROM alembic_version)"
+docker exec memos-ng-db-1 psql -U memosng -d memosng -c "DROP DATABASE memosng_restore_probe"
+```
+
+The same four numbers are read from production, read-only, through the estate's
+`~/projects/archimedes/bin/prod-sql.sh`; they must be equal, apart from rows written between the
+dump and the read. The step is done when the dump, its `.sha256` and its `.toc` exist with mode
+600, the `TABLE DATA` count equals the table count, and the restore probe matched.
+
+**Retention.** A dump is about 0.5 to 0.6 MB today. Every `~/backups/memosng-pre-<version>-<date>/`
+directory is kept and nothing prunes them; revisit this when a dump passes 1 GB.
+
+**Rehearsed 2026-09-18** against production, read-only: 611,456 bytes, 24 `TABLE DATA` entries, and
+the restore probe matched production exactly (24 tables, 291 memos, 1730 attachments, alembic
+`d3f81b06c9a4`).
 
 ## Deploy target
 
@@ -135,6 +187,13 @@ whose operation was cancelled, the supervisor unwinding, and `asyncio.run()`'s o
 task still left (which re-cancels an abandoned requeue write and does not honour its 3 s bound).
 Docker's SIGKILL at the end of the grace is the only deadline over the stop as a whole — and a
 second SIGTERM sent meanwhile is deliberately a no-op, so it does not shorten anything either.
+
+A print-ready encode is the one job the stop **waits out**: it runs in a thread, which cannot be
+interrupted, so `process_printready_job` lets the running rendition finish before the
+cancellation goes on to the hand-back — an abandoned thread would keep writing the rendition into
+its final path after the coroutine that guards the publish is gone. The light consumer runs one
+such job at a time, so the wait is one rendition's remaining encode. If that outlasts the grace,
+this is the SIGKILL case below.
 
 **Past the grace nothing can be written**: docker sends SIGKILL. That strands a row only if a
 claim was actually in flight — a worker sitting idle leaves nothing behind. A claim that was in
