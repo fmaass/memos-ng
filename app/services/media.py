@@ -1118,9 +1118,9 @@ def resolve_thermal_sensor() -> Path | None:
             try:
                 found = candidate.exists()
             except OSError:
-                # exists() answers False only for a path that is simply not there (ENOENT,
-                # ENOTDIR, EBADF, ELOOP) and re-raises the rest — EACCES, EIO. Those are unreadable
-                # candidates like any other, not a reason to take the worker down.
+                # exists() answers False for ENOENT, ENOTDIR, EBADF and ELOOP and re-raises every
+                # other OSError — EACCES and EIO among them. Those are unreadable candidates like
+                # any other, not a reason to take the worker down.
                 continue
             if found:
                 return candidate
