@@ -43,6 +43,10 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
   let probing = false
   let paused = false
   let disposed = false
+  // Bumped every time the server proves itself reachable. A probe carries the generation it was
+  // started in, so one that was still in flight when a real request answered is discarded rather
+  // than being allowed to fail the server all over again.
+  let generation = 0
   const listeners = new Set<(status: ReachabilityStatus) => void>()
 
   const cancelTimer = () => {
@@ -56,6 +60,7 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
     // asking for its own probe would multiply exactly the traffic that is already failing.
     if (probing || paused || disposed) return
     probing = true
+    const startedIn = generation
     let result: ReachabilitySignal
     try {
       result = await deps.probe()
@@ -63,7 +68,7 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
       result = 'probe-failed'
     }
     probing = false
-    if (disposed) return
+    if (disposed || startedIn !== generation) return
     report(result)
   }
 
@@ -72,11 +77,16 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
       if (effect.type === 'stop-probing') {
         cancelTimer()
       } else if (effect.type === 'probe-now') {
+        // A probe already on its way IS the immediate answer; cancelling the schedule for one
+        // that will not start would leave nothing pending at all.
+        if (probing) continue
         cancelTimer()
         void runProbe()
       } else if (effect.type === 'probe-in') {
-        cancelTimer()
-        if (paused || disposed) continue
+        // A pending probe keeps its deadline. Rescheduling on every new failure let a stream of
+        // failures arriving faster than the backoff push the probe out for ever, so the server
+        // was never asked again and the banner stayed up after it came back.
+        if (paused || disposed || probing || timer !== null) continue
         timer = deps.setTimer(() => {
           timer = null
           void runProbe()
@@ -92,6 +102,7 @@ export function createReachabilityMonitor(deps: ReachabilityMonitorDeps): Reacha
     const previous = state.status
     const decision = reduceReachability(state, signal, deps.now())
     state = decision.state
+    if (previous !== 'reachable' && state.status === 'reachable') generation++
     apply(decision.effects)
     if (state.status !== previous) {
       for (const listener of listeners) listener(state.status)

@@ -38,10 +38,18 @@ describe('classifyFailure', () => {
     expect(classifyFailure(new TypeError('Failed to fetch'))).toBe('network-error')
   })
 
-  it.each(['AbortError', 'TimeoutError'])('reads a %s as a timeout', (name) => {
-    const error = new Error('gone')
-    error.name = name
+  it('reads a TimeoutError (what AbortSignal.timeout rejects with) as a timeout', () => {
+    const error = new Error('timed out')
+    error.name = 'TimeoutError'
     expect(classifyFailure(error)).toBe('timeout')
+  })
+
+  it('reads an AbortError as the app cancelling itself, which is no evidence at all', () => {
+    // Query cancellation, a navigation, a component unmounting: the request never reached a
+    // conclusion about the server, so it must not count towards an outage.
+    const error = new Error('aborted')
+    error.name = 'AbortError'
+    expect(classifyFailure(error)).toBe('request-cancelled')
   })
 
   it('reads anything else as saying nothing about the network', () => {
@@ -88,6 +96,24 @@ describe('reduceReachability — a case per category', () => {
 
   it('a failed probe counts as a failure', () => {
     expect(suspectAfter('probe-failed').status).toBe('suspect')
+  })
+
+  it('two requests the app cancelled itself never add up to an outage', () => {
+    // The sequence that would otherwise condemn a perfectly healthy server: cancel one request
+    // now, cancel another once the debounce window has passed.
+    const first = reduceReachability(fresh, 'request-cancelled', 0)
+    expect(first).toEqual({ state: fresh, effects: [] })
+    const second = reduceReachability(first.state, 'request-cancelled', 3_000)
+    expect(second.state.status).toBe('reachable')
+    expect(second.state.failures).toBe(0)
+  })
+
+  it('a stream error asks the probe rather than passing judgement', () => {
+    // An EventSource error carries no status: it cannot tell a vanished server from a 401 after
+    // the session expired, so it may only trigger the request that CAN tell them apart.
+    const { state, effects } = reduceReachability(fresh, 'stream-error', 0)
+    expect(state).toEqual(fresh)
+    expect(effects).toEqual([{ type: 'probe-now' }])
   })
 
   it('an error that is neither network nor timeout changes nothing at all', () => {

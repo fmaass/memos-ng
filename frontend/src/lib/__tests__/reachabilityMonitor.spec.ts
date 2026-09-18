@@ -173,6 +173,56 @@ describe('createReachabilityMonitor', () => {
     expect(h.probe.mock.calls.length).toBe(whileHidden + 1)
   })
 
+  it('keeps a pending probe on its deadline however many failures pile up', async () => {
+    // Rescheduling on every failure let failures arriving faster than the backoff push the probe
+    // out for ever: the server was never asked again and the banner stayed up after it returned.
+    const h = harness(Array.from({ length: 80 }, () => 'probe-failed' as ProbeResult))
+    h.monitor.report('network-error')
+    await flush()
+    expect(h.scheduled()).toEqual([1_000])
+
+    for (let elapsed = 0; elapsed < 60_000; elapsed += 500) {
+      h.monitor.report('network-error')
+      await h.advance(500)
+    }
+    // A minute of relentless failures still got the server asked, repeatedly. Rescheduling on
+    // each failure pins this at exactly 1 — the immediate probe, and never another.
+    expect(h.probe.mock.calls.length).toBeGreaterThanOrEqual(4)
+  })
+
+  it('never condemns the server on stream errors alone — the probe answers', async () => {
+    // An EventSource error has no status behind it, so it may only prompt the question.
+    const h = harness(Array.from({ length: 20 }, () => 'probe-ok' as ProbeResult))
+    for (let i = 0; i < 20; i++) {
+      h.monitor.report('stream-error')
+      await flush()
+    }
+    expect(h.probe.mock.calls.length).toBeGreaterThan(0)
+    expect(h.monitor.status()).toBe('reachable')
+  })
+
+  it('discards a probe still in flight when a real request proved the server back', async () => {
+    let settle: (value: ProbeResult) => void = () => {}
+    const probe = vi.fn(() => new Promise<ProbeResult>((resolve) => (settle = resolve)))
+    const monitor = createReachabilityMonitor({
+      now: () => 0,
+      setTimer: () => 1,
+      clearTimer: () => {},
+      probe,
+    })
+    monitor.report('network-error')
+    expect(probe).toHaveBeenCalledTimes(1)
+
+    monitor.report('success')
+    expect(monitor.status()).toBe('reachable')
+
+    // The probe was started against the outage; its verdict is about a moment that has passed.
+    settle('probe-failed')
+    await flush()
+    expect(monitor.status()).toBe('reachable')
+    expect(monitor.snapshot().failures).toBe(0)
+  })
+
   it('notifies subscribers only when the verdict actually changes', async () => {
     const h = harness(['probe-failed', 'probe-failed', 'probe-failed'])
     const seen: string[] = []

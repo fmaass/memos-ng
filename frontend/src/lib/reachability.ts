@@ -26,7 +26,13 @@ export type ReachabilitySignal =
   | 'probe-ok'
   | 'probe-failed'
   | 'stream-open'
+  // The event stream errored. It carries no status, so it cannot tell "the server is gone" from
+  // "the server answered 401 because the session expired" — a reason to ask /health, never a
+  // verdict of its own.
   | 'stream-error'
+  // The app cancelled its own request (navigation, unmount, query cancellation). It never
+  // reached a conclusion about the server, so it is no evidence at all.
+  | 'request-cancelled'
   // A rejection that is neither a network failure nor a timeout (a bug in our own code, a
   // serializer throwing). It says nothing about the network, so it changes nothing.
   | 'other-error'
@@ -70,8 +76,11 @@ const FAILURE_SIGNALS = new Set<ReachabilitySignal>([
   'timeout',
   'gateway-error',
   'probe-failed',
-  'stream-error',
 ])
+
+// Signals that say nothing either way. They must not touch the failure streak: two requests the
+// app itself cancelled, minutes apart, would otherwise add up to an outage on a healthy server.
+const IGNORED_SIGNALS = new Set<ReachabilitySignal>(['request-cancelled', 'other-error'])
 
 // Anything that proves the server answered. `unauthorized` belongs here: a 401 is a reply, and a
 // reply is proof of reachability — it must never raise the banner, and it may clear it.
@@ -103,8 +112,12 @@ export function classifyStatus(status: number): ReachabilitySignal {
 
 /** What a rejected fetch says about reachability. */
 export function classifyFailure(error: unknown): ReachabilitySignal {
-  if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
-    return 'timeout'
+  if (error instanceof Error) {
+    // `AbortSignal.timeout()` rejects with TimeoutError — the server had its chance and took it.
+    // A plain AbortError is the app cancelling its own request, which proves nothing about the
+    // server and must never feed the verdict.
+    if (error.name === 'TimeoutError') return 'timeout'
+    if (error.name === 'AbortError') return 'request-cancelled'
   }
   if (error instanceof TypeError) return 'network-error'
   return 'other-error'
@@ -124,7 +137,10 @@ export function reduceReachability(
   signal: ReachabilitySignal,
   now: number,
 ): ReachabilityDecision {
-  if (signal === 'other-error') return { state, effects: [] }
+  if (IGNORED_SIGNALS.has(signal)) return { state, effects: [] }
+
+  // A stream error asks the question; only the probe's answer moves the verdict.
+  if (signal === 'stream-error') return { state, effects: [{ type: 'probe-now' }] }
 
   if (signal === 'browser-online' || signal === 'retry-requested') {
     // Never a verdict of its own — the device being "online" says nothing about the tunnel.
