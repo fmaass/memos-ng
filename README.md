@@ -99,6 +99,7 @@ The full local gate (must be green before pushing):
 
 ```bash
 uv run ruff check app/ tests/ scripts/
+uv run ruff format --check app/ tests/ scripts/
 uv run pyright app/
 uv run pytest -q
 uv run alembic check
