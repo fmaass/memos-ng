@@ -122,15 +122,32 @@ export interface FitPadding {
  * pixel a uniform padding will happily put a pin under: live at 1440x900 two of eight pins
  * landed behind it, unclickable. The reservation is MEASURED from the overlay on each fit
  * rather than named as a constant — the bar is a different height on a phone and grows again
- * when its controls wrap — and an overlay that does not actually overlap the pane (the phone's
- * in-view grid, which sits below the map) reserves nothing.
+ * when its controls wrap.
+ *
+ * The contract is deliberately narrow: this reserves for a BOTTOM-ANCHORED overlay that really
+ * intersects the pane on BOTH axes, and for nothing else. An overlay clear of the pane (the
+ * phone's in-view grid, below the map), one beside it, one entirely above it, and one anchored
+ * at the TOP of it all reserve nothing and leave the uniform padding exactly as it was. A top
+ * bar or a side panel would need a different side reserved, and inferring which from a
+ * rectangle would quietly mis-fit the one overlay the map actually has.
  */
 export function fitPadding(
   pane: PaneRect,
   overlay: PaneRect | null,
   base: number = FIT_PADDING,
 ): FitPadding {
-  const overlap = overlay ? Math.max(0, pane.bottom - Math.max(overlay.top, pane.top)) : 0
+  // Both axes, or an overlay that shares only a y-range with the pane (a side panel) would
+  // reserve as if it covered it; and only a bottom-anchored one, or a banner above the pane
+  // would reserve the whole pane height and swallow it.
+  const intersects =
+    !!overlay &&
+    overlay.right > pane.left &&
+    overlay.left < pane.right &&
+    overlay.bottom > pane.top &&
+    overlay.top < pane.bottom
+  const anchoredBottom = !!overlay && intersects && overlay.bottom > (pane.top + pane.bottom) / 2
+  const overlap =
+    overlay && anchoredBottom ? Math.max(0, pane.bottom - Math.max(overlay.top, pane.top)) : 0
   const top = Math.min(base, Math.max(0, (pane.height - MIN_FIT_SPAN) / 2))
   const room = pane.height - MIN_FIT_SPAN - top
   return { top, right: base, bottom: Math.max(0, Math.min(base + overlap, room)), left: base }

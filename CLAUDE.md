@@ -5,7 +5,7 @@
 A from-scratch replacement for the old `memos` (`neosmemo/memos:0.29.1`) plus its three support
 containers (`memos-nginx`, `memos-imgproxy`, `memos-resizer`) and the Merkur `memos-transcoder`.
 **All four collapse into memos-ng**: FastAPI serves the SPA + API + asset tiers (no nginx), and an
-in-stack `memos-ng-worker` (pyvips + ffmpeg, Postgres `media_jobs` queue) replaces imgproxy +
+in-stack `memos-ng-worker` (Pillow/pillow-heif + ffmpeg, Postgres `media_jobs` queue) replaces imgproxy +
 resizer + the 5-minute NFS transcoder.
 
 **State: SHIPPED — memos-ng IS production** at `https://memos.discomarder.live`; cutover done, the
@@ -48,7 +48,9 @@ Treat every deploy and every prod DB migration as production-affecting:
    live change into the sanitized in-repo template the same session.
 2. **Shared Postgres17 + Saturn host.** The real coupling is **thermal** — a transcode storm can
    trip a host shutdown. Reuse existing derived mp4s (no mass re-transcode); 1-thread throttle;
-   stay <70 °C.
+   stay <70 °C. That rule was set for **Saturn**, which shuts down fast when hot. The worker —
+   and so every transcode — has run on **jupiter** since 2026-07-15; jupiter's thermal guard
+   (sensor and threshold) is tracked in MEMNG-354.
 3. **Traefik** routes per-service (own router) — additive and isolated, but a bad router config
    can still cascade: do router changes as their own change in a quiet window.
 
@@ -63,7 +65,8 @@ Treat every deploy and every prod DB migration as production-affecting:
   session cookie. Token/JWKS via **public** `https://auth.discomarder.live/...` URLs only
   (never `http://authelia:9091`). `client_secret_post` + `one_factor`.
 - **Media:** two containers, one image — `memos-ng-app` + `memos-ng-worker`
-  (`command: worker`, `cpu_shares: 512`, `mem_limit: 4g`). Queue = Postgres `media_jobs`
+  (`command: worker`; its limits live in the stack compose, which is the authority — `cpus: 8`,
+  `mem_limit: 8g` since the 2026-07-15 move to jupiter). Queue = Postgres `media_jobs`
   with `FOR UPDATE SKIP LOCKED`. HEIC/HEVC originals kept as archive master (ADR-0008).
 
 Full detail: `docs/plans/PLAN_2026-06-20_memos-ng.md`.

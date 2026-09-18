@@ -141,6 +141,36 @@ describe('fitPadding', () => {
     expect(fitPadding(pane, below).bottom).toBe(FIT_PADDING)
   })
 
+  it('ignores an overlay entirely above the pane', () => {
+    // A banner over the header shares no pixel with the map: reserving for it would throw away
+    // the bottom of the pane for something that hides nothing.
+    const above = { top: 0, bottom: 40, left: 240, right: 1440, height: 40 }
+
+    expect(fitPadding(pane, above).bottom).toBe(FIT_PADDING)
+  })
+
+  it('ignores an overlay that misses the pane horizontally', () => {
+    // A side panel beside the map, at the same height: it overlaps on the y axis and covers no
+    // pin at all, so the reservation has to test both axes.
+    const beside = { top: 700, bottom: 900, left: 0, right: 239, height: 200 }
+
+    expect(fitPadding(pane, beside).bottom).toBe(FIT_PADDING)
+  })
+
+  it('reserves nothing for an overlay anchored at the TOP of the pane', () => {
+    // The contract is deliberately narrow: this reserves for a BOTTOM-anchored overlay only.
+    // A top bar overlapping the pane would need the top side reserved instead, and guessing
+    // that from a rectangle would silently mis-fit the one case the map actually has.
+    const topBar = { top: 40, bottom: 120, left: 240, right: 1440, height: 80 }
+
+    expect(fitPadding(pane, topBar)).toEqual({
+      top: FIT_PADDING,
+      right: FIT_PADDING,
+      bottom: FIT_PADDING,
+      left: FIT_PADDING,
+    })
+  })
+
   it('never lets the reservation swallow the pane', () => {
     // A short pane with a tall bar: padding that exceeds the pane leaves `fitBounds` no box to
     // solve for, and the first view lands on nothing instead of on the pins.
