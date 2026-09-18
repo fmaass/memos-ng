@@ -85,8 +85,9 @@ class Settings(BaseSettings):
     # only its sub-steps do (ffprobe 30 s, poster encode 60 s), while the Pillow/libheif decode and
     # encode are wrapped by no timeout at all. It is anchored on the two numbers that do exist: it
     # is half the 1800 s worker healthcheck bar, so the supervisor stops stamping with a full bar of
-    # margin before autoheal fires, and it is ~1500x the largest per-job light cost this deployment
-    # has measured (23 HEIC derives in 14 s, 2026-09-18). No source-derived light bound is claimed.
+    # margin before autoheal fires, and it sits far above the only light-class cost this deployment
+    # has measured: 23 HEIC derives in 14 s on 2026-09-18, i.e. about 0.6 s each ON AVERAGE. That
+    # is a batch figure; no per-job maximum was recorded. No source-derived light bound is claimed.
     WORKER_LIGHT_STALL_SECONDS: int = 900
 
     # Which media lanes a worker drains. Default = both (single-worker dev/CI + the original

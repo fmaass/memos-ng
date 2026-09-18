@@ -120,13 +120,25 @@ CLASS_TABLE = [
     ("slow/derive/mp4", JobLane.slow, JobKind.derive, "video/mp4", False, "transcode"),
     ("slow/derive/mov", JobLane.slow, JobKind.derive, "video/quicktime", False, "transcode"),
     ("slow/printready/jpeg", JobLane.slow, JobKind.printready, "image/jpeg", False, "light"),
-    # NOT a shape any path in app/ produces — enqueue_printready is image-only and
-    # process_printready_job raises on a non-image, saying that reaching it means a hand-made row.
-    # It is seeded here solely to make the `kind = derive` conjunct falsifiable: with that conjunct
-    # removed this row flips to `transcode`. A print rendition is never transcode work whatever the
-    # attachment's mime, so `light` is its right answer.
-    ("slow/printready/video", JobLane.slow, JobKind.printready, "video/mp4", False, "light"),
+    ("fast/printready/jpeg", JobLane.fast, JobKind.printready, "image/jpeg", False, "light"),
+    # Neither image nor video: the mime term is a positive `video/%` test, so anything else is
+    # light by the same rule that makes a HEIC light — stated as its own category, not inferred.
+    ("slow/derive/pdf", JobLane.slow, JobKind.derive, "application/pdf", False, "light"),
+    ("slow/derive/audio", JobLane.slow, JobKind.derive, "audio/mpeg", False, "light"),
     ("orphan slow/derive", JobLane.slow, JobKind.derive, None, True, "light"),
+]
+
+# Every kind that is NOT `derive`, on the slow lane, with a video attachment. Generated from the
+# enum so a kind added later arrives here with no test edit, and the expected value stays the
+# LITERAL `light`: whatever else a job derives, it is not the H.264 transcode. These rows are NOT a
+# shape any path in app/ produces — enqueue_printready is image-only and process_printready_job
+# raises on a non-image, saying in so many words that reaching it means a hand-made row. They are
+# seeded solely to make the `kind = derive` conjunct falsifiable: with that conjunct removed they
+# flip to `transcode`.
+CLASS_TABLE += [
+    (f"slow/{kind}/video", JobLane.slow, kind, "video/mp4", False, "light")
+    for kind in JobKind
+    if kind is not JobKind.derive
 ]
 CLASS_TABLE_IDS = [row[0] for row in CLASS_TABLE]
 
@@ -186,10 +198,10 @@ async def test_the_transcode_claim_uses_a_correlated_exists_and_locks_only_media
     what Postgres was really asked to do and not a second construction of it.
     """
     await _seed_job(adb, lane=JobLane.slow, mime="video/mp4")
-    captured: list[str] = []
+    captured: list[tuple[str, object]] = []
 
     def _capture(conn, cursor, statement, parameters, context, executemany):
-        captured.append(statement)
+        captured.append((statement, parameters))
 
     event.listen(Engine, "before_cursor_execute", _capture)
     try:
@@ -197,11 +209,21 @@ async def test_the_transcode_claim_uses_a_correlated_exists_and_locks_only_media
     finally:
         event.remove(Engine, "before_cursor_execute", _capture)
 
-    sql = next(s for s in captured if "FOR UPDATE" in s)
-    assert "EXISTS" in sql
-    assert "FOR UPDATE OF media_jobs" in sql
-    assert "SKIP LOCKED" in sql
-    assert "JOIN" not in sql.upper()
+    sql, params = next((s, p) for s, p in captured if "FOR UPDATE" in s)
+    flat = " ".join(sql.split())
+
+    # Named on the ATTACHMENTS subquery specifically: the order guard contributes an EXISTS of its
+    # own over media_jobs, so a bare "EXISTS is present" assertion would pass with the class term
+    # gone entirely.
+    assert "EXISTS (SELECT 1 FROM attachments" in flat
+    assert "attachments.id = media_jobs.attachment_id" in flat
+    assert "attachments.mime LIKE" in flat
+    values = list(params.values()) if isinstance(params, dict) else list(params)
+    assert "video/%" in values  # the prefix match, not an equality on one container
+
+    assert "FOR UPDATE OF media_jobs" in flat
+    assert "SKIP LOCKED" in flat
+    assert "JOIN" not in flat.upper()
 
 
 def _seed_committed(mime: str, lane: JobLane, kind: str = JobKind.derive) -> tuple[int, int]:
@@ -317,7 +339,7 @@ async def _seed_importer_pair(
     return prior, later
 
 
-@pytest.mark.parametrize("blocking_state", [JobState.queued, JobState.processing, JobState.claimed])
+@pytest.mark.parametrize("blocking_state", [JobState.queued, JobState.processing])
 async def test_the_order_guard_holds_a_successor_back_while_its_predecessor_is_in_flight(
     adb, blocking_state
 ):
@@ -326,6 +348,22 @@ async def test_the_order_guard_holds_a_successor_back_while_its_predecessor_is_i
     await adb.flush()
 
     assert await worker.claim_one(adb, lanes=BOTH_LANES, job_class="transcode") is None
+
+
+async def test_a_claimed_predecessor_does_not_block_its_successor(adb):
+    """`claimed` must stay OUT of the guard's set, or the hold it creates has no bound.
+
+    Nothing in the media queue ever writes `claimed` — the claim writes `processing` — and nothing
+    would ever leave it: the claim selects `queued` and the stale sweep selects `processing`. A
+    guard that waited on a state no path produces and no path clears would strand every later job
+    of that attachment for good.
+    """
+    prior, later = await _seed_importer_pair(adb)
+    prior.state = JobState.claimed
+    await adb.flush()
+
+    claimed = await worker.claim_one(adb, lanes=BOTH_LANES, job_class="transcode")
+    assert claimed is not None and claimed.id == later.id
 
 
 @pytest.mark.parametrize("terminal_state", [JobState.done, JobState.failed])
@@ -456,3 +494,90 @@ def test_the_dead_worker_concurrency_setting_is_gone(monkeypatch):
     assert "WORKER_CONCURRENCY" not in Settings.model_fields
     monkeypatch.setenv("WORKER_CONCURRENCY", "4")
     Settings()  # extra="ignore" — a leftover env key is not a startup failure
+
+
+def _add_committed_job(aid: int, lane: JobLane, kind: str = JobKind.derive) -> int:
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        jid = c.execute(
+            text(
+                "INSERT INTO media_jobs (attachment_id, lane, kind, state, attempts, progress_pct) "
+                "VALUES (:a, CAST(:l AS job_lane), :k, CAST('queued' AS job_state), 0, 0) "
+                "RETURNING id"
+            ),
+            {"a": aid, "l": str(lane), "k": str(kind)},
+        ).scalar_one()
+    eng.dispose()
+    return jid
+
+
+def test_an_uncommitted_claim_already_holds_the_next_job_of_that_attachment():
+    """The "no window" claim, tested across two real sessions rather than asserted in a comment.
+
+    Session A claims the earlier job and does NOT commit, so session B — reading its own snapshot —
+    still sees that row as `queued`. `queued` is in the guard's set precisely so that this instant,
+    between a claim and its commit, is covered: B must not take the later job of that attachment,
+    while an unrelated attachment's job stays available to it.
+    """
+    aid_x, job1 = _seed_committed("video/mp4", JobLane.fast)  # the poster job — light class
+    job2 = _add_committed_job(aid_x, JobLane.slow)  # its transcode job, higher id
+    aid_y, job3 = _seed_committed("video/mp4", JobLane.slow)  # an unrelated transcode job
+
+    async def _go():
+        async with async_session() as db_a, async_session() as db_b:
+            held = None
+            for _ in range(50):  # walk past any row another test left behind
+                j = await worker.claim_one(db_a, lanes=BOTH_LANES, job_class="light")
+                if j is None:
+                    break
+                if j.id == job1:
+                    held = j.id
+                    break
+            transcode_ids = set()
+            for _ in range(50):
+                j = await worker.claim_one(db_b, lanes=BOTH_LANES, job_class="transcode")
+                if j is None:
+                    break
+                transcode_ids.add(j.id)
+            await db_a.rollback()  # nothing is ever committed: the window stays open throughout
+            await db_b.rollback()
+            return held, transcode_ids
+
+    try:
+        held, transcode_ids = asyncio.run(_go())
+        assert held == job1  # session A is holding the earlier job, uncommitted
+        assert job2 not in transcode_ids  # the successor is held back across the window
+        assert job3 in transcode_ids  # a different attachment is not caught by the guard
+    finally:
+        _cleanup_committed([aid_x, aid_y], [job1, job2, job3])
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_a_nonpositive_transcode_cpu_cost_is_refused(slot_settings, value):
+    # A negative cost would be SUBTRACTED from the demand and let any configuration through.
+    slot_settings(WORKER_TRANSCODE_CPU_COST=value)
+    with pytest.raises(ValueError, match=f"WORKER_TRANSCODE_CPU_COST={value} must be at least 1"):
+        worker.validate_worker_slots()
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_a_nonpositive_cpu_budget_is_refused(slot_settings, value):
+    slot_settings(WORKER_CPU_BUDGET=value)
+    with pytest.raises(ValueError, match=f"WORKER_CPU_BUDGET={value} must be at least 1"):
+        worker.validate_worker_slots()
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_a_nonpositive_ffmpeg_thread_count_is_refused(slot_settings, value):
+    # 0 is ffmpeg's "pick it yourself", which leaves the budget with no number to reason from.
+    slot_settings(FFMPEG_THREADS=value)
+    with pytest.raises(ValueError, match=f"FFMPEG_THREADS={value} must be at least 1"):
+        worker.validate_worker_slots()
+
+
+def test_the_deployed_configuration_validates():
+    # The real production shape, read off the deployed environment: both lanes on one worker, one
+    # encoder thread, and every setting this change adds left on its in-code default.
+    assert worker.parse_worker_lanes(settings.WORKER_LANES) == [JobLane.fast, JobLane.slow]
+    assert settings.FFMPEG_THREADS == 1
+    worker.validate_worker_slots()

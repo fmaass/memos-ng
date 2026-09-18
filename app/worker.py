@@ -55,9 +55,15 @@ ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message he
 # claim has no class term — drain the very same rows serially.
 JobClass = Literal["transcode", "light"]
 # Both in-flight states block a successor, so there is no window between an earlier job's claim and
-# its commit. Terminal states never block. `claimed` is unused by the media queue (claim_one writes
-# `processing`) and is listed for safety, matching the reconcile path's own in-flight set.
-IN_FLIGHT_STATES = (JobState.queued, JobState.claimed, JobState.processing)
+# its commit: a claimer reading its own snapshot still sees the predecessor as `queued`. Terminal
+# states never block.
+#
+# Deliberately NARROWER than reconcile's IN_FLIGHT_JOBS, which also lists `claimed`: there the
+# extra state only SUPPRESSES a requeue, so including a state nothing produces is harmless, while
+# here it would WITHHOLD a claim. Nothing in the media queue ever writes `claimed` (the claim
+# writes `processing`) and nothing would ever clear it (the claim selects `queued`, the stale sweep
+# selects `processing`), so waiting on it would strand every later job of that attachment for good.
+IN_FLIGHT_STATES = (JobState.queued, JobState.processing)
 
 
 def validate_worker_slots() -> None:
@@ -82,6 +88,25 @@ def validate_worker_slots() -> None:
                 "files, synchronous image work on the event loop, and a 5+5 connection pool all "
                 "have to be addressed first)"
             )
+
+    # Checked BEFORE the arithmetic below, which a nonpositive number would quietly defeat: a
+    # negative cost is SUBTRACTED from the demand and lets any configuration through.
+    if settings.WORKER_TRANSCODE_CPU_COST < 1:
+        raise ValueError(
+            f"WORKER_TRANSCODE_CPU_COST={settings.WORKER_TRANSCODE_CPU_COST} must be at least 1: "
+            "a transcode cannot cost no cores, and a negative cost would cancel the budget out"
+        )
+    if settings.WORKER_CPU_BUDGET < 1:
+        raise ValueError(
+            f"WORKER_CPU_BUDGET={settings.WORKER_CPU_BUDGET} must be at least 1: a worker with no "
+            "cores to spend cannot run a consumer at all"
+        )
+    if settings.FFMPEG_THREADS < 1:
+        raise ValueError(
+            f"FFMPEG_THREADS={settings.FFMPEG_THREADS} must be at least 1: 0 is ffmpeg's "
+            "'choose the thread count yourself', which leaves the CPU budget below with no "
+            "encoder figure to be checked against"
+        )
 
     demand = (
         settings.WORKER_TRANSCODE_SLOTS * settings.WORKER_TRANSCODE_CPU_COST
@@ -160,7 +185,12 @@ def _transcode_class_predicate():
     A correlated EXISTS in WHERE, never a join. Postgres applies a locking clause only to rows
     coming from the outer query's FROM list, so this subquery takes no lock at all — `attachments`
     is read unlocked and the job-then-attachment order every co-holding path acquires in stays
-    untouched. A join would pull `attachments` into that FROM and lock it too.
+    untouched.
+
+    A join would put `attachments` in that FROM list, where a bare locking clause would lock it
+    too; the `of=MediaJob` the claim carries would in fact stop that. The subquery form is kept
+    because it needs no such care, and because it leaves the claim's FROM list — and with it the
+    lock census that is keyed on this statement — exactly as it already was.
     """
     return and_(
         MediaJob.lane == JobLane.slow,
