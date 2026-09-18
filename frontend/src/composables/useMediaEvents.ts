@@ -2,6 +2,7 @@ import type { QueryClient } from '@tanstack/vue-query'
 import { useQueryClient } from '@tanstack/vue-query'
 import { getCurrentInstance, onUnmounted } from 'vue'
 
+import { reachability } from '@/api/reachability'
 import type { components } from '@/api/schema'
 import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
 
@@ -94,9 +95,15 @@ function anyMemoCacheInFlight(queryClient: QueryClient): boolean {
 // at network-RTT speed, a worse hammering than the native reconnect this module replaces.
 export const RECONNECT_DELAY_MS = 3000
 
+// The event stream is a second, free source of reachability evidence: its open/error are real
+// traffic to the same server. Optional and defaulted to a no-op so this module stays drivable
+// from a test with nothing but a fake EventSource.
+export type ReachabilityReporter = (signal: 'stream-open' | 'stream-error') => void
+
 export function startMediaEvents(
   queryClient: QueryClient,
   createSource: MediaEventSourceFactory,
+  report: ReachabilityReporter = () => {},
 ): () => void {
   let source: MediaEventSource | null = null
   let connected = false
@@ -123,6 +130,7 @@ export function startMediaEvents(
     source = createSource('/api/events')
     connected = true
     source.onopen = () => {
+      report('stream-open')
       if (everConnected) {
         void queryClient.invalidateQueries({ queryKey: ['memos'] })
       }
@@ -142,6 +150,7 @@ export function startMediaEvents(
       )
     }
     source.onerror = () => {
+      report('stream-error')
       closeSource()
       if (retryTimer !== null) return
       retryTimer = setTimeout(() => {
@@ -168,7 +177,11 @@ export function useMediaEvents() {
   const queryClient = useQueryClient()
   if (typeof EventSource === 'undefined') return
 
-  const stop = startMediaEvents(queryClient, (url) => new EventSource(url))
+  const stop = startMediaEvents(
+    queryClient,
+    (url) => new EventSource(url),
+    (signal) => reachability.report(signal),
+  )
 
   if (getCurrentInstance()) onUnmounted(stop)
 }
