@@ -75,6 +75,40 @@ async def adb(db_engine):
             await trans.rollback()
 
 
+@pytest.fixture(scope="session")
+def _empty_hwmon(tmp_path_factory):
+    return tmp_path_factory.mktemp("hwmon-empty")
+
+
+@pytest.fixture(autouse=True)
+def _thermal_sensor_is_not_this_machine(_empty_hwmon):
+    """No test reads the running machine's CPU temperature.
+
+    The guard resolves its sensor by chip name, and the host this suite runs on IS the production
+    host — a real coretemp package that crosses THERMAL_MAX_C under load. Left alone, whether a
+    media test deferred would depend on how warm the machine happened to be, so every test starts
+    from an empty hwmon tree: nothing found, state UNKNOWN, guard open. A test that wants a
+    temperature sets THERMAL_ZONE or points HWMON_ROOT at a tree of its own — both override this.
+
+    Saves and restores by hand rather than taking `monkeypatch`, and that is not a style choice:
+    an AUTOUSE fixture requesting monkeypatch has it built before every other fixture of the test,
+    so it is also undone after them — which left another test's `commit` patch in place during a
+    fixture teardown that committed, and leaked a row into two later tests. A fixture that exists
+    to keep the suite deterministic must not reorder anyone else's teardown.
+    """
+    from app.config import settings
+    from app.services import media
+
+    saved_root, saved_zone = media.HWMON_ROOT, settings.THERMAL_ZONE
+    media.HWMON_ROOT = _empty_hwmon
+    settings.THERMAL_ZONE = ""
+    try:
+        yield
+    finally:
+        media.HWMON_ROOT = saved_root
+        settings.THERMAL_ZONE = saved_zone
+
+
 @pytest.fixture(autouse=True)
 def _reset_rate_limit():
     # The login rate-limiter keeps per-IP state in a module dict; all tests share the one

@@ -862,6 +862,18 @@ class _DrainHealth:
 
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
+    # Say what the thermal guard is actually reading, ONCE per process and here rather than in the
+    # guard: this runs before any consumer task exists, so it needs no latch, no lock and no
+    # module-level "have I logged this" flag that two concurrent drains could race on — and it
+    # cannot become a flood the way a line inside the per-job guard would. UNKNOWN is a real
+    # answer worth seeing in the log: it means the worker is draining with no thermal protection,
+    # which is correct on a dev host and would be a finding in production.
+    logger.info(
+        "worker_thermal_sensor",
+        state=str(media.thermal_state()),
+        sensor=str(media.thermal_sensor() or ""),
+        max_c=settings.THERMAL_MAX_C,
+    )
     beat()  # blocking-ok: the liveness stamp itself — see beat()
     # Schema gate (MEMNG-86): a deploy recreates app + worker together, but only the app migrates.
     # Wait for the live schema to reach the head this image was built with before running the
