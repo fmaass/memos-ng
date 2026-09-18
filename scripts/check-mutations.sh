@@ -37,9 +37,13 @@ TWO GUARDS, AND THEY COVER DIFFERENT HAZARDS. Neither substitutes for the other:
 The lock is `mutation-gate.lock` in this working tree's own git directory, taken with flock and
 held for the whole run. The build takes the same lock (see RELEASING.md) and waits for it; this
 script does NOT wait — it refuses immediately, because a gate that silently blocks for minutes
-reads as a hang, while a build that waits simply starts later and is still correct. The lock is
-released by the kernel when this process exits, on every path including a kill, so there is no
-release step that can be forgotten or skipped.
+reads as a hang, while a build that waits simply starts later.
+
+The LOCK needs no cleanup after any exit: the kernel drops it when this process dies, so there is
+no release step to forget. THE TREE IS A DIFFERENT MATTER. A SIGKILL runs no trap, so a run killed
+that way can leave the patch applied, and the lock being free afterwards says nothing about it.
+That is why the build script (scripts/build-image.sh) checks, under the lock, that no tracked file
+differs from HEAD before it builds: waiting for the lock is not by itself proof of a clean tree.
 
 Run from the repository root. For every row of tests/mutations/expected.tsv the script:
 
@@ -124,8 +128,18 @@ for case in ET.parse(sys.argv[1]).iter("testcase"):
     print(kind + "\t" + "::".join(part for part in [path, *classes, name] if part))
 '
 
+# THE one place a `uv` child is started. Every one of them runs with fd 9 — the mutation gate
+# lock — CLOSED. The lock is this process's hold: a child that outlives us (a pytest still winding
+# down after a kill, a parse) must not go on holding a lock whose owner is gone, and the tree it
+# would be guarding has already been reverted by the trap. It also keeps --selftest honest, where
+# leg 5 kills a run and leg 6 immediately starts another. Callers keep their own redirections and
+# `env` prefix; this wrapper adds only the one that must never be forgotten at a new call site.
+run_uv() {
+    "$@" 9>&-
+}
+
 parse_junit_cases() {
-    uv run python -c "$PARSE_PY" "$1"
+    run_uv uv run python -c "$PARSE_PY" "$1"
 }
 
 # pytest's own count of failures and errors, from its summary line only — an unanchored search of
@@ -544,11 +558,7 @@ mapfile -t control_modules < <(printf '%s\n' "${modules[@]}" | LC_ALL=C sort -u)
 for control_module in "${control_modules[@]}"; do
     control_log="$logdir/control-$(printf '%s' "$control_module" | tr '/.' '__').log"
     echo "control: running $control_module with $MARKER_VAR removed from the environment (must exit 0)"
-    # 9>&- : the lock is THIS process's hold, and a pytest child must not extend it past our own
-    # exit. Without it a run killed mid-flight would leave the lock held by the surviving child
-    # until that child finished — and the tree it would be guarding has already been reverted by
-    # the trap. It also keeps `--selftest` honest: leg 5 kills a run and leg 6 starts another.
-    env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null 9>&-
+    run_uv env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null
     control_rc=$?
     if [ "$control_rc" -eq 0 ]; then
         echo "control: PASS — the unmutated $control_module exits 0"
@@ -586,8 +596,8 @@ for i in "${!patches[@]}"; do
         continue
     fi
 
-    env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
-        "$module" > "$log" 2>&1 < /dev/null 9>&-
+    run_uv env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
+        "$module" > "$log" 2>&1 < /dev/null
     rc=$?
 
     if ! revert_applied; then
