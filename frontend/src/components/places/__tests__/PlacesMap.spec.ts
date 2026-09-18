@@ -194,3 +194,25 @@ describe('PlacesMap timeline seam', () => {
     wrapper.unmount()
   })
 })
+
+describe('PlacesMap pin payload', () => {
+  /** Three photos from one spot, so they collapse into a single badge pin. */
+  const here = (uid: string) =>
+    marker({ uid, taken_at: '2025-03-10T12:00:00Z', latitude: 47.5, longitude: 8.5 })
+
+  it('hands the drawer the photos the pin now holds, not the ones it held', async () => {
+    // A refreshed markers query after one photo was deleted and another arrived at the same spot:
+    // the pin's lead, count and coordinate are unchanged, only its membership moved.
+    const wrapper = mount(PlacesMap, { props: { markers: [here('a'), here('b')] } })
+    await flushPromises()
+    maplibre.state.map?.fire('load')
+
+    await wrapper.setProps({ markers: [here('a'), here('c')] })
+    const pin = maplibre.state.elements.filter(({ lngLat }) => lngLat[0] === 8.5).at(-1)?.element
+    pin?.dispatchEvent(new Event('click'))
+    await flushPromises()
+
+    expect(wrapper.emitted('cluster-open')?.at(-1)).toEqual([{ clusterId: null, uids: ['a', 'c'] }])
+    wrapper.unmount()
+  })
+})
