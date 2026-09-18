@@ -513,23 +513,56 @@ def test_a_published_archive_that_stops_verifying_is_refused_never_rewritten(tmp
 # --- the extraction script's pruning ----------------------------------------------------------
 
 DOCKER_STUB = """#!/bin/sh
-# Plays `docker run ... protomaps/go-pmtiles <subcommand>`: an extract writes the archive it was
-# asked for, a verify accepts it. The tiles directory is learned from the -v mount the script
-# passes, exactly as the real tool learns it, so a script that stopped mounting it would fail here.
+# Plays `docker run ...` for both images extract.sh uses: the go-pmtiles extractor (an extract
+# writes the archive it was asked for, a verify accepts it) and the small helper that performs the
+# renames as the publishing user (`sh -c <snippet>` against /tiles). The tiles directory is learned
+# from the -v mount the script passes, exactly as the real tools learn it, so a script that stopped
+# mounting it would fail here.
 #
-# With PMTILES_STUB_ARGV set it also appends its own argv to that file, one argument per line and
-# a `--` between invocations: the only way to see what the script actually handed `docker run`.
-if [ -n "${PMTILES_STUB_ARGV:-}" ]; then
-  for a in "$@"; do printf '%s\\n' "$a" >> "$PMTILES_STUB_ARGV"; done
-  printf -- '--\\n' >> "$PMTILES_STUB_ARGV"
-fi
+# With PMTILES_STUB_ARGV set it appends its own argv to that file, one argument per line and a `--`
+# between invocations: the only way to see what the script actually handed `docker run`.
+#
+# With PMTILES_STUB_GUARD set to a mode, it stands in for a container running as a user the caller
+# is NOT: the tiles directory is writable only while this stub is working, and goes back to that
+# mode afterwards. A write the script makes outside a container then fails, which is the whole
+# point of the read-only case below.
 tiles=""
-for a in "$@"; do
-  case "$a" in *:/tiles) tiles="${a%:/tiles}" ;; esac
-done
-mode=""
 src=""
+for a in "$@"; do
+  case "$a" in
+    *:/tiles) tiles="${a%:/tiles}" ;;
+    *:/src:ro) src="${a%:/src:ro}" ;;
+  esac
+done
+if [ -n "${PMTILES_STUB_ARGV:-}" ]; then
+  for a in "$@"; do printf '%s\n' "$a" >> "$PMTILES_STUB_ARGV"; done
+  printf -- '--\n' >> "$PMTILES_STUB_ARGV"
+fi
+lift() { [ -n "${PMTILES_STUB_GUARD:-}" ] && [ -n "$tiles" ] && chmod u+w "$tiles"; return 0; }
+drop() {
+  [ -n "${PMTILES_STUB_GUARD:-}" ] && [ -n "$tiles" ] && chmod "$PMTILES_STUB_GUARD" "$tiles"
+  return 0
+}
+
+case " $* " in
+  *" sh -c "*)
+    snippet=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "-c" ]; then snippet="$a"; break; fi
+      prev="$a"
+    done
+    lift
+    sh -c "$(printf '%s' "$snippet" | sed -e "s#/tiles#$tiles#g" -e "s#/src#$src#g")"
+    rc=$?
+    drop
+    exit $rc
+    ;;
+esac
+
+mode=""
 out=""
+seen_src=""
 for a in "$@"; do
   if [ -z "$mode" ]; then
     case "$a" in extract|verify|show) mode="$a" ;; esac
@@ -537,13 +570,17 @@ for a in "$@"; do
   fi
   case "$a" in -*) continue ;; esac
   if [ "$mode" = extract ]; then
-    if [ -z "$src" ]; then src="$a"; elif [ -z "$out" ]; then out="$a"; fi
+    if [ -z "$seen_src" ]; then seen_src="$a"; elif [ -z "$out" ]; then out="$a"; fi
   fi
 done
 if [ "$mode" = extract ]; then
   [ -n "$out" ] || exit 3
   [ -n "$tiles" ] || exit 3
+  lift
   printf 'PMTiles-stub-archive' > "${tiles}/$(basename "$out")"
+  rc=$?
+  drop
+  [ "$rc" = 0 ] || exit "$rc"
 fi
 exit 0
 """
@@ -635,15 +672,21 @@ def test_the_container_user_defaults_to_the_caller_so_a_local_directory_is_uncha
     assert {_user_argument(c) for c in calls} == {f"{os.getuid()}:{os.getgid()}"}
 
 
-def test_the_container_user_override_reaches_every_container_invocation(tmp_path):
-    """--user is the whole point of the ticket, so what is asserted is the argv `docker run` got.
+# 1027:100 is the production share's owner and the value RELEASING.md names, but a runner that
+# happened to BE 1027:100 would make "the override differs from the caller" vacuously false, so the
+# override these tests use is chosen to differ from whoever runs them.
+PRODUCTION_USER = "1027:100"
+OVERRIDE_USER = PRODUCTION_USER if (os.getuid(), os.getgid()) != (1027, 100) else "1028:101"
 
-    On the production tiles share the go-pmtiles container can only write as the share's owner —
-    the export's ACL decides by numeric uid and masks the unix mode, so a container running as the
-    caller is refused on a 0777 directory. A test that only checked the script's exit code would
-    pass with the flag parsed and then dropped, which is exactly the bug; hence a stub `docker` on
-    PATH that records its own argv, and an assertion that EVERY invocation carries the override —
-    one un-overridden call is one permission denied, and the publish stops there.
+
+def test_the_container_user_override_reaches_every_container_invocation(tmp_path):
+    """--user has to reach EVERY container, not just the extractor.
+
+    On the production tiles share only the share's owner may write, and this script writes there in
+    more than one way: the extraction, then the renames that publish it. A test that only checked
+    the script's exit code would pass with the flag parsed and dropped, which is the bug; hence a
+    stub `docker` on PATH that records its own argv, and an assertion over every invocation — one
+    call left at the caller's uid is one permission denied, mid-publish.
     """
     tiles = tmp_path / "tiles"
     tiles.mkdir()
@@ -658,20 +701,104 @@ def test_the_container_user_override_reaches_every_container_invocation(tmp_path
         "--dev",
         "small",
         "--user",
-        "1027:100",
+        OVERRIDE_USER,
         extra_env={"PMTILES_STUB_ARGV": str(argv_log)},
     )
     assert run.returncode == 0, (run.stdout, run.stderr)
 
     calls = _recorded_invocations(argv_log)
-    assert len(calls) == 4, calls
-    assert {_user_argument(c) for c in calls} == {"1027:100"}
-    # and the caller's own id is nowhere in the argv any more, not even as a leftover earlier flag
+    # the extractor's four, plus every rename/delete/write the publish performs
+    assert len(calls) > 4, calls
+    users = {_user_argument(c) for c in calls if any(a.endswith(":/tiles") for a in c)}
+    assert users == {OVERRIDE_USER}, calls
     assert not any(f"{os.getuid()}:{os.getgid()}" in c for c in calls), calls
-    # positive control: the archives were still published, so the assertions above ran against a
-    # real end-to-end publish rather than a run that died before reaching the container
+    # positive control: the assertions ran against a real end-to-end publish
     assert (tiles / "planet-20260917.pmtiles").is_file(), run.stdout
     assert list(tiles.glob("detail-20260917-*.pmtiles")), run.stdout
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores the directory mode this case relies on")
+def test_with_an_override_the_publish_touches_a_directory_the_caller_cannot_write(tmp_path):
+    """The real surface: a tiles directory the CALLER may not write, published into anyway.
+
+    This is what the production share is. The first version of this change made only the extractor
+    run as the share's owner, so the extract succeeded and the very next step — the rename that
+    publishes it — was refused by the same directory; the script still could not publish, which was
+    the ticket. Here the directory is mode 0555 and the stub `docker`, standing in for a container
+    running as a user the caller is not, lifts the mode only while it is itself working. So every
+    byte that lands in this directory provably came from a container: anything the script does in
+    its own shell fails.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = tmp_path / "regions.geojson"
+    regions.write_text('{"type":"Polygon","coordinates":[]}')
+    stub_dir = _stub_docker(tmp_path)
+    tiles.chmod(0o555)
+    try:
+        run = _run_extract(
+            tiles,
+            stub_dir,
+            str(regions),
+            "--build",
+            "20260917",
+            "--user",
+            OVERRIDE_USER,
+            extra_env={"PMTILES_STUB_GUARD": "0555"},
+        )
+        assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
+
+        names = sorted(p.name for p in tiles.iterdir())
+        assert "planet-20260917.pmtiles" in names, names
+        detail = [n for n in names if n.startswith("detail-20260917-") and n.endswith(".pmtiles")]
+        assert detail, names
+        assert any(n.endswith(".regions.geojson") for n in names), names  # the sidecar
+        assert "BUILD" in names, names
+        assert not [n for n in names if n.endswith(".tmp")], names  # nothing half-written left
+        build = (tiles / "BUILD").read_text()
+        assert "planet=planet-20260917.pmtiles" in build, build
+    finally:
+        tiles.chmod(0o755)
+
+
+def test_the_user_flag_without_a_value_is_refused(tmp_path):
+    """`--user` last on the line: the value is missing, and consuming the next argument that is not
+    there must not silently become "no override" on a share where that is the difference between
+    publishing and a permission denied."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+
+    run = _run_extract(tiles, stub_dir, "--build", "20260917", "--dev", "small", "--user")
+
+    assert run.returncode == 2, (run.returncode, run.stdout, run.stderr)
+    assert "--user needs a value" in run.stderr, run.stderr
+    assert list(tiles.iterdir()) == [], list(tiles.iterdir())
+
+
+def test_an_exported_pmtiles_user_does_not_change_the_container_user(tmp_path):
+    """Which uid wrote a published archive belongs in the command an operator can read back, not in
+    an exported variable that a stale shell can carry into the next publish unseen. The name is an
+    internal one; a value in the environment has to be ignored."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    argv_log = tmp_path / "argv.log"
+
+    run = _run_extract(
+        tiles,
+        stub_dir,
+        "--build",
+        "20260917",
+        "--dev",
+        "small",
+        extra_env={"PMTILES_USER": "31337:31337", "PMTILES_STUB_ARGV": str(argv_log)},
+    )
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    calls = _recorded_invocations(argv_log)
+    assert {_user_argument(c) for c in calls} == {f"{os.getuid()}:{os.getgid()}"}, calls
+    assert not any("31337:31337" in c for c in calls), calls
 
 
 @pytest.mark.parametrize("value", ["root", "1027", "1027:100:1", "1027:staff", ""])

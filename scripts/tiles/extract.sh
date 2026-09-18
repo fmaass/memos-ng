@@ -2,11 +2,16 @@
 # Publish the self-hosted basemap archives into a tiles directory.
 #
 #   extract.sh <tiles-dir> <regions.geojson> [--build YYYYMMDD] [--dev small|large]
-#                                            [--user uid:gid]
+#                                            [--user uid:gid] [--helper-image IMAGE]
 #
-# --user is the numeric uid:gid the go-pmtiles container runs as; it defaults to the caller's own,
-# which is what an ordinary local tiles directory wants. Publishing into the production tiles share
-# needs its owner, --user 1027:100 (see THE CONTAINER USER below).
+# --user is the numeric uid:gid that PUBLISHES: every write into the tiles directory is made as
+# that user, both the extraction and every rename, copy and delete around it. It defaults to the
+# caller's own, which is what an ordinary local tiles directory wants and leaves this script
+# behaving exactly as it always has. Publishing into the production tiles share needs its owner,
+# --user 1027:100 (see THE CONTAINER USER below).
+#
+# --helper-image is the small image those renames run in when --user is given (default busybox:stable;
+# it must already be present locally — the script refuses before writing anything if it is not).
 #
 # Produces two PMTiles archives cut from the Protomaps daily planet build:
 #   planet-<build>.pmtiles          the whole world, z0-7  — always renders something
@@ -30,10 +35,21 @@
 # Synology export whose ACL decides by numeric uid and MASKS the unix mode: the directory is mode
 # 0777 owned 1000:1000, yet a container running as 1000:1000 is refused
 # ("open /tiles/<name>.tmp: permission denied") while the share's owner 1027:100 — the uid the app
-# and worker containers run as — is accepted. fetch-assets.sh never hit this because it writes from
-# the host shell, which the export treats differently, and so do this script's own renames and the
-# BUILD file. Only the extraction needs the override, and it needs it on every invocation: one call
-# left at the caller's uid is one permission denied, mid-publish.
+# and worker containers run as — is accepted.
+#
+# The extraction is only half of it. This script also creates, renames and deletes files in that
+# directory around the container — the .tmp it renames into place, the regions sidecar, the pruned
+# generations, BUILD — and those run in the calling shell. Against the production share the caller
+# is refused there too, so an override that covered the container alone would move the failure one
+# line down and no further: the extract would succeed and the rename that publishes it would not.
+# fetch-assets.sh does write from the host shell and works, which is what made this easy to
+# misread; it writes as the operator into a directory the operator may write, which the share and
+# the container case are not.
+#
+# So when --user is given, NOTHING in the tiles directory is written by this shell. Every create,
+# rename and delete goes through tiles_do(), a throwaway container running as that same user, and
+# the shell only reads (listing, sizes) and decides. Without --user nothing changes: the writes are
+# ordinary shell builtins, no helper container is started, and no helper image is needed.
 #
 # TOOL FLAGS — read off `go-pmtiles v1.31.2` itself (2026-09-17, image digest
 # sha256:06574f01f55a78f78f887bc7ebf729a5c093c0d6e17d9876300cfcb0758b59d3), not assumed:
@@ -52,6 +68,12 @@
 set -euo pipefail
 
 PMTILES_IMAGE="protomaps/go-pmtiles:v1.31.2"
+# The go-pmtiles image is distroless — /go-pmtiles and nothing else, no shell and an EMPTY
+# /usr/bin — so it cannot perform the renames, and they need a second image. It is only ever
+# started when --user is given, and the script checks it is present locally BEFORE it writes
+# anything rather than discovering a missing image (or a registry outage) halfway through a
+# publish. Any image with a POSIX shell will do; override it with --helper-image.
+HELPER_IMAGE="busybox:stable"
 PLANET_MAXZOOM=7
 DETAIL_MAXZOOM=15
 DEV_MAXZOOM=12
@@ -80,7 +102,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --build) BUILD="${2:-}"; shift 2 ;;
         --dev) DEV="${2:-}"; shift 2 ;;
-        --user) PMTILES_USER="${2:-}"; USER_GIVEN=1; shift 2 ;;
+        --user)
+            [ $# -ge 2 ] || { echo "extract.sh: --user needs a value" >&2; exit 2; }
+            PMTILES_USER="$2"; USER_GIVEN=1; shift 2 ;;
+        --helper-image)
+            [ $# -ge 2 ] || { echo "extract.sh: --helper-image needs a value" >&2; exit 2; }
+            HELPER_IMAGE="$2"; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "extract.sh: unknown option $1" >&2; usage ;;
         *)
@@ -111,6 +138,16 @@ if [ "$USER_GIVEN" = 1 ]; then
 else
     PMTILES_USER="$(id -u):$(id -g)"
 fi
+
+# Checked here, before the first byte is written: a helper image that is not on this machine would
+# otherwise surface as a failed rename between an extracted .tmp and a published name, which is the
+# one moment this script has no good answer for. No pull is attempted — a publish is not the place
+# to discover that a registry is down.
+if [ "$USER_GIVEN" = 1 ] && ! docker image inspect "$HELPER_IMAGE" >/dev/null 2>&1; then
+    echo "extract.sh: helper image '$HELPER_IMAGE' is not present locally." >&2
+    echo "extract.sh: --user publishes through it; run 'docker pull $HELPER_IMAGE' first, or pass --helper-image with one you have." >&2
+    exit 2
+fi
 case "$DEV" in
     "")
         [ -n "$REGIONS" ] || usage
@@ -127,7 +164,13 @@ case "$BUILD" in
     *) echo "extract.sh: --build must be YYYYMMDD, got '$BUILD'" >&2; exit 2 ;;
 esac
 
-mkdir -p "$TILES_DIR"
+if [ "$USER_GIVEN" = 1 ]; then
+    # Creating it is itself a write, and on a share the caller may not write it would fail here or,
+    # worse, no-op on an existing directory and hide the denial until the first real file.
+    [ -d "$TILES_DIR" ] || { echo "extract.sh: no such tiles directory: $TILES_DIR" >&2; exit 2; }
+else
+    mkdir -p "$TILES_DIR"
+fi
 # Every path this script writes is built from this one, so nothing can land outside it.
 TILES_DIR="$(cd "$TILES_DIR" && pwd)"
 SOURCE="https://build.protomaps.com/${BUILD}.pmtiles"
@@ -162,6 +205,28 @@ pmtiles() {
     docker run --rm --user "$PMTILES_USER" "${mounts[@]}" "$PMTILES_IMAGE" "$@"
 }
 
+# Every write into the tiles directory, and the ONLY place this script performs one. Without
+# --user it is the calling shell, exactly as it has always been — same commands, same order, no
+# container started and no helper image required. With --user it is a throwaway container running
+# as the publishing user, so a share that only its owner may write is written only by its owner.
+#
+# The snippet is POSIX sh operating on /tiles (and /src for the sidecar copy, mounted read-only);
+# the paths inside it are container paths in both modes, and the shell mode rewrites them back.
+# Nothing here decides anything: the caller keeps the .tmp-verify-rename order, the refusal to
+# rewrite a published name, and the prune rules. This only decides WHO writes.
+tiles_do() {
+    local snippet="$1" src_dir="${2:-}"
+    if [ "$USER_GIVEN" = 1 ]; then
+        local mounts=(-v "${TILES_DIR}:/tiles")
+        [ -n "$src_dir" ] && mounts+=(-v "${src_dir}:/src:ro")
+        docker run --rm -i --user "$PMTILES_USER" "${mounts[@]}" "$HELPER_IMAGE" sh -c "$snippet"
+    else
+        local host_snippet="${snippet//\/tiles/$TILES_DIR}"
+        [ -n "$src_dir" ] && host_snippet="${host_snippet//\/src/$src_dir}"
+        sh -c "$host_snippet"
+    fi
+}
+
 # One archive, published atomically: write to a temporary name, verify the STRUCTURE of what was
 # written, and only then rename it into place. A half-downloaded file never becomes a served one,
 # and the rename is what makes the new generation visible to the manifest.
@@ -194,17 +259,17 @@ publish() {
         echo "extract.sh: re-run with a fresh build name (--build <newer YYYYMMDD>) — the repaired archive is published beside this one, and the manifest moves to it." >&2
         exit 2
     fi
-    rm -f "${TILES_DIR}/${name}.tmp"
+    tiles_do "rm -f '/tiles/${name}.tmp'"
     echo "extract.sh: extracting ${name} from ${SOURCE}"
     pmtiles extract "$SOURCE" "/tiles/${name}.tmp" "$@"
     pmtiles verify "/tiles/${name}.tmp"
     if [ -n "$regions_src" ]; then
-        local sidecar="${TILES_DIR}/${name%.pmtiles}.regions.geojson"
-        cp "$regions_src" "${sidecar}.tmp"
-        mv "${sidecar}.tmp" "$sidecar"
-        echo "extract.sh: published ${sidecar##*/}"
+        local stem="${name%.pmtiles}.regions.geojson"
+        tiles_do "cp '/src/$(basename "$regions_src")' '/tiles/${stem}.tmp' && mv '/tiles/${stem}.tmp' '/tiles/${stem}'" \
+            "$(cd "$(dirname "$regions_src")" && pwd)"
+        echo "extract.sh: published ${stem}"
     fi
-    mv "${TILES_DIR}/${name}.tmp" "${TILES_DIR}/${name}"
+    tiles_do "mv '/tiles/${name}.tmp' '/tiles/${name}'"
     echo "extract.sh: published ${name} ($(stat -c%s "${TILES_DIR}/${name}") bytes)"
 }
 
@@ -217,7 +282,7 @@ prune() {
     # shellcheck disable=SC2012  # ls -t orders by mtime, which is the publication order here
     ls -1t "${TILES_DIR}/${kind}-"*.pmtiles 2>/dev/null | tail -n +$((keep + 1)) | while read -r old; do
         echo "extract.sh: removing superseded ${old##*/}"
-        rm -f "$old" "${old%.pmtiles}.regions.geojson"
+        tiles_do "rm -f '/tiles/${old##*/}' '/tiles/$(basename "${old%.pmtiles}").regions.geojson'"
     done
 }
 
@@ -241,6 +306,7 @@ prune detail
 # being served by appending `assets_*` lines here, and those files stay on disk across a
 # re-extract. Rewriting this file wholesale would drop the record while the assets it describes
 # are still being served, so the existing lines are carried over verbatim.
+BUILD_BODY="$(mktemp)"
 ASSETS_LINES=""
 if [ -f "${TILES_DIR}/BUILD" ]; then
     ASSETS_LINES="$(grep '^assets_' "${TILES_DIR}/BUILD" || true)"
@@ -260,7 +326,10 @@ fi
     echo "detail_maxzoom=${DETAIL_ZOOM}"
     echo "extracted_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     [ -n "$ASSETS_LINES" ] && echo "$ASSETS_LINES"
-} > "${TILES_DIR}/BUILD.tmp"
-mv "${TILES_DIR}/BUILD.tmp" "${TILES_DIR}/BUILD"
+} > "$BUILD_BODY"
+# Composed in a caller-owned temporary file and piped in, so the bytes are decided here and only
+# the write crosses into the tiles directory.
+tiles_do "cat > /tiles/BUILD.tmp && mv /tiles/BUILD.tmp /tiles/BUILD" < "$BUILD_BODY"
+rm -f "$BUILD_BODY"
 
 echo "extract.sh: done — ${TILES_DIR}/BUILD"
