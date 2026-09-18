@@ -15,7 +15,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from tests.db_guard import assert_database_is_disposable, assert_urls_target_one_database
+from tests.db_guard import (
+    acquire_bootstrap_lock,
+    assert_database_is_disposable,
+    assert_urls_target_one_database,
+    release_bootstrap_lock,
+)
 
 SYNC_URL = os.environ.get(
     "DATABASE_URL_SYNC", "postgresql+psycopg2://memosng:memosng@localhost:5433/memosng"
@@ -29,6 +34,32 @@ assert_database_is_disposable(async_engine.url)
 assert_urls_target_one_database(SYNC_URL, async_engine.url)
 
 
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Claim the database for this run before collection, so nothing can drop a live schema.
+
+    Session start, not import time: the two guards above read URLs and can run anywhere, but
+    the lock is a claim by a RUN, and only a real session goes on to drop `public`. A bare
+    `import tests.conftest` — tests/test_db_guard.py does exactly that, in a subprocess, to
+    prove the URL guards fire before any engine connects — must not take the parent suite's
+    database away from it. This hook runs before collection and long before `db_engine` builds
+    an engine, so a refusal here happens with the other run's schema still untouched.
+
+    A database that is not reachable yet is not a refusal: plenty of runs never open it at all,
+    and those worked with Postgres stopped before this lock existed. Such a run proceeds
+    unlocked and `db_engine` makes the claim before it drops anything.
+    """
+    try:
+        acquire_bootstrap_lock(SYNC_URL, tolerate_unreachable=True)
+    except RuntimeError as exc:
+        # Reported as a usage error: `ERROR: <message>` and exit 4, rather than the
+        # INTERNALERROR traceback a bare raise in a hook produces, which reads like a crash.
+        raise pytest.UsageError(str(exc)) from exc
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    release_bootstrap_lock()
+
+
 @pytest.fixture(scope="session")
 def db_engine():
     """A Postgres engine with the Alembic baseline applied from an empty schema.
@@ -36,6 +67,11 @@ def db_engine():
     Drops + recreates `public`, then runs `alembic upgrade head` — so this fixture
     also exercises the migration end-to-end, not just the ORM metadata.
     """
+    # The claim, at the point of use. Normally session start made it already and this is a
+    # no-op; it is repeated here because that call is allowed to find the database down, and
+    # the invariant this lock exists for is not "a session claims the database" but "no DROP
+    # SCHEMA without the claim" — including a database that came up in between.
+    acquire_bootstrap_lock(SYNC_URL)
     engine = create_engine(SYNC_URL)
     with engine.begin() as conn:
         conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
