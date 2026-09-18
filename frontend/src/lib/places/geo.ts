@@ -11,8 +11,6 @@ export type MapMarker = components['schemas']['MapMarker']
 /** What travels into the clustering source — and, on every `setData`, into MapLibre's worker. */
 export interface MarkerProps {
   uid: string
-  /** taken_at as epoch millis — a number survives the trip into MapLibre's worker as it is. */
-  t: number
 }
 
 export type Bbox = [west: number, south: number, east: number, north: number]
@@ -39,7 +37,7 @@ export function toFeatureCollection(
     features: markers.map((m) => ({
       type: 'Feature',
       geometry: { type: 'Point', coordinates: [m.longitude, m.latitude] },
-      properties: { uid: m.uid, t: Date.parse(m.taken_at) },
+      properties: { uid: m.uid },
     })),
   }
 }

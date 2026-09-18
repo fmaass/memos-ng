@@ -63,7 +63,7 @@ const maplibre = vi.hoisted(() => {
     querySourceFeatures(id: string) {
       return (this.sources.get(id)?.data.features ?? []).map((feature) => ({
         geometry: feature.geometry,
-        properties: { uid: feature.properties.uid, t: feature.properties.t },
+        properties: { uid: feature.properties.uid },
       }))
     }
     getCenter() {

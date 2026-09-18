@@ -81,7 +81,7 @@ defineExpose({ zoomToCluster })
 function paint(element: HTMLElement, pin: PinSpec) {
   const lead = byUid.get(pin.uid)
   // By class, not by tag: the badge and the thumbnail sit inside a wrapper element that is itself
-  // a span (the landing animation's home), which `querySelector('span')` would find first.
+  // a span (the wrapper the badge is positioned against), which `querySelector('span')` finds first.
   const image = element.querySelector<HTMLImageElement>('.places-pin__thumb')
   const badge = element.querySelector<HTMLElement>('.places-pin__badge')
   if (image && lead) {

@@ -15,7 +15,7 @@ describe('toFeatureCollection', () => {
     expect(toFeatureCollection([])).toEqual({ type: 'FeatureCollection', features: [] })
   })
 
-  it('carries only uid and taken-at millis into the feature payload', () => {
+  it('carries only the uid into the feature payload', () => {
     // The clustering source ships these features to a web worker on every setData; the
     // AttachmentRef fields (signed URLs, blurhash) stay in the view's own Map<uid, marker>.
     const [feature] = toFeatureCollection([
@@ -23,7 +23,7 @@ describe('toFeatureCollection', () => {
     ]).features
 
     expect(feature?.geometry).toEqual({ type: 'Point', coordinates: [-3.25, 12.5] })
-    expect(feature?.properties).toEqual({ uid: 'a', t: Date.parse('2026-01-02T03:04:05Z') })
+    expect(feature?.properties).toEqual({ uid: 'a' })
   })
 })
 

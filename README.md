@@ -195,6 +195,8 @@ All settings come from the environment (or a `.env` file). Key variables — see
 - The Places map shows its icons. MapLibre does not resolve a root-relative sprite address, so
   the sprite sheet 1.7.0 named was never requested; the style now carries absolute addresses on
   the page's own origin for the sprite and the glyphs, and the unit tests pin both.
+- The first view of `/places` keeps every pin clear of the timeline bar. The padding of the first
+  fit is measured from the overlay that really covers the map, per side, on desktop and phone.
 - The empty-map message appears only once the markers have been asked for and came back empty.
   While they load that message stays away, and a failed request has a message of its own.
 - Photos uploaded while a long video is transcoding no longer wait for it. The one worker process
@@ -234,6 +236,11 @@ All settings come from the environment (or a `.env` file). Key variables — see
   drawer with its photos and a Zoom-in button; a single pin opens the lightbox, which offers "Show
   in memo". On a phone the map acts as a filter above a grid of the photos in view. The map chunk
   and its worker load only on `/places` and are kept out of the service worker's precache.
+- A bar under the map plays the located photos through time: a per-month histogram with
+  proportional year ticks, a playhead that moves at 1×, 2× or 4×, and a choice between
+  accumulating the pins and a rolling twelve-month window. Each step hands the map the playhead's
+  subset, so the clusters are re-computed rather than filtered, and the in-view grid and the phone
+  layout follow the playhead. Opening the photo viewer pauses playback.
 - A HEIC original's Exif is read from its box headers instead of through a full decode: the walker
   follows the file's boxes to the primary image's Exif item and reads only that extent. On the 4 MB
   fixture that is 597 bytes instead of 4,195,036, so the read deadline no longer depends on the

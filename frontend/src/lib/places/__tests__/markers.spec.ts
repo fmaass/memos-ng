@@ -17,7 +17,7 @@ function clusterFeature(id: number, count: number, lng: number, lat: number, uid
 }
 
 function pointFeature(uid: string, lng: number, lat: number): SourceFeature {
-  return { geometry: { type: 'Point', coordinates: [lng, lat] }, properties: { uid, t: 0 } }
+  return { geometry: { type: 'Point', coordinates: [lng, lat] }, properties: { uid } }
 }
 
 describe('badgeText', () => {
