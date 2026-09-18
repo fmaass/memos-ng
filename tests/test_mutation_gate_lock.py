@@ -14,7 +14,15 @@ that took, unlinked or contended for the real lock could defeat the very mechani
 file's inode under a live holder would let a build and a gate both believe they hold it.
 
 `uv` and `docker` are stubs on PATH inside the sandbox. The scripts themselves are never stubbed.
-Synchronisation is by ready file and FIFO; nothing here sleeps to wait for something to happen.
+No test waits out a fixed duration: every wait is for a named condition, polled at 10 ms with a
+bound, or a FIFO a stub is already blocked on. There is exactly one bounded negative window, in
+`test_a_build_waits_for_the_lock_and_says_so`, where the thing being proved is that something does
+NOT happen while the lock is held; it is opened only after contention has been confirmed on the
+build's own stderr, and it is short.
+
+Every process a test starts, and every stub blocked on a FIFO, is torn down in a `finally` that
+runs whatever the body did — processes first, by pid, then the FIFO — so a failing assertion fails
+the test instead of hanging the suite behind a reader nobody woke.
 """
 
 from __future__ import annotations
@@ -94,7 +102,12 @@ exit 99
 _DOCKER_STUB = r"""#!/bin/sh
 fd9=closed
 [ -e "/proc/$$/fd/9" ] && fd9=open
-printf '%s\t%s\n' "$fd9" "$*" >> "$DOCKER_RECORD"
+# DOCKER_MARKER, when set, is a file a test creates at the moment it lets the lock go. Recording
+# whether it existed WHEN DOCKER RAN is what distinguishes "the build waited" from "the build ran
+# and the assertions happened to look afterwards".
+marker=absent
+[ -n "${DOCKER_MARKER:-}" ] && [ -e "$DOCKER_MARKER" ] && marker=present
+printf '%s\t%s\t%s\n' "$fd9" "$marker" "$*" >> "$DOCKER_RECORD"
 if [ -n "${DOCKER_GATE_READY:-}" ]; then
     : > "$DOCKER_GATE_READY"
     read -r _ < "$DOCKER_GATE_FIFO"
@@ -128,7 +141,7 @@ def _lock_is_held(lock: Path) -> bool:
     return subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0
 
 
-def _release(fifo: Path) -> None:
+def _release(fifo: Path, timeout: float = 30, required: bool = True) -> bool:
     """Let a gated stub continue. O_NONBLOCK, so a dead reader raises instead of hanging."""
 
     def opened() -> bool:
@@ -138,11 +151,82 @@ def _release(fifo: Path) -> None:
             if exc.errno == errno.ENXIO:  # nobody is reading (yet)
                 return False
             raise
-        os.write(fd, b"go\n")
-        os.close(fd)
+        try:
+            os.write(fd, b"go\n")
+        finally:
+            os.close(fd)
         return True
 
-    assert _wait_until(opened, 30), f"no reader on {fifo}"
+    woke = _wait_until(opened, timeout)
+    assert woke or not required, f"no reader on {fifo}"
+    return woke
+
+
+class Reaper:
+    """Everything a test starts, torn down by a finalizer that runs whatever the body did.
+
+    Order matters and so does exception-safety. The processes a test started are killed by pid
+    first, each bounded and each independent of the others, then the stub grandchildren that
+    recorded their own pids (each checked against its /proc cmdline first, so a recycled pid
+    cannot be a stranger's process); only then is every gated FIFO written, so a stub blocked on
+    a read that nobody was ever going to answer is woken rather than left behind. A failing
+    assertion must fail its test, not park a reader for the rest of the session.
+    """
+
+    def __init__(self) -> None:
+        self.procs: list[subprocess.Popen[str]] = []
+        self.fifos: list[Path] = []
+        self.pid_files: list[Path] = []
+
+    def watch(self, proc: subprocess.Popen[str]) -> subprocess.Popen[str]:
+        self.procs.append(proc)
+        return proc
+
+    def gate(self, fifo: Path) -> Path:
+        self.fifos.append(fifo)
+        return fifo
+
+    def children(self, pid_file: Path) -> Path:
+        """A file the stubs append their own pids to: grandchildren this process cannot wait on."""
+        self.pid_files.append(pid_file)
+        return pid_file
+
+    def close(self) -> None:
+        for proc in self.procs:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=60)
+            except Exception:  # noqa: BLE001 — one stuck process must not skip the rest
+                pass
+        for fifo in self.fifos:
+            try:
+                _release(fifo, timeout=1, required=False)
+            except Exception:  # noqa: BLE001 — cleanup, not an assertion
+                pass
+        for pid_file in self.pid_files:
+            try:
+                pids = [int(line) for line in pid_file.read_text().split()]
+            except Exception:  # noqa: BLE001
+                continue
+            _wait_until(lambda pids=pids: not any(_alive(pid) for pid in pids), 30)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+@pytest.fixture
+def reaper() -> Iterator[Reaper]:
+    reap = Reaper()
+    try:
+        yield reap
+    finally:
+        reap.close()
 
 
 @dataclass
@@ -172,10 +256,11 @@ class Sandbox:
         raw = Path(self.env["UV_RECORD"]).read_text().splitlines()
         return [(line.split("\t")[0], line.split("\t")[1]) for line in raw if line]
 
-    def docker_record(self) -> list[tuple[str, str]]:
+    def docker_record(self) -> list[tuple[str, str, str]]:
+        """One (fd-9 state, release-marker state, argv) triple per docker invocation."""
         path = Path(self.env["DOCKER_RECORD"])
         raw = path.read_text().splitlines() if path.exists() else []
-        return [(line.split("\t")[0], line.split("\t")[1]) for line in raw if line]
+        return [tuple(line.split("\t", 2)) for line in raw if line]  # type: ignore[misc]
 
     def gate_on_control(self) -> tuple[Path, Path]:
         """Make the control run block, so a test has a deterministic window with the lock held."""
@@ -199,13 +284,15 @@ class Sandbox:
             list(args), cwd=self.root, env=self.env, capture_output=True, text=True, **kwargs
         )
 
-    def popen(self, *args: str, **kwargs) -> subprocess.Popen[str]:
+    def popen(
+        self, *args: str, stderr: object = subprocess.PIPE, **kwargs
+    ) -> subprocess.Popen[str]:
         return subprocess.Popen(
             list(args),
             cwd=self.root,
             env=self.env,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr,
             text=True,
             **kwargs,
         )
@@ -268,8 +355,8 @@ def sandbox(tmp_path: Path) -> Sandbox:
 
 
 @pytest.fixture
-def holder(sandbox: Sandbox) -> Iterator[Sandbox]:
-    """A process standing in for a build: it holds the sandbox's lock until the fixture lets go."""
+def holder(sandbox: Sandbox, reaper: Reaper) -> Sandbox:
+    """A process standing in for a build: it holds the sandbox's lock until the reaper kills it."""
     program = (
         "import fcntl, sys\n"
         "handle = open(sys.argv[1], 'w')\n"
@@ -278,18 +365,15 @@ def holder(sandbox: Sandbox) -> Iterator[Sandbox]:
         "sys.stdin.read()\n"
     )
     ready = sandbox.root.parent / "holder-ready"
-    proc = subprocess.Popen(
-        [sys.executable, "-c", program, str(sandbox.lock), str(ready)],
-        stdin=subprocess.PIPE,
-        text=True,
+    reaper.watch(
+        subprocess.Popen(
+            [sys.executable, "-c", program, str(sandbox.lock), str(ready)],
+            stdin=subprocess.PIPE,  # an open pipe is what keeps its read — and the lock — blocking
+            text=True,
+        )
     )
-    try:
-        assert _wait_until(ready.exists, 30), "the holder never signalled that it holds the lock"
-        yield sandbox
-    finally:
-        assert proc.stdin is not None
-        proc.stdin.close()
-        proc.wait(timeout=30)
+    assert _wait_until(ready.exists, 30), "the holder never signalled that it holds the lock"
+    return sandbox
 
 
 # --------------------------------------------------------------------------------------------
@@ -310,35 +394,52 @@ def test_the_gate_refuses_while_another_process_holds_the_lock(holder: Sandbox) 
     assert holder.uv_record() == []
 
 
-def test_a_build_waits_for_the_lock_and_says_so(sandbox: Sandbox) -> None:
-    """The other direction, for real: the gate holds the lock and the build queues behind it."""
-    ready, fifo = sandbox.gate_on_control()
-    gate = sandbox.popen("scripts/check-mutations.sh")
-    try:
-        assert _wait_until(ready.exists, 60), "the gate never reached its control run"
-        assert _lock_is_held(sandbox.lock)
+def test_a_build_waits_for_the_lock_and_says_so(sandbox: Sandbox, reaper: Reaper) -> None:
+    """The other direction, and the wait itself: the gate holds the lock, the build queues.
 
-        build = sandbox.popen("scripts/build-image.sh", "1.7.1+abc1234")
-        try:
-            # It must not reach docker while the gate holds the lock. Proven by the gate's own
-            # release below being what unblocks it, not by waiting out a duration.
-            assert sandbox.docker_record() == []
-            _release(fifo)
-            assert gate.wait(timeout=180) == 0
-            assert build.wait(timeout=180) == 0
-        finally:
-            if build.poll() is None:
-                build.kill()
-                build.wait(timeout=60)
-        stderr = build.stderr.read() if build.stderr else ""
-        assert "waiting for the mutation gate lock" in stderr
-        assert [argv for _, argv in sandbox.docker_record()] == [
-            "build --build-arg APP_VERSION=1.7.1+abc1234 -t memos-ng:local ."
-        ]
-    finally:
-        if gate.poll() is None:
-            gate.kill()
-            gate.wait(timeout=60)
+    The shape matters. Looking once and finding docker unused proves nothing — a build that took
+    no lock at all would also be unlikely to have finished by then. So: contention is CONFIRMED
+    first, on the build's own stderr, and only then is a short negative window opened. That window
+    is the one place in this file where the absence of an event is asserted over a duration, and
+    it is sound only because the lock is demonstrably held for all of it: correct code cannot run
+    docker there, and a build that skipped the blocking wait runs it immediately.
+
+    The marker closes the last gap: the stub records whether it existed when docker ran, so "the
+    build went ahead early and the assertions happened to look later" is a distinguishable answer.
+    """
+    ready, fifo = sandbox.gate_on_control()
+    reaper.gate(fifo)
+    reaper.children(Path(sandbox.env["UV_PIDS"]))
+    gate = reaper.watch(sandbox.popen("scripts/check-mutations.sh"))
+    assert _wait_until(ready.exists, 60), "the gate never reached its control run"
+    assert _lock_is_held(sandbox.lock)
+
+    released = sandbox.root.parent / "lock-released"
+    sandbox.env["DOCKER_MARKER"] = str(released)
+    build_err = sandbox.root.parent / "build.err"
+    with build_err.open("w") as err:
+        build = reaper.watch(sandbox.popen("scripts/build-image.sh", "1.7.1+abc1234", stderr=err))
+
+    def contended() -> bool:
+        return "waiting for the mutation gate lock" in build_err.read_text()
+
+    assert _wait_until(contended, 60), "the build never reported that it was waiting"
+
+    # The bounded negative window, opened only now: the build has told us it is blocked, the gate
+    # still holds the lock, and nothing may reach docker until we let go.
+    assert not _wait_until(lambda: sandbox.docker_record() != [], 0.5), sandbox.docker_record()
+    assert _lock_is_held(sandbox.lock)
+
+    released.touch()
+    _release(fifo)
+    assert gate.wait(timeout=180) == 0
+    assert build.wait(timeout=180) == 0
+
+    record = sandbox.docker_record()
+    assert [argv for _, _, argv in record] == [
+        "build --build-arg APP_VERSION=1.7.1+abc1234 -t memos-ng:local ."
+    ]
+    assert [marker for _, marker, _ in record] == ["present"], "docker ran before the lock was free"
 
 
 # --------------------------------------------------------------------------------------------
@@ -358,7 +459,9 @@ def test_no_uv_child_of_the_gate_inherits_the_lock(sandbox: Sandbox) -> None:
     assert [kind for kind, fd9 in record if fd9 != "closed"] == [], record
 
 
-def test_a_child_that_outlives_a_killed_run_does_not_keep_the_lock(sandbox: Sandbox) -> None:
+def test_a_child_that_outlives_a_killed_run_does_not_keep_the_lock(
+    sandbox: Sandbox, reaper: Reaper
+) -> None:
     """The kill case, with only the script killed — not the process group, which would take the
     child with it and prove nothing. The child ignores TERM and is still running at the assert.
 
@@ -368,25 +471,21 @@ def test_a_child_that_outlives_a_killed_run_does_not_keep_the_lock(sandbox: Sand
     is the claim under test.
     """
     ready, fifo = sandbox.gate_on_control()
+    reaper.gate(fifo)
+    reaper.children(Path(sandbox.env["UV_PIDS"]))
     sandbox.env["UV_IGNORE_TERM"] = "1"
-    gate = sandbox.popen("scripts/check-mutations.sh")
-    try:
-        assert _wait_until(ready.exists, 60), "the gate never reached its control run"
-        assert _lock_is_held(sandbox.lock)
+    gate = reaper.watch(sandbox.popen("scripts/check-mutations.sh"))
+    assert _wait_until(ready.exists, 60), "the gate never reached its control run"
+    assert _lock_is_held(sandbox.lock)
 
-        gate.send_signal(signal.SIGKILL)  # the script alone, by pid
-        gate.wait(timeout=120)
+    gate.send_signal(signal.SIGKILL)  # the script alone, by pid
+    gate.wait(timeout=120)
 
-        child_pid = int(Path(sandbox.env["UV_PIDS"]).read_text().split()[0])
-        os.kill(child_pid, 0)  # control: the child really did outlive the run
-        assert _wait_until(lambda: not _lock_is_held(sandbox.lock), 60), (
-            "a surviving child is still holding the lock of a run that is gone"
-        )
-    finally:
-        _release(fifo)
-        if gate.poll() is None:
-            gate.kill()
-            gate.wait(timeout=60)
+    child_pid = int(Path(sandbox.env["UV_PIDS"]).read_text().split()[0])
+    os.kill(child_pid, 0)  # control: the child really did outlive the run
+    assert _wait_until(lambda: not _lock_is_held(sandbox.lock), 60), (
+        "a surviving child is still holding the lock of a run that is gone"
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -405,21 +504,19 @@ def test_the_build_refuses_while_a_tracked_file_differs_from_head(sandbox: Sandb
     assert sandbox.docker_record() == [], "it built anyway"
 
 
-def test_the_build_holds_the_lock_for_as_long_as_docker_reads_the_context(sandbox: Sandbox) -> None:
+def test_the_build_holds_the_lock_for_as_long_as_docker_reads_the_context(
+    sandbox: Sandbox, reaper: Reaper
+) -> None:
     ready, fifo = sandbox.gate_on_docker()
-    build = sandbox.popen("scripts/build-image.sh", "1.7.1+abc1234")
-    try:
-        assert _wait_until(ready.exists, 60), "docker was never reached"
-        assert _lock_is_held(sandbox.lock), "the build dropped the lock before the build ran"
-        _release(fifo)
-        assert build.wait(timeout=180) == 0
-    finally:
-        if build.poll() is None:
-            build.kill()
-            build.wait(timeout=60)
+    reaper.gate(fifo)
+    build = reaper.watch(sandbox.popen("scripts/build-image.sh", "1.7.1+abc1234"))
+    assert _wait_until(ready.exists, 60), "docker was never reached"
+    assert _lock_is_held(sandbox.lock), "the build dropped the lock before the build ran"
+    _release(fifo)
+    assert build.wait(timeout=180) == 0
 
     assert sandbox.docker_record() == [
-        ("open", "build --build-arg APP_VERSION=1.7.1+abc1234 -t memos-ng:local .")
+        ("open", "absent", "build --build-arg APP_VERSION=1.7.1+abc1234 -t memos-ng:local .")
     ]
     assert not _lock_is_held(sandbox.lock)
 
@@ -429,7 +526,9 @@ def test_the_build_holds_the_lock_for_as_long_as_docker_reads_the_context(sandbo
 # --------------------------------------------------------------------------------------------
 
 
-def test_a_run_in_one_worktree_does_not_block_a_run_in_another(tmp_path: Path) -> None:
+def test_a_run_in_one_worktree_does_not_block_a_run_in_another(
+    tmp_path: Path, reaper: Reaper
+) -> None:
     """Why the lock is taken on `--absolute-git-dir` and not on `--git-common-dir`: the hazard is
     one WORKING TREE. A gate in another worktree is patching files this one cannot see, and making
     the two queue behind each other would be pure cost. Driven, not argued: one run holds its lock
@@ -445,19 +544,15 @@ def test_a_run_in_one_worktree_does_not_block_a_run_in_another(tmp_path: Path) -
 
     assert first.lock != second.lock
     ready, fifo = first.gate_on_control()
-    held = first.popen("scripts/check-mutations.sh")
-    try:
-        assert _wait_until(ready.exists, 60), "the first run never reached its control run"
-        assert _lock_is_held(first.lock)
+    reaper.gate(fifo)
+    reaper.children(Path(first.env["UV_PIDS"]))
+    reaper.watch(first.popen("scripts/check-mutations.sh"))
+    assert _wait_until(ready.exists, 60), "the first run never reached its control run"
+    assert _lock_is_held(first.lock)
 
-        other = second.run("scripts/check-mutations.sh", timeout=180)
-        assert other.returncode == 0, other.stdout + other.stderr
-        assert "mutation gate lock" not in other.stderr
-    finally:
-        _release(fifo)
-        if held.poll() is None:
-            held.kill()
-        held.wait(timeout=120)
+    other = second.run("scripts/check-mutations.sh", timeout=180)
+    assert other.returncode == 0, other.stdout + other.stderr
+    assert "mutation gate lock" not in other.stderr
 
 
 def test_the_release_procedure_builds_through_the_script(sandbox: Sandbox) -> None:

@@ -33,8 +33,10 @@ the other sorts itself out. They behave differently on purpose: the build **wait
 once on stderr, while the mutation script **refuses at once** with `another process holds the
 mutation gate lock`, exit 2, having patched nothing — a gate that blocked silently for minutes
 would read as a hang. The lock is per working tree, so a build in one worktree and a mutation run
-in another never wait for each other, and the kernel drops it when the holder dies, so **the lock
-itself needs no cleanup after any exit**.
+in another never wait for each other. An flock lives until the last descriptor on it is closed,
+and a process's descriptors all close when it dies — the mutation script starts its `uv` children
+with that descriptor closed for the same reason — so **the lock itself needs no cleanup after any
+exit**.
 
 The tree is a separate question. A run killed with `SIGKILL` runs no trap: it cannot revert its
 patch, and its lock is freed all the same, so waiting for the lock proves nothing about what is
@@ -93,8 +95,8 @@ Host **jupiter** (the stack runs where the repo lives). Stack:
     scripts/build-image.sh <version>+<short-sha>
 
 Run it from the repository root. It takes the mutation gate lock, refuses if any tracked file
-differs from `HEAD`, and then `exec`s the `docker build` — so the lock is held for exactly as long
-as the build is reading the context (see the gate section above). Both guards matter: the lock
+differs from `HEAD`, and then `exec`s the `docker build` — so the lock is held for at least as
+long as the build is reading the context (see the gate section above). Both guards matter: the lock
 covers a mutation run that is active right now, the `HEAD` comparison covers one that was killed
 and could not revert.
 

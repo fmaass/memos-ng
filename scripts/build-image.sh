@@ -45,7 +45,9 @@ gitdir=$(git rev-parse --absolute-git-dir 2> /dev/null) || die "cannot locate th
 LOCKFILE="$gitdir/mutation-gate.lock"
 exec 9> "$LOCKFILE" || die "cannot open the mutation gate lock at $LOCKFILE"
 if ! flock -n 9; then
-    printf 'build-image: waiting for the mutation gate lock (%s) — a mutation run has this checkout patched\n' \
+    # Who else could be holding it: a mutation run (which has this checkout patched right now) or
+    # another build of the same checkout. Both are reasons to wait rather than to read the tree.
+    printf 'build-image: waiting for the mutation gate lock (%s) — a mutation run or another build holds it\n' \
         "$LOCKFILE" >&2
     flock 9 || die "could not take the mutation gate lock at $LOCKFILE"
 fi
@@ -62,7 +64,8 @@ if [ -n "$dirty" ]; then
     exit 1
 fi
 
-# exec, deliberately: docker inherits fd 9 and therefore the lock, so the lock lasts exactly as
-# long as the build reads the context and not a moment less. A `docker build` started as a child
-# and waited for would be equivalent only as long as nobody ever adds an early `exit` above it.
+# exec, deliberately: docker inherits fd 9 and therefore the lock, so the lock lasts at least as
+# long as the build reads the context — it is the docker client's whole lifetime, of which the
+# context transfer is the part that matters here. A `docker build` started as a child and waited
+# for would be equivalent only as long as nobody ever adds an early `exit` above it.
 exec docker build --build-arg APP_VERSION="$version" -t memos-ng:local .

@@ -39,8 +39,10 @@ held for the whole run. The build takes the same lock (see RELEASING.md) and wai
 script does NOT wait — it refuses immediately, because a gate that silently blocks for minutes
 reads as a hang, while a build that waits simply starts later.
 
-The LOCK needs no cleanup after any exit: the kernel drops it when this process dies, so there is
-no release step to forget. THE TREE IS A DIFFERENT MATTER. A SIGKILL runs no trap, so a run killed
+The LOCK needs no cleanup after any exit: an flock lives until the LAST descriptor on that open
+file description is closed, and every descriptor a process owns is closed when it dies — which is
+also exactly why each `uv` child is started with fd 9 closed (see run_uv), so no child of ours can
+keep the lock alive past us. There is no release step to forget. THE TREE IS A DIFFERENT MATTER. A SIGKILL runs no trap, so a run killed
 that way can leave the patch applied, and the lock being free afterwards says nothing about it.
 That is why the build script (scripts/build-image.sh) checks, under the lock, that no tracked file
 differs from HEAD before it builds: waiting for the lock is not by itself proof of a clean tree.
@@ -129,11 +131,15 @@ for case in ET.parse(sys.argv[1]).iter("testcase"):
 '
 
 # THE one place a `uv` child is started. Every one of them runs with fd 9 — the mutation gate
-# lock — CLOSED. The lock is this process's hold: a child that outlives us (a pytest still winding
-# down after a kill, a parse) must not go on holding a lock whose owner is gone, and the tree it
-# would be guarding has already been reverted by the trap. It also keeps --selftest honest, where
-# leg 5 kills a run and leg 6 immediately starts another. Callers keep their own redirections and
-# `env` prefix; this wrapper adds only the one that must never be forgotten at a new call site.
+# lock — CLOSED. The lock is this process's hold, and it is released only when the LAST descriptor
+# on it closes: a child that inherited fd 9 and outlives us (a pytest still winding down after a
+# kill, a parse) would go on holding the lock of a run that is gone, and the next gate run would be
+# refused for nothing. Note what this does NOT claim: it says nothing about the state of the tree.
+# A run killed with SIGKILL runs no trap and can leave a patch applied, and that is caught by the
+# build's own HEAD comparison, never by who holds the lock. Closing fd 9 also keeps --selftest
+# honest, where leg 5 kills a run and leg 6 immediately starts another. Callers keep their own
+# redirections and `env` prefix; this wrapper adds only the one that must never be forgotten at a
+# new call site.
 run_uv() {
     "$@" 9>&-
 }
