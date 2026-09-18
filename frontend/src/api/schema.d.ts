@@ -716,6 +716,11 @@ export interface paths {
         /**
          * Serve Basemap Asset
          * @description Serve one map style asset — a glyph range or a sprite sheet.
+         *
+         *     Cached as long as an archive, and for a different reason: these paths ARE rewritten in place
+         *     when the assets pin is bumped, so a week of immutable caching is only truthful because the
+         *     style asks for them under a URL carrying the revision the manifest reported. A request's query
+         *     string is not part of the file lookup; it is the cache key.
          */
         get: operations["serve_basemap_asset_api_map_assets__path__get"];
         put?: never;
@@ -735,10 +740,15 @@ export interface paths {
         };
         /**
          * Basemap Manifest
-         * @description List the basemap archives this server currently offers.
+         * @description List the basemap archives this server currently offers, and how well they cover the pins.
          *
          *     Never cached: it is the pointer that changes when new map data is published, and a client
          *     holding a stale copy would keep asking for an archive that has been superseded.
+         *
+         *     The ordinary session dependency here, unlike the two routes below: this answer is a few
+         *     hundred bytes and the coverage count is a query, so the connection is held for a short
+         *     response rather than for a multi-gigabyte transfer. The count itself is cached per viewer for
+         *     ten minutes — the manifest is fetched on every map open and every theme toggle.
          */
         get: operations["basemap_manifest_api_map_manifest_get"];
         put?: never;
@@ -1947,12 +1957,27 @@ export interface components {
          *
          *     `detail` is null when no region archive has been published; a client renders the world archive
          *     alone rather than nothing at all.
+         *
+         *     `assets_commit` is the revision of the style's fonts and sprites currently on disk. Unlike an
+         *     archive, those files are overwritten IN PLACE at fixed paths when their pin is bumped, so
+         *     nothing about their URL would change — and they are served as cacheable for a week. Handing
+         *     the client the revision is what lets the style version the URLs it builds, which is the only
+         *     thing that can retire a cached copy of the previous ones.
+         *
+         *     `uncovered` counts the caller's visible pins that fall outside the ground the current detail
+         *     archive was cut for — the signal that a re-extract is due, because a detail archive does not
+         *     follow the household to a new place on its own. It is null, never zero, when no detail archive
+         *     is published or its regions were not recorded: zero would read as full coverage.
          */
         MapManifest: {
+            /** Assets Commit */
+            assets_commit: string | null;
             /** Build */
             build: string | null;
             detail: components["schemas"]["MapArchive"] | null;
             planet: components["schemas"]["MapArchive"] | null;
+            /** Uncovered */
+            uncovered: number | null;
         };
         /**
          * MapMarker

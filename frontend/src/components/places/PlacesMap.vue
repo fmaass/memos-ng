@@ -33,7 +33,13 @@ const emit = defineEmits<{
 }>()
 
 const SOURCE = MARKERS_SOURCE
-const EMPTY_MANIFEST: MapManifest = { build: null, planet: null, detail: null }
+const EMPTY_MANIFEST: MapManifest = {
+  build: null,
+  assets_commit: null,
+  planet: null,
+  detail: null,
+  uncovered: null,
+}
 
 // The pmtiles protocol is a MapLibre global, not a per-map one: registering it twice throws.
 let protocolRegistered = false

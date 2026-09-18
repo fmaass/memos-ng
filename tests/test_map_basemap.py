@@ -15,6 +15,7 @@ resources. Three properties are load-bearing and each has a failure that looks l
   test below observes the real sequence rather than the code's shape.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -28,6 +29,8 @@ from app.security_headers import CSP
 from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
 from sqlalchemy import event
+
+from tests.conftest import SYNC_URL
 
 # The whole CSP as it stood before the basemap work, directive by directive. Frozen here on
 # purpose: the change under test is additive, and the only way to prove a directive did not go
@@ -272,13 +275,132 @@ def test_a_new_generation_takes_over_the_manifest_while_the_previous_file_stays(
     assert client.get(_tile(DETAIL)).status_code == 200
 
 
+# --- the assets revision the style versions its URLs with ------------------------------------
+
+ASSETS_COMMIT = "028c18f713baecad011301ff7a69acc39bcc2ae7"
+
+
+def test_the_manifest_states_which_assets_revision_is_being_served(logged_in_client, tiles_dir):
+    """The glyphs and sprites are overwritten IN PLACE at fixed paths when their pin is bumped, so
+    nothing about their URL changes on its own. The manifest carrying the recorded commit is what
+    lets the style put it in the URL, which is the only thing that can end a week-long immutable
+    cache of the previous revision."""
+    client, _ = logged_in_client
+    (tiles_dir / "BUILD").write_text(
+        f"build=20260917\nassets_repo=protomaps/basemaps-assets\nassets_commit={ASSETS_COMMIT}\n"
+    )
+    body = client.get("/api/map/manifest").json()
+    assert body["assets_commit"] == ASSETS_COMMIT
+    assert body["build"] == "20260917"  # the other keys of the same file still read
+
+
+def test_an_unrecorded_assets_revision_is_reported_absent_rather_than_guessed(
+    logged_in_client, tiles_dir
+):
+    """A tiles directory whose assets were never fetched has no pin to state. Null rather than a
+    placeholder: the style omits the query entirely instead of versioning URLs against a value
+    that describes nothing."""
+    client, _ = logged_in_client
+    assert "assets_" not in (tiles_dir / "BUILD").read_text()
+    assert client.get("/api/map/manifest").json()["assets_commit"] is None
+
+
+def test_a_style_asset_is_cached_for_a_week_only_because_its_url_carries_the_revision(
+    logged_in_client, tiles_dir
+):
+    """`immutable` on a path that IS rewritten in place (fetch-assets.sh overwrites fonts/ and
+    sprites/) is only truthful while the client asks under a URL that changes with the pin. The
+    header and the versioned query are one decision, so the header is asserted here and the query
+    in the style's own spec."""
+    client, _ = logged_in_client
+    r = client.get(f"/api/map/assets/sprites/v4/light.json?v={ASSETS_COMMIT[:8]}")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "private, max-age=604800, immutable"
+
+
+@pytest.fixture(autouse=True)
+def _empty_coverage_cache():
+    """The uncovered count is cached per viewer and archive for ten minutes, and every case here
+    speaks as the same viewer about the same archive names."""
+    from app.services import map_coverage
+
+    map_coverage._CACHE.clear()
+    yield
+    map_coverage._CACHE.clear()
+
+
+def test_the_manifest_counts_the_pins_the_published_detail_archive_does_not_reach(
+    logged_in_client, tiles_dir
+):
+    """A detail archive is cut to the regions that had pins WHEN IT WAS CUT; pins keep arriving.
+    The count is what tells an operator the map has quietly stopped having streets where the
+    household now takes photographs."""
+    from sqlalchemy import create_engine, text
+
+    from tests.test_map_markers import _wipe
+
+    client, subject = logged_in_client
+    (tiles_dir / DETAIL).write_bytes(ARCHIVE_BYTES)
+    (tiles_dir / f"{DETAIL.removesuffix('.pmtiles')}.regions.geojson").write_text(
+        json.dumps(REGIONS_DOC)
+    )
+    engine = create_engine(SYNC_URL)
+    try:
+        with engine.begin() as connection:
+            owner_id = connection.execute(
+                text("SELECT id FROM users WHERE subject = :s"), {"s": subject}
+            ).scalar_one()
+            memo_id = connection.execute(
+                text(
+                    "INSERT INTO memos"
+                    " (uid, owner_id, content, visibility, pinned, created_at, updated_at)"
+                    " VALUES ('memo-uncovered', :o, 'elsewhere', 'PUBLIC', false, now(), now())"
+                    " RETURNING id"
+                ),
+                {"o": owner_id},
+            ).scalar_one()
+            connection.execute(
+                text(
+                    "INSERT INTO attachments"
+                    " (uid, owner_id, memo_id, filename, mime, size, status, storage_path,"
+                    "  latitude, longitude, location_source)"
+                    " VALUES ('faraway', :o, :m, 'f.jpg', 'image/jpeg', 1, 'ready', '/nowhere',"
+                    "  12.5, 45.25, 'exif')"
+                ),
+                {"o": owner_id, "m": memo_id},
+            )
+
+        body = client.get("/api/map/manifest").json()
+        assert body["detail"]["name"] == DETAIL
+        assert body["uncovered"] == 1
+    finally:
+        engine.dispose()
+        _wipe()
+
+
+def test_with_no_detail_archive_the_coverage_question_is_answered_with_nothing(
+    logged_in_client, tiles_dir
+):
+    client, _ = logged_in_client
+    body = client.get("/api/map/manifest").json()
+
+    assert body["detail"] is None
+    assert body["uncovered"] is None
+
+
 def test_an_empty_tiles_directory_reports_nothing_rather_than_failing(
     logged_in_client, tmp_path, monkeypatch
 ):
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "TILES_DIR", str(tmp_path / "never-extracted"))
     body = client.get("/api/map/manifest").json()
-    assert body == {"build": None, "planet": None, "detail": None}
+    assert body == {
+        "build": None,
+        "assets_commit": None,
+        "planet": None,
+        "detail": None,
+        "uncovered": None,
+    }
 
 
 def test_the_tiles_directory_defaults_to_the_derived_asset_volume(monkeypatch):
@@ -386,3 +508,329 @@ def test_a_published_archive_that_stops_verifying_is_refused_never_rewritten(tmp
     assert "--build <newer YYYYMMDD>" in run.stderr, run.stderr
     assert published.read_bytes() == before  # not repaired, not truncated, not touched
     assert list(tiles.glob("*.tmp")) == []  # and nothing half-written left behind
+
+
+# --- the extraction script's pruning ----------------------------------------------------------
+
+DOCKER_STUB = """#!/bin/sh
+# Plays `docker run ... protomaps/go-pmtiles <subcommand>`: an extract writes the archive it was
+# asked for, a verify accepts it. The tiles directory is learned from the -v mount the script
+# passes, exactly as the real tool learns it, so a script that stopped mounting it would fail here.
+tiles=""
+for a in "$@"; do
+  case "$a" in *:/tiles) tiles="${a%:/tiles}" ;; esac
+done
+mode=""
+src=""
+out=""
+for a in "$@"; do
+  if [ -z "$mode" ]; then
+    case "$a" in extract|verify|show) mode="$a" ;; esac
+    continue
+  fi
+  case "$a" in -*) continue ;; esac
+  if [ "$mode" = extract ]; then
+    if [ -z "$src" ]; then src="$a"; elif [ -z "$out" ]; then out="$a"; fi
+  fi
+done
+if [ "$mode" = extract ]; then
+  [ -n "$out" ] || exit 3
+  [ -n "$tiles" ] || exit 3
+  printf 'PMTiles-stub-archive' > "${tiles}/$(basename "$out")"
+fi
+exit 0
+"""
+
+
+def _stub_docker(tmp_path: Path) -> Path:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "docker"
+    stub.write_text(DOCKER_STUB)
+    stub.chmod(0o755)
+    return stub_dir
+
+
+def _seed_archive(tiles: Path, name: str, when: int) -> Path:
+    """One previously published archive, stamped with the mtime publication order is read from."""
+    path = tiles / name
+    path.write_bytes(b"a published archive")
+    os.utime(path, (when, when))
+    return path
+
+
+def _run_extract(tiles: Path, stub_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), *args],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}"},
+    )
+
+
+def test_publishing_keeps_the_new_generation_and_the_one_it_replaced_and_no_more(tmp_path):
+    """Two generations of each kind survive an extraction, and they are the right two.
+
+    The previous generation has to stay: a client mid-session holds its directory and keeps
+    range-reading that exact file, so deleting it in the run that replaces it breaks the map for
+    whoever is looking at it. Everything older than that is unreachable — the manifest names only
+    the newest — and keeping it would grow a multi-gigabyte directory without bound. The real
+    script runs; only the extraction tool is stubbed.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    oldest_planet = _seed_archive(tiles, "planet-20260901.pmtiles", 1_000_000_000)
+    older_planet = _seed_archive(tiles, "planet-20260908.pmtiles", 1_100_000_000)
+    previous_planet = _seed_archive(tiles, "planet-20260915.pmtiles", 1_200_000_000)
+    oldest_detail = _seed_archive(tiles, "detail-20260901-aaaaaaaa.pmtiles", 1_000_000_000)
+    older_detail = _seed_archive(tiles, "detail-20260908-bbbbbbbb.pmtiles", 1_100_000_000)
+    previous_detail = _seed_archive(tiles, "detail-20260915-cccccccc.pmtiles", 1_200_000_000)
+
+    run = _run_extract(tiles, stub_dir, "--build", "20260917", "--dev", "small")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    published_planet = tiles / "planet-20260917.pmtiles"
+    assert published_planet.is_file(), run.stdout  # positive control: something WAS published
+    [published_detail] = [
+        p
+        for p in tiles.glob("detail-20260917-*.pmtiles")
+        if p.name not in {oldest_detail.name, older_detail.name, previous_detail.name}
+    ]
+
+    assert sorted(p.name for p in tiles.glob("planet-*.pmtiles")) == sorted(
+        [published_planet.name, previous_planet.name]
+    )
+    assert sorted(p.name for p in tiles.glob("detail-*.pmtiles")) == sorted(
+        [published_detail.name, previous_detail.name]
+    )
+    for gone in (oldest_planet, older_planet, oldest_detail, older_detail):
+        assert not gone.exists(), gone.name
+
+
+def test_a_kind_with_nothing_to_supersede_loses_nothing(tmp_path):
+    """The other branch: below the keep count, pruning removes nothing at all. Without this case a
+    prune that deleted the previous generation on every run would still pass the case above."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    stub_dir = _stub_docker(tmp_path)
+    only_planet = _seed_archive(tiles, "planet-20260915.pmtiles", 1_200_000_000)
+    only_detail = _seed_archive(tiles, "detail-20260915-cccccccc.pmtiles", 1_200_000_000)
+
+    run = _run_extract(tiles, stub_dir, "--build", "20260917", "--dev", "small")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    assert only_planet.exists()
+    assert only_detail.exists()
+    assert len(list(tiles.glob("planet-*.pmtiles"))) == 2
+    assert len(list(tiles.glob("detail-*.pmtiles"))) == 2
+    assert "removing superseded" not in run.stdout
+
+
+# --- the regions a detail archive covers ------------------------------------------------------
+
+REGIONS_DOC = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"cells": 1},
+            "geometry": {
+                "type": "MultiPolygon",
+                "coordinates": [
+                    [[[8.0, 47.0], [9.0, 47.0], [9.0, 48.0], [8.0, 48.0], [8.0, 47.0]]]
+                ],
+            },
+        }
+    ],
+}
+
+
+def _regions_file(tmp_path: Path) -> Path:
+    path = tmp_path / "regions.geojson"
+    path.write_text(json.dumps(REGIONS_DOC))
+    return path
+
+
+def test_the_regions_a_detail_archive_was_cut_from_are_published_under_its_own_stem(tmp_path):
+    """The manifest names one detail archive; nothing on disk said which ground it covers.
+
+    Published under the archive's immutable stem, so the two are one thing: the name that picks
+    the archive picks its regions, and a regions file can never be paired with an archive cut from
+    a different one.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+
+    run = _run_extract(tiles, _stub_docker(tmp_path), str(regions), "--build", "20260917")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    [detail] = list(tiles.glob("detail-20260917-*.pmtiles"))
+    sidecar = tiles / f"{detail.name.removesuffix('.pmtiles')}.regions.geojson"
+    assert sidecar.is_file(), sorted(p.name for p in tiles.iterdir())
+    assert json.loads(sidecar.read_text()) == REGIONS_DOC
+
+
+def test_a_superseded_detail_archive_takes_its_regions_file_with_it(tmp_path):
+    """The pair is one generation. A regions file left behind by the archive it describes would
+    accumulate silently and, worse, could be read for an archive that is no longer there."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    kept, dropped = [], []
+    for name, when in (
+        ("detail-20260901-aaaaaaaa", 1_000_000_000),
+        ("detail-20260908-bbbbbbbb", 1_100_000_000),
+        ("detail-20260915-cccccccc", 1_200_000_000),
+    ):
+        _seed_archive(tiles, f"{name}.pmtiles", when)
+        sidecar = tiles / f"{name}.regions.geojson"
+        sidecar.write_text('{"type": "FeatureCollection", "features": []}')
+        (kept if name.endswith("cccccccc") else dropped).append(sidecar)
+
+    run = _run_extract(tiles, _stub_docker(tmp_path), str(regions), "--build", "20260917")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    assert len(list(tiles.glob("detail-*.pmtiles"))) == 2
+    for survivor in kept:
+        # The generation still being read keeps its regions.
+        assert survivor.is_file(), survivor.name
+    for gone in dropped:
+        assert not gone.exists(), gone.name
+    assert len(list(tiles.glob("*.regions.geojson"))) == 2
+
+
+# --- the archive and its regions become visible together ---------------------------------------
+
+# `mv` is what makes a generation visible, so the moment to check is the rename itself. This stands
+# in for it on PATH: an archive arriving without its regions file beside it stops the script right
+# there, and every rename is recorded so a case can prove the check was reached at all.
+MV_GUARD = """#!/bin/sh
+dest=""
+for a in "$@"; do
+  case "$a" in -*) ;; *) src="$dest"; dest="$a" ;; esac
+done
+case "$dest" in
+  */detail-*.pmtiles)
+    echo "mv $dest" >> "$MV_LOG"
+    sidecar="${dest%.pmtiles}.regions.geojson"
+    if [ ! -f "$sidecar" ]; then
+      echo "ORDERING VIOLATION: ${sidecar##*/} absent when ${dest##*/} appeared" >&2
+      exit 9
+    fi
+    ;;
+  *.pmtiles) echo "mv $dest" >> "$MV_LOG" ;;
+esac
+exec /bin/mv "$@"
+"""
+
+# An extraction tool that produces the archive and then makes the regions file unreadable: the
+# publication is past the point of no return when copying the sidecar starts to fail.
+DOCKER_STUB_POISONS_REGIONS = DOCKER_STUB.replace(
+    '  printf \'PMTiles-stub-archive\' > "${tiles}/$(basename "$out")"\n',
+    '  printf \'PMTiles-stub-archive\' > "${tiles}/$(basename "$out")"\n'
+    '  [ -n "$POISON_REGIONS" ] && chmod 000 "$POISON_REGIONS"\n',
+)
+
+# Verification refuses the detail archive alone: the planet publishes normally, so the case is
+# about what the FAILED publication leaves behind rather than about stopping early.
+DOCKER_STUB_DETAIL_FAILS_VERIFY = DOCKER_STUB.replace(
+    'if [ "$mode" = extract ]; then',
+    'if [ "$mode" = verify ]; then\n'
+    '  for a in "$@"; do\n'
+    '    case "$a" in */detail-*.tmp) exit 1 ;; esac\n'
+    "  done\n"
+    "fi\n"
+    'if [ "$mode" = extract ]; then',
+    1,
+)
+
+
+def _stub_docker_variant(tmp_path: Path, body: str) -> Path:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "docker"
+    stub.write_text(body)
+    stub.chmod(0o755)
+    return stub_dir
+
+
+def test_a_detail_archive_never_becomes_visible_before_its_regions_file(tmp_path):
+    """The pair is what has to be atomic, not each rename on its own.
+
+    The manifest picks the newest detail archive and the coverage answer is read from the regions
+    file under its stem. An archive that is visible first — for an instant, or for good after an
+    interrupted run — is a generation whose regions do not exist, and nothing later repairs it,
+    because a published name is never rewritten. So the regions file goes down first: one beside
+    an archive nobody can see yet is harmless, the other way round is not.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    stub_dir = _stub_docker(tmp_path)
+    (stub_dir / "mv").write_text(MV_GUARD)
+    (stub_dir / "mv").chmod(0o755)
+    log = tmp_path / "mv.log"
+
+    run = subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), str(regions), "--build", "20260917"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}", "MV_LOG": str(log)},
+    )
+
+    assert "ORDERING VIOLATION" not in run.stderr, run.stderr
+    assert run.returncode == 0, (run.stdout, run.stderr)
+    [detail] = list(tiles.glob("detail-20260917-*.pmtiles"))
+    # Positive control: the guard DID run over the rename that publishes the detail archive.
+    assert f"mv {detail}" in log.read_text(), log.read_text()
+    assert (tiles / f"{detail.name.removesuffix('.pmtiles')}.regions.geojson").is_file()
+
+
+def test_a_regions_file_that_cannot_be_copied_publishes_no_archive_at_all(tmp_path):
+    """The failure the ordering exists for: if the sidecar cannot be written, the generation it
+    belongs to must simply not appear. Half of it appearing is the state nothing can repair."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    stub_dir = _stub_docker_variant(tmp_path, DOCKER_STUB_POISONS_REGIONS)
+
+    try:
+        run = subprocess.run(
+            ["bash", str(EXTRACT_SH), str(tiles), str(regions), "--build", "20260917"],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": f"{stub_dir}:{os.environ['PATH']}",
+                "POISON_REGIONS": str(regions),
+            },
+        )
+
+        assert run.returncode != 0, (run.stdout, run.stderr)
+        assert list(tiles.glob("detail-*.pmtiles")) == [], sorted(p.name for p in tiles.iterdir())
+    finally:
+        regions.chmod(0o644)
+
+
+def test_an_archive_that_fails_verification_leaves_no_regions_file_behind(tmp_path):
+    """No orphan either: a regions file whose archive was never published would be pruned by
+    nothing (prune follows archives) and would sit there describing a generation that does not
+    exist."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    stub_dir = _stub_docker_variant(tmp_path, DOCKER_STUB_DETAIL_FAILS_VERIFY)
+
+    run = subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), str(regions), "--build", "20260917"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode != 0, (run.stdout, run.stderr)
+    assert (tiles / "planet-20260917.pmtiles").is_file(), run.stdout  # control: it got that far
+    assert list(tiles.glob("detail-*.pmtiles")) == []
+    assert list(tiles.glob("*.regions.geojson")) == [], sorted(p.name for p in tiles.iterdir())
