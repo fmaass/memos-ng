@@ -386,7 +386,14 @@ def _sandbox(tmp_path: Path, name: str = "repo") -> Sandbox:
     env["DOCKER_RECORD"] = str(tmp_path / f"{name}-docker.log")
     Path(env["UV_RECORD"]).touch()
     Path(env["UV_PIDS"]).touch()
-    for leaked in ("UV_GATE_READY", "UV_GATE_FIFO", "DOCKER_GATE_READY", "DOCKER_GATE_FIFO"):
+    # IMAGE_TAG too: an exported tag in the developer's shell must not decide what "the default" is.
+    for leaked in (
+        "UV_GATE_READY",
+        "UV_GATE_FIFO",
+        "DOCKER_GATE_READY",
+        "DOCKER_GATE_FIFO",
+        "IMAGE_TAG",
+    ):
         env.pop(leaked, None)
     return Sandbox(root=root, bindir=bindir, env=env)
 
@@ -595,6 +602,51 @@ def test_a_run_in_one_worktree_does_not_block_a_run_in_another(
     other = second.run("scripts/check-mutations.sh", timeout=180)
     assert other.returncode == 0, other.stdout + other.stderr
     assert "mutation gate lock" not in other.stderr
+
+
+def _built_tags(sandbox: Sandbox) -> list[str]:
+    """EVERY `-t` value docker was handed: a second tag beside the asked-for one must show."""
+    tags = []
+    for _, _, argv in sandbox.docker_record():
+        words = argv.split()
+        tags.extend(words[i + 1] for i, word in enumerate(words) if word == "-t")
+    return tags
+
+
+def test_the_build_tags_the_deploy_image_unless_told_otherwise(sandbox: Sandbox) -> None:
+    run = sandbox.run("scripts/build-image.sh", "1.7.1+abc1234", timeout=120)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert _built_tags(sandbox) == ["memos-ng:local"]
+
+
+def test_a_compile_check_builds_under_its_own_tag_and_leaves_the_deploy_tag_alone(
+    sandbox: Sandbox,
+) -> None:
+    sandbox.env["IMAGE_TAG"] = "memos-ng:compile-check"
+
+    run = sandbox.run("scripts/build-image.sh", "1.7.1+abc1234", timeout=120)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert _built_tags(sandbox) == ["memos-ng:compile-check"]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    ["", "memos-ng:", "other/image:local", "memos-ng:a b", "memos-ng:x;rm", "memos-ng:-x"],
+)
+def test_the_build_refuses_a_tag_outside_its_own_image(sandbox: Sandbox, tag: str) -> None:
+    sandbox.env["IMAGE_TAG"] = tag
+
+    run = sandbox.run("scripts/build-image.sh", "1.7.1+abc1234", timeout=120)
+
+    if tag == "":  # unset and empty are the same to the script: the deploy tag
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert _built_tags(sandbox) == ["memos-ng:local"]
+        return
+    assert run.returncode == 2
+    assert "IMAGE_TAG" in run.stderr
+    assert sandbox.docker_record() == [], "it built anyway"
 
 
 def test_the_release_procedure_builds_through_the_script(sandbox: Sandbox) -> None:
