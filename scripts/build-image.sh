@@ -40,13 +40,10 @@ esac
 version="$1"
 
 tag="${IMAGE_TAG:-memos-ng:local}"
-case "$tag" in
-    memos-ng:?*) ;;
-    *) die "IMAGE_TAG must name a memos-ng:<tag> image, not '$tag'" ;;
-esac
-case "$tag" in
-    *[[:space:]]*) die "IMAGE_TAG must not contain whitespace" ;;
-esac
+# docker's own tag grammar, spelled out: anything else is refused here, before the lock is taken
+# and long before docker sees it, rather than left to whatever docker makes of it.
+[[ "$tag" =~ ^memos-ng:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+    die "IMAGE_TAG must name a memos-ng:<tag> image with a plain docker tag, not '$tag'"
 
 toplevel=$(git rev-parse --show-toplevel 2> /dev/null) || die "not a git repository"
 [ "$toplevel" = "$PWD" ] || die "run from the repository root ($toplevel), not $PWD"

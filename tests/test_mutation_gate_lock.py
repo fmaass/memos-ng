@@ -386,7 +386,14 @@ def _sandbox(tmp_path: Path, name: str = "repo") -> Sandbox:
     env["DOCKER_RECORD"] = str(tmp_path / f"{name}-docker.log")
     Path(env["UV_RECORD"]).touch()
     Path(env["UV_PIDS"]).touch()
-    for leaked in ("UV_GATE_READY", "UV_GATE_FIFO", "DOCKER_GATE_READY", "DOCKER_GATE_FIFO"):
+    # IMAGE_TAG too: an exported tag in the developer's shell must not decide what "the default" is.
+    for leaked in (
+        "UV_GATE_READY",
+        "UV_GATE_FIFO",
+        "DOCKER_GATE_READY",
+        "DOCKER_GATE_FIFO",
+        "IMAGE_TAG",
+    ):
         env.pop(leaked, None)
     return Sandbox(root=root, bindir=bindir, env=env)
 
@@ -598,11 +605,11 @@ def test_a_run_in_one_worktree_does_not_block_a_run_in_another(
 
 
 def _built_tags(sandbox: Sandbox) -> list[str]:
-    """The `-t` value of every docker invocation the stub recorded."""
+    """EVERY `-t` value docker was handed: a second tag beside the asked-for one must show."""
     tags = []
     for _, _, argv in sandbox.docker_record():
         words = argv.split()
-        tags.append(words[words.index("-t") + 1])
+        tags.extend(words[i + 1] for i, word in enumerate(words) if word == "-t")
     return tags
 
 
@@ -624,7 +631,10 @@ def test_a_compile_check_builds_under_its_own_tag_and_leaves_the_deploy_tag_alon
     assert _built_tags(sandbox) == ["memos-ng:compile-check"]
 
 
-@pytest.mark.parametrize("tag", ["", "memos-ng:", "other/image:local", "memos-ng:a b"])
+@pytest.mark.parametrize(
+    "tag",
+    ["", "memos-ng:", "other/image:local", "memos-ng:a b", "memos-ng:x;rm", "memos-ng:-x"],
+)
 def test_the_build_refuses_a_tag_outside_its_own_image(sandbox: Sandbox, tag: str) -> None:
     sandbox.env["IMAGE_TAG"] = tag
 
