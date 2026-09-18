@@ -366,9 +366,10 @@ async def test_failing_statement_never_quotes_the_coordinate_it_carried(adb):
         assert f"latitude = {spelling}" not in message
         assert f"({spelling}," not in message
     # What remains is PostgreSQL's own "Failing row contains" DETAIL, which the server sends with
-    # every check violation and no client setting suppresses. That residue is why no
-    # coordinate-writing path may let a SQLAlchemyError's MESSAGE travel: `_store` answers it
-    # below, with the uid alone (see the next case).
+    # every check violation and no client setting suppresses. The EXCEPTION keeps it; no log line
+    # does — `app.logging_privacy` scrubs it where an exception is rendered, for structlog and for
+    # Uvicorn's stdlib logger alike (tests/test_logging_privacy.py), and `_store` answers its own
+    # failure with the uid alone (see the next case).
     assert "Failing row contains" in message
 
 

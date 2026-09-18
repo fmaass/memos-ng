@@ -45,6 +45,7 @@ from pathlib import Path
 import structlog
 from anyio import fail_after, to_thread
 from app.database import async_session
+from app.logging_privacy import configure_logging
 from app.models import Attachment, AttachmentStatus
 from app.services import location
 from app.services.media import too_hot
@@ -52,6 +53,7 @@ from app.services.uploads import CAPTURE_READ_TIMEOUT_S
 from sqlalchemy import Select, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
+configure_logging()
 logger = structlog.get_logger(__name__)
 
 # A dead NFS mount fails every read at once. Without a stop, one such run would rewrite the whole
