@@ -111,11 +111,29 @@ Rollback: retag the previous image `memos-ng:rollback-<short-sha>` *before* over
 `APP_VERSION` env lines and `docker compose up -d --force-recreate` (compose always deploys the
 `memos-ng:local` tag; reverting only the env var would restart the BAD image under the old name).
 
-Recreating the worker kills any in-flight transcode/frame job. A frame job interrupted mid-send is
-no longer lost: the next worker start re-queues any claim older than `FRAME_CLAIM_STALE_MINUTES`
-(15 by default) and retries it, at the price of a possible re-upload of a photo the album already
-accepted — aura-frames dedups by sha256, so an unchanged photo does not duplicate (MEMNG-35). Still
-deploy in a quiet window — worker heartbeat fresh and no active job in the log tail.
+Recreating the worker stops any in-flight media job, and a **deliberate** stop now puts that work
+back in the queue instead of stranding it. `docker compose up -d --force-recreate` sends SIGTERM to
+the worker process (the entrypoint `exec`s it, so the signal arrives at Python); the supervisor
+tears both consumers down, and each cancelled job's row goes back to `queued` with its attempt
+count untouched — so the new worker claims it at once rather than waiting out the 2-hour
+`MEDIA_CLAIM_STALE_SECONDS` horizon, and the per-attachment order guard stops withholding that
+attachment's later jobs.
+
+That happens inside docker's stop grace, which is **10 s**: the stack compose sets no
+`stop_grace_period`, so the default applies. The budget the stop was designed against is the
+transcode's own tree stop first (SIGTERM to the ffmpeg process group, `media.KILL_GRACE_SECONDS` =
+5 s) plus a 3-second bound on the requeue write (`worker.CANCEL_REQUEUE_TIMEOUT_SECONDS`) — about
+8 s worst case, with both consumers requeueing in parallel. **Past the grace nothing can be
+written**: docker sends SIGKILL, and those rows stay `processing` (exactly as after an OOM kill or
+a host crash) until the stale-claim sweep requeues them 2 hours later, with the order guard holding
+that attachment's later jobs meanwhile. The same is true of an ffmpeg that ignores SIGTERM for its
+full 5 s and then needs the SIGKILL step.
+
+A frame job interrupted mid-send is not lost either: the next worker start re-queues any claim
+older than `FRAME_CLAIM_STALE_MINUTES` (15 by default) and retries it, at the price of a possible
+re-upload of a photo the album already accepted — aura-frames dedups by sha256, so an unchanged
+photo does not duplicate (MEMNG-35). Still deploy in a quiet window — worker heartbeat fresh and no
+active job in the log tail: a quiet window is what keeps the SIGKILL case off the table.
 
 ### Rollback across a migration
 

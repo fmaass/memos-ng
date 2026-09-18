@@ -15,7 +15,9 @@ for a consumer that died or went quiet while the other is still working.
 """
 
 import asyncio
+import contextlib
 import os
+import signal
 import socket
 import time
 from datetime import UTC, datetime, timedelta
@@ -54,6 +56,18 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
 ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message helps nobody
+# The signals a deliberate stop arrives as: SIGTERM is what `docker compose up -d
+# --force-recreate` sends (the entrypoint `exec`s this process, so it arrives here and not at a
+# shell), SIGINT is the same stop from a terminal.
+STOP_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
+# How long the cancel path may spend returning ONE claim to the queue, and the whole time budget
+# it lives in: the stack compose sets no `stop_grace_period`, so docker allows 10 s between
+# SIGTERM and SIGKILL. A running transcode is stopped first — media.KILL_GRACE_SECONDS = 5 s for
+# the TERM step of the ffmpeg tree stop — which makes the worst case this is designed for 5 + 3 =
+# 8 s, with ~2 s of margin. The two consumers requeue in parallel, so the 3 s is not doubled.
+# Past the grace docker sends SIGKILL, nothing can be written, and the row stays `processing` for
+# the stale-claim sweep (MEDIA_CLAIM_STALE_SECONDS) exactly as an OOM kill leaves it.
+CANCEL_REQUEUE_TIMEOUT_SECONDS = 3.0
 
 # A claim-time PREDICATE, not a column and not a row value: nothing is stored, and the class exists
 # only in the WHERE of a claim and as the name of the consumer that issued it. That is what lets
@@ -407,6 +421,32 @@ async def _requeue_claim(db: AsyncSession, job_id: int) -> None:
     await db.commit()
 
 
+async def _requeue_cancelled_claim(db: AsyncSession, job_id: int) -> None:
+    """Return a committed claim to `queued` while THIS task is being CANCELLED — the deploy stop.
+
+    Two bounds, both because the container this runs in is already stopping:
+
+    * SHIELDED — a second cancellation (a second TERM, an impatient caller) must not interrupt the
+      write half-done, or the row this exists to free stays `processing` after all.
+    * TIMED OUT at CANCEL_REQUEUE_TIMEOUT_SECONDS — a database that does not answer must not hold
+      the process past docker's stop grace. Past the bound the row stays `processing` and the
+      stale-claim sweep is the backstop, which is where a SIGKILL would have left it anyway.
+
+    Every failure is swallowed on purpose: run_once re-raises the cancellation either way, and a
+    requeue that could not be written must not replace the shutdown in progress with an error.
+    """
+    write = asyncio.ensure_future(_requeue_claim(db, job_id))
+    try:
+        async with asyncio.timeout(CANCEL_REQUEUE_TIMEOUT_SECONDS):
+            await asyncio.shield(write)
+        logger.info("media_job_requeued_on_cancel", job_id=job_id)
+    except (TimeoutError, asyncio.CancelledError):
+        write.cancel()  # the bound reached, or a second cancel — let the stop proceed
+        logger.warning("media_job_cancel_requeue_unfinished", job_id=job_id)
+    except Exception:
+        logger.exception("media_job_cancel_requeue_error", job_id=job_id)
+
+
 async def _discard_claim(db: AsyncSession, job_id: int, attachment_id: int, reason: str) -> None:
     """Discard a job whose attachment is gone (MEMNG-41), in a fresh transaction. Drops any partial
     transaction, then deletes the job row if it still exists — delete_attachment may have already
@@ -469,6 +509,16 @@ async def run_once(db: AsyncSession, job_class: JobClass | None = None) -> str:
             # owner a second "your photo is ready" per photo — a few hundred of them per book.
             await _notify_terminal_safe(attachment_id)  # separate session, after job is durable
         return "processed"
+    except asyncio.CancelledError:
+        # A DELIBERATE stop — SIGTERM → the supervisor's teardown → this consumer's cancellation —
+        # with a claim that is already committed. Without this branch the row keeps `processing`
+        # and a claim identity no live process answers to, and nothing requeues it until
+        # MEDIA_CLAIM_STALE_SECONDS (2 h), during which _order_guard also withholds every LATER
+        # job of the same attachment. Same treatment for both consumers: a recreate strands one
+        # row per class otherwise. The cancellation keeps propagating — shutdown stays prompt, and
+        # swallowing it here would turn a stop into a worker that keeps draining.
+        await _requeue_cancelled_claim(db, job_id)
+        raise
     except media.ThermalDefer:
         await _requeue_claim(db, job_id)  # too hot — back to queued, not a failure
         return "deferred"
@@ -487,6 +537,13 @@ async def run_once(db: AsyncSession, job_class: JobClass | None = None) -> str:
         # client saw its transcode reach 100%, snap back to 0%, and only then turn ready
         # (MEMNG-36). After the commit there is no such window — a finished job leaves the
         # snapshot's active set in the same transaction that publishes the result.
+        #
+        # It runs on the CANCEL path too, and deliberately after the requeue above rather than
+        # before it: the requeue is what the stop grace exists for, this is telemetry. A requeued
+        # job whose progress row survived would report the dead attempt's percentage until the
+        # retry publishes its own, and if the grace runs out here instead, the claim-time clear
+        # above and sweep_job_progress_safe both still remove it. clear_progress swallows its own
+        # errors, so this cannot mask the cancellation on its way out.
         await media.clear_progress(job_id)
 
 
@@ -982,6 +1039,70 @@ def _consumers_healthy(
     return healthy
 
 
+class _StopRequest:
+    """Whether a deliberate stop signal asked this supervisor to end.
+
+    The supervisor is ended by cancelling its own task — the same shutdown every in-process caller
+    performs — so this flag is the only thing that tells "docker asked us to stop" from "a caller
+    cancelled run()", and it decides whether run() returns (the process exits 0) or lets the
+    cancellation keep propagating.
+    """
+
+    def __init__(self) -> None:
+        self.signum: int | None = None
+
+    @property
+    def fired(self) -> bool:
+        return self.signum is not None
+
+
+def _install_stop_handlers(
+    stop: _StopRequest, supervisor: asyncio.Task[None]
+) -> list[signal.Signals]:
+    """Make SIGTERM/SIGINT end the supervisor through its OWN teardown; returns what was installed.
+
+    Cancelling the supervisor task is deliberately the same shutdown the in-process callers use:
+    the `finally` in run() already cancels and awaits both consumers, and each consumer's
+    in-flight claim is returned to the queue by run_once's cancel branch. So the signal path adds
+    no second teardown to keep in step with the first.
+
+    The handler does nothing but flag and cancel: it runs on the event loop, and a stop that
+    waited on anything here would spend the grace before the teardown even started.
+    """
+    loop = asyncio.get_running_loop()
+    installed: list[signal.Signals] = []
+
+    def request_stop(signum: signal.Signals) -> None:
+        if stop.fired:
+            return  # a second TERM cannot make a teardown that is already running any faster
+        stop.signum = int(signum)
+        logger.info("worker_stopping", signal=signum.name)
+        supervisor.cancel()
+
+    for sig in STOP_SIGNALS:
+        try:
+            loop.add_signal_handler(sig, request_stop, sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            # This loop cannot take signal handlers (not a Unix loop, or not the main thread — as
+            # in some test runners). Said out loud rather than passed over: production's stop path
+            # IS a Unix main-thread signal, so a worker that logs this is one whose claims a
+            # recreate would strand again.
+            logger.warning("worker_stop_handler_unavailable", signal=sig.name)
+            continue
+        installed.append(sig)
+    return installed
+
+
+def _remove_stop_handlers(installed: list[signal.Signals]) -> None:
+    """Hand the signals back on the way out — a handler still bound to a supervisor task that has
+    ended would otherwise outlive it, and one process can run run() more than once (the tests do).
+    """
+    loop = asyncio.get_running_loop()
+    for sig in installed:
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.remove_signal_handler(sig)
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     # Before anything is spawned or stamped: a configuration this release cannot honour must fail
@@ -1001,41 +1122,48 @@ async def run() -> None:
         max_c=settings.THERMAL_MAX_C,
     )
     beat()  # blocking-ok: the liveness stamp itself — see beat()
-    # Schema gate (MEMNG-86): a deploy recreates app + worker together, but only the app migrates.
-    # Wait for the live schema to reach the head this image was built with before running the
-    # recovery sweep or the loop — otherwise the sweep hits UndefinedColumnError against the old
-    # schema. Raises (worker exits, Docker restarts) if the schema never catches up.
-    await migrations.wait_for_migrated_schema()
-    # Startup sweeps: the common stranding cause is this very restart (a deploy --force-recreate
-    # killing work mid-flight), so adopt orphaned claims — frame-share AND media (MEMNG-90) — before
-    # draining anything new.
-    await run_frame_share_recover_safe()
-    await run_media_recover_safe()
-    # One consumer task per class, each with its OWN health and watermark. The supervisor keeps a
-    # strong reference to every task: a task only weakly referenced by the loop can be garbage
-    # collected mid-drain, and the teardown below needs them anyway.
-    stall_bounds: dict[JobClass, int] = {
-        "transcode": settings.WORKER_TRANSCODE_STALL_SECONDS,
-        "light": settings.WORKER_LIGHT_STALL_SECONDS,
-    }
+    # A deliberate stop is a signal, and it is installed HERE — before the schema gate, which can
+    # wait minutes — so that a recreate arriving during startup also ends through the teardown
+    # below rather than by SIGKILL. `consumers` exists this early for the same reason: the
+    # teardown is the one exit path, and before the spawn it simply has nothing to cancel.
+    stop = _StopRequest()
+    supervisor = asyncio.current_task()
+    installed = _install_stop_handlers(stop, supervisor) if supervisor is not None else []
     consumers: _Consumers = {}
-    spawn_classes: tuple[JobClass, ...] = ("transcode", "light")
-    for job_class in spawn_classes:
-        job_health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
-        job_watermark = _Watermark()
-        consumers[job_class] = (
-            asyncio.create_task(
-                consume_media(job_class, job_health, job_watermark),
-                name=f"media-consumer-{job_class}",
-            ),
-            job_health,
-            job_watermark,
-        )
-    last_reap = 0.0
-    # Which classes have already had their exit reported with the cause attached. A local, because
-    # it belongs to this supervisor's run and must not outlive it.
-    reported_exits: set[JobClass] = set()
     try:
+        # Schema gate (MEMNG-86): a deploy recreates app + worker together, but only the app
+        # migrates. Wait for the live schema to reach the head this image was built with before
+        # running the recovery sweep or the loop — otherwise the sweep hits UndefinedColumnError
+        # against the old schema. Raises (worker exits, Docker restarts) if it never catches up.
+        await migrations.wait_for_migrated_schema()
+        # Startup sweeps: the common stranding cause is this very restart (a deploy
+        # --force-recreate killing work mid-flight), so adopt orphaned claims — frame-share AND
+        # media (MEMNG-90) — before draining anything new.
+        await run_frame_share_recover_safe()
+        await run_media_recover_safe()
+        # One consumer task per class, each with its OWN health and watermark. The supervisor keeps
+        # a strong reference to every task: a task only weakly referenced by the loop can be
+        # garbage collected mid-drain, and the teardown below needs them anyway.
+        stall_bounds: dict[JobClass, int] = {
+            "transcode": settings.WORKER_TRANSCODE_STALL_SECONDS,
+            "light": settings.WORKER_LIGHT_STALL_SECONDS,
+        }
+        spawn_classes: tuple[JobClass, ...] = ("transcode", "light")
+        for job_class in spawn_classes:
+            job_health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
+            job_watermark = _Watermark()
+            consumers[job_class] = (
+                asyncio.create_task(
+                    consume_media(job_class, job_health, job_watermark),
+                    name=f"media-consumer-{job_class}",
+                ),
+                job_health,
+                job_watermark,
+            )
+        last_reap = 0.0
+        # Which classes have already had their exit reported with the cause attached. A local,
+        # because it belongs to this supervisor's run and must not outlive it.
+        reported_exits: set[JobClass] = set()
         while True:
             if _consumers_healthy(consumers, stall_bounds, reported_exits, report=True):
                 beat()  # blocking-ok: the liveness stamp itself — see beat()
@@ -1086,9 +1214,19 @@ async def run() -> None:
                 # The media term is gone from this condition with the media drain: the consumers
                 # pace themselves on their own backoff now, and the supervisor's own pass is cheap.
                 await asyncio.sleep(POLL_SECONDS)
+    except asyncio.CancelledError:
+        if not stop.fired:
+            raise  # somebody else's cancellation (the loop tests) keeps propagating, as before
+        # Our own stop signal: the teardown below runs either way, and returning afterwards is
+        # what makes a deliberate stop exit 0 instead of dying on an escaped CancelledError.
     finally:
-        # Teardown, not signal handling: every caller that cancels run() (the loop tests do) would
-        # otherwise leave a consumer draining against patched collaborators or a closed session.
+        _remove_stop_handlers(installed)
+        # The teardown is what the stop signal ENDS IN, and what every caller that cancels run()
+        # (the loop tests do) relies on: it would otherwise leave a consumer draining against
+        # patched collaborators or a closed session. Cancelling and AWAITING is load-bearing for
+        # the stop — each consumer returns its in-flight claim to the queue while it unwinds
+        # (run_once's cancel branch), and only the await makes that write part of the stop rather
+        # than a race with the process exiting.
         for task, _, _ in consumers.values():
             task.cancel()
         for task, _, _ in consumers.values():
@@ -1101,6 +1239,14 @@ async def run() -> None:
                 # left to surface as an unretrieved-task warning, and it must not mask the
                 # shutdown that is in progress.
                 logger.exception("worker_consumer_teardown_error")
+    # Reached only on a signalled stop (the loop above never exits on its own): every consumer has
+    # been cancelled AND awaited by now, so whatever they held is back in the queue and the next
+    # worker start can claim it at once.
+    logger.info(
+        "worker_stopped",
+        signal=signal.Signals(stop.signum).name if stop.signum is not None else None,
+        worker_id=WORKER_ID,
+    )
 
 
 def main() -> None:
