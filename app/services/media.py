@@ -1118,8 +1118,8 @@ def resolve_thermal_sensor() -> Path | None:
             try:
                 found = candidate.exists()
             except OSError:
-                # exists() answers False for ENOENT and re-raises everything else — EACCES on a
-                # restricted sysfs mount, EIO from a driver that went away. Those are unreadable
+                # exists() answers False only for a path that is simply not there (ENOENT,
+                # ENOTDIR, EBADF, ELOOP) and re-raises the rest — EACCES, EIO. Those are unreadable
                 # candidates like any other, not a reason to take the worker down.
                 continue
             if found:
@@ -1145,7 +1145,7 @@ def read_temp_millideg() -> int | None:
     except (OSError, ValueError):
         return None  # configured but unreadable is UNKNOWN too, not cool
     if not THERMAL_MIN_PLAUSIBLE_MILLIDEG <= milli <= THERMAL_MAX_PLAUSIBLE_MILLIDEG:
-        return None  # a number, but not one this guard's sensors produce — see the bound's comment
+        return None  # a number, but outside the range this guard accepts — see the bound's comment
     return milli
 
 

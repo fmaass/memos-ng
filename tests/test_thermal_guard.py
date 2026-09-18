@@ -268,8 +268,8 @@ def test_an_undecodable_name_with_nothing_else_is_unknown(hwmon):
 
 @pytest.mark.parametrize("reading", ["0", "-1", "-40000", "999000", "150001"])
 def test_a_reading_outside_this_guards_plausible_range_is_unknown(hwmon, reading):
-    """Outside the range a CPU package or host zone produces on a running machine — not a claim
-    that 0 °C or 200 °C is never a real temperature somewhere. Both ends are failure modes that
+    """Outside the range this guard ACCEPTS, a policy sized for a CPU package or host zone — not
+    a claim that 0 °C or 200 °C is never real somewhere. Both ends are failure modes that
     would otherwise read as a decision here. 0 and negatives are what a disconnected or misread
     sensor reports, and they sit below every threshold — "cool" about a host nothing measured,
     which is the exact bug this guard exists to stop. An absurd positive is above every threshold
