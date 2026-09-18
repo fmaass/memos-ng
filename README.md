@@ -116,7 +116,8 @@ There is no CI — the LOCAL gate is the gate (see `RELEASING.md`): pyright, ruf
 `alembic check` run bare with their exit codes cited, plus the frontend suite and the
 api-drift check (`python3 scripts/gen-openapi.py` then `npm run gen:api` in `frontend/` must
 produce no diff). A change touching
-`pyproject.toml` or the `Dockerfile` additionally needs a local `docker build`, because a
+`pyproject.toml` or the `Dockerfile` additionally needs a local image build — through
+`scripts/build-image.sh <version>+<short-sha>`, never a bare `docker build` — because a
 dependency that needs a compiler fails on `python:3.13-slim` but not on a dev machine.
 
 ## Build & deploy
@@ -188,6 +189,35 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | Authelia OIDC | — | confidential BFF client; public `https://auth…` endpoints only |
 
 ## Changelog
+
+### v1.7.1
+
+- The Places map shows its icons. MapLibre does not resolve a root-relative sprite address, so
+  the sprite sheet 1.7.0 named was never requested; the style now carries absolute addresses on
+  the page's own origin for the sprite and the glyphs, and the unit tests pin both.
+- The first view of `/places` keeps every pin clear of the timeline bar. The padding of the first
+  fit is measured from the overlay that really covers the map, per side, on desktop and phone.
+- "No located photos" appears only once the markers have been asked for and came back empty. While
+  they load that message stays away, and a failed request has a message of its own.
+- Photos uploaded while a long video is transcoding no longer wait for it. The one worker process
+  drains the queue with two consumers, `transcode` (a slow-lane `derive` job on a video) and
+  `light` (everything else), split by a predicate at claim time; nothing is stored, so there is no
+  migration. A per-attachment order guard keeps one attachment's jobs in sequence. The supervisor
+  owns the heartbeat and stamps it while both consumers are alive and inside their inactivity
+  bound, so a transcode longer than the healthcheck bar no longer makes a working worker look
+  dead. `WORKER_CONCURRENCY`, which nothing read, gives way to `WORKER_TRANSCODE_SLOTS`,
+  `WORKER_LIGHT_SLOTS`, `WORKER_CPU_BUDGET` and `WORKER_TRANSCODE_CPU_COST`, checked at startup.
+- The thermal guard reads the CPU package sensor by its hwmon name instead of a fixed thermal-zone
+  number, which on the worker's host was not the CPU; it says at startup which sensor it
+  resolved, and its limit is 90 °C, set for the host the worker runs on. A host without that sensor reports UNKNOWN
+  and keeps working.
+- `scripts/tiles/extract.sh --user uid:gid` publishes the basemap archives as the owner of the
+  tiles share: with it, every write into the tiles directory runs in a container as that user.
+- Release tooling: `npm run smoke:places` opens the production build of `/places` in a real
+  headless browser on a desktop and a phone viewport and is a gate for every release that touches
+  `frontend/`; `scripts/check-mutations.sh` and the new `scripts/build-image.sh` share a lock, so
+  a mutation patch can never be copied into an image.
+- No migration, and the API contract is unchanged.
 
 ### v1.7.0
 
