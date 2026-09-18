@@ -302,6 +302,7 @@ def _iloc(
     construction: dict[int, int] | None = None,
     data_reference: dict[int, int] | None = None,
     index_size: int = 0,
+    declared: int | None = None,
 ) -> bytes:
     """An `iloc` box in its version 0, 1 or 2 spelling, one extent per item.
 
@@ -323,7 +324,9 @@ def _iloc(
             (base_offset_size << 4) | (index_size if version in (1, 2) else 0),
         ]
     )
-    body += len(items).to_bytes(4 if version == 2 else 2, "big")
+    # `declared` is the count the box CLAIMS; writing fewer rows than that is a real corruption
+    # and the shape a reader most easily answers from halfway through.
+    body += (len(items) if declared is None else declared).to_bytes(4 if version == 2 else 2, "big")
     for item_id, offset, length in items:
         body += item_id.to_bytes(4 if version == 2 else 2, "big")
         if version in (1, 2):
@@ -374,6 +377,10 @@ def _heif_variant(
     exif_data_reference: int = 0,
     exif_length: int = 0,
     index_size: int = 0,
+    iloc_declared: int | None = None,
+    omit_exif_extent: bool = False,
+    extra_reference: tuple[int, int] | None = None,
+    extra_reference_first: bool = False,
     filler: int = 0,
     lead_filler: int = 0,
     trail_filler: int = 0,
@@ -410,19 +417,24 @@ def _heif_variant(
     out = b""
     for _pass in (1, 2):  # the field widths are fixed, so the second pass only fills the offsets
         pieces: list[bytes] = []
-        for kind, start, _body, end in children:
+        for kind, start, body, end in children:
+            if kind == b"iref" and extra_reference is not None:
+                pieces.append(_iref_with(source, body, end, extra_reference, extra_reference_first))
+                continue
             if kind != b"iloc":
                 pieces.append(source[start:end])
                 continue
             if in_idat:
                 pieces.append(_box(b"idat", payloads[exif_id]))
+            written = [row for row in rows if not (omit_exif_extent and row[0] == exif_id)]
             pieces.append(
                 _iloc(
-                    rows,
+                    written,
                     iloc_version,
                     construction=construction,
                     data_reference=data_reference,
                     index_size=index_size,
+                    declared=iloc_declared,
                 )
             )
         meta = _box(b"meta", b"\x00\x00\x00\x00" + b"".join(pieces))
@@ -442,6 +454,22 @@ def _heif_variant(
                 cursor += len(payloads[item])
         out = ftyp + lead + meta + mdat
     return out
+
+
+def _iref_with(source: bytes, body: int, end: int, extra: tuple[int, int], first: bool) -> bytes:
+    """The file's `iref` box with one more reference in it — `extra` is (declared, present).
+
+    A reference box whose declared reference_count exceeds the IDs it actually holds: legal-looking
+    until the arithmetic is done, and the second half of a table a reader may already have taken
+    its answer from.
+    """
+    declared, present = extra
+    reference = _box(
+        b"cdsc", (1).to_bytes(2, "big") + declared.to_bytes(2, "big") + b"\x00\x01" * present
+    )
+    existing = source[body + 4 : end]
+    ordered = reference + existing if first else existing + reference
+    return _box(b"iref", source[body : body + 4] + ordered)
 
 
 def _exif_item_id(source: bytes, meta_body: int, meta_end: int) -> int:
@@ -508,6 +536,42 @@ def heic_gps_overlong_exif(path: Path, *, length: int = 3 * 1024 * 1024) -> None
     about the cap.
     """
     path.write_bytes(_heif_variant(_source_heic(), exif_length=length, trail_filler=length))
+
+
+def heic_gps_overcounted_reference(path: Path, *, first: bool = False) -> None:
+    """`heic-gps.heic` with a second `cdsc` whose reference_count overstates the IDs it holds.
+
+    Placed AFTER the reference that matches, it is the half of the table a reader that answers on
+    the first match never looks at; placed FIRST (`first=True`) it is the control, since any walk
+    at all must meet it. The file is malformed either way, and libheif refuses it either way — so
+    an answer from the good half turns an unreadable original into a successful read.
+    """
+    path.write_bytes(
+        _heif_variant(
+            _source_heic(), iloc_version=1, extra_reference=(4, 1), extra_reference_first=first
+        )
+    )
+
+
+def heic_gps_overcounted_iloc(path: Path, *, omit_exif: bool = False) -> None:
+    """`heic-gps.heic` whose `iloc` declares more items than it writes.
+
+    With the Exif item present (the default) the shortfall lies BEYOND the match, which is exactly
+    what a reader that returns on the first item it wants never reads. With `omit_exif` the Exif
+    row is dropped as well, so the shortfall is met before any match — the control.
+    """
+    source = _source_heic()
+    items = len(_source_items(source, *_meta_span(source))[0])
+    path.write_bytes(
+        _heif_variant(source, iloc_version=1, iloc_declared=items + 3, omit_exif_extent=omit_exif)
+    )
+
+
+def _meta_span(source: bytes) -> tuple[int, int]:
+    _, _, meta_body, meta_end = next(
+        b for b in _iso_boxes(source, 0, len(source)) if b[0] == b"meta"
+    )
+    return meta_body + 4, meta_end
 
 
 def heic_gps_index_size(path: Path, version: int, index_size: int) -> None:

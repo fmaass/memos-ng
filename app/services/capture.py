@@ -412,6 +412,11 @@ def _heif_exif_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int 
     references = _heif_boxes(meta, body + 4, end)
     if references is None:
         return None
+    # The WHOLE table is validated before any match in it is believed. A reference that matches
+    # says nothing about the ones after it, and a file whose second reference over-counts is a
+    # file libheif refuses outright — answering from the good half of it would turn an unreadable
+    # original into a successful read and skip the fallback that would have raised.
+    found: int | None = None
     for kind, ref, ref_end in references:
         if ref + width + 2 > ref_end:
             return None
@@ -424,8 +429,10 @@ def _heif_exif_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int 
         for index in range(count):
             at = ref + width + 2 + index * width
             if int.from_bytes(meta[at : at + width], "big") == primary:
-                return source
-    return None
+                if found is not None and found != source:
+                    return None  # two Exif items claiming the same image: unknowable
+                found = source
+    return found
 
 
 def _heif_extent(
@@ -461,6 +468,10 @@ def _heif_extent(
         return None
     count = int.from_bytes(meta[cursor : cursor + count_size], "big")
     cursor += count_size
+    # As in `_heif_exif_item`: the item table is walked to its END before the row this read wants
+    # is believed. An `iloc` declaring more items than it writes is a corrupt table whichever side
+    # of the match the shortfall falls on, and only a complete walk can tell.
+    found: tuple[int, int] | None = None
     for _ in range(count):
         head = id_size + (2 if version in (1, 2) else 0) + 2 + base_size + 2
         if cursor + head > body_end:
@@ -485,17 +496,24 @@ def _heif_extent(
             continue
         # construction_method 0 is a FILE offset; a data_reference_index names ANOTHER file; and a
         # split extent would have to be stitched. None of the three is a header read of this file.
-        if method != 0 or reference != 0 or extents != 1:
+        if method != 0 or reference != 0 or extents != 1 or found is not None:
             return None
         # The index is SKIPPED, and the length is measured from the end of the OFFSET — not from
         # the end of the whole extent, which would read `index_size` bytes too far and turn a
         # declared 32 into billions.
-        cursor += index_size
-        offset = int.from_bytes(meta[cursor : cursor + offset_size], "big") if offset_size else 0
-        at = cursor + offset_size
-        length = int.from_bytes(meta[at : at + length_size], "big") if length_size else 0
-        return base + offset, length
-    return None
+        offset_at = cursor + index_size
+        offset = (
+            int.from_bytes(meta[offset_at : offset_at + offset_size], "big") if offset_size else 0
+        )
+        length_at = offset_at + offset_size
+        length = (
+            int.from_bytes(meta[length_at : length_at + length_size], "big") if length_size else 0
+        )
+        found = (base + offset, length)
+        cursor += extents * span
+    if cursor != body_end:  # the rows must account for the box exactly, with nothing left over
+        return None
+    return found
 
 
 def _heif_exif_payload(raw: bytes) -> bytes | None:

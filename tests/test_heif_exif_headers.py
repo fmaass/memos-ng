@@ -13,6 +13,7 @@ Pillow independently finds in the same file — never from a value this module b
 """
 
 import json
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -267,6 +268,34 @@ def test_a_structure_the_walker_cannot_trust_is_declined(tmp_path, damage):
     else:
         with pytest.raises(OSError):
             location.read_location(path, HEIC_MIME)
+
+
+TABLE_DAMAGES = {
+    "reference-over-counted-after-the-match": gen.heic_gps_overcounted_reference,
+    "reference-over-counted-before-it": partial(gen.heic_gps_overcounted_reference, first=True),
+    "iloc-short-of-its-count-after-the-match": gen.heic_gps_overcounted_iloc,
+    "iloc-short-of-its-count-before-it": partial(gen.heic_gps_overcounted_iloc, omit_exif=True),
+}
+
+
+@pytest.mark.parametrize("case", sorted(TABLE_DAMAGES))
+def test_the_whole_table_is_validated_before_a_match_in_it_is_believed(tmp_path, case):
+    # A match found halfway through a table says nothing about the rest of it. Both walks used to
+    # answer on the first hit, so a file whose SECOND reference over-counts, or whose `iloc`
+    # declares more items than it writes, came back with Exif bytes while libheif refused the file
+    # outright — an unreadable original turned into a successful metadata read, and the fallback
+    # that would have raised was never reached. The two "BEFORE it" cases are the controls: any
+    # walk at all meets that damage, so they were already declined.
+    path = tmp_path / "table.heic"
+    TABLE_DAMAGES[case](path)
+    assert _walk(path) is None
+
+    with pytest.raises(OSError) as refused:
+        with Image.open(path):
+            pass  # pragma: no cover — the open is what raises
+    # The file's fate stays the one the full read gives it, down to the exception class.
+    with pytest.raises(type(refused.value)):
+        location.read_location(path, HEIC_MIME)
 
 
 def test_a_truncated_meta_is_declined_and_the_file_stays_unreadable(heifs, tmp_path):
