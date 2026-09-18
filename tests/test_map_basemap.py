@@ -15,6 +15,7 @@ resources. Three properties are load-bearing and each has a failure that looks l
   test below observes the real sequence rather than the code's shape.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -28,6 +29,8 @@ from app.security_headers import CSP
 from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
 from sqlalchemy import event
+
+from tests.conftest import SYNC_URL
 
 # The whole CSP as it stood before the basemap work, directive by directive. Frozen here on
 # purpose: the change under test is additive, and the only way to prove a directive did not go
@@ -315,13 +318,89 @@ def test_a_style_asset_is_cached_for_a_week_only_because_its_url_carries_the_rev
     assert r.headers["cache-control"] == "private, max-age=604800, immutable"
 
 
+@pytest.fixture(autouse=True)
+def _empty_coverage_cache():
+    """The uncovered count is cached per viewer and archive for ten minutes, and every case here
+    speaks as the same viewer about the same archive names."""
+    from app.services import map_coverage
+
+    map_coverage._CACHE.clear()
+    yield
+    map_coverage._CACHE.clear()
+
+
+def test_the_manifest_counts_the_pins_the_published_detail_archive_does_not_reach(
+    logged_in_client, tiles_dir
+):
+    """A detail archive is cut to the regions that had pins WHEN IT WAS CUT; pins keep arriving.
+    The count is what tells an operator the map has quietly stopped having streets where the
+    household now takes photographs."""
+    from sqlalchemy import create_engine, text
+
+    from tests.test_map_markers import _wipe
+
+    client, subject = logged_in_client
+    (tiles_dir / DETAIL).write_bytes(ARCHIVE_BYTES)
+    (tiles_dir / f"{DETAIL.removesuffix('.pmtiles')}.regions.geojson").write_text(
+        json.dumps(REGIONS_DOC)
+    )
+    engine = create_engine(SYNC_URL)
+    try:
+        with engine.begin() as connection:
+            owner_id = connection.execute(
+                text("SELECT id FROM users WHERE subject = :s"), {"s": subject}
+            ).scalar_one()
+            memo_id = connection.execute(
+                text(
+                    "INSERT INTO memos"
+                    " (uid, owner_id, content, visibility, pinned, created_at, updated_at)"
+                    " VALUES ('memo-uncovered', :o, 'elsewhere', 'PUBLIC', false, now(), now())"
+                    " RETURNING id"
+                ),
+                {"o": owner_id},
+            ).scalar_one()
+            connection.execute(
+                text(
+                    "INSERT INTO attachments"
+                    " (uid, owner_id, memo_id, filename, mime, size, status, storage_path,"
+                    "  latitude, longitude, location_source)"
+                    " VALUES ('faraway', :o, :m, 'f.jpg', 'image/jpeg', 1, 'ready', '/nowhere',"
+                    "  12.5, 45.25, 'exif')"
+                ),
+                {"o": owner_id, "m": memo_id},
+            )
+
+        body = client.get("/api/map/manifest").json()
+        assert body["detail"]["name"] == DETAIL
+        assert body["uncovered"] == 1
+    finally:
+        engine.dispose()
+        _wipe()
+
+
+def test_with_no_detail_archive_the_coverage_question_is_answered_with_nothing(
+    logged_in_client, tiles_dir
+):
+    client, _ = logged_in_client
+    body = client.get("/api/map/manifest").json()
+
+    assert body["detail"] is None
+    assert body["uncovered"] is None
+
+
 def test_an_empty_tiles_directory_reports_nothing_rather_than_failing(
     logged_in_client, tmp_path, monkeypatch
 ):
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "TILES_DIR", str(tmp_path / "never-extracted"))
     body = client.get("/api/map/manifest").json()
-    assert body == {"build": None, "assets_commit": None, "planet": None, "detail": None}
+    assert body == {
+        "build": None,
+        "assets_commit": None,
+        "planet": None,
+        "detail": None,
+        "uncovered": None,
+    }
 
 
 def test_the_tiles_directory_defaults_to_the_derived_asset_volume(monkeypatch):
@@ -546,3 +625,77 @@ def test_a_kind_with_nothing_to_supersede_loses_nothing(tmp_path):
     assert len(list(tiles.glob("planet-*.pmtiles"))) == 2
     assert len(list(tiles.glob("detail-*.pmtiles"))) == 2
     assert "removing superseded" not in run.stdout
+
+
+# --- the regions a detail archive covers ------------------------------------------------------
+
+REGIONS_DOC = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"cells": 1},
+            "geometry": {
+                "type": "MultiPolygon",
+                "coordinates": [
+                    [[[8.0, 47.0], [9.0, 47.0], [9.0, 48.0], [8.0, 48.0], [8.0, 47.0]]]
+                ],
+            },
+        }
+    ],
+}
+
+
+def _regions_file(tmp_path: Path) -> Path:
+    path = tmp_path / "regions.geojson"
+    path.write_text(json.dumps(REGIONS_DOC))
+    return path
+
+
+def test_the_regions_a_detail_archive_was_cut_from_are_published_under_its_own_stem(tmp_path):
+    """The manifest names one detail archive; nothing on disk said which ground it covers.
+
+    Published under the archive's immutable stem, so the two are one thing: the name that picks
+    the archive picks its regions, and a regions file can never be paired with an archive cut from
+    a different one.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+
+    run = _run_extract(tiles, _stub_docker(tmp_path), str(regions), "--build", "20260917")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    [detail] = list(tiles.glob("detail-20260917-*.pmtiles"))
+    sidecar = tiles / f"{detail.name.removesuffix('.pmtiles')}.regions.geojson"
+    assert sidecar.is_file(), sorted(p.name for p in tiles.iterdir())
+    assert json.loads(sidecar.read_text()) == REGIONS_DOC
+
+
+def test_a_superseded_detail_archive_takes_its_regions_file_with_it(tmp_path):
+    """The pair is one generation. A regions file left behind by the archive it describes would
+    accumulate silently and, worse, could be read for an archive that is no longer there."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    kept, dropped = [], []
+    for name, when in (
+        ("detail-20260901-aaaaaaaa", 1_000_000_000),
+        ("detail-20260908-bbbbbbbb", 1_100_000_000),
+        ("detail-20260915-cccccccc", 1_200_000_000),
+    ):
+        _seed_archive(tiles, f"{name}.pmtiles", when)
+        sidecar = tiles / f"{name}.regions.geojson"
+        sidecar.write_text('{"type": "FeatureCollection", "features": []}')
+        (kept if name.endswith("cccccccc") else dropped).append(sidecar)
+
+    run = _run_extract(tiles, _stub_docker(tmp_path), str(regions), "--build", "20260917")
+    assert run.returncode == 0, (run.stdout, run.stderr)
+
+    assert len(list(tiles.glob("detail-*.pmtiles"))) == 2
+    for survivor in kept:
+        # The generation still being read keeps its regions.
+        assert survivor.is_file(), survivor.name
+    for gone in dropped:
+        assert not gone.exists(), gone.name
+    assert len(list(tiles.glob("*.regions.geojson"))) == 2

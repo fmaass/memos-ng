@@ -1506,7 +1506,7 @@
         "type": "object"
       },
       "MapManifest": {
-        "description": "Which basemap archives are available, and the date of the data they were cut from.\n\n`detail` is null when no region archive has been published; a client renders the world archive\nalone rather than nothing at all.\n\n`assets_commit` is the revision of the style's fonts and sprites currently on disk. Unlike an\narchive, those files are overwritten IN PLACE at fixed paths when their pin is bumped, so\nnothing about their URL would change \u2014 and they are served as cacheable for a week. Handing\nthe client the revision is what lets the style version the URLs it builds, which is the only\nthing that can retire a cached copy of the previous ones.",
+        "description": "Which basemap archives are available, and the date of the data they were cut from.\n\n`detail` is null when no region archive has been published; a client renders the world archive\nalone rather than nothing at all.\n\n`assets_commit` is the revision of the style's fonts and sprites currently on disk. Unlike an\narchive, those files are overwritten IN PLACE at fixed paths when their pin is bumped, so\nnothing about their URL would change \u2014 and they are served as cacheable for a week. Handing\nthe client the revision is what lets the style version the URLs it builds, which is the only\nthing that can retire a cached copy of the previous ones.\n\n`uncovered` counts the caller's visible pins that fall outside the ground the current detail\narchive was cut for \u2014 the signal that a re-extract is due, because a detail archive does not\nfollow the household to a new place on its own. It is null, never zero, when no detail archive\nis published or its regions were not recorded: zero would read as full coverage.",
         "properties": {
           "assets_commit": {
             "title": "Assets Commit",
@@ -1541,13 +1541,21 @@
                 "type": "null"
               }
             ]
+          },
+          "uncovered": {
+            "title": "Uncovered",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
           "build",
           "assets_commit",
           "planet",
-          "detail"
+          "detail",
+          "uncovered"
         ],
         "title": "MapManifest",
         "type": "object"
@@ -4671,7 +4679,7 @@
     },
     "/api/map/manifest": {
       "get": {
-        "description": "List the basemap archives this server currently offers.\n\nNever cached: it is the pointer that changes when new map data is published, and a client\nholding a stale copy would keep asking for an archive that has been superseded.",
+        "description": "List the basemap archives this server currently offers, and how well they cover the pins.\n\nNever cached: it is the pointer that changes when new map data is published, and a client\nholding a stale copy would keep asking for an archive that has been superseded.\n\nThe ordinary session dependency here, unlike the two routes below: this answer is a few\nhundred bytes and the coverage count is a query, so the connection is held for a short\nresponse rather than for a multi-gigabyte transfer. The count itself is cached per viewer for\nten minutes \u2014 the manifest is fetched on every map open and every theme toggle.",
         "operationId": "basemap_manifest_api_map_manifest_get",
         "responses": {
           "200": {

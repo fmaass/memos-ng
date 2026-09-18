@@ -152,18 +152,33 @@ publish() {
 }
 
 # Drop generations older than the previous one. Newest two of each kind are kept: the one just
-# published and the one it replaced (still being read by any client mid-session).
+# published and the one it replaced (still being read by any client mid-session). An archive's
+# regions file shares its stem and goes with it: the two are one generation, and a regions file
+# outliving its archive would be read as describing ground nothing covers any more.
 prune() {
     local kind="$1" keep=2
     # shellcheck disable=SC2012  # ls -t orders by mtime, which is the publication order here
     ls -1t "${TILES_DIR}/${kind}-"*.pmtiles 2>/dev/null | tail -n +$((keep + 1)) | while read -r old; do
         echo "extract.sh: removing superseded ${old##*/}"
-        rm -f "$old"
+        rm -f "$old" "${old%.pmtiles}.regions.geojson"
     done
 }
 
 publish "$PLANET_NAME" --maxzoom="$PLANET_MAXZOOM"
 publish "$DETAIL_NAME" "${SELECTOR[@]}" --maxzoom="$DETAIL_ZOOM"
+
+# The selected geometry, published under the detail archive's own stem. The manifest picks ONE
+# detail archive, and picking it has to imply the ground it covers — otherwise the only way to
+# answer "is this pin on the detailed part of the map" is to guess from a regions file that may
+# already describe a later extraction. A dev preset selects a bbox rather than a regions file and
+# publishes none: it is a developer's small extract, never the answer to that question.
+if [ -z "$DEV" ]; then
+    REGIONS_SIDECAR="${TILES_DIR}/${DETAIL_NAME%.pmtiles}.regions.geojson"
+    cp "$REGIONS" "${REGIONS_SIDECAR}.tmp"
+    mv "${REGIONS_SIDECAR}.tmp" "$REGIONS_SIDECAR"
+    echo "extract.sh: published ${REGIONS_SIDECAR##*/}"
+fi
+
 prune planet
 prune detail
 

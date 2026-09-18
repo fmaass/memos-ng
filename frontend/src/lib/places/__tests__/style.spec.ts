@@ -10,7 +10,13 @@ const DETAIL = {
 }
 // No assets revision recorded: the shared fixture is the plain case, and the cases that
 // exercise the versioned asset URLs state their own commit.
-const BOTH: MapManifest = { build: '20260916', assets_commit: null, planet: PLANET, detail: DETAIL }
+const BOTH: MapManifest = {
+  build: '20260916',
+  assets_commit: null,
+  planet: PLANET,
+  detail: DETAIL,
+  uncovered: null,
+}
 const ASSETS_COMMIT = '028c18f713baecad011301ff7a69acc39bcc2ae7'
 const OTHER_COMMIT = 'f19c4a0b6d2e5a78c3b1049fd7e6a2158bc0d34e'
 
@@ -79,7 +85,7 @@ describe('buildStyle', () => {
     // An overzoomed basemap beats a blank one: without the detail archive, capping the planet
     // layers at z8 would leave every zoom past it empty.
     const style = buildStyle(
-      { build: '20260916', assets_commit: null, planet: PLANET, detail: null },
+      { build: '20260916', assets_commit: null, planet: PLANET, detail: null, uncovered: null },
       'dark',
     )
 
@@ -90,7 +96,10 @@ describe('buildStyle', () => {
 
   it('still renders a map background when no archive exists at all', () => {
     // The route must not depend on the basemap: markers and the grid are the feature.
-    const style = buildStyle({ build: null, assets_commit: null, planet: null, detail: null }, 'light')
+    const style = buildStyle(
+      { build: null, assets_commit: null, planet: null, detail: null, uncovered: null },
+      'light',
+    )
 
     expect(style.sources).toEqual({})
     expect(style.layers.map((l) => l.type)).toEqual(['background'])

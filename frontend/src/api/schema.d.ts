@@ -740,10 +740,15 @@ export interface paths {
         };
         /**
          * Basemap Manifest
-         * @description List the basemap archives this server currently offers.
+         * @description List the basemap archives this server currently offers, and how well they cover the pins.
          *
          *     Never cached: it is the pointer that changes when new map data is published, and a client
          *     holding a stale copy would keep asking for an archive that has been superseded.
+         *
+         *     The ordinary session dependency here, unlike the two routes below: this answer is a few
+         *     hundred bytes and the coverage count is a query, so the connection is held for a short
+         *     response rather than for a multi-gigabyte transfer. The count itself is cached per viewer for
+         *     ten minutes — the manifest is fetched on every map open and every theme toggle.
          */
         get: operations["basemap_manifest_api_map_manifest_get"];
         put?: never;
@@ -1958,6 +1963,11 @@ export interface components {
          *     nothing about their URL would change — and they are served as cacheable for a week. Handing
          *     the client the revision is what lets the style version the URLs it builds, which is the only
          *     thing that can retire a cached copy of the previous ones.
+         *
+         *     `uncovered` counts the caller's visible pins that fall outside the ground the current detail
+         *     archive was cut for — the signal that a re-extract is due, because a detail archive does not
+         *     follow the household to a new place on its own. It is null, never zero, when no detail archive
+         *     is published or its regions were not recorded: zero would read as full coverage.
          */
         MapManifest: {
             /** Assets Commit */
@@ -1966,6 +1976,8 @@ export interface components {
             build: string | null;
             detail: components["schemas"]["MapArchive"] | null;
             planet: components["schemas"]["MapArchive"] | null;
+            /** Uncovered */
+            uncovered: number | null;
         };
         /**
          * MapMarker
