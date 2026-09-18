@@ -11,6 +11,7 @@ import os
 import random
 import secrets
 import struct
+import threading
 import time
 from datetime import UTC, datetime
 from io import BytesIO
@@ -710,6 +711,55 @@ async def test_a_print_job_dispatches_by_kind_not_by_lane(adb, monkeypatch, tmp_
     assert printready.printready_path(att.uid).exists()
     assert not (tmp_path / "assets" / "thumbs" / f"{att.uid}.jpg").exists()
     assert att.blurhash is None and att.width is None  # the photo's own columns are untouched
+
+
+async def test_the_encode_does_not_freeze_the_event_loop(adb, monkeypatch, tmp_path):
+    # The worker runs two consumers plus the supervisor on ONE loop (MEMNG-241 split), so a
+    # print encode held on the loop thread freezes the transcode consumer's progress writes and
+    # the supervisor's heartbeat for its whole duration — seconds, per rendition, a few hundred
+    # renditions per book. What is asserted is therefore the loop STILL RUNNING while the encode
+    # is in the middle of blocking, not merely finishing afterwards.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    att = await _persisted(adb, tmp_path, source=_png(tmp_path / "offloop.png"))
+    job = MediaJob(
+        attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=JobState.queued
+    )
+    adb.add(job)
+    await adb.flush()
+
+    block_s = 0.4
+    loop_thread = threading.get_ident()
+    encode_threads: list[int] = []
+    began: list[float] = []
+    finished: list[float] = []
+
+    def _slow_encode(attachment, profile=None) -> Path:
+        # A CPU-bound encode's stand-in: a blocking sleep that offers the loop no yield point,
+        # exactly like Pillow's decode/resize/save.
+        encode_threads.append(threading.get_ident())
+        began.append(time.monotonic())
+        time.sleep(block_s)
+        finished.append(time.monotonic())
+        return printready.printready_path(attachment.uid, profile)
+
+    monkeypatch.setattr(media, "process_printready", _slow_encode)
+
+    ticks: list[float] = []
+
+    async def _ticker() -> None:
+        # Bounded by the stub's own duration so a regression fails on the assertions below
+        # instead of hanging the suite.
+        deadline = time.monotonic() + block_s * 5
+        while not finished and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            ticks.append(time.monotonic())
+
+    await asyncio.gather(media.process_printready_job(adb, job, att), _ticker())
+
+    during = [t for t in ticks if began[0] < t < finished[0]]
+    assert len(during) >= 3, f"the loop ran {len(during)} times while the encode blocked"
+    assert encode_threads and encode_threads[0] != loop_thread  # ran on a worker thread
 
 
 async def test_the_upload_pipeline_never_generates_the_print_tier(adb, monkeypatch, tmp_path):

@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 import pillow_heif
 import structlog
+from anyio import to_thread
 from PIL import Image, ImageChops, ImageCms, ImageFile, ImageOps, ImageStat
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
@@ -1531,8 +1532,8 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
     Slow lane and thermally deferred like the transcode, for the same reason: a 40-60 MP decode +
     LANCZOS reduction + q92 encode is seconds of full-core CPU on a NAS that is shared with
     production and bounded by heat, and a book asks for a few hundred of them at once. The worker
-    drains one job at a time and Pillow encodes on the calling thread, so "single-threaded and
-    throttled" is what this already is — nothing here fans out.
+    drains one slow-lane job at a time and the encode below occupies exactly one worker thread, so
+    "single-threaded and throttled" is what this already is — nothing here fans out.
 
     It publishes an EXTRA tier for a photo that is already `ready`, so unlike every other job it
     changes no attachment column and no status: a print rendition that never gets made must not
@@ -1557,9 +1558,18 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
             # rather than guess a profile and publish bytes nobody asked for.
             raise RuntimeError(f"job {job.id} names an unknown print profile {job.profile_key!r}")
         profile = parsed
-    # blocking-ok: this IS the worker's job — a CPU-bound decode/encode that would still occupy
-    # the process in a thread. Nothing else is queued on this loop to yield to.
-    process_printready(attachment, profile)
+    # Off the loop, because "nothing else is queued on this loop" stopped being true: the worker
+    # process now runs TWO consumers plus the supervisor on one event loop. Held inline, a
+    # multi-second 40-60 MP decode/LANCZOS/q92 encode freezes the transcode consumer's progress
+    # writes and the supervisor's heartbeat for its whole duration — and a book asks for a few
+    # hundred renditions in a row. The CPU cost is unchanged; only the loop is given back.
+    # `attachment` may cross to the thread because process_printready reads nothing that can
+    # touch the session: uid, storage_path, captured_at, id, and the selectin-loaded `renditions`
+    # collection (app/models.py:283) — all already loaded, and expire_on_commit=False
+    # (app/database.py:39) keeps them loaded across process_job's pre-derive commit.
+    # Cancellation waits for the thread (anyio's default): a worker stop finishes the encode in
+    # flight rather than cutting a rendition in half, exactly as the inline call did.
+    await to_thread.run_sync(process_printready, attachment, profile)
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
     await guard_publish(db, job, attachment)
