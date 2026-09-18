@@ -762,6 +762,45 @@ async def test_the_encode_does_not_freeze_the_event_loop(adb, monkeypatch, tmp_p
     assert encode_threads and encode_threads[0] != loop_thread  # ran on a worker thread
 
 
+async def test_a_stop_during_the_encode_waits_for_the_thread(adb, monkeypatch, tmp_path):
+    # The worker's teardown cancels each consumer task natively (app/worker.py: `task.cancel()`),
+    # and a native cancel is delivered straight through anyio's abandon_on_cancel=False shield.
+    # A thread cannot be interrupted, so the encode goes on resizing and os.replace-ing the
+    # rendition into its final path after the coroutine is gone — with no guard_publish left to
+    # fence it. The inline call could not be cut short; the off-loop hop must keep that ordering.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    att = await _persisted(adb, tmp_path, source=_png(tmp_path / "cancel.png"))
+    job = MediaJob(
+        attachment_id=att.id, lane=JobLane.slow, kind=JobKind.printready, state=JobState.queued
+    )
+    adb.add(job)
+    await adb.flush()
+
+    entered = threading.Event()
+    left = threading.Event()
+
+    def _slow_encode(attachment, profile=None) -> Path:
+        entered.set()
+        time.sleep(0.4)
+        left.set()
+        return printready.printready_path(attachment.uid, profile)
+
+    monkeypatch.setattr(media, "process_printready", _slow_encode)
+
+    task = asyncio.create_task(media.process_printready_job(adb, job, att))
+    # Waited for off the loop (the stub sets a threading.Event from its own thread), so the stop
+    # below lands with the encode mid-flight rather than before it has started.
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert left.is_set(), "the stop returned while the encode thread was still writing"
+    assert task.cancelled()  # and the cancellation is still delivered, never swallowed
+
+
 async def test_the_upload_pipeline_never_generates_the_print_tier(adb, monkeypatch, tmp_path):
     # On-demand only: a 60 MP re-encode per upload is exactly the cost this tier is designed to
     # pay once, when a book needs it.

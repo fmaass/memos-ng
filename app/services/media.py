@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -1567,9 +1568,25 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
     # touch the session: uid, storage_path, captured_at, id, and the selectin-loaded `renditions`
     # collection (app/models.py:283) — all already loaded, and expire_on_commit=False
     # (app/database.py:39) keeps them loaded across process_job's pre-derive commit.
-    # Cancellation waits for the thread (anyio's default): a worker stop finishes the encode in
-    # flight rather than cutting a rendition in half, exactly as the inline call did.
-    await to_thread.run_sync(process_printready, attachment, profile)
+    # The wait-out is NOT anyio's `abandon_on_cancel=False`: that shield only covers cancel-scope
+    # cancellation, and the worker's teardown cancels each consumer task natively
+    # (app/worker.py: `task.cancel()`), which goes straight through it. A thread cannot be
+    # interrupted, so an abandoned encode keeps resizing and os.replace-ing the rendition into its
+    # final path after the coroutine is gone — past the guard_publish below, which is what fences
+    # a photo deleted mid-job. Shielding restores the ordering the inline call had for free: a
+    # stop that lands during an encode is delivered only once the thread is done, which bounds a
+    # worker stop by the remaining encode time of the ONE rendition in flight (one slow-lane slot,
+    # so never more than one at a time). The cancellation itself is re-raised, never swallowed.
+    encode = asyncio.create_task(to_thread.run_sync(process_printready, attachment, profile))
+    try:
+        await asyncio.shield(encode)
+    except asyncio.CancelledError:
+        while not encode.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(encode)  # re-shielded: a second stop must not win either
+        if not encode.cancelled():
+            encode.exception()  # retrieved, so a failed encode is not logged as never-retrieved
+        raise
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
     await guard_publish(db, job, attachment)
