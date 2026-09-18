@@ -16,7 +16,9 @@ except ModuleNotFoundError:
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # env.py also loads inside the app process, whose loggers exist by then and carry the privacy
+    # filters (app/logging_privacy.py). fileConfig's default would disable every one of them.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
