@@ -24,7 +24,26 @@ uv run ruff format --check app/ tests/ scripts/ && uv run pytest -q &&
 uv run alembic check && scripts/check-mutations.sh`, plus the frontend suite (`npx vitest run`)
 and the version checker above. `scripts/check-mutations.sh` runs the repo-carried mutation
 controls: each patch in `tests/mutations/` is applied in place with a sha256-proven revert and
-must fail exactly the probes `tests/mutations/expected.tsv` names. Images are never pulled from
+must fail exactly the probes `tests/mutations/expected.tsv` names.
+
+**The mutation run and the image build must not overlap**, because for a few seconds at a time
+the checkout on disk *is* mutated source, and `docker build` copies whatever it finds. Both take
+the same lock — `mutation-gate.lock` in this working tree's git directory — so run either one and
+the other sorts itself out. They behave differently on purpose: the build **waits**, saying so
+once on stderr, while the mutation script **refuses at once** with `another process holds the
+mutation gate lock`, exit 2, having patched nothing — a gate that blocked silently for minutes
+would read as a hang. The lock is per working tree, so a build in one worktree and a mutation run
+in another never wait for each other. An flock lives until the last descriptor on it is closed,
+and a process's descriptors all close when it dies — the mutation script starts its `uv` children
+with that descriptor closed for the same reason — so **the lock itself needs no cleanup after any
+exit**.
+
+The tree is a separate question. A run killed with `SIGKILL` runs no trap: it cannot revert its
+patch, and its lock is freed all the same, so waiting for the lock proves nothing about what is
+in the files. That is why the build goes through `scripts/build-image.sh`, which takes the lock
+and then refuses, naming the files, if any tracked file differs from `HEAD`. Restore such a file
+by hand (`git checkout -- <file>`) — `scripts/check-mutations.sh` names it when a revert could not
+be proved — and run the build again. Images are never pulled from
 a registry — the deploy image is built locally (below), so there is no `ghcr.io` push and no
 Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
 agreement is enforced *before* tagging via the checker's `--tag`.
@@ -73,7 +92,13 @@ Host **jupiter** (the stack runs where the repo lives). Stack:
 `/opt/jupiter-stacks/stacks/memos-ng/docker-compose.yml`, containers `memos-ng-app` +
 `memos-ng-worker`, image **`memos-ng:local`** built locally:
 
-    docker build --build-arg APP_VERSION=<version>+<short-sha> -t memos-ng:local .
+    scripts/build-image.sh <version>+<short-sha>
+
+Run it from the repository root. It takes the mutation gate lock, refuses if any tracked file
+differs from `HEAD`, and then `exec`s the `docker build` — so the lock is held for at least as
+long as the build is reading the context (see the gate section above). Both guards matter: the lock
+covers a mutation run that is active right now, the `HEAD` comparison covers one that was killed
+and could not revert.
 
 `APP_VERSION` is **also hardcoded in the stack compose `environment:` for both containers** and
 must be updated to the same string in the same deploy — the compose env is the runtime authority
