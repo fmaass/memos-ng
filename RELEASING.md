@@ -129,6 +129,13 @@ consumers running their own in parallel. These are **designed bounds, not hard c
 that ignores SIGTERM also needs the SIGKILL step, which adds another 5 s, and nothing in the
 process can bound the kernel.
 
+The 9 s bounds the **consumers' stop path only**. What comes after it is not measured and is not
+bounded by this code: the consumers' database sessions closing, asyncpg tearing down a connection
+whose operation was cancelled, the supervisor unwinding, and `asyncio.run()`'s own shutdown of any
+task still left (which re-cancels an abandoned requeue write and does not honour its 3 s bound).
+Docker's SIGKILL at the end of the grace is the only deadline over the stop as a whole — and a
+second SIGTERM sent meanwhile is deliberately a no-op, so it does not shorten anything either.
+
 **Past the grace nothing can be written**: docker sends SIGKILL. That strands a row only if a
 claim was actually in flight — a worker sitting idle leaves nothing behind. A claim that was in
 flight stays `processing` (exactly as after an OOM kill or a host crash) until a sweep requeues

@@ -45,7 +45,6 @@ from tests.test_worker_parked_transcode import (  # noqa: F401 — `supervised` 
     _seed_image,
     _seed_video,
     _started,
-    _supervisor,
     supervised,
 )
 
@@ -53,6 +52,39 @@ from tests.test_worker_parked_transcode import (  # noqa: F401 — `supervised` 
 # stack compose sets no `stop_grace_period`. Not a measurement of this machine — a bound the
 # signal proof fails at, so a stop that grew past what production allows is visible here.
 STOP_GRACE_SECONDS = 10.0
+
+
+@contextlib.asynccontextmanager
+async def _stopped_supervisor():
+    """worker.run(), stopped on the way out — with docker's grace as the DEADLINE on the stop.
+
+    Deliberately not the shared `_supervisor()` of the other worker proofs, whose teardown await
+    has no bound. Here the stop IS the thing under test, and its failure mode is a consumer that
+    never ends: `run_once` returning from its cancel handler instead of re-raising leaves the
+    consumer looping, so an unbounded await would hang the suite exactly where it has to go red.
+    Every exit from this block therefore ends in a verdict — a completed stop, or an assertion
+    naming the grace it ran past.
+    """
+    task = asyncio.create_task(worker.run())
+    try:
+        yield task
+    finally:
+        task.cancel()
+        try:
+            # suppress OUTSIDE the bound: the expected CancelledError must not be mistaken for the
+            # deadline's own, or a stop that ran out of grace would read as a clean one.
+            with contextlib.suppress(asyncio.CancelledError):
+                async with asyncio.timeout(STOP_GRACE_SECONDS):
+                    await task
+        except TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                async with asyncio.timeout(30):
+                    await task  # never leave a supervisor draining into the next test
+            raise AssertionError(
+                f"the stop did not finish inside docker's {STOP_GRACE_SECONDS}s grace — a "
+                "consumer that keeps draining through a cancellation never ends"
+            ) from None
 
 
 @pytest.fixture(autouse=True)
@@ -156,7 +188,7 @@ async def test_a_deliberate_stop_returns_both_consumers_claims_to_the_queue(
     monkeypatch.setattr(worker, "_requeue_claim_conditional", watched_conditional)
 
     try:
-        async with _supervisor():
+        async with _stopped_supervisor():
             await _until(lambda: _started(tmp_path, uid_v).exists(), "the transcode to start")
             async with asyncio.timeout(60):
                 await light_parked.wait()
@@ -245,7 +277,7 @@ async def test_a_stop_during_the_push_after_the_done_commit_leaves_the_finished_
     monkeypatch.setattr(worker, "_requeue_claim_conditional", watched_conditional)
 
     try:
-        async with _supervisor():
+        async with _stopped_supervisor():
             async with asyncio.timeout(60):
                 await notifying.wait()
             assert _read_claim(jid)[0] == "done", "the job had not finished, so this proves nothing"
@@ -355,7 +387,7 @@ async def test_a_requeue_write_that_never_answers_still_ends_the_consumer_cancel
     monkeypatch.setattr(media, "guard_publish", parking_guard_publish)
     monkeypatch.setattr(worker, "_requeue_claim_conditional", hanging_conditional)
 
-    # The supervisor is driven by hand here rather than through `_supervisor()`: the stop itself is
+    # The supervisor is driven by hand here rather than through the helper above: the stop itself is
     # what is under test, so it is given docker's grace as a BOUND and a stop that never finishes
     # has to fail as an assertion rather than hang the suite.
     supervisor = asyncio.create_task(worker.run())

@@ -67,7 +67,13 @@ STOP_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
 # consumers run their own in parallel rather than one after the other.
 #
 # DESIGNED bounds, not hard caps on the process: an ffmpeg that also has to be SIGKILLed adds a
-# second 5 s step, and nothing here can bound the kernel. Past the grace docker sends SIGKILL and
+# second 5 s step, and nothing here can bound the kernel. The 9 s bounds the CONSUMERS' stop path
+# and nothing else — what follows it is unmeasured and unbounded by this code: the consumers'
+# sessions closing, asyncpg tearing down a connection whose operation was cancelled, the
+# supervisor unwinding, and asyncio.run()'s own shutdown of whatever tasks are left (which
+# re-cancels an abandoned requeue write without honouring the bound above). Docker's SIGKILL at
+# the end of the grace is the only deadline over the whole stop; a second SIGTERM meanwhile is
+# deliberately a no-op, so it cannot shorten it either. Past the grace docker sends SIGKILL and
 # nothing can be written — a claim that was in flight then stays `processing` for the stale-claim
 # sweep (MEDIA_CLAIM_STALE_SECONDS), exactly as an OOM kill leaves it, while a stop that happened
 # to be holding no claim leaves nothing behind at all.
