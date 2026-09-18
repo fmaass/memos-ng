@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { marker } from '@/lib/places/__tests__/fixtures'
 import type { MapMarker } from '@/lib/places/geo'
+import { TICK_MS } from '@/lib/places/timelineBar'
 
 // Three months apart so every bucket boundary in the assertions is a real calendar month in
 // Europe/Zurich, and the middle one proves the playhead is not just "all or nothing".
@@ -293,6 +294,98 @@ describe('what the map says before the markers arrive', () => {
     expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="places-error"]').exists()).toBe(false)
     expect(lastShown()).toEqual(['jan', 'feb', 'mar'])
+    wrapper.unmount()
+  })
+})
+
+describe('the speed control, end to end', () => {
+  // The reducer was already proven: `tick` advances 1, 2 and 4 buckets at speeds 1, 2 and 4.
+  // What had never been proven is the chain around it — that a click on the REAL PrimeVue
+  // control emits, that the view dispatches it, and that the player then steps by that many
+  // buckets per tick. In the live pass 1x and 2x finished a four-bucket library in the same
+  // three steps, which four buckets cannot distinguish; this drives 24.
+  const MANY = Array.from({ length: 24 }, (_, i) =>
+    marker({
+      uid: `m${i}`,
+      memo_uid: `mm${i}`,
+      taken_at: `${2024 + Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, '0')}-15T12:00:00Z`,
+    }),
+  )
+
+  /** One marker per month and `accumulate` mode: the count on the map IS the playhead index. */
+  function playheadIndex(): number {
+    return lastShown().length - 1
+  }
+
+  async function stepsOver(ticks: number): Promise<number[]> {
+    const seen: number[] = []
+    for (let i = 0; i < ticks; i += 1) {
+      vi.advanceTimersByTime(TICK_MS)
+      await nextTick()
+      seen.push(playheadIndex())
+    }
+    return seen
+  }
+
+  beforeEach(() => {
+    query.markers = MANY
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('steps one bucket per tick at 1x and two at 2x, after a click on the desktop control', async () => {
+    const wrapper = mountView()
+    await wrapper.find('[data-test="timeline-play"]').trigger('click')
+
+    const atOne = await stepsOver(4)
+    expect(atOne).toEqual([1, 2, 3, 4])
+
+    const speeds = wrapper.findAll('[data-test="timeline-speed"] .p-togglebutton')
+    expect(speeds.map((option) => option.text())).toEqual(['1×', '2×', '4×'])
+    await speeds[1]?.trigger('click')
+    await nextTick()
+
+    const atTwo = await stepsOver(4)
+    expect(atTwo).toEqual([6, 8, 10, 12])
+    wrapper.unmount()
+  })
+
+  it('steps two buckets per tick after a tap on the phone speed chip', async () => {
+    const wrapper = mountView(true)
+    await wrapper.find('[data-test="timeline-play"]').trigger('click')
+
+    expect(await stepsOver(2)).toEqual([1, 2])
+
+    const chip = wrapper.find('[data-test="timeline-speed-chip"]')
+    expect(chip.text()).toBe('1×')
+    await chip.trigger('click')
+    await nextTick()
+    expect(wrapper.find('[data-test="timeline-speed-chip"]').text()).toBe('2×')
+
+    expect(await stepsOver(2)).toEqual([4, 6])
+    wrapper.unmount()
+  })
+
+  it('does not run the clock faster — the interval is the same at every speed', async () => {
+    // Speed advances BUCKETS; one tick is one `setData` at 1x, 2x and 4x alike. A speed that
+    // shortened the interval would cost the map a redraw per step instead.
+    const wrapper = mountView()
+    await wrapper.find('[data-test="timeline-play"]').trigger('click')
+    await stepsOver(1)
+    const before = setVisibleMarkers.mock.calls.length
+
+    await wrapper.findAll('[data-test="timeline-speed"] .p-togglebutton')[2]?.trigger('click')
+    await nextTick()
+    setVisibleMarkers.mockClear()
+    vi.advanceTimersByTime(TICK_MS - 1)
+    await nextTick()
+    expect(setVisibleMarkers).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    await nextTick()
+    expect(playheadIndex()).toBe(5)
+    expect(before).toBeGreaterThan(0)
     wrapper.unmount()
   })
 })
