@@ -311,13 +311,23 @@ async def test_the_thermal_gate_is_taken_at_every_job_start_by_every_consumer(
             async with _supervisor():
                 await _until(lambda: _started(tmp_path, uid_v).exists(), "the transcode to start")
                 sensor["millideg"] = hot
-                # Seeded only now: the light consumer can never have seen this job while cool, so
-                # nothing here depends on winning a race. While the transcode is parked the light
-                # consumer is the only one calling run_once, so every defer below is its own.
-                aid_i, jid_i, uid_i = _seed_image(subject, tmp_path)
 
                 def defers() -> list[dict]:
                     return [c for c in caps if c["event"] == "worker_thermal_defer"]
+
+                # Seeded only after a defer that POST-DATES the heat. Seeding on the flip itself
+                # left a window: a consumer already past its gate with a cool reading, suspended on
+                # an await, claimed the image the instant this (blocking) seed committed — a ~1-in-5
+                # flake with nothing wrong in the worker. A logged defer proves that pass is over,
+                # and the sensor reads hot for every pass after it. While the transcode is parked
+                # the light consumer is the only one calling run_once, so every defer here is its
+                # own.
+                await _until(
+                    lambda: defers(),
+                    "the light consumer to read the new heat",
+                    give_up_after=30.0,  # a gate that never fires must not cost the full bound
+                )
+                aid_i, jid_i, uid_i = _seed_image(subject, tmp_path)
 
                 await _until(
                     lambda: len(defers()) >= 3 or _read_claim(jid_i)[0] != "queued",
@@ -348,3 +358,64 @@ async def test_the_thermal_gate_is_taken_at_every_job_start_by_every_consumer(
         gate.write_text("go")
         _reap_parked(tmp_path)
         _cleanup(subject, aid_v, *([aid_i] if aid_i is not None else []))
+
+
+async def test_a_queued_video_is_not_started_while_the_host_is_too_hot(
+    supervised, monkeypatch, tmp_path
+):
+    """The other half of "every consumer": the TRANSCODE consumer's own job start is gated too.
+
+    The test above holds a light job back while a transcode that started cool runs on. This one
+    offers the hot host the heavy job — the class that produces the heat — and asks that nothing
+    starts: no ffmpeg process, no `processing` row, no attempt charged. Cooling is then the only
+    thing that changes, and the same video runs, which is what makes the refusal a gate rather
+    than a stuck queue.
+    """
+    hot = (settings.THERMAL_MAX_C + 5) * 1000  # derived from the limit, never a literal
+    cool = (settings.THERMAL_MAX_C - 30) * 1000
+    sensor = {"millideg": hot}  # hot BEFORE the worker starts: the video is never offered cool
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: sensor["millideg"])
+    gate = tmp_path / "release-the-transcode"
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _parked_cmd(gate))
+    subject = "hot_transcode_owner"
+    aid_v, jid_v, uid_v = _seed_video(subject, tmp_path)
+    try:
+        with capture_logs() as caps:
+            async with _supervisor():
+
+                def defers() -> list[dict]:
+                    return [c for c in caps if c["event"] == "worker_thermal_defer"]
+
+                # Either end is a verdict: three real defers means the consumers kept asking and
+                # kept being refused; a started marker means the gate let the video through.
+                await _until(
+                    lambda: len(defers()) >= 3 or _started(tmp_path, uid_v).exists(),
+                    "the transcode consumer to defer the queued video while the host is too hot",
+                    give_up_after=30.0,  # a gate that never fires must not cost the full bound
+                )
+                state_v, attempts_v, claimed_v = _read_claim(jid_v)
+                assert not _started(tmp_path, uid_v).exists(), (
+                    "ffmpeg started on a host that was already too hot"
+                )
+                assert state_v == "queued", f"the video was {state_v} while the host was hot"
+                assert attempts_v == 0, "a thermal defer counted as an attempt"
+                assert claimed_v is None, claimed_v
+                assert defers()[0]["max_c"] == settings.THERMAL_MAX_C
+                assert defers()[0]["temp_c"] == round(hot / 1000, 1)
+
+                sensor["millideg"] = cool  # the ONLY thing that changes
+                await _until(
+                    lambda: (
+                        _started(tmp_path, uid_v).exists() and _read_claim(jid_v)[0] == "processing"
+                    ),
+                    "the queued video to start once the host reads cool",
+                )
+                gate.write_text("go")
+                await _until(
+                    lambda: _read_claim(jid_v)[0] == "done", "the released transcode to finish"
+                )
+                assert _read_claim(jid_v)[1] == 0, "the deferred job was charged an attempt"
+    finally:
+        gate.write_text("go")
+        _reap_parked(tmp_path)
+        _cleanup(subject, aid_v)

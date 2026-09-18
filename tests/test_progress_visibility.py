@@ -522,6 +522,21 @@ def _parked_pids(root: Path) -> list[int]:
     return pids
 
 
+def _parked_alive(root: Path) -> list[int]:
+    """Parked stubs that are STILL RUNNING, each confirmed by its own argv so a recycled pid can
+    never be mistaken for a live transcode. 'While the transcode is processing' is a claim about a
+    real process, and this is what reads it."""
+    live = []
+    for pid in _parked_pids(root):
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue  # exited between listing and reading
+        if b"sys.argv[1] + '.started'" in argv:
+            live.append(pid)
+    return live
+
+
 def _reap_parked(root: Path) -> None:
     """Teardown net: a stub still parked when its test ends is killed, identified by its OWN argv
     so a recycled pid can never be the victim."""
@@ -565,25 +580,13 @@ def _read_claim(jid: int) -> tuple[str, int, str | None]:
     return row[0], row[1], row[2]
 
 
-def _seed_head_of_line_queue(subject: str, root: Path) -> dict[str, int | str]:
-    """Two slow videos then one image, ids ascending in that order — the shape AC1 is about.
+def _seed_head_of_line_videos(subject: str, root: Path) -> dict[str, int | str]:
+    """The owner and TWO slow videos, ids ascending — the queue the photo will arrive behind.
 
-    With one transcode slot the two videos cannot both run, so the image is behind BOTH of them in
-    id order: it can only finish first if the light consumer claims by class rather than by queue
-    position.
+    Two, not one: with a single transcode slot they cannot both run, so anything claimed by queue
+    position has at least one transcode ahead of it for the whole test.
     """
     ids: dict[str, int | str] = {}
-    videos = []
-    for name in ("a", "b"):
-        src = root / "originals" / f"v{name}.mp4"
-        src.parent.mkdir(parents=True, exist_ok=True)
-        src.write_bytes(b"stub source")
-        videos.append(str(src))
-    uid_img = f"prog-img-{secrets.token_urlsafe(6)}"
-    img = root / "originals" / f"{uid_img}.png"
-    img.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (900, 600), (30, 90, 160)).save(img, "PNG")
-
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
         c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": subject})
@@ -591,7 +594,10 @@ def _seed_head_of_line_queue(subject: str, root: Path) -> dict[str, int | str]:
             text("INSERT INTO users (subject, role) VALUES (:s,'user') RETURNING id"),
             {"s": subject},
         ).scalar_one()
-        for name, path in zip(("a", "b"), videos, strict=True):
+        for name in ("a", "b"):
+            src = root / "originals" / f"v{name}.mp4"
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_bytes(b"stub source")
             uid = f"prog-v{name}-{secrets.token_urlsafe(6)}"
             aid = c.execute(
                 text(
@@ -599,7 +605,7 @@ def _seed_head_of_line_queue(subject: str, root: Path) -> dict[str, int | str]:
                     "(uid, owner_id, filename, mime, size, status, storage_path, duration) "
                     "VALUES (:u,:o,'v.mp4','video/mp4',1,'processing',:sp,1.0) RETURNING id"
                 ),
-                {"u": uid, "o": owner, "sp": path},
+                {"u": uid, "o": owner, "sp": str(src)},
             ).scalar_one()
             jid = c.execute(
                 text(
@@ -609,6 +615,27 @@ def _seed_head_of_line_queue(subject: str, root: Path) -> dict[str, int | str]:
                 {"a": aid},
             ).scalar_one()
             ids[f"aid_{name}"], ids[f"jid_{name}"], ids[f"uid_{name}"] = aid, jid, uid
+    eng.dispose()
+    return ids
+
+
+def _seed_late_photo(subject: str, root: Path) -> dict[str, int | str]:
+    """The photo of the acceptance criterion, committed only when the caller says so.
+
+    Inserted after the videos it must overtake, it gets a later attachment id, a later job id and a
+    later created_at — so it is an UPLOAD THAT ARRIVED DURING the transcode, which is the thing the
+    criterion is about. Seeded up front it would prove only that a photo already in the queue can
+    be drained first.
+    """
+    uid_img = f"prog-img-{secrets.token_urlsafe(6)}"
+    img = root / "originals" / f"{uid_img}.png"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (900, 600), (30, 90, 160)).save(img, "PNG")
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        owner = c.execute(
+            text("SELECT id FROM users WHERE subject=:s"), {"s": subject}
+        ).scalar_one()
         aid_c = c.execute(
             text(
                 "INSERT INTO attachments "
@@ -625,8 +652,7 @@ def _seed_head_of_line_queue(subject: str, root: Path) -> dict[str, int | str]:
             {"a": aid_c},
         ).scalar_one()
     eng.dispose()
-    ids["aid_c"], ids["jid_c"], ids["uid_c"] = aid_c, jid_c, uid_img
-    return ids
+    return {"aid_c": aid_c, "jid_c": jid_c, "uid_c": uid_img}
 
 
 def _start_consumers(*classes: str) -> list[asyncio.Task[None]]:
@@ -654,13 +680,13 @@ async def _stop(tasks: list[asyncio.Task[None]]) -> None:
 
 
 async def test_a_parked_transcode_never_blocks_the_light_class_behind_it(monkeypatch, tmp_path):
-    """AC1: with TWO videos parked ahead of it in the queue, an image still finishes.
+    """AC1: a photo uploaded WHILE a transcode runs reaches `done` without waiting for it.
 
-    One consumer per class, one transcode slot: video A holds the slot, video B waits its turn,
-    and the image — LAST in id order, behind both — is drained by the light consumer while the
-    transcode is still running. A single unclassed loop, or two unclassed consumers, would have
-    the image waiting behind at least one transcode; two unclassed consumers take BOTH videos and
-    the image never starts at all.
+    The order is the proof, so the test enforces it: two videos are queued, video A is claimed and
+    its stub really parks, and only THEN is the photo inserted — later attachment id, later job id,
+    later created_at than both videos. The photo is therefore an arrival during the transcode, and
+    reaching `done` while A's ffmpeg process is still parked cannot come from queue position. Video
+    B stays queued throughout: one transcode slot, one transcode.
     """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 300)  # the park is not a timeout test
@@ -669,9 +695,9 @@ async def test_a_parked_transcode_never_blocks_the_light_class_behind_it(monkeyp
     gate = tmp_path / "release-the-transcode"
     monkeypatch.setattr(media, "slow_ffmpeg_cmd", _parked_cmd(gate))
     subject = "head_of_line_owner"
-    ids = _seed_head_of_line_queue(subject, tmp_path)
-    jid_a, jid_b, jid_c = cast(int, ids["jid_a"]), cast(int, ids["jid_b"]), cast(int, ids["jid_c"])
-    tiers = [tmp_path / "assets" / tier / f"{ids['uid_c']}.jpg" for tier in ("thumbs", "mobile")]
+    ids = _seed_head_of_line_videos(subject, tmp_path)
+    jid_a, jid_b = cast(int, ids["jid_a"]), cast(int, ids["jid_b"])
+    photo: dict[str, int | str] = {}
 
     tasks = _start_consumers("transcode", "light")
     try:
@@ -679,25 +705,35 @@ async def test_a_parked_transcode_never_blocks_the_light_class_behind_it(monkeyp
             lambda: (
                 (
                     (tmp_path / "assets" / "web" / f"{ids['uid_a']}.tmp.mp4.started").exists()
-                    and _read_claim(jid_c)[0] == "done"
+                    and _read_claim(jid_a)[0] == "processing"
                 )
                 # …or the queue has already gone wrong: video B claimed means both consumers took
                 # transcodes, which the assertions below then name precisely instead of timing out.
                 or _read_claim(jid_b)[0] != "queued"
             ),
-            "video A's transcode to start and the image job to finish",
+            "video A's transcode to start and hold the slot",
+        )
+
+        photo = _seed_late_photo(subject, tmp_path)  # the upload lands mid-transcode
+        jid_c = cast(int, photo["jid_c"])
+        tiers = [tmp_path / "assets" / t / f"{photo['uid_c']}.jpg" for t in ("thumbs", "mobile")]
+        await _until(
+            lambda: _read_claim(jid_c)[0] == "done" or _read_claim(jid_b)[0] != "queued",
+            f"the photo uploaded during the transcode (media_jobs id {jid_c}) to reach done",
         )
 
         # Taken while the gate is STILL CLOSED: video A cannot have finished, so every state below
         # is the state of a queue with a transcode in flight.
-        state_a, _, claimed_a = _read_claim(jid_a)
+        state_a, attempts_a, claimed_a = _read_claim(jid_a)
         state_b, _, _ = _read_claim(jid_b)
         state_c, attempts_c, claimed_c = _read_claim(jid_c)
         assert state_a == "processing", state_a
+        assert _parked_alive(tmp_path), "no transcode process was still running when the photo done"
         assert state_b == "queued", (  # AC3: at most one ffmpeg transcode at a time
             f"video B is {state_b}: a second transcode started while the first held the slot"
         )
         assert (state_c, attempts_c) == ("done", 0), (state_c, attempts_c)
+        assert attempts_a == 0, attempts_a  # neither job was retried into its result
         assert all(tier.exists() for tier in tiers), [str(t) for t in tiers]
         assert claimed_c is not None and claimed_c.endswith("/light"), claimed_c
         assert claimed_a is not None and claimed_a.endswith("/transcode"), claimed_a
@@ -710,4 +746,7 @@ async def test_a_parked_transcode_never_blocks_the_light_class_behind_it(monkeyp
         gate.write_text("go")  # whatever the body did, no stub stays parked
         await _stop(tasks)
         _reap_parked(tmp_path)
-        _cleanup(subject, cast(int, ids["aid_a"]), cast(int, ids["aid_b"]), cast(int, ids["aid_c"]))
+        seeded = [cast(int, ids["aid_a"]), cast(int, ids["aid_b"])]
+        if photo:  # the photo may never have been seeded (an early failure above)
+            seeded.append(cast(int, photo["aid_c"]))
+        _cleanup(subject, *seeded)
