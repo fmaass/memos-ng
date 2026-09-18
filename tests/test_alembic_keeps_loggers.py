@@ -18,7 +18,8 @@ class _Collect(logging.Handler):
         self.messages.append(record.getMessage())
 
 
-def test_logger_created_before_env_py_still_emits_after_it() -> None:
+def test_logger_created_before_env_py_still_emits_after_it(db_engine) -> None:
+    # db_engine, not for its tables: it is what hands env.py the suite's DSN when none is exported.
     # Named outside every logger alembic.ini configures (root, sqlalchemy, alembic), so the only
     # thing fileConfig can do to it is the disable this test is about.
     logger = logging.getLogger("memosng_created_before_alembic")
