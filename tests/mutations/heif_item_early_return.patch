@@ -1,0 +1,22 @@
+Answer on the first matching `iloc` row instead of walking the item table to its end.
+
+The same defect one box over: an `iloc` that declares more items than it writes is corrupt whether
+the shortfall falls before or after the row this read wants, and only a complete walk can tell.
+The probe is the fixture whose shortfall sits AFTER the match.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -509,11 +509,9 @@ def _heif_extent(
+         length = (
+             int.from_bytes(meta[length_at : length_at + length_size], "big") if length_size else 0
+         )
+-        found = (base + offset, length)
++        return base + offset, length
+         cursor += extents * span
+-    if cursor != body_end:  # the rows must account for the box exactly, with nothing left over
+-        return None
+-    return found
++    return None
+ 
+ 
+ def _heif_exif_payload(raw: bytes) -> bytes | None:

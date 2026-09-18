@@ -1,0 +1,18 @@
+Answer with the first Exif item in the file instead of the one describing the primary image.
+
+Which Exif belongs to which image is stated ONLY by the `cdsc` reference in `iref`. The failure
+this control proves a test can see is silent and wrong rather than absent — a memo dated from the
+decoy item, or from a secondary image whose metadata libheif does not even offer for the primary —
+so the probes it must turn red are the four-item fixture's capture date and the lone-secondary
+fixture, and nothing else.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -405,6 +405,7 @@ def _heif_exif_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int
+     iref = children.get(b"iref")
+     if not items or primary is None or iref is None:
+         return None
++    return items[0]
+     body, end = iref
+     if body + 4 > end or meta[body] > 1:
+         return None

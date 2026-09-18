@@ -1,0 +1,23 @@
+Answer on the first matching `cdsc` instead of validating the rest of the reference table.
+
+A reference that matches says nothing about the ones after it. With this line restored, a file
+whose SECOND reference over-counts comes back with Exif bytes while libheif refuses the file
+outright — an unreadable original reported as a successful metadata read, and the fallback that
+would have raised for it skipped. The probe is the fixture whose damage sits AFTER the match; the
+one whose damage sits before it is the control and must stay green.
+
+--- a/app/services/capture.py
++++ b/app/services/capture.py
+@@ -429,10 +429,8 @@ def _heif_exif_item(meta: bytes, children: dict[bytes, tuple[int, int]]) -> int
+         for index in range(count):
+             at = ref + width + 2 + index * width
+             if int.from_bytes(meta[at : at + width], "big") == primary:
+-                if found is not None and found != source:
+-                    return None  # two Exif items claiming the same image: unknowable
+-                found = source
+-    return found
++                return source
++    return None
+ 
+ 
+ def _heif_extent(
