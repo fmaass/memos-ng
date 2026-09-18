@@ -19,7 +19,7 @@ Both call the same pure function, so there is one pattern to review and one to t
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import structlog
@@ -27,14 +27,35 @@ import structlog
 ROW_DETAIL_REDACTION = "DETAIL: [row hidden]"
 KEY_DETAIL_REDACTION = "DETAIL: [key hidden]"
 
-# Each pattern eats the WHOLE detail: greedily to the last `).`/`.` on the line, or, when a
-# truncated message has neither, to the end of the line. Stopping at the first `)` would leave
-# the tail of a row visible whenever a value contained one — a row is redacted whole or not at
-# all. The line ends at a real newline OR at a literal backslash-n, because `repr(exc)` and a
-# traceback's source line both spell it that way.
-_LINE = r"(?:(?!\\n)[^\n])"
-_ROW_DETAIL = re.compile(rf"DETAIL:[ \t]*Failing row contains \((?:{_LINE}*\)\.|{_LINE}*)")
-_KEY_DETAIL = re.compile(rf"DETAIL:[ \t]*Key \((?:{_LINE}*\.|{_LINE}*)")
+# A row is redacted WHOLE or not at all, whatever its values contain: a filename is stored
+# verbatim, so a value may hold a newline (real, or spelled `\n` by repr and by a traceback's
+# source line), a `).`, a `%`. Anchoring the scrub to the line or to the first `).` leaves the
+# rest of the row — and the coordinates — standing. So the match runs from `DETAIL:` ACROSS
+# lines until the next thing that is certainly not part of the row: one of PostgreSQL's own
+# following fields, SQLAlchemy's statement echo, or the next traceback. Nothing recognizable
+# follows? Then it eats the rest of the text — dropping too much beats dropping too little.
+_BOUNDARIES = (
+    "HINT:",
+    "CONTEXT:",
+    "SCHEMA NAME:",
+    "TABLE NAME:",
+    "COLUMN NAME:",
+    "CONSTRAINT NAME:",
+    "DATATYPE NAME:",
+    "STATEMENT:",
+    "DETAIL:",
+    "[SQL:",
+    "[parameters:",
+    "(Background on this error at:",
+    "Traceback (most recent call last)",
+    "The above exception",
+    "During handling",
+)
+_BOUNDARY = "|".join(re.escape(token) for token in _BOUNDARIES)
+# The gap before a boundary may be blank lines in either spelling.
+_TERMINATOR = rf"(?=(?:\\n|\n)(?:\\n|\s)*(?:{_BOUNDARY}))"
+_ROW_DETAIL = re.compile(rf"DETAIL:[ \t]*Failing row contains \(.*?(?:{_TERMINATOR}|\Z)", re.DOTALL)
+_KEY_DETAIL = re.compile(rf"DETAIL:[ \t]*Key \(.*?(?:{_TERMINATOR}|\Z)", re.DOTALL)
 
 
 def redact_row_details(text: str) -> str:
@@ -63,43 +84,82 @@ def redact_processor(logger: Any, method_name: str, event: Any) -> Any:
     return event
 
 
+def _carries_detail(record: logging.LogRecord) -> bool:
+    """Cheap pre-check, so an ordinary record keeps its lazy `%`-formatting untouched."""
+    if "DETAIL:" in str(record.msg):
+        return True
+    args = record.args
+    if isinstance(args, Mapping):
+        args = tuple(args.values())
+    elif not isinstance(args, tuple):
+        args = () if args is None else (args,)
+    return any("DETAIL:" in str(a) for a in args)
+
+
+def scrub_record(record: logging.LogRecord) -> None:
+    """Take the row out of a stdlib record, message, args, traceback and stack alike.
+
+    The message is RENDERED before it is scrubbed: `logger.error("failed: %s", exc)` keeps the
+    exception OBJECT in `record.args`, and `getMessage()` would spell its DETAIL out at format
+    time — after any scrub that only looked at strings. With the args emptied afterwards
+    `getMessage()` returns the message verbatim, so a `%` left in the rendered text is safe.
+    """
+    if _carries_detail(record):
+        record.msg = redact_row_details(record.getMessage())
+        record.args = ()
+    if record.exc_info and not record.exc_text:
+        rendered = logging.Formatter().formatException(record.exc_info)
+        if "DETAIL:" in rendered:
+            # Only then: a record whose traceback is clean keeps the handler's own formatting.
+            # `Formatter.format` reuses `exc_text` when it is set, which is what lets a scrub
+            # outside the formatter reach a traceback at all.
+            record.exc_text = redact_row_details(rendered)
+    elif record.exc_text:
+        record.exc_text = redact_row_details(record.exc_text)
+    if record.stack_info:
+        record.stack_info = redact_row_details(record.stack_info)
+
+
 class RowDetailFilter(logging.Filter):
-    """Scrub a stdlib record before any handler formats it."""
+    """The scrub as a filter, for records that reach a handler without passing the factory."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = redact_row_details(record.msg)
-        if isinstance(record.args, tuple):
-            record.args = tuple(
-                redact_row_details(a) if isinstance(a, str) else a for a in record.args
-            )
-        elif isinstance(record.args, Mapping):
-            record.args = {
-                k: redact_row_details(v) if isinstance(v, str) else v
-                for k, v in record.args.items()
-            }
-        if record.exc_info and not record.exc_text:
-            # Formatting it here is what lets a Filter reach a traceback at all: `Formatter.format`
-            # reuses a record's `exc_text` rather than re-rendering `exc_info`.
-            record.exc_text = logging.Formatter().formatException(record.exc_info)
-        if record.exc_text:
-            record.exc_text = redact_row_details(record.exc_text)
-        if record.stack_info:
-            record.stack_info = redact_row_details(record.stack_info)
+        scrub_record(record)
         return True
 
 
-# The loggers Uvicorn logs an escaped request exception through, plus the root for everything
-# that reaches a handler by propagation from an unnamed call site.
+_original_factory: Callable[..., logging.LogRecord] | None = None
+
+
+def _record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    """Scrub at CREATION, which is the only point every record passes.
+
+    A filter on a logger is consulted only for records logged directly to it — never for records
+    that propagate up from `app.*`, `sqlalchemy.*` or `alembic` — and a filter on a handler
+    misses every handler installed after us (uvicorn configures its handlers before it imports
+    the app). The record factory has neither blind spot.
+    """
+    factory = _original_factory or logging.LogRecord
+    record = factory(*args, **kwargs)
+    scrub_record(record)
+    return record
+
+
+# Belt for the factory's braces: the loggers Uvicorn logs an escaped request exception through,
+# plus the root, in case a record arrives already built (a socket handler, `makeLogRecord`).
 _FILTERED_LOGGERS = ("", "uvicorn", "uvicorn.error")
 
 
 def configure_logging() -> None:
-    """Install both hooks. Idempotent — importing the app twice must not stack filters."""
+    """Install every hook. Idempotent — importing the app twice must not stack them."""
+    global _original_factory
     processors = list(structlog.get_config()["processors"])
     if redact_processor not in processors:
         processors.append(redact_processor)
         structlog.configure(processors=processors)
+    if _original_factory is None:
+        _original_factory = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(_record_factory)
     for name in _FILTERED_LOGGERS:
         logger = logging.getLogger(name)
         if not any(isinstance(f, RowDetailFilter) for f in logger.filters):

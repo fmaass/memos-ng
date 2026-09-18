@@ -14,6 +14,7 @@ import logging
 import subprocess
 import sys
 
+import app.logging_privacy as logging_privacy
 import pytest
 import structlog
 from app.logging_privacy import (
@@ -204,6 +205,10 @@ def test_configure_logging_registers_both_hooks_and_is_idempotent():
     configure_logging()
     processors = structlog.get_config()["processors"]
     assert processors.count(redact_processor) == 1
+    # The record factory is the hook that reaches every logger and every handler; installing it
+    # twice would make it wrap itself.
+    assert logging.getLogRecordFactory() is logging_privacy._record_factory
+    assert logging_privacy._original_factory is not logging_privacy._record_factory
     assert processors[-1] is redact_processor  # after the renderer, i.e. after exception formatting
     for name in ("", "uvicorn", "uvicorn.error"):
         filters = [f for f in logging.getLogger(name).filters if isinstance(f, RowDetailFilter)]
@@ -224,3 +229,174 @@ def test_importing_the_app_installs_the_filter_before_any_request():
     )
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.strip().endswith("True"), done.stdout + done.stderr[-2000:]
+
+
+# --- a row is redacted WHOLE, whatever its values contain -------------------------------------
+# Values are stored verbatim: a filename may hold a newline, a `).`, a `%`. A line-anchored scrub
+# stops at the first of those and leaves the coordinates standing on the next line.
+
+MULTILINE_ROW = (
+    'new row for relation "attachments" violates check constraint'
+    ' "ck_attachments_location_pair"\n'
+    "DETAIL:  Failing row contains (1767, photo\nname.jpg, image/jpeg, 12.5, 8.1).\n"
+    "[SQL: UPDATE attachments SET latitude = $1 WHERE id = $2]\n"
+)
+
+
+def test_a_value_with_a_real_newline_does_not_end_the_scrub_early():
+    scrubbed = redact_row_details(MULTILINE_ROW)
+    assert "12.5" not in scrubbed
+    assert "8.1" not in scrubbed
+    assert "name.jpg" not in scrubbed
+    assert "ck_attachments_location_pair" in scrubbed
+    assert "[SQL: UPDATE attachments SET latitude = $1 WHERE id = $2]" in scrubbed
+
+
+def test_a_value_with_an_escaped_newline_does_not_end_the_scrub_early():
+    one_line = MULTILINE_ROW.replace("\n", "\\n")
+    scrubbed = redact_row_details(one_line)
+    assert "12.5" not in scrubbed
+    assert "8.1" not in scrubbed
+    assert "ck_attachments_location_pair" in scrubbed
+
+
+def test_a_value_containing_a_closing_paren_and_period_does_not_end_the_scrub_early():
+    text = (
+        'violates check constraint "ck_attachments_location_pair"\n'
+        "DETAIL:  Failing row contains (1767, holiday (2024).jpg, image/jpeg, 12.5, 8.1).\n"
+        "[SQL: UPDATE attachments SET latitude = $1]\n"
+    )
+    scrubbed = redact_row_details(text)
+    assert "12.5" not in scrubbed
+    assert "8.1" not in scrubbed
+    assert "holiday" not in scrubbed
+    assert "[SQL: UPDATE attachments SET latitude = $1]" in scrubbed
+
+
+def test_a_chained_traceback_after_the_detail_survives_the_scrub():
+    text = (
+        "Traceback (most recent call last):\n"
+        "  File \"asyncpg/protocol.py\", line 1, in execute\n"
+        "asyncpg.exceptions.CheckViolationError: new row violates check constraint"
+        ' "ck_attachments_location_pair"\n'
+        "DETAIL:  Failing row contains (1767, a.jpg, 12.5, 8.1).\n"
+        "\n"
+        "The above exception was the direct cause of the following exception:\n"
+        "\n"
+        "Traceback (most recent call last):\n"
+        '  File "app/services/location.py", line 42, in store\n'
+        "sqlalchemy.exc.IntegrityError: (asyncpg.exceptions.CheckViolationError)\n"
+    )
+    scrubbed = redact_row_details(text)
+    assert "12.5" not in scrubbed
+    assert "8.1" not in scrubbed
+    assert "The above exception was the direct cause of the following exception:" in scrubbed
+    assert "app/services/location.py" in scrubbed
+    assert "ck_attachments_location_pair" in scrubbed
+
+
+def test_a_multiline_row_is_scrubbed_through_the_installed_uvicorn_filter():
+    # The reviewers reproduced the leak here, not on the pure function: the record path is what
+    # a request failure actually travels.
+    configure_logging()
+    logger = logging.getLogger("uvicorn.error")
+    logger.disabled = False
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    try:
+        logger.error(MULTILINE_ROW)
+    finally:
+        logger.removeHandler(handler)
+    rendered = buffer.getvalue()
+    assert "12.5" not in rendered
+    assert "8.1" not in rendered
+    assert "ck_attachments_location_pair" in rendered
+
+
+# --- the record's ARGS, not just its message ---------------------------------------------------
+
+
+def test_an_exception_object_passed_as_a_format_arg_is_scrubbed():
+    # `logger.error("write failed: %s", exc)` renders `str(exc)` at FORMAT time, i.e. after any
+    # filter that only looked at strings has run.
+    configure_logging()
+    logger = logging.getLogger("uvicorn.error")
+    logger.disabled = False
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    try:
+        logger.error("write failed: %s", ValueError(ROW_VIOLATION))
+    finally:
+        logger.removeHandler(handler)
+    rendered = buffer.getvalue()
+    assert "write failed:" in rendered
+    assert "12.5" not in rendered
+    assert "probe-a" not in rendered
+    assert "ck_attachments_location_pair" in rendered
+
+
+def test_a_percent_sign_in_the_scrubbed_text_does_not_break_formatting():
+    # Scrubbing renders the message, so the result must no longer be treated as a format string.
+    configure_logging()
+    logger = logging.getLogger("uvicorn.error")
+    logger.disabled = False
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    logger.addHandler(handler)
+    try:
+        logger.error("100%% done, then %s", ValueError("DETAIL:  Failing row contains (12.5)."))
+    finally:
+        logger.removeHandler(handler)
+    rendered = buffer.getvalue()
+    assert "100% done" in rendered
+    assert "12.5" not in rendered
+
+
+# --- every logger, every handler, including handlers installed later ---------------------------
+
+
+def test_a_child_logger_reaching_a_root_handler_is_scrubbed():
+    # A filter attached to a LOGGER never sees records propagated from its children, so the root
+    # filter alone protects nothing that `app.*`, `sqlalchemy.*` or `alembic` emit.
+    configure_logging()
+    root = logging.getLogger()
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    root.addHandler(handler)
+    child = logging.getLogger("sqlalchemy.engine.Engine.probe")
+    child.disabled = False
+    previous = root.level
+    root.setLevel(logging.ERROR)
+    try:
+        child.error("write failed: %s", ValueError(ROW_VIOLATION))
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous)
+    rendered = buffer.getvalue()
+    assert "write failed:" in rendered
+    assert "12.5" not in rendered
+    assert "ck_attachments_location_pair" in rendered
+
+
+def test_a_handler_attached_after_configure_logging_is_covered_too():
+    # Uvicorn configures its handlers BEFORE it imports the app; the worker and the backfill
+    # configure their own. Nothing may depend on the order.
+    configure_logging()
+    logger = logging.getLogger("app.probe.late")
+    logger.disabled = False
+    logger.propagate = False
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)  # attached after the hooks were installed
+    logger.addHandler(handler)
+    logger.setLevel(logging.ERROR)
+    try:
+        logger.error(MULTILINE_ROW)
+    finally:
+        logger.removeHandler(handler)
+    rendered = buffer.getvalue()
+    assert "12.5" not in rendered
+    assert "ck_attachments_location_pair" in rendered
