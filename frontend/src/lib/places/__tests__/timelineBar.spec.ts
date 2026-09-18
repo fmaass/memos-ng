@@ -9,6 +9,7 @@ import {
   createTicker,
   indexAtX,
   isTypingTarget,
+  ownsItsKeys,
   MODE_OPTIONS,
   speedLabel,
   TICK_MS,
@@ -165,6 +166,42 @@ describe('timelineKeyAction', () => {
     expect(isTypingTarget(editable)).toBe(true)
     expect(timelineKeyAction('ArrowLeft', paused, editable)).toBeNull()
     expect(isTypingTarget(document.createElement('div'))).toBe(false)
+  })
+
+  it('leaves a focused control its own keys, and keeps them everywhere else', () => {
+    const paused = state()
+    // Space activates a button; arrows move a link's focus. A pin, the play button and the phone
+    // speed chip are all buttons, so hijacking space there kills the control the user is on.
+    const cases: [string, HTMLElement, boolean][] = [
+      ['button', document.createElement('button'), true],
+      ['link', Object.assign(document.createElement('a'), { href: '#x' }), true],
+      ['summary', document.createElement('summary'), true],
+      ['input', document.createElement('input'), true],
+      ['textarea', document.createElement('textarea'), true],
+      ['select', document.createElement('select'), true],
+      ['body', document.body, false],
+      ['canvas', document.createElement('canvas'), false],
+      ['div', document.createElement('div'), false],
+    ]
+    for (const [name, element, owned] of cases) {
+      expect(ownsItsKeys(element), name).toBe(owned)
+      expect(timelineKeyAction(' ', paused, element), name).toEqual(owned ? null : { type: 'play' })
+    }
+
+    const editable = document.createElement('div')
+    editable.setAttribute('contenteditable', 'true')
+    expect(ownsItsKeys(editable)).toBe(true)
+
+    const aria = document.createElement('div')
+    aria.setAttribute('role', 'button')
+    expect(ownsItsKeys(aria)).toBe(true)
+
+    // A click target is often the icon INSIDE the button, so the ancestor decides.
+    const button = document.createElement('button')
+    const icon = document.createElement('span')
+    button.appendChild(icon)
+    expect(ownsItsKeys(icon)).toBe(true)
+    expect(timelineKeyAction(' ', paused, icon)).toBeNull()
   })
 })
 

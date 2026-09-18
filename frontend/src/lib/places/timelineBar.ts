@@ -152,6 +152,38 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return element.isContentEditable === true || element.getAttribute?.('contenteditable') === 'true'
 }
 
+// Everything that answers a keystroke by itself: space activates a button, arrows move a link's
+// focus, and every pin, the play button and the phone speed chip are buttons. A control's own
+// keys are never the timeline's.
+const INTERACTIVE_SELECTOR = [
+  'button',
+  'a[href]',
+  'summary',
+  'input',
+  'textarea',
+  'select',
+  'option',
+  '[contenteditable="true"]',
+  '[role="button"]',
+  '[role="link"]',
+  '[role="menuitem"]',
+  '[role="tab"]',
+  '[role="checkbox"]',
+  '[role="radio"]',
+  '[role="switch"]',
+  '[role="option"]',
+  '[role="textbox"]',
+].join(', ')
+
+/** Does the focused element own this keystroke itself? The ancestor counts: a click lands on the
+ * icon inside the button, not on the button. */
+export function ownsItsKeys(target: EventTarget | null): boolean {
+  const element = target as HTMLElement | null
+  if (!element || typeof element.tagName !== 'string') return false
+  if (isTypingTarget(element)) return true
+  return typeof element.closest === 'function' && element.closest(INTERACTIVE_SELECTOR) !== null
+}
+
 /** What else on the page may already own the keystroke. */
 export interface KeyContext {
   /** Another handler has claimed it — PhotoSwipe takes the arrows at document level. */
@@ -167,7 +199,7 @@ export function timelineKeyAction(
   context: KeyContext = {},
 ): TimelineAction | null {
   if (context.defaultPrevented || context.viewerOpen) return null
-  if (isTypingTarget(target)) return null
+  if (ownsItsKeys(target)) return null
   return actionForKey(key, state)
 }
 
