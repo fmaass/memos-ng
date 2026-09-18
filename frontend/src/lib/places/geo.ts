@@ -88,3 +88,50 @@ export function groupByCoordinate(markers: readonly MapMarker[]): CoordinateGrou
   }
   return [...groups.values()]
 }
+
+/** The breathing room the first view keeps around the outermost pins, per side. */
+export const FIT_PADDING = 50
+
+/**
+ * The least map the first view may be left with once the reservation is taken off it. A pane
+ * shorter than the overlay it carries would otherwise be padded out of existence, and
+ * `fitBounds` has no box to solve for.
+ */
+const MIN_FIT_SPAN = 40
+
+/** Only the sides of a DOMRect this module needs — so a test can state one as a literal. */
+export interface PaneRect {
+  top: number
+  bottom: number
+  left: number
+  right: number
+  height: number
+}
+
+export interface FitPadding {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+
+/**
+ * What `fitBounds` must keep free, given the pane and the overlay drawn on top of it.
+ *
+ * The timeline bar is absolutely positioned over the map pane, so every pixel it covers is a
+ * pixel a uniform padding will happily put a pin under: live at 1440x900 two of eight pins
+ * landed behind it, unclickable. The reservation is MEASURED from the overlay on each fit
+ * rather than named as a constant — the bar is a different height on a phone and grows again
+ * when its controls wrap — and an overlay that does not actually overlap the pane (the phone's
+ * in-view grid, which sits below the map) reserves nothing.
+ */
+export function fitPadding(
+  pane: PaneRect,
+  overlay: PaneRect | null,
+  base: number = FIT_PADDING,
+): FitPadding {
+  const overlap = overlay ? Math.max(0, pane.bottom - Math.max(overlay.top, pane.top)) : 0
+  const top = Math.min(base, Math.max(0, (pane.height - MIN_FIT_SPAN) / 2))
+  const room = pane.height - MIN_FIT_SPAN - top
+  return { top, right: base, bottom: Math.max(0, Math.min(base + overlap, room)), left: base }
+}

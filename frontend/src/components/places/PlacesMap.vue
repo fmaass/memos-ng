@@ -15,18 +15,25 @@ import {
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { Protocol } from 'pmtiles'
-import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 
 import { useApi } from '@/composables/useApi'
 import { useDarkMode } from '@/composables/useDarkMode'
-import { bboxOf, type MapMarker, toFeatureCollection } from '@/lib/places/geo'
+import { bboxOf, fitPadding, type MapMarker, toFeatureCollection } from '@/lib/places/geo'
 import { blurhashToDataUrl } from '@/lib/media'
 import { badgeText, type PinSpec, pinsFor, type SourceFeature, syncMarkers } from '@/lib/places/markers'
 import { createPinElement, setLanding } from '@/lib/places/pin'
 import { installMarkerSource, MARKERS_SOURCE } from '@/lib/places/source'
 import { ATTRIBUTION, buildStyle, type MapManifest } from '@/lib/places/style'
 
-const props = defineProps<{ markers: MapMarker[] }>()
+const props = defineProps<{
+  markers: MapMarker[]
+  /**
+   * An element drawn ON TOP of the map pane — the timeline bar. The first fit reserves what it
+   * covers, so no pin lands underneath it; see `fitPadding`.
+   */
+  overlay?: HTMLElement | null
+}>()
 const emit = defineEmits<{
   'cluster-open': [payload: { clusterId: number | null; uids: string[] }]
   'point-open': [uid: string]
@@ -207,7 +214,13 @@ function fitToMarkers() {
     instance.jumpTo({ center: [0, 20], zoom: 1 })
     return
   }
-  instance.fitBounds(box, { padding: 50, maxZoom: 15, animate: false })
+  // Measured on every fit, never a constant: the bar is a different height on a phone and
+  // grows again when its controls wrap.
+  const padding = fitPadding(
+    instance.getContainer().getBoundingClientRect(),
+    props.overlay?.getBoundingClientRect() ?? null,
+  )
+  instance.fitBounds(box, { padding, maxZoom: 15, animate: false })
 }
 
 async function loadManifest(): Promise<MapManifest> {
@@ -255,7 +268,7 @@ onMounted(async () => {
 
 watch(
   () => props.markers,
-  (markers) => {
+  async (markers) => {
     byUid.clear()
     for (const marker of markers) byUid.set(marker.uid, marker)
     // A fresh markers query resets the playhead too (PlacesView), so the map goes back to showing
@@ -264,6 +277,10 @@ watch(
     if (!map.value?.getSource(SOURCE)) return
     setVisibleMarkers(markers)
     if (!fitted && markers.length) {
+      // After the DOM has caught up with these markers: the overlay this fit must reserve is
+      // rendered by the same arrival (`v-if="markers.length"`), so fitting in the same tick
+      // would measure a bar that is not there yet and reserve nothing.
+      await nextTick()
       fitToMarkers()
       fitted = true
     }

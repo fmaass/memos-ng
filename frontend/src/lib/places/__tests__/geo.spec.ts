@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
-import { bboxOf, coordKey, groupByCoordinate, MIN_BBOX_SPAN, toFeatureCollection } from '@/lib/places/geo'
+import {
+  bboxOf,
+  coordKey,
+  FIT_PADDING,
+  fitPadding,
+  groupByCoordinate,
+  MIN_BBOX_SPAN,
+  toFeatureCollection,
+} from '@/lib/places/geo'
 
 import { marker } from './fixtures'
 
@@ -85,5 +93,63 @@ describe('groupByCoordinate', () => {
     // 7th decimal is ~1 cm: the same spot. The 4th decimal is ~10 m: two spots.
     expect(groups).toHaveLength(2)
     expect(groups[0]?.markers.map((m) => m.uid)).toEqual(['a', 'b'])
+  })
+})
+
+describe('fitPadding', () => {
+  // The bar is an absolutely-positioned overlay on the map pane, so the pixels it covers are
+  // pixels `fitBounds` will happily put a pin in. Live at 1440x900 that put 2 of 8 pins at
+  // y 826 behind a bar occupying y 812-884, where nothing can click them.
+  const pane = { top: 56, bottom: 900, left: 240, right: 1440, height: 844 }
+
+  it('reserves the overlay it is given, on the bottom side only', () => {
+    const bar = { top: 812, bottom: 884, left: 256, right: 1424, height: 72 }
+
+    const padding = fitPadding(pane, bar)
+
+    expect(padding.bottom).toBe(FIT_PADDING + (pane.bottom - bar.top))
+    expect(padding.top).toBe(FIT_PADDING)
+    expect(padding.left).toBe(FIT_PADDING)
+    expect(padding.right).toBe(FIT_PADDING)
+  })
+
+  it('reserves what a taller or a shorter overlay actually occupies, not a fixed number', () => {
+    // The bar is a different height on a phone (smaller type, tighter insets) and grows again
+    // when its controls wrap, so the reservation is measured on every fit.
+    const shallow = fitPadding(pane, { top: 852, bottom: 892, left: 8, right: 382, height: 40 })
+    const deep = fitPadding(pane, { top: 760, bottom: 884, left: 8, right: 382, height: 124 })
+
+    expect(deep.bottom).toBeGreaterThan(shallow.bottom)
+    expect(deep.bottom - shallow.bottom).toBe(852 - 760)
+  })
+
+  it('falls back to the uniform padding when no overlay is on the pane', () => {
+    // No markers means no timeline bar at all (PlacesView renders it `v-if="markers.length"`).
+    expect(fitPadding(pane, null)).toEqual({
+      top: FIT_PADDING,
+      right: FIT_PADDING,
+      bottom: FIT_PADDING,
+      left: FIT_PADDING,
+    })
+  })
+
+  it('ignores an overlay that sits clear of the pane', () => {
+    // On a phone the in-view grid is BELOW the map rather than over it: it hides no pin and
+    // must reserve nothing, or the fit would throw away half the short pane for nothing.
+    const below = { top: 950, bottom: 1400, left: 0, right: 390, height: 450 }
+
+    expect(fitPadding(pane, below).bottom).toBe(FIT_PADDING)
+  })
+
+  it('never lets the reservation swallow the pane', () => {
+    // A short pane with a tall bar: padding that exceeds the pane leaves `fitBounds` no box to
+    // solve for, and the first view lands on nothing instead of on the pins.
+    const short = { top: 56, bottom: 520, left: 0, right: 390, height: 464 }
+    const tall = { top: 100, bottom: 512, left: 8, right: 382, height: 412 }
+
+    const padding = fitPadding(short, tall)
+
+    expect(padding.top + padding.bottom).toBeLessThan(short.height)
+    expect(padding.bottom).toBeGreaterThan(0)
   })
 })

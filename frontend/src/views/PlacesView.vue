@@ -26,6 +26,10 @@ import { createTicker, timelineKeyAction } from '@/lib/places/timelineBar'
 const api = useApi()
 const router = useRouter()
 const mapRef = useTemplateRef<InstanceType<typeof PlacesMap>>('map')
+// The timeline bar is an overlay on the map pane, so the map has to know what it covers to keep
+// the first fit from putting pins underneath it (PlacesMap's `overlay` prop, `fitPadding`).
+const barRef = useTemplateRef<InstanceType<typeof TimelineBar>>('bar')
+const barElement = computed(() => (barRef.value?.$el as HTMLElement | undefined) ?? null)
 
 const { data, isPending } = useQuery({
   queryKey: ['map', 'markers'],
@@ -179,6 +183,7 @@ const drawerOpen = computed({
       <PlacesMap
         ref="map"
         :markers="markers"
+        :overlay="barElement"
         @cluster-open="onClusterOpen"
         @point-open="onPointOpen"
         @visible-change="visibleUids = $event"
@@ -190,6 +195,7 @@ const drawerOpen = computed({
       />
       <TimelineBar
         v-if="markers.length"
+        ref="bar"
         class="absolute inset-x-2 bottom-2 z-10 md:inset-x-4 md:bottom-4"
         :histogram="histogram"
         :state="playhead"

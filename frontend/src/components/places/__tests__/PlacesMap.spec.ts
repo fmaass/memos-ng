@@ -3,7 +3,7 @@ import type { FeatureCollection, Point } from 'geojson'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { marker } from '@/lib/places/__tests__/fixtures'
-import type { MarkerProps } from '@/lib/places/geo'
+import { FIT_PADDING, type MarkerProps } from '@/lib/places/geo'
 import { MARKERS_SOURCE } from '@/lib/places/source'
 
 // MapLibre needs a WebGL canvas, which happy-dom has not got — so the map itself is a double and
@@ -15,6 +15,9 @@ vi.mock('@/composables/useApi', () => ({
 }))
 
 type Data = FeatureCollection<Point, MarkerProps>
+
+/** A desktop map pane, stated once: the fit assertions read against these numbers. */
+const PANE = { top: 56, bottom: 900, left: 240, right: 1440, height: 844 }
 
 const maplibre = vi.hoisted(() => {
   const state = {
@@ -69,7 +72,13 @@ const maplibre = vi.hoisted(() => {
     getBounds() {
       return { contains: () => true }
     }
-    fitBounds() {}
+    fits: { padding: unknown }[] = []
+    fitBounds(_box: unknown, options: { padding: unknown }) {
+      this.fits.push({ padding: options.padding })
+    }
+    getContainer() {
+      return { getBoundingClientRect: () => ({ ...PANE, width: PANE.right - PANE.left }) }
+    }
     jumpTo() {}
     easeTo() {}
     /** A theme toggle: MapLibre's style diff drops every source and layer the new style lacks. */
@@ -127,6 +136,14 @@ const feb = marker({
 
 function uidsIn(data: Data | undefined): string[] {
   return (data?.features ?? []).map((feature) => feature.properties.uid)
+}
+
+/** A stand-in for the timeline bar: an element whose rect the fit has to reserve. */
+function overlayElement(rect: { top: number; bottom: number; left: number; right: number }) {
+  const element = document.createElement('div')
+  element.getBoundingClientRect = () =>
+    ({ ...rect, height: rect.bottom - rect.top, width: rect.right - rect.left }) as DOMRect
+  return element
 }
 
 async function mountMap() {
@@ -213,6 +230,38 @@ describe('PlacesMap pin payload', () => {
     await flushPromises()
 
     expect(wrapper.emitted('cluster-open')?.at(-1)).toEqual([{ clusterId: null, uids: ['a', 'c'] }])
+    wrapper.unmount()
+  })
+})
+
+describe('the first fit', () => {
+  it('reserves the overlay drawn on the pane, so no pin lands under it', async () => {
+    // Live at 1440x900 the uniform padding put 2 of 8 pins at y 826 behind a bar occupying
+    // y 812-884: visible, and impossible to click.
+    const bar = overlayElement({ top: 812, bottom: 884, left: 256, right: 1424 })
+    const wrapper = mount(PlacesMap, { props: { markers: [jan, feb], overlay: bar } })
+    await flushPromises()
+    maplibre.state.map?.fire('load')
+    await flushPromises()
+
+    const padding = maplibre.state.map?.fits.at(-1)?.padding as { bottom: number; top: number }
+    expect(padding.bottom).toBe(FIT_PADDING + (PANE.bottom - 812))
+    expect(padding.top).toBe(FIT_PADDING)
+    wrapper.unmount()
+  })
+
+  it('keeps the uniform padding when nothing overlays the pane', async () => {
+    const wrapper = mount(PlacesMap, { props: { markers: [jan, feb] } })
+    await flushPromises()
+    maplibre.state.map?.fire('load')
+    await flushPromises()
+
+    expect(maplibre.state.map?.fits.at(-1)?.padding).toEqual({
+      top: FIT_PADDING,
+      right: FIT_PADDING,
+      bottom: FIT_PADDING,
+      left: FIT_PADDING,
+    })
     wrapper.unmount()
   })
 })
