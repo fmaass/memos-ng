@@ -18,6 +18,10 @@
 # Usage: scripts/build-image.sh <version-string>      (run from the repository root)
 #   e.g. scripts/build-image.sh 1.7.1+abc1234
 # APP_VERSION must also be set to the same string in the stack compose — see RELEASING.md.
+#
+# IMAGE_TAG=memos-ng:<name> builds under another tag. A build that only proves the slim image still
+# compiles must not move `memos-ng:local`: that tag is what the stack runs on its next recreate, and
+# the rollback step is keyed on it still naming the running image.
 set -uo pipefail
 
 die() {
@@ -34,6 +38,12 @@ esac
 
 [ "$#" -eq 1 ] && [ -n "$1" ] || die "usage: scripts/build-image.sh <version-string>"
 version="$1"
+
+tag="${IMAGE_TAG:-memos-ng:local}"
+# docker's own tag grammar, spelled out: anything else is refused here, before the lock is taken
+# and long before docker sees it, rather than left to whatever docker makes of it.
+[[ "$tag" =~ ^memos-ng:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+    die "IMAGE_TAG must name a memos-ng:<tag> image with a plain docker tag, not '$tag'"
 
 toplevel=$(git rev-parse --show-toplevel 2> /dev/null) || die "not a git repository"
 [ "$toplevel" = "$PWD" ] || die "run from the repository root ($toplevel), not $PWD"
@@ -68,4 +78,4 @@ fi
 # long as the build reads the context — it is the docker client's whole lifetime, of which the
 # context transfer is the part that matters here. A `docker build` started as a child and waited
 # for would be equivalent only as long as nobody ever adds an early `exit` above it.
-exec docker build --build-arg APP_VERSION="$version" -t memos-ng:local .
+exec docker build --build-arg APP_VERSION="$version" -t "$tag" .
