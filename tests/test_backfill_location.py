@@ -180,6 +180,41 @@ async def test_the_run_stops_after_twenty_consecutive_read_failures(seeded):
     assert bf.exit_code(stats) == 1
 
 
+async def test_a_run_whose_writes_all_fail_stops_like_a_run_whose_reads_do(seeded, monkeypatch):
+    # The read is the cheap half. A store that fails row after row — a constraint, a lost
+    # connection, a read-only replica — is the same storm, and counting it only until the next
+    # successful READ would let the run walk the whole library writing nothing.
+    from sqlalchemy.exc import IntegrityError
+
+    seeded([(f"w{i}", WITH_GPS, None) for i in range(bf.MAX_CONSECUTIVE_FAILURES + 5)])
+    candidates = await bf.load_candidates(execute=True)
+
+    class _FailingSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, *args, **kwargs):
+            raise IntegrityError(
+                "UPDATE attachments SET latitude=%(latitude)s",
+                {},
+                Exception("ck_attachments_location_pair"),
+            )
+
+        async def commit(self):  # pragma: no cover - never reached
+            raise AssertionError("commit after a failed execute")
+
+    monkeypatch.setattr(bf, "async_session", lambda: _FailingSession())
+    stats = await bf.run_backfill(candidates, execute=True)
+
+    assert stats.stopped_after_failures is True
+    assert stats.failed == bf.MAX_CONSECUTIVE_FAILURES
+    assert stats.processed == bf.MAX_CONSECUTIVE_FAILURES  # it stopped, it did not walk on
+    assert bf.exit_code(stats) == 1
+
+
 async def test_a_success_between_failures_resets_the_counter(seeded):
     rows = [(f"nfs{i}", MISSING, None) for i in range(bf.MAX_CONSECUTIVE_FAILURES - 1)]
     rows.append(("good", WITH_GPS, None))

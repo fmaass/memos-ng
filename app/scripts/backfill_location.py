@@ -204,6 +204,9 @@ async def run_backfill(
 
         stats.processed += 1
         found: location.LocationResult | None = None
+        # A row counts as failed until its WRITE has landed: resetting on the read alone let a
+        # run whose every store failed walk the whole library without ever tripping the stop.
+        row_failed = False
         with location.measuring() as meter:
             try:
                 with fail_after(READ_TIMEOUT_S):
@@ -216,14 +219,14 @@ async def run_backfill(
             except TimeoutError:
                 source = location.SOURCE_UNREADABLE
                 stats.failed += 1
-                consecutive_failures += 1
+                row_failed = True
                 logger.warning(
                     "backfill_location.read_timeout", uid=candidate.uid, mime=candidate.mime
                 )
             except Exception as exc:
                 source = location.SOURCE_UNREADABLE
                 stats.failed += 1
-                consecutive_failures += 1
+                row_failed = True
                 logger.warning(
                     "backfill_location.unreadable",
                     uid=candidate.uid,
@@ -232,7 +235,6 @@ async def run_backfill(
                 )
             else:
                 source = found.source if found else location.SOURCE_NONE
-                consecutive_failures = 0
         stats.bytes_read += meter.bytes_read
         stats.sources[source] += 1
         # Counts and sources only: the value this run just read is the one thing a log may not
@@ -250,7 +252,8 @@ async def run_backfill(
 
         if execute and not await _store(candidate, found, source):
             stats.failed += 1
-            consecutive_failures += 1
+            row_failed = True
+        consecutive_failures = consecutive_failures + 1 if row_failed else 0
 
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             stats.stopped_after_failures = True
