@@ -22,6 +22,7 @@ on an event, and every bound is a failure message rather than a measurement.
 """
 
 import asyncio
+import contextlib
 import os
 import signal
 import subprocess
@@ -142,15 +143,17 @@ async def test_a_deliberate_stop_returns_both_consumers_claims_to_the_queue(
 
     monkeypatch.setattr(media, "guard_publish", parking_guard_publish)
 
-    # The decision point: the real requeue write, wrapped so it can be asked what it ran for.
-    requeued: list[int] = []
-    real_requeue_claim = worker._requeue_claim
+    # The decision point: the real conditional write, wrapped so it can be asked what it ran for
+    # and how many rows it actually changed.
+    requeued: list[tuple[int, int]] = []
+    real_conditional = worker._requeue_claim_conditional
 
-    async def watched_requeue_claim(db, job_id: int) -> None:
-        requeued.append(job_id)
-        await real_requeue_claim(db, job_id)
+    async def watched_conditional(job_id: int, claim: str) -> int:
+        rows = await real_conditional(job_id, claim)
+        requeued.append((job_id, rows))
+        return rows
 
-    monkeypatch.setattr(worker, "_requeue_claim", watched_requeue_claim)
+    monkeypatch.setattr(worker, "_requeue_claim_conditional", watched_conditional)
 
     try:
         async with _supervisor():
@@ -173,8 +176,8 @@ async def test_a_deliberate_stop_returns_both_consumers_claims_to_the_queue(
             f"the transcode claim was stranded: {after_v}"
         )
         assert after_i == ("queued", attempts_i, None), f"the light claim was stranded: {after_i}"
-        assert sorted(requeued) == sorted([jid_v, jid_i]), (
-            f"the cancelled claims never reached the requeue write: {requeued}"
+        assert sorted(requeued) == sorted([(jid_v, 1), (jid_i, 1)]), (
+            f"the cancelled claims never reached the requeue write, or changed no row: {requeued}"
         )
         assert _progress_rows(jid_v) == 0, "the stopped attempt left its progress sample behind"
         assert jid_v in await _claimable_now("transcode"), (
@@ -187,6 +190,195 @@ async def test_a_deliberate_stop_returns_both_consumers_claims_to_the_queue(
         gate.write_text("go")  # whatever the body did, no stub stays parked
         _reap_parked(tmp_path)
         _cleanup(subject, aid_v, aid_i)
+
+
+def _seed_owner(subject: str) -> int:
+    """Just the user row, for the proofs that need one image and no video."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": subject})
+        owner = c.execute(
+            text("INSERT INTO users (subject, role) VALUES (:s,'user') RETURNING id"),
+            {"s": subject},
+        ).scalar_one()
+    eng.dispose()
+    return int(owner)
+
+
+async def test_a_stop_during_the_push_after_the_done_commit_leaves_the_finished_job_alone(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+    tmp_path,
+):
+    """The requeue is CONDITIONAL, so a stop that lands past the outcome cannot resurrect a job.
+
+    `_notify_terminal_safe` runs after `state = done` has been committed, and a cancellation
+    delivered in there reaches the same handler as one delivered mid-derivation. An unconditional
+    requeue would put a finished job back on the queue to be derived a second time — for a photo
+    whose owner has already been told it is ready.
+
+    Asserted at the decision point as well as on the row: the write must run and report that it
+    changed NOTHING, which is what distinguishes "left alone on purpose" from "never asked".
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    subject = "shutdown_done_owner"
+    _seed_owner(subject)
+    aid, jid, _uid = _seed_image(subject, tmp_path)
+
+    notifying = asyncio.Event()
+
+    async def parking_notify(attachment_id: int) -> None:
+        if attachment_id == aid:
+            notifying.set()
+            await asyncio.sleep(3600)  # the stop lands here, past the done commit
+
+    monkeypatch.setattr(worker, "_notify_terminal_safe", parking_notify)
+
+    decisions: list[tuple[int, int]] = []
+    real_conditional = worker._requeue_claim_conditional
+
+    async def watched_conditional(job_id: int, claim: str) -> int:
+        rows = await real_conditional(job_id, claim)
+        decisions.append((job_id, rows))
+        return rows
+
+    monkeypatch.setattr(worker, "_requeue_claim_conditional", watched_conditional)
+
+    try:
+        async with _supervisor():
+            async with asyncio.timeout(60):
+                await notifying.wait()
+            assert _read_claim(jid)[0] == "done", "the job had not finished, so this proves nothing"
+        state, attempts, claimed = _read_claim(jid)
+        assert state == "done", f"a finished job was resurrected by the stop: {state}"
+        assert attempts == 0, attempts
+        assert claimed is not None, "the done row lost its claim identity"
+        assert decisions == [(jid, 0)], (
+            f"the cancel path did not decide against requeueing the finished row: {decisions}"
+        )
+    finally:
+        _cleanup(subject, aid)
+
+
+async def test_a_stop_in_the_claim_time_progress_clear_still_requeues_inside_the_grace(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+    tmp_path,
+):
+    """The window between the claim commit and the work itself is covered too — and it is bounded.
+
+    `media.clear_progress` runs after the claim is durable and before anything is derived. A
+    cancellation there used to reach no handler at all, so the row stayed `processing`. The same
+    stub keeps hanging when the stop path clears the row on the way out, which is what makes this
+    also a proof of the bound: the whole stop still completes well inside docker's grace.
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    subject = "shutdown_clear_owner"
+    _seed_owner(subject)
+    aid, jid, _uid = _seed_image(subject, tmp_path)
+
+    clearing = asyncio.Event()
+    real_clear_progress = media.clear_progress
+
+    async def hanging_clear_progress(job_id: int) -> None:
+        if job_id == jid:
+            clearing.set()
+            await asyncio.sleep(3600)  # never answers — a lock wait that outlives the stop
+        await real_clear_progress(job_id)
+
+    monkeypatch.setattr(media, "clear_progress", hanging_clear_progress)
+
+    try:
+        async with _supervisor():
+            async with asyncio.timeout(60):
+                await clearing.wait()
+            assert _read_claim(jid)[0] == "processing", _read_claim(jid)
+            started = time.monotonic()
+        elapsed = time.monotonic() - started
+        assert _read_claim(jid) == ("queued", 0, None), (
+            f"a stop in the claim-time cleanup stranded the row: {_read_claim(jid)}"
+        )
+        assert jid in await _claimable_now("light"), "the requeued job is not claimable at once"
+        assert elapsed < STOP_GRACE_SECONDS, (
+            f"the stop waited {elapsed:.1f}s on best-effort cleanup, past docker's grace"
+        )
+    finally:
+        _cleanup(subject, aid)
+
+
+async def test_a_requeue_write_that_never_answers_still_ends_the_consumer_cancelled(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+    tmp_path,
+):
+    """The bound holds even when the database does not answer, and the stop stays a cancellation.
+
+    The write is given its own session and abandoned at the bound, so nothing it does afterwards
+    can reach the session the consumer is closing behind it. What must NOT happen: the cancelled
+    consumer ending as an ordinary error (`run_media_drain` would swallow it and the consumer
+    would keep draining while the supervisor waits for it to end). So the consumer task's own
+    verdict is read: cancelled, not finished.
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    subject = "shutdown_hang_owner"
+    _seed_owner(subject)
+    aid, jid, _uid = _seed_image(subject, tmp_path)
+
+    publishing = asyncio.Event()
+    real_guard_publish = media.guard_publish
+
+    async def parking_guard_publish(db, job, attachment) -> None:
+        if attachment.id == aid:
+            publishing.set()
+            await asyncio.sleep(3600)
+        await real_guard_publish(db, job, attachment)
+
+    async def hanging_conditional(job_id: int, claim: str) -> int:
+        await asyncio.sleep(3600)  # a database that never answers
+        return 0
+
+    monkeypatch.setattr(media, "guard_publish", parking_guard_publish)
+    monkeypatch.setattr(worker, "_requeue_claim_conditional", hanging_conditional)
+
+    # The supervisor is driven by hand here rather than through `_supervisor()`: the stop itself is
+    # what is under test, so it is given docker's grace as a BOUND and a stop that never finishes
+    # has to fail as an assertion rather than hang the suite.
+    supervisor = asyncio.create_task(worker.run())
+    consumer: asyncio.Task | None = None
+    try:
+        async with asyncio.timeout(60):
+            await publishing.wait()
+        consumer = next(t for t in asyncio.all_tasks() if t.get_name() == "media-consumer-light")
+        started = time.monotonic()
+        supervisor.cancel()
+        try:
+            # suppress OUTSIDE the bound: the expected CancelledError must not be mistaken for
+            # the timeout's own, or a stop that ran out of grace would read as a clean one.
+            with contextlib.suppress(asyncio.CancelledError):
+                async with asyncio.timeout(STOP_GRACE_SECONDS):
+                    await supervisor
+        except TimeoutError:
+            raise AssertionError(
+                f"a requeue write that never answers held the stop past docker's "
+                f"{STOP_GRACE_SECONDS}s grace"
+            ) from None
+        elapsed = time.monotonic() - started
+        assert consumer is not None and consumer.cancelled(), (
+            "the light consumer did not end as a cancellation, so the stop became an error path"
+        )
+        assert elapsed >= worker.CANCEL_REQUEUE_TIMEOUT_SECONDS, (
+            f"the stop did not even wait for the bound ({elapsed:.1f}s)"
+        )
+        assert elapsed < STOP_GRACE_SECONDS, f"the hung write held the stop for {elapsed:.1f}s"
+        assert _read_claim(jid)[0] == "processing", (
+            "the write was supposed to hang, so the row must be left for the stale-claim sweep"
+        )
+    finally:
+        supervisor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await supervisor
+        _cleanup(subject, aid)
 
 
 # A worker process with no database and no media work: every collaborator the supervisor calls is
@@ -210,7 +402,11 @@ async def parked_drain(job_class=None):
     try:
         await asyncio.sleep(3600)
     except asyncio.CancelledError:
+        # Stands in for the cancel path's requeue: it takes real time, and the process must still
+        # be alive to finish it — which is what a second signal arriving here would take away.
         marker.with_suffix(".cancelled." + str(job_class)).write_text("torn down")
+        await asyncio.sleep(1.0)
+        marker.with_suffix(".finished." + str(job_class)).write_text("write completed")
         raise
     return "idle"
 
@@ -229,10 +425,43 @@ worker.main()
 """
 
 
+def _start_worker_child(tmp_path: Path) -> tuple[subprocess.Popen[str], Path]:
+    """A real worker process, parked in both consumers' drains, ready to be signalled."""
+    marker = tmp_path / "teardown"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _CHILD, str(marker)],
+        env={**os.environ, "DATA_ROOT": str(tmp_path)},
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if all(
+            marker.with_suffix(f".started.{job_class}").exists()
+            for job_class in ("transcode", "light")
+        ):
+            return child, marker
+        assert child.poll() is None, f"the worker died before draining: {child.communicate()}"
+        time.sleep(0.05)
+    child.kill()
+    raise AssertionError("the worker's consumers never reached their drain")
+
+
+def _wait_for(marker: Path, give_up_after: float = 60.0) -> bool:
+    deadline = time.monotonic() + give_up_after
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def test_a_real_sigterm_runs_the_supervisor_teardown_and_exits_cleanly(tmp_path):
     """AC3's wiring: a real SIGTERM to a real worker process ends it through the teardown.
 
-    The database proof above drives the shutdown directly; this one proves the signal is wired to
+    The database proofs above drive the shutdown directly; this one proves the signal is wired to
     that same shutdown. With no handler installed, SIGTERM's default action kills the process
     outright: no consumer is cancelled, no marker is written, and the exit status is -SIGTERM —
     which is the red this test fails with when the handler is removed.
@@ -240,29 +469,8 @@ def test_a_real_sigterm_runs_the_supervisor_teardown_and_exits_cleanly(tmp_path)
     The stop is also bounded by STOP_GRACE_SECONDS, the grace the stack compose leaves at docker's
     default: past it docker sends SIGKILL and the claims cannot be written back at all.
     """
-    marker = tmp_path / "teardown"
-    env = {**os.environ, "DATA_ROOT": str(tmp_path)}
-    child = subprocess.Popen(
-        [sys.executable, "-c", _CHILD, str(marker)],
-        env=env,
-        cwd=str(Path(__file__).resolve().parent.parent),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    child, marker = _start_worker_child(tmp_path)
     try:
-        started = time.monotonic()
-        while time.monotonic() - started < 120:
-            if all(
-                marker.with_suffix(f".started.{job_class}").exists()
-                for job_class in ("transcode", "light")
-            ):
-                break
-            assert child.poll() is None, f"the worker died before draining: {child.communicate()}"
-            time.sleep(0.05)
-        else:
-            raise AssertionError("the worker's consumers never reached their drain")
-
         sent = time.monotonic()
         child.send_signal(signal.SIGTERM)
         try:
@@ -282,6 +490,48 @@ def test_a_real_sigterm_runs_the_supervisor_teardown_and_exits_cleanly(tmp_path)
         )
     assert child.returncode == 0, (
         f"a signalled stop must end the process cleanly, not by signal "
+        f"(returncode {child.returncode}); worker said: {output}"
+    )
+    assert elapsed < STOP_GRACE_SECONDS, (
+        f"the stop took {elapsed:.1f}s, past docker's {STOP_GRACE_SECONDS}s grace"
+    )
+
+
+def test_a_second_sigterm_during_the_teardown_does_not_kill_the_write(tmp_path):
+    """An impatient operator (or docker) signalling twice must not cut the requeue in half.
+
+    The handlers stay installed until the teardown has finished, and a repeat signal is a no-op
+    while a stop is already running. Give them back before the consumers are awaited instead, and
+    the seconds each consumer spends writing its claim back are seconds in which SIGTERM's default
+    action is armed again — the process dies mid-write, which is the state this whole path exists
+    to avoid. The child's drain writes its completion marker AFTER a delay on the cancel path, so
+    "the write still completed" is observable rather than inferred.
+    """
+    child, marker = _start_worker_child(tmp_path)
+    try:
+        sent = time.monotonic()
+        child.send_signal(signal.SIGTERM)
+        assert _wait_for(marker.with_suffix(".cancelled.transcode")), (
+            "the first SIGTERM never reached the teardown"
+        )
+        child.send_signal(signal.SIGTERM)  # while the consumers are still unwinding
+        try:
+            output = child.communicate(timeout=60)[0]
+        except subprocess.TimeoutExpired:
+            child.kill()
+            raise AssertionError("the second SIGTERM left the worker hanging") from None
+        elapsed = time.monotonic() - sent
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
+
+    for job_class in ("transcode", "light"):
+        assert marker.with_suffix(f".finished.{job_class}").exists(), (
+            f"the second SIGTERM cut the {job_class} consumer's write short; worker said: {output}"
+        )
+    assert child.returncode == 0, (
+        f"the second signal killed the process instead of being a no-op "
         f"(returncode {child.returncode}); worker said: {output}"
     )
     assert elapsed < STOP_GRACE_SECONDS, (

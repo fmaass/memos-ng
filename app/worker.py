@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 import structlog
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -60,14 +60,19 @@ ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message he
 # --force-recreate` sends (the entrypoint `exec`s this process, so it arrives here and not at a
 # shell), SIGINT is the same stop from a terminal.
 STOP_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
-# How long the cancel path may spend returning ONE claim to the queue, and the whole time budget
-# it lives in: the stack compose sets no `stop_grace_period`, so docker allows 10 s between
-# SIGTERM and SIGKILL. A running transcode is stopped first — media.KILL_GRACE_SECONDS = 5 s for
-# the TERM step of the ffmpeg tree stop — which makes the worst case this is designed for 5 + 3 =
-# 8 s, with ~2 s of margin. The two consumers requeue in parallel, so the 3 s is not doubled.
-# Past the grace docker sends SIGKILL, nothing can be written, and the row stays `processing` for
-# the stale-claim sweep (MEDIA_CLAIM_STALE_SECONDS) exactly as an OOM kill leaves it.
+# The stop path's own bounds, and the budget they were chosen against: the stack compose sets no
+# `stop_grace_period`, so docker allows 10 s between SIGTERM and SIGKILL. A consumer stopping a
+# transcode spends the ffmpeg tree stop's TERM step first (media.KILL_GRACE_SECONDS = 5 s), then
+# up to 3 s returning the claim, then up to 1 s on the progress row — 9 s of the 10, and the two
+# consumers run their own in parallel rather than one after the other.
+#
+# DESIGNED bounds, not hard caps on the process: an ffmpeg that also has to be SIGKILLed adds a
+# second 5 s step, and nothing here can bound the kernel. Past the grace docker sends SIGKILL and
+# nothing can be written — a claim that was in flight then stays `processing` for the stale-claim
+# sweep (MEDIA_CLAIM_STALE_SECONDS), exactly as an OOM kill leaves it, while a stop that happened
+# to be holding no claim leaves nothing behind at all.
 CANCEL_REQUEUE_TIMEOUT_SECONDS = 3.0
+CANCEL_PROGRESS_CLEAR_SECONDS = 1.0
 
 # A claim-time PREDICATE, not a column and not a row value: nothing is stored, and the class exists
 # only in the WHERE of a claim and as the name of the consumer that issued it. That is what lets
@@ -421,8 +426,58 @@ async def _requeue_claim(db: AsyncSession, job_id: int) -> None:
     await db.commit()
 
 
-async def _requeue_cancelled_claim(db: AsyncSession, job_id: int) -> None:
-    """Return a committed claim to `queued` while THIS task is being CANCELLED — the deploy stop.
+def _stop_in_flight() -> bool:
+    """Is a cancellation being delivered to this task right now?
+
+    `Task.cancelling()` counts cancels requested and not un-requested; nothing in the worker
+    uncancels, and the bounded `asyncio.timeout` blocks it passes through restore their own count,
+    so inside a consumer this is 0 during ordinary work and 1 from the moment the stop reaches it.
+    What it decides is whether a piece of best-effort cleanup may still take unbounded time.
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+async def _requeue_claim_conditional(job_id: int, claim: str) -> int:
+    """Return THIS claim to `queued` in a session of its OWN; answers how many rows it changed.
+
+    CONDITIONAL on the row still being `processing` under this exact `claimed_by`, because the
+    cancel path cannot know where in the attempt the stop landed: a cancellation delivered in the
+    push notification that follows the `done` commit, or in a failure branch that already
+    committed its own outcome, would otherwise resurrect a finished job as `queued` and run it a
+    second time. Zero rows changed is the correct, silent answer for a row that is done, failed,
+    deleted, or has since been claimed by somebody else.
+
+    Its OWN session, not the consumer's: the consumer's session is being torn down around this
+    call (a statement of ITS may have just been cancelled mid-flight), and a write that shared it
+    could be interrupted by that teardown or interrupt it in turn. `attempts` is untouched — a
+    deploy is not a failed attempt.
+    """
+    async with async_session() as db:
+        # RETURNING rather than rowcount, as everywhere else here: the id that comes back IS the
+        # row this write claimed to have moved, and it is typed.
+        moved = (
+            (
+                await db.execute(
+                    update(MediaJob)
+                    .where(
+                        MediaJob.id == job_id,
+                        MediaJob.state == JobState.processing,
+                        MediaJob.claimed_by == claim,
+                    )
+                    .values(state=JobState.queued, claimed_by=None)
+                    .returning(MediaJob.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await db.commit()
+        return len(moved)
+
+
+async def _requeue_cancelled_claim(job_id: int, claim: str) -> None:
+    """Run that write while THIS task is being CANCELLED — the deploy stop.
 
     Two bounds, both because the container this runs in is already stopping:
 
@@ -430,21 +485,48 @@ async def _requeue_cancelled_claim(db: AsyncSession, job_id: int) -> None:
       write half-done, or the row this exists to free stays `processing` after all.
     * TIMED OUT at CANCEL_REQUEUE_TIMEOUT_SECONDS — a database that does not answer must not hold
       the process past docker's stop grace. Past the bound the row stays `processing` and the
-      stale-claim sweep is the backstop, which is where a SIGKILL would have left it anyway.
+      stale-claim sweep is the backstop, which is where a SIGKILL would have left it anyway. The
+      abandoned write owns nothing but its own session, so whatever it does while unwinding cannot
+      reach the session the consumer is closing behind it.
 
-    Every failure is swallowed on purpose: run_once re-raises the cancellation either way, and a
-    requeue that could not be written must not replace the shutdown in progress with an error.
+    Every failure is swallowed on purpose, cancellation included: run_once re-raises the
+    cancellation immediately after this returns, so it cannot be masked on the way out — while an
+    error raised from HERE would replace it, be caught by run_media_drain's `except Exception`,
+    and leave the consumer draining on while the supervisor waits for it to end.
     """
-    write = asyncio.ensure_future(_requeue_claim(db, job_id))
+    write = asyncio.ensure_future(_requeue_claim_conditional(job_id, claim))
     try:
         async with asyncio.timeout(CANCEL_REQUEUE_TIMEOUT_SECONDS):
-            await asyncio.shield(write)
-        logger.info("media_job_requeued_on_cancel", job_id=job_id)
+            rows = await asyncio.shield(write)
+        if rows:
+            logger.info("media_job_requeued_on_cancel", job_id=job_id, claim=claim)
+        else:
+            # Not this attempt's row any more: finished, failed, deleted or re-claimed.
+            logger.info("media_job_cancel_requeue_skipped", job_id=job_id, claim=claim)
     except (TimeoutError, asyncio.CancelledError):
         write.cancel()  # the bound reached, or a second cancel — let the stop proceed
-        logger.warning("media_job_cancel_requeue_unfinished", job_id=job_id)
+        logger.warning("media_job_cancel_requeue_unfinished", job_id=job_id, claim=claim)
     except Exception:
-        logger.exception("media_job_cancel_requeue_error", job_id=job_id)
+        logger.exception("media_job_cancel_requeue_error", job_id=job_id, claim=claim)
+
+
+async def _clear_progress_on_stop(job_id: int) -> None:
+    """The progress side channel's cleanup, BOUNDED, on the stop path.
+
+    Unbounded (as the post-outcome clear in run_once is) a lock wait here would spend the rest of
+    docker's grace after the requeue has already succeeded — and this is telemetry. Past the bound
+    the row simply outlives the stop: the next attempt's claim-time clear in run_once removes it
+    before it derives anything, which is the same path that covers a killed worker.
+    """
+    clear = asyncio.ensure_future(media.clear_progress(job_id))
+    try:
+        async with asyncio.timeout(CANCEL_PROGRESS_CLEAR_SECONDS):
+            await asyncio.shield(clear)
+    except (TimeoutError, asyncio.CancelledError):
+        clear.cancel()
+        logger.warning("media_job_cancel_progress_clear_unfinished", job_id=job_id)
+    except Exception:
+        logger.exception("media_job_cancel_progress_clear_error", job_id=job_id)
 
 
 async def _discard_claim(db: AsyncSession, job_id: int, attachment_id: int, reason: str) -> None:
@@ -494,57 +576,66 @@ async def run_once(db: AsyncSession, job_class: JobClass | None = None) -> str:
     # Commit the claim BEFORE processing (see docstring): `processing` becomes durable and the
     # media_jobs row lock is released for the transcode's whole duration.
     await db.commit()
-    # Cleanup BEFORE processing (MEMNG-36): drop any progress row a dead attempt left behind, so the
-    # snapshot never reports a percentage that goes backwards. Its own committing session; a no-op
-    # delete on a fast-lane job that never published.
-    await media.clear_progress(job_id)
+    # The claim identity THIS attempt owns, read while the instance is still trustworthy: the stop
+    # path's requeue is conditional on it, and after a cancellation the ORM object may describe a
+    # transaction that never committed.
+    claim = job.claimed_by
+    # One cancellation handler around EVERYTHING that follows the claim commit — the claim-time
+    # clear, the work itself, every outcome branch and the post-outcome clear. A stop can land in
+    # any of them, and each one of those is a window in which the row is `processing` with nobody
+    # left to finish it. The handler's write is conditional, so it is safe wherever it landed.
     try:
-        await media.process_job(db, job)
-        job.state = JobState.done
-        job.progress_pct = 100
-        await db.commit()
-        if job_kind == JobKind.derive:
-            # Only the pipeline that PRODUCES the photo announces it. A printready job leaves the
-            # attachment exactly as it found it (already `ready`), so pushing here would send the
-            # owner a second "your photo is ready" per photo — a few hundred of them per book.
-            await _notify_terminal_safe(attachment_id)  # separate session, after job is durable
-        return "processed"
+        # Cleanup BEFORE processing (MEMNG-36): drop any progress row a dead attempt left behind,
+        # so the snapshot never reports a percentage that goes backwards. Its own committing
+        # session; a no-op delete on a fast-lane job that never published.
+        await media.clear_progress(job_id)
+        try:
+            await media.process_job(db, job)
+            job.state = JobState.done
+            job.progress_pct = 100
+            await db.commit()
+            if job_kind == JobKind.derive:
+                # Only the pipeline that PRODUCES the photo announces it. A printready job leaves
+                # the attachment exactly as it found it (already `ready`), so pushing here would
+                # send the owner a second "your photo is ready" per photo — hundreds per book.
+                await _notify_terminal_safe(attachment_id)  # own session, after job is durable
+            return "processed"
+        except media.ThermalDefer:
+            await _requeue_claim(db, job_id)  # too hot — back to queued, not a failure
+            return "deferred"
+        except media.AttachmentGone as exc:
+            # The attachment was deleted while this job ran (MEMNG-41): nothing to derive or
+            # notify, no attempt to count. guard_publish already swept this run's output; discard
+            # the job row.
+            await _discard_claim(db, job_id, attachment_id, str(exc))
+            return "processed"
+        except Exception as exc:  # a bad input must not kill the worker
+            return await _record_job_failure(db, job_id, attachment_id, job_kind, exc)
+        finally:
+            # Cleanup AFTER the outcome is committed — every branch above commits before it
+            # returns. Clearing the row from inside the transcode instead (media.process_slow)
+            # opened a window between that clear and this transaction's commit in which the
+            # snapshot fell back to the job row's committed progress (0) while the attachment
+            # still read `processing`: the client saw its transcode reach 100%, snap back to 0%,
+            # and only then turn ready (MEMNG-36). After the commit there is no such window.
+            #
+            # NOT on the stop path: there the handler below clears the row under a bound instead,
+            # because an unbounded delete here would spend grace the requeue has already earned.
+            if not _stop_in_flight():
+                await media.clear_progress(job_id)
     except asyncio.CancelledError:
         # A DELIBERATE stop — SIGTERM → the supervisor's teardown → this consumer's cancellation —
-        # with a claim that is already committed. Without this branch the row keeps `processing`
+        # arriving anywhere after the claim was committed. Without this the row keeps `processing`
         # and a claim identity no live process answers to, and nothing requeues it until
         # MEDIA_CLAIM_STALE_SECONDS (2 h), during which _order_guard also withholds every LATER
-        # job of the same attachment. Same treatment for both consumers: a recreate strands one
-        # row per class otherwise. The cancellation keeps propagating — shutdown stays prompt, and
-        # swallowing it here would turn a stop into a worker that keeps draining.
-        await _requeue_cancelled_claim(db, job_id)
+        # job of the same attachment. Both consumers get it: a recreate strands one row per class
+        # otherwise. The requeue comes first because it is what the grace exists for; the progress
+        # row is telemetry and follows. The cancellation keeps propagating — a swallowed stop is a
+        # worker that keeps draining while the supervisor waits for it.
+        if claim is not None:
+            await _requeue_cancelled_claim(job_id, claim)
+        await _clear_progress_on_stop(job_id)
         raise
-    except media.ThermalDefer:
-        await _requeue_claim(db, job_id)  # too hot — back to queued, not a failure
-        return "deferred"
-    except media.AttachmentGone as exc:
-        # The attachment was deleted while this job ran (MEMNG-41): nothing to derive or notify,
-        # no attempt to count. guard_publish already swept this run's output; discard the job row.
-        await _discard_claim(db, job_id, attachment_id, str(exc))
-        return "processed"
-    except Exception as exc:  # a bad input must not kill the worker
-        return await _record_job_failure(db, job_id, attachment_id, job_kind, exc)
-    finally:
-        # Cleanup AFTER the outcome is committed — every branch above commits before it returns.
-        # Clearing the row from inside the transcode instead (media.process_slow) opened a window
-        # between that clear and this transaction's commit in which the snapshot fell back to the
-        # job row's committed progress (0) while the attachment still read `processing`: the
-        # client saw its transcode reach 100%, snap back to 0%, and only then turn ready
-        # (MEMNG-36). After the commit there is no such window — a finished job leaves the
-        # snapshot's active set in the same transaction that publishes the result.
-        #
-        # It runs on the CANCEL path too, and deliberately after the requeue above rather than
-        # before it: the requeue is what the stop grace exists for, this is telemetry. A requeued
-        # job whose progress row survived would report the dead attempt's percentage until the
-        # retry publishes its own, and if the grace runs out here instead, the claim-time clear
-        # above and sweep_job_progress_safe both still remove it. clear_progress swallows its own
-        # errors, so this cannot mask the cancellation on its way out.
-        await media.clear_progress(job_id)
 
 
 async def run_media_drain(job_class: JobClass | None = None) -> str:
@@ -1220,25 +1311,33 @@ async def run() -> None:
         # Our own stop signal: the teardown below runs either way, and returning afterwards is
         # what makes a deliberate stop exit 0 instead of dying on an escaped CancelledError.
     finally:
-        _remove_stop_handlers(installed)
         # The teardown is what the stop signal ENDS IN, and what every caller that cancels run()
         # (the loop tests do) relies on: it would otherwise leave a consumer draining against
         # patched collaborators or a closed session. Cancelling and AWAITING is load-bearing for
         # the stop — each consumer returns its in-flight claim to the queue while it unwinds
         # (run_once's cancel branch), and only the await makes that write part of the stop rather
         # than a race with the process exiting.
-        for task, _, _ in consumers.values():
-            task.cancel()
-        for task, _, _ in consumers.values():
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass  # the cancellation this teardown just requested, and only that one
-            except Exception:
-                # A consumer that had ALREADY died: its exception is retrieved here rather than
-                # left to surface as an unretrieved-task warning, and it must not mask the
-                # shutdown that is in progress.
-                logger.exception("worker_consumer_teardown_error")
+        try:
+            for task, _, _ in consumers.values():
+                task.cancel()
+            for task, _, _ in consumers.values():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass  # the cancellation this teardown just requested, and only that one
+                except Exception:
+                    # A consumer that had ALREADY died: its exception is retrieved here rather
+                    # than left to surface as an unretrieved-task warning, and it must not mask
+                    # the shutdown that is in progress.
+                    logger.exception("worker_consumer_teardown_error")
+        finally:
+            # Only NOW are the signals given back. Removing them before the teardown would leave
+            # the default action installed for exactly the seconds the consumers spend writing
+            # their claims back, so an impatient second SIGTERM would kill the process mid-write —
+            # the one thing this whole path exists to prevent. While they are still installed a
+            # repeat signal is a no-op (`stop.fired`), so it cannot re-cancel the supervisor
+            # either.
+            _remove_stop_handlers(installed)
     # Reached only on a signalled stop (the loop above never exits on its own): every consumer has
     # been cancelled AND awaited by now, so whatever they held is back in the queue and the next
     # worker start can claim it at once.

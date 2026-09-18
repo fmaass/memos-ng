@@ -115,19 +115,26 @@ Recreating the worker stops any in-flight media job, and a **deliberate** stop n
 back in the queue instead of stranding it. `docker compose up -d --force-recreate` sends SIGTERM to
 the worker process (the entrypoint `exec`s it, so the signal arrives at Python); the supervisor
 tears both consumers down, and each cancelled job's row goes back to `queued` with its attempt
-count untouched — so the new worker claims it at once rather than waiting out the 2-hour
-`MEDIA_CLAIM_STALE_SECONDS` horizon, and the per-attachment order guard stops withholding that
-attachment's later jobs.
+count untouched — provided the row is still `processing` under that worker's own claim, so a job
+that had already finished (or failed, or been deleted) is left exactly as it is. The requeued job
+is therefore re-runnable by the next worker start, and once it has run, the per-attachment order
+guard stops withholding that attachment's later jobs.
 
 That happens inside docker's stop grace, which is **10 s**: the stack compose sets no
-`stop_grace_period`, so the default applies. The budget the stop was designed against is the
+`stop_grace_period`, so the default applies. The bounds the stop was designed against: the
 transcode's own tree stop first (SIGTERM to the ffmpeg process group, `media.KILL_GRACE_SECONDS` =
-5 s) plus a 3-second bound on the requeue write (`worker.CANCEL_REQUEUE_TIMEOUT_SECONDS`) — about
-8 s worst case, with both consumers requeueing in parallel. **Past the grace nothing can be
-written**: docker sends SIGKILL, and those rows stay `processing` (exactly as after an OOM kill or
-a host crash) until the stale-claim sweep requeues them 2 hours later, with the order guard holding
-that attachment's later jobs meanwhile. The same is true of an ffmpeg that ignores SIGTERM for its
-full 5 s and then needs the SIGKILL step.
+5 s), then up to 3 s for the requeue write (`worker.CANCEL_REQUEUE_TIMEOUT_SECONDS`), then up to
+1 s for the progress row (`worker.CANCEL_PROGRESS_CLEAR_SECONDS`) — 9 s of the 10, with both
+consumers running their own in parallel. These are **designed bounds, not hard caps**: an ffmpeg
+that ignores SIGTERM also needs the SIGKILL step, which adds another 5 s, and nothing in the
+process can bound the kernel.
+
+**Past the grace nothing can be written**: docker sends SIGKILL. That strands a row only if a
+claim was actually in flight — a worker sitting idle leaves nothing behind. A claim that was in
+flight stays `processing` (exactly as after an OOM kill or a host crash) until a sweep requeues
+it: `MEDIA_CLAIM_STALE_SECONDS` (7200 s) is the age at which a claim becomes eligible, and the
+next sweep after that requeues it, so the delay is that threshold plus up to one sweep interval.
+While such a row stands, the order guard withholds that attachment's later jobs.
 
 A frame job interrupted mid-send is not lost either: the next worker start re-queues any claim
 older than `FRAME_CLAIM_STALE_MINUTES` (15 by default) and retries it, at the price of a possible
