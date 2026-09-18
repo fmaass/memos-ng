@@ -189,3 +189,74 @@ def test_the_threshold_is_the_one_the_owner_named_for_this_host():
     assert defaults["THERMAL_MAX_C"].default == 90
     # and the shipped default resolves by name — a path here would be an explicit override
     assert defaults["THERMAL_ZONE"].default == ""
+
+
+# --- reads that are not text, and numbers that are not temperatures (fold round) --------------
+
+
+def test_a_chip_name_that_is_not_utf8_is_skipped_not_raised(hwmon):
+    """A chip whose `name` is not valid UTF-8 raises UnicodeDecodeError — a ValueError, not an
+    OSError. Unguarded it escapes the resolver, and the resolver's first caller is the worker's
+    startup line, before the schema gate: the worker would not start at all. So the chip is skipped
+    and the scan goes on, which a second, valid coretemp behind it proves."""
+    bad = hwmon / "hwmon0"
+    bad.mkdir()
+    (bad / "name").write_bytes(b"\xff\xfe not text\n")
+    _chip(hwmon, 1, "coretemp", temp1=("Package id 0", "88000"))
+
+    assert media.resolve_thermal_sensor() == hwmon / "hwmon1" / "temp1_input"
+    assert media.thermal_state() is media.ThermalState.COOL
+
+
+def test_a_label_that_is_not_utf8_is_skipped_not_raised(hwmon):
+    """Same failure one level down: the chip reads fine and one of its labels does not."""
+    chip = _chip(hwmon, 0, "coretemp", temp2=("Package id 0", "95000"))
+    (chip / "temp1_label").write_bytes(b"\xff\xfe\n")
+    (chip / "temp1_input").write_text("50000\n")
+
+    assert media.resolve_thermal_sensor() == chip / "temp2_input"
+    assert media.thermal_state() is media.ThermalState.HOT
+
+
+def test_an_undecodable_name_with_nothing_else_is_unknown(hwmon):
+    """And with no good chip behind it, the answer is UNKNOWN — never an exception, never cool."""
+    bad = hwmon / "hwmon0"
+    bad.mkdir()
+    (bad / "name").write_bytes(b"\xff\xfe\n")
+
+    assert media.resolve_thermal_sensor() is None
+    assert media.thermal_state() is media.ThermalState.UNKNOWN
+
+
+@pytest.mark.parametrize("reading", ["0", "-1", "-40000", "999000", "150001"])
+def test_a_reading_that_is_not_a_temperature_is_unknown(hwmon, reading):
+    """Both ends are failure modes that would otherwise read as a decision. 0 and negatives are
+    what a disconnected or misread sensor reports, and they sit below every threshold — "cool"
+    about a host nothing measured, which is the exact bug this guard exists to stop. An absurd
+    positive is above every threshold for ever, and backfill_location waits in `while too_hot()`,
+    so it would never finish."""
+    _chip(hwmon, 0, "coretemp", temp1=("Package id 0", reading))
+
+    assert media.read_temp_millideg() is None
+    assert media.thermal_state() is media.ThermalState.UNKNOWN
+    assert media.too_hot() is False
+
+
+@pytest.mark.parametrize(
+    ("reading", "expected"),
+    [
+        ("1", "COOL"),  # the lowest plausible reading is still a measurement
+        ("150000", "HOT"),  # the highest one is still a measurement, and it is hot
+        ("90000", "COOL"),  # exactly at the threshold is not above it
+        ("90001", "HOT"),
+    ],
+)
+def test_the_edges_of_the_plausible_range_and_of_the_threshold_still_classify(
+    hwmon, reading, expected
+):
+    """The bound must reject nonsense without swallowing the extremes of the real range, and the
+    threshold comparison stays strictly-greater-than."""
+    _chip(hwmon, 0, "coretemp", temp1=("Package id 0", reading))
+
+    assert media.read_temp_millideg() == int(reading)
+    assert media.thermal_state() is getattr(media.ThermalState, expected)

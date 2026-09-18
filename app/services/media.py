@@ -1044,8 +1044,10 @@ class ThermalDefer(Exception):
 # is how this guard spent the whole jupiter era reading a number that could not rise: a backfill
 # ran with the package above 80 °C and deferred nothing.
 #
-# HWMON_ROOT is a module constant so a test can point the entire resolution at a fake tree; nothing
-# in this module ever reads the running machine's /sys when it is patched. All three functions are
+# HWMON_ROOT is a module constant so a test can point the NAME RESOLUTION at a fake tree. It does
+# not isolate a test on its own: a non-empty THERMAL_ZONE is read exactly as given and never goes
+# near HWMON_ROOT, so a test that wants nothing of this machine patches HWMON_ROOT *and* leaves
+# THERMAL_ZONE empty — which is what the suite's autouse fixture does. All these functions are
 # pure reads with no cache and no shared state: two concurrent job consumers calling them at the
 # same moment cannot interfere, and the scan is a handful of small sysfs reads against a directory
 # the kernel keeps in memory — orders of magnitude cheaper than the transcode it guards, which is
@@ -1053,6 +1055,15 @@ class ThermalDefer(Exception):
 HWMON_ROOT = Path("/sys/class/hwmon")
 THERMAL_CHIP = "coretemp"  # Intel's per-package driver; jupiter's CPU
 THERMAL_INPUT_LABEL = "Package id 0"  # the whole-package reading, not one core's
+# A reading outside this range is not a temperature, so it is UNKNOWN rather than a verdict. Both
+# ends are failure modes that would otherwise read as a decision: a disconnected or misread sensor
+# reports 0 or a negative sentinel, which lands below any threshold and says "cool" about a host
+# nothing measured; and an absurd positive is permanently above any threshold, which would leave
+# backfill_location's `while too_hot()` waiting for a machine that is never going to cool. Nothing
+# real sits above 150 °C — this package's own critical limit is 100 °C — and silicon that did
+# would have shut itself down long before.
+THERMAL_MIN_PLAUSIBLE_MILLIDEG = 1
+THERMAL_MAX_PLAUSIBLE_MILLIDEG = 150_000
 
 
 class ThermalState(StrEnum):
@@ -1073,8 +1084,14 @@ def resolve_thermal_sensor() -> Path | None:
 
     None is the honest answer on a dev machine, in a container without /sys, or on a CPU whose
     driver names things differently (Saturn's k10temp publishes no labels at all) — and it means
-    UNKNOWN, not cool. Every read is guarded: sysfs entries can disappear between the scan and the
-    open, and an unreadable chip must not take the whole resolution down with it.
+    UNKNOWN, not cool.
+
+    Every read is guarded, and against ValueError as well as OSError: sysfs entries can disappear
+    between the scan and the open, and a chip whose `name` or label is not valid UTF-8 raises
+    UnicodeDecodeError, which is a ValueError and would otherwise escape this function entirely.
+    The first caller is the worker's startup line, before the schema gate — an exception there does
+    not degrade the guard, it stops the worker from starting. One unreadable chip is skipped; the
+    scan goes on and can still find a good one.
     """
     try:
         chips = sorted(HWMON_ROOT.iterdir())
@@ -1085,13 +1102,13 @@ def resolve_thermal_sensor() -> Path | None:
             if (chip / "name").read_text().strip() != THERMAL_CHIP:
                 continue
             labels = sorted(chip.glob("temp*_label"))
-        except OSError:
+        except (OSError, ValueError):
             continue
         for label in labels:
             try:
                 if label.read_text().strip() != THERMAL_INPUT_LABEL:
                     continue
-            except OSError:
+            except (OSError, ValueError):
                 continue
             candidate = label.with_name(label.name.removesuffix("_label") + "_input")
             if candidate.exists():
@@ -1113,9 +1130,12 @@ def read_temp_millideg() -> int | None:
     if sensor is None:
         return None
     try:
-        return int(sensor.read_text().strip())
+        milli = int(sensor.read_text().strip())
     except (OSError, ValueError):
         return None  # configured but unreadable is UNKNOWN too, not cool
+    if not THERMAL_MIN_PLAUSIBLE_MILLIDEG <= milli <= THERMAL_MAX_PLAUSIBLE_MILLIDEG:
+        return None  # a number, but not a temperature — see the bound's comment
+    return milli
 
 
 def thermal_state() -> ThermalState:
