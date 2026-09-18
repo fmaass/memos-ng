@@ -20,6 +20,7 @@ import os
 import signal
 import socket
 import time
+from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -55,6 +56,52 @@ logger = structlog.get_logger(__name__)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
+# The worker healthcheck's staleness bar, restated here because the bounds below are chosen
+# against it: the compose healthcheck calls the worker unhealthy once the heartbeat is older than
+# this, and `autoheal=true` then RECREATES the container — with two consumers mid-job. It is not
+# read from here (the healthcheck is compose's), it is the budget every bound is spent out of.
+HEARTBEAT_STALE_SECONDS = 1800
+# The TOTAL bound on each step run() awaits on its OWN coroutine, in seconds. Every such step is
+# time between two heartbeat stamps, so an unbounded one is a healthy worker killed by its own
+# healthcheck — which is what these exist to prevent. Named here rather than inline so the whole
+# budget is reviewable in one place and a later edit has to move a number somebody can see.
+#
+# Not settings: they are the shape of THIS loop (which step can hold the stamp, and for how long),
+# not a per-deployment knob, and an operator raising one in the environment would be raising it
+# past the healthcheck bar with nothing to stop them. Each is generous against the work it covers
+# — a bound reached is an incident, never routine pacing.
+HOUSEKEEPING_BOUNDS: dict[str, int] = {
+    # One frame-share job: a claim, an external album send, a commit. The send is the slow part
+    # and the only one that can hang on somebody else's server.
+    "frame_share_drain": 120,
+    # Two indexed reads and a CAS on one row. Generous by two orders of magnitude; anything near
+    # this is the database being unreachable, not a slow query.
+    "adopt_manual_digest": 30,
+    "digest_is_due": 30,
+    # Deletes expired upload sessions and unlinks their part files under plain FOR UPDATE (no SKIP
+    # LOCKED): it can legitimately WAIT on a finalize that holds the row, and that wait is the
+    # reason this one needs a bound at all.
+    "reap_expired_committed": 120,
+    # Two bounded UPDATEs over one index each, at startup and on the reap cadence.
+    "frame_share_recover": 60,
+    "media_recover": 60,
+    # An anti-join delete over the progress side channel — telemetry, and the smallest sweep here.
+    "job_progress_sweep": 60,
+    # Scans recent memos and re-enqueues poster jobs; the scan is bounded by the window, not by
+    # the table.
+    "commit_race_reconcile": 120,
+    # The largest by far, and the step the ticket was raised on: the hosted-media retention sweep
+    # deletes from Dropbox with per-operation timeouts but no total, so a big expiry batch against
+    # a slow remote is exactly the unbounded case. Missing a sweep costs a cycle of retention
+    # lateness; missing a heartbeat costs the container.
+    "digest_sweep": 240,
+}
+# Under half the healthcheck bar, and asserted in the tests so a later edit cannot quietly exceed
+# it. It is a deliberate OVER-estimate of any real gap: no single stamp-to-stamp gap contains every
+# step (the startup pair runs before the loop, the hourly block only on the reap cadence, and the
+# two digest-gate reads are the only pair that can both be spent in one pass), so the sum bounds
+# the worst gap with room for the POLL_SECONDS back-off on top.
+HOUSEKEEPING_BOUND_TOTAL_SECONDS = sum(HOUSEKEEPING_BOUNDS.values())
 ERROR_TEXT_LIMIT = 500  # media_jobs.error is Text, but a stack-sized message helps nobody
 # The signals a deliberate stop arrives as: SIGTERM is what `docker compose up -d
 # --force-recreate` sends (the entrypoint `exec`s this process, so it arrives here and not at a
@@ -1200,6 +1247,47 @@ def _remove_stop_handlers(installed: list[signal.Signals]) -> None:
             loop.remove_signal_handler(sig)
 
 
+async def _bounded[T](step: str, work: Awaitable[T], on_timeout: T) -> T:
+    """Await one supervisor step under its TOTAL bound; past the bound, say so and carry on.
+
+    WHY a bound here rather than the `spawn_digest` treatment, for every step this wraps: each one
+    is a SHORT, idempotent sweep whose answer the supervisor's very next lines act on — the frame
+    drain's status decides this pass's back-off, the two gate reads decide whether a digest is
+    spawned at all, and the hourly sweeps have to finish before the cadence timer is re-armed or
+    the next hour would start a second copy over the same rows. A spawn would therefore need a
+    single-flight handle per sweep (what `_digest_task` is for the one step that genuinely runs for
+    minutes to hours), which is more machinery than the thing it would protect. The digest RUN
+    itself stays spawned; this is only its cheap gate.
+
+    A bound reached is an EVENT, not a failure of the loop: it is logged by name and the caller
+    gets `on_timeout`, so both consumers and the next stamp are untouched.
+
+    Telling a bound's expiry from a deliberate stop is the whole hazard here, and both directions
+    hold:
+
+    * A bound expiring cancels the supervisor's await and `asyncio.timeout` converts that
+      cancellation into `TimeoutError` at the context exit — caught HERE, so it never reaches
+      run()'s `except asyncio.CancelledError` and can never be read as a stop.
+    * A stop arriving while a bounded step runs cancels the supervisor task a SECOND time.
+      `asyncio.timeout` converts only while `Task.uncancel()` brings the count back to what it was
+      on entry (the same cancelling census `_stop_in_flight` reads), so with a stop outstanding the
+      `CancelledError` propagates untouched and the teardown runs at once. The stop is never
+      swallowed as a timeout, and it does not wait the bound out.
+
+    The step's session survives either cancellation: every `*_safe` wrapper isolates `Exception`,
+    which a `CancelledError` is not, so the cancellation unwinds through the `async with
+    async_session()` that opened the transaction and that context manager rolls it back and closes
+    it — nothing is left mid-transaction for the next pass to trip over.
+    """
+    bound = HOUSEKEEPING_BOUNDS[step]
+    try:
+        async with asyncio.timeout(bound):
+            return await work
+    except TimeoutError:
+        logger.warning("worker_housekeeping_timeout", step=step, bound_seconds=bound)
+        return on_timeout
+
+
 async def run() -> None:
     logger.info("worker_started", version=__version__, worker_id=WORKER_ID)
     # Before anything is spawned or stamped: a configuration this release cannot honour must fail
@@ -1236,8 +1324,11 @@ async def run() -> None:
         # Startup sweeps: the common stranding cause is this very restart (a deploy
         # --force-recreate killing work mid-flight), so adopt orphaned claims — frame-share AND
         # media (MEMNG-90) — before draining anything new.
-        await run_frame_share_recover_safe()
-        await run_media_recover_safe()
+        # Bounded like every other awaited step, and for the sharper reason: these two run AFTER
+        # the startup stamp and BEFORE the loop exists, so until they return the heartbeat has
+        # exactly one value and nothing else can refresh it.
+        await _bounded("frame_share_recover", run_frame_share_recover_safe(), 0)
+        await _bounded("media_recover", run_media_recover_safe(), 0)
         # One consumer task per class, each with its OWN health and watermark. The supervisor keeps
         # a strong reference to every task: a task only weakly referenced by the loop can be
         # garbage collected mid-drain, and the teardown below needs them anyway.
@@ -1267,7 +1358,11 @@ async def run() -> None:
             # Drain a frame-share job opportunistically in its own session (like reap): the album
             # upload is decoupled from the media job's transaction so an upload error can't poison
             # media work.
-            frame_status = await run_frame_share_drain()
+            # Bounded: this is the await that sits BETWEEN the pass's two stamps, and the album
+            # send inside it hangs on somebody else's server. A drain that reached its bound
+            # answers "error" — an existing status, and the right one: it is not "processed", so
+            # the pass backs off exactly as it does for a drain that raised.
+            frame_status = await _bounded("frame_share_drain", run_frame_share_drain(), "error")
             # Ask again, silently, on a fresh clock: the drain above is an await of unbounded
             # length, and a consumer that dies, crosses its bound or reaches its error streak
             # inside it would otherwise be stamped alive on a verdict taken before it happened.
@@ -1279,33 +1374,39 @@ async def run() -> None:
             # the gate answers not-due anyway (its local_date is in the ledger), so the order costs
             # a scheduled run nothing and gives an operator's "Run now" the shortest path to
             # starting.
+            # Both reads are bounded: they are cheap by construction, so the only way either takes
+            # real time is an unreachable database — and then "no manual run" / "not due" is the
+            # same answer their own error isolation already gives, one poll earlier.
             if not digest_task_in_flight():
-                manual_run_id = await adopt_manual_digest()
+                manual_run_id = await _bounded("adopt_manual_digest", adopt_manual_digest(), None)
                 if manual_run_id is not None:
                     if spawn_claimed_digest(manual_run_id):
                         logger.info("digest_run_spawned", trigger="manual", run_id=manual_run_id)
-                elif await digest_is_due():
+                elif await _bounded("digest_is_due", digest_is_due(), False):
                     if spawn_digest():
                         logger.info("digest_run_spawned", trigger="scheduled")
             if time.time() - last_reap > REAP_INTERVAL_SECONDS:
-                reaped = await reap_expired_committed()
+                # The whole hourly block is bounded step by step. Every one of these is idempotent
+                # and runs again next hour, so a step cut short costs a cycle of lateness — which
+                # is the cheaper of the two outcomes, the other being a recreated container.
+                reaped = await _bounded("reap_expired_committed", reap_expired_committed(), 0)
                 if reaped:
                     logger.info("uploads_reaped", count=reaped)
                 # Piggybacks the reap cadence: a claim orphaned by something other than a restart
                 # (an OOM-killed send that leaves the worker alive) is recovered within the hour —
                 # frame-share and media alike.
-                await run_frame_share_recover_safe()
-                await run_media_recover_safe()
+                await _bounded("frame_share_recover", run_frame_share_recover_safe(), 0)
+                await _bounded("media_recover", run_media_recover_safe(), 0)
                 # Same cadence for the progress side channel: a killed worker cannot clear its own
                 # row, so the anti-join sweep keeps the table bounded by what is actually running.
-                await sweep_job_progress_safe()
+                await _bounded("job_progress_sweep", sweep_job_progress_safe(), 0)
                 # …and for the commit-race window (MEMNG-146), which no in-request bookkeeping can
                 # close: a stored video whose poster the unwind discarded gets its fast lane back.
-                await run_commit_race_reconcile_safe()
+                await _bounded("commit_race_reconcile", run_commit_race_reconcile_safe(), 0)
                 # The digest's two sweeps ride the same cadence: a run whose process died is marked
                 # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
-                # is deleted from Dropbox.
-                await sweep_digest_safe()
+                # is deleted from Dropbox. The retention half is the step this bound was raised on.
+                await _bounded("digest_sweep", sweep_digest_safe(), None)
                 last_reap = time.time()
             if frame_status != "processed":  # idle/deferred → back off
                 # The media term is gone from this condition with the media drain: the consumers

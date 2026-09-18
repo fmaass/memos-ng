@@ -9,9 +9,11 @@ Where a proof turns on elapsed time, the supervisor's clock (`worker._now`) is i
 the time under test advances on this file's word and not on the host's scheduling luck.
 """
 
+import ast
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import pytest
 from app import migrations, worker
@@ -134,9 +136,26 @@ class _CountingBeat:
 
     def __init__(self) -> None:
         self.count = 0
+        self._stamped = asyncio.Event()
 
     def __call__(self) -> None:
         self.count += 1
+        self._stamped.set()
+
+    async def wait_for(self, n: int, give_up_after: float = 20.0) -> None:
+        """Wake on stamps until `n` more have landed.
+
+        The supervisor's own clock (a pass of the frame-share drain) cannot drive the bound proofs:
+        the step under test is the one that never returns, so the pass never completes and waiting
+        on passes would deadlock on the very hang being tested. Stamps are the right clock for
+        "the heartbeat kept going" anyway — it is what the healthcheck reads. The bound is a
+        failure, not a measurement: a regression must fail here rather than hang.
+        """
+        target = self.count + n
+        async with asyncio.timeout(give_up_after):
+            while self.count < target:
+                self._stamped.clear()
+                await self._stamped.wait()
 
 
 async def _stamps_per_pass(
@@ -446,6 +465,267 @@ async def test_cancelling_the_supervisor_tears_both_consumers_down(harness, monk
     for _ in range(10):  # give anything still scheduled every chance to run
         await asyncio.sleep(0)
     assert dict(harness.drains) == drained, "a drain started after the supervisor stopped"
+
+
+# --- the total bound on every step the supervisor awaits ------------------------------------
+#
+# The defect these cover: a housekeeping step with no total bound is time between two heartbeat
+# stamps, and the worker healthcheck recreates a container whose heartbeat is older than its bar —
+# so one sweep that never returns gets a healthy worker, mid-job consumers and all, killed. Each
+# proof parks one step forever and asks the only question that matters: did the stamp keep coming?
+#
+# A tiny bound, not a slept one: nothing here waits an interval out, the step under test simply
+# never returns, and the bound is what has to notice. Real seconds are unavoidable for these —
+# `asyncio.timeout` runs on the event loop's clock, not on the supervisor's injectable `_now` —
+# so the number is kept at a twentieth of a second and every wait below is itself bounded.
+_TINY_BOUND = 0.05
+
+
+def _bounds_with(monkeypatch, **overrides: float) -> None:
+    monkeypatch.setattr(worker, "HOUSEKEEPING_BOUNDS", {**worker.HOUSEKEEPING_BOUNDS, **overrides})
+
+
+def _idle_media_drain(harness, monkeypatch) -> None:
+    """Both consumers alive and draining nothing — the baseline every bound proof needs, because a
+    supervisor with a dead consumer stops stamping for a reason that has nothing to do with bounds.
+    """
+
+    async def drain(job_class=None) -> str:
+        await asyncio.sleep(0)
+        harness.drains[job_class] += 1
+        return "idle"
+
+    monkeypatch.setattr(worker, "run_media_drain", drain)
+
+
+def _timeouts(caps) -> list[dict]:
+    return [c for c in caps if c["event"] == "worker_housekeeping_timeout"]
+
+
+def _assert_consumers_unharmed() -> None:
+    tasks = _consumer_tasks()
+    assert len(tasks) == 2, f"a bound's expiry cost a consumer: {len(tasks)} still running"
+    assert all(not t.done() for t in tasks), "a bound's expiry ended a consumer"
+
+
+async def test_a_frame_share_drain_that_never_returns_keeps_the_heartbeat_going(
+    harness, monkeypatch
+):
+    # Category 1: the per-turn step, awaited between the pass's two stamps.
+    beats = _CountingBeat()
+    monkeypatch.setattr(worker, "beat", beats)
+    _bounds_with(monkeypatch, frame_share_drain=_TINY_BOUND)
+    _idle_media_drain(harness, monkeypatch)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+
+    async def frame_drain() -> str:
+        parked.set()
+        await never_set.wait()
+        return "idle"  # unreachable: this drain only ever leaves by its bound
+
+    monkeypatch.setattr(worker, "run_frame_share_drain", frame_drain)
+    with capture_logs() as caps:
+        async with _supervisor() as task:
+            await asyncio.wait_for(parked.wait(), 20)
+            await beats.wait_for(4)  # two passes' worth of stamps AFTER the hang began
+            assert not task.done(), "the supervisor ended over a step that merely took too long"
+            _assert_consumers_unharmed()
+    timed_out = _timeouts(caps)
+    assert timed_out, "the bound expired without saying which step it was"
+    assert timed_out[0]["step"] == "frame_share_drain"
+    assert timed_out[0]["bound_seconds"] == _TINY_BOUND
+
+
+async def test_a_digest_gate_read_that_never_returns_keeps_the_heartbeat_going(
+    harness, monkeypatch
+):
+    # Category 2: the gate read. Cheap by construction, which is exactly why an unbounded one is
+    # a surprise — it means the database is unreachable, and then it can hang for as long as the
+    # connection takes to fail.
+    beats = _CountingBeat()
+    monkeypatch.setattr(worker, "beat", beats)
+    _bounds_with(monkeypatch, adopt_manual_digest=_TINY_BOUND)
+    _idle_media_drain(harness, monkeypatch)
+    monkeypatch.setattr(worker, "digest_task_in_flight", lambda: False)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+
+    async def adopt() -> int | None:
+        parked.set()
+        await never_set.wait()
+        return None  # unreachable
+
+    async def not_due() -> bool:
+        return False
+
+    monkeypatch.setattr(worker, "adopt_manual_digest", adopt)
+    monkeypatch.setattr(worker, "digest_is_due", not_due)
+    with capture_logs() as caps:
+        async with _supervisor() as task:
+            await asyncio.wait_for(parked.wait(), 20)
+            await beats.wait_for(4)
+            assert not task.done()
+            _assert_consumers_unharmed()
+    timed_out = _timeouts(caps)
+    assert timed_out and timed_out[0]["step"] == "adopt_manual_digest"
+
+
+async def test_an_hourly_sweep_that_never_returns_keeps_the_heartbeat_going(harness, monkeypatch):
+    # Category 3: the hourly block — and `digest_sweep` in particular, whose hosted-media half
+    # deletes from a remote under per-operation timeouts and no total one. The cadence is collapsed
+    # to every pass so the proof does not wait an hour out.
+    beats = _CountingBeat()
+    monkeypatch.setattr(worker, "beat", beats)
+    monkeypatch.setattr(worker, "REAP_INTERVAL_SECONDS", 0)
+    _bounds_with(monkeypatch, digest_sweep=_TINY_BOUND)
+    _idle_media_drain(harness, monkeypatch)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+
+    async def sweep() -> None:
+        parked.set()
+        await never_set.wait()
+
+    monkeypatch.setattr(worker, "sweep_digest_safe", sweep)
+    with capture_logs() as caps:
+        async with _supervisor() as task:
+            await asyncio.wait_for(parked.wait(), 20)
+            await beats.wait_for(4)
+            assert not task.done()
+            _assert_consumers_unharmed()
+    timed_out = _timeouts(caps)
+    assert timed_out and timed_out[0]["step"] == "digest_sweep"
+
+
+async def test_a_pre_loop_recover_that_never_returns_still_reaches_the_loop(harness, monkeypatch):
+    # Category 4: the startup sweeps. The sharpest case — they run AFTER the first stamp and BEFORE
+    # the loop and the consumers exist, so until they return the heartbeat holds exactly one value
+    # and there is nothing else in the process that could refresh it.
+    beats = _CountingBeat()
+    monkeypatch.setattr(worker, "beat", beats)
+    _bounds_with(monkeypatch, media_recover=_TINY_BOUND)
+    _idle_media_drain(harness, monkeypatch)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+    calls = 0
+
+    async def recover() -> int:
+        # Only the FIRST call — the pre-loop one — hangs, so the single timeout line below can
+        # only have come from before the loop and not from the hourly copy of the same step.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            parked.set()
+            await never_set.wait()
+        return 0
+
+    monkeypatch.setattr(worker, "run_media_recover_safe", recover)
+    with capture_logs() as caps:
+        async with _supervisor() as task:
+            await asyncio.wait_for(parked.wait(), 20)
+            assert beats.count == 1, "the startup stamp is the only one there can be by now"
+            await beats.wait_for(3)
+            assert not task.done()
+            _assert_consumers_unharmed()
+    timed_out = _timeouts(caps)
+    assert len(timed_out) == 1, f"a step other than the pre-loop recover timed out: {timed_out}"
+    assert timed_out[0]["step"] == "media_recover"
+
+
+async def test_a_stop_during_a_bounded_step_still_ends_the_supervisor(harness, monkeypatch):
+    # The hazard the bounds introduce: `asyncio.timeout` ends its inner await with a CancelledError
+    # and converts it to TimeoutError on the way out — and the deliberate stop IS a cancellation of
+    # this same task. A bound that swallowed it would leave the worker running through its stop
+    # grace until SIGKILL, with both consumers' claims stranded.
+    #
+    # The bound here is LONG on purpose: if the supervisor ends, it is the stop that ended it. The
+    # stop is driven by cancelling the supervisor task, which is exactly what the SIGTERM handler
+    # does (`_install_stop_handlers`); the flag it also sets decides only whether run() returns or
+    # re-raises, not whether the cancellation gets through.
+    _bounds_with(monkeypatch, frame_share_drain=600)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+    finished: set[str] = set()
+
+    async def drain(job_class=None) -> str:
+        await asyncio.sleep(0)
+        harness.drains[job_class] += 1
+        try:
+            await never_set.wait()
+        except asyncio.CancelledError:
+            finished.add(job_class)
+            raise
+        return "idle"  # unreachable
+
+    async def frame_drain() -> str:
+        parked.set()
+        await never_set.wait()
+        return "idle"  # unreachable
+
+    monkeypatch.setattr(worker, "run_media_drain", drain)
+    monkeypatch.setattr(worker, "run_frame_share_drain", frame_drain)
+    with capture_logs() as caps:
+        loop_task = asyncio.create_task(worker.run())
+        await asyncio.wait_for(parked.wait(), 20)
+        consumers = _consumer_tasks()
+        assert len(consumers) == 2
+        loop_task.cancel()
+        # `wait`, not `wait_for`: a bound that swallowed the stop leaves the supervisor running, and
+        # wait_for would answer that by cancelling it AGAIN and waiting on a task that never ends —
+        # a hang where this proof needs a failure. This observes and then reads the outcome off the
+        # task itself.
+        _, pending = await asyncio.wait([loop_task], timeout=20)
+        assert not pending, "the stop never ended the supervisor: the bound swallowed it"
+        with pytest.raises(asyncio.CancelledError):
+            loop_task.result()
+    assert finished == {"transcode", "light"}, "the stop did not reach both consumers' teardown"
+    assert all(t.done() for t in consumers), "a consumer outlived the stop"
+    assert not _timeouts(caps), "the stop was logged as a step that took too long"
+
+
+def test_every_bounded_step_is_declared_and_the_budget_stays_under_half_the_bar():
+    # Two ways the budget could quietly stop being true, both cheap to pin: a step bounded by a
+    # name nobody declared (a KeyError inside the supervisor, i.e. a dead worker), a declared bound
+    # nobody applies (a number that lies about the budget) — and the sum drifting up until a single
+    # round of housekeeping can outlast the healthcheck bar it is supposed to sit well inside.
+    applied = _bounded_step_names()
+    declared = set(worker.HOUSEKEEPING_BOUNDS)
+    assert applied == declared, (
+        f"bounded but undeclared: {sorted(applied - declared)}; declared but never applied: "
+        f"{sorted(declared - applied)}"
+    )
+    total = worker.HOUSEKEEPING_BOUND_TOTAL_SECONDS
+    assert total == sum(worker.HOUSEKEEPING_BOUNDS.values())
+    assert total < worker.HEARTBEAT_STALE_SECONDS / 2, (
+        f"the housekeeping bounds now sum to {total}s, at or past half the "
+        f"{worker.HEARTBEAT_STALE_SECONDS}s healthcheck bar — one round of housekeeping can "
+        "outlive the heartbeat the healthcheck reads"
+    )
+
+
+def _bounded_step_names() -> set[str]:
+    """Every step name `run()` actually passes to `_bounded`, read out of the source.
+
+    From the source and not from a call count: the question is which names the supervisor will use
+    at runtime, and only the file can answer that without running an hour of worker.
+    """
+    tree = ast.parse(Path(worker.__file__).read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_bounded"
+        ):
+            step = node.args[0]
+            assert isinstance(step, ast.Constant) and isinstance(step.value, str), (
+                f"a bound is applied under a non-literal step name at line {node.lineno}, so "
+                "neither this test nor a reader can tell which step it covers"
+            )
+            names.add(step.value)
+    assert names, "no bounded step found at all — this test would pass vacuously"
+    return names
 
 
 async def test_a_refused_configuration_never_stamps_and_never_spawns(harness, monkeypatch):
