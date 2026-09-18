@@ -190,6 +190,68 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.7.2
+
+- `/places` no longer carries a timeline. The map keeps everything it showed: pins, clusters,
+  the cluster drawer and the viewer all stay, and the whole located set is on the map at once.
+  The playhead, its histogram, the play/speed controls and their keyboard shortcuts are gone, and
+  the drawer and the grid read the same one set the map shows.
+- A worker told to stop tries to hand its in-flight media work back to the queue. On the SIGTERM a
+  `--force-recreate` sends, the supervisor tears both consumers down and each cancelled job's row
+  is put back to `queued` with its attempt count untouched — provided that row is still
+  `processing` under this worker's own claim, so a job that had already finished, failed or been
+  deleted is left as it is. The next worker start re-runs the requeued job, and the per-attachment
+  order guard then stops withholding that attachment's later jobs. The hand-back is an attempt,
+  not a guarantee. Its bounds are designed, not guaranteed, and docker's stop grace is 10 seconds:
+  a stop that outlasts the grace ends in SIGKILL. One window is known to be uncovered even inside
+  the grace: a stop that lands while the claim itself is being committed can leave that job
+  `processing` although the worker exits cleanly. In both cases the claim stays `processing`
+  until the stale-claim sweep requeues it — `MEDIA_CLAIM_STALE_SECONDS` (7200 s) plus up to one
+  sweep interval — and that recovery charges the job an attempt. Deploy the worker in a quiet
+  window, which is what keeps both cases off the table.
+- Every housekeeping step the worker supervisor awaits has a total bound. Each of those steps is
+  time between two heartbeat stamps, so an unbounded one — the hosted-media retention sweep
+  against a slow remote is the case this was raised on — could let the healthcheck call a working
+  worker dead and recreate the container mid-job. A step that reaches its bound is logged by name
+  and the loop carries on with the same answer its own error isolation would have given. The
+  bounds sum to under half the healthcheck's staleness bar, and a test holds them there.
+- The print-ready encode runs off the event loop. A 40–60 MP decode, reduction and re-encode used
+  to hold the worker's one event loop for its whole duration, freezing the other consumer's
+  progress writes and the supervisor's heartbeat; it now occupies one worker thread instead, at
+  the same CPU cost. A stop waits out the rendition already being encoded: a thread cannot be
+  interrupted, and an abandoned one would go on writing the rendition into its final path after
+  the coroutine that fences a photo deleted mid-job is gone. Known limit: on that stop path the
+  fence itself does not run. A photo deleted during the very encode a stop is waiting out
+  keeps that one print rendition on disk; no row points at it and no route serves it.
+- The reclaim reads the attachment's current state under its own lock. It re-selected the row FOR
+  UPDATE but then decided from the copy the caller's session had already loaded, so a photo
+  re-attached to another memo mid-run was deleted anyway and the read-back reported success. Both
+  implementations now read the row's current columns under the lock, which is what makes the
+  re-read a revalidation rather than a formality.
+- Alembic no longer disables loggers that already exist. It configures logging through
+  `fileConfig`, which by default switches off every logger created before it runs. The migration
+  at container boot was never affected, since it runs in its own process before the server
+  starts; a process that loads `alembic/env.py` after the app's logging is set up, as the test
+  suite does, lost those loggers. `alembic/env.py` now passes `disable_existing_loggers=False`.
+- The web client says so when the server stops answering: a banner offering an immediate retry
+  while requests keep failing, and a short notice once it is reachable again. The verdict comes
+  only from real traffic — a request's outcome, or the health probe — never from
+  `navigator.onLine`, which stays true when what dropped is the path between the device and the
+  server.
+- Release tooling: a build meant only to prove the slim image still compiles can leave the deploy
+  tag alone, with `IMAGE_TAG=memos-ng:<name>` in front of `scripts/build-image.sh` — same lock,
+  same refusal of a tree that differs from `HEAD`, and `memos-ng:local` keeps naming the image
+  that is running, which is what the rollback step depends on. A pytest run now claims its database
+  with a session-level advisory lock, so a second run against the same database refuses up front
+  instead of dropping the first run's tables mid-flight, and the idle-in-transaction test has room
+  for a loaded host.
+- Documentation: the release procedure carries the production backup step for any release with a
+  migration — a custom-format dump, its checksum and table of contents, and a restore into a
+  throwaway database whose counts are compared with production — and the settings table describes
+  the thermal guard the code has, the CPU package sensor resolved by name and a 90 °C limit,
+  instead of the previous host's sensor and its 70 °C.
+- No migration, and the API contract is unchanged.
+
 ### v1.7.1
 
 - The Places map shows its icons. MapLibre does not resolve a root-relative sprite address, so

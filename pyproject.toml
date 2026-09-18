@@ -1,6 +1,6 @@
 [project]
 name = "memos-ng"
-version = "1.7.1"
+version = "1.7.2"
 description = "Memos rebuilt on the household default web stack — FastAPI + async media pipeline"
 requires-python = ">=3.13"
 dependencies = [
