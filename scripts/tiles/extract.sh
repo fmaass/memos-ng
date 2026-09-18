@@ -13,6 +13,10 @@
 # --helper-image is the small image those renames run in when --user is given (default busybox:stable;
 # it must already be present locally — the script refuses before writing anything if it is not).
 #
+# With --user the tiles directory must ALREADY EXIST and be writable by that user: creating it is
+# itself a write, and this script performs none as the caller in that mode. Without --user it is
+# created if missing, as before.
+#
 # Produces two PMTiles archives cut from the Protomaps daily planet build:
 #   planet-<build>.pmtiles          the whole world, z0-7  — always renders something
 #   detail-<build>-<sha8>.pmtiles   the regions with pins, z0-15 — street detail where it matters
@@ -83,7 +87,7 @@ DEV_SMALL_BBOX="8.4470,47.3200,8.6250,47.4350"
 DEV_LARGE_BBOX="8.3570,47.1590,8.9850,47.6950"
 
 usage() {
-    sed -n '2,9p' "$0" >&2
+    sed -n '2,18p' "$0" >&2
     exit 2
 }
 
@@ -210,20 +214,31 @@ pmtiles() {
 # container started and no helper image required. With --user it is a throwaway container running
 # as the publishing user, so a share that only its owner may write is written only by its owner.
 #
-# The snippet is POSIX sh operating on /tiles (and /src for the sidecar copy, mounted read-only);
-# the paths inside it are container paths in both modes, and the shell mode rewrites them back.
+# NO PATH IS EVER SHELL TEXT. Every snippet is a constant, single-quoted string that names its
+# directories as "$T" (the tiles directory) and "$S" (the regions source), and everything else as
+# "$1", "$2", … The two directories arrive as environment, the names as positional parameters, so
+# a space, a quote or a directory literally called /src is data in both modes and cannot end a
+# quoted string, split into two arguments, or be rewritten by a textual substitution. Inside a
+# container T and S are the mount points; outside they are the real directories, and nothing has
+# to be translated back.
+#
+#   tiles_do <snippet> <src-dir-or-empty> [args...]
+#
 # Nothing here decides anything: the caller keeps the .tmp-verify-rename order, the refusal to
 # rewrite a published name, and the prune rules. This only decides WHO writes.
 tiles_do() {
-    local snippet="$1" src_dir="${2:-}"
+    local snippet="$1" src_dir="$2"
+    shift 2
     if [ "$USER_GIVEN" = 1 ]; then
-        local mounts=(-v "${TILES_DIR}:/tiles")
-        [ -n "$src_dir" ] && mounts+=(-v "${src_dir}:/src:ro")
-        docker run --rm -i --user "$PMTILES_USER" "${mounts[@]}" "$HELPER_IMAGE" sh -c "$snippet"
+        local args=(-v "${TILES_DIR}:/tiles" -e "T=/tiles")
+        if [ -n "$src_dir" ]; then args+=(-v "${src_dir}:/src:ro" -e "S=/src"); fi
+        # --entrypoint sh, because an image is free to have an ENTRYPOINT of its own and `sh -c …`
+        # would then be its arguments rather than the command: the helper is specified as "any
+        # image with a POSIX shell", and this is what makes that true.
+        docker run --rm -i --user "$PMTILES_USER" "${args[@]}" --entrypoint sh "$HELPER_IMAGE" \
+            -c "$snippet" sh "$@"
     else
-        local host_snippet="${snippet//\/tiles/$TILES_DIR}"
-        [ -n "$src_dir" ] && host_snippet="${host_snippet//\/src/$src_dir}"
-        sh -c "$host_snippet"
+        T="$TILES_DIR" S="$src_dir" sh -c "$snippet" sh "$@"
     fi
 }
 
@@ -259,17 +274,17 @@ publish() {
         echo "extract.sh: re-run with a fresh build name (--build <newer YYYYMMDD>) — the repaired archive is published beside this one, and the manifest moves to it." >&2
         exit 2
     fi
-    tiles_do "rm -f '/tiles/${name}.tmp'"
+    tiles_do 'rm -f "$T/$1.tmp"' "" "$name"
     echo "extract.sh: extracting ${name} from ${SOURCE}"
     pmtiles extract "$SOURCE" "/tiles/${name}.tmp" "$@"
     pmtiles verify "/tiles/${name}.tmp"
     if [ -n "$regions_src" ]; then
         local stem="${name%.pmtiles}.regions.geojson"
-        tiles_do "cp '/src/$(basename "$regions_src")' '/tiles/${stem}.tmp' && mv '/tiles/${stem}.tmp' '/tiles/${stem}'" \
-            "$(cd "$(dirname "$regions_src")" && pwd)"
+        tiles_do 'cp "$S/$1" "$T/$2.tmp" && mv "$T/$2.tmp" "$T/$2"' \
+            "$(cd "$(dirname "$regions_src")" && pwd)" "$(basename "$regions_src")" "$stem"
         echo "extract.sh: published ${stem}"
     fi
-    tiles_do "mv '/tiles/${name}.tmp' '/tiles/${name}'"
+    tiles_do 'mv "$T/$1.tmp" "$T/$1"' "" "$name"
     echo "extract.sh: published ${name} ($(stat -c%s "${TILES_DIR}/${name}") bytes)"
 }
 
@@ -282,7 +297,7 @@ prune() {
     # shellcheck disable=SC2012  # ls -t orders by mtime, which is the publication order here
     ls -1t "${TILES_DIR}/${kind}-"*.pmtiles 2>/dev/null | tail -n +$((keep + 1)) | while read -r old; do
         echo "extract.sh: removing superseded ${old##*/}"
-        tiles_do "rm -f '/tiles/${old##*/}' '/tiles/$(basename "${old%.pmtiles}").regions.geojson'"
+        tiles_do 'rm -f "$T/$1" "$T/$2"' "" "${old##*/}" "$(basename "${old%.pmtiles}").regions.geojson"
     done
 }
 
@@ -329,7 +344,7 @@ fi
 } > "$BUILD_BODY"
 # Composed in a caller-owned temporary file and piped in, so the bytes are decided here and only
 # the write crosses into the tiles directory.
-tiles_do "cat > /tiles/BUILD.tmp && mv /tiles/BUILD.tmp /tiles/BUILD" < "$BUILD_BODY"
+tiles_do 'cat > "$T/BUILD.tmp" && mv "$T/BUILD.tmp" "$T/BUILD"' "" < "$BUILD_BODY"
 rm -f "$BUILD_BODY"
 
 echo "extract.sh: done — ${TILES_DIR}/BUILD"

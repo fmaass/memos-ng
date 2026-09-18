@@ -116,6 +116,10 @@ inside a container and from the calling shell alike:
     docker pull busybox:stable      # once; the script refuses to start if it is missing
     scripts/tiles/extract.sh <tiles-dir> <regions.geojson> --user 1027:100
 
+With `--user` the tiles directory must already exist and be writable by that user: creating it is
+itself a write, and in that mode the script performs none as the caller. (Without `--user` it is
+created if missing, as before.)
+
 `--user` is not only the extractor's uid. With it, **nothing in the tiles directory is written by
 the calling shell**: the extraction, the `.tmp` renames that publish each archive, the regions
 sidecar, the pruning of superseded generations and `BUILD` all run in a container as that user.
@@ -134,7 +138,9 @@ containers run as. `fetch-assets.sh` needs none of this: it writes as the operat
 directory the operator may write. The publish order is the script's and stays as it is: planet,
 then the detail archive's regions sidecar, then the detail archive, then `BUILD` last — each
 written to a `.tmp` and renamed, so no half-written file is ever served, `BUILD` never names an
-archive that is not there yet, and a published name is never rewritten or deleted.
+archive that is not there yet, and a published name is never rewritten or repaired under its own
+name. Names do leave, by one route only: `prune` removes generations older than the previous one,
+together with their regions sidecars, once no client can still be reading them.
 
 ## Acceptance probes (real surface: https://memos.discomarder.live)
 

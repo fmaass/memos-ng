@@ -526,6 +526,9 @@ DOCKER_STUB = """#!/bin/sh
 # is NOT: the tiles directory is writable only while this stub is working, and goes back to that
 # mode afterwards. A write the script makes outside a container then fails, which is the whole
 # point of the read-only case below.
+#
+# With PMTILES_STUB_NO_IMAGE set, `docker image inspect` fails: the helper image is not on this
+# machine.
 tiles=""
 src=""
 for a in "$@"; do
@@ -544,16 +547,23 @@ drop() {
   return 0
 }
 
+if [ "${1:-}" = image ] && [ "${2:-}" = inspect ]; then
+  [ -z "${PMTILES_STUB_NO_IMAGE:-}" ] || exit 1
+  exit 0
+fi
+
+# The helper container. The script must hand docker `--entrypoint sh` and then `-c <snippet> sh
+# <args...>`, so the snippet is the command rather than the arguments of whatever ENTRYPOINT the
+# image happens to carry. Run it exactly as the container would: the mount points come in as T and
+# S, the names as positional parameters, and nothing is rewritten textually.
 case " $* " in
-  *" sh -c "*)
-    snippet=""
-    prev=""
-    for a in "$@"; do
-      if [ "$prev" = "-c" ]; then snippet="$a"; break; fi
-      prev="$a"
-    done
+  *" --entrypoint sh "*)
+    while [ "$#" -gt 0 ] && [ "$1" != "-c" ]; do shift; done
+    shift
+    snippet="$1"; shift
+    shift            # the $0 the script passes for the snippet's own name
     lift
-    sh -c "$(printf '%s' "$snippet" | sed -e "s#/tiles#$tiles#g" -e "s#/src#$src#g")"
+    T="$tiles" S="$src" sh -c "$snippet" sh "$@"
     rc=$?
     drop
     exit $rc
@@ -711,6 +721,14 @@ def test_the_container_user_override_reaches_every_container_invocation(tmp_path
     assert len(calls) > 4, calls
     users = {_user_argument(c) for c in calls if any(a.endswith(":/tiles") for a in c)}
     assert users == {OVERRIDE_USER}, calls
+    # And the helper is invoked as a command, not as arguments to an ENTRYPOINT the image may
+    # carry: `--entrypoint sh <image> -c <snippet> sh <args…>`. Any image with a POSIX shell is
+    # documented as usable, and this is the shape that makes that true.
+    helpers = [c for c in calls if "--entrypoint" in c]
+    assert helpers, calls
+    for call in helpers:
+        at = call.index("--entrypoint")
+        assert call[at + 1 : at + 4] == ["sh", "busybox:stable", "-c"], call
     assert not any(f"{os.getuid()}:{os.getgid()}" in c for c in calls), calls
     # positive control: the assertions ran against a real end-to-end publish
     assert (tiles / "planet-20260917.pmtiles").is_file(), run.stdout
@@ -757,6 +775,89 @@ def test_with_an_override_the_publish_touches_a_directory_the_caller_cannot_writ
         assert not [n for n in names if n.endswith(".tmp")], names  # nothing half-written left
         build = (tiles / "BUILD").read_text()
         assert "planet=planet-20260917.pmtiles" in build, build
+    finally:
+        tiles.chmod(0o755)
+
+
+def test_a_missing_helper_image_is_refused_before_anything_is_written(tmp_path):
+    """No pull at publish time, so an absent helper image has to be a refusal up front.
+
+    Discovered halfway through, it surfaces between an extracted `.tmp` and the rename that would
+    publish it — the one moment this script has no good answer for, and one that costs a multi-
+    gigabyte download to reach. The message has to name the image and how to get it.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    (tiles / "BUILD").write_text("build=20260101\n")  # something already published here
+    before = sorted(p.name for p in tiles.iterdir())
+    stub_dir = _stub_docker(tmp_path)
+
+    run = _run_extract(
+        tiles,
+        stub_dir,
+        "--build",
+        "20260917",
+        "--dev",
+        "small",
+        "--user",
+        OVERRIDE_USER,
+        extra_env={"PMTILES_STUB_NO_IMAGE": "1"},
+    )
+
+    assert run.returncode == 2, (run.returncode, run.stdout, run.stderr)
+    assert "busybox:stable" in run.stderr, run.stderr
+    assert "docker pull busybox:stable" in run.stderr, run.stderr
+    assert sorted(p.name for p in tiles.iterdir()) == before
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores the directory mode this case relies on")
+def test_an_override_publish_prunes_and_overwrites_through_the_container_too(tmp_path):
+    """The read-only case above starts from an empty directory, so it never exercises the writes
+    that only happen when something is already there: removing a stale `.tmp`, pruning the
+    generation that has fallen out of the window, and replacing BUILD. On the production share
+    every one of those is a write the caller is refused, and each is a separate call site.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    oldest = _seed_archive(tiles, "planet-20260101.pmtiles", 1_700_000_000)
+    _seed_archive(tiles, "planet-20260201.pmtiles", 1_700_100_000)
+    oldest_detail = _seed_archive(tiles, "detail-20260101-aaaaaaaa.pmtiles", 1_700_000_000)
+    oldest_sidecar = tiles / "detail-20260101-aaaaaaaa.regions.geojson"
+    oldest_sidecar.write_text('{"type":"Polygon","coordinates":[]}')
+    kept_detail = _seed_archive(tiles, "detail-20260201-bbbbbbbb.pmtiles", 1_700_100_000)
+    stale = tiles / "planet-20260917.pmtiles.tmp"
+    stale.write_bytes(b"half an archive from a run that died")
+    (tiles / "BUILD").write_text("build=20260201\nassets_rev=deadbeef\n")
+    regions = tmp_path / "regions.geojson"
+    regions.write_text('{"type":"Polygon","coordinates":[]}')
+    stub_dir = _stub_docker(tmp_path)
+
+    tiles.chmod(0o555)
+    try:
+        run = _run_extract(
+            tiles,
+            stub_dir,
+            str(regions),
+            "--build",
+            "20260917",
+            "--user",
+            OVERRIDE_USER,
+            extra_env={"PMTILES_STUB_GUARD": "0555"},
+        )
+        assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
+
+        names = sorted(p.name for p in tiles.iterdir())
+        assert not stale.exists(), names  # the stale .tmp was removed, from inside the container
+        assert not oldest.exists(), names  # pruned
+        assert not oldest_detail.exists(), names
+        assert not oldest_sidecar.exists(), names  # a generation's regions file goes with it
+        assert kept_detail.exists(), names  # the one it replaced is still being read
+        assert "planet-20260917.pmtiles" in names, names
+        assert not [n for n in names if n.endswith(".tmp")], names
+        build = (tiles / "BUILD").read_text()
+        assert "planet=planet-20260917.pmtiles" in build, build
+        assert "detail=detail-20260917-" in build, build
+        assert "assets_rev=deadbeef" in build, build  # the assets record survives a re-extract
     finally:
         tiles.chmod(0o755)
 
@@ -830,6 +931,52 @@ def test_a_container_user_that_is_not_numeric_uid_gid_is_refused_before_anything
     assert "--user must be a numeric uid:gid" in run.stderr, run.stderr
     assert not argv_log.exists(), "a container ran before the value was rejected"
     assert list(tiles.iterdir()) == [], list(tiles.iterdir())
+
+
+def test_a_publish_survives_a_tiles_directory_whose_path_is_awkward(tmp_path):
+    """No `--user`, i.e. the path every developer takes. The directories are not shell text.
+
+    A tiles directory with a space in it, and a component spelled like the mount point the helper
+    uses for the regions source (`/src`, as in a checkout under ~/src): a publisher that pastes
+    paths into a shell snippet, or rewrites container paths back textually, corrupts one or the
+    other. Both spellings are ordinary on a developer's machine.
+    """
+    tiles = tmp_path / "my src" / "src" / "tiles"
+    tiles.mkdir(parents=True)
+    regions = tmp_path / "regions.geojson"
+    regions.write_text('{"type":"Polygon","coordinates":[]}')
+    stub_dir = _stub_docker(tmp_path)
+
+    run = _run_extract(tiles, stub_dir, str(regions), "--build", "20260917")
+
+    assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
+    names = sorted(p.name for p in tiles.iterdir())
+    assert "planet-20260917.pmtiles" in names, names
+    assert [n for n in names if n.startswith("detail-") and n.endswith(".pmtiles")], names
+    assert [n for n in names if n.endswith(".regions.geojson")], names
+    assert "BUILD" in names, names
+    assert not [n for n in names if n.endswith(".tmp")], names
+
+
+def test_a_publish_survives_a_regions_filename_that_is_awkward(tmp_path):
+    """Same class, the other input: the sidecar is copied under the regions file's own basename.
+
+    A quote in it ends the quoting of any snippet the name is pasted into, and a space splits it
+    into two arguments. The sidecar has to arrive whole under the archive's stem either way.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = tmp_path / "it's regions.geojson"
+    regions.write_text('{"type":"Polygon","coordinates":[]}')
+    stub_dir = _stub_docker(tmp_path)
+
+    run = _run_extract(tiles, stub_dir, str(regions), "--build", "20260917")
+
+    assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
+    sidecars = [p for p in tiles.iterdir() if p.name.endswith(".regions.geojson")]
+    assert len(sidecars) == 1, sorted(p.name for p in tiles.iterdir())
+    assert sidecars[0].read_text() == regions.read_text()
+    assert sidecars[0].name.startswith("detail-20260917-")
 
 
 def test_publishing_keeps_the_new_generation_and_the_one_it_replaced_and_no_more(tmp_path):
