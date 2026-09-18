@@ -1118,3 +1118,120 @@ def test_drain_health_stops_heartbeat_after_an_error_streak():
     assert not h.healthy
     h.record("idle")
     assert h.healthy  # an empty queue is not a failure
+
+
+# --- MEMNG-361: the stale sweep hands recovered rows back to the CLASS-ROUTED consumers ---
+
+
+def _seed_stale(*, mime, lane, storage_path, age_seconds, duration=None, kind="derive"):
+    """A `processing` row aged `age_seconds` into the past, like `_seed_processing`, but with the
+    mime/lane/kind the CLASS predicate reads — a stale claim of one class is otherwise
+    indistinguishable from a stale claim of the other, and the whole point here is that the sweep
+    returns each one to the consumer that can drain it."""
+    uid = f"stale-{secrets.token_urlsafe(6)}"
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        aid = c.execute(
+            text(
+                "INSERT INTO attachments "
+                "(uid, filename, mime, size, status, storage_path, duration) VALUES "
+                "(:u,'x',:m,1,CAST('processing' AS attachment_status),:sp,:d) RETURNING id"
+            ),
+            {"u": uid, "m": mime, "sp": str(storage_path), "d": duration},
+        ).scalar_one()
+        jid = c.execute(
+            text(
+                "INSERT INTO media_jobs "
+                "(attachment_id, lane, kind, state, attempts, progress_pct, claimed_by, "
+                "updated_at) VALUES (:a, CAST(:l AS job_lane), :k, "
+                "CAST('processing' AS job_state), 0, 0, 'dead-worker', "
+                "now() - (:age * interval '1 second')) RETURNING id"
+            ),
+            {"a": aid, "l": lane, "k": kind, "age": age_seconds},
+        ).scalar_one()
+    eng.dispose()
+    return uid, aid, jid
+
+
+def _stale_ledger_cmd(ledger, hold):
+    """A REAL transcode argv that records the run before producing the output, so "finished exactly
+    once" is read off work that happened rather than off a terminal row (which a job run twice
+    reaches just the same)."""
+
+    def cmd(src, dest, threads):
+        return [
+            "sh",
+            "-c",
+            'printf "%s\\n" "$(basename "$2")" >> "$1"; sleep "$3"; printf transcoded > "$2"',
+            "sh",
+            str(ledger),
+            dest,
+            str(hold),
+        ]
+
+    return cmd
+
+
+async def _drain_to_idle(job_class, budget=100):
+    for _ in range(budget):
+        if await worker.run_media_drain(job_class) == "idle":
+            return
+    raise AssertionError(f"{job_class} never drained to idle within {budget} passes")
+
+
+def test_the_stale_sweep_returns_a_row_of_each_class_to_its_own_consumer(
+    monkeypatch, tmp_path, db_engine
+):
+    """Both classes' stale claims are recovered, and BOTH consumers then finish them.
+
+    The sweep is class-blind by design (it selects on state and age, never on a class predicate),
+    so the risk it has to be held to is the other side: a recovered row must land back in the lane
+    and kind its own consumer claims. One stale row per class plus a FRESH `processing` row, which
+    is a live worker's claim and must be left exactly where it is.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "WORKER_LANES", "fast,slow")
+    monkeypatch.setattr(settings, "MEDIA_CLAIM_STALE_SECONDS", 100)
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 120)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)  # thermal guard open
+    ledger = tmp_path / "stale-transcodes.log"
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _stale_ledger_cmd(ledger, 0.1))
+
+    clip = tmp_path / "originals" / "stale.mov"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"not really a video")
+    photo = tmp_path / "originals" / "stale.png"
+    _make_png(photo)
+    fresh_photo = tmp_path / "originals" / "fresh.png"
+    _make_png(fresh_photo)
+
+    video_uid, video_aid, video_jid = _seed_stale(
+        mime="video/mp4", lane="slow", storage_path=clip, age_seconds=200, duration=2.0
+    )
+    light_uid, light_aid, light_jid = _seed_stale(
+        mime="image/png", lane="fast", storage_path=photo, age_seconds=200
+    )
+    _, fresh_aid, fresh_jid = _seed_stale(
+        mime="image/png", lane="fast", storage_path=fresh_photo, age_seconds=5
+    )
+    try:
+
+        async def _go():
+            async with async_session() as db:
+                recovered = await worker.recover_stale_media_claims(db)
+                await db.commit()
+            await _drain_to_idle("transcode")
+            await _drain_to_idle("light")
+            return recovered
+
+        assert asyncio.run(_go()) == 2  # the fresh claim is not stale and is not touched
+
+        assert _job_row(video_jid) == ("done", 1)  # recovery costs the one attempt, and no more
+        assert _job_row(light_jid) == ("done", 1)
+        assert _job_row(fresh_jid) == ("processing", 0)  # a live worker still owns it
+        assert ledger.read_text().split() == [f"{video_uid}.tmp.mp4"]  # ran once, not twice
+        assert (tmp_path / "assets" / "web" / f"{video_uid}.mp4").exists()
+        assert (tmp_path / "assets" / "thumbs" / f"{light_uid}.jpg").exists()
+    finally:
+        _cleanup(video_aid, light_aid, fresh_aid)
+        _cleanup_jobs(video_jid, light_jid, fresh_jid)
