@@ -184,7 +184,9 @@ met until its tests exist and pass.
 - Book **1648** "memos-ng — Features": Session Reviews chapter **2689**, Decisions chapter **2690**,
   Lessons Learned page **1664**.
 - Plan pages: **1649** (historical build roadmap), **1884** (feature-parity roadmap), **3151**
-  (native iOS client + reference iOS architecture, 2026-08-23).
+  (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17).
+- Feature pages (book level): **1663** (Media serving), **3836** (Places map).
+- Release records (book level): **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
   ADR-0013 **2316**, ADR-0014 **2584**, ADR-0015 **3152** (native client; PAT bearer; HTTPS
   callback brokered by the BFF), ADR-0016 **3209** (universal links skipped — the custom scheme is
