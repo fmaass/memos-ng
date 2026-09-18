@@ -15,7 +15,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from tests.db_guard import assert_database_is_disposable, assert_urls_target_one_database
+from tests.db_guard import (
+    acquire_bootstrap_lock,
+    assert_database_is_disposable,
+    assert_urls_target_one_database,
+    release_bootstrap_lock,
+)
 
 SYNC_URL = os.environ.get(
     "DATABASE_URL_SYNC", "postgresql+psycopg2://memosng:memosng@localhost:5433/memosng"
@@ -27,6 +32,28 @@ assert_database_is_disposable(SYNC_URL)
 assert_database_is_disposable(async_engine.url)
 # A parallel run exports a scratch database; both engines have to have followed it there.
 assert_urls_target_one_database(SYNC_URL, async_engine.url)
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Claim the database for this run before collection, so nothing can drop a live schema.
+
+    Session start, not import time: the two guards above read URLs and can run anywhere, but
+    the lock is a claim by a RUN, and only a real session goes on to drop `public`. A bare
+    `import tests.conftest` — tests/test_db_guard.py does exactly that, in a subprocess, to
+    prove the URL guards fire before any engine connects — must not take the parent suite's
+    database away from it. This hook runs before collection and long before `db_engine` builds
+    an engine, so a refusal here happens with the other run's schema still untouched.
+    """
+    try:
+        acquire_bootstrap_lock(SYNC_URL)
+    except RuntimeError as exc:
+        # Reported as a usage error: `ERROR: <message>` and exit 4, rather than the
+        # INTERNALERROR traceback a bare raise in a hook produces, which reads like a crash.
+        raise pytest.UsageError(str(exc)) from exc
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    release_bootstrap_lock()
 
 
 @pytest.fixture(scope="session")
