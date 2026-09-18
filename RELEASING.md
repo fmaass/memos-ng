@@ -29,18 +29,15 @@ a registry — the deploy image is built locally (below), so there is no `ghcr.i
 Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
 agreement is enforced *before* tagging via the checker's `--tag`.
 
-### The Places browser smoke — mandatory for changes to the map view
+### The Places browser smoke — mandatory for every release that touches `frontend/`
 
-Any release whose range touches the map view additionally runs, from `frontend/`, bare. A
-`places/` directory glob is not enough: the pane and the timeline-bar overlay whose geometry the
-smoke checks live in `PlacesView.vue`, outside any such directory — the 1.7.1 fit-padding fix
-touched exactly that file. The paths are:
-
-- `frontend/src/views/PlacesView.vue` — the view that assembles the pane, the overlay and the grid
-- `frontend/src/components/places/**` — the map, the timeline bar, the drawer, the in-view grid
-- `frontend/src/lib/places/**` — the style, the geometry, the timeline reducer, the pin builder
-- `frontend/src/lib/media.ts` and `frontend/src/composables/useMediaLightbox.ts` — shared with the
-  rest of the app, but the map's pins and its lightbox are built out of them
+Any release whose range touches anything under `frontend/` additionally runs, from `frontend/`,
+bare. The rule is the whole directory on purpose. A list of map files cannot be kept true: the
+view is assembled from modules the rest of the app shares (the API client, the dark-mode switch
+that picks the map's style, the media helpers, the lightbox), and the likeliest way to break the
+map is a `maplibre-gl` bump in `package.json`, which touches no map file at all. The 1.7.1
+fit-padding fix touched `frontend/src/views/PlacesView.vue`, outside every `places/` directory.
+The smoke costs little: it ran in 13 s here, on top of a build the release makes anyway.
 
 The command:
 
