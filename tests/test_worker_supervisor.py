@@ -5,11 +5,13 @@ collaborator it calls is stubbed and the two consumer tasks are real. Time is dr
 supervisor's OWN passes (a counted stub it calls exactly once per pass) plus injected stall bounds,
 never by a fixed sleep a loaded machine could turn into a false verdict: every wait ends on an
 observed pass, with a generous `wait_for` as a failure bound rather than as the thing measured.
+Where a proof turns on elapsed time, the supervisor's clock (`worker._now`) is injected too, so
+the time under test advances on this file's word and not on the host's scheduling luck.
 """
 
 import asyncio
 import contextlib
-import time
+from collections.abc import Awaitable, Callable
 
 import pytest
 from app import migrations, worker
@@ -46,10 +48,9 @@ class _Harness:
         target = self.passes + n
         await self._until(lambda: self.passes >= target)
 
-    async def wait_seconds_of_passes(self, seconds: float) -> None:
-        """Keep watching real passes until the injected bound has demonstrably elapsed."""
-        started = time.monotonic()
-        await self._until(lambda: time.monotonic() - started >= seconds, give_up_after=seconds + 20)
+    async def wait_until(self, done) -> None:
+        """Watch real passes until `done()` — for a condition on injected time, never on real."""
+        await self._until(done)
 
     async def wait_for_log(self, caps: list[dict], event: str) -> None:
         await self._until(lambda: any(c["event"] == event for c in caps))
@@ -113,6 +114,72 @@ def _consumer_tasks() -> list[asyncio.Task]:
     return [t for t in asyncio.all_tasks() if t.get_name().startswith("media-consumer-")]
 
 
+class _Clock:
+    """The supervisor's time source, under this file's control: it moves when a test says so."""
+
+    def __init__(self, at: float = 1_000_000.0) -> None:
+        self.at = at
+
+    def __call__(self) -> float:
+        return self.at
+
+    def advance(self, seconds: float) -> None:
+        self.at += seconds
+
+
+class _CountingBeat:
+    """`beat()` as a counter. The heartbeat FILE cannot answer these proofs: it holds one float,
+    so two stamps in the same pass are indistinguishable in it, and 'did the second stamp fire'
+    is exactly the question."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __call__(self) -> None:
+        self.count += 1
+
+
+async def _stamps_per_pass(
+    harness, monkeypatch, bring_about: Callable[[], Awaitable[None]]
+) -> tuple[list[int], int]:
+    """Run the supervisor and let `bring_about()` happen INSIDE the awaited frame-share drain.
+
+    That await is what separates a pass's two stamps, so it is the window in which a consumer can
+    die, go quiet or fail systematically while the pass is already under way. Returns the stamp
+    count observed at the entry of every pass, and the index of the pass that was armed.
+    """
+    beats = _CountingBeat()
+    monkeypatch.setattr(worker, "beat", beats)
+    at_pass_entry: list[int] = []
+    armed = -1
+
+    async def frame_drain() -> str:
+        nonlocal armed
+        harness.saw_a_pass()
+        at_pass_entry.append(beats.count)
+        if len(at_pass_entry) == 3 and armed < 0:
+            armed = len(at_pass_entry) - 1
+            async with asyncio.timeout(20):
+                await bring_about()
+        return "idle"
+
+    monkeypatch.setattr(worker, "run_frame_share_drain", frame_drain)
+    async with _supervisor():
+        await harness.wait_passes(5)
+    return at_pass_entry, armed
+
+
+def _assert_the_second_stamp_was_withheld(stamps: list[int], armed: int, condition: str) -> None:
+    assert armed > 0, "the drain was never armed, so nothing was proved"
+    assert stamps[armed] - stamps[armed - 1] == 2, (
+        "the supervisor was not stamping twice a pass before the condition arose, so withholding "
+        "the second stamp afterwards would prove nothing"
+    )
+    assert stamps[armed + 1] == stamps[armed], (
+        f"the supervisor stamped after {condition} during the drain it was awaiting"
+    )
+
+
 async def test_the_heartbeat_stops_when_a_consumer_dies(harness, monkeypatch):
     # A dead consumer is a class nothing drains. The supervisor is still perfectly healthy itself,
     # which is exactly why it must not keep saying so.
@@ -136,13 +203,48 @@ async def test_the_heartbeat_stops_when_a_consumer_dies(harness, monkeypatch):
             assert harness.stamp() == stamp, "the beat advanced with a dead consumer"
     exited = [c for c in caps if c["event"] == "worker_consumer_exited"]
     assert exited and exited[0]["job_class"] == "transcode"
+    # WHY the cause is on the FIRST line: until the supervisor is torn down, nothing else retrieves
+    # that exception, so a worker that keeps running (or restarts) would otherwise leave the reason
+    # a whole class stopped draining nowhere in the log.
+    assert isinstance(exited[0].get("exc_info"), RuntimeError), (
+        f"the first exit line named no cause: {exited[0]}"
+    )
+    assert all("exc_info" not in c for c in exited[1:]), (
+        "every pass after the first repeated the traceback instead of the short line"
+    )
 
 
-async def test_the_heartbeat_stops_when_a_consumer_hangs(harness, monkeypatch):
-    # The hole the old serial loop covered by accident: a consumer suspended inside an AWAIT is
-    # neither done nor erroring. Deliberately not an ffmpeg hang — that path is bounded by a
-    # subprocess timeout; the unbounded region is the publication tail.
-    monkeypatch.setattr(settings, "WORKER_LIGHT_STALL_SECONDS", 1)  # must exceed POLL_SECONDS
+async def test_a_consumer_that_dies_during_the_drain_is_not_stamped_alive(harness, monkeypatch):
+    # The pass's verdict is taken before an await of unbounded length. A consumer that dies inside
+    # that await is dead for the rest of the pass, and a stamp is a promise that it is not.
+    let_it_die = asyncio.Event()
+
+    async def drain(job_class=None) -> str:
+        await asyncio.sleep(0)
+        harness.drains[job_class] += 1
+        if job_class == "transcode":
+            await let_it_die.wait()
+            raise RuntimeError("the transcode consumer died mid-pass")
+        return "idle"
+
+    monkeypatch.setattr(worker, "run_media_drain", drain)
+
+    async def kill_it() -> None:
+        let_it_die.set()
+        await asyncio.wait(_consumer_tasks(), return_when=asyncio.FIRST_COMPLETED)
+
+    stamps, armed = await _stamps_per_pass(harness, monkeypatch, kill_it)
+    _assert_the_second_stamp_was_withheld(stamps, armed, "a consumer exited")
+
+
+async def test_a_consumer_that_crosses_its_bound_during_the_drain_is_not_stamped_alive(
+    harness, monkeypatch
+):
+    # Same window, the stall condition: the consumer was within its bound when the pass began and
+    # is past it by the time the pass ends.
+    clock = _Clock()
+    monkeypatch.setattr(worker, "_now", clock)
+    monkeypatch.setattr(settings, "WORKER_LIGHT_STALL_SECONDS", 60)
     parked = asyncio.Event()
     never_set = asyncio.Event()
 
@@ -155,6 +257,75 @@ async def test_the_heartbeat_stops_when_a_consumer_hangs(harness, monkeypatch):
         return "idle"
 
     monkeypatch.setattr(worker, "run_media_drain", drain)
+
+    async def let_the_bound_pass() -> None:
+        await parked.wait()
+        clock.advance(600)  # ten bounds' silence from the light consumer, none from the other
+
+    stamps, armed = await _stamps_per_pass(harness, monkeypatch, let_the_bound_pass)
+    _assert_the_second_stamp_was_withheld(stamps, armed, "a consumer crossed its stall bound")
+
+
+async def test_a_consumer_that_reaches_its_error_streak_during_the_drain_is_not_stamped_alive(
+    harness, monkeypatch
+):
+    # Same window, the systemic-error condition: the streak reaches the threshold while the
+    # supervisor is awaiting the frame-share drain.
+    monkeypatch.setattr(settings, "WORKER_UNHEALTHY_ERROR_STREAK", 2)
+    erroring = asyncio.Event()
+    recorded = asyncio.Event()
+    errors = 0
+
+    async def drain(job_class=None) -> str:
+        nonlocal errors
+        await asyncio.sleep(0)
+        harness.drains[job_class] += 1
+        if job_class == "light" and erroring.is_set():
+            errors += 1
+            if errors > 2:
+                # A THIRD error call means the consumer recorded the second one: the streak is in.
+                recorded.set()
+            return "error"
+        return "idle"
+
+    monkeypatch.setattr(worker, "run_media_drain", drain)
+
+    async def let_the_streak_build() -> None:
+        erroring.set()
+        await recorded.wait()
+
+    stamps, armed = await _stamps_per_pass(harness, monkeypatch, let_the_streak_build)
+    _assert_the_second_stamp_was_withheld(stamps, armed, "a consumer reached its error streak")
+
+
+async def test_the_heartbeat_stops_when_a_consumer_hangs(harness, monkeypatch):
+    # The hole the old serial loop covered by accident: a consumer suspended inside an AWAIT is
+    # neither done nor erroring. Deliberately not an ffmpeg hang — that path is bounded by a
+    # subprocess timeout; the unbounded region is the publication tail.
+    clock = _Clock()
+    monkeypatch.setattr(worker, "_now", clock)
+    monkeypatch.setattr(settings, "WORKER_LIGHT_STALL_SECONDS", 1)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+    moved = asyncio.Event()
+
+    async def drain(job_class=None) -> str:
+        await asyncio.sleep(0)
+        harness.drains[job_class] += 1
+        if job_class == "light":
+            parked.set()
+            await never_set.wait()
+        return "idle"
+
+    async def frame_drain() -> str:
+        harness.saw_a_pass()
+        if parked.is_set() and not moved.is_set():
+            moved.set()
+            clock.advance(1000)  # the hang is now a thousand bounds old, without waiting one out
+        return "idle"
+
+    monkeypatch.setattr(worker, "run_media_drain", drain)
+    monkeypatch.setattr(worker, "run_frame_share_drain", frame_drain)
     with capture_logs() as caps:
         async with _supervisor():
             await asyncio.wait_for(parked.wait(), 20)
@@ -164,7 +335,7 @@ async def test_the_heartbeat_stops_when_a_consumer_hangs(harness, monkeypatch):
             assert harness.stamp() == stamp, "the beat advanced with a hung consumer"
     stalled = [c for c in caps if c["event"] == "worker_consumer_stalled"]
     assert stalled[0]["job_class"] == "light"
-    assert stalled[0]["elapsed_seconds"] >= 1
+    assert stalled[0]["elapsed_seconds"] >= 1000
 
 
 async def test_one_consumers_error_streak_stops_the_beat_the_others_success_cannot_reset_it(
@@ -198,41 +369,78 @@ async def test_one_consumers_error_streak_stops_the_beat_the_others_success_cann
 
 async def test_a_thermally_deferred_pass_is_not_a_stall(harness, monkeypatch):
     # A worker held off by the thermal gate is idle, not stuck: every pass returns and re-stamps
-    # the watermark, so the bound must never be reached however long the heat lasts.
-    monkeypatch.setattr(settings, "WORKER_LIGHT_STALL_SECONDS", 1)
-    monkeypatch.setattr(settings, "WORKER_TRANSCODE_STALL_SECONDS", 1)
+    # the watermark, so the bound must never be reached however long the heat lasts. "However long"
+    # is injected rather than waited out — waiting a real bound out made this test a measurement of
+    # the host's scheduler, which fails on a loaded machine with nothing wrong.
+    clock = _Clock()
+    monkeypatch.setattr(worker, "_now", clock)
+    bound = 1000
+    monkeypatch.setattr(settings, "WORKER_LIGHT_STALL_SECONDS", bound)
+    monkeypatch.setattr(settings, "WORKER_TRANSCODE_STALL_SECONDS", bound)
 
     async def drain(job_class=None) -> str:
         await asyncio.sleep(0)
         harness.drains[job_class] += 1
         return "deferred"
 
+    seen = dict(harness.drains)
+
+    async def frame_drain() -> str:
+        harness.saw_a_pass()
+        # The heat only advances in steps BOTH consumers have been heard within, and a step is a
+        # quarter of the bound: the claim under test is that a deferred pass re-stamps, so a jump
+        # taken while a consumer happened to be descheduled would be measuring the scheduler again.
+        if all(harness.drains[c] > seen[c] for c in seen):
+            seen.update(harness.drains)
+            clock.advance(bound // 4)
+        return "idle"
+
     monkeypatch.setattr(worker, "run_media_drain", drain)
+    monkeypatch.setattr(worker, "run_frame_share_drain", frame_drain)
+    started = clock()
     with capture_logs() as caps:
         async with _supervisor():
             await harness.wait_passes(1)
             stamp = harness.stamp()
-            await harness.wait_seconds_of_passes(1.5)  # well past the injected bound
+            await harness.wait_until(lambda: clock() - started > 3 * bound)  # three bounds of heat
             assert harness.stamp() != stamp, "the beat stopped on a merely deferred worker"
     assert not [c for c in caps if c["event"] == "worker_consumer_stalled"]
 
 
 async def test_cancelling_the_supervisor_tears_both_consumers_down(harness, monkeypatch):
     # Every caller that drives the loop cancels it; a consumer surviving that would go on draining
-    # against patched collaborators or a closed session.
+    # against patched collaborators or a closed session. Finishing a cancellation is deliberately
+    # NOT synchronous here — each consumer needs one more loop turn after its CancelledError — so
+    # the proof can tell a teardown that AWAITS its consumers from one that merely asks them to go.
+    both_parked = asyncio.Event()
+    never_set = asyncio.Event()
+    finished: set[str] = set()
+
     async def drain(job_class=None) -> str:
         await asyncio.sleep(0)
         harness.drains[job_class] += 1
-        return "idle"
+        if all(harness.drains.values()):
+            both_parked.set()
+        try:
+            await never_set.wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)  # one more turn of the loop before this consumer is finished
+            finished.add(job_class)
+            raise
+        return "idle"  # unreachable: this consumer only ever leaves by cancellation
 
     monkeypatch.setattr(worker, "run_media_drain", drain)
     loop_task = asyncio.create_task(worker.run())
+    await asyncio.wait_for(both_parked.wait(), 20)
     await harness.wait_passes(2)
     consumers = _consumer_tasks()
     assert len(consumers) == 2
     loop_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await loop_task
+    # Nothing yields between the supervisor's cancellation completing and this line: a teardown
+    # that only REQUESTED the cancellations leaves both finalisers still pending here.
+    assert finished == {"transcode", "light"}, "the supervisor stopped before its consumers had"
     assert all(t.done() for t in consumers), "a consumer outlived the supervisor"
     drained = dict(harness.drains)
     for _ in range(10):  # give anything still scheduled every chance to run

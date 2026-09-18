@@ -876,6 +876,17 @@ class _DrainHealth:
         return self._streak
 
 
+def _now() -> float:
+    """The one clock the watermarks and the liveness verdict read.
+
+    An indirection, not a wrapper for its own sake: the stall bound is the only part of the
+    supervisor whose verdict depends on how much time has passed, so a proof of it has to be able
+    to decide when time moves. Reading `time.time()` directly made those tests measure the host's
+    scheduler instead: a pause longer than the bound failed them with nothing wrong.
+    """
+    return time.time()
+
+
 class _Watermark:
     """The last moment a consumer was observably alive, read by the supervisor's beat gate.
 
@@ -886,10 +897,10 @@ class _Watermark:
     """
 
     def __init__(self) -> None:
-        self.at = time.time()
+        self.at = _now()
 
     def stamp(self) -> None:
-        self.at = time.time()
+        self.at = _now()
 
 
 async def consume_media(job_class: JobClass, health: _DrainHealth, watermark: _Watermark) -> None:
@@ -907,6 +918,68 @@ async def consume_media(job_class: JobClass, health: _DrainHealth, watermark: _W
         health.record(status)
         if status != "processed":  # idle/deferred/error → back off, like the old single loop
             await asyncio.sleep(POLL_SECONDS)
+
+
+_Consumers = dict[JobClass, tuple[asyncio.Task[None], _DrainHealth, _Watermark]]
+
+
+def _consumers_healthy(
+    consumers: _Consumers,
+    stall_bounds: dict[JobClass, int],
+    reported_exits: set[JobClass],
+    *,
+    report: bool,
+) -> bool:
+    """Is every consumer alive, draining and being heard from RIGHT NOW?
+
+    Heartbeat honesty asked of every consumer rather than of one serial loop: the stamp means "all
+    media work is being drained", so ONE bad consumer has to stop it. Three ways a consumer stops
+    counting as alive — a streak of escaped errors, having exited, and having gone quiet past its
+    class's bound — each logged distinctly so the log says which one it was.
+
+    The verdict is a function of the moment it is asked for, which is why it lives here instead of
+    in a variable: a pass asks twice, either side of an await, and holding the first answer over
+    the second would stamp a consumer that died while the supervisor was waiting. `report` is what
+    makes asking twice affordable — only the first verdict of a pass speaks, so the log keeps
+    saying each condition once per pass and no faster.
+    """
+    now = _now()
+    healthy = True
+    for job_class, (task, job_health, job_watermark) in consumers.items():
+        if not job_health.healthy:
+            if report:
+                logger.error(
+                    "worker_unhealthy_error_streak",
+                    job_class=job_class,
+                    streak=job_health.streak,
+                )
+            healthy = False
+        if task.done():
+            if report and job_class in reported_exits:
+                logger.error("worker_consumer_exited", job_class=job_class)
+            elif report:
+                reported_exits.add(job_class)
+                # The one line that can carry WHY the class stopped: nothing else retrieves this
+                # exception until the supervisor itself is torn down, so a worker that keeps
+                # running would otherwise log a dead class without ever naming what killed it.
+                # Once only — repeating the traceback every ten seconds would bury the rest.
+                logger.error(
+                    "worker_consumer_exited",
+                    job_class=job_class,
+                    exc_info=None if task.cancelled() else task.exception(),
+                )
+            healthy = False
+        elapsed = now - job_watermark.at
+        if elapsed > stall_bounds[job_class]:
+            if report:
+                logger.error(
+                    "worker_consumer_stalled",
+                    job_class=job_class,
+                    elapsed_seconds=round(elapsed, 1),
+                    bound_seconds=stall_bounds[job_class],
+                )
+            healthy = False
+    return healthy
 
 
 async def run() -> None:
@@ -945,7 +1018,7 @@ async def run() -> None:
         "transcode": settings.WORKER_TRANSCODE_STALL_SECONDS,
         "light": settings.WORKER_LIGHT_STALL_SECONDS,
     }
-    consumers: dict[JobClass, tuple[asyncio.Task[None], _DrainHealth, _Watermark]] = {}
+    consumers: _Consumers = {}
     spawn_classes: tuple[JobClass, ...] = ("transcode", "light")
     for job_class in spawn_classes:
         job_health = _DrainHealth(settings.WORKER_UNHEALTHY_ERROR_STREAK)
@@ -959,42 +1032,21 @@ async def run() -> None:
             job_watermark,
         )
     last_reap = 0.0
+    # Which classes have already had their exit reported with the cause attached. A local, because
+    # it belongs to this supervisor's run and must not outlive it.
+    reported_exits: set[JobClass] = set()
     try:
         while True:
-            # Heartbeat honesty (MEMNG-90), now asked of every consumer rather than of one serial
-            # loop: the stamp means "all media work is being drained", so ONE bad consumer has to
-            # stop it. Three ways a consumer stops counting as alive — a streak of escaped errors,
-            # having exited, and having gone quiet past its class's bound — each logged distinctly
-            # so the log says which one it was.
-            now = time.time()
-            healthy = True
-            for job_class, (task, job_health, job_watermark) in consumers.items():
-                if not job_health.healthy:
-                    logger.error(
-                        "worker_unhealthy_error_streak",
-                        job_class=job_class,
-                        streak=job_health.streak,
-                    )
-                    healthy = False
-                if task.done():
-                    logger.error("worker_consumer_exited", job_class=job_class)
-                    healthy = False
-                elapsed = now - job_watermark.at
-                if elapsed > stall_bounds[job_class]:
-                    logger.error(
-                        "worker_consumer_stalled",
-                        job_class=job_class,
-                        elapsed_seconds=round(elapsed, 1),
-                        bound_seconds=stall_bounds[job_class],
-                    )
-                    healthy = False
-            if healthy:
+            if _consumers_healthy(consumers, stall_bounds, reported_exits, report=True):
                 beat()  # blocking-ok: the liveness stamp itself — see beat()
             # Drain a frame-share job opportunistically in its own session (like reap): the album
             # upload is decoupled from the media job's transaction so an upload error can't poison
             # media work.
             frame_status = await run_frame_share_drain()
-            if healthy:
+            # Ask again, silently, on a fresh clock: the drain above is an await of unbounded
+            # length, and a consumer that dies, crosses its bound or reaches its error streak
+            # inside it would otherwise be stamped alive on a verdict taken before it happened.
+            if _consumers_healthy(consumers, stall_bounds, reported_exits, report=False):
                 beat()  # blocking-ok: the liveness stamp itself — see beat()
             # The digest: a cheap gate read, and a SPAWN when it fires. The loop continues
             # immediately — see spawn_digest for why this is never awaited here. A manual row the
