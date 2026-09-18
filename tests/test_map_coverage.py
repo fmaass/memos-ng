@@ -194,6 +194,30 @@ async def test_a_photo_the_feed_hides_is_not_counted_as_a_gap(adb, tiles_with_re
     assert await map_coverage.uncovered_for(adb, viewer, tiles_with_regions, DETAIL) == 1
 
 
+async def test_two_callers_in_a_row_are_each_answered_about_their_own_pins(adb, tiles_with_regions):
+    """One process-wide cache, and the answer is the CALLER's: what is visible decides the count.
+
+    Asked one after the other with nothing cleared in between — the way two members hitting the
+    manifest actually arrive — each must get their own number, and the first must still get theirs
+    afterwards. A cache keyed by the archive alone would hand whoever asked second the other
+    member's count, which is both wrong and a disclosure about photos they cannot see.
+    """
+    from app.models import Visibility
+
+    first = await _member(adb, "coverage-pair-first")
+    second = await _member(adb, "coverage-pair-second")
+    mine = await _memo(adb, first, visibility=Visibility.PRIVATE)
+    await _located(adb, mine, uid="pair-a1", latitude=-10.0, longitude=-10.0)
+    theirs = await _memo(adb, second, visibility=Visibility.PRIVATE)
+    await _located(adb, theirs, uid="pair-b1", latitude=-11.0, longitude=-11.0)
+    await _located(adb, theirs, uid="pair-b2", latitude=-12.0, longitude=-12.0)
+
+    assert await map_coverage.uncovered_for(adb, first, tiles_with_regions, DETAIL) == 1
+    assert await map_coverage.uncovered_for(adb, second, tiles_with_regions, DETAIL) == 2
+    # And the first one's own answer survives the second one asking.
+    assert await map_coverage.uncovered_for(adb, first, tiles_with_regions, DETAIL) == 1
+
+
 # --- what the gap may be logged as -------------------------------------------------------------
 
 

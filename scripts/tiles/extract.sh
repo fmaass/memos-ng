@@ -124,8 +124,18 @@ pmtiles() {
 # One archive, published atomically: write to a temporary name, verify the STRUCTURE of what was
 # written, and only then rename it into place. A half-downloaded file never becomes a served one,
 # and the rename is what makes the new generation visible to the manifest.
+#
+#   publish <name> <regions-file-or-empty> [tool flags...]
+#
+# WHY THE REGIONS FILE IS PUBLISHED HERE, AND FIRST. The manifest selects the newest detail archive
+# and its coverage answer is read from the regions file under that archive's stem, so the two are
+# one generation and the ARCHIVE is the half that must arrive last. Copying the regions file after
+# the archive's rename leaves a window — and, if the run is interrupted or the copy fails, a
+# permanent state — where the selected archive has no regions at all, which nothing later repairs
+# because a published name is never rewritten. A regions file beside an archive nobody can see yet
+# costs nothing; the reverse is unrecoverable.
 publish() {
-    local name="$1"; shift
+    local name="$1" regions_src="$2"; shift 2
     if [ -f "${TILES_DIR}/${name}" ]; then
         if pmtiles verify "/tiles/${name}"; then
             echo "extract.sh: ${name} is already published and verifies — skipping"
@@ -147,6 +157,12 @@ publish() {
     echo "extract.sh: extracting ${name} from ${SOURCE}"
     pmtiles extract "$SOURCE" "/tiles/${name}.tmp" "$@"
     pmtiles verify "/tiles/${name}.tmp"
+    if [ -n "$regions_src" ]; then
+        local sidecar="${TILES_DIR}/${name%.pmtiles}.regions.geojson"
+        cp "$regions_src" "${sidecar}.tmp"
+        mv "${sidecar}.tmp" "$sidecar"
+        echo "extract.sh: published ${sidecar##*/}"
+    fi
     mv "${TILES_DIR}/${name}.tmp" "${TILES_DIR}/${name}"
     echo "extract.sh: published ${name} ($(stat -c%s "${TILES_DIR}/${name}") bytes)"
 }
@@ -164,20 +180,16 @@ prune() {
     done
 }
 
-publish "$PLANET_NAME" --maxzoom="$PLANET_MAXZOOM"
-publish "$DETAIL_NAME" "${SELECTOR[@]}" --maxzoom="$DETAIL_ZOOM"
+# The geometry the detail archive is cut to travels with it: picking that archive has to imply the
+# ground it covers, otherwise "is this pin on the detailed part of the map" can only be guessed
+# from a regions file that may already describe a later extraction. A dev preset cuts to a bbox
+# instead, so even a regions file named on its command line does not describe what was extracted
+# and none is published — a developer's small extract is never the answer to that question.
+SIDECAR_SRC=""
+[ -n "$DEV" ] || SIDECAR_SRC="$REGIONS"
 
-# The selected geometry, published under the detail archive's own stem. The manifest picks ONE
-# detail archive, and picking it has to imply the ground it covers — otherwise the only way to
-# answer "is this pin on the detailed part of the map" is to guess from a regions file that may
-# already describe a later extraction. A dev preset selects a bbox rather than a regions file and
-# publishes none: it is a developer's small extract, never the answer to that question.
-if [ -z "$DEV" ]; then
-    REGIONS_SIDECAR="${TILES_DIR}/${DETAIL_NAME%.pmtiles}.regions.geojson"
-    cp "$REGIONS" "${REGIONS_SIDECAR}.tmp"
-    mv "${REGIONS_SIDECAR}.tmp" "$REGIONS_SIDECAR"
-    echo "extract.sh: published ${REGIONS_SIDECAR##*/}"
-fi
+publish "$PLANET_NAME" "" --maxzoom="$PLANET_MAXZOOM"
+publish "$DETAIL_NAME" "$SIDECAR_SRC" "${SELECTOR[@]}" --maxzoom="$DETAIL_ZOOM"
 
 prune planet
 prune detail

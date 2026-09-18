@@ -699,3 +699,138 @@ def test_a_superseded_detail_archive_takes_its_regions_file_with_it(tmp_path):
     for gone in dropped:
         assert not gone.exists(), gone.name
     assert len(list(tiles.glob("*.regions.geojson"))) == 2
+
+
+# --- the archive and its regions become visible together ---------------------------------------
+
+# `mv` is what makes a generation visible, so the moment to check is the rename itself. This stands
+# in for it on PATH: an archive arriving without its regions file beside it stops the script right
+# there, and every rename is recorded so a case can prove the check was reached at all.
+MV_GUARD = """#!/bin/sh
+dest=""
+for a in "$@"; do
+  case "$a" in -*) ;; *) src="$dest"; dest="$a" ;; esac
+done
+case "$dest" in
+  */detail-*.pmtiles)
+    echo "mv $dest" >> "$MV_LOG"
+    sidecar="${dest%.pmtiles}.regions.geojson"
+    if [ ! -f "$sidecar" ]; then
+      echo "ORDERING VIOLATION: ${sidecar##*/} absent when ${dest##*/} appeared" >&2
+      exit 9
+    fi
+    ;;
+  *.pmtiles) echo "mv $dest" >> "$MV_LOG" ;;
+esac
+exec /bin/mv "$@"
+"""
+
+# An extraction tool that produces the archive and then makes the regions file unreadable: the
+# publication is past the point of no return when copying the sidecar starts to fail.
+DOCKER_STUB_POISONS_REGIONS = DOCKER_STUB.replace(
+    '  printf \'PMTiles-stub-archive\' > "${tiles}/$(basename "$out")"\n',
+    '  printf \'PMTiles-stub-archive\' > "${tiles}/$(basename "$out")"\n'
+    '  [ -n "$POISON_REGIONS" ] && chmod 000 "$POISON_REGIONS"\n',
+)
+
+# Verification refuses the detail archive alone: the planet publishes normally, so the case is
+# about what the FAILED publication leaves behind rather than about stopping early.
+DOCKER_STUB_DETAIL_FAILS_VERIFY = DOCKER_STUB.replace(
+    'if [ "$mode" = extract ]; then',
+    'if [ "$mode" = verify ]; then\n'
+    '  for a in "$@"; do\n'
+    '    case "$a" in */detail-*.tmp) exit 1 ;; esac\n'
+    "  done\n"
+    "fi\n"
+    'if [ "$mode" = extract ]; then',
+    1,
+)
+
+
+def _stub_docker_variant(tmp_path: Path, body: str) -> Path:
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "docker"
+    stub.write_text(body)
+    stub.chmod(0o755)
+    return stub_dir
+
+
+def test_a_detail_archive_never_becomes_visible_before_its_regions_file(tmp_path):
+    """The pair is what has to be atomic, not each rename on its own.
+
+    The manifest picks the newest detail archive and the coverage answer is read from the regions
+    file under its stem. An archive that is visible first — for an instant, or for good after an
+    interrupted run — is a generation whose regions do not exist, and nothing later repairs it,
+    because a published name is never rewritten. So the regions file goes down first: one beside
+    an archive nobody can see yet is harmless, the other way round is not.
+    """
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    stub_dir = _stub_docker(tmp_path)
+    (stub_dir / "mv").write_text(MV_GUARD)
+    (stub_dir / "mv").chmod(0o755)
+    log = tmp_path / "mv.log"
+
+    run = subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), str(regions), "--build", "20260917"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}", "MV_LOG": str(log)},
+    )
+
+    assert "ORDERING VIOLATION" not in run.stderr, run.stderr
+    assert run.returncode == 0, (run.stdout, run.stderr)
+    [detail] = list(tiles.glob("detail-20260917-*.pmtiles"))
+    # Positive control: the guard DID run over the rename that publishes the detail archive.
+    assert f"mv {detail}" in log.read_text(), log.read_text()
+    assert (tiles / f"{detail.name.removesuffix('.pmtiles')}.regions.geojson").is_file()
+
+
+def test_a_regions_file_that_cannot_be_copied_publishes_no_archive_at_all(tmp_path):
+    """The failure the ordering exists for: if the sidecar cannot be written, the generation it
+    belongs to must simply not appear. Half of it appearing is the state nothing can repair."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    stub_dir = _stub_docker_variant(tmp_path, DOCKER_STUB_POISONS_REGIONS)
+
+    try:
+        run = subprocess.run(
+            ["bash", str(EXTRACT_SH), str(tiles), str(regions), "--build", "20260917"],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": f"{stub_dir}:{os.environ['PATH']}",
+                "POISON_REGIONS": str(regions),
+            },
+        )
+
+        assert run.returncode != 0, (run.stdout, run.stderr)
+        assert list(tiles.glob("detail-*.pmtiles")) == [], sorted(p.name for p in tiles.iterdir())
+    finally:
+        regions.chmod(0o644)
+
+
+def test_an_archive_that_fails_verification_leaves_no_regions_file_behind(tmp_path):
+    """No orphan either: a regions file whose archive was never published would be pruned by
+    nothing (prune follows archives) and would sit there describing a generation that does not
+    exist."""
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    regions = _regions_file(tmp_path)
+    stub_dir = _stub_docker_variant(tmp_path, DOCKER_STUB_DETAIL_FAILS_VERIFY)
+
+    run = subprocess.run(
+        ["bash", str(EXTRACT_SH), str(tiles), str(regions), "--build", "20260917"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_dir}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode != 0, (run.stdout, run.stderr)
+    assert (tiles / "planet-20260917.pmtiles").is_file(), run.stdout  # control: it got that far
+    assert list(tiles.glob("detail-*.pmtiles")) == []
+    assert list(tiles.glob("*.regions.geojson")) == [], sorted(p.name for p in tiles.iterdir())
