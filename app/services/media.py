@@ -487,10 +487,7 @@ def classify_chromaticity(img: Image.Image) -> Chromaticity:
     rather than left implicit in a threshold.
     """
     stats = chroma_stats(img)
-    if (
-        stats.magnitude <= NEUTRAL_MEAN_CHROMA_MAX
-        and stats.spread <= NEUTRAL_CHROMA_STDDEV_MAX
-    ):
+    if stats.magnitude <= NEUTRAL_MEAN_CHROMA_MAX and stats.spread <= NEUTRAL_CHROMA_STDDEV_MAX:
         return "neutral"
     return "toned" if stats.uniformity >= TONED_UNIFORMITY_MIN else "color"
 
@@ -587,9 +584,7 @@ def process_printready(
         img = _normalise_for_print(img)
         img, icc = to_srgb(img)
         if resolved.long_edge != printready.ORIGINAL_LONG_EDGE:
-            img.thumbnail(
-                (resolved.long_edge, resolved.long_edge), Image.Resampling.LANCZOS
-            )
+            img.thumbnail((resolved.long_edge, resolved.long_edge), Image.Resampling.LANCZOS)
         keep_dates = resolved.metadata_policy == printready.METADATA_KEEP_DATES
         exif = _date_only_exif(raw) if keep_dates else None
         if resolved.grayscale_single_channel and classify_chromaticity(img) == "neutral":
@@ -668,9 +663,7 @@ def encode_for_mail(source: bytes, profile: export_settings.MailProfile) -> Mail
             img = ImageOps.exif_transpose(raw)
             img = _normalise_for_print(img)  # not print-specific: 8-bit, alpha onto white
             img, icc = to_srgb(img)
-            img.thumbnail(
-                (profile.long_edge, profile.long_edge), Image.Resampling.LANCZOS
-            )
+            img.thumbnail((profile.long_edge, profile.long_edge), Image.Resampling.LANCZOS)
             buffer = BytesIO()
             _save_jpeg(
                 img,

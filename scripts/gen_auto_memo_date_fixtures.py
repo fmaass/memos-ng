@@ -77,9 +77,7 @@ def png_exif(path: Path) -> None:
     without an eXIf chunk falls through to a full pixel decode. Both spellings are fixtures now, so
     the reader has to answer each from the header alone.
     """
-    _still((10, 120, 200)).save(
-        path, "PNG", exif=_exif("2026:01:01 13:00:00", "+05:45").tobytes()
-    )
+    _still((10, 120, 200)).save(path, "PNG", exif=_exif("2026:01:01 13:00:00", "+05:45").tobytes())
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

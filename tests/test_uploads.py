@@ -300,9 +300,12 @@ def test_failed_post_puts_the_moved_original_back_where_it_came_from(
         client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
         monkeypatch.setattr(memo_svc, "create_memo", boom)  # fail AFTER finalize_pending moved it
         # raise_server_exceptions=False → the failure surfaces as a 500 (the finally still runs).
-        assert client.post(
-            "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
-        ).status_code == 500
+        assert (
+            client.post(
+                "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
+            ).status_code
+            == 500
+        )
         originals = tmp_path / "originals"
         stranded = [p for p in originals.rglob("*") if p.is_file()] if originals.exists() else []
         assert stranded == []  # nothing left half-filed under a memo that does not exist
@@ -380,9 +383,7 @@ async def test_heic_finalize_routes_to_slow_lane(adb, monkeypatch, tmp_path):
 
     assert att.mime == "image/heic"  # classified as image, not video/mp4
     assert att.status is AttachmentStatus.processing  # 'pending' is only for video
-    job = (
-        await adb.execute(select(MediaJob).where(MediaJob.attachment_id == att.id))
-    ).scalar_one()
+    job = (await adb.execute(select(MediaJob).where(MediaJob.attachment_id == att.id))).scalar_one()
     assert job.lane is JobLane.slow  # heavy decode offloaded to Merkur
 
 
@@ -398,9 +399,7 @@ def test_edit_memo_attaches_new_upload(logged_in_client, monkeypatch, tmp_path):
         data = b"\x89PNG\r\n\x1a\n" + b"E" * 4000
         uid = _start(client, "added.png", "image/png", len(data))
         client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
-        edited = client.patch(
-            f"/api/memos/{memo['uid']}", json={"upload_uids": [uid]}
-        ).json()
+        edited = client.patch(f"/api/memos/{memo['uid']}", json={"upload_uids": [uid]}).json()
         assert len(edited["attachments"]) == 1  # new image attached on edit
         assert client.head(f"/api/uploads/{uid}").status_code == 404  # upload consumed
     finally:
@@ -542,9 +541,7 @@ def test_patch_memo_409s_and_leaves_the_memo_exactly_as_it_was(
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
-        memo = client.post(
-            "/api/memos", json={"content": "before", "visibility": "PUBLIC"}
-        ).json()
+        memo = client.post("/api/memos", json={"content": "before", "visibility": "PUBLIC"}).json()
         _expect_unlinkable(
             client.patch(
                 f"/api/memos/{memo['uid']}",
@@ -1079,9 +1076,12 @@ def test_pre_ownership_upload_row_fails_closed_on_every_verb(
         eng.dispose()
 
         assert client.head(f"/api/uploads/{uid}").status_code == 404
-        assert client.patch(
-            f"/api/uploads/{uid}", content=b"x" * 10, headers={"Upload-Offset": str(len(data))}
-        ).status_code == 404
+        assert (
+            client.patch(
+                f"/api/uploads/{uid}", content=b"x" * 10, headers={"Upload-Offset": str(len(data))}
+            ).status_code
+            == 404
+        )
         assert client.post(f"/api/uploads/{uid}/finalize").status_code == 404
         memo = client.post(
             "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
@@ -1133,9 +1133,12 @@ def test_deleting_a_user_nulls_their_upload_instead_of_stranding_its_bytes(
 
         # ...and an owner-less session is claimable by nobody: every verb still fails closed
         assert other.head(f"/api/uploads/{uid}").status_code == 404
-        assert other.patch(
-            f"/api/uploads/{uid}", content=b"x" * 10, headers={"Upload-Offset": str(len(data))}
-        ).status_code == 404
+        assert (
+            other.patch(
+                f"/api/uploads/{uid}", content=b"x" * 10, headers={"Upload-Offset": str(len(data))}
+            ).status_code
+            == 404
+        )
         assert other.post(f"/api/uploads/{uid}/finalize").status_code == 404
         memo = other.post(
             "/api/memos", json={"content": "x", "visibility": "PUBLIC", "upload_uids": [uid]}
@@ -1180,8 +1183,7 @@ async def test_worker_reap_entry_commits_the_deletions(db_engine, tmp_path, monk
     with eng.begin() as c:
         uid_owner = c.execute(
             text(
-                "INSERT INTO users (subject, role) "
-                "VALUES ('reap_commit_user','user') RETURNING id"
+                "INSERT INTO users (subject, role) VALUES ('reap_commit_user','user') RETURNING id"
             )
         ).scalar_one()
         c.execute(

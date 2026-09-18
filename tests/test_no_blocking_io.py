@@ -44,16 +44,54 @@ APP_DIR = Path(__file__).resolve().parent.parent / "app"
 # `read`, `write`, `close`) are excluded — see the module docstring.
 PATH_METHODS = frozenset(
     {
-        "mkdir", "touch", "stat", "lstat", "exists", "is_file", "is_dir", "unlink", "rmdir",
-        "rename", "read_text", "read_bytes", "write_text", "write_bytes", "open", "iterdir",
-        "glob", "rglob", "resolve", "samefile", "chmod", "symlink_to", "hardlink_to",
+        "mkdir",
+        "touch",
+        "stat",
+        "lstat",
+        "exists",
+        "is_file",
+        "is_dir",
+        "unlink",
+        "rmdir",
+        "rename",
+        "read_text",
+        "read_bytes",
+        "write_text",
+        "write_bytes",
+        "open",
+        "iterdir",
+        "glob",
+        "rglob",
+        "resolve",
+        "samefile",
+        "chmod",
+        "symlink_to",
+        "hardlink_to",
     }
 )
 OS_FUNCS = frozenset(
     {
-        "replace", "rename", "remove", "unlink", "mkdir", "makedirs", "rmdir", "stat", "lstat",
-        "listdir", "scandir", "walk", "chmod", "utime", "link", "symlink", "readlink", "truncate",
-        "fsync", "access", "open",
+        "replace",
+        "rename",
+        "remove",
+        "unlink",
+        "mkdir",
+        "makedirs",
+        "rmdir",
+        "stat",
+        "lstat",
+        "listdir",
+        "scandir",
+        "walk",
+        "chmod",
+        "utime",
+        "link",
+        "symlink",
+        "readlink",
+        "truncate",
+        "fsync",
+        "access",
+        "open",
     }
 )
 OS_PATH_FUNCS = frozenset({"exists", "isfile", "isdir", "getsize", "getmtime", "islink"})
@@ -174,9 +212,7 @@ def _called_names(node: ast.Call) -> str | None:
 
 def _blocking_sync_functions(tree: ast.Module) -> set[str]:
     """Module-level sync functions that block, resolved to a fixpoint through their own calls."""
-    sync_defs = {
-        n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)
-    }
+    sync_defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     blocking = {
         name
         for name, fn in sync_defs.items()

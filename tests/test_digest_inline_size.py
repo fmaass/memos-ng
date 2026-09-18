@@ -183,9 +183,7 @@ async def test_a_hosted_videos_poster_anchor_keeps_its_box_when_the_poster_is_ab
         MediaRef(attachment_id=9, uid="vid-1", filename="clip.mp4", mime="video/mp4")
     ]
     profile = mail_profile()
-    files = await render.read_card_images(
-        render.card_source_paths([candidate], links, 2), profile
-    )
+    files = await render.read_card_images(render.card_source_paths([candidate], links, 2), profile)
     cards, _ = render.build_cards(
         [candidate],
         files,

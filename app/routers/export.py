@@ -281,9 +281,7 @@ async def export_photobook(
         # Same 422 family as the geometry above — a query parameter naming something that is not a
         # profile. It used to be FastAPI's own enum rejection; the admissible set now depends on
         # the settings row, so the check moved into the handler and the status code did not.
-        raise HTTPException(
-            status_code=422, detail=f"unknown print profile {profile!r}"
-        ) from exc
+        raise HTTPException(status_code=422, detail=f"unknown print profile {profile!r}") from exc
     except export_settings_svc.SettingsMissing as exc:
         raise HTTPException(status_code=500, detail="export settings row is missing") from exc
 

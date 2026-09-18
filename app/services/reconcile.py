@@ -98,9 +98,7 @@ async def reconcile_commit_races(db: AsyncSession, *, limit: int = MAX_SCAN) -> 
     videos = [att for att in rows if att.mime.startswith("video/")]
     posters = {att.uid: str(poster.poster_path(att.uid)) for att in videos}
     originals = {att.uid: str(att.storage_path) for att in rows}
-    missing = await to_thread.run_sync(
-        _missing_sync, [*originals.values(), *posters.values()]
-    )
+    missing = await to_thread.run_sync(_missing_sync, [*originals.values(), *posters.values()])
 
     misplaced = [att.uid for att in rows if originals[att.uid] in missing]
 

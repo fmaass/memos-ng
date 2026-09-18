@@ -51,9 +51,7 @@ DEFAULT_PRINT_VARIANT_KEY = "print"
 REV_LENGTH = 8
 
 
-def _negotiated_path_sync(
-    path: Path, media_type: str, want_webp: bool
-) -> tuple[Path, str] | None:
+def _negotiated_path_sync(path: Path, media_type: str, want_webp: bool) -> tuple[Path, str] | None:
     """Pick the pre-generated webp variant when it was negotiated AND exists, else confirm the
     original tier is there. None means 'nothing to serve' → the caller's 404.
 
@@ -481,9 +479,7 @@ async def attach_rendition(
     # read the rendition state before the lock is taken — the very thing this route must not do.
     # These two columns settle the 404 and the 400 and decide nothing else.
     precheck = (
-        await db.execute(
-            select(Attachment.owner_id, Attachment.mime).where(Attachment.uid == uid)
-        )
+        await db.execute(select(Attachment.owner_id, Attachment.mime).where(Attachment.uid == uid))
     ).first()
     if precheck is None or precheck.owner_id != user.id:  # OWNER-only: a mutation, unlike viewing
         raise HTTPException(status_code=404, detail="Attachment not found")

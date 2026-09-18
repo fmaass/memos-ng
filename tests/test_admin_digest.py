@@ -133,20 +133,17 @@ def test_the_sweep_below_covers_every_route_this_router_publishes():
     read the route table off the app rather than being typed out. This assertion is what stops a
     route being ADDED without being swept."""
     assert len(ADMIN_ROUTES) == 12, ADMIN_ROUTES
-    assert (
-        sorted({path for _, path in ADMIN_ROUTES})
-        == [
-            f"{PREFIX}/hosting",
-            f"{PREFIX}/preview",
-            f"{PREFIX}/recipients",
-            f"{PREFIX}/recipients/{{recipient_id}}",
-            f"{PREFIX}/run",
-            f"{PREFIX}/runs",
-            f"{PREFIX}/runs/{{run_id}}",
-            f"{PREFIX}/settings",
-            f"{PREFIX}/test-send",
-        ]
-    )
+    assert sorted({path for _, path in ADMIN_ROUTES}) == [
+        f"{PREFIX}/hosting",
+        f"{PREFIX}/preview",
+        f"{PREFIX}/recipients",
+        f"{PREFIX}/recipients/{{recipient_id}}",
+        f"{PREFIX}/run",
+        f"{PREFIX}/runs",
+        f"{PREFIX}/runs/{{run_id}}",
+        f"{PREFIX}/settings",
+        f"{PREFIX}/test-send",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -306,22 +303,16 @@ def test_arming_the_digest_with_no_recipients_is_refused(admin_client):
 def test_arming_the_digest_is_allowed_once_a_recipient_is_enabled(admin_client):
     client, _ = admin_client
     assert client.post(f"{PREFIX}/recipients", json={"email": "a@b.co"}).status_code == 201
-    assert client.put(
-        f"{PREFIX}/settings", json=_settings_payload(enabled=True)
-    ).status_code == 200
+    assert client.put(f"{PREFIX}/settings", json=_settings_payload(enabled=True)).status_code == 200
 
 
 def test_a_disabled_recipient_does_not_count_as_someone_to_send_to(admin_client):
     client, _ = admin_client
     assert (
-        client.post(
-            f"{PREFIX}/recipients", json={"email": "a@b.co", "enabled": False}
-        ).status_code
+        client.post(f"{PREFIX}/recipients", json={"email": "a@b.co", "enabled": False}).status_code
         == 201
     )
-    assert client.put(
-        f"{PREFIX}/settings", json=_settings_payload(enabled=True)
-    ).status_code == 422
+    assert client.put(f"{PREFIX}/settings", json=_settings_payload(enabled=True)).status_code == 422
 
 
 @pytest.mark.parametrize("zone", ["Europe/Zurichh", "Not/AZone", "UTC+2"])
@@ -339,9 +330,7 @@ def test_a_valid_non_default_timezone_is_accepted(admin_client):
     """The Phase-1 suite only ever exercised Europe/Zurich; a validator that accepted only that
     would pass every one of those tests."""
     client, _ = admin_client
-    accepted = client.put(
-        f"{PREFIX}/settings", json=_settings_payload(timezone="America/New_York")
-    )
+    accepted = client.put(f"{PREFIX}/settings", json=_settings_payload(timezone="America/New_York"))
     assert accepted.status_code == 200, accepted.text
     assert client.get(f"{PREFIX}/settings").json()["timezone"] == "America/New_York"
 
@@ -689,9 +678,7 @@ def test_hosting_reports_configured_once_all_three_keys_are_present(admin_client
     assert client.get(f"{PREFIX}/hosting").json()["configured"] is True
 
 
-def test_hosting_reports_the_account_the_keys_actually_authenticate_as(
-    admin_client, monkeypatch
-):
+def test_hosting_reports_the_account_the_keys_actually_authenticate_as(admin_client, monkeypatch):
     """`configured` says the keys are SET; only a live lookup says they WORK. A revoked refresh
     token leaves `configured` true for ever while every upload silently falls back to
     inline-only — which is the failure this line exists to expose."""
@@ -835,9 +822,7 @@ async def test_two_overlapping_disables_cannot_empty_an_armed_digest(db_engine, 
     async def second_request() -> None:
         async with async_session() as db:
             target = (
-                await db.execute(
-                    select(DigestRecipient).where(DigestRecipient.id == second_id)
-                )
+                await db.execute(select(DigestRecipient).where(DigestRecipient.id == second_id))
             ).scalar_one()
             assert target.enabled is True  # control: it really is an enabled recipient
             await first_holds_the_lock.wait()
@@ -896,14 +881,10 @@ def test_an_over_long_display_name_is_refused_rather_than_500(admin_client):
     recipient_id = client.post(f"{PREFIX}/recipients", json={"email": "long@example.com"}).json()[
         "id"
     ]
-    refused = client.patch(
-        f"{PREFIX}/recipients/{recipient_id}", json={"display_name": "x" * 256}
-    )
+    refused = client.patch(f"{PREFIX}/recipients/{recipient_id}", json={"display_name": "x" * 256})
     assert refused.status_code == 422, refused.text
     # Control: one character shorter is stored, so the bound is the bound and not a blanket refusal.
-    accepted = client.patch(
-        f"{PREFIX}/recipients/{recipient_id}", json={"display_name": "x" * 255}
-    )
+    accepted = client.patch(f"{PREFIX}/recipients/{recipient_id}", json={"display_name": "x" * 255})
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["display_name"] == "x" * 255
 

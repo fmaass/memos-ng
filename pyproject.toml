@@ -64,6 +64,15 @@ target-version = "py313"
 line-length = 100
 src = ["app", "tests"]
 
+[tool.ruff.format]
+# Stated rather than inherited: the formatter now decides the shape of every Python file in the
+# repo, so the settings that decide it must be reviewable in the diff that changes them — an
+# implicit default silently changes meaning across a ruff upgrade, and a tree-wide reformat is
+# the one change nobody wants to re-litigate. All three ARE ruff's defaults, written down.
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 

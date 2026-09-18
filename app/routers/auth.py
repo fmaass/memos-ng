@@ -445,9 +445,7 @@ async def native_logout(
     device offline. A session cookie is refused here for the same reason from the other side — the
     SPA revokes through `/api/pats/{pat_id}`, which knows which token it is talking about.
     """
-    await db.execute(
-        delete(Pat).where(Pat.hashed_token == hashed_token, Pat.user_id == user.id)
-    )
+    await db.execute(delete(Pat).where(Pat.hashed_token == hashed_token, Pat.user_id == user.id))
     await db.commit()
 
 

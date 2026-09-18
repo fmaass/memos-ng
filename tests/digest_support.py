@@ -528,9 +528,7 @@ class FakeTransport:
         part = len(self.sent) + 1
         if self.raise_on_part == part:
             raise OSError("simulated SMTP connection failure")
-        self.sent.append(
-            SentMail(message=message, sender=sender, recipients=list(recipients))
-        )
+        self.sent.append(SentMail(message=message, sender=sender, recipients=list(recipients)))
         if self.on_sent is not None:
             self.on_sent(part)
         return self.refusals_by_part.get(part, {})
@@ -722,8 +720,7 @@ def jpeg_facts(data: bytes) -> JpegFacts:
                 height=int.from_bytes(payload[1:3], "big"),
                 progressive=marker in _SOF_PROGRESSIVE,
                 sampling=tuple(
-                    (payload[7 + i * 3] >> 4, payload[7 + i * 3] & 0x0F)
-                    for i in range(components)
+                    (payload[7 + i * 3] >> 4, payload[7 + i * 3] & 0x0F) for i in range(components)
                 ),
                 has_icc=has_icc,
             )

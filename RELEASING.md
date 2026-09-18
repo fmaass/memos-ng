@@ -19,7 +19,8 @@ repairs exactly the staleness the checker exists to catch.
 There is no GitHub Actions workflow (retired 2026-08-25 after every run had been refused at
 the billing layer for 40+ runs while the local gates did all the catching). The release gate
 is the LOCAL gate, run bare with each exit code cited:
-`uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q &&
+`uv run pyright app/ && uv run ruff check app/ tests/ scripts/ &&
+uv run ruff format --check app/ tests/ scripts/ && uv run pytest -q &&
 uv run alembic check && scripts/check-mutations.sh`, plus the frontend suite (`npx vitest run`)
 and the version checker above. `scripts/check-mutations.sh` runs the repo-carried mutation
 controls: each patch in `tests/mutations/` is applied in place with a sha256-proven revert and

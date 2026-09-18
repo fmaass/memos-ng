@@ -336,9 +336,12 @@ def test_an_in_flight_run_reloaded_can_still_receive_its_one_terminal_write(db_s
     assert reloaded.status is None
     reloaded.status = "failed"  # must not raise
     db_session.flush()
-    assert db_session.execute(
-        text("SELECT status FROM digest_runs WHERE id = :i"), {"i": run.id}
-    ).scalar_one() == "failed"
+    assert (
+        db_session.execute(
+            text("SELECT status FROM digest_runs WHERE id = :i"), {"i": run.id}
+        ).scalar_one()
+        == "failed"
+    )
 
 
 # --- the migration against a POPULATED database -----------------------------------------------

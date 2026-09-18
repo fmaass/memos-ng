@@ -175,9 +175,7 @@ async def _await_file(path: Path) -> bool:
     return False
 
 
-def test_delete_returns_promptly_while_a_job_row_is_locked(
-    logged_in_client, monkeypatch, tmp_path
-):
+def test_delete_returns_promptly_while_a_job_row_is_locked(logged_in_client, monkeypatch, tmp_path):
     """AC1/AC2: the HTTP DELETE completes while a worker still holds the job's row lock.
 
     The lock is taken exactly as claim_one takes it (SELECT … FOR UPDATE, then the UPDATE to
@@ -250,9 +248,7 @@ def test_transcode_outliving_a_delete_publishes_nothing(monkeypatch, tmp_path):
             try:
                 assert await _await_file(tmp_out), "the stub transcode never started"
                 async with async_session() as api_db:
-                    user = (
-                        await api_db.execute(select(User).where(User.id == owner))
-                    ).scalar_one()
+                    user = (await api_db.execute(select(User).where(User.id == owner))).scalar_one()
                     started = time.monotonic()
                     await asyncio.wait_for(
                         delete_attachment(uid, user, api_db), DELETE_BUDGET_SECONDS

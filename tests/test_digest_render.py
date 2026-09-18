@@ -149,12 +149,10 @@ def test_the_subject_names_the_part_only_when_there_is_more_than_one():
     title = "The Daily Dami Memos Mail"
     assert render.subject_for(title, "July 1, 2026", 1, 1) == f"{title} — July 1, 2026"
     assert (
-        render.subject_for(title, "July 1, 2026", 1, 2)
-        == f"{title} — July 1, 2026 (Part 1 of 2)"
+        render.subject_for(title, "July 1, 2026", 1, 2) == f"{title} — July 1, 2026 (Part 1 of 2)"
     )
     assert (
-        render.subject_for(title, "July 1, 2026", 2, 2)
-        == f"{title} — July 1, 2026 (Part 2 of 2)"
+        render.subject_for(title, "July 1, 2026", 2, 2) == f"{title} — July 1, 2026 (Part 2 of 2)"
     )
 
 
@@ -239,9 +237,7 @@ def test_a_video_whose_mp4_is_not_transcoded_yet_reads_as_processing():
 async def test_max_videos_per_memo_bounds_the_card(data_root):
     for uid in ("v1", "v2", "v3"):
         write_poster(data_root, uid)
-    candidate = _candidate(
-        videos=[_video("v1", 1), _video("v2", 2), _video("v3", 3)]
-    )
+    candidate = _candidate(videos=[_video("v1", 1), _video("v2", 2), _video("v3", 3)])
     links = MediaLinks(by_attachment={1: "u1", 2: "u2", 3: "u3"})
     files = await _encoded([candidate], links)
     cards, _ = render.build_cards(
@@ -325,9 +321,7 @@ async def test_the_html_uses_the_configured_mail_title(data_root):
 
 async def test_the_part_banner_appears_only_in_a_multi_part_mail(data_root):
     groups = await _one_card_groups(data_root)
-    single = render.render_html(
-        groups, subject="s", mail_title="t", date_range="r", memo_count=1
-    )
+    single = render.render_html(groups, subject="s", mail_title="t", date_range="r", memo_count=1)
     multi = render.render_html(
         groups,
         subject="s",
@@ -344,9 +338,7 @@ async def test_the_part_banner_appears_only_in_a_multi_part_mail(data_root):
 async def test_a_memos_ng_link_in_a_memo_never_reaches_the_rendered_html(data_root):
     """The end-to-end shape of AC 4, through the real template."""
     groups = await _one_card_groups(data_root, content=f"[home](https://{MEMOS_HOST}/m/abc)")
-    html = render.render_html(
-        groups, subject="s", mail_title="t", date_range="r", memo_count=1
-    )
+    html = render.render_html(groups, subject="s", mail_title="t", date_range="r", memo_count=1)
     assert MEMOS_HOST not in html
 
 

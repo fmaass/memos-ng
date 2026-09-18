@@ -59,9 +59,7 @@ def disagreements(root: pathlib.Path, tag: str | None = None) -> list[str]:
     if mirrored != version:
         found.append(mismatch("frontend/package.json version", mirrored, npm_fix))
 
-    package_lock = json.loads(
-        (root / "frontend" / "package-lock.json").read_text(encoding="utf-8")
-    )
+    package_lock = json.loads((root / "frontend" / "package-lock.json").read_text(encoding="utf-8"))
     root_package = package_lock.get("packages", {}).get("", {})
     for source, mirrored in (
         ("frontend/package-lock.json .version", package_lock.get("version")),

@@ -58,9 +58,7 @@ async def _upload(bearer, name: str, data: bytes, mime="image/png") -> str:
     )
     assert opened.status_code == 201, opened.text
     uid = opened.json()["upload_uid"]
-    sent = await bearer.patch(
-        f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"}
-    )
+    sent = await bearer.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
     assert sent.status_code == 200, sent.text
     return uid
 

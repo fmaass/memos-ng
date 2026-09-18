@@ -84,9 +84,7 @@ def start_of_local_day_utc(day: date, timezone: str) -> datetime:
     does at `app/__main__.py:37-39`.
     """
     zone = resolve_zone(timezone) or ZoneInfo(FALLBACK_TIMEZONE)
-    return datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(
-        ZoneInfo("UTC")
-    )
+    return datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(ZoneInfo("UTC"))
 
 
 def digest_due(

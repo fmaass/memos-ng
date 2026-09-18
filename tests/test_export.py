@@ -26,9 +26,7 @@ def _attach(memo_uid, att_uid, subject, *, filename, storage_path, mime="image/j
     """Link a ready attachment to a memo (the upload pipeline is exercised in test_uploads)."""
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
-        oid = c.execute(
-            text("SELECT id FROM users WHERE subject=:s"), {"s": subject}
-        ).scalar_one()
+        oid = c.execute(text("SELECT id FROM users WHERE subject=:s"), {"s": subject}).scalar_one()
         mid = c.execute(text("SELECT id FROM memos WHERE uid=:u"), {"u": memo_uid}).scalar_one()
         aid = c.execute(
             text(
@@ -119,9 +117,7 @@ def test_export_carries_media_payload_bytes(logged_in_client, tmp_path):
     assert zf.read(name) == payload
     assert zf.getinfo(name).date_time[:3] == (2019, 7, 4)  # the file's own mtime
     record = next(r for r in json.loads(zf.read("manifest.json")) if r["uid"] == memo["uid"])
-    assert record["media"] == [
-        {"attachment": "att-exp-1", "file": name, "size": len(payload)}
-    ]
+    assert record["media"] == [{"attachment": "att-exp-1", "file": name, "size": len(payload)}]
 
 
 def test_export_notes_a_tier_that_is_not_on_disk(logged_in_client, tmp_path, monkeypatch):

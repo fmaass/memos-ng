@@ -10,12 +10,31 @@ from tests.conftest import SYNC_URL
 # ground truth). Hardcoded here so the contract test is self-contained and CI-safe — the real
 # fixtures are gitignored because they contain private family memo content.
 MEMO_KEYS = {
-    "name", "state", "creator", "createTime", "updateTime", "content", "visibility",
-    "tags", "pinned", "attachments", "relations", "reactions", "property", "snippet",
+    "name",
+    "state",
+    "creator",
+    "createTime",
+    "updateTime",
+    "content",
+    "visibility",
+    "tags",
+    "pinned",
+    "attachments",
+    "relations",
+    "reactions",
+    "property",
+    "snippet",
 }
 ATTACHMENT_KEYS = {
-    "name", "createTime", "filename", "content", "externalLink", "type", "size",
-    "memo", "motionMedia",
+    "name",
+    "createTime",
+    "filename",
+    "content",
+    "externalLink",
+    "type",
+    "size",
+    "memo",
+    "motionMedia",
 }
 
 
@@ -35,8 +54,10 @@ def _seed_memo(c, owner_id, uid, content, visibility, tag=None):
     ).scalar_one()
     if tag:
         tid = c.execute(
-            text("INSERT INTO tags (name) VALUES (:n) ON CONFLICT (name) DO UPDATE SET name=:n "
-                 "RETURNING id"),
+            text(
+                "INSERT INTO tags (name) VALUES (:n) ON CONFLICT (name) DO UPDATE SET name=:n "
+                "RETURNING id"
+            ),
             {"n": tag},
         ).scalar_one()
         c.execute(

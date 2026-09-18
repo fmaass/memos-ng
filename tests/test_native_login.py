@@ -135,9 +135,7 @@ def _handoff_code(client, *, device: str = DEVICE, challenge: str = RFC_CHALLENG
 
 
 def _exchange(client, code: str, verifier: str = RFC_VERIFIER):
-    return client.post(
-        "/api/auth/native/exchange", json={"code": code, "code_verifier": verifier}
-    )
+    return client.post("/api/auth/native/exchange", json={"code": code, "code_verifier": verifier})
 
 
 # --- the IdP request is untouched -----------------------------------------------------------
@@ -478,23 +476,19 @@ def test_native_logout_revokes_only_the_presenting_token(native_oidc):
     second = _exchange(client, _handoff_code(client, device="PhoneTwo")).json()["token"]
 
     anon = TestClient(app, raise_server_exceptions=False)
-    revoked = anon.post(
-        "/api/auth/native/logout", headers={"Authorization": f"Bearer {first}"}
-    )
+    revoked = anon.post("/api/auth/native/logout", headers={"Authorization": f"Bearer {first}"})
     assert revoked.status_code == 204
 
-    assert _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(first))[0][
-        0
-    ] == 0
-    assert _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(second))[0][
-        0
-    ] == 1
     assert (
-        anon.get("/api/memos", headers={"Authorization": f"Bearer {first}"}).status_code == 401
+        _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(first))[0][0]
+        == 0
     )
     assert (
-        anon.get("/api/memos", headers={"Authorization": f"Bearer {second}"}).status_code == 200
+        _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(second))[0][0]
+        == 1
     )
+    assert anon.get("/api/memos", headers={"Authorization": f"Bearer {first}"}).status_code == 401
+    assert anon.get("/api/memos", headers={"Authorization": f"Bearer {second}"}).status_code == 200
 
 
 def test_native_logout_refuses_a_browser_session(logged_in_client):
@@ -630,9 +624,10 @@ async def test_a_token_that_never_expires_is_not_renewable(pat_client):
     resp = await bearer.post("/api/auth/native/renew")
     assert resp.status_code == 400
     assert resp.json()["detail"] == "token_not_renewable"
-    assert _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(token))[0][
-        0
-    ] == 1
+    assert (
+        _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(token))[0][0]
+        == 1
+    )
     assert (await bearer.get("/api/memos")).status_code == 200  # refused, not revoked
 
 
@@ -662,9 +657,7 @@ PAT_COLUMNS = "hashed_token, name, user_id, last_used, created_at, expires_at"
 
 
 def _pat_row(token: str):
-    return _sql(
-        f"SELECT {PAT_COLUMNS} FROM pats WHERE hashed_token = :h", h=auth.hash_token(token)
-    )
+    return _sql(f"SELECT {PAT_COLUMNS} FROM pats WHERE hashed_token = :h", h=auth.hash_token(token))
 
 
 def _bearer() -> TestClient:
@@ -805,9 +798,10 @@ def test_rename_touches_no_sibling(native_oidc):
     assert [r[1] for r in _pat_row(first)] == ["Fabian's iPhone"]
     assert _pat_row(second) == sibling_before
     # Renamed in place — never re-minted beside the old row.
-    assert _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(first))[0][
-        0
-    ] == 1
+    assert (
+        _sql("SELECT count(*) FROM pats WHERE hashed_token = :h", h=auth.hash_token(first))[0][0]
+        == 1
+    )
 
 
 def test_a_rename_is_visible_to_the_next_self_read(native_oidc):
@@ -883,9 +877,12 @@ def test_expired_token_is_401_before_the_route(native_oidc, controlled_clock):
 def test_a_revoked_token_cannot_read_or_rename_itself(native_oidc):
     client, _ = native_oidc
     token = _exchange(client, _handoff_code(client, device="GonePhone")).json()["token"]
-    assert _bearer().post(
-        "/api/auth/native/logout", headers={"Authorization": f"Bearer {token}"}
-    ).status_code == 204
+    assert (
+        _bearer()
+        .post("/api/auth/native/logout", headers={"Authorization": f"Bearer {token}"})
+        .status_code
+        == 204
+    )
 
     assert _self_token(token).status_code == 401
     assert _rename(token, "Resurrected").status_code == 401
@@ -1062,9 +1059,7 @@ def test_aasa_claims_the_domain_for_the_configured_app(client, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/json")
-    assert resp.json() == {
-        "webcredentials": {"apps": ["ABCDE12345.live.discomarder.memosng"]}
-    }
+    assert resp.json() == {"webcredentials": {"apps": ["ABCDE12345.live.discomarder.memosng"]}}
 
 
 @pytest.mark.real_clock

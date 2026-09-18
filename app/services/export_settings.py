@@ -97,9 +97,7 @@ async def print_profile(db: AsyncSession) -> printready.PrintProfile:
     return (await load_config(db)).print_profile
 
 
-async def resolve_print_profile(
-    db: AsyncSession, requested: str | None
-) -> printready.PrintProfile:
+async def resolve_print_profile(db: AsyncSession, requested: str | None) -> printready.PrintProfile:
     """The profile a photo-book request is served at: what it asked for, or what settings say.
 
     `requested is None` means the parameter was OMITTED, which is not the same as asking for

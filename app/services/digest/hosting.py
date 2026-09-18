@@ -303,9 +303,7 @@ class DropboxHost:
         session_id = response.json()["session_id"]
         offset = len(chunk)
         while offset < size:
-            chunk = await to_thread.run_sync(
-                _read_chunk_sync, local_path, offset, CHUNK_SIZE_BYTES
-            )
+            chunk = await to_thread.run_sync(_read_chunk_sync, local_path, offset, CHUNK_SIZE_BYTES)
             if not chunk:
                 break
             response = await self._client.post(
@@ -321,9 +319,7 @@ class DropboxHost:
             )
             await self._beat()
             if response.status_code != 200:
-                raise DropboxError(
-                    f"upload session append failed with HTTP {response.status_code}"
-                )
+                raise DropboxError(f"upload session append failed with HTTP {response.status_code}")
             offset += len(chunk)
         response = await self._client.post(
             UPLOAD_SESSION_FINISH_URL,
@@ -463,9 +459,7 @@ def image_full_source_path(uid: str) -> Path | None:
     return None if resolved is None else resolved[0]
 
 
-async def current_account(
-    *, app_key: str, app_secret: str, refresh_token: str
-) -> str | None:
+async def current_account(*, app_key: str, app_secret: str, refresh_token: str) -> str | None:
     """The Dropbox account the configured keys authenticate as, or None when it cannot be read.
 
     None on EVERY failure — unset keys, a refused refresh, a malformed payload, a timeout: this
@@ -539,9 +533,9 @@ async def resolve_links(
                 videos.append((ref.attachment_id, f"{ref.uid}.mp4", path))
         if link_images_full:
             for ref in candidate.images:
-                path = (image_full_sources or {}).get(
-                    ref.attachment_id
-                ) or image_full_source_path(ref.uid)
+                path = (image_full_sources or {}).get(ref.attachment_id) or image_full_source_path(
+                    ref.uid
+                )
                 if path is not None:
                     images.append((ref.attachment_id, f"{ref.uid}.jpg", path))
 

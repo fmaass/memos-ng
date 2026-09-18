@@ -291,9 +291,7 @@ def test_pat_expiry_is_decided_by_the_stored_instant(logged_in_client):
     )
     assert anon.get("/api/memos", headers=headers).status_code == 401
 
-    _sql(
-        "UPDATE pats SET expires_at = now() + interval '1 hour' WHERE hashed_token = :h", h=hashed
-    )
+    _sql("UPDATE pats SET expires_at = now() + interval '1 hour' WHERE hashed_token = :h", h=hashed)
     assert anon.get("/api/memos", headers=headers).status_code == 200
 
 

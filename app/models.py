@@ -884,9 +884,7 @@ class DigestRun(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     trigger: Mapped[str] = mapped_column(String(16))
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str | None] = mapped_column(String(32))
     memos_sent: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
@@ -1018,9 +1016,7 @@ class DigestHostedMedia(Base):
     shared_link: Mapped[str | None] = mapped_column(Text)
     # When the INTENTION was committed. The reconciliation threshold for a stuck `pending` row is
     # measured from here, because such a row has no `uploaded_at` to be measured from.
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # NULL until the upload succeeds. Retention age is measured from it, so a pending row is never
     # swept on age alone — it is reconciled against the remote first.
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

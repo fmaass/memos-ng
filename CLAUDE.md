@@ -139,7 +139,8 @@ met until its tests exist and pass.
 - **The LOCAL gate is the gate — there is NO CI** (GitHub Actions abandoned, MEMNG-1 cancelled).
   A task is not done until, run **bare** (never piped — a pipe hides the exit code)
   and each exit code cited:
-  `uv run pyright app/ && uv run ruff check app/ tests/ scripts/ && uv run pytest -q && uv run alembic check`
+  `uv run pyright app/ && uv run ruff check app/ tests/ scripts/ &&
+  uv run ruff format --check app/ tests/ scripts/ && uv run pytest -q && uv run alembic check`
   are all green. Never commit while any is RED. The test DB the gate needs: bring it up with
   `docker compose -f compose.dev.yaml up -d` and export
   `DATABASE_URL_SYNC=postgresql+psycopg2://memosng:memosng@localhost:5433/memosng` (pytest and

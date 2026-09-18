@@ -44,9 +44,7 @@ async def mint_grant(db: AsyncSession, user: User) -> tuple[str, datetime]:
     await db.execute(delete(ManagementGrant).where(ManagementGrant.expires_at < now))
     grant = secrets.token_urlsafe(32)
     expires_at = now + timedelta(seconds=settings.MANAGE_GRANT_TTL_S)
-    db.add(
-        ManagementGrant(hashed_grant=hash_grant(grant), user_id=user.id, expires_at=expires_at)
-    )
+    db.add(ManagementGrant(hashed_grant=hash_grant(grant), user_id=user.id, expires_at=expires_at))
     await db.flush()
     return grant, expires_at
 

@@ -68,7 +68,7 @@ def test_yesterdays_run_does_not_suppress_today():
 
 
 def test_a_failed_day_is_not_retried_automatically():
-    """"At most one" is literal: the ledger date is what suppresses, not the run's outcome. The
+    """ "At most one" is literal: the ledger date is what suppresses, not the run's outcome. The
     26 h alert and the admin's Run now are the recovery — which is exactly what a single daily
     timer offered."""
     settings = _settings()
@@ -159,9 +159,9 @@ def test_the_local_date_is_the_same_on_both_sides_of_the_autumn_fold():
 
 def test_late_evening_utc_is_already_tomorrow_in_zurich():
     """The local date is what the ledger keys on, so a UTC date would suppress the wrong day."""
-    assert gate.local_date_of(
-        datetime(2026, 7, 1, 22, 30, tzinfo=UTC), "Europe/Zurich"
-    ) == date(2026, 7, 2)
+    assert gate.local_date_of(datetime(2026, 7, 1, 22, 30, tzinfo=UTC), "Europe/Zurich") == date(
+        2026, 7, 2
+    )
 
 
 # --- an unresolvable zone already in the row ---------------------------------------------------
@@ -191,18 +191,16 @@ def test_a_second_distinct_bad_zone_is_reported_separately():
         gate.digest_due(datetime(2026, 7, 1, 12, tzinfo=UTC), _settings(timezone="Bad/One"), None)
         gate.digest_due(datetime(2026, 7, 1, 12, tzinfo=UTC), _settings(timezone="Bad/Two"), None)
     reported = [
-        entry["timezone"]
-        for entry in logs
-        if entry["event"] == "digest.timezone_unresolvable"
+        entry["timezone"] for entry in logs if entry["event"] == "digest.timezone_unresolvable"
     ]
     assert reported == ["Bad/One", "Bad/Two"]
 
 
 def test_local_date_of_falls_back_rather_than_raising_on_a_bad_zone():
     """A defensive caller about to write a run row still needs a plausible `local_date`."""
-    assert gate.local_date_of(
-        datetime(2026, 7, 1, 6, 0, tzinfo=UTC), "Europe/Zurichh"
-    ) == date(2026, 7, 1)
+    assert gate.local_date_of(datetime(2026, 7, 1, 6, 0, tzinfo=UTC), "Europe/Zurichh") == date(
+        2026, 7, 1
+    )
 
 
 def test_start_of_local_day_is_the_utc_instant_the_local_day_begins():

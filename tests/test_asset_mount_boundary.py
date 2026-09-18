@@ -128,9 +128,7 @@ async def _seed_image(adb, tmp_path, uid: str, lane=JobLane.fast) -> tuple[Attac
     return att, job
 
 
-def test_the_fixture_really_refuses_a_rename_across_the_boundary(
-    split_assets_mount, tmp_path
-):
+def test_the_fixture_really_refuses_a_rename_across_the_boundary(split_assets_mount, tmp_path):
     """The positive control for every test below: without this, a green run would also be what a
     fixture that quietly does nothing produces."""
     import os

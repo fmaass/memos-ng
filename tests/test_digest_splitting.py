@@ -18,8 +18,12 @@ from jinja2 import Environment
 DAY = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
 
 
-def _card(uid: str, photos: list[tuple[str, int]], videos: list[tuple[str, int]] | None = None,
-          link_urls: dict[str, str] | None = None) -> tuple[Card, dict[str, int]]:
+def _card(
+    uid: str,
+    photos: list[tuple[str, int]],
+    videos: list[tuple[str, int]] | None = None,
+    link_urls: dict[str, str] | None = None,
+) -> tuple[Card, dict[str, int]]:
     """A card plus the cid→bytes map its media contributes."""
     links = link_urls or {}
     card = Card(uid=uid, memo_id=abs(hash(uid)) % 100000, content_html="", created_at=DAY)
@@ -330,9 +334,7 @@ def test_the_chip_and_tag_line_allowances_are_what_the_template_actually_renders
     def sizes(count: int) -> tuple[int, int]:
         card = _tagged_card("m", tuple(name for _ in range(count)), "body")
         groups = render.group_by_local_day([card], "Europe/Zurich")
-        html = render.render_html(
-            groups, subject="s", mail_title="t", date_range="r", memo_count=1
-        )
+        html = render.render_html(groups, subject="s", mail_title="t", date_range="r", memo_count=1)
         plain = render.render_plain(groups, subject="s", memo_count=1)
         return len(html.encode("utf-8")), len(plain.encode("utf-8"))
 

@@ -162,18 +162,29 @@ async def test_create_memo_links_only_owners_attachments(adb):
     alice = await _user(adb, "alice")
     bob = await _user(adb, "bob")
     a_att = Attachment(
-        uid="a-att", owner_id=alice.id, filename="a.jpg", mime="image/jpeg",
-        size=1, status=AttachmentStatus.ready,
+        uid="a-att",
+        owner_id=alice.id,
+        filename="a.jpg",
+        mime="image/jpeg",
+        size=1,
+        status=AttachmentStatus.ready,
     )
     b_att = Attachment(
-        uid="b-att", owner_id=bob.id, filename="b.jpg", mime="image/jpeg",
-        size=1, status=AttachmentStatus.ready,
+        uid="b-att",
+        owner_id=bob.id,
+        filename="b.jpg",
+        mime="image/jpeg",
+        size=1,
+        status=AttachmentStatus.ready,
     )
     adb.add_all([a_att, b_att])
     await adb.flush()
 
     memo = await svc.create_memo(
-        adb, alice, content="pics", visibility=Visibility.PRIVATE,
+        adb,
+        alice,
+        content="pics",
+        visibility=Visibility.PRIVATE,
         attachment_uids=["a-att", "b-att"],  # tries to claim bob's too
     )
     await adb.refresh(a_att)
@@ -186,8 +197,13 @@ async def test_create_memo_links_only_owners_attachments(adb):
 async def test_memo_out_serializes_attachment_tier_urls(adb):
     alice = await _user(adb, "alice")
     att = Attachment(
-        uid="att1", owner_id=alice.id, filename="v.mp4", mime="video/mp4",
-        size=1, status=AttachmentStatus.processing, blurhash="LKO2",
+        uid="att1",
+        owner_id=alice.id,
+        filename="v.mp4",
+        mime="video/mp4",
+        size=1,
+        status=AttachmentStatus.processing,
+        blurhash="LKO2",
     )
     adb.add(att)
     await adb.flush()

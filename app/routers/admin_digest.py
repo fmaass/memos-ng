@@ -438,9 +438,7 @@ async def add_digest_recipient(
         # The check above loses to a concurrent POST of the same address; the unique index is what
         # actually decides, and the loser gets the same answer it would have got a moment earlier.
         await db.rollback()
-        raise HTTPException(
-            status_code=409, detail="that address is already a recipient"
-        ) from exc
+        raise HTTPException(status_code=409, detail="that address is already a recipient") from exc
     return _recipient_out(row)
 
 

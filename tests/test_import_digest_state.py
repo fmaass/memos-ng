@@ -479,9 +479,7 @@ async def test_an_empty_registry_executes_without_a_single_delivery(adb, env, tm
 async def test_hosted_media_entries_are_reported_and_never_imported(adb, env, tmp_path):
     await _seed_memos(adb)
     path = tmp_path / "state.json"
-    path.write_text(
-        '{"sent_uids": {}, "hosted_media": {"9": {"kind": "video"}}}', encoding="utf-8"
-    )
+    path.write_text('{"sent_uids": {}, "hosted_media": {"9": {"kind": "video"}}}', encoding="utf-8")
     report = await importer.run_import(
         adb, registry=importer.load_registry(path), env=env, execute=True
     )

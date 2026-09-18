@@ -250,9 +250,7 @@ async def stream_zip(items: AsyncIterator[ExportItem]) -> AsyncIterator[bytes]:
                     media.append({"attachment": entry.uid, "file": entry.arcname, "missing": True})
                     continue
                 handle, stat = opened
-                async for chunk in _media_entry(
-                    zf, sink, entry.arcname, handle, stat, entry.mtime
-                ):
+                async for chunk in _media_entry(zf, sink, entry.arcname, handle, stat, entry.mtime):
                     yield chunk
                 media.append({"attachment": entry.uid, "file": entry.arcname, "size": stat.st_size})
             if item.media:

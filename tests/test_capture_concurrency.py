@@ -218,9 +218,7 @@ async def test_the_second_patch_applies_to_what_the_row_says_after_the_first(
     client, _ = logged_in_client
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
-        memo = client.post(
-            "/api/memos", json={"content": "orig", "visibility": "PRIVATE"}
-        ).json()
+        memo = client.post("/api/memos", json={"content": "orig", "visibility": "PRIVATE"}).json()
 
         entered = asyncio.Event()
         release = asyncio.Event()

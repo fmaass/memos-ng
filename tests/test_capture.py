@@ -232,9 +232,23 @@ def test_the_video_reader_seeks_over_the_samples_instead_of_reading_them(tmp_pat
     clip = tmp_path / "big.mp4"
     subprocess.run(
         [
-            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=s=640x480:d=8:r=25",
-            "-c:v", "libx264", "-crf", "5", "-pix_fmt", "yuv420p",
-            "-metadata", f"creation_time={header['expect']}", "-y", str(clip),
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=s=640x480:d=8:r=25",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "5",
+            "-pix_fmt",
+            "yuv420p",
+            "-metadata",
+            f"creation_time={header['expect']}",
+            "-y",
+            str(clip),
         ],
         check=True,
     )

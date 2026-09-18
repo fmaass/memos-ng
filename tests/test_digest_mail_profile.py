@@ -423,8 +423,7 @@ async def test_the_mail_profile_costs_the_digest_fewer_parts_than_the_raw_tier(e
 
     # The baseline: the very same cards, sized by the bytes of the tier files themselves.
     tier_sizes = {
-        path.name: path.stat().st_size
-        for path in (data_root / "assets" / "mobile").iterdir()
+        path.name: path.stat().st_size for path in (data_root / "assets" / "mobile").iterdir()
     }
     assert len(tier_sizes) == 4
     day_groups = digest_render.group_by_local_day(
@@ -440,9 +439,7 @@ async def test_the_mail_profile_costs_the_digest_fewer_parts_than_the_raw_tier(e
         ],
         "Europe/Zurich",
     )
-    baseline = len(
-        digest_splitting.split_into_parts(day_groups, tier_sizes, cap).parts
-    )
+    baseline = len(digest_splitting.split_into_parts(day_groups, tier_sizes, cap).parts)
 
     assert baseline > 1  # control: the raw tier really did not fit one message
     assert with_profile < baseline

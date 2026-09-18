@@ -91,9 +91,7 @@ async def read_snapshot(db: AsyncSession) -> Snapshot:
         {"statuses": list(SUCCESS_STATUSES), "triggers": list(NON_DELIVERING_TRIGGERS)},
     )
     rows = await db.execute(
-        sa_text(
-            "SELECT status, count(*) FROM digest_runs WHERE status IS NOT NULL GROUP BY status"
-        )
+        sa_text("SELECT status, count(*) FROM digest_runs WHERE status IS NOT NULL GROUP BY status")
     )
     return Snapshot(
         taken_at=time.time(),
