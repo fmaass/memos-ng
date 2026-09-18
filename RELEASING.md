@@ -161,6 +161,43 @@ services:
 After a roll-forward, re-run any backfill the newer release depends on for the rows the OLD code
 created in the meantime (for 1.7.0: `python -m app.scripts.backfill_location --execute`).
 
+## Basemap archives (only when the map's tiles are being republished)
+
+Not part of an ordinary release: the PMTiles archives live on the tiles share and outlive the
+image. When a release does republish them, `scripts/tiles/extract.sh` writes them through
+containers, and **the production tiles share accepts a write only from the share's owner** — from
+inside a container and from the calling shell alike:
+
+    docker pull busybox:stable      # once; the script refuses to start if it is missing
+    scripts/tiles/extract.sh <tiles-dir> <regions.geojson> --user 1027:100
+
+With `--user` the tiles directory must already exist and be writable by that user: creating it is
+itself a write, and in that mode the script performs none as the caller. (Without `--user` it is
+created if missing, as before.)
+
+`--user` is not only the extractor's uid. With it, **nothing in the tiles directory is written by
+the calling shell**: the extraction, the `.tmp` renames that publish each archive, the regions
+sidecar, the pruning of superseded generations and `BUILD` all run in a container as that user.
+Without it none of that changes — the writes are ordinary shell commands and no helper container
+starts, which is what a local tiles directory wants.
+
+The renames need a shell, and the go-pmtiles image is distroless (one binary, an empty
+`/usr/bin`), so they run in a second, small image — `busybox:stable` by default, `--helper-image`
+to name another. **It is never pulled at publish time**: the script checks it is present locally
+before it writes anything, so a missing image or an unreachable registry is a refusal up front
+rather than a failure between an extracted `.tmp` and a published name.
+
+The share is an NFS-mounted Synology export whose ACL decides by numeric uid and masks the unix
+mode, so the 0777 directory still refuses anyone but `1027:100` — the uid the app and worker
+containers run as. `fetch-assets.sh` needs none of this: it writes as the operator into a
+directory the operator may write. The publish order is the script's and stays as it is: planet,
+then the detail archive's regions sidecar, then the detail archive, then `BUILD` last — each
+written to a `.tmp` and renamed, so no half-written file is ever served, `BUILD` never names an
+archive that is not there yet, and a published name is never rewritten or repaired under its own
+name. Names do leave, by one route only: `prune` removes generations older than the previous one,
+together with their regions sidecars. It keeps the newest two of each kind by publication time and
+does not check whether a client is still reading an older one.
+
 ## Acceptance probes (real surface: https://memos.discomarder.live)
 
 1. `GET /health` → `{"status":"ok","version":"<version>+<short-sha>","db":"ok"}` (version read
