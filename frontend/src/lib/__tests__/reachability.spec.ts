@@ -52,6 +52,29 @@ describe('classifyFailure', () => {
     expect(classifyFailure(error)).toBe('request-cancelled')
   })
 
+  // The classifier reads `name` off whatever was thrown rather than testing `instanceof Error`,
+  // because a DOMException's relationship to Error differs between the browser, Node and the
+  // test DOM — and a thrown value that fails the instanceof test would be classified as no
+  // evidence, silently losing the outage it was reporting. These cases are the difference
+  // between the two readings: real DOMExceptions pass under either one.
+  it('classifies a cancellation that is not an Error instance at all', () => {
+    expect(classifyFailure({ name: 'AbortError' })).toBe('request-cancelled')
+  })
+
+  it('classifies a timeout that is not an Error instance at all', () => {
+    expect(classifyFailure({ name: 'TimeoutError' })).toBe('timeout')
+  })
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'Failed to fetch'],
+    ['an object with no name', { message: 'something' }],
+  ])('reads %s as saying nothing about the network', (_label, thrown) => {
+    // Nothing here names a condition, so nothing here may move the verdict either way.
+    expect(classifyFailure(thrown)).toBe('other-error')
+  })
+
   it('reads anything else as saying nothing about the network', () => {
     expect(classifyFailure(new RangeError('bug in our own code'))).toBe('other-error')
   })
