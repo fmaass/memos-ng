@@ -68,14 +68,10 @@ src = ["app", "tests"]
 # Stated rather than inherited: the formatter now decides the shape of every Python file in the
 # repo, so the settings that decide it must be reviewable in the diff that changes them — an
 # implicit default silently changes meaning across a ruff upgrade, and a tree-wide reformat is
-# the one change nobody wants to re-litigate. These three ARE ruff's defaults, written down.
+# the one change nobody wants to re-litigate. All three ARE ruff's defaults, written down.
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
-# The exception, and the only value here that is not a default: code examples inside docstrings
-# are formatted like the code around them, so a doctest cannot drift into a style the gate would
-# reject anywhere else in the file.
-docstring-code-format = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]

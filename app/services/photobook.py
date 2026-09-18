@@ -109,11 +109,11 @@ def effective_dpi(px_w: int | None, px_h: int | None, geom: Geometry) -> float |
     placed at FULL PAGE HEIGHT across at most `max_pages` facing pages, aspect preserved. That is a
     "contain" fit into a box `max_pages` pages wide and one page tall::
 
-        box_w_cm = page_w_cm * max_pages
-        box_h_cm = page_h_cm
-        aspect = px_w / px_h
+        box_w_cm     = page_w_cm * max_pages
+        box_h_cm     = page_h_cm
+        aspect       = px_w / px_h
         printed_w_cm = min(box_w_cm, box_h_cm * aspect)
-        dpi = px_w / (printed_w_cm / 2.54)
+        dpi          = px_w / (printed_w_cm / 2.54)
 
     `min` is what makes `max_pages` a CAP rather than a multiplier: a photo wide enough to run past
     it is cut back to the spread width (width-bound), while a narrower one stops at the page height
