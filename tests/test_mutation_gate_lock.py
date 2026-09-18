@@ -597,6 +597,48 @@ def test_a_run_in_one_worktree_does_not_block_a_run_in_another(
     assert "mutation gate lock" not in other.stderr
 
 
+def _built_tags(sandbox: Sandbox) -> list[str]:
+    """The `-t` value of every docker invocation the stub recorded."""
+    tags = []
+    for _, _, argv in sandbox.docker_record():
+        words = argv.split()
+        tags.append(words[words.index("-t") + 1])
+    return tags
+
+
+def test_the_build_tags_the_deploy_image_unless_told_otherwise(sandbox: Sandbox) -> None:
+    run = sandbox.run("scripts/build-image.sh", "1.7.1+abc1234", timeout=120)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert _built_tags(sandbox) == ["memos-ng:local"]
+
+
+def test_a_compile_check_builds_under_its_own_tag_and_leaves_the_deploy_tag_alone(
+    sandbox: Sandbox,
+) -> None:
+    sandbox.env["IMAGE_TAG"] = "memos-ng:compile-check"
+
+    run = sandbox.run("scripts/build-image.sh", "1.7.1+abc1234", timeout=120)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert _built_tags(sandbox) == ["memos-ng:compile-check"]
+
+
+@pytest.mark.parametrize("tag", ["", "memos-ng:", "other/image:local", "memos-ng:a b"])
+def test_the_build_refuses_a_tag_outside_its_own_image(sandbox: Sandbox, tag: str) -> None:
+    sandbox.env["IMAGE_TAG"] = tag
+
+    run = sandbox.run("scripts/build-image.sh", "1.7.1+abc1234", timeout=120)
+
+    if tag == "":  # unset and empty are the same to the script: the deploy tag
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert _built_tags(sandbox) == ["memos-ng:local"]
+        return
+    assert run.returncode == 2
+    assert "IMAGE_TAG" in run.stderr
+    assert sandbox.docker_record() == [], "it built anyway"
+
+
 def test_the_release_procedure_builds_through_the_script(sandbox: Sandbox) -> None:
     """A documented `docker build` that bypasses the script bypasses both guards with it."""
     releasing = RELEASING.read_text()
