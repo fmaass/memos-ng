@@ -22,6 +22,31 @@ that checkout while it runs — another reader sees mutated source, another writ
 The patch is reversed on interrupt too (EXIT/INT/TERM), and every revert is proved by sha256; if
 one cannot be proved the script stops and names the file to restore by hand.
 
+TWO GUARDS, AND THEY COVER DIFFERENT HAZARDS. Neither substitutes for the other:
+
+  * the uncommitted-changes refusal below is about STATE — an author's unsaved edit to a file a
+    patch touches, which this script's revert would overwrite. It reads the tree once, at the
+    start, and a clean tree satisfies it.
+  * the lock is about TIME — another process reading or writing the same tree WHILE a patch is
+    applied. A clean tree says nothing about that: during a release the tree is clean and a
+    `docker build` with this checkout as its context is reading every file in it. That is not
+    hypothetical: during the 1.7.0 release this script had app/services/uploads.py patched while a
+    build read the same tree, and only a 103-file sha256 comparison afterwards established that the
+    image was clean.
+
+The lock is `mutation-gate.lock` in this working tree's own git directory, taken with flock and
+held for the whole run. The build takes the same lock (see RELEASING.md) and waits for it; this
+script does NOT wait — it refuses immediately, because a gate that silently blocks for minutes
+reads as a hang, while a build that waits simply starts later.
+
+The LOCK needs no cleanup after any exit: an flock lives until the LAST descriptor on that open
+file description is closed, and every descriptor a process owns is closed when it dies — which is
+also exactly why each `uv` child is started with fd 9 closed (see run_uv), so no child of ours can
+keep the lock alive past us. There is no release step to forget. THE TREE IS A DIFFERENT MATTER. A SIGKILL runs no trap, so a run killed
+that way can leave the patch applied, and the lock being free afterwards says nothing about it.
+That is why the build script (scripts/build-image.sh) checks, under the lock, that no tracked file
+differs from HEAD before it builds: waiting for the lock is not by itself proof of a clean tree.
+
 Run from the repository root. For every row of tests/mutations/expected.tsv the script:
 
   * refuses to start if the file that row's patch touches has uncommitted changes, so the
@@ -105,8 +130,22 @@ for case in ET.parse(sys.argv[1]).iter("testcase"):
     print(kind + "\t" + "::".join(part for part in [path, *classes, name] if part))
 '
 
+# THE one place a `uv` child is started. Every one of them runs with fd 9 — the mutation gate
+# lock — CLOSED. The lock is this process's hold, and it is released only when the LAST descriptor
+# on it closes: a child that inherited fd 9 and outlives us (a pytest still winding down after a
+# kill, a parse) would go on holding the lock of a run that is gone, and the next gate run would be
+# refused for nothing. Note what this does NOT claim: it says nothing about the state of the tree.
+# A run killed with SIGKILL runs no trap and can leave a patch applied, and that is caught by the
+# build's own HEAD comparison, never by who holds the lock. Closing fd 9 also keeps --selftest
+# honest, where leg 5 kills a run and leg 6 immediately starts another. Callers keep their own
+# redirections and `env` prefix; this wrapper adds only the one that must never be forgotten at a
+# new call site.
+run_uv() {
+    "$@" 9>&-
+}
+
 parse_junit_cases() {
-    uv run python -c "$PARSE_PY" "$1"
+    run_uv uv run python -c "$PARSE_PY" "$1"
 }
 
 # pytest's own count of failures and errors, from its summary line only — an unanchored search of
@@ -381,6 +420,24 @@ fi
 # ------------------------------------------------------------------------------------------
 toplevel=$(git rev-parse --show-toplevel 2> /dev/null) || die "not a git repository"
 [ "$toplevel" = "$PWD" ] || die "run from the repository root ($toplevel), not $PWD"
+
+# --absolute-git-dir, not --git-common-dir: what has to be serialised is one WORKING TREE, because
+# that is what a patch is applied to and what a build reads as its context. The common dir is
+# shared by every linked worktree of this repository, so a lock there would make a mutation run in
+# one worktree block a build in another that cannot see its patches at all — two agents on two
+# worktrees queueing behind each other for nothing. The per-worktree git dir is exactly the scope
+# of the hazard. (Plain --git-dir prints a bare `.git` in a main checkout, which would resolve
+# against whatever directory the caller happened to be in; the absolute form is the same answer,
+# spelled so it cannot drift.)
+gitdir=$(git rev-parse --absolute-git-dir 2> /dev/null) || die "cannot locate the git directory"
+LOCKFILE="$gitdir/mutation-gate.lock"
+exec 9> "$LOCKFILE" || die "cannot open the mutation gate lock at $LOCKFILE"
+if ! flock -n 9; then
+    printf 'check-mutations: another process holds the mutation gate lock (%s).\n' "$LOCKFILE" >&2
+    printf 'check-mutations: a build reading this checkout and a mutation run patching it must not overlap.\n' >&2
+    printf 'check-mutations: nothing was patched. Wait for it to finish and run this again.\n' >&2
+    exit 2
+fi
 [ -f "$MANIFEST" ] || die "no manifest at $MANIFEST"
 [ -f "$MODULE" ] || die "no $MODULE"
 command -v uv > /dev/null 2>&1 || die "uv is not on PATH"
@@ -507,7 +564,7 @@ mapfile -t control_modules < <(printf '%s\n' "${modules[@]}" | LC_ALL=C sort -u)
 for control_module in "${control_modules[@]}"; do
     control_log="$logdir/control-$(printf '%s' "$control_module" | tr '/.' '__').log"
     echo "control: running $control_module with $MARKER_VAR removed from the environment (must exit 0)"
-    env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null
+    run_uv env -u "$MARKER_VAR" uv run pytest -q "$control_module" > "$control_log" 2>&1 < /dev/null
     control_rc=$?
     if [ "$control_rc" -eq 0 ]; then
         echo "control: PASS — the unmutated $control_module exits 0"
@@ -545,7 +602,7 @@ for i in "${!patches[@]}"; do
         continue
     fi
 
-    env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
+    run_uv env "$MARKER_VAR=$marker" uv run pytest -q -o junit_family=xunit1 --junitxml="$xml" \
         "$module" > "$log" 2>&1 < /dev/null
     rc=$?
 
