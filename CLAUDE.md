@@ -187,7 +187,9 @@ met until its tests exist and pass.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
   ADR-0013 **2316**, ADR-0014 **2584**, ADR-0015 **3152** (native client; PAT bearer; HTTPS
   callback brokered by the BFF), ADR-0016 **3209** (universal links skipped — the custom scheme is
-  the permanent deep-link lane).
+  the permanent deep-link lane), ADR-0017 **3307** (daily digest absorbed into memos-ng, the
+  satellite retired), ADR-0018 **3828** (Places map: coordinates in Postgres, one whole-set
+  markers endpoint, client-side clustering, self-hosted PMTiles basemap).
 - Sibling project **memos-ng-ios** (the reference iOS repo): book **3153** (Decisions **3154**,
   Session Reviews **3155**), Project Overview **3158**, doctrine "Reference iOS Architecture"
   **3156**, ADR-0001 **3157**.
