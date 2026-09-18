@@ -29,6 +29,25 @@ a registry — the deploy image is built locally (below), so there is no `ghcr.i
 Trivy gate; run the local `docker build` before deploy to catch slim-image/wheel breakage. Tag
 agreement is enforced *before* tagging via the checker's `--tag`.
 
+### The Places browser smoke — mandatory for changes under `frontend/src/**/places/`
+
+Any release whose range touches `frontend/src/**/places/` (the map view, its components or its
+pure libraries) additionally runs, from `frontend/`, bare:
+
+```
+npm ci && npm run build && npm run smoke:places
+```
+
+A real headless Chromium opens the PRODUCTION build at `/places` on a desktop viewport
+(1440x900) and a phone one (390x844) against synthetic committed fixtures, and exits non-zero on
+any console error, any failed request, and any first-view pin that falls outside the map pane or
+behind the timeline bar. It exists because happy-dom cannot run MapLibre: 1.7.0 shipped a
+basemap with no icons and pins hidden under the bar past 913 green unit tests and two audit
+rounds. The browser is found via `PLACES_SMOKE_CHROME`, else the newest Playwright build under
+`PLAYWRIGHT_BROWSERS_PATH`/`~/.cache/ms-playwright`, else a system Chromium; with none it fails
+with a message saying so. `playwright-core` is a devDependency and downloads no browser on
+install.
+
 ## Migrations
 
 Alembic. Applied automatically at app-container boot (`docker-entrypoint.sh` runs
