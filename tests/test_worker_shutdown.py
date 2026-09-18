@@ -288,12 +288,23 @@ async def test_a_stop_in_the_claim_time_progress_clear_still_requeues_inside_the
 
     monkeypatch.setattr(media, "clear_progress", hanging_clear_progress)
 
+    # Driven by hand, like the hung-write proof below: docker's grace is the BOUND, so a stop that
+    # spends it on best-effort cleanup fails as an assertion instead of hanging the suite.
+    supervisor = asyncio.create_task(worker.run())
     try:
-        async with _supervisor():
-            async with asyncio.timeout(60):
-                await clearing.wait()
-            assert _read_claim(jid)[0] == "processing", _read_claim(jid)
-            started = time.monotonic()
+        async with asyncio.timeout(60):
+            await clearing.wait()
+        assert _read_claim(jid)[0] == "processing", _read_claim(jid)
+        started = time.monotonic()
+        supervisor.cancel()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                async with asyncio.timeout(STOP_GRACE_SECONDS):
+                    await supervisor
+        except TimeoutError:
+            raise AssertionError(
+                f"the stop hung on best-effort cleanup past docker's {STOP_GRACE_SECONDS}s grace"
+            ) from None
         elapsed = time.monotonic() - started
         assert _read_claim(jid) == ("queued", 0, None), (
             f"a stop in the claim-time cleanup stranded the row: {_read_claim(jid)}"
@@ -303,6 +314,10 @@ async def test_a_stop_in_the_claim_time_progress_clear_still_requeues_inside_the
             f"the stop waited {elapsed:.1f}s on best-effort cleanup, past docker's grace"
         )
     finally:
+        supervisor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await supervisor
         _cleanup(subject, aid)
 
 
