@@ -370,11 +370,25 @@ async def test_a_queued_video_is_not_started_while_the_host_is_too_hot(
     starts: no ffmpeg process, no `processing` row, no attempt charged. Cooling is then the only
     thing that changes, and the same video runs, which is what makes the refusal a gate rather
     than a stuck queue.
+
+    The row cannot say WHERE the refusal happened: the slow path has a thermal check of its own,
+    and a video claimed while hot, deferred in there and requeued reads exactly like one that was
+    never claimed — queued, unclaimed, no attempt — while a defer log line names no consumer. So
+    the claim itself is watched: while the sensor reads hot, nobody may reach it.
     """
     hot = (settings.THERMAL_MAX_C + 5) * 1000  # derived from the limit, never a literal
     cool = (settings.THERMAL_MAX_C - 30) * 1000
     sensor = {"millideg": hot}  # hot BEFORE the worker starts: the video is never offered cool
     monkeypatch.setattr(media, "read_temp_millideg", lambda: sensor["millideg"])
+    hot_claims: list[str | None] = []
+    real_claim_one = worker.claim_one
+
+    async def _watched_claim_one(db, **kwargs):
+        if sensor["millideg"] == hot:
+            hot_claims.append(kwargs.get("job_class"))
+        return await real_claim_one(db, **kwargs)  # the real claim runs; this only keeps a record
+
+    monkeypatch.setattr(worker, "claim_one", _watched_claim_one)
     gate = tmp_path / "release-the-transcode"
     monkeypatch.setattr(media, "slow_ffmpeg_cmd", _parked_cmd(gate))
     subject = "hot_transcode_owner"
@@ -392,6 +406,11 @@ async def test_a_queued_video_is_not_started_while_the_host_is_too_hot(
                     lambda: len(defers()) >= 3 or _started(tmp_path, uid_v).exists(),
                     "the transcode consumer to defer the queued video while the host is too hot",
                     give_up_after=30.0,  # a gate that never fires must not cost the full bound
+                )
+                # First, because it is the one verdict that does not depend on WHEN the row is read:
+                # a claim made while hot stays on this list even after the row is queued again.
+                assert hot_claims == [], (
+                    f"a consumer reached the claim while the host was too hot: {hot_claims}"
                 )
                 state_v, attempts_v, claimed_v = _read_claim(jid_v)
                 assert not _started(tmp_path, uid_v).exists(), (
