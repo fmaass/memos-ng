@@ -1,22 +1,41 @@
 <script setup lang="ts">
 import { useQuery } from '@tanstack/vue-query'
 import Skeleton from 'primevue/skeleton'
-import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, useTemplateRef } from 'vue'
+import {
+  computed,
+  onBeforeUnmount,
+  onMounted,
+  onUnmounted,
+  ref,
+  shallowRef,
+  useTemplateRef,
+} from 'vue'
 import { useRouter } from 'vue-router'
 
 import ClusterDrawer from '@/components/places/ClusterDrawer.vue'
 import InViewGrid from '@/components/places/InViewGrid.vue'
-import PlacesMap from '@/components/places/PlacesMap.vue'
+import { asyncMapComponent } from '@/components/places/asyncMap'
+// Type only: a value import here would put the whole map chunk back on the route's critical path.
+import type PlacesMap from '@/components/places/PlacesMap.vue'
 import { useApi } from '@/composables/useApi'
 import { useMediaLightbox } from '@/composables/useMediaLightbox'
 import type { MapMarker } from '@/lib/places/geo'
 import { memoPath, toLightboxItems } from '@/lib/places/lightbox'
+import { loadPlacesMap } from '@/lib/places/loadMap'
 import { viewerTarget } from '@/lib/places/order'
 import { placesStatus } from '@/lib/places/state'
 
 const api = useApi()
 const router = useRouter()
 const mapRef = useTemplateRef<InstanceType<typeof PlacesMap>>('map')
+
+// The map is a megabyte of MapLibre and the only code the service worker does not precache, so
+// the route may not block on it: the shell paints, the pane says it is loading, and a chunk that
+// never arrives gets a way to ask again (a fresh component — see `asyncMapComponent`).
+const mapComponent = shallowRef(asyncMapComponent(loadPlacesMap, retryMap))
+function retryMap() {
+  mapComponent.value = asyncMapComponent(loadPlacesMap, retryMap)
+}
 
 const { data, isPending, isError } = useQuery({
   queryKey: ['map', 'markers'],
@@ -112,7 +131,8 @@ const drawerOpen = computed({
 <template>
   <div class="flex h-[calc(100vh-3.5rem)] flex-col" data-test="view-places">
     <div class="relative h-[55vh] shrink-0 md:h-full md:shrink">
-      <PlacesMap
+      <component
+        :is="mapComponent"
         ref="map"
         :markers="markers"
         @cluster-open="onClusterOpen"
