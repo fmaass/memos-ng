@@ -1974,8 +1974,30 @@ export interface components {
             assets_commit: string | null;
             /** Build */
             build: string | null;
-            detail: components["schemas"]["MapArchive"] | null;
-            planet: components["schemas"]["MapArchive"] | null;
+            /**
+             * MapArchive
+             * @description One published basemap archive.
+             */
+            detail: {
+                /** Name */
+                name: string;
+                /** Size */
+                size: number;
+                /** Url */
+                url: string;
+            } | null;
+            /**
+             * MapArchive
+             * @description One published basemap archive.
+             */
+            planet: {
+                /** Name */
+                name: string;
+                /** Size */
+                size: number;
+                /** Url */
+                url: string;
+            } | null;
             /** Uncovered */
             uncovered: number | null;
         };
