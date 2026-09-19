@@ -76,6 +76,18 @@ HOUSEKEEPING_BOUNDS: dict[str, int] = {
     "frame_share_drain": 120,
     # Two indexed reads and a CAS on one row. Generous by two orders of magnitude; anything near
     # this is the database being unreachable, not a slow query.
+    #
+    # What THIS bound can cost, written down because nothing in the code recovers it: the CAS is
+    # the claim, and `claim_run` commits it inside the call. A database that stalls for ~30 s
+    # exactly across that commit lets the bound expire AFTER the row was claimed, so the supervisor
+    # reads the fallback `None`, never spawns the run, and no later poll can adopt it — the claim
+    # is `heartbeat_at IS NOT NULL` and `digest_runs` records no owner, so a claimed-but-unspawned
+    # row is indistinguishable from one a live worker is executing, and adopting it on a hunch is
+    # how two workers send the same digest. The operator loses that one "Run now": the stale-run
+    # sweep marks the row `failed` after 15 minutes of silence, and pressing Run now again then
+    # works (the single-inflight index only refuses while the dead row is still NULL-status). Worth
+    # more than it costs to fix: recovering it automatically needs an owner column and another
+    # query on this poll path, to close a window that a 30 s database stall has to open first.
     "adopt_manual_digest": 30,
     "digest_is_due": 30,
     # Deletes expired upload sessions and unlinks their part files under plain FOR UPDATE (no SKIP
