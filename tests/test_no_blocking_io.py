@@ -123,7 +123,10 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         ("app/services/media.py", "guard_publish", "discard_outputs"): 1,
         ("app/services/media.py", "process_slow", "too_hot"): 1,
         ("app/services/media.py", "process_slow", "mkdir"): 1,
-        ("app/services/media.py", "process_slow", "unlink"): 1,
+        # TWO: the partial's unlink in the run's `finally`, and the finished temp's on the stop
+        # path at the publish checkpoint — both synchronous for the same reason, that an await
+        # there can be interrupted before the unlink ever happens.
+        ("app/services/media.py", "process_slow", "unlink"): 2,
         ("app/services/media.py", "process_slow", "os.replace"): 1,
         ("app/services/media.py", "process_slow", "_stamp_mtime"): 1,
         # ONE, not two: only the FAST lane's Pillow decode is still inline. The slow lane's heavy

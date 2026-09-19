@@ -1520,7 +1520,20 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     # The delete endpoint does not wait for this job, so the attachment may have gone away during
     # the transcode. Check under the row lock BEFORE publishing: past this point the tmp file
     # becomes the served web tier, and republishing it after a delete would resurrect it.
-    await guard_publish(db, job, attachment)  # sweeps tmp + any tier files when the delete won
+    try:
+        await guard_publish(db, job, attachment)  # sweeps tmp + any tier files when the delete won
+    except asyncio.CancelledError:
+        # A stop delivered at guard_publish's own first await skips that sweep, and nothing else
+        # reaps a `.tmp.mp4`: a delete that landed before ffmpeg created this one took the job row
+        # with the attachment, so the cancel path's conditional requeue moves no row and the job
+        # never runs again. Unlike the light lane's fence this asks the database nothing — the only
+        # file this run has on disk is its own unpublished temp, which even a live attachment's
+        # requeued run re-transcodes from scratch rather than resuming. That keeps the transcode
+        # path's stop budget where it is (RELEASING.md): it can afford no further bounded second.
+        # blocking-ok: one unlink, on a stop path where an await could be interrupted before it
+        # ever happened — the same reason the `finally` above stays synchronous.
+        tmp.unlink(missing_ok=True)
+        raise
     # blocking-ok: the publish must follow guard_publish's row-lock check with no yield point in
     # between — an await here would hand the loop back between "the attachment still exists" and
     # the rename that resurrects its file. Worker-only either way.
@@ -1572,6 +1585,27 @@ async def _discard_on_stop_if_gone(attachment_id: int, uid: str) -> None:
         logger.warning("printready_cancel_sweep_unfinished", attachment_id=attachment_id, uid=uid)
     except Exception:
         logger.exception("printready_cancel_sweep_error", attachment_id=attachment_id, uid=uid)
+
+
+async def _guard_publish_fenced(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
+    """guard_publish, plus the same fence for a stop delivered AT ITS OWN first await.
+
+    guard_publish begins with `SELECT … FOR UPDATE` on the job row, so a stop can land inside it —
+    between a publish that has already happened and the sweep that is supposed to follow it. The
+    cancellation then comes out of this call and the checkpoint never gets to sweep anything, which
+    is the permanent leak _discard_on_stop_if_gone describes: the delete took the job row with the
+    attachment, so nothing requeues and no later run passes the checkpoint either.
+
+    Every site that publishes before its checkpoint goes through here. The wait-out fences above
+    are its other half and cannot both fire for one job: a stop that the wait-out absorbs re-raises
+    before the checkpoint is ever reached, so the light path's stop budget still carries exactly
+    one CANCEL_SWEEP_TIMEOUT_SECONDS (RELEASING.md).
+    """
+    try:
+        await guard_publish(db, job, attachment)
+    except asyncio.CancelledError:
+        await _discard_on_stop_if_gone(attachment.id, attachment.uid)
+        raise
 
 
 async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
@@ -1646,7 +1680,7 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
         raise
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
-    await guard_publish(db, job, attachment)
+    await _guard_publish_fenced(db, job, attachment)
 
 
 async def process_job(db: AsyncSession, job: MediaJob) -> None:
@@ -1699,8 +1733,12 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
                         await asyncio.shield(decode)  # re-shielded: a second stop must not win
                 if not decode.cancelled():
                     decode.exception()  # retrieved: not logged as a never-retrieved failure
+                # The thread published its tiers while the stop was waiting for it, and the
+                # checkpoint below is never reached — so its fence is applied here instead, as
+                # process_printready_job does for the rendition it waits out.
+                await _discard_on_stop_if_gone(attachment.id, attachment.uid)
                 raise
-            await guard_publish(db, job, attachment)
+            await _guard_publish_fenced(db, job, attachment)
             attachment.width = meta.get("width")
             attachment.height = meta.get("height")
             attachment.blurhash = meta.get("blurhash")
@@ -1713,7 +1751,9 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     # the slow-lane branch above — CPU-bound, worker-only, nothing concurrent to starve.
     meta = process_video_poster(attachment) if is_video else process_image(attachment)
 
-    await guard_publish(db, job, attachment)
+    # Fenced for the one window a stop has here: the decode above is inline, so the checkpoint's
+    # own first await is the only place a cancellation can land after those tiers are published.
+    await _guard_publish_fenced(db, job, attachment)
     attachment.width = meta.get("width")
     attachment.height = meta.get("height")
     attachment.duration = meta.get("duration")
