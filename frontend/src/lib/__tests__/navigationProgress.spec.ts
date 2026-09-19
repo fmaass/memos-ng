@@ -167,6 +167,21 @@ describe('createNavigationProgress', () => {
     expect(h.scheduled()).toEqual([])
   })
 
+  it('takes the bar down for a navigation it never saw start', () => {
+    // A push to the location the viewer is already on is answered with a DUPLICATED failure:
+    // vue-router runs no `beforeEach` for it, but it has already made it the pending location —
+    // the stalled navigation is abandoned — and it still reaches `afterEach`. That report is the
+    // newest thing the viewer asked for, so the bar is over.
+    const h = harness()
+    h.progress.started(navigation('resources'))
+    h.advance(NAV_PROGRESS_DELAY_MS)
+    expect(h.progress.visible()).toBe(true)
+
+    h.progress.ended(navigation('home'))
+    expect(h.progress.visible()).toBe(false)
+    expect(h.scheduled()).toEqual([])
+  })
+
   it('ignores an end that belongs to no navigation it is showing', () => {
     const h = harness()
     h.progress.ended(navigation('stale'))

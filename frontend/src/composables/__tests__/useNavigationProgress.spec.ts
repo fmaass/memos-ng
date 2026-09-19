@@ -171,6 +171,20 @@ describe('useNavigationProgress', () => {
     expect(visible.value).toBe(false)
   })
 
+  it('takes the bar down when a tap on the open route abandons a stalled one', async () => {
+    // Tap Resources, then tap Home while its chunk is still out. vue-router answers the second
+    // tap with a DUPLICATED failure: no guard runs, so the bar never hears it start — but that
+    // tap has already doomed the Resources navigation, whose chunk may never settle at all.
+    void router.push('/slow').catch(() => {})
+    await flush()
+    vi.advanceTimersByTime(NAV_PROGRESS_DELAY_MS)
+    expect(visible.value).toBe(true)
+
+    await router.push('/')
+    await flush()
+    expect(visible.value).toBe(false)
+  })
+
   it('hands beforeEach, afterEach and onError one and the same location object', async () => {
     // The identity the bar is keyed on. vue-router builds `toLocation` once per navigation and
     // passes that object to every hook — a claim this composable would silently fail without.

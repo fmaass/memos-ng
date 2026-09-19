@@ -33,6 +33,9 @@ export function createNavigationProgress(deps: NavigationProgressDeps): Navigati
   let current: NavigationId | null = null
   let visible = false
   let timer: unknown = null
+  /** Weak: the router's locations outlive nothing here, and a navigation is never asked about
+   * again once it has been reported. */
+  const everStarted = new WeakSet<NavigationId>()
 
   function show(next: boolean) {
     if (visible === next) return
@@ -54,6 +57,7 @@ export function createNavigationProgress(deps: NavigationProgressDeps): Navigati
 
   return {
     started(id) {
+      everStarted.add(id)
       current = id
       // One timer covers the whole wait: it is armed by the first navigation still out, and a
       // second tap mid-wait must not push the bar further away.
@@ -64,10 +68,14 @@ export function createNavigationProgress(deps: NavigationProgressDeps): Navigati
       }, delayMs)
     },
     ended(id) {
-      // Only the navigation the bar is speaking for may take it down. The router reports a
-      // superseded one only once its chunk finally arrives — taps later — and a redirect never
-      // reports the leg it replaced at all; counting either would move the wrong bar.
-      if (id !== current) return
+      // Two halves, and both are load-bearing. A navigation that DID start and has since been
+      // superseded is reported only once its own chunk finally arrives — taps later — so its
+      // report may not move a bar that now speaks for something else. But a report for a
+      // navigation that never started is a newer one that skipped its start: vue-router answers
+      // a push to the open location with a DUPLICATED failure, running no guard, and that tap
+      // has already abandoned whatever was pending. It answers the viewer's latest tap, so it
+      // takes the bar down — otherwise the bar waits on a chunk nobody is going to use.
+      if (id !== current && everStarted.has(id)) return
       idle()
     },
     visible: () => visible,
