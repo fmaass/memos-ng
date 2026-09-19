@@ -18,7 +18,12 @@ export default defineConfig({
       strategies: 'injectManifest',
       srcDir: 'src',
       filename: 'sw.ts',
-      registerType: 'autoUpdate',
+      // NOT 'autoUpdate': in that mode the plugin's own registration helper reloads the page the
+      // moment a new worker activates (node_modules/vite-plugin-pwa/dist/client/build/register.js
+      // lines 38-45, `if (auto) … window.location.reload()`), which throws away whatever is being
+      // typed. The hand-written worker still calls skipWaiting()/clientsClaim(), so the new build
+      // takes control either way; when to actually load it is decided in `lib/buildRefresh`.
+      registerType: 'prompt',
       injectManifest: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         // The map chunk and MapLibre's worker are ~1 MB that only /places needs. Precaching them

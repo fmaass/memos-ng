@@ -73,9 +73,18 @@ export function decideOnChunkFailure(input: ChunkFailureInput): { action: ChunkF
   if (!isChunkLoadError(input.error)) return { action: 'ignore' }
 
   const key = chunkReloadMarkerKey(input.target)
+  // Blocked cookies/storage and Safari's private mode make every `sessionStorage` touch throw —
+  // and without storage there is no loop guard, so reloading would be a bet on the reload
+  // working. The message is the safe half of the contract: it never loops.
+  let raw: string | null
+  try {
+    raw = input.storage.getItem(key)
+  } catch {
+    return { action: 'message' }
+  }
+
   // `Number(null)` is 0, which would read as a marker stamped at the epoch — an absent marker has
   // to be turned into NaN by hand or the very first failure decides it has already reloaded.
-  const raw = input.storage.getItem(key)
   const stamped = raw ? Number(raw) : Number.NaN
   const age = input.now - stamped
   // A marker that is unreadable, or stamped in the future by a clock change, counts as absent.
@@ -83,8 +92,43 @@ export function decideOnChunkFailure(input: ChunkFailureInput): { action: ChunkF
     return { action: 'message' }
   }
 
-  input.storage.setItem(key, String(input.now))
+  try {
+    input.storage.setItem(key, String(input.now))
+  } catch {
+    // The marker could not be recorded, so a reload would come back to exactly this point.
+    return { action: 'message' }
+  }
   return { action: 'reload' }
+}
+
+/** Where the document is right now — only the parts that decide whether `assign` navigates. */
+export interface CurrentLocation {
+  pathname: string
+  search: string
+}
+
+export type FullLoadPlan = { kind: 'assign'; url: string } | { kind: 'reload' }
+
+/**
+ * `location.assign(url)` for a URL that differs from the current one only by its fragment is a
+ * same-document navigation: the fragment scrolls, nothing is fetched, and the stale build stays.
+ * Same for assigning the identical URL. Those cases need `location.reload()` instead.
+ */
+export function decideFullLoad({
+  target,
+  current,
+}: {
+  target: string
+  current: CurrentLocation
+}): FullLoadPlan {
+  const hashAt = target.indexOf('#')
+  const beforeHash = hashAt === -1 ? target : target.slice(0, hashAt)
+  const queryAt = beforeHash.indexOf('?')
+  const path = queryAt === -1 ? beforeHash : beforeHash.slice(0, queryAt)
+  const search = queryAt === -1 ? '' : beforeHash.slice(queryAt)
+
+  if (path === current.pathname && search === current.search) return { kind: 'reload' }
+  return { kind: 'assign', url: target }
 }
 
 /** Whether this page owes the user a full load onto the build that took over. */
@@ -124,4 +168,22 @@ export function consumeFullLoad(state: BuildRefreshState): BuildRefreshState {
 /** A background tab polling for updates spends the user's bytes for nothing. */
 export function shouldCheckForUpdate({ visibility }: { visibility: string }): boolean {
   return visibility === 'visible'
+}
+
+export interface UpdateCheckDeps {
+  registration: { update(): Promise<unknown> }
+  visibility: () => string
+  schedule: (check: () => void, everyMs: number) => unknown
+}
+
+/**
+ * Asks the service worker whether a newer build exists, on an interval, while the page is
+ * visible. The check is a network request like any other: offline, or a 502 from the proxy, it
+ * rejects — and an unhandled rejection there would surface as an error the user cannot act on.
+ */
+export function scheduleUpdateChecks(deps: UpdateCheckDeps): void {
+  deps.schedule(() => {
+    if (!shouldCheckForUpdate({ visibility: deps.visibility() })) return
+    void deps.registration.update().catch(() => undefined)
+  }, BUILD_UPDATE_POLL_MS)
 }

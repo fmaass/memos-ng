@@ -10,7 +10,7 @@ import { registerSW } from 'virtual:pwa-register'
 
 import { installReachability } from './api/reachability'
 import App from './App.vue'
-import { BUILD_UPDATE_POLL_MS, shouldCheckForUpdate } from './lib/buildRefresh'
+import { scheduleUpdateChecks } from './lib/buildRefresh'
 import { loadPlacesMap, recordStylesheetFailures } from './lib/places/loadMap'
 import { idleSchedule, MAP_WARMUP_DELAY_MS, scheduleMapWarmup } from './lib/mapWarmup'
 import router, { wireBuildRefresh } from './router'
@@ -23,9 +23,11 @@ registerSW({
   immediate: true,
   onRegisteredSW(_swScriptUrl, registration) {
     if (!registration) return
-    window.setInterval(() => {
-      if (shouldCheckForUpdate({ visibility: document.visibilityState })) void registration.update()
-    }, BUILD_UPDATE_POLL_MS)
+    scheduleUpdateChecks({
+      registration,
+      visibility: () => document.visibilityState,
+      schedule: (check, everyMs) => window.setInterval(check, everyMs),
+    })
   },
 })
 
@@ -34,9 +36,24 @@ registerSW({
 wireBuildRefresh({
   onError: (handler) => router.onError(handler),
   beforeEach: (guard) => router.beforeEach(guard),
-  storage: sessionStorage,
+  // Every `sessionStorage` touch is deferred into these closures: with cookies blocked, merely
+  // READING the property throws, and at this point that would take the whole bootstrap down.
+  storage: {
+    getItem: (key) => sessionStorage.getItem(key),
+    setItem: (key, value) => {
+      sessionStorage.setItem(key, value)
+    },
+    removeItem: (key) => {
+      sessionStorage.removeItem(key)
+    },
+  },
   now: () => Date.now(),
+  currentLocation: () => ({
+    pathname: window.location.pathname,
+    search: window.location.search,
+  }),
   assign: (url) => window.location.assign(url),
+  reload: () => window.location.reload(),
   serviceWorker: 'serviceWorker' in navigator ? navigator.serviceWorker : undefined,
 })
 

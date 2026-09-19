@@ -4,10 +4,12 @@ import {
   BUILD_UPDATE_POLL_MS,
   CHUNK_RELOAD_MARKER_TTL_MS,
   consumeFullLoad,
+  decideFullLoad,
   decideOnChunkFailure,
   initialBuildRefreshState,
   isChunkLoadError,
   noteControllerChange,
+  scheduleUpdateChecks,
   shouldCheckForUpdate,
   shouldFullLoadOnNavigation,
   type ReloadMarkerStorage,
@@ -147,6 +149,124 @@ describe('decideOnChunkFailure', () => {
     expect(
       decideOnChunkFailure({ error: chunkError, target: '/places', storage, now: 1_500 }),
     ).toEqual({ action: 'reload' })
+  })
+})
+
+describe('decideOnChunkFailure with storage that throws', () => {
+  const chunkError = new TypeError('Failed to fetch dynamically imported module: /assets/x.js')
+  const boom = () => {
+    throw new DOMException('The operation is insecure.', 'SecurityError')
+  }
+
+  it('shows the message rather than reloading blind when the marker cannot be read', () => {
+    const storage: ReloadMarkerStorage = { getItem: boom, setItem: boom, removeItem: boom }
+
+    expect(
+      decideOnChunkFailure({ error: chunkError, target: '/places', storage, now: 1_000 }),
+    ).toEqual({ action: 'message' })
+  })
+
+  it('shows the message when the marker cannot be written', () => {
+    const readable = fakeStorage()
+    const storage: ReloadMarkerStorage = { ...readable, setItem: boom }
+
+    expect(
+      decideOnChunkFailure({ error: chunkError, target: '/places', storage, now: 1_000 }),
+    ).toEqual({ action: 'message' })
+  })
+})
+
+describe('decideFullLoad', () => {
+  it('reloads when the target differs from the current URL only by its fragment', () => {
+    expect(
+      decideFullLoad({ target: '/places#memo-7', current: { pathname: '/places', search: '' } }),
+    ).toEqual({ kind: 'reload' })
+  })
+
+  it('reloads when the target is the current URL', () => {
+    expect(
+      decideFullLoad({
+        target: '/search?q=trip',
+        current: { pathname: '/search', search: '?q=trip' },
+      }),
+    ).toEqual({ kind: 'reload' })
+  })
+
+  it('assigns when the path differs', () => {
+    expect(
+      decideFullLoad({ target: '/settings', current: { pathname: '/places', search: '' } }),
+    ).toEqual({ kind: 'assign', url: '/settings' })
+  })
+
+  it('assigns when only the query differs — that IS a document load', () => {
+    expect(
+      decideFullLoad({ target: '/search?q=trip', current: { pathname: '/search', search: '' } }),
+    ).toEqual({ kind: 'assign', url: '/search?q=trip' })
+  })
+})
+
+describe('scheduleUpdateChecks', () => {
+  function scheduler() {
+    let tick: (() => void) | undefined
+    return {
+      schedule: (check: () => void, everyMs: number) => {
+        tick = check
+        return everyMs
+      },
+      run: () => {
+        if (!tick) throw new Error('nothing was scheduled')
+        tick()
+      },
+    }
+  }
+
+  it('asks the registration for an update while the page is visible', () => {
+    const update = vi.fn(() => Promise.resolve())
+    const clock = scheduler()
+    scheduleUpdateChecks({
+      registration: { update },
+      visibility: () => 'visible',
+      schedule: clock.schedule,
+    })
+
+    clock.run()
+
+    expect(update).toHaveBeenCalledTimes(1)
+  })
+
+  it('asks for nothing while the page is hidden', () => {
+    const update = vi.fn(() => Promise.resolve())
+    const clock = scheduler()
+    scheduleUpdateChecks({
+      registration: { update },
+      visibility: () => 'hidden',
+      schedule: clock.schedule,
+    })
+
+    clock.run()
+
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('swallows a failed update check instead of leaving a rejection unhandled', async () => {
+    const rejection = new Error('Failed to fetch')
+    const clock = scheduler()
+    const unhandled: unknown[] = []
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      unhandled.push(event.reason)
+    }
+    window.addEventListener('unhandledrejection', onUnhandled)
+    scheduleUpdateChecks({
+      registration: { update: () => Promise.reject(rejection) },
+      visibility: () => 'visible',
+      schedule: clock.schedule,
+    })
+
+    expect(() => clock.run()).not.toThrow()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    window.removeEventListener('unhandledrejection', onUnhandled)
+
+    expect(unhandled).toEqual([])
   })
 })
 
