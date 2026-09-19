@@ -126,6 +126,9 @@ describe('ResourcesView', () => {
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
     wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
 
+    // Both halves, or the case says nothing: with no handler supplied the viewer offers the action
+    // on no slide at all, and an empty memoUid would then pass for the wrong reason.
+    expect(lightboxOpen.mock.calls[0][2].onShowInMemo).toBeTypeOf('function')
     expect(lightboxOpen.mock.calls[0][0][0].memoUid).toBeNull()
   })
 
