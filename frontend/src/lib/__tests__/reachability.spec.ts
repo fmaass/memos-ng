@@ -243,4 +243,16 @@ describe('reduceReachability — recovery', () => {
   it('does not ask for a refetch on every successful request while already reachable', () => {
     expect(reduceReachability(initialReachabilityState(), 'success', 0).effects).toEqual([])
   })
+
+  // The blip the banner never showed: one failure, answered again inside the debounce window, so
+  // the verdict never reached `unreachable` and nothing was ever paused. It still has to ask for
+  // a refetch — a `retry: false` query that failed in there has nothing else to wake it.
+  it('asks for a refetch when a blip that only reached suspect answers again', () => {
+    const blip = { status: 'suspect' as const, failures: 1, streakStartedAt: 0 }
+    const { state, effects } = reduceReachability(blip, 'probe-ok', 900)
+    expect(state).toEqual(initialReachabilityState())
+    expect(effects).toEqual([{ type: 'stop-probing' }, { type: 'refetch' }])
+    // Exactly one — a recovery that asked twice would double every refetch behind it.
+    expect(effects.filter((effect) => effect.type === 'refetch')).toHaveLength(1)
+  })
 })
