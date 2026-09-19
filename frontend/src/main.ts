@@ -10,14 +10,48 @@ import { registerSW } from 'virtual:pwa-register'
 
 import { installReachability } from './api/reachability'
 import App from './App.vue'
+import { buildRegisterSWOptions } from './lib/buildRefresh'
 import { loadPlacesMap, recordStylesheetFailures } from './lib/places/loadMap'
 import { idleSchedule, MAP_WARMUP_DELAY_MS, scheduleMapWarmup } from './lib/mapWarmup'
-import router from './router'
+import router, { wireBuildRefresh } from './router'
 import './style.css'
 import 'primeicons/primeicons.css'
 
-// Register the app-shell + Web Push service worker; autoUpdate swaps in new versions.
-registerSW({ immediate: true })
+// Register the app-shell + Web Push service worker. A page left open across a deploy would
+// otherwise never ask again — so while it is visible, ask hourly. When to actually load the new
+// build is decided in `lib/buildRefresh`, NOT by the plugin's helper (see buildRegisterSWOptions).
+registerSW(
+  buildRegisterSWOptions({
+    visibility: () => document.visibilityState,
+    schedule: (check, everyMs) => window.setInterval(check, everyMs),
+  }),
+)
+
+// A dead lazy route (its chunk gone with the old build) reloads once onto the current build, and a
+// build that takes over mid-session is picked up on the next navigation — never mid-typing.
+wireBuildRefresh({
+  onError: (handler) => router.onError(handler),
+  beforeEach: (guard) => router.beforeEach(guard),
+  // Every `sessionStorage` touch is deferred into these closures: with cookies blocked, merely
+  // READING the property throws, and at this point that would take the whole bootstrap down.
+  storage: {
+    getItem: (key) => sessionStorage.getItem(key),
+    setItem: (key, value) => {
+      sessionStorage.setItem(key, value)
+    },
+    removeItem: (key) => {
+      sessionStorage.removeItem(key)
+    },
+  },
+  now: () => Date.now(),
+  currentLocation: () => ({
+    pathname: window.location.pathname,
+    search: window.location.search,
+  }),
+  assign: (url) => window.location.assign(url),
+  reload: () => window.location.reload(),
+  serviceWorker: 'serviceWorker' in navigator ? navigator.serviceWorker : undefined,
+})
 
 // The plugin builds its own client when it is not given one (`new QueryClient(undefined)` in
 // `@tanstack/vue-query`'s vueQueryPlugin.ts), and nothing outside the component tree can then reach
