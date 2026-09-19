@@ -31,16 +31,19 @@ const linkFor = (href = HREF) =>
 
 /** Let the repair get as far as it can: it then waits on the replacement's own events. */
 async function settle() {
-  for (let i = 0; i < 10; i++) await Promise.resolve()
-  await new Promise((resolve) => setTimeout(resolve, 0))
+  for (let round = 0; round < 3; round++) {
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
 }
 
-beforeEach(() => {
-  // The record of failed links outlives a test, as it outlives a navigation in the browser. The
-  // repair empties it as it starts, so calling it (nothing waits for it) is how a test begins
-  // with a document that has failed nothing.
-  document.head.replaceChildren()
-  void repairFailedStylesheets().catch(() => {})
+beforeEach(async () => {
+  // The list of failed links outlives a test, as it outlives a navigation in the browser, and
+  // only a replacement that loads takes one off it. So: repair whatever is left over, let every
+  // replacement load, and each test starts on a document that has failed nothing.
+  const drain = repairFailedStylesheets()
+  for (const link of document.head.querySelectorAll('link')) link.dispatchEvent(new Event('load'))
+  await drain.catch(() => {})
   document.head.replaceChildren()
   recordStylesheetFailures(document)
 })
@@ -113,6 +116,55 @@ describe('loadPlacesMap', () => {
     linkFor()!.dispatchEvent(new Event('load'))
     await settle()
     expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  it('holds every caller on the one repair that is in flight', async () => {
+    // The warm-up and the pane share this loader, so both can want the repair at once; the viewer
+    // leaving Places and coming straight back does it too. A caller that walked past an
+    // unfinished repair would import the chunk with the stylesheet still missing, and Vite's
+    // helper never appends that one again — an unstyled map, for good.
+    failedLink()
+    const settled: string[] = []
+    const record = (name: string) => (outcome: unknown) => {
+      settled.push(outcome instanceof Error ? `${name} failed` : name)
+    }
+    void repairFailedStylesheets().then(record('first'), record('first'))
+    void loadPlacesMap().then(record('loader'), record('loader'))
+    void repairFailedStylesheets().then(record('second'), record('second'))
+    await settle()
+
+    // One failed link, one replacement: the later callers joined the repair that was running
+    // rather than each starting one of their own.
+    const replacements = document.head.querySelectorAll(`link[href="${HREF}"]`)
+    expect(replacements).toHaveLength(1)
+    expect(settled).toEqual([])
+
+    replacements[0].dispatchEvent(new Event('load'))
+    await settle()
+    expect([...settled].sort()).toEqual(['first', 'loader', 'second'])
+  })
+
+  it('keeps the failure recorded when the replacement fails, and tries again after', async () => {
+    failedLink()
+    const first = repairFailedStylesheets()
+    const second = repairFailedStylesheets()
+    await settle()
+
+    const replacement = linkFor()!
+    replacement.dispatchEvent(new Event('error'))
+    await expect(first).rejects.toThrow(/map-abc123\.css/)
+    await expect(second).rejects.toThrow(/map-abc123\.css/)
+
+    // The rejection reaches every caller — and the next attempt is a real one: the failure is
+    // still on the list, and a NEW element, because the browser would answer the burned one from
+    // its memory of that failure.
+    const third = loadPlacesMap()
+    await settle()
+    const next = linkFor()!
+    expect(next).not.toBe(replacement)
+
+    next.dispatchEvent(new Event('load'))
+    await expect(third).resolves.toMatchObject({ default: { name: 'PlacesMap' } })
   })
 
   it('imports straight away when no stylesheet has failed', async () => {
