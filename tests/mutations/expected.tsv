@@ -13,3 +13,8 @@ tests/mutations/heif_iinf_count.patch	heif_iinf_count	test_a_structure_the_walke
 tests/mutations/heif_meta_version.patch	heif_meta_version	test_a_structure_the_walker_cannot_trust_is_declined[meta-version]		tests/test_heif_exif_headers.py
 tests/mutations/heif_reference_early_return.patch	heif_reference_early_return	test_the_whole_table_is_validated_before_a_match_in_it_is_believed[reference-over-counted-after-the-match]		tests/test_heif_exif_headers.py
 tests/mutations/heif_item_early_return.patch	heif_item_early_return	test_the_whole_table_is_validated_before_a_match_in_it_is_believed[iloc-short-of-its-count-after-the-match]		tests/test_heif_exif_headers.py
+# Three probes, not one: the claim being COMMITTED before the work is a property with three
+# separate consequences, and the flush takes all three away at once — the row is invisible to
+# another connection while the work runs, the claiming session stays idle-in-transaction across
+# it, and a claim that was only flushed does not survive an outcome write that fails.
+tests/mutations/claim_flush.patch	claim_flush	test_failure_record_commit_error_leaves_job_for_the_stale_sweep test_run_once_commits_the_claim_before_processing test_result_commits_when_processing_outlasts_idle_in_transaction_timeout		tests/test_media.py
