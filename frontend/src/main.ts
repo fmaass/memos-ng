@@ -10,14 +10,35 @@ import { registerSW } from 'virtual:pwa-register'
 
 import { installReachability } from './api/reachability'
 import App from './App.vue'
+import { BUILD_UPDATE_POLL_MS, shouldCheckForUpdate } from './lib/buildRefresh'
 import { loadPlacesMap, recordStylesheetFailures } from './lib/places/loadMap'
 import { idleSchedule, MAP_WARMUP_DELAY_MS, scheduleMapWarmup } from './lib/mapWarmup'
-import router from './router'
+import router, { wireBuildRefresh } from './router'
 import './style.css'
 import 'primeicons/primeicons.css'
 
-// Register the app-shell + Web Push service worker; autoUpdate swaps in new versions.
-registerSW({ immediate: true })
+// Register the app-shell + Web Push service worker; autoUpdate swaps in new versions. A page left
+// open across a deploy would otherwise never ask again — so while it is visible, ask hourly.
+registerSW({
+  immediate: true,
+  onRegisteredSW(_swScriptUrl, registration) {
+    if (!registration) return
+    window.setInterval(() => {
+      if (shouldCheckForUpdate({ visibility: document.visibilityState })) void registration.update()
+    }, BUILD_UPDATE_POLL_MS)
+  },
+})
+
+// A dead lazy route (its chunk gone with the old build) reloads once onto the current build, and a
+// build that takes over mid-session is picked up on the next navigation — never mid-typing.
+wireBuildRefresh({
+  onError: (handler) => router.onError(handler),
+  beforeEach: (guard) => router.beforeEach(guard),
+  storage: sessionStorage,
+  now: () => Date.now(),
+  assign: (url) => window.location.assign(url),
+  serviceWorker: 'serviceWorker' in navigator ? navigator.serviceWorker : undefined,
+})
 
 // Reachability drives TanStack Query's online state from here on, not `navigator.onLine`.
 installReachability()
