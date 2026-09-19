@@ -35,6 +35,7 @@ from app import worker
 from app.database import async_session
 from app.services import media
 from sqlalchemy import create_engine, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.conftest import SYNC_URL
 
@@ -419,6 +420,204 @@ async def test_a_requeue_write_that_never_answers_still_ends_the_consumer_cancel
         assert elapsed < STOP_GRACE_SECONDS, f"the hung write held the stop for {elapsed:.1f}s"
         assert _read_claim(jid)[0] == "processing", (
             "the write was supposed to hang, so the row must be left for the stale-claim sweep"
+        )
+    finally:
+        supervisor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await supervisor
+        _cleanup(subject, aid)
+
+
+class _EventSpy:
+    """Every event name the worker logs, with the real logger still doing its job.
+
+    For the proofs that have to say a log did NOT happen: "no requeue was announced" is a claim
+    about the stop path's decision, and reading it off the row would pass for a stop that decided
+    nothing at all.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.events: list[str] = []
+
+    def __getattr__(self, name: str):
+        method = getattr(self._real, name)
+
+        def record(event, *args, **kwargs):
+            self.events.append(event)
+            return method(event, *args, **kwargs)
+
+        return record
+
+
+def _park_the_claim_commit(monkeypatch, jid: int, *, after_the_database: bool) -> asyncio.Event:
+    """Park a consumer INSIDE run_once's claim commit, on the chosen side of the database.
+
+    That commit is the one await on the way into an attempt that no test had ever stopped in, and
+    it has two sides with opposite answers: past it the claim is DURABLE and only a hand-back frees
+    the row, before it the claim is a flush in a transaction nobody will commit.
+
+    Armed by the real `claim_one` on the session that just claimed OUR job, so the park is that
+    session's next commit and nothing else's — both consumers and every side-session (the requeue's
+    own, the progress clear's) commit through this same wrapper.
+    """
+    reached = asyncio.Event()
+    armed: list[AsyncSession] = []
+    real_claim_one = worker.claim_one
+    real_commit = AsyncSession.commit
+
+    async def arming_claim_one(db, *args, **kwargs):
+        job = await real_claim_one(db, *args, **kwargs)
+        if job is not None and job.id == jid:
+            armed.append(db)
+        return job
+
+    async def parked_commit(self, *args, **kwargs):
+        parking = bool(armed) and armed[0] is self
+        if parking:
+            armed.clear()
+            if not after_the_database:
+                reached.set()
+                await asyncio.sleep(3600)  # stopped before Postgres is ever asked to COMMIT
+        await real_commit(self, *args, **kwargs)
+        if parking and after_the_database:
+            reached.set()
+            await asyncio.sleep(3600)  # stopped with the claim already accepted
+
+    monkeypatch.setattr(worker, "claim_one", arming_claim_one)
+    monkeypatch.setattr(AsyncSession, "commit", parked_commit)
+    return reached
+
+
+def _watch_requeue_decisions(monkeypatch) -> list[tuple[int, int]]:
+    """The (job, rows changed) verdict of every conditional hand-back the stop path decided to make
+    — the decision point itself, which an end-state row alone cannot distinguish from inaction."""
+    decisions: list[tuple[int, int]] = []
+    real_conditional = worker._requeue_claim_conditional
+
+    async def watched_conditional(job_id: int, claim: str) -> int:
+        rows = await real_conditional(job_id, claim)
+        decisions.append((job_id, rows))
+        return rows
+
+    monkeypatch.setattr(worker, "_requeue_claim_conditional", watched_conditional)
+    return decisions
+
+
+async def test_a_stop_inside_the_accepted_claim_commit_hands_the_row_back(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+    tmp_path,
+):
+    """A stop delivered in the claim commit, PAST the database's yes, must still free the row.
+
+    This is the one window the cancel handler did not cover: the commit that makes `processing`
+    durable sat above the `try`, so a cancellation raised out of it went straight past the
+    hand-back. The row it stranded is the worst kind — claimed, durable, and owned by a claim
+    identity that died with the commit it was never told had landed — and `_order_guard` withholds
+    every LATER job of that attachment for the two hours until the stale-claim sweep.
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    subject = "shutdown_commit_owner"
+    _seed_owner(subject)
+    aid, jid, _uid = _seed_image(subject, tmp_path)
+
+    committed = _park_the_claim_commit(monkeypatch, jid, after_the_database=True)
+    decisions = _watch_requeue_decisions(monkeypatch)
+
+    supervisor = asyncio.create_task(worker.run())
+    try:
+        async with asyncio.timeout(60):
+            await committed.wait()
+        assert _read_claim(jid)[0] == "processing", (
+            f"the claim was supposed to be durable before the stop: {_read_claim(jid)}"
+        )
+        consumer = next(t for t in asyncio.all_tasks() if t.get_name() == "media-consumer-light")
+        supervisor.cancel()
+        try:
+            # suppress OUTSIDE the bound, as everywhere here: the expected CancelledError must not
+            # be mistaken for the deadline's own.
+            with contextlib.suppress(asyncio.CancelledError):
+                async with asyncio.timeout(STOP_GRACE_SECONDS):
+                    await supervisor
+        except TimeoutError:
+            raise AssertionError(
+                f"a stop inside the claim commit held the process past docker's "
+                f"{STOP_GRACE_SECONDS}s grace"
+            ) from None
+        assert _read_claim(jid) == ("queued", 0, None), (
+            f"a stop inside the claim commit stranded the row: {_read_claim(jid)}"
+        )
+        assert decisions == [(jid, 1)], (
+            f"the stop did not hand the freshly committed claim back: {decisions}"
+        )
+        assert jid in await _claimable_now("light"), "the requeued job is not claimable at once"
+        assert consumer.cancelled(), (
+            "the consumer did not end as a cancellation, so the stop became an error path"
+        )
+    finally:
+        supervisor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await supervisor
+        _cleanup(subject, aid)
+
+
+async def test_a_stop_before_the_claim_commit_lands_requeues_nothing(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+    tmp_path,
+):
+    """The other side of the same commit: a claim the database never accepted is not this stop's.
+
+    Putting the commit under the cancel handler means the handler now also runs for attempts whose
+    claim exists only as a flush in a transaction that will be rolled back. Such a row is `queued`
+    for everybody else, so the conditional write must find nothing and announce nothing — an
+    unconditional hand-back here would be a requeue of a job that was never claimed, and a
+    `media_job_requeued_on_cancel` for it would be a lie in the deploy log.
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    subject = "shutdown_uncommitted_owner"
+    _seed_owner(subject)
+    aid, jid, _uid = _seed_image(subject, tmp_path)
+
+    committing = _park_the_claim_commit(monkeypatch, jid, after_the_database=False)
+    decisions = _watch_requeue_decisions(monkeypatch)
+    spy = _EventSpy(worker.logger)
+    monkeypatch.setattr(worker, "logger", spy)
+
+    supervisor = asyncio.create_task(worker.run())
+    try:
+        async with asyncio.timeout(60):
+            await committing.wait()
+        assert _read_claim(jid)[0] == "queued", (
+            f"the claim was supposed to be uncommitted before the stop: {_read_claim(jid)}"
+        )
+        started = time.monotonic()
+        supervisor.cancel()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                async with asyncio.timeout(STOP_GRACE_SECONDS):
+                    await supervisor
+        except TimeoutError:
+            raise AssertionError(
+                f"a stop before the claim commit held the process past docker's "
+                f"{STOP_GRACE_SECONDS}s grace"
+            ) from None
+        elapsed = time.monotonic() - started
+        assert decisions == [(jid, 0)], (
+            f"the stop did not decide AGAINST handing back a claim nobody committed: {decisions}"
+        )
+        assert "media_job_requeued_on_cancel" not in spy.events, (
+            "the stop announced a requeue for a row that was never claimed"
+        )
+        assert _read_claim(jid) == ("queued", 0, None), (
+            f"the uncommitted claim outlived the stop: {_read_claim(jid)}"
+        )
+        assert elapsed < worker.CANCEL_REQUEUE_TIMEOUT_SECONDS, (
+            f"the hand-back waited {elapsed:.1f}s — it blocked on the lock the rolled-back claim "
+            "still held instead of reading past it"
         )
     finally:
         supervisor.cancel()
