@@ -427,7 +427,7 @@ async def api_fallback(path: str):
     return JSONResponse({"detail": f"/api/{path} not found"}, status_code=404)
 
 
-def resolve_spa_file(path: str) -> Path:
+def resolve_spa_file(path: str, root: Path = FRONTEND_DIR) -> Path:
     """Map a SPA request to a real file under dist, else index.html.
 
     Uses Path.is_relative_to (NOT a lexical startswith, which would let a
@@ -437,28 +437,40 @@ def resolve_spa_file(path: str) -> Path:
     Blocking (resolve + is_file touch the disk) and deliberately kept sync: callers on the
     event loop run it through to_thread.run_sync.
     """
-    dist = FRONTEND_DIR.resolve()
-    candidate = (FRONTEND_DIR / path).resolve()
+    dist = root.resolve()
+    candidate = (root / path).resolve()
     if candidate.is_relative_to(dist) and candidate.is_file():
         return candidate
-    return FRONTEND_DIR / "index.html"
+    return root / "index.html"
 
 
 # SPA static serving (frontend/dist is produced by the Vite build stage in Docker).
-if FRONTEND_DIR.is_dir():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
+def mount_spa(target: FastAPI, frontend_dir: Path) -> None:
+    """Register the SPA tiers on `target`: /assets, then the shell catch-all (order matters).
 
-    @app.get("/{path:path}", include_in_schema=False)
+    Takes the app and the directory rather than reading the module globals so the tiers can be
+    stood up over a fixture tree: frontend/dist is a build output and exists only in the image,
+    so in a checkout the branch below is the only one that ever runs.
+    """
+    if not frontend_dir.is_dir():
+        logger.warning("frontend_not_built", path=str(frontend_dir))
+
+        @target.get("/{path:path}", include_in_schema=False)
+        async def serve_spa_fallback(path: str):
+            return JSONResponse(
+                {"error": "Frontend not built. Run 'npm run build' in frontend/."},
+                status_code=503,
+            )
+
+        return
+
+    target.mount("/assets", StaticFiles(directory=frontend_dir / "assets"), name="assets")
+
+    @target.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
         # Highest-fan-out route in the app (every non-/api URL), and its resolve()+is_file()
         # hit the bind-mounted volume — off the event loop.
-        return FileResponse(await to_thread.run_sync(resolve_spa_file, path))
-else:
-    logger.warning("frontend_not_built", path=str(FRONTEND_DIR))
+        return FileResponse(await to_thread.run_sync(resolve_spa_file, path, frontend_dir))
 
-    @app.get("/{path:path}", include_in_schema=False)
-    async def serve_spa_fallback(path: str):
-        return JSONResponse(
-            {"error": "Frontend not built. Run 'npm run build' in frontend/."},
-            status_code=503,
-        )
+
+mount_spa(app, FRONTEND_DIR)
