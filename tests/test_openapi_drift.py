@@ -186,6 +186,13 @@ def test_a_nullable_reference_becomes_an_inline_nullable_copy_of_its_target():
     # The target keeps its own place: other properties may reference it, nullable or not.
     assert document["components"]["schemas"]["Archive"] == ARCHIVE
 
+    # And keeps it independently. A shallow copy satisfies every assertion above while handing the
+    # copy and the target the SAME nested dicts, so a later edit of one property's schema — the
+    # next pass of this very walk included — would rewrite the model for everything referencing it.
+    detail["properties"]["name"]["type"] = "integer"
+    detail["required"].append("part_of")
+    assert document["components"]["schemas"]["Archive"] == ARCHIVE
+
 
 def test_the_parents_own_keywords_survive_the_inlining():
     from app.main import collapse_nullable_anyof
@@ -215,6 +222,43 @@ def test_a_reference_that_does_not_resolve_stops_the_schema():
         collapse_nullable_anyof(_document(_nullable_ref("Missing")))
     assert "#/properties/detail" in str(raised.value)
     assert "Missing" in str(raised.value)
+
+
+def test_a_reference_outside_this_document_stops_the_schema():
+    """Only the served document is in hand when it is built; nothing else can be resolved, and a
+    reference left unresolved is a null arm sent to the generator."""
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = _document({"anyOf": [{"$ref": "https://example.test/Archive"}, {"type": "null"}]})
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "#/properties/detail" in str(raised.value)
+
+
+def test_a_reference_that_lands_on_something_other_than_a_schema_stops_the_schema():
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = {
+        "components": {"schemas": {"Archive": ["not", "a", "schema"]}},
+        "properties": {"detail": _nullable_ref()},
+    }
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "#/properties/detail" in str(raised.value)
+
+
+def test_a_reference_arm_carrying_sibling_keywords_stops_the_schema():
+    """A `$ref` beside other keywords is two descriptions of one schema; deciding which of them
+    the client should believe is not this rewrite's call to make."""
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = _document(
+        {"anyOf": [{"$ref": "#/components/schemas/Archive", "title": "Detail"}, {"type": "null"}]}
+    )
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "#/properties/detail" in str(raised.value)
+    assert "title" in str(raised.value)
 
 
 @pytest.mark.parametrize(
