@@ -1,4 +1,4 @@
-import { onlineManager } from '@tanstack/vue-query'
+import { onlineManager, QueryClient } from '@tanstack/vue-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { installReachability } from '@/api/reachability'
@@ -13,8 +13,8 @@ describe('installReachability', () => {
     const unsubscribe = onlineManager.subscribe(() => {})
     const add = vi.spyOn(window, 'addEventListener')
 
-    installReachability()
-    installReachability()
+    installReachability(new QueryClient())
+    installReachability(new QueryClient())
 
     // Twice called, once wired — a second install must add no listener and reset no state.
     expect(add.mock.calls.filter(([type]) => type === 'online')).toHaveLength(1)

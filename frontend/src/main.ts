@@ -1,6 +1,6 @@
 import { definePreset } from '@primeuix/themes'
 import Aura from '@primeuix/themes/aura'
-import { VueQueryPlugin } from '@tanstack/vue-query'
+import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
@@ -19,8 +19,14 @@ import 'primeicons/primeicons.css'
 // Register the app-shell + Web Push service worker; autoUpdate swaps in new versions.
 registerSW({ immediate: true })
 
+// The plugin builds its own client when it is not given one (`new QueryClient(undefined)` in
+// `@tanstack/vue-query`'s vueQueryPlugin.ts), and nothing outside the component tree can then reach
+// it. Recovery from a blip has to invalidate through the SAME client the app queries against, so
+// it is created here and handed to both.
+const queryClient = new QueryClient()
+
 // Reachability drives TanStack Query's online state from here on, not `navigator.onLine`.
-installReachability()
+installReachability(queryClient)
 
 // Brand primary = indigo (matches the PWA manifest theme_color #6366f1); raw Aura
 // otherwise defaults to emerald, which is off-brand.
@@ -44,7 +50,7 @@ const MemosPreset = definePreset(Aura, {
 
 createApp(App)
   .use(router)
-  .use(VueQueryPlugin)
+  .use(VueQueryPlugin, { queryClient })
   .use(PrimeVue, {
     // Weeks start on Monday (deep-merged into the default locale, so day/month names are kept).
     locale: { firstDayOfWeek: 1 },
