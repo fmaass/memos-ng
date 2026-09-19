@@ -18,7 +18,7 @@ from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.routing import BaseRoute
-from starlette.types import Scope
+from starlette.types import Receive, Scope, Send
 
 from app import auth
 from app.config import settings
@@ -452,21 +452,47 @@ def resolve_spa_file(path: str, root: Path = FRONTEND_DIR) -> Path:
 # round-trip is what a phone on the VPN pays before a lazy route (/places, ~1 MB) can even start.
 ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 # The shell's names are stable instead, so it has to be revalidated: an index.html kept across a
-# deploy names chunks that are gone. `no-cache` is "revalidate", not "don't store" — FileResponse
-# already sends an ETag, so the steady state is a 304 and nothing is re-downloaded.
+# deploy names chunks that are gone. `no-cache` is "revalidate", not "don't store". The
+# revalidation costs the full couple of KB: FileResponse sends an ETag but evaluates no
+# If-None-Match (unlike StaticFiles above), so the catch-all always answers 200. Cheap enough
+# against a round-trip the client pays anyway, and not worth hand-rolling validator comparison
+# into the highest-fan-out route in the app.
 SHELL_CACHE_CONTROL = "no-cache"
 
 
 class HashedAssetFiles(StaticFiles):
-    """StaticFiles for the content-hashed tier, with the immutable header on every answer.
+    """StaticFiles for the content-hashed tier: immutable, never ranged.
 
-    Set on the response rather than at the mount so it also rides the 304, which is what a
-    revalidating client gets for the rest of the year.
+    Ranges are refused because the compressor wraps this mount: FileResponse would cut the slice
+    out of the identity file and the compressor would then gzip it, so `Content-Range` and the
+    strong ETag would describe a representation the client never received — a browser resuming an
+    interrupted download would splice that onto its partial entry and reassemble garbage. A server
+    may always ignore Range (RFC 9110 §14.2) and the full 200 replaces the partial entry; nothing
+    under assets/ (JS, CSS, fonts) is large enough or seekable enough to want ranges anyway. The
+    tiers that DO serve ranges — media, the basemap archives — are their own routes, uncompressed.
     """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Dropped before StaticFiles builds the response: FileResponse reads them straight off the
+        # scope, so this is the only place that decides for both the response and its body.
+        scope = dict(scope)
+        scope["headers"] = [
+            (name, value) for name, value in scope["headers"] if name not in (b"range", b"if-range")
+        ]
+        await super().__call__(scope, receive, send)
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         response = await super().get_response(path, scope)
+        # On the response rather than at the mount so both also ride the 304, which is what a
+        # revalidating client gets for the rest of the year.
         response.headers["Cache-Control"] = ASSET_CACHE_CONTROL
+        if response.status_code == 304:
+            # The compressor adds Vary downstream of here and never sees a body to compress on a
+            # 304, so the negotiation dimension the stored 200 carries has to be restated
+            # (RFC 9110 §15.4.5).
+            response.headers["Vary"] = "Accept-Encoding"
+        else:
+            response.headers["Accept-Ranges"] = "none"
         return response
 
 

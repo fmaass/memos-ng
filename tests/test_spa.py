@@ -20,7 +20,13 @@ IMMUTABLE = "public, max-age=31536000, immutable"
 MAP_CHUNK = b"export const tile = () => 'xyzzy'\n" * 6000
 TINY_CHUNK = b"export default 1\n"
 
-SHELL_HTML = "<!doctype html><title>memos-ng</title><script src=/assets/index-abcd1234.js></script>"
+# Padded past the compressor's floor, like the real index.html (a couple of KB): below it, "came
+# back uncompressed" would be indistinguishable from "too small to compress" and the scope control
+# at the bottom of this file would have no teeth.
+SHELL_HTML = (
+    "<!doctype html><title>memos-ng</title>"
+    "<script type=module src=/assets/index-abcd1234.js></script>" + "<!-- preload hint -->" * 100
+)
 SERVICE_WORKER = "self.addEventListener('push', () => {})\n"
 MANIFEST = '{"name": "memos-ng"}'
 
@@ -39,7 +45,7 @@ def spa_dist(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def spa_client(spa_dist: Path) -> TestClient:
+def spa_app(spa_dist: Path) -> FastAPI:
     """The real SPA tiers over that tree.
 
     frontend/dist is a build output and never exists in a checkout, so the app under test here
@@ -48,7 +54,12 @@ def spa_client(spa_dist: Path) -> TestClient:
     """
     built = FastAPI()
     mount_spa(built, spa_dist)
-    return TestClient(built)
+    return built
+
+
+@pytest.fixture
+def spa_client(spa_app: FastAPI) -> TestClient:
+    return TestClient(spa_app)
 
 
 def matched_route(path: str, method: str = "GET") -> Route | None:
@@ -205,15 +216,56 @@ def test_hashed_asset_still_answers_a_conditional_request(spa_client):
     assert second.status_code == 304
     assert second.content == b""
     assert second.headers["cache-control"] == IMMUTABLE
+    # The compressor adds Vary downstream of StaticFiles and a 304 carries no body to compress, so
+    # without help the 304 would drop the negotiation dimension the 200 was stored under.
+    assert "accept-encoding" in second.headers["vary"].lower()
+
+
+def test_hashed_asset_ignores_a_range_request(spa_client):
+    # Nothing under assets/ needs ranges, and honouring one here corrupts the download: the slice
+    # is cut from the identity file and then compressed, so Content-Range and the strong ETag
+    # describe a different representation than the bytes on the wire. A browser resuming an
+    # interrupted map chunk over the tunnel would splice that onto its partial entry. A server may
+    # always ignore Range (RFC 9110 §14.2), and the full 200 replaces the partial entry.
+    full = spa_client.get("/assets/map-abcd1234.js", headers={"Accept-Encoding": "gzip"})
+
+    resumed = spa_client.get(
+        "/assets/map-abcd1234.js",
+        headers={
+            "Accept-Encoding": "gzip",
+            "Range": "bytes=0-999",
+            "If-Range": full.headers["etag"],
+        },
+    )
+
+    assert resumed.status_code == 200
+    assert "content-range" not in resumed.headers
+    assert resumed.content == MAP_CHUNK
+    # ...and it must not have invited the range in the first place.
+    assert resumed.headers.get("accept-ranges") != "bytes"
+    assert full.headers.get("accept-ranges") != "bytes"
+
+
+def test_hashed_asset_ignores_a_range_request_from_an_identity_client(spa_client):
+    # The same guarantee off the compressed path: answering an identity 206 under the same strong
+    # ETag as the gzip 200 is the identical corruption seen from the other side.
+    resumed = spa_client.get(
+        "/assets/map-abcd1234.js",
+        headers={"Accept-Encoding": "identity", "Range": "bytes=0-999"},
+    )
+
+    assert resumed.status_code == 200
+    assert "content-range" not in resumed.headers
+    assert resumed.content == MAP_CHUNK
 
 
 @pytest.mark.parametrize(
     ("path", "expected_body"),
     [
-        ("/", SHELL_HTML),
-        ("/places/nested/route", SHELL_HTML),
-        ("/sw.js", SERVICE_WORKER),
-        ("/manifest.webmanifest", MANIFEST),
+        pytest.param("/", SHELL_HTML, id="root"),
+        pytest.param("/places/nested/route", SHELL_HTML, id="deep-route"),
+        pytest.param("/sw.js", SERVICE_WORKER, id="service-worker"),
+        pytest.param("/manifest.webmanifest", MANIFEST, id="manifest"),
     ],
 )
 def test_every_unhashed_shell_file_is_revalidated(spa_client, path, expected_body):
@@ -236,17 +288,23 @@ def test_missing_asset_is_a_real_404_not_the_shell(spa_client):
     assert SHELL_HTML not in response.text
 
 
-def test_compression_never_leaves_the_assets_mount(client):
+def test_compression_never_leaves_the_assets_mount(client, spa_app, spa_client):
     # The scope control. The compressor is the mounted app's own wrapper, never app-wide: reach
-    # for app.add_middleware(GZipMiddleware) and this goes red — which is the point, because
-    # app-wide it would also hit the media tiers, the Range-served basemap archives and the
-    # /api/events SSE stream.
-    assert all(middleware.cls is not GZipMiddleware for middleware in app.user_middleware)
+    # for add_middleware(GZipMiddleware) and this goes red — which is the point, because app-wide
+    # it would also hit the media tiers, the Range-served basemap archives and the /api/events
+    # SSE stream. `spa_app` is checked as well as the live app: in a checkout the live app takes
+    # the not-built branch, so a compressor added inside the built branch would be invisible here.
+    for target in (app, spa_app):
+        assert all(middleware.cls is not GZipMiddleware for middleware in target.user_middleware)
+
+    # The shell, served by the catch-all of an app whose /assets mount IS live, and both JSON
+    # routes: bodies well past any compressor's minimum size, so "uncompressed" means something.
+    shell = spa_client.get("/", headers={"Accept-Encoding": "gzip"})
+    assert "content-encoding" not in shell.headers, "the shell came back compressed"
+    assert len(shell.content) > 2000
 
     for path in ("/health", "/openapi.json"):
         response = client.get(path, headers={"Accept-Encoding": "gzip"})
         assert "content-encoding" not in response.headers, f"{path} came back compressed"
 
-    # ...and the control has teeth only if one of those bodies is far above any compressor's
-    # minimum size, which /openapi.json (the whole schema) is.
     assert len(client.get("/openapi.json").content) > 2000
