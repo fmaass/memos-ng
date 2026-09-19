@@ -710,6 +710,60 @@ async def test_a_stop_in_the_failure_record_requeues_without_charging_the_attemp
         _cleanup(subject, aid)
 
 
+async def test_an_error_raised_over_a_stop_in_the_push_does_not_swallow_the_stop(monkeypatch):
+    """The best-effort push swallows every error — and a stop can arrive DISGUISED as one.
+
+    `_notify_terminal_safe` runs inside run_once's cancellation window (right after the `done`
+    commit) and catches `except Exception` by design. The trap is Python's, not the push's: an
+    error raised while a CancelledError is unwinding REPLACES it, and the session's own exit is one
+    await that can do exactly that — asyncpg closing a connection whose operation was just
+    cancelled is a real way there. What arrives at the `except` is then an ordinary exception, the
+    stop is gone with it, and the consumer returns 'processed' and goes round its loop again while
+    the supervisor's teardown waits for a task that will never end.
+
+    Asserted on the coroutine's own verdict rather than on a row: "the stop survived" is a fact
+    about what came out of this call, and no end state distinguishes it from a push that simply
+    finished.
+    """
+    pushing = asyncio.Event()
+
+    class _SessionThatFailsToClose:
+        """A session whose EXIT raises an ordinary error, whatever is unwinding through it."""
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc_info):
+            raise RuntimeError("another operation is in progress")
+
+    async def parking_notify(db, attachment_id: int) -> None:
+        pushing.set()
+        await asyncio.sleep(3600)  # the stop lands in the push itself
+
+    monkeypatch.setattr(worker, "_notify_terminal", parking_notify)
+    monkeypatch.setattr(worker, "async_session", _SessionThatFailsToClose)
+
+    push = asyncio.create_task(worker._notify_terminal_safe(4242))
+    try:
+        async with asyncio.timeout(60):
+            await pushing.wait()
+        push.cancel()
+        # suppress OUTSIDE the bound: the CancelledError this test WANTS must not be mistaken for
+        # the deadline's own.
+        with contextlib.suppress(asyncio.CancelledError):
+            async with asyncio.timeout(STOP_GRACE_SECONDS):
+                await push
+        assert push.cancelled(), (
+            "the best-effort push swallowed the stop — the error raised while the cancellation "
+            "unwound its session replaced it, and the consumer would keep draining"
+        )
+    finally:
+        push.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await push
+
+
 # A worker process with no database and no media work: every collaborator the supervisor calls is
 # replaced in the child itself, and each consumer's drain parks until the shutdown cancels it, so
 # what this proves is the SIGNAL path and nothing else.

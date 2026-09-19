@@ -420,6 +420,12 @@ async def _notify_terminal_safe(attachment_id: int) -> None:
             await db.commit()
     except Exception as exc:  # push is best-effort; the job is already committed
         logger.warning("push_notify_failed", attachment_id=attachment_id, error=str(exc))
+        if _stop_in_flight():
+            # An error raised while a cancellation was unwinding this call REPLACES it — the
+            # session's own exit is one await that can, closing a connection whose operation was
+            # just cancelled. Swallowing that error here would swallow the stop with it, and the
+            # consumer would go round its loop again while the supervisor's teardown waits for it.
+            raise asyncio.CancelledError from exc
 
 
 async def _record_job_failure(
