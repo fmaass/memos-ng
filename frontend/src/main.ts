@@ -10,6 +10,8 @@ import { registerSW } from 'virtual:pwa-register'
 
 import { installReachability } from './api/reachability'
 import App from './App.vue'
+import { loadPlacesMap } from './lib/places/loadMap'
+import { idleSchedule, MAP_WARMUP_DELAY_MS, scheduleMapWarmup } from './lib/mapWarmup'
 import router from './router'
 import './style.css'
 import 'primeicons/primeicons.css'
@@ -58,3 +60,18 @@ createApp(App)
   .use(ToastService)
   .use(ConfirmationService)
   .mount('#app')
+
+// The map chunk is excluded from the precache on purpose (a cold Home must not pay for it), which
+// left every first tap on Places waiting for a megabyte. Fetch it once the app is up and the
+// browser has nothing better to do — the decision itself is `shouldWarmMap`.
+scheduleMapWarmup({
+  schedule: (fn) => idleSchedule(window, fn, MAP_WARMUP_DELAY_MS),
+  readEnvironment: () => ({
+    online: navigator.onLine,
+    saveData:
+      (navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData ===
+      true,
+    routeName: router.currentRoute.value.name?.toString(),
+  }),
+  warm: loadPlacesMap,
+})
