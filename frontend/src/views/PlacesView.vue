@@ -14,7 +14,7 @@ import { useRouter } from 'vue-router'
 
 import ClusterDrawer from '@/components/places/ClusterDrawer.vue'
 import InViewGrid from '@/components/places/InViewGrid.vue'
-import { asyncMapComponent } from '@/components/places/asyncMap'
+import { asyncMapComponent, mapLoadRung } from '@/components/places/asyncMap'
 // Type only: a value import here would put the whole map chunk back on the route's critical path.
 import type PlacesMap from '@/components/places/PlacesMap.vue'
 import { useApi } from '@/composables/useApi'
@@ -32,9 +32,23 @@ const mapRef = useTemplateRef<InstanceType<typeof PlacesMap>>('map')
 // The map is a megabyte of MapLibre and the only code the service worker does not precache, so
 // the route may not block on it: the shell paints, the pane says it is loading, and a chunk that
 // never arrives gets a way to ask again (a fresh component — see `asyncMapComponent`).
-const mapComponent = shallowRef(asyncMapComponent(loadPlacesMap, retryMap))
-function retryMap() {
-  mapComponent.value = asyncMapComponent(loadPlacesMap, retryMap)
+const mapFailures = ref(0)
+function loadMapPane() {
+  return loadPlacesMap().catch((error: unknown) => {
+    mapFailures.value += 1
+    throw error
+  })
+}
+const recovery = { rung: () => mapLoadRung(mapFailures.value), onAct: recoverMap }
+const mapComponent = shallowRef(asyncMapComponent(loadMapPane, recovery))
+function recoverMap() {
+  // The last rung: once a retry has failed too, the browser may be answering from its memory of
+  // the first failure and no further attempt in this document can reach the network.
+  if (mapLoadRung(mapFailures.value) === 'reload') {
+    window.location.reload()
+    return
+  }
+  mapComponent.value = asyncMapComponent(loadMapPane, recovery)
 }
 
 const { data, isPending, isError } = useQuery({

@@ -247,4 +247,28 @@ describe('the view does not wait for the map chunk', () => {
     expect(wrapper.find('[data-test="map-stub"]').exists()).toBe(true)
     wrapper.unmount()
   })
+
+  it('offers a reload once the retry has failed again in the same document', async () => {
+    // A browser that remembers a failed module fetch rejects the identical URL again without
+    // asking the network, for the life of the document. Asking a third time would be theatre;
+    // a new document is the only rung the pane has left.
+    const reload = vi.spyOn(window.location, 'reload').mockImplementation(() => {})
+    mapChunk.load = () => Promise.reject(new Error('chunk load failed'))
+    const wrapper = mountPending()
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="map-retry"]').text()).toBe('Try again')
+    await wrapper.find('[data-test="map-retry"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="map-retry"]').text()).toBe('Reload the page')
+    // Asserted at the decision point: nothing reloads until the viewer asks for it — the pane
+    // may be sitting behind a half-written memo.
+    expect(reload).not.toHaveBeenCalled()
+
+    await wrapper.find('[data-test="map-retry"]').trigger('click')
+    expect(reload).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+    reload.mockRestore()
+  })
 })
