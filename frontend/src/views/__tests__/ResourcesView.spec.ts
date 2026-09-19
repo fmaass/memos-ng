@@ -10,6 +10,8 @@ import ResourcesView from '@/views/ResourcesView.vue'
 const refetch = vi.fn()
 
 vi.mock('@/composables/useApi', () => ({ useApi: () => ({ GET: vi.fn(), DELETE: vi.fn() }) }))
+const { push } = vi.hoisted(() => ({ push: vi.fn() }))
+vi.mock('vue-router', () => ({ useRouter: () => ({ push }) }))
 // The viewer is PhotoSwipe (needs a real DOM) — mock the composable so jsdom doesn't boot it.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
 vi.mock('@/composables/useMediaLightbox', () => ({
@@ -66,6 +68,26 @@ vi.mock('@tanstack/vue-query', () => ({
         posterUrl: '/api/attachments/a1/poster',
         downloadUrl: '/api/attachments/a1/original',
         printUrl: '/api/attachments/a1/print',
+        memoUid: null, // an orphan upload: it hangs on no memo
+      },
+      {
+        uid: 'a2',
+        mime: 'image/jpeg',
+        status: 'ready',
+        blurhash: null,
+        sha256: null,
+        width: 800,
+        height: 600,
+        mine: true,
+        hasPrint: false,
+        orphan: false,
+        thumbnailUrl: '/api/attachments/a2/thumb',
+        previewUrl: '/api/attachments/a2/mobile',
+        webUrl: '/api/attachments/a2/web',
+        posterUrl: '/api/attachments/a2/poster',
+        downloadUrl: '/api/attachments/a2/original',
+        printUrl: '/api/attachments/a2/print',
+        memoUid: 'memo-7',
       },
     ]),
     isPending: ref(false),
@@ -83,6 +105,28 @@ describe('ResourcesView', () => {
     printRemove.mockClear()
     printRetry.mockClear()
     usePrintMasterMock.mockClear()
+    push.mockClear()
+  })
+
+  it('leaves the viewer for the memo the photo hangs on', () => {
+    // Resources is the one gallery that shows everything at once, so a photo found here is often
+    // wanted in context; the jump goes to the same permalink the Places viewer uses.
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 1)
+
+    lightboxOpen.mock.calls[0][2].onShowInMemo('memo-7')
+
+    expect(push).toHaveBeenCalledWith('/m/memo-7')
+  })
+
+  it('hands the viewer an orphan with no memo to jump to', () => {
+    // The action is offered per slide, and the viewer withholds it on one that knows no memo
+    // (composables/__tests__/useMediaLightbox.spec.ts) — that guard only holds while this view
+    // passes the orphan's empty memoUid through instead of inventing one.
+    const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
+    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+
+    expect(lightboxOpen.mock.calls[0][0][0].memoUid).toBeNull()
   })
 
   it('renders the justified gallery + type filter (not the old square grid)', () => {
