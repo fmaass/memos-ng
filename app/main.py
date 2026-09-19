@@ -16,7 +16,9 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.routing import BaseRoute
+from starlette.types import Scope
 
 from app import auth
 from app.config import settings
@@ -444,6 +446,30 @@ def resolve_spa_file(path: str, root: Path = FRONTEND_DIR) -> Path:
     return root / "index.html"
 
 
+# Everything the Vite build puts under dist/assets is content-hashed — the default
+# `assets/[name]-[hash].ext` plus the explicitly hashed map worker (frontend/vite.config.ts) — so
+# such a URL can never change meaning and the client may keep it without ever revalidating. That
+# round-trip is what a phone on the VPN pays before a lazy route (/places, ~1 MB) can even start.
+ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+# The shell's names are stable instead, so it has to be revalidated: an index.html kept across a
+# deploy names chunks that are gone. `no-cache` is "revalidate", not "don't store" — FileResponse
+# already sends an ETag, so the steady state is a 304 and nothing is re-downloaded.
+SHELL_CACHE_CONTROL = "no-cache"
+
+
+class HashedAssetFiles(StaticFiles):
+    """StaticFiles for the content-hashed tier, with the immutable header on every answer.
+
+    Set on the response rather than at the mount so it also rides the 304, which is what a
+    revalidating client gets for the rest of the year.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = ASSET_CACHE_CONTROL
+        return response
+
+
 # SPA static serving (frontend/dist is produced by the Vite build stage in Docker).
 def mount_spa(target: FastAPI, frontend_dir: Path) -> None:
     """Register the SPA tiers on `target`: /assets, then the shell catch-all (order matters).
@@ -464,13 +490,23 @@ def mount_spa(target: FastAPI, frontend_dir: Path) -> None:
 
         return
 
-    target.mount("/assets", StaticFiles(directory=frontend_dir / "assets"), name="assets")
+    # The compressor wraps the mounted app ALONE — never app-wide, which would also reach the
+    # media tiers, the Range-served basemap archives and the /api/events stream. Text here
+    # compresses ~4x, and the map chunk is the one asset a phone waits on.
+    target.mount(
+        "/assets",
+        GZipMiddleware(HashedAssetFiles(directory=frontend_dir / "assets")),
+        name="assets",
+    )
 
     @target.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
         # Highest-fan-out route in the app (every non-/api URL), and its resolve()+is_file()
         # hit the bind-mounted volume — off the event loop.
-        return FileResponse(await to_thread.run_sync(resolve_spa_file, path, frontend_dir))
+        return FileResponse(
+            await to_thread.run_sync(resolve_spa_file, path, frontend_dir),
+            headers={"Cache-Control": SHELL_CACHE_CONTROL},
+        )
 
 
 mount_spa(app, FRONTEND_DIR)
