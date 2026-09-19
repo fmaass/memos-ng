@@ -10,26 +10,22 @@ import { registerSW } from 'virtual:pwa-register'
 
 import { installReachability } from './api/reachability'
 import App from './App.vue'
-import { scheduleUpdateChecks } from './lib/buildRefresh'
+import { buildRegisterSWOptions } from './lib/buildRefresh'
 import { loadPlacesMap, recordStylesheetFailures } from './lib/places/loadMap'
 import { idleSchedule, MAP_WARMUP_DELAY_MS, scheduleMapWarmup } from './lib/mapWarmup'
 import router, { wireBuildRefresh } from './router'
 import './style.css'
 import 'primeicons/primeicons.css'
 
-// Register the app-shell + Web Push service worker; autoUpdate swaps in new versions. A page left
-// open across a deploy would otherwise never ask again — so while it is visible, ask hourly.
-registerSW({
-  immediate: true,
-  onRegisteredSW(_swScriptUrl, registration) {
-    if (!registration) return
-    scheduleUpdateChecks({
-      registration,
-      visibility: () => document.visibilityState,
-      schedule: (check, everyMs) => window.setInterval(check, everyMs),
-    })
-  },
-})
+// Register the app-shell + Web Push service worker. A page left open across a deploy would
+// otherwise never ask again — so while it is visible, ask hourly. When to actually load the new
+// build is decided in `lib/buildRefresh`, NOT by the plugin's helper (see buildRegisterSWOptions).
+registerSW(
+  buildRegisterSWOptions({
+    visibility: () => document.visibilityState,
+    schedule: (check, everyMs) => window.setInterval(check, everyMs),
+  }),
+)
 
 // A dead lazy route (its chunk gone with the old build) reloads once onto the current build, and a
 // build that takes over mid-session is picked up on the next navigation — never mid-typing.

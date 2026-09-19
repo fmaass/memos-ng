@@ -1,12 +1,42 @@
 import ToastEventBus from 'primevue/toasteventbus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { registerSW } from '../../../node_modules/vite-plugin-pwa/dist/client/build/register.js'
 
-import { decideOnChunkFailure, type ReloadMarkerStorage } from '../buildRefresh'
+import { buildRegisterSWOptions, decideOnChunkFailure, type ReloadMarkerStorage } from '../buildRefresh'
 import { runMapWarmup } from '../mapWarmup'
 import { wireBuildRefresh, type ChunkErrorTarget } from '../../router'
+
+/**
+ * A stand-in for workbox-window, so the REAL registration helper can be driven through the
+ * sequence a deploy produces while the tab is open.
+ */
+const workbox = vi.hoisted(() => {
+  const listeners = new Map<string, Array<(event: Record<string, unknown>) => void>>()
+  class FakeWorkbox {
+    addEventListener(type: string, handler: (event: Record<string, unknown>) => void) {
+      listeners.set(type, [...(listeners.get(type) ?? []), handler])
+    }
+    register() {
+      return Promise.resolve({ update: () => Promise.resolve() })
+    }
+    messageSkipWaiting() {
+      return undefined
+    }
+  }
+  return {
+    listeners,
+    FakeWorkbox,
+    emit(type: string, event: Record<string, unknown>) {
+      for (const handler of listeners.get(type) ?? []) handler(event)
+    },
+    reset() {
+      listeners.clear()
+    },
+  }
+})
+
+vi.mock('workbox-window', () => ({ Workbox: workbox.FakeWorkbox }))
 
 const CHUNK_ERROR = new TypeError(
   'Failed to fetch dynamically imported module: /assets/PlacesView-a1b2c3.js',
@@ -272,16 +302,6 @@ describe('wireBuildRefresh', () => {
     expect(assign).not.toHaveBeenCalled()
   })
 
-  it("leaves the PWA plugin's own immediate reload out of the build", () => {
-    // `registerType: 'autoUpdate'` makes vite-plugin-pwa's registration helper call
-    // window.location.reload() on activation (dist/client/build/register.js:38-45) — no unit test
-    // of ours can reach that virtual module, so the configuration is what gets pinned.
-    const config = readFileSync(resolve(process.cwd(), 'vite.config.ts'), 'utf8')
-
-    expect(config).toContain("registerType: 'prompt'")
-    expect(config).not.toContain("registerType: 'autoUpdate'")
-  })
-
   it('never routes a failed idle map warm-up into the chunk-failure decision', async () => {
     const assign = vi.fn()
     const router = fakeRouter()
@@ -302,5 +322,75 @@ describe('wireBuildRefresh', () => {
     // DOES record the identical error — so "not called" means the warm-up never got there.
     router.fail(CHUNK_ERROR, '/places')
     expect(decide).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("the PWA plugin's own registration helper", () => {
+  let reload: ReturnType<typeof vi.fn>
+  let realLocation: Location
+
+  beforeEach(() => {
+    workbox.reset()
+    reload = vi.fn()
+    realLocation = window.location
+    Object.defineProperty(window, 'location', {
+      value: { href: realLocation.href, reload },
+      configurable: true,
+      writable: true,
+    })
+    // The helper does nothing at all without this (register.js:25) — happy-dom has no
+    // ServiceWorkerContainer, and a helper that never registers would make the test vacuous.
+    Object.defineProperty(navigator, 'serviceWorker', {
+      value: { controller: {}, addEventListener: () => undefined },
+      configurable: true,
+    })
+  })
+
+  afterEach(() => {
+    Object.defineProperty(window, 'location', {
+      value: realLocation,
+      configurable: true,
+      writable: true,
+    })
+    Reflect.deleteProperty(navigator, 'serviceWorker')
+  })
+
+  /** What a deploy looks like to an open tab that has been polling for an hour. */
+  async function driveUpdateWhileOpen() {
+    await vi.waitFor(() => expect(workbox.listeners.has('installed')).toBe(true))
+    // Every `updatefound` later than 60s after registration is EXTERNAL to workbox-window and
+    // carries no `isUpdate` (Workbox.ts:28, :405-421, :459-471) — i.e. every hit of our hourly
+    // poll. The helper answers that by arming its own `controlling` listener (register.js:67-71).
+    workbox.emit('installed', { isExternal: true })
+    await vi.waitFor(() => expect(workbox.listeners.has('controlling')).toBe(true))
+    // `controlling.isUpdate` is `Boolean(navigator.serviceWorker.controller)` read at
+    // registration (Workbox.ts:119, :569): true on every controlled load.
+    workbox.emit('controlling', { isUpdate: true, isExternal: true })
+  }
+
+  it('does not reload the page out from under the user when a new build takes over', async () => {
+    const scheduled: number[] = []
+    registerSW(
+      buildRegisterSWOptions({
+        visibility: () => 'visible',
+        schedule: (_check, everyMs) => {
+          scheduled.push(everyMs)
+          return 0
+        },
+      }),
+    )
+
+    await driveUpdateWhileOpen()
+
+    expect(reload).not.toHaveBeenCalled()
+    expect(scheduled).toHaveLength(1)
+  })
+
+  it('DOES reload with the helper defaults — the behaviour our options suppress', async () => {
+    registerSW({ immediate: true })
+
+    await driveUpdateWhileOpen()
+
+    expect(reload).toHaveBeenCalledTimes(1)
   })
 })

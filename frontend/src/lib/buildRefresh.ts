@@ -170,6 +170,39 @@ export function shouldCheckForUpdate({ visibility }: { visibility: string }): bo
   return visibility === 'visible'
 }
 
+export interface RegisterSWOptionsDeps {
+  visibility: () => string
+  schedule: (check: () => void, everyMs: number) => unknown
+}
+
+/**
+ * The options `registerSW` is called with, built here so the test drives the SAME object
+ * production does.
+ *
+ * `onNeedReload` is the load-bearing one. vite-plugin-pwa's helper reloads the page itself the
+ * moment a new worker takes control — in prompt mode too: workbox-window reports every
+ * `updatefound` later than 60 s after registration as EXTERNAL (Workbox.ts:405-421), which is
+ * every hit of the hourly poll below, the helper then arms its own `controlling` listener
+ * (register.js:57-71), and that calls `window.location.reload()` unless `onNeedReload` is set.
+ * That reload is exactly what this feature exists to prevent, and nothing is lost by suppressing
+ * it: our own `controllerchange` listener has already marked the deferred full load, which the
+ * next navigation performs.
+ */
+export function buildRegisterSWOptions(deps: RegisterSWOptionsDeps): {
+  immediate: true
+  onNeedReload: () => void
+  onRegisteredSW: (swScriptUrl: string, registration: UpdateCheckDeps['registration'] | undefined) => void
+} {
+  return {
+    immediate: true,
+    onNeedReload: () => undefined,
+    onRegisteredSW: (_swScriptUrl, registration) => {
+      if (!registration) return
+      scheduleUpdateChecks({ registration, visibility: deps.visibility, schedule: deps.schedule })
+    },
+  }
+}
+
 export interface UpdateCheckDeps {
   registration: { update(): Promise<unknown> }
   visibility: () => string

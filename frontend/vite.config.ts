@@ -96,5 +96,11 @@ export default defineConfig({
     environment: 'happy-dom',
     globals: true,
     setupFiles: ['./src/test-setup.ts'],
+    server: {
+      // The PWA plugin's registration helper is a test SUBJECT (it is what reloads the page on
+      // its own), so it has to go through vitest's transform — externalised it would import the
+      // real workbox-window and ignore the mock.
+      deps: { inline: [/vite-plugin-pwa/] },
+    },
   },
 })
