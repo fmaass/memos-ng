@@ -103,6 +103,28 @@
       "sha256": "b450d597534d183402033d19ca1e6e85835684002ffb107aec78dfa30680b492",
       "size": 668
     },
+    "avif-gps.avif": {
+      "mime": "image/avif",
+      "note": "AVIF is the same ISO-BMFF container as HEIC, and carries the same EXIF payload.",
+      "expect": {
+        "latitude": 20.0,
+        "longitude": -150.0,
+        "location_source": "exif"
+      },
+      "sha256": "e67b37d3df24facf08b15c2377a120b36c5adec78525106ab8f705bb8a4412ef",
+      "size": 518
+    },
+    "avif-no-gps.avif": {
+      "mime": "image/avif",
+      "note": "an AVIF with no Exif item at all: read, and no location.",
+      "expect": {
+        "latitude": null,
+        "longitude": null,
+        "location_source": "none"
+      },
+      "sha256": "10592c35f628fa02b0451806f7e532e88e58978d989d9c5a97678ea502afafc9",
+      "size": 313
+    },
     "mov-iso6709.mov": {
       "mime": "video/quicktime",
       "note": "com.apple.quicktime.location.ISO6709 under moov/meta, WITH an altitude component.",
