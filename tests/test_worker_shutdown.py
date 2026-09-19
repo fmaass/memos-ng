@@ -161,10 +161,10 @@ async def test_a_deliberate_stop_returns_both_consumers_claims_to_the_queue(
     aid_v, jid_v, uid_v = _seed_video(subject, tmp_path)
     aid_i, jid_i, uid_i = _seed_image(subject, tmp_path)
 
-    # The light class has no subprocess to park in: its Pillow work runs INLINE on the loop thread
-    # (app/services/media.py:1610-1613), so a cancellation arriving during the decode is delivered
-    # at the first await AFTER it — `guard_publish`. Parking exactly there puts the cancellation
-    # where production would deliver it, with the decode itself real.
+    # The light class has no subprocess to park in: its Pillow work runs in a thread that cannot be
+    # interrupted and is waited out, so a cancellation arriving during the decode is delivered at
+    # the first await AFTER it — `guard_publish`. Parking exactly there puts the cancellation where
+    # production would deliver it, with the decode itself real.
     light_parked = asyncio.Event()
     real_guard_publish = media.guard_publish
 

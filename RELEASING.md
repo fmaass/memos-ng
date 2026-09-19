@@ -177,7 +177,13 @@ That happens inside docker's stop grace, which is **10 s**: the stack compose se
 transcode's own tree stop first (SIGTERM to the ffmpeg process group, `media.KILL_GRACE_SECONDS` =
 5 s), then up to 3 s for the requeue write (`worker.CANCEL_REQUEUE_TIMEOUT_SECONDS`), then up to
 1 s for the progress row (`worker.CANCEL_PROGRESS_CLEAR_SECONDS`) — 9 s of the 10, with both
-consumers running their own in parallel. These are **designed bounds, not hard caps**: an ffmpeg
+consumers running their own in parallel. The light consumer adds up to 1 s of its own
+(`media.CANCEL_SWEEP_TIMEOUT_SECONDS`) when the stop skipped `guard_publish`, and with it the sweep
+that fences a file published for a photo deleted mid-job: a stop waited out a print encode or a
+heavy image decode, or was delivered at the checkpoint's own first await. At most one of those
+fires per stopped job, so it is 5 s on the light path against the transcode path's 9 and does not
+move the total. The transcode path takes no bounded second of its own — its checkpoint fence is a
+single synchronous unlink of this run's temp — because 9 + 1 would be the whole grace. These are **designed bounds, not hard caps**: an ffmpeg
 that ignores SIGTERM also needs the SIGKILL step, which adds another 5 s, and nothing in the
 process can bound the kernel.
 
@@ -188,12 +194,16 @@ task still left (which re-cancels an abandoned requeue write and does not honour
 Docker's SIGKILL at the end of the grace is the only deadline over the stop as a whole — and a
 second SIGTERM sent meanwhile is deliberately a no-op, so it does not shorten anything either.
 
-A print-ready encode is the one job the stop **waits out**: it runs in a thread, which cannot be
-interrupted, so `process_printready_job` lets the running rendition finish before the
-cancellation goes on to the hand-back — an abandoned thread would keep writing the rendition into
-its final path after the coroutine that guards the publish is gone. The light consumer runs one
-such job at a time, so the wait is one rendition's remaining encode. If that outlasts the grace,
-this is the SIGKILL case below.
+Two kinds of job the stop **waits out**: a print-ready encode and a heavy image decode (HEIC/AVIF).
+Both run in a thread, which cannot be interrupted, so `process_printready_job` and the slow lane's
+image branch let the running work finish before the cancellation goes on to the hand-back — an
+abandoned thread would keep writing its rendition or tiers into their final paths after the
+coroutine that guards the publish is gone. The light consumer runs one job at a time, so either
+wait is one job's remaining thread work. It is **not** part of the bounds above: it happens in
+front of them, so the 5 s quoted for the light path is the bounded part only. Nor is it new
+waiting — before the decode moved into a thread it ran inline on the event loop, which held the
+stop's delivery back for exactly the same time. If a wait outlasts the grace, this is the SIGKILL
+case below.
 
 **Past the grace nothing can be written**: docker sends SIGKILL. That strands a row only if a
 claim was actually in flight — a worker sitting idle leaves nothing behind. A claim that was in

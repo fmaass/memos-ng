@@ -12,17 +12,20 @@ tests/test_slowlane_timeout.py), so the real subprocess machinery runs without a
 """
 
 import asyncio
+import errno
 import secrets
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from app import worker
 from app.config import settings
 from app.database import async_session
 from app.models import User
 from app.routers.assets import delete_attachment
-from app.services import media
+from app.services import media, printready
 from app.worker import run_once
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import OperationalError
@@ -92,7 +95,14 @@ def _seed_video(
         eng.dispose()
 
 
-def _seed_image(uid: str) -> tuple[int, int, int]:
+def _seed_image(
+    uid: str,
+    *,
+    src: Path | None = None,
+    mime: str = "image/jpeg",
+    lane: str = "fast",
+    kind: str = "derive",
+) -> tuple[int, int, int]:
     eng = create_engine(SYNC_URL)
     try:
         with eng.begin() as c:
@@ -108,17 +118,18 @@ def _seed_image(uid: str) -> tuple[int, int, int]:
                 text(
                     "INSERT INTO attachments "
                     "(uid, owner_id, filename, mime, size, status, storage_path) "
-                    "VALUES (:u, :o, 'p.jpg', 'image/jpeg', 1, 'pending', '/nonexistent') "
+                    "VALUES (:u, :o, 'p.jpg', :m, 1, 'pending', :sp) "
                     "RETURNING id"
                 ),
-                {"u": uid, "o": owner},
+                {"u": uid, "o": owner, "m": mime, "sp": str(src) if src else "/nonexistent"},
             ).scalar_one()
             jid = c.execute(
                 text(
-                    "INSERT INTO media_jobs (attachment_id, lane, state, attempts, progress_pct) "
-                    "VALUES (:a, 'fast', 'queued', 0, 0) RETURNING id"
+                    "INSERT INTO media_jobs (attachment_id, lane, kind, state, attempts, "
+                    "progress_pct) "
+                    "VALUES (:a, CAST(:l AS job_lane), :k, 'queued', 0, 0) RETURNING id"
                 ),
-                {"a": aid},
+                {"a": aid, "l": lane, "k": kind},
             ).scalar_one()
         return aid, jid, owner
     finally:
@@ -356,5 +367,444 @@ def test_guard_publish_sweeps_and_raises_when_the_row_is_gone(monkeypatch, tmp_p
     try:
         asyncio.run(_go())
         assert not path.exists()
+    finally:
+        _cleanup(aid, owner)
+
+
+# --- a stop landing between the publish and its checkpoint (MEMNG-267 R7 class) ----------------
+#
+# `guard_publish` is the only thing that sweeps what a job published for a photo deleted under it.
+# A worker stop that leaves the job between "the file is at its final path" and "guard_publish
+# finished" therefore leaks that file PERMANENTLY: the delete took the job row with the attachment
+# (the claim is committed before processing, so the row was lockable), so the cancel path's
+# conditional requeue moves no row and the job never runs again. These pin every such window.
+
+# The three light-consumer sites, by the job row that routes to them.
+_AT_GUARD_SITES = {
+    "printready": {"mime": "image/jpeg", "lane": "slow", "kind": "printready"},
+    "heavy image": {"mime": "image/heic", "lane": "slow", "kind": "derive"},
+    "fast lane": {"mime": "image/jpeg", "lane": "fast", "kind": "derive"},
+}
+
+
+def _delete_rows(aid: int) -> None:
+    """What `delete_attachment` leaves behind when it lands before this run has written anything:
+    the job rows it can lock and the attachment, its file sweep a no-op on an empty derived set."""
+    _sql("DELETE FROM media_jobs WHERE attachment_id = :a", a=aid)
+    _sql("DELETE FROM attachments WHERE id = :a", a=aid)
+
+
+def _watch_requeues(monkeypatch) -> list[tuple[int, int]]:
+    """Spy the REAL conditional requeue and record how many rows it moved — "nothing is requeued"
+    asserted at its decision point, not on a job table that reads empty for either reason."""
+    seen: list[tuple[int, int]] = []
+    real = worker._requeue_claim_conditional
+
+    async def _watched(job_id: int, claim: str) -> int:
+        rows = await real(job_id, claim)
+        seen.append((job_id, rows))
+        return rows
+
+    monkeypatch.setattr(worker, "_requeue_claim_conditional", _watched)
+    return seen
+
+
+def _park_at_the_publish_checkpoint(monkeypatch) -> asyncio.Event:
+    """Park the job AT `guard_publish`'s own first await, which is where the stop is delivered.
+
+    In production that await is its `SELECT … FOR UPDATE` on the job row; once the delete has
+    removed both rows guard_publish locks, no real query can be parked there, so the wait is stood
+    in for. Everything the assertions are about is the production path: the publish that already
+    happened, a cancellation coming out of the guard_publish call, and the fence its caller applies.
+    """
+    reached = asyncio.Event()
+    real = media.guard_publish
+
+    async def _parked(db, job, attachment) -> None:
+        reached.set()
+        await asyncio.Event().wait()  # only the stop ends this await
+        await real(db, job, attachment)  # unreachable under a stop; the real checkpoint otherwise
+
+    monkeypatch.setattr(media, "guard_publish", _parked)
+    return reached
+
+
+def _install_publishing_stub(
+    site: str, monkeypatch, uid: str, tmp_path: Path, on_entry
+) -> list[Path]:
+    """Stand in for the real Pillow work (a dependency, not the unit under test): run `on_entry`,
+    then write the same files that work publishes into their FINAL paths."""
+    written = (
+        [printready.printready_path(uid)]
+        if site == "printready"
+        else [tmp_path / "assets" / t / f"{uid}.jpg" for t in ("thumbs", "mobile")]
+    )
+
+    def _publish() -> None:
+        on_entry()
+        for path in written:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"published")
+
+    if site == "printready":
+
+        def _encode(attachment, profile=None) -> Path:
+            _publish()
+            return written[0]
+
+        monkeypatch.setattr(media, "process_printready", _encode)
+    else:
+
+        def _derive(attachment) -> dict:
+            _publish()
+            return {"width": 4, "height": 2, "blurhash": "LKO2"}
+
+        monkeypatch.setattr(media, "process_image", _derive)
+    return written
+
+
+async def _stop_at_the_checkpoint(reached: asyncio.Event) -> None:
+    async with async_session() as db:
+        task = asyncio.create_task(run_once(db))
+        await asyncio.wait_for(reached.wait(), FILE_WAIT_SECONDS)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task  # and the stop is still delivered, never swallowed
+
+
+@pytest.mark.parametrize("site", list(_AT_GUARD_SITES))
+def test_a_stop_at_the_publish_checkpoint_leaves_nothing_of_a_deleted_photo(
+    monkeypatch, tmp_path, site
+):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)  # thermal guard off (dev host)
+    uid = f"guardstop-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.bin"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"the archive master")
+    aid, jid, owner = _seed_image(uid, src=src, **_AT_GUARD_SITES[site])
+    # The delete lands while this run still has nothing on disk, so its own sweep finds nothing and
+    # the file published a moment later is named by no row at all.
+    published = _install_publishing_stub(
+        site, monkeypatch, uid, tmp_path, lambda: _delete_rows(aid)
+    )
+    requeued = _watch_requeues(monkeypatch)
+    reached = _park_at_the_publish_checkpoint(monkeypatch)
+
+    try:
+        asyncio.run(_stop_at_the_checkpoint(reached))
+
+        assert [p.name for p in published if p.exists()] == [], (
+            "the stop left a deleted photo's tiers on disk, with no row and no job naming them"
+        )
+        assert requeued == [(jid, 0)], f"a row WAS requeued, so a later run could sweep: {requeued}"
+        assert _sql("SELECT id FROM media_jobs WHERE attachment_id = :a", a=aid) == []
+        assert src.exists()  # the original is the archive master: a sweep never touches it
+    finally:
+        _cleanup(aid, owner)
+
+
+@pytest.mark.parametrize("site", list(_AT_GUARD_SITES))
+def test_a_stop_at_the_publish_checkpoint_keeps_a_live_photos_tiers(monkeypatch, tmp_path, site):
+    # The other half of the fence, and the reason it asks the database at all: a stop is not a
+    # delete. The photo is still there, the requeued job republishes the same bytes, and sweeping
+    # here would take every tier of a live photo — the sweep is the whole derived set.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    uid = f"guardlive-{secrets.token_urlsafe(4)}"
+    aid, jid, owner = _seed_image(uid, **_AT_GUARD_SITES[site])
+    published = _install_publishing_stub(site, monkeypatch, uid, tmp_path, lambda: None)
+    reached = _park_at_the_publish_checkpoint(monkeypatch)
+
+    try:
+        asyncio.run(_stop_at_the_checkpoint(reached))
+
+        assert [p.name for p in published if not p.exists()] == [], (
+            "the stop swept a live photo's tiers"
+        )
+        # ...and the claim went back for the next worker, which republishes over them.
+        assert _sql("SELECT state FROM media_jobs WHERE id = :j", j=jid)[0][0] == "queued"
+    finally:
+        _cleanup(aid, owner)
+
+
+def _gated_decode(uid: str, tmp_path: Path, entered, release):
+    """A heavy-image decode the TEST gates: the stop has to land while the thread is running and
+    the publish has to follow it, and a timed stub would let host load decide that order."""
+    written = [tmp_path / "assets" / t / f"{uid}.jpg" for t in ("thumbs", "mobile")]
+
+    def _decode(attachment) -> dict:
+        entered.set()
+        release.wait(5)
+        for path in written:  # the real decode's last act — the FINAL path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"published")
+        return {"width": 4, "height": 2, "blurhash": "LKO2"}
+
+    return written, _decode
+
+
+def test_a_stop_during_a_deleted_photos_heavy_decode_leaves_nothing_of_it_on_disk(
+    monkeypatch, tmp_path
+):
+    # The wait-out window, the sibling of the print encode's: the thread cannot be interrupted, so
+    # it publishes while the stop waits for it, and the cancellation is then re-raised BEFORE
+    # guard_publish.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    uid = f"heicstop-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.heic"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"the archive master")
+    aid, jid, owner = _seed_image(uid, src=src, mime="image/heic", lane="slow")
+    entered, release = threading.Event(), threading.Event()
+    written, decode = _gated_decode(uid, tmp_path, entered, release)
+    monkeypatch.setattr(media, "process_image", decode)
+    requeued = _watch_requeues(monkeypatch)
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(run_once(db))
+            # Waited for off the loop, so the delete and the stop land with the decode mid-flight.
+            assert await asyncio.to_thread(entered.wait, 5)
+            await asyncio.to_thread(_delete_rows, aid)
+            task.cancel()
+            # FIFO scheduling, not elapsed time: cancel() queues the resumption, so these yields
+            # hand the job its CancelledError and park it in the wait-out on any host.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not task.done(), "the cancelled await returned while the decode was running"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    try:
+        asyncio.run(_go())
+
+        assert [p.name for p in written if p.exists()] == [], (
+            "the stop left a deleted photo's tiers on disk, with no row and no job naming them"
+        )
+        assert requeued == [(jid, 0)], f"a row WAS requeued, so a later run could sweep: {requeued}"
+        assert src.exists()
+    finally:
+        release.set()
+        _cleanup(aid, owner)
+
+
+def test_a_stop_during_a_live_photos_heavy_decode_keeps_what_the_thread_published(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    uid = f"heiclive-{secrets.token_urlsafe(4)}"
+    aid, jid, owner = _seed_image(uid, mime="image/heic", lane="slow")
+    entered, release = threading.Event(), threading.Event()
+    written, decode = _gated_decode(uid, tmp_path, entered, release)
+    monkeypatch.setattr(media, "process_image", decode)
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(run_once(db))
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    try:
+        asyncio.run(_go())
+
+        assert [p.name for p in written if not p.exists()] == [], (
+            "the stop swept a live photo's tiers"
+        )
+        assert _sql("SELECT state FROM media_jobs WHERE id = :j", j=jid)[0][0] == "queued"
+    finally:
+        release.set()
+        _cleanup(aid, owner)
+
+
+def _transcode_site(monkeypatch, tmp_path, uid: str, on_spawn) -> Path:
+    """A slow-lane video whose stub transcode finishes cleanly, so its temp survives the run's own
+    cleanup (which only unlinks a partial) and is still there when the checkpoint is reached."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 60)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+
+    def _cmd(src: str, dest: str, threads: int) -> list[str]:
+        on_spawn()  # between the claim and the temp's creation: the delete's window
+        return ["sh", "-c", 'printf transcoded > "$1"', "sh", dest]
+
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _cmd)
+    return tmp_path / "assets" / "web" / f"{uid}.tmp.mp4"
+
+
+def test_a_stop_at_the_publish_checkpoint_leaves_no_temp_of_a_deleted_video(monkeypatch, tmp_path):
+    # The transcode site of the same class. Nothing is at a final path yet (os.replace comes after
+    # the checkpoint), but the finished temp is the biggest file the worker ever writes and nothing
+    # else reaps a `.tmp.mp4` — guard_publish's sweep is the only thing that would have.
+    uid = f"vidstop-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"not really a video")
+    aid, jid = _seed_video(uid, src=src)
+    owner = _sql("SELECT owner_id FROM attachments WHERE id=:a", a=aid)[0][0]
+    tmp_out = _transcode_site(monkeypatch, tmp_path, uid, lambda: _delete_rows(aid))
+    requeued = _watch_requeues(monkeypatch)
+    reached = _park_at_the_publish_checkpoint(monkeypatch)
+
+    try:
+        asyncio.run(_stop_at_the_checkpoint(reached))
+
+        assert not tmp_out.exists(), "the stop left a deleted video's temp on disk for good"
+        assert not (tmp_path / "assets" / "web" / f"{uid}.mp4").exists()  # never published either
+        assert requeued == [(jid, 0)], f"a row WAS requeued, so a later run could sweep: {requeued}"
+        assert src.exists()
+    finally:
+        _cleanup(aid, owner)
+
+
+def _unlink_fails_on(monkeypatch, target: Path) -> None:
+    """Fail ONE path's unlink the way the derived tier's NFS mount can (EIO/ESTALE/EROFS), leaving
+    every other unlink in the process real — `missing_ok` covers a missing file and nothing else."""
+    real = Path.unlink
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == target:
+            raise OSError(errno.EIO, "Input/output error", str(self))
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+
+
+def _watch_slow_lane(monkeypatch) -> list[BaseException]:
+    """Spy the REAL process_slow and record what comes OUT of it — where "the stop was not
+    replaced" is decided. The job table cannot answer it: a failure and a stop both leave the
+    row behind, and only the exception type says which of the two run_once was handed."""
+    seen: list[BaseException] = []
+    real = media.process_slow
+
+    async def _watched(db, job, attachment) -> None:
+        try:
+            await real(db, job, attachment)
+        except BaseException as exc:
+            seen.append(exc)
+            raise
+
+    monkeypatch.setattr(media, "process_slow", _watched)
+    return seen
+
+
+def test_a_failing_unlink_at_the_checkpoint_does_not_replace_the_stop(monkeypatch, tmp_path):
+    # The same stop as above, but the temp's unlink fails. Raised out of the `except CancelledError`
+    # block it REPLACES the cancellation: run_once then books an ordinary job failure, never runs
+    # the cancel hand-back, and the stop is swallowed by the very sweep that closes the leak.
+    uid = f"vidunlink-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"not really a video")
+    aid, jid = _seed_video(uid, src=src)
+    owner = _sql("SELECT owner_id FROM attachments WHERE id=:a", a=aid)[0][0]
+    tmp_out = _transcode_site(monkeypatch, tmp_path, uid, lambda: _delete_rows(aid))
+    requeued = _watch_requeues(monkeypatch)
+    raised = _watch_slow_lane(monkeypatch)
+    reached = _park_at_the_publish_checkpoint(monkeypatch)
+    _unlink_fails_on(monkeypatch, tmp_out)
+    out: list[BaseException] = []
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(run_once(db))
+            await asyncio.wait_for(reached.wait(), FILE_WAIT_SECONDS)
+            task.cancel()
+            try:
+                await task
+            # Not pytest.raises: what run_once did with the stop is an assertion below, and under
+            # the defect it does not raise at all.
+            except BaseException as exc:
+                out.append(exc)
+
+    try:
+        asyncio.run(_go())
+
+        assert [type(e).__name__ for e in raised] == ["CancelledError"], (
+            f"the unlink's error left process_slow in place of the stop: {raised}"
+        )
+        assert [type(e).__name__ for e in out] == ["CancelledError"], (
+            f"run_once was handed something other than the stop: {out}"
+        )
+        assert requeued == [(jid, 0)], f"the cancel hand-back never ran: {requeued}"
+        # The temp the failed unlink could not take: a leak a SIGKILL would have left anyway.
+        assert tmp_out.exists()
+    finally:
+        _cleanup(aid, owner)
+
+
+def test_a_failing_unlink_of_the_partial_does_not_replace_the_stop(monkeypatch, tmp_path):
+    # The other unlink on this path: the run's `finally`, which the stop unwinds THROUGH. An error
+    # raised there replaces the propagating cancellation just as surely as one raised in an
+    # `except` block does — same NFS failure, same swallowed stop, one lane earlier.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 60)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _stub_transcode_cmd)
+    uid = f"vidpartial-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"not really a video")
+    aid, _jid = _seed_video(uid, src=src)
+    owner = _sql("SELECT owner_id FROM attachments WHERE id=:a", a=aid)[0][0]
+    tmp_out = tmp_path / "assets" / "web" / f"{uid}.tmp.mp4"
+    raised = _watch_slow_lane(monkeypatch)
+    _unlink_fails_on(monkeypatch, tmp_out)
+    out: list[BaseException] = []
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(run_once(db))
+            assert await _await_file(tmp_out), "the stub transcode never wrote its partial"
+            task.cancel()
+            try:
+                await task
+            except BaseException as exc:
+                out.append(exc)
+
+    try:
+        asyncio.run(_go())
+
+        assert [type(e).__name__ for e in raised] == ["CancelledError"], (
+            f"the partial's unlink error left process_slow in place of the stop: {raised}"
+        )
+        assert [type(e).__name__ for e in out] == ["CancelledError"], (
+            f"run_once was handed something other than the stop: {out}"
+        )
+    finally:
+        _cleanup(aid, owner)
+
+
+def test_a_stop_at_the_publish_checkpoint_keeps_a_live_videos_tiers(monkeypatch, tmp_path):
+    # The control: the stop takes this run's own unpublished temp (the requeued run re-transcodes
+    # from the original anyway) and nothing else — a live video's poster and screen tiers stay.
+    uid = f"vidlive-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"not really a video")
+    aid, jid = _seed_video(uid, src=src)
+    owner = _sql("SELECT owner_id FROM attachments WHERE id=:a", a=aid)[0][0]
+    tiers = [tmp_path / "assets" / t / f"{uid}.jpg" for t in ("thumbs", "posters")]
+    for tier in tiers:
+        tier.parent.mkdir(parents=True, exist_ok=True)
+        tier.write_bytes(b"live")
+    _transcode_site(monkeypatch, tmp_path, uid, lambda: None)
+    reached = _park_at_the_publish_checkpoint(monkeypatch)
+
+    try:
+        asyncio.run(_stop_at_the_checkpoint(reached))
+
+        assert [p.name for p in tiers if not p.exists()] == [], (
+            "the stop swept a live video's tiers"
+        )
+        assert _sql("SELECT state FROM media_jobs WHERE id = :j", j=jid)[0][0] == "queued"
     finally:
         _cleanup(aid, owner)

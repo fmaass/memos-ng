@@ -877,6 +877,143 @@ async def test_a_stop_still_wins_when_the_waited_out_encode_fails(adb, monkeypat
         loop.set_exception_handler(previous)
 
 
+def _job_rows_for(attachment_id: int) -> int:
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        rows = c.execute(
+            text("SELECT count(*) FROM media_jobs WHERE attachment_id=:a"), {"a": attachment_id}
+        ).scalar_one()
+    eng.dispose()
+    return rows
+
+
+def test_a_stop_during_a_deleted_photos_encode_leaves_nothing_of_it_on_disk(
+    monkeypatch, tmp_path, db_engine
+):
+    # The stop re-raises BEFORE guard_publish, and the thread it has just waited out already
+    # os.replace'd the rendition into its final path. So if the photo was deleted during that
+    # encode, the published file names nothing — and no later run sweeps it: the delete took the
+    # job row with the attachment (the claim is committed before processing, so the row was
+    # lockable), the cancel path's conditional requeue therefore moves no row, and the job never
+    # runs again. What is asserted is what is LEFT ON DISK once the consumer has exited.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    src = _png(tmp_path / "stop-delete.png")
+    aid, jid, uid = _seed_job("image/png", str(src), JobKind.printready)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _publishing_encode(attachment, profile=None) -> Path:
+        # Gated by the TEST, not by a sleep: the delete has to land while the encode is still
+        # running and the publish has to follow it, and a timed stub would let host load decide
+        # that order. What it writes is the real encode's last act — the FINAL path.
+        entered.set()
+        release.wait(5)
+        out = printready.printready_path(attachment.uid, profile)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (9, 9, 9)).save(out, "JPEG")
+        return out
+
+    monkeypatch.setattr(media, "process_printready", _publishing_encode)
+
+    # "Nothing is requeued" asserted at its decision point: the REAL conditional write, wrapped and
+    # asked how many rows it moved. An empty job table afterwards would read the same for a row
+    # that was requeued and then swept by something else.
+    requeued: list[tuple[int, int]] = []
+    real_conditional = worker._requeue_claim_conditional
+
+    async def _watched(job_id: int, claim: str) -> int:
+        rows = await real_conditional(job_id, claim)
+        requeued.append((job_id, rows))
+        return rows
+
+    monkeypatch.setattr(worker, "_requeue_claim_conditional", _watched)
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(worker.run_once(db))
+            # Waited for off the loop, so the delete and the stop below land with the encode
+            # mid-flight rather than before it has started.
+            assert await asyncio.to_thread(entered.wait, 5)
+            # The delete never waits for a running job: it removes every job row it can lock and
+            # then the attachment, sweeping the derived set while this encode still has nothing
+            # on disk.
+            await asyncio.to_thread(_delete_attachments, aid)
+
+            task.cancel()
+            # FIFO scheduling, not elapsed time: cancel() queues the resumption, so these yields
+            # hand the job its CancelledError and park it in the wait-out on any host.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not task.done(), "the cancelled await returned while the encode was running"
+
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task  # and the stop is still delivered, never swallowed
+
+    try:
+        asyncio.run(_go())
+
+        assert requeued == [(jid, 0)], f"a row WAS requeued, so a later run could sweep: {requeued}"
+        assert _job_rows_for(aid) == 0  # nothing is left that could ever re-run
+        assert not printready.printready_path(uid).exists(), (
+            "the stop left a deleted photo's rendition on disk, with no row and no job naming it"
+        )
+        assert src.exists()  # the original is the archive master: a sweep never touches it
+    finally:
+        release.set()
+        _delete_attachments(aid)
+
+
+def test_a_stop_during_a_live_photos_encode_keeps_what_the_thread_published(
+    monkeypatch, tmp_path, db_engine
+):
+    # The other half of the fence above, and the reason it asks the database at all: a stop is not
+    # a delete. The photo is still there, the requeued job will publish nothing new (it re-encodes
+    # the same bytes into the same path), and sweeping here would take a finished rendition — and
+    # with it every OTHER tier of a live photo, since the sweep is the whole derived set.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(media, "too_hot", lambda: False)
+    src = _png(tmp_path / "stop-live.png")
+    aid, jid, uid = _seed_job("image/png", str(src), JobKind.printready)
+    thumb = tmp_path / "assets" / "thumbs" / f"{uid}.jpg"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _publishing_encode(attachment, profile=None) -> Path:
+        entered.set()
+        release.wait(5)
+        out = printready.printready_path(attachment.uid, profile)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (9, 9, 9)).save(out, "JPEG")
+        Image.new("RGB", (4, 4), (1, 1, 1)).save(thumb, "JPEG")  # a screen tier, already live
+        return out
+
+    monkeypatch.setattr(media, "process_printready", _publishing_encode)
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(worker.run_once(db))
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    try:
+        asyncio.run(_go())
+
+        assert printready.printready_path(uid).exists(), "the stop swept a live photo's rendition"
+        assert thumb.exists(), "the stop swept a live photo's screen tiers"
+        assert _read_job(jid)[0] == "queued"  # ...and the claim went back for the next worker
+    finally:
+        release.set()
+        _delete_attachments(aid)
+
+
 async def test_the_upload_pipeline_never_generates_the_print_tier(adb, monkeypatch, tmp_path):
     # On-demand only: a 60 MP re-encode per upload is exactly the cost this tier is designed to
     # pay once, when a book needs it.
