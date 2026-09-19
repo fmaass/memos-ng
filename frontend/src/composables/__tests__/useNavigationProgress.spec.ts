@@ -11,6 +11,7 @@ import { NAV_PROGRESS_DELAY_MS } from '@/lib/navigationProgress'
 const Blank = defineComponent({ setup: () => () => h('div') })
 
 let resolveSlow: ((component: unknown) => void) | null = null
+let resolveOther: ((component: unknown) => void) | null = null
 let rejectBroken: ((error: unknown) => void) | null = null
 
 function makeRouter(): Router {
@@ -25,6 +26,14 @@ function makeRouter(): Router {
         component: () =>
           new Promise((resolve) => {
             resolveSlow = resolve
+          }),
+      },
+      {
+        path: '/other',
+        name: 'other',
+        component: () =>
+          new Promise((resolve) => {
+            resolveOther = resolve
           }),
       },
       {
@@ -51,6 +60,7 @@ let visible: Ref<boolean>
 beforeEach(async () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   resolveSlow = null
+  resolveOther = null
   rejectBroken = null
   router = makeRouter()
   scope = effectScope()
@@ -122,6 +132,70 @@ describe('useNavigationProgress', () => {
     await second.catch(() => {})
     await flush()
     expect(visible.value).toBe(false)
+  })
+
+  it('keeps the bar up for the newest tap after a cached route arrived between them', async () => {
+    // Resources (slow chunk), Explore (cached, arrives), Settings (slow chunk), and only then the
+    // Resources chunk lands and reports itself cancelled — the order a phone on a slow tunnel
+    // produces every time. The bar belongs to Settings until Settings says otherwise.
+    void router.push('/slow').catch(() => {})
+    await flush()
+    await router.push('/fast')
+    await flush()
+    void router.push('/other').catch(() => {})
+    await flush()
+    vi.advanceTimersByTime(NAV_PROGRESS_DELAY_MS)
+    expect(visible.value).toBe(true)
+
+    resolveSlow!(Blank)
+    await flush()
+    expect(visible.value).toBe(true)
+
+    resolveOther!(Blank)
+    await flush()
+    expect(visible.value).toBe(false)
+  })
+
+  it('takes the bar down when the newest tap fails, however long an older one stalls', async () => {
+    // The mirror case: nothing will ever come back from the abandoned first navigation, so a bar
+    // that waits for it claims the app is still on its way somewhere it has given up on.
+    void router.push('/slow').catch(() => {})
+    await flush()
+    void router.push('/broken').catch(() => {})
+    await flush()
+    vi.advanceTimersByTime(NAV_PROGRESS_DELAY_MS)
+    expect(visible.value).toBe(true)
+
+    rejectBroken!(new Error('chunk load failed'))
+    await flush()
+    expect(visible.value).toBe(false)
+  })
+
+  it('hands beforeEach, afterEach and onError one and the same location object', async () => {
+    // The identity the bar is keyed on. vue-router builds `toLocation` once per navigation and
+    // passes that object to every hook — a claim this composable would silently fail without.
+    const before: unknown[] = []
+    const after: unknown[] = []
+    const failed: unknown[] = []
+    router.beforeEach((to) => {
+      before.push(to)
+    })
+    router.afterEach((to) => {
+      after.push(to)
+    })
+    router.onError((_error, to) => {
+      failed.push(to)
+    })
+
+    await router.push('/fast')
+    await flush()
+    expect(after[0]).toBe(before[0])
+
+    void router.push('/broken').catch(() => {})
+    await flush()
+    rejectBroken!(new Error('chunk load failed'))
+    await flush()
+    expect(failed[0]).toBe(before[1])
   })
 
   it('unhooks itself from the router when its scope is disposed', async () => {

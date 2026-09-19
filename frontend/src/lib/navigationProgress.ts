@@ -7,8 +7,8 @@
  */
 export const NAV_PROGRESS_DELAY_MS = 120
 
-/** How a navigation left: on the view it asked for, or any other way. */
-export type NavigationEnd = 'completed' | 'unfinished'
+/** Whatever the caller uses to tell one navigation from another; the composable passes `to`. */
+export type NavigationId = object
 
 export interface NavigationProgressDeps {
   setTimer: (fn: () => void, delayMs: number) => unknown
@@ -18,20 +18,19 @@ export interface NavigationProgressDeps {
 }
 
 export interface NavigationProgress {
-  started: () => void
-  ended: (end: NavigationEnd) => void
+  started: (id: NavigationId) => void
+  ended: (id: NavigationId) => void
   visible: () => boolean
-  pending: () => number
   stop: () => void
 }
 
 /**
- * The bar's whole decision, away from the router and the DOM: how many navigations are out, and
- * whether the oldest of them has been out long enough to say so.
+ * The bar's whole decision, away from the router and the DOM: WHICH navigation it is speaking for,
+ * and whether that one has been out long enough to say so.
  */
 export function createNavigationProgress(deps: NavigationProgressDeps): NavigationProgress {
   const delayMs = deps.delayMs ?? NAV_PROGRESS_DELAY_MS
-  let pending = 0
+  let current: NavigationId | null = null
   let visible = false
   let timer: unknown = null
 
@@ -48,34 +47,30 @@ export function createNavigationProgress(deps: NavigationProgressDeps): Navigati
   }
 
   function idle() {
-    pending = 0
+    current = null
     disarm()
     show(false)
   }
 
   return {
-    started() {
-      pending += 1
-      // One timer covers the whole queue: it is armed by the first navigation still out, and a
-      // second one starting mid-wait must not push the bar further away.
+    started(id) {
+      current = id
+      // One timer covers the whole wait: it is armed by the first navigation still out, and a
+      // second tap mid-wait must not push the bar further away.
       if (visible || timer !== null) return
       timer = deps.setTimer(() => {
         timer = null
-        if (pending > 0) show(true)
+        if (current !== null) show(true)
       }, delayMs)
     },
-    ended(end) {
-      // A completed navigation has its view on screen, so nothing may still be waiting behind it:
-      // a redirect reports only the leg that finished, and counting alone would strand the bar.
-      if (end === 'completed') {
-        idle()
-        return
-      }
-      pending = Math.max(0, pending - 1)
-      if (pending === 0) idle()
+    ended(id) {
+      // Only the navigation the bar is speaking for may take it down. The router reports a
+      // superseded one only once its chunk finally arrives — taps later — and a redirect never
+      // reports the leg it replaced at all; counting either would move the wrong bar.
+      if (id !== current) return
+      idle()
     },
     visible: () => visible,
-    pending: () => pending,
     stop: idle,
   }
 }

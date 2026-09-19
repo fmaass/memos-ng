@@ -18,14 +18,16 @@ export function useNavigationProgress(router: Router): Ref<boolean> {
     },
   })
 
+  // The `to` location IS the navigation's identity: vue-router builds it once and hands that same
+  // object to every hook below, so a report can be matched to the tap it belongs to.
   const unhook = [
-    router.beforeEach(() => {
-      progress.started()
+    router.beforeEach((to) => {
+      progress.started(to)
     }),
     // A navigation that was cancelled, aborted or duplicated arrives here WITH a failure; one
     // whose component never loaded arrives at `onError` instead and never here at all.
-    router.afterEach((_to, _from, failure) => progress.ended(failure ? 'unfinished' : 'completed')),
-    router.onError(() => progress.ended('unfinished')),
+    router.afterEach((to) => progress.ended(to)),
+    router.onError((_error, to) => progress.ended(to)),
   ]
 
   onScopeDispose(() => {
