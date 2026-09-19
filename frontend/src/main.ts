@@ -10,7 +10,7 @@ import { registerSW } from 'virtual:pwa-register'
 
 import { installReachability } from './api/reachability'
 import App from './App.vue'
-import { loadPlacesMap } from './lib/places/loadMap'
+import { loadPlacesMap, recordStylesheetFailures } from './lib/places/loadMap'
 import { idleSchedule, MAP_WARMUP_DELAY_MS, scheduleMapWarmup } from './lib/mapWarmup'
 import router from './router'
 import './style.css'
@@ -60,6 +60,10 @@ createApp(App)
   .use(ToastService)
   .use(ConfirmationService)
   .mount('#app')
+
+// Before anything can ask for a chunk: a stylesheet that fails is never fetched again by itself,
+// and the warm-up below is the first thing that can burn one.
+recordStylesheetFailures(document)
 
 // The map chunk is excluded from the precache on purpose (a cold Home must not pay for it), which
 // left every first tap on Places waiting for a megabyte. Fetch it once the app is up and the
