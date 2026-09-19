@@ -1502,11 +1502,15 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # Keyed on "this run finished cleanly", NOT on the leader's exit status: a leader can exit
         # 0 while a descendant hangs and the ceiling fires, and that partial must still go.
         if not completed:
-            # blocking-ok: STAYS inline on purpose. This `finally` also runs on worker-shutdown
-            # cancellation, and an await here could be interrupted before the unlink ever
-            # happened — leaking a partial transcode (the biggest file the worker writes, and
-            # nothing else reaps a `.tmp.mp4`). A synchronous call cannot be cut short.
-            tmp.unlink(missing_ok=True)
+            # Suppressed for the reason the checkpoint's unlink below gives, which this `finally`
+            # shares: a stop unwinds THROUGH here, and an error raised while a CancelledError is
+            # propagating replaces it exactly as one raised inside an `except` block would.
+            with contextlib.suppress(OSError):
+                # blocking-ok: STAYS inline on purpose. This `finally` also runs on worker-shutdown
+                # cancellation, and an await here could be interrupted before the unlink ever
+                # happened — leaking a partial transcode (the biggest file the worker writes, and
+                # nothing else reaps a `.tmp.mp4`). A synchronous call cannot be cut short.
+                tmp.unlink(missing_ok=True)
         # The progress row is deliberately NOT cleared here. This runs inside the claiming
         # transaction, before the outcome commits, and in that window the snapshot would fall back
         # to the job row's committed 0 while the attachment still reads `processing` — a transcode
@@ -1530,9 +1534,15 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # file this run has on disk is its own unpublished temp, which even a live attachment's
         # requeued run re-transcodes from scratch rather than resuming. That keeps the transcode
         # path's stop budget where it is (RELEASING.md): it can afford no further bounded second.
-        # blocking-ok: one unlink, on a stop path where an await could be interrupted before it
-        # ever happened — the same reason the `finally` above stays synchronous.
-        tmp.unlink(missing_ok=True)
+        # Suppressed, not just `missing_ok`: that covers a missing file and nothing else, and this
+        # temp sits on the NFS-backed derived tier where EIO/ESTALE/EROFS are real. Raised from
+        # inside this except block the error would REPLACE the cancellation — run_once would see an
+        # ordinary failure and never run the cancel hand-back. A temp that stays is a leak a
+        # SIGKILL would have left anyway; a replaced cancellation is a swallowed stop.
+        with contextlib.suppress(OSError):
+            # blocking-ok: one unlink, on a stop path where an await could be interrupted before it
+            # ever happened — the same reason the `finally` above stays synchronous.
+            tmp.unlink(missing_ok=True)
         raise
     # blocking-ok: the publish must follow guard_publish's row-lock check with no yield point in
     # between — an await here would hand the loop back between "the attachment still exists" and

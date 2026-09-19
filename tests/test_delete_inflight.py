@@ -12,6 +12,7 @@ tests/test_slowlane_timeout.py), so the real subprocess machinery runs without a
 """
 
 import asyncio
+import errno
 import secrets
 import threading
 import time
@@ -660,6 +661,124 @@ def test_a_stop_at_the_publish_checkpoint_leaves_no_temp_of_a_deleted_video(monk
         assert not (tmp_path / "assets" / "web" / f"{uid}.mp4").exists()  # never published either
         assert requeued == [(jid, 0)], f"a row WAS requeued, so a later run could sweep: {requeued}"
         assert src.exists()
+    finally:
+        _cleanup(aid, owner)
+
+
+def _unlink_fails_on(monkeypatch, target: Path) -> None:
+    """Fail ONE path's unlink the way the derived tier's NFS mount can (EIO/ESTALE/EROFS), leaving
+    every other unlink in the process real — `missing_ok` covers a missing file and nothing else."""
+    real = Path.unlink
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == target:
+            raise OSError(errno.EIO, "Input/output error", str(self))
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+
+
+def _watch_slow_lane(monkeypatch) -> list[BaseException]:
+    """Spy the REAL process_slow and record what comes OUT of it — where "the stop was not
+    replaced" is decided. The job table cannot answer it: a failure and a stop both leave the
+    row behind, and only the exception type says which of the two run_once was handed."""
+    seen: list[BaseException] = []
+    real = media.process_slow
+
+    async def _watched(db, job, attachment) -> None:
+        try:
+            await real(db, job, attachment)
+        except BaseException as exc:
+            seen.append(exc)
+            raise
+
+    monkeypatch.setattr(media, "process_slow", _watched)
+    return seen
+
+
+def test_a_failing_unlink_at_the_checkpoint_does_not_replace_the_stop(monkeypatch, tmp_path):
+    # The same stop as above, but the temp's unlink fails. Raised out of the `except CancelledError`
+    # block it REPLACES the cancellation: run_once then books an ordinary job failure, never runs
+    # the cancel hand-back, and the stop is swallowed by the very sweep that closes the leak.
+    uid = f"vidunlink-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"not really a video")
+    aid, jid = _seed_video(uid, src=src)
+    owner = _sql("SELECT owner_id FROM attachments WHERE id=:a", a=aid)[0][0]
+    tmp_out = _transcode_site(monkeypatch, tmp_path, uid, lambda: _delete_rows(aid))
+    requeued = _watch_requeues(monkeypatch)
+    raised = _watch_slow_lane(monkeypatch)
+    reached = _park_at_the_publish_checkpoint(monkeypatch)
+    _unlink_fails_on(monkeypatch, tmp_out)
+    out: list[BaseException] = []
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(run_once(db))
+            await asyncio.wait_for(reached.wait(), FILE_WAIT_SECONDS)
+            task.cancel()
+            try:
+                await task
+            # Not pytest.raises: what run_once did with the stop is an assertion below, and under
+            # the defect it does not raise at all.
+            except BaseException as exc:
+                out.append(exc)
+
+    try:
+        asyncio.run(_go())
+
+        assert [type(e).__name__ for e in raised] == ["CancelledError"], (
+            f"the unlink's error left process_slow in place of the stop: {raised}"
+        )
+        assert [type(e).__name__ for e in out] == ["CancelledError"], (
+            f"run_once was handed something other than the stop: {out}"
+        )
+        assert requeued == [(jid, 0)], f"the cancel hand-back never ran: {requeued}"
+        # The temp the failed unlink could not take: a leak a SIGKILL would have left anyway.
+        assert tmp_out.exists()
+    finally:
+        _cleanup(aid, owner)
+
+
+def test_a_failing_unlink_of_the_partial_does_not_replace_the_stop(monkeypatch, tmp_path):
+    # The other unlink on this path: the run's `finally`, which the stop unwinds THROUGH. An error
+    # raised there replaces the propagating cancellation just as surely as one raised in an
+    # `except` block does — same NFS failure, same swallowed stop, one lane earlier.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "SLOW_TRANSCODE_TIMEOUT_S", 60)
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    monkeypatch.setattr(media, "slow_ffmpeg_cmd", _stub_transcode_cmd)
+    uid = f"vidpartial-{secrets.token_urlsafe(4)}"
+    src = tmp_path / "originals" / f"{uid}.mp4"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"not really a video")
+    aid, _jid = _seed_video(uid, src=src)
+    owner = _sql("SELECT owner_id FROM attachments WHERE id=:a", a=aid)[0][0]
+    tmp_out = tmp_path / "assets" / "web" / f"{uid}.tmp.mp4"
+    raised = _watch_slow_lane(monkeypatch)
+    _unlink_fails_on(monkeypatch, tmp_out)
+    out: list[BaseException] = []
+
+    async def _go() -> None:
+        async with async_session() as db:
+            task = asyncio.create_task(run_once(db))
+            assert await _await_file(tmp_out), "the stub transcode never wrote its partial"
+            task.cancel()
+            try:
+                await task
+            except BaseException as exc:
+                out.append(exc)
+
+    try:
+        asyncio.run(_go())
+
+        assert [type(e).__name__ for e in raised] == ["CancelledError"], (
+            f"the partial's unlink error left process_slow in place of the stop: {raised}"
+        )
+        assert [type(e).__name__ for e in out] == ["CancelledError"], (
+            f"run_once was handed something other than the stop: {out}"
+        )
     finally:
         _cleanup(aid, owner)
 
