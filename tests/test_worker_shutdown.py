@@ -627,6 +627,89 @@ async def test_a_stop_before_the_claim_commit_lands_requeues_nothing(
         _cleanup(subject, aid)
 
 
+async def test_a_stop_in_the_failure_record_requeues_without_charging_the_attempt(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+    tmp_path,
+):
+    """ACCEPTED as it stands: an attempt the stop interrupted mid-bookkeeping is not charged.
+
+    The window is real. A job raises an ordinary error, `_record_job_failure` opens with a rollback,
+    and a cancellation there arrives before `attempts += 1` has committed anything — so the cancel
+    handler hands a still-`processing` row back with its attempt count untouched, and the failure
+    that did happen goes uncounted.
+
+    WHY it stays that way rather than being charged on the stop path: the stop cannot tell a job's
+    OWN failure from a failure the stop itself caused. A teardown produces ordinary exceptions as a
+    matter of course — an asyncpg operation cancelled mid-flight, a session closing under a
+    coroutine, a subprocess taken down with the process group — and every one of them reaches this
+    same branch. Charging here would therefore charge good jobs for a deploy, which is precisely
+    what "a deploy is not a failed attempt" forbids. The price of the lenient direction is bounded
+    and small: at most one uncounted attempt per consumer per stop, on a job that is retried exactly
+    as the retry branch would have retried it, while every attempt NOT interrupted by a stop still
+    counts — so a persistently-bad job still ages out to `failed` at MEDIA_MAX_ATTEMPTS.
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    subject = "shutdown_failure_owner"
+    _seed_owner(subject)
+    aid, jid, _uid = _seed_image(subject, tmp_path)
+
+    recording = asyncio.Event()
+    armed: list[AsyncSession] = []
+    real_process_job = media.process_job
+    real_rollback = AsyncSession.rollback
+
+    async def failing_process_job(db, job):
+        if job.id == jid:
+            # Raised before anything is written or locked, so the only transaction in play when the
+            # stop lands is the one the failure record is about to roll back.
+            armed.append(db)
+            raise RuntimeError("a bad input, as any unreadable original would be")
+        await real_process_job(db, job)
+
+    async def parked_rollback(self, *args, **kwargs):
+        if armed and armed[0] is self:
+            armed.clear()
+            recording.set()
+            await asyncio.sleep(3600)  # the stop lands in the failure record's FIRST await
+        await real_rollback(self, *args, **kwargs)
+
+    monkeypatch.setattr(media, "process_job", failing_process_job)
+    monkeypatch.setattr(AsyncSession, "rollback", parked_rollback)
+    decisions = _watch_requeue_decisions(monkeypatch)
+
+    supervisor = asyncio.create_task(worker.run())
+    try:
+        async with asyncio.timeout(60):
+            await recording.wait()
+        assert _read_claim(jid)[0] == "processing", (
+            f"the failure record was supposed to start on a claimed row: {_read_claim(jid)}"
+        )
+        supervisor.cancel()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                async with asyncio.timeout(STOP_GRACE_SECONDS):
+                    await supervisor
+        except TimeoutError:
+            raise AssertionError(
+                f"a stop in the failure record held the process past docker's "
+                f"{STOP_GRACE_SECONDS}s grace"
+            ) from None
+        assert decisions == [(jid, 1)], (
+            f"the stop did not hand the interrupted failure record's row back: {decisions}"
+        )
+        assert _read_claim(jid) == ("queued", 0, None), (
+            f"the interrupted failure record left the row anything but retryable-as-new: "
+            f"{_read_claim(jid)}"
+        )
+    finally:
+        supervisor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await supervisor
+        _cleanup(subject, aid)
+
+
 # A worker process with no database and no media work: every collaborator the supervisor calls is
 # replaced in the child itself, and each consumer's drain parks until the shutdown cancels it, so
 # what this proves is the SIGNAL path and nothing else.
