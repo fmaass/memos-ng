@@ -67,6 +67,36 @@ describe('bboxOf', () => {
   })
 })
 
+describe('coordKey', () => {
+  // The native client rounds the same coordinates to build the same pin key, so these vectors are
+  // the parity contract between the two clients: every expected value is JavaScript's own
+  // `toFixed(6)` — rounding of the EXACT binary value, half away from zero — confirmed on this
+  // host before it was written down. Each vector runs through both halves of the key, because a
+  // rounding change in either half must be caught.
+  const vectors: [value: number, rounded: string][] = [
+    [0.0078125, '0.007813'], // an exact tie in binary: it rounds away from zero, not to even
+    [1.0000005, '1.000001'],
+    [0.0000015, '0.000002'],
+    [46.9479745, '46.947975'],
+    [179.9999995, '180.000000'],
+    [47.3769875, '47.376987'], // stored just BELOW the decimal tie, so it rounds DOWN
+    [8.0000015, '8.000001'],
+    [8.5417235, '8.541723'],
+    [100.0000005, '100.000000'],
+  ]
+
+  it.each(vectors)('rounds %s to %s in both halves of the key', (value, rounded) => {
+    expect(coordKey(value, value)).toBe(`${rounded},${rounded}`)
+  })
+
+  it('writes no negative zero', () => {
+    // A coordinate that reaches zero from the west and one that reaches it from the east are one
+    // spot; a "-0.000000" half would split them into two pins that can never merge.
+    expect(coordKey(-0, -0)).toBe('0.000000,0.000000')
+    expect(coordKey(-0, -0)).not.toContain('-')
+  })
+})
+
 describe('groupByCoordinate', () => {
   it('collapses identical coordinates into one group, newest-first order preserved', () => {
     const groups = groupByCoordinate([
