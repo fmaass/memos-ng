@@ -194,12 +194,16 @@ task still left (which re-cancels an abandoned requeue write and does not honour
 Docker's SIGKILL at the end of the grace is the only deadline over the stop as a whole — and a
 second SIGTERM sent meanwhile is deliberately a no-op, so it does not shorten anything either.
 
-A print-ready encode is the one job the stop **waits out**: it runs in a thread, which cannot be
-interrupted, so `process_printready_job` lets the running rendition finish before the
-cancellation goes on to the hand-back — an abandoned thread would keep writing the rendition into
-its final path after the coroutine that guards the publish is gone. The light consumer runs one
-such job at a time, so the wait is one rendition's remaining encode. If that outlasts the grace,
-this is the SIGKILL case below.
+Two kinds of job the stop **waits out**: a print-ready encode and a heavy image decode (HEIC/AVIF).
+Both run in a thread, which cannot be interrupted, so `process_printready_job` and the slow lane's
+image branch let the running work finish before the cancellation goes on to the hand-back — an
+abandoned thread would keep writing its rendition or tiers into their final paths after the
+coroutine that guards the publish is gone. The light consumer runs one job at a time, so either
+wait is one job's remaining thread work. It is **not** part of the bounds above: it happens in
+front of them, so the 5 s quoted for the light path is the bounded part only. Nor is it new
+waiting — before the decode moved into a thread it ran inline on the event loop, which held the
+stop's delivery back for exactly the same time. If a wait outlasts the grace, this is the SIGKILL
+case below.
 
 **Past the grace nothing can be written**: docker sends SIGKILL. That strands a row only if a
 claim was actually in flight — a worker sitting idle leaves nothing behind. A claim that was in
