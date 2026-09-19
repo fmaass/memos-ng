@@ -1,4 +1,4 @@
-import { mount, type VueWrapper } from '@vue/test-utils'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import { defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -28,6 +28,11 @@ vi.mock('@tanstack/vue-query', async () => {
   }
 })
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+
+// The map arrives as its own chunk now, so the seam the view really has is the LOADER: hold it
+// unanswered and the view has to paint anyway, reject it and the pane has to offer a way back.
+const mapChunk = vi.hoisted(() => ({ load: null as null | (() => Promise<unknown>) }))
+vi.mock('@/lib/places/loadMap', () => ({ loadPlacesMap: () => mapChunk.load!() }))
 
 // PhotoSwipe cannot open in happy-dom; what this view owes it is the list it opens on.
 const lightbox = vi.hoisted(() => ({
@@ -63,7 +68,7 @@ function shownOnMap(wrapper: VueWrapper): string[] {
   return uidsOf(wrapper.findComponent(MapStub).props('markers'))
 }
 
-function mountView(phone = false) {
+function mountPending(phone = false) {
   window.matchMedia = ((q: string) =>
     ({
       matches: phone,
@@ -75,12 +80,18 @@ function mountView(phone = false) {
     global: {
       plugins: [PrimeVue],
       stubs: {
-        PlacesMap: MapStub,
         ClusterDrawer: listStub('ClusterDrawer', 'drawer-stub'),
         InViewGrid: listStub('InViewGrid', 'grid-stub'),
       },
     },
   })
+}
+
+/** The view with its map chunk delivered — the state every one of these tests is about. */
+async function mountView(phone = false) {
+  const wrapper = mountPending(phone)
+  await flushPromises()
+  return wrapper
 }
 
 // Imported after the mocks so the component picks them up.
@@ -89,13 +100,14 @@ const { default: PlacesView } = await import('@/views/PlacesView.vue')
 beforeEach(() => {
   query.markers = ALL
   lightbox.open.mockClear()
+  mapChunk.load = () => Promise.resolve({ default: MapStub, __esModule: true })
 })
 
 describe('PlacesView map wiring', () => {
   it('shows every located photo on the map, and no timeline bar', async () => {
     // The timeline was removed: nothing filters the marker set any more, and no bar is drawn
     // over the pane. Both halves have to hold — a bar without a filter would be just as wrong.
-    const wrapper = mountView()
+    const wrapper = await mountView()
     await wrapper.vm.$nextTick()
     expect(shownOnMap(wrapper)).toEqual(['jan', 'feb', 'mar'])
     expect(wrapper.find('[data-test="timeline-bar"]').exists()).toBe(false)
@@ -103,7 +115,7 @@ describe('PlacesView map wiring', () => {
   })
 
   it('shows the drawer the photos behind the pin that was tapped', async () => {
-    const wrapper = mountView()
+    const wrapper = await mountView()
     await wrapper.vm.$nextTick()
     wrapper.findComponent(MapStub).vm.$emit('cluster-open', {
       clusterId: 7,
@@ -115,7 +127,7 @@ describe('PlacesView map wiring', () => {
   })
 
   it('shows the phone grid the photos the map reports in view', async () => {
-    const wrapper = mountView(true)
+    const wrapper = await mountView(true)
     await wrapper.vm.$nextTick()
     wrapper.findComponent(MapStub).vm.$emit('visible-change', ['jan', 'feb'])
     await wrapper.vm.$nextTick()
@@ -124,7 +136,7 @@ describe('PlacesView map wiring', () => {
   })
 
   it('opens the viewer on the photos in view when a single pin is tapped', async () => {
-    const wrapper = mountView()
+    const wrapper = await mountView()
     await wrapper.vm.$nextTick()
     wrapper.findComponent(MapStub).vm.$emit('visible-change', ['jan', 'feb', 'mar'])
     await wrapper.vm.$nextTick()
@@ -144,12 +156,16 @@ describe('what the map says before the markers arrive', () => {
   // 1.7.0 rendered "No photo here knows where it was taken yet" from the absence of markers
   // alone, so it claimed it while the 1.1 MB markers request was still in flight — the feature
   // read as "found nothing" for the first seconds of every cold open.
-  function mountWith(state: { markers?: MapMarker[]; isPending: boolean; isError: boolean }) {
+  async function mountWith(state: {
+    markers?: MapMarker[]
+    isPending: boolean
+    isError: boolean
+  }) {
     const data = ref(state.markers ? { markers: state.markers } : undefined)
     const isPending = ref(state.isPending)
     const isError = ref(state.isError)
     query.state = { data, isPending, isError }
-    const wrapper = mountView()
+    const wrapper = await mountView()
     return { wrapper, data, isPending, isError }
   }
 
@@ -157,24 +173,24 @@ describe('what the map says before the markers arrive', () => {
     query.state = null
   })
 
-  it('says nothing about an empty library while the request is still in flight', () => {
-    const { wrapper } = mountWith({ isPending: true, isError: false })
+  it('says nothing about an empty library while the request is still in flight', async () => {
+    const { wrapper } = await mountWith({ isPending: true, isError: false })
 
     expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="places-loading"]').exists()).toBe(true)
     wrapper.unmount()
   })
 
-  it('tells a failed request apart from an empty library', () => {
-    const { wrapper } = mountWith({ markers: [], isPending: false, isError: true })
+  it('tells a failed request apart from an empty library', async () => {
+    const { wrapper } = await mountWith({ markers: [], isPending: false, isError: true })
 
     expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="places-error"]').exists()).toBe(true)
     wrapper.unmount()
   })
 
-  it('says the library is empty once the query has settled with nothing', () => {
-    const { wrapper } = mountWith({ markers: [], isPending: false, isError: false })
+  it('says the library is empty once the query has settled with nothing', async () => {
+    const { wrapper } = await mountWith({ markers: [], isPending: false, isError: false })
 
     expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="places-error"]').exists()).toBe(false)
@@ -184,7 +200,7 @@ describe('what the map says before the markers arrive', () => {
   it('shows the pins, and no message, when markers arrive LATE', async () => {
     // The map is mounted before the data exists — the sequence every cold open takes. The empty
     // state may not appear at any point of it.
-    const { wrapper, data, isPending } = mountWith({ isPending: true, isError: false })
+    const { wrapper, data, isPending } = await mountWith({ isPending: true, isError: false })
     expect(wrapper.find('[data-test="places-empty"]').exists()).toBe(false)
 
     data.value = { markers: ALL }
@@ -195,5 +211,64 @@ describe('what the map says before the markers arrive', () => {
     expect(wrapper.find('[data-test="places-error"]').exists()).toBe(false)
     expect(shownOnMap(wrapper)).toEqual(['jan', 'feb', 'mar'])
     wrapper.unmount()
+  })
+})
+
+describe('the view does not wait for the map chunk', () => {
+  it('paints the shell and says the map is on its way', async () => {
+    // The defect: `/places` is a 12 KB route, but it used to import the 1.09 MB map statically,
+    // so the navigation itself could not finish until the whole map had come over the tunnel —
+    // and nothing on screen said so.
+    mapChunk.load = () => new Promise(() => {})
+    const wrapper = mountPending()
+
+    expect(wrapper.find('[data-test="view-places"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="map-loading"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="map-stub"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('asks for the chunk again when the pane offers a retry', async () => {
+    let attempts = 0
+    mapChunk.load = () => {
+      attempts += 1
+      return attempts === 1
+        ? Promise.reject(new Error('chunk load failed'))
+        : Promise.resolve({ default: MapStub, __esModule: true })
+    }
+    const wrapper = mountPending()
+    await flushPromises()
+    expect(wrapper.find('[data-test="map-load-error"]').exists()).toBe(true)
+
+    await wrapper.find('[data-test="map-retry"]').trigger('click')
+    await flushPromises()
+
+    expect(attempts).toBe(2)
+    expect(wrapper.find('[data-test="map-stub"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('offers a reload once the retry has failed again in the same document', async () => {
+    // A browser that remembers a failed module fetch rejects the identical URL again without
+    // asking the network, for the life of the document. Asking a third time would be theatre;
+    // a new document is the only rung the pane has left.
+    const reload = vi.spyOn(window.location, 'reload').mockImplementation(() => {})
+    mapChunk.load = () => Promise.reject(new Error('chunk load failed'))
+    const wrapper = mountPending()
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="map-retry"]').text()).toBe('Try again')
+    await wrapper.find('[data-test="map-retry"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="map-retry"]').text()).toBe('Reload the page')
+    // Asserted at the decision point: nothing reloads until the viewer asks for it — the pane
+    // may be sitting behind a half-written memo.
+    expect(reload).not.toHaveBeenCalled()
+
+    await wrapper.find('[data-test="map-retry"]').trigger('click')
+    expect(reload).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+    reload.mockRestore()
   })
 })

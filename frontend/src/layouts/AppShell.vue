@@ -2,12 +2,15 @@
 import Button from 'primevue/button'
 import Drawer from 'primevue/drawer'
 import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
 import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
 import ConnectionBanner from '@/components/ConnectionBanner.vue'
+import NavigationProgressBar from '@/components/NavigationProgressBar.vue'
 import TagList from '@/components/TagList.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
+import { useNavigationProgress } from '@/composables/useNavigationProgress'
 import { useSettings } from '@/composables/useSettings'
 
 // The primary destinations, mirroring the original memos sidebar. One list, both navigations.
@@ -24,6 +27,10 @@ const NAV: NavItem[] = [
   { label: 'Resources', icon: 'pi pi-images', to: '/resources' },
   { label: 'Settings', icon: 'pi pi-cog', to: '/settings' },
 ]
+
+// A tap on a lazy route (Places above all) can take a second over the tunnel; until now nothing
+// on screen said the tap had been taken at all.
+const navigating = useNavigationProgress(useRouter())
 
 const { isDark, toggle, setDark } = useDarkMode()
 const { data: user } = useSession()
@@ -110,9 +117,10 @@ const headerInsetClass = computed(() =>
            covers none of the header's controls. The background and blur live here so both rows
            share them in either theme. -->
       <div
-        class="sticky top-0 z-30 bg-surface-50/90 backdrop-blur-sm dark:bg-surface-950/90"
+        class="relative sticky top-0 z-30 bg-surface-50/90 backdrop-blur-sm dark:bg-surface-950/90"
         data-test="app-chrome"
       >
+        <NavigationProgressBar :visible="navigating" />
         <ConnectionBanner @occupied="chromeRowShown = $event" />
 
         <header
