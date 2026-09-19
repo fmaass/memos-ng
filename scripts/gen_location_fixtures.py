@@ -1,4 +1,4 @@
-"""Author the twelve binary fixtures behind `fixtures/locations.json`.
+"""Author the fourteen binary fixtures behind `fixtures/locations.json`.
 
 Run it only to (re)create them; the committed files are the contract, and their sha256 is
 recorded in the artefact so a silent edit fails the suite. exiftool and ffmpeg are used HERE, at
@@ -17,12 +17,13 @@ interesting fact, so a failure names a rule rather than a file.
 """
 
 import hashlib
+import random
 import subprocess
 import sys
 from pathlib import Path
 
 import pillow_heif
-from PIL import Image
+from PIL import ExifTags, Image
 from PIL.TiffImagePlugin import IFDRational
 
 OUT = Path(__file__).resolve().parent.parent / "fixtures" / "locations"
@@ -32,6 +33,8 @@ GPS_LATITUDE_REF = 1
 GPS_LATITUDE = 2
 GPS_LONGITUDE_REF = 3
 GPS_LONGITUDE = 4
+DATETIME_ORIGINAL = 0x9003
+OFFSET_TIME_ORIGINAL = 0x9011
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -158,6 +161,24 @@ def heic_gps(path: Path) -> None:
     heif.save(path, quality=50)
 
 
+def avif_gps(path: Path) -> None:
+    """The HEIC payload in the AVIF spelling of the same container (+20.0, -150.0).
+
+    Written by Pillow's own libavif, not by pillow-heif: the pillow-heif build installed here
+    reports no AVIF encoder at all (`pillow_heif.libheif_info()["AVIF"]` is empty), while Pillow
+    12 encodes and decodes AVIF on its own (`PIL.features.check("avif")`). Both are the image
+    stack this repo already depends on; neither is a new one.
+    """
+    _still((10, 60, 200)).save(
+        path, "AVIF", quality=50, exif=_gps_exif((20, 0, 0), "N", (150, 0, 0), "W")
+    )
+
+
+def avif_no_gps(path: Path) -> None:
+    """An AVIF with no Exif item at all → read, and no location ('none', not 'unreadable')."""
+    _still((60, 120, 10)).save(path, "AVIF", quality=50)
+
+
 def _ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", "-v", "error", *args], check=True)
 
@@ -225,6 +246,8 @@ FIXTURES = {
     "png-exif-after-idat.png": png_exif_after_idat,
     "tiff-gps.tif": tiff_gps,
     "heic-gps.heic": heic_gps,
+    "avif-gps.avif": avif_gps,
+    "avif-no-gps.avif": avif_no_gps,
     "mov-iso6709.mov": mov_iso6709,
     "mp4-xyz.mp4": mp4_xyz,
     "mov-no-location.mov": mov_no_location,
@@ -683,3 +706,41 @@ def _meta_child_end(buf: bytes, kind: bytes) -> int:
 
 def _source_heic() -> bytes:
     return (OUT / "heic-gps.heic").read_bytes()
+
+
+# --------------------------------------------------------------------------------------------
+# AVIF VARIANTS — built at test runtime, never committed
+# --------------------------------------------------------------------------------------------
+# The same reasoning as the HEIF variants above: the large one is the point and is large, and the
+# other two say something the committed pair cannot — that a DATE travels the header path too, and
+# that an AVIF with no Exif ends exactly where a HEIC with no Exif ends.
+
+
+def avif_gps_large(path: Path, *, side: int = 512) -> None:
+    """`avif-gps.avif` with a real image behind it: tens of kilobytes of `mdat` to seek over.
+
+    NOISE rather than a flat colour, because an AVIF of a flat 8x8 still compresses to almost
+    nothing — and a payload that costs nothing proves nothing about a walk claiming to skip it.
+    Seeded, so the file a failing run built can be rebuilt byte for byte.
+    """
+    noise = Image.frombytes("RGB", (side, side), random.Random(0).randbytes(side * side * 3))
+    noise.save(path, "AVIF", quality=50, exif=_gps_exif((20, 0, 0), "N", (150, 0, 0), "W"))
+
+
+def avif_gps_dated(path: Path) -> None:
+    """`avif-gps.avif` with the capture read's own two tags beside the GPS IFD.
+
+    The committed AVIF carries a position and no date, so the date half of the header read would
+    otherwise be held to "nothing, same as the full read" — which any broken walk also answers.
+    """
+    exif = Image.Exif()
+    exif.load(_gps_exif((20, 0, 0), "N", (150, 0, 0), "W"))
+    ifd = exif.get_ifd(ExifTags.IFD.Exif)
+    ifd[DATETIME_ORIGINAL] = "2026:01:01 13:00:00"
+    ifd[OFFSET_TIME_ORIGINAL] = "+05:45"
+    _still((10, 60, 200)).save(path, "AVIF", quality=50, exif=exif.tobytes())
+
+
+def heic_no_gps(path: Path) -> None:
+    """A HEIC with no Exif item — the file the AVIF without one has to be indistinguishable from."""
+    pillow_heif.from_pillow(_still((60, 120, 10))).save(path, quality=50)

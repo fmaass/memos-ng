@@ -1,6 +1,6 @@
 """The location read (Phase 1 of Places): what a file's own metadata says about WHERE it was.
 
-`fixtures/locations.json` is the contract — twelve binaries pinned by sha256, each carrying one
+`fixtures/locations.json` is the contract — fourteen binaries pinned by sha256, each carrying one
 rule — and these cases hold `app/services/location.py` to it. The parametrized fixture test is the
 acceptance probe for the reader; the unit cases below it name the individual rules so a failure
 says WHICH rule broke rather than which file.

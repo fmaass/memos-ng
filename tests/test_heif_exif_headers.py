@@ -70,6 +70,18 @@ def _read(path: Path) -> dict[str, object]:
     }
 
 
+def _read_avif(path: Path) -> dict[str, object]:
+    """`_read`, for the mime the AVIF cases below are read under."""
+    result = location.read_location(path, AVIF_MIME)
+    if result is None:
+        return {"latitude": None, "longitude": None, "location_source": location.SOURCE_NONE}
+    return {
+        "latitude": result.latitude,
+        "longitude": result.longitude,
+        "location_source": result.source,
+    }
+
+
 def _walk(path: Path) -> bytes | None:
     with open(path, "rb") as f:
         return capture.heif_exif_from(f)
@@ -336,6 +348,134 @@ def test_the_cap_is_of_the_same_order_as_the_other_metadata_caps():
     # A cap that drifted to gigabytes would be no cap at all; one below a real Exif payload would
     # send every HEIC down the slow path silently.
     assert 64 * 1024 <= capture.HEIF_EXIF_READ_CAP <= capture.MOOV_READ_CAP
+
+
+# --------------------------------------------------------------------------------------------
+# AVIF — the same container, the same walk
+# --------------------------------------------------------------------------------------------
+
+AVIF_MIME = "image/avif"
+AVIF_EXPECTED = LOCATIONS["binaries"]["avif-gps.avif"]["expect"]
+AVIF_BINARY = BINARIES / "avif-gps.avif"
+AVIF_NO_EXIF = BINARIES / "avif-no-gps.avif"
+
+
+@pytest.fixture(scope="module")
+def avifs(tmp_path_factory) -> dict[str, Path]:
+    out = tmp_path_factory.mktemp("avif")
+    built = {
+        "large": gen.avif_gps_large,
+        "dated": gen.avif_gps_dated,
+        "heic-no-exif": gen.heic_no_gps,
+    }
+    paths = {}
+    for name, build in built.items():
+        paths[name] = out / f"{name}.avif"
+        build(paths[name])
+    return paths
+
+
+class _OpenSpy:
+    """The REAL `Image.open`, counting its calls. Not a stand-in: it opens the file.
+
+    The fallback is what this feature exists to skip, and "it was skipped" is a claim about the
+    DECISION, not about the answer — the full read returns the same coordinates, so an end-state
+    assertion passes just as loudly on a file that took the slow path all the way.
+    """
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.calls: list[object] = []
+
+    def __call__(self, fp, *args, **kwargs):
+        self.calls.append(fp)
+        return self._real(fp, *args, **kwargs)
+
+
+@pytest.fixture
+def open_spy(monkeypatch) -> _OpenSpy:
+    spy = _OpenSpy(Image.open)
+    monkeypatch.setattr(location.Image, "open", spy)
+    monkeypatch.setattr(capture.Image, "open", spy)
+    return spy
+
+
+def test_an_avif_with_exif_never_reaches_the_full_decode(open_spy):
+    # (b) of the acceptance: the decision point. `location._read_image` and `capture._read_image`
+    # reach `Image.open` only when the walk declined, so a zero here IS "the fallback was not
+    # called" — and the no-Exif file below is the positive control that the spy can count at all.
+    assert _read_avif(AVIF_BINARY) == AVIF_EXPECTED
+    assert capture.read_capture(AVIF_BINARY, AVIF_MIME) == capture.NOTHING
+    assert open_spy.calls == []
+
+    location.read_location(AVIF_NO_EXIF, AVIF_MIME)
+    assert len(open_spy.calls) == 1
+
+
+def test_an_avif_answers_what_the_full_decode_answers_for_the_same_file(
+    avifs, monkeypatch, open_spy
+):
+    # (a): the oracle is the SAME file read the slow way — the walk is only allowed to be cheaper.
+    dated = avifs["dated"]
+    walked_location, walked_capture = _read_avif(dated), capture.read_capture(dated, AVIF_MIME)
+    assert walked_capture.capture_instant is not None  # else "equal" would be nothing == nothing
+    # Each leg has to be the leg it claims to be: an AVIF that is not routed to the walk makes
+    # both reads the slow one, and the comparison below is then a read against itself.
+    assert open_spy.calls == []
+
+    monkeypatch.setattr(capture, "heif_exif_from", lambda f: None)  # force the fallback leg
+    assert _read_avif(dated) == walked_location
+    assert capture.read_capture(dated, AVIF_MIME) == walked_capture
+    assert len(open_spy.calls) == 2
+
+
+def test_the_walker_hands_over_exactly_the_payload_pillow_finds_for_an_avif(avifs):
+    # libheif has no AVIF codec in this build; Pillow's own libavif is the independent reader.
+    for path in (AVIF_BINARY, avifs["large"], avifs["dated"]):
+        with Image.open(path) as im:
+            expected = im.info.get("exif")
+        assert expected, f"{path.name} must carry an Exif item for this to prove anything"
+        assert _walk(path) == expected
+
+
+def test_a_multi_kilobyte_avif_costs_a_header_read_not_the_file(avifs):
+    # (c), the same claim the HEIC case makes about its filler: what a header read may cost is the
+    # `meta` box plus the one Exif extent, and nothing may scale with the image payload.
+    large = avifs["large"]
+    size = large.stat().st_size
+    assert size > 32 * 1024, "the fixture has to be big enough for the claim to mean anything"
+
+    with location.measuring() as small_meter:
+        assert _read_avif(AVIF_BINARY) == AVIF_EXPECTED
+    with location.measuring() as large_meter:
+        assert _read_avif(large) == AVIF_EXPECTED
+    assert large_meter.bytes_read < size // 16, f"read {large_meter.bytes_read} of {size} bytes"
+    grown = size - AVIF_BINARY.stat().st_size
+    assert large_meter.bytes_read - small_meter.bytes_read < 1024, (
+        f"{grown} bytes of image cost {large_meter.bytes_read - small_meter.bytes_read} extra"
+    )
+
+
+def test_an_avif_without_exif_ends_exactly_where_a_heic_without_exif_ends(avifs, open_spy):
+    # The other category. Neither file HAS an Exif item, so both are declined by the walk, both
+    # log their fallback, and both let the full read answer — the AVIF must not be a special case
+    # in either direction (a silent None, or an answer the HEIC does not give).
+    heic = avifs["heic-no-exif"]
+    answers = []
+    for path, mime in ((AVIF_NO_EXIF, AVIF_MIME), (heic, HEIC_MIME)):
+        assert _walk(path) is None
+        with capture_logs() as logs:
+            answers.append(
+                (
+                    location.read_location(path, mime),
+                    capture.read_capture(path, mime),
+                    sorted(e["event"] for e in logs if "heif_fallback" in str(e.get("event"))),
+                )
+            )
+    fell_back = ["capture.heif_fallback", "location.heif_fallback"]
+    assert answers[0] == (None, capture.NOTHING, fell_back)
+    assert answers[0] == answers[1]
+    assert len(open_spy.calls) == 4  # both files, both readers: every one of them fell back
 
 
 def test_a_non_heif_image_never_goes_near_the_walker(monkeypatch):
