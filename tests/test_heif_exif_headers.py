@@ -412,15 +412,21 @@ def test_an_avif_with_exif_never_reaches_the_full_decode(open_spy):
     assert len(open_spy.calls) == 1
 
 
-def test_an_avif_answers_what_the_full_decode_answers_for_the_same_file(avifs, monkeypatch):
+def test_an_avif_answers_what_the_full_decode_answers_for_the_same_file(
+    avifs, monkeypatch, open_spy
+):
     # (a): the oracle is the SAME file read the slow way — the walk is only allowed to be cheaper.
     dated = avifs["dated"]
     walked_location, walked_capture = _read_avif(dated), capture.read_capture(dated, AVIF_MIME)
     assert walked_capture.capture_instant is not None  # else "equal" would be nothing == nothing
+    # Each leg has to be the leg it claims to be: an AVIF that is not routed to the walk makes
+    # both reads the slow one, and the comparison below is then a read against itself.
+    assert open_spy.calls == []
 
     monkeypatch.setattr(capture, "heif_exif_from", lambda f: None)  # force the fallback leg
     assert _read_avif(dated) == walked_location
     assert capture.read_capture(dated, AVIF_MIME) == walked_capture
+    assert len(open_spy.calls) == 2
 
 
 def test_the_walker_hands_over_exactly_the_payload_pillow_finds_for_an_avif(avifs):
