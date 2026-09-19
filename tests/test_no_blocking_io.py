@@ -126,7 +126,11 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         ("app/services/media.py", "process_slow", "unlink"): 1,
         ("app/services/media.py", "process_slow", "os.replace"): 1,
         ("app/services/media.py", "process_slow", "_stamp_mtime"): 1,
-        ("app/services/media.py", "process_job", "process_image"): 2,
+        # ONE, not two: only the FAST lane's Pillow decode is still inline. The slow lane's heavy
+        # image (HEIC/AVIF) decode goes through to_thread.run_sync — it is the light consumer's
+        # longest hold, and "nothing else is queued on this loop" is exactly the argument the
+        # consumer split retired above.
+        ("app/services/media.py", "process_job", "process_image"): 1,
         ("app/services/media.py", "process_job", "process_video_poster"): 1,
         # The print encode itself is NO LONGER exempt — it goes through to_thread.run_sync, so it
         # produces no marker and must not be declared here. Only the thermal guard stays inline:

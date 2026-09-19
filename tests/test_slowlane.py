@@ -2,6 +2,8 @@ import asyncio
 import secrets
 import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 from app import worker
@@ -144,6 +146,63 @@ async def test_slow_lane_decodes_heic_image(adb, monkeypatch, tmp_path):
     assert (tmp_path / "assets" / "mobile" / "heic1.jpg").exists()
     assert att.status is AttachmentStatus.ready
     assert att.width == 120 and att.height == 90 and att.blurhash
+
+
+async def test_the_heavy_image_decode_does_not_freeze_the_event_loop(adb, monkeypatch, tmp_path):
+    # The worker runs two consumers plus the supervisor on ONE loop, and a HEIC derive is claimed
+    # by the LIGHT one: held on the loop thread, its libheif decode freezes the transcode
+    # consumer's progress writes and the supervisor's heartbeat for its whole duration — seconds
+    # of full-core CPU per photo, back to back through an import. What is asserted is therefore
+    # the loop STILL RUNNING while the decode is in the middle of blocking, not merely finishing
+    # afterwards.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att = Attachment(
+        uid="heic-offloop",
+        filename="p.heic",
+        mime="image/heic",
+        size=1,
+        status=AttachmentStatus.processing,
+        storage_path=str(tmp_path / "p.heic"),
+    )
+    adb.add(att)
+    await adb.flush()
+    job = MediaJob(attachment_id=att.id, lane=JobLane.slow, state=JobState.queued)
+    adb.add(job)
+    await adb.flush()
+
+    block_s = 0.4
+    loop_thread = threading.get_ident()
+    decode_threads: list[int] = []
+    began: list[float] = []
+    finished: list[float] = []
+
+    def _slow_decode(attachment) -> dict:
+        # A libheif decode's stand-in: a blocking sleep that offers the loop no yield point,
+        # exactly like the real decode + derivation.
+        decode_threads.append(threading.get_ident())
+        began.append(time.monotonic())
+        time.sleep(block_s)
+        finished.append(time.monotonic())
+        return {"width": 120, "height": 90, "blurhash": "L00000"}
+
+    monkeypatch.setattr(media, "process_image", _slow_decode)
+
+    ticks: list[float] = []
+
+    async def _ticker() -> None:
+        # Bounded by the stub's own duration so a regression fails on the assertions below instead
+        # of hanging the suite.
+        deadline = time.monotonic() + block_s * 5
+        while not finished and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            ticks.append(time.monotonic())
+
+    await asyncio.gather(media.process_job(adb, job), _ticker())
+
+    during = [t for t in ticks if began[0] < t < finished[0]]
+    assert len(during) >= 3, f"the loop ran {len(during)} times while the decode blocked"
+    assert decode_threads and decode_threads[0] != loop_thread  # ran on a worker thread
+    assert att.status is AttachmentStatus.ready and att.blurhash == "L00000"  # ...and published
 
 
 def test_progress_parser():
