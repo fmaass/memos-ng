@@ -83,25 +83,28 @@ def _mappings(node: object, path: str = "#"):
             yield from _mappings(value, f"{path}/{index}")
 
 
-def _inline_nullable_anyof(node: dict) -> bool:
-    members = node.get("anyOf")
-    if not isinstance(members, list) or len(members) != 2:
-        return False
-    if not any(m == {"type": "null"} for m in members):
-        return False
-    keep = next(m for m in members if m != {"type": "null"})
-    return isinstance(keep, dict) and "type" in keep and "$ref" not in keep
+def _null_arm_union(node: dict) -> str | None:
+    """The union keyword under which `node` offers a bare `null` arm, if it offers one at all."""
+    for keyword in ("anyOf", "oneOf"):
+        members = node.get(keyword)
+        if isinstance(members, list) and any(m == {"type": "null"} for m in members):
+            return keyword
+    return None
 
 
-def test_no_inline_nullable_anyof_survives_anywhere_in_the_document():
-    """swift-openapi-generator drops a property whose schema contains a bare `null` member, so a
-    single surviving one silently deletes a field from the generated client (MEMNG-105)."""
+def test_no_union_with_a_null_arm_survives_anywhere_in_the_document():
+    """swift-openapi-generator has no support for a bare `null` schema: it DROPS the property that
+    contains one rather than failing, so a single survivor silently deletes a field from the
+    generated client (MEMNG-105). A `$ref` arm is no exception — the walk covers the whole served
+    document, both union keywords and any number of arms."""
     from app.main import app
 
     offenders = [
-        pointer for pointer, node in _mappings(app.openapi()) if _inline_nullable_anyof(node)
+        f"{pointer}/{keyword}"
+        for pointer, node in _mappings(app.openapi())
+        if (keyword := _null_arm_union(node)) is not None
     ]
-    assert offenders == [], f"{len(offenders)} nullable anyOf survived, e.g. {offenders[:3]}"
+    assert offenders == [], f"{len(offenders)} union(s) with a null arm survived: {offenders[:5]}"
 
 
 def test_a_nullable_field_reaches_the_client_as_a_type_array():
@@ -134,11 +137,10 @@ def test_a_genuine_union_is_left_as_an_anyof():
     assert loc == {"anyOf": [{"type": "string"}, {"type": "integer"}]}
 
 
-def test_reference_and_wider_unions_are_not_rewritten():
+def test_wider_unions_are_not_rewritten():
     from app.main import collapse_nullable_anyof
 
     document = {
-        "ref_plus_null": {"anyOf": [{"$ref": "#/components/schemas/Visibility"}, {"type": "null"}]},
         "three_arm": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
         "union": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
         "already_a_type_array": {"type": ["string", "null"]},
@@ -146,6 +148,164 @@ def test_reference_and_wider_unions_are_not_rewritten():
     untouched = deepcopy(document)
     collapse_nullable_anyof(document)
     assert document == untouched
+
+
+# The shape `MapManifest.planet` and `.detail` arrive in: a reference to a model, or null.
+ARCHIVE = {
+    "title": "Archive",
+    "type": "object",
+    "properties": {"name": {"type": "string"}, "part_of": {"$ref": "#/components/schemas/Set"}},
+    "required": ["name"],
+}
+
+
+def _document(detail: dict, target: dict | None = None) -> dict:
+    return {
+        "components": {"schemas": {"Archive": deepcopy(ARCHIVE if target is None else target)}},
+        "properties": {"detail": detail},
+    }
+
+
+def _nullable_ref(name: str = "Archive") -> dict:
+    return {"anyOf": [{"$ref": f"#/components/schemas/{name}"}, {"type": "null"}]}
+
+
+def test_a_nullable_reference_becomes_an_inline_nullable_copy_of_its_target():
+    """The reference arm cannot stay a reference — a `$ref` has no room for the second type — so
+    the target is restated inline with `"null"` added to its type."""
+    from app.main import collapse_nullable_anyof
+
+    document = _document(_nullable_ref())
+    collapse_nullable_anyof(document)
+
+    detail = document["properties"]["detail"]
+    assert detail["type"] == ["object", "null"]
+    assert detail["properties"] == ARCHIVE["properties"]  # nested $refs stay references
+    assert detail["required"] == ["name"]
+    assert "anyOf" not in detail
+    # The target keeps its own place: other properties may reference it, nullable or not.
+    assert document["components"]["schemas"]["Archive"] == ARCHIVE
+
+    # And keeps it independently. A shallow copy satisfies every assertion above while handing the
+    # copy and the target the SAME nested dicts, so a later edit of one property's schema — the
+    # next pass of this very walk included — would rewrite the model for everything referencing it.
+    detail["properties"]["name"]["type"] = "integer"
+    detail["required"].append("part_of")
+    assert document["components"]["schemas"]["Archive"] == ARCHIVE
+
+
+def test_the_parents_own_keywords_survive_the_inlining():
+    from app.main import collapse_nullable_anyof
+
+    document = _document(_nullable_ref() | {"description": "null when nothing was published"})
+    collapse_nullable_anyof(document)
+
+    detail = document["properties"]["detail"]
+    assert detail["description"] == "null when nothing was published"
+    assert detail["title"] == "Archive"  # and so do the target's
+    assert detail["type"] == ["object", "null"]
+
+
+def test_a_reference_disagreeing_with_its_parent_stops_the_schema():
+    from app.main import NullableMergeCollision, collapse_nullable_anyof
+
+    with pytest.raises(NullableMergeCollision) as raised:
+        collapse_nullable_anyof(_document(_nullable_ref() | {"title": "Detail"}))
+    assert "#/properties/detail" in str(raised.value)
+    assert "title" in str(raised.value)
+
+
+def test_a_reference_that_does_not_resolve_stops_the_schema():
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(_document(_nullable_ref("Missing")))
+    assert "#/properties/detail" in str(raised.value)
+    assert "Missing" in str(raised.value)
+
+
+def test_a_reference_outside_this_document_stops_the_schema():
+    """Only the served document is in hand when it is built; nothing else can be resolved, and a
+    reference left unresolved is a null arm sent to the generator."""
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = _document({"anyOf": [{"$ref": "https://example.test/Archive"}, {"type": "null"}]})
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "#/properties/detail" in str(raised.value)
+
+
+def test_a_reference_that_lands_on_something_other_than_a_schema_stops_the_schema():
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = {
+        "components": {"schemas": {"Archive": ["not", "a", "schema"]}},
+        "properties": {"detail": _nullable_ref()},
+    }
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "#/properties/detail" in str(raised.value)
+
+
+def test_a_reference_arm_carrying_sibling_keywords_stops_the_schema():
+    """A `$ref` beside other keywords is two descriptions of one schema; deciding which of them
+    the client should believe is not this rewrite's call to make."""
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = _document(
+        {"anyOf": [{"$ref": "#/components/schemas/Archive", "title": "Detail"}, {"type": "null"}]}
+    )
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "#/properties/detail" in str(raised.value)
+    assert "title" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param({"title": "Loose", "properties": {}}, id="no type at all"),
+        pytest.param({"type": ["object", "null"]}, id="already a union"),
+        pytest.param({"anyOf": [{"type": "string"}, {"type": "integer"}]}, id="a union of arms"),
+    ],
+)
+def test_a_reference_with_no_single_type_stops_the_schema(target):
+    """There is no honest type array to build from these, and a served contract that misdescribes
+    the model is worse than one that refuses to be served at all."""
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(_document(_nullable_ref(), target=target))
+    assert "#/properties/detail" in str(raised.value)
+
+
+def test_a_reference_nullable_within_itself_stops_instead_of_inlining_forever():
+    """Inlining a copy that contains the same nullable reference would never reach a fixed point."""
+    from app.main import NullableRefNotInlinable, collapse_nullable_anyof
+
+    document = _document(
+        _nullable_ref("Node"),
+        target={"type": "object", "properties": {"parent": _nullable_ref("Node")}},
+    )
+    document["components"]["schemas"]["Node"] = document["components"]["schemas"].pop("Archive")
+
+    with pytest.raises(NullableRefNotInlinable) as raised:
+        collapse_nullable_anyof(document)
+    assert "Node" in str(raised.value)
+
+
+def test_the_map_manifest_publishes_its_archives_as_nullable_objects():
+    """Read off the COMMITTED snapshot: this is the file the iOS client vendors, and these two
+    properties were the last references-plus-null in it."""
+    manifest = json.loads((REPO_ROOT / "openapi.json").read_text())["components"]["schemas"][
+        "MapManifest"
+    ]
+    for name in ("planet", "detail"):
+        prop = manifest["properties"][name]
+        assert prop["type"] == ["object", "null"], (name, prop)
+        assert prop["properties"].keys() == {"name", "url", "size"}, (name, prop)
+        assert "anyOf" not in prop, (name, prop)
+        assert name in manifest["required"], name  # present-and-null, never absent
 
 
 def test_sibling_keywords_survive_the_collapse():

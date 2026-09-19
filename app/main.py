@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -253,6 +254,10 @@ class NullableMergeCollision(Exception):
     """A nullable `anyOf` member and its parent disagree about a shared keyword."""
 
 
+class NullableRefNotInlinable(Exception):
+    """A `$ref` arm of a nullable `anyOf` cannot be restated as a nullable schema."""
+
+
 def _is_null_schema(node: Any) -> bool:
     return isinstance(node, dict) and node.get("type") == "null" and len(node) == 1
 
@@ -271,7 +276,58 @@ def _merge_nullable(keep: dict[str, Any], parent: dict[str, Any], path: str) -> 
     return merged
 
 
-def collapse_nullable_anyof(node: Any, path: str = "#") -> None:
+def _resolve_local_ref(root: Any, ref: Any, path: str) -> dict[str, Any]:
+    """The schema a document-local `$ref` names, or a refusal naming the pointer that held it."""
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        raise NullableRefNotInlinable(
+            f"{path}: {ref!r} is not a reference this document can resolve on its own"
+        )
+    target: Any = root
+    for token in ref[2:].split("/"):
+        key = token.replace("~1", "/").replace("~0", "~")
+        target = target.get(key) if isinstance(target, dict) else None
+        if target is None:
+            raise NullableRefNotInlinable(f"{path}: {ref!r} does not resolve inside the document")
+    if not isinstance(target, dict):
+        raise NullableRefNotInlinable(
+            f"{path}: {ref!r} names a {type(target).__name__}, not a schema"
+        )
+    return target
+
+
+def _inline_nullable_ref(
+    node: dict[str, Any], keep: dict[str, Any], root: Any, path: str, inlining: frozenset[str]
+) -> dict[str, Any]:
+    """`{$ref: X} | null` restated as a copy of X whose type carries `"null"` as well.
+
+    A `$ref` is the whole schema wherever it appears, so there is nowhere to put the second type
+    without copying X out; X itself stays in `components`, because other properties reference it
+    and most of them are not nullable. Its own nested references are left as references — only the
+    one arm being made nullable is resolved.
+    """
+    ref = keep["$ref"]
+    extra = sorted(set(keep) - {"$ref"})
+    if extra:
+        raise NullableRefNotInlinable(
+            f"{path}: the reference arm carries {extra} beside its $ref; which side of a shared "
+            "keyword should win is not ours to guess"
+        )
+    if ref in inlining:
+        raise NullableRefNotInlinable(
+            f"{path}: {ref!r} is nullable within itself — inlining it would never terminate"
+        )
+    target = _resolve_local_ref(root, ref, path)
+    if not isinstance(target.get("type"), str):
+        raise NullableRefNotInlinable(
+            f'{path}: {ref!r} has no single `type` to extend with "null" '
+            f"(type={target.get('type')!r})"
+        )
+    return _merge_nullable(deepcopy(target), node, path)
+
+
+def collapse_nullable_anyof(
+    node: Any, path: str = "#", root: Any = None, inlining: frozenset[str] = frozenset()
+) -> None:
     """Rewrite `anyOf: [{type: X}, {type: "null"}]` into `type: [X, "null"]` in place.
 
     Pydantic spells an optional field the first way; swift-openapi-generator has no support for a
@@ -280,24 +336,36 @@ def collapse_nullable_anyof(node: Any, path: str = "#") -> None:
     thing in JSON Schema 2020-12, so emitting the type array here retires the iOS repo's
     vendoring-time rewrite and keeps every generated client on one contract (ADR-0009, MEMNG-105).
 
-    Only that exact two-arm inline shape is touched: `anyOf: [{$ref: …}, {type: "null"}]` cannot
-    become a type array (a reference plus null needs a different fix) and a wider union is not a
-    nullable at all. A keyword the retained member and its parent disagree about raises, because a
-    served contract that differs from the model in a way nobody chose is worse than a loud stop.
+    A two-arm `anyOf: [{$ref: …}, {type: "null"}]` — how pydantic spells an optional model field —
+    goes the same way, through `_inline_nullable_ref`: the generator drops such a property just as
+    readily, and `MapManifest.planet`/`.detail` were the last two left in the document. A wider
+    union is not a nullable at all and is left alone. A keyword the retained member and its parent
+    disagree about, and a reference that cannot be given a type array, both raise: a served
+    contract that differs from the model in a way nobody chose is worse than a loud stop.
+
+    `root` is the document the references resolve against; it threads down the walk so a nested
+    call can resolve one, and `inlining` carries the references already expanded above this node.
     """
+    if root is None:
+        root = node
     if isinstance(node, dict):
         members = node.get("anyOf")
         if isinstance(members, list) and len(members) == 2 and any(map(_is_null_schema, members)):
             keep = next(m for m in members if not _is_null_schema(m))
-            if isinstance(keep, dict) and isinstance(keep.get("type"), str) and "$ref" not in keep:
+            if isinstance(keep, dict) and "$ref" in keep:
+                merged = _inline_nullable_ref(node, keep, root, path, inlining)
+                inlining = inlining | {keep["$ref"]}
+                node.clear()
+                node.update(merged)
+            elif isinstance(keep, dict) and isinstance(keep.get("type"), str):
                 merged = _merge_nullable(keep, node, path)
                 node.clear()
                 node.update(merged)
         for key, value in list(node.items()):
-            collapse_nullable_anyof(value, f"{path}/{key}")
+            collapse_nullable_anyof(value, f"{path}/{key}", root, inlining)
     elif isinstance(node, list):
         for index, value in enumerate(node):
-            collapse_nullable_anyof(value, f"{path}/{index}")
+            collapse_nullable_anyof(value, f"{path}/{index}", root, inlining)
 
 
 def custom_openapi() -> dict[str, Any]:
