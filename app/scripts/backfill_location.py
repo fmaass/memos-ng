@@ -20,8 +20,10 @@ Two safety properties are worth stating because the rehearsal depends on them:
   reads and by `--sleep`, and the bytes-read counter in the summary is the evidence that the reads
   really are header-sized.
 
-pillow-heif reads the ENTIRE HEIC file when it opens one, so the bytes-read counter shows
-full-file reads for HEIC originals and header-sized reads for everything else.
+HEIC and AVIF originals are read through `capture.heif_exif_from` — the `meta` box and the one
+Exif extent, the rest seeked over — so the bytes-read counter shows header-sized reads for them
+too. The exception is the original whose Exif item the headers cannot address: that one falls
+back to an open, which parses the whole file, and counts as a full-file read.
 
 No coordinate is ever printed or logged: the summary carries counts, sources, bytes and a ranking
 of 1° cells whose identities are withheld. `--regions-out` writes those cells as GeoJSON, which is

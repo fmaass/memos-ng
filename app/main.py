@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,9 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.routing import BaseRoute
+from starlette.types import Receive, Scope, Send
 
 from app import auth
 from app.config import settings
@@ -251,6 +254,10 @@ class NullableMergeCollision(Exception):
     """A nullable `anyOf` member and its parent disagree about a shared keyword."""
 
 
+class NullableRefNotInlinable(Exception):
+    """A `$ref` arm of a nullable `anyOf` cannot be restated as a nullable schema."""
+
+
 def _is_null_schema(node: Any) -> bool:
     return isinstance(node, dict) and node.get("type") == "null" and len(node) == 1
 
@@ -269,7 +276,58 @@ def _merge_nullable(keep: dict[str, Any], parent: dict[str, Any], path: str) -> 
     return merged
 
 
-def collapse_nullable_anyof(node: Any, path: str = "#") -> None:
+def _resolve_local_ref(root: Any, ref: Any, path: str) -> dict[str, Any]:
+    """The schema a document-local `$ref` names, or a refusal naming the pointer that held it."""
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        raise NullableRefNotInlinable(
+            f"{path}: {ref!r} is not a reference this document can resolve on its own"
+        )
+    target: Any = root
+    for token in ref[2:].split("/"):
+        key = token.replace("~1", "/").replace("~0", "~")
+        target = target.get(key) if isinstance(target, dict) else None
+        if target is None:
+            raise NullableRefNotInlinable(f"{path}: {ref!r} does not resolve inside the document")
+    if not isinstance(target, dict):
+        raise NullableRefNotInlinable(
+            f"{path}: {ref!r} names a {type(target).__name__}, not a schema"
+        )
+    return target
+
+
+def _inline_nullable_ref(
+    node: dict[str, Any], keep: dict[str, Any], root: Any, path: str, inlining: frozenset[str]
+) -> dict[str, Any]:
+    """`{$ref: X} | null` restated as a copy of X whose type carries `"null"` as well.
+
+    A `$ref` is the whole schema wherever it appears, so there is nowhere to put the second type
+    without copying X out; X itself stays in `components`, because other properties reference it
+    and most of them are not nullable. Its own nested references are left as references — only the
+    one arm being made nullable is resolved.
+    """
+    ref = keep["$ref"]
+    extra = sorted(set(keep) - {"$ref"})
+    if extra:
+        raise NullableRefNotInlinable(
+            f"{path}: the reference arm carries {extra} beside its $ref; which side of a shared "
+            "keyword should win is not ours to guess"
+        )
+    if ref in inlining:
+        raise NullableRefNotInlinable(
+            f"{path}: {ref!r} is nullable within itself — inlining it would never terminate"
+        )
+    target = _resolve_local_ref(root, ref, path)
+    if not isinstance(target.get("type"), str):
+        raise NullableRefNotInlinable(
+            f'{path}: {ref!r} has no single `type` to extend with "null" '
+            f"(type={target.get('type')!r})"
+        )
+    return _merge_nullable(deepcopy(target), node, path)
+
+
+def collapse_nullable_anyof(
+    node: Any, path: str = "#", root: Any = None, inlining: frozenset[str] = frozenset()
+) -> None:
     """Rewrite `anyOf: [{type: X}, {type: "null"}]` into `type: [X, "null"]` in place.
 
     Pydantic spells an optional field the first way; swift-openapi-generator has no support for a
@@ -278,24 +336,36 @@ def collapse_nullable_anyof(node: Any, path: str = "#") -> None:
     thing in JSON Schema 2020-12, so emitting the type array here retires the iOS repo's
     vendoring-time rewrite and keeps every generated client on one contract (ADR-0009, MEMNG-105).
 
-    Only that exact two-arm inline shape is touched: `anyOf: [{$ref: …}, {type: "null"}]` cannot
-    become a type array (a reference plus null needs a different fix) and a wider union is not a
-    nullable at all. A keyword the retained member and its parent disagree about raises, because a
-    served contract that differs from the model in a way nobody chose is worse than a loud stop.
+    A two-arm `anyOf: [{$ref: …}, {type: "null"}]` — how pydantic spells an optional model field —
+    goes the same way, through `_inline_nullable_ref`: the generator drops such a property just as
+    readily, and `MapManifest.planet`/`.detail` were the last two left in the document. A wider
+    union is not a nullable at all and is left alone. A keyword the retained member and its parent
+    disagree about, and a reference that cannot be given a type array, both raise: a served
+    contract that differs from the model in a way nobody chose is worse than a loud stop.
+
+    `root` is the document the references resolve against; it threads down the walk so a nested
+    call can resolve one, and `inlining` carries the references already expanded above this node.
     """
+    if root is None:
+        root = node
     if isinstance(node, dict):
         members = node.get("anyOf")
         if isinstance(members, list) and len(members) == 2 and any(map(_is_null_schema, members)):
             keep = next(m for m in members if not _is_null_schema(m))
-            if isinstance(keep, dict) and isinstance(keep.get("type"), str) and "$ref" not in keep:
+            if isinstance(keep, dict) and "$ref" in keep:
+                merged = _inline_nullable_ref(node, keep, root, path, inlining)
+                inlining = inlining | {keep["$ref"]}
+                node.clear()
+                node.update(merged)
+            elif isinstance(keep, dict) and isinstance(keep.get("type"), str):
                 merged = _merge_nullable(keep, node, path)
                 node.clear()
                 node.update(merged)
         for key, value in list(node.items()):
-            collapse_nullable_anyof(value, f"{path}/{key}")
+            collapse_nullable_anyof(value, f"{path}/{key}", root, inlining)
     elif isinstance(node, list):
         for index, value in enumerate(node):
-            collapse_nullable_anyof(value, f"{path}/{index}")
+            collapse_nullable_anyof(value, f"{path}/{index}", root, inlining)
 
 
 def custom_openapi() -> dict[str, Any]:
@@ -427,7 +497,7 @@ async def api_fallback(path: str):
     return JSONResponse({"detail": f"/api/{path} not found"}, status_code=404)
 
 
-def resolve_spa_file(path: str) -> Path:
+def resolve_spa_file(path: str, root: Path = FRONTEND_DIR) -> Path:
     """Map a SPA request to a real file under dist, else index.html.
 
     Uses Path.is_relative_to (NOT a lexical startswith, which would let a
@@ -437,28 +507,100 @@ def resolve_spa_file(path: str) -> Path:
     Blocking (resolve + is_file touch the disk) and deliberately kept sync: callers on the
     event loop run it through to_thread.run_sync.
     """
-    dist = FRONTEND_DIR.resolve()
-    candidate = (FRONTEND_DIR / path).resolve()
+    dist = root.resolve()
+    candidate = (root / path).resolve()
     if candidate.is_relative_to(dist) and candidate.is_file():
         return candidate
-    return FRONTEND_DIR / "index.html"
+    return root / "index.html"
+
+
+# Everything the Vite build puts under dist/assets is content-hashed — the default
+# `assets/[name]-[hash].ext` plus the explicitly hashed map worker (frontend/vite.config.ts) — so
+# such a URL can never change meaning and the client may keep it without ever revalidating. That
+# round-trip is what a phone on the VPN pays before a lazy route (/places, ~1 MB) can even start.
+ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+# The shell's names are stable instead, so it has to be revalidated: an index.html kept across a
+# deploy names chunks that are gone. `no-cache` is "revalidate", not "don't store". The
+# revalidation costs the full couple of KB: FileResponse sends an ETag but evaluates no
+# If-None-Match (unlike StaticFiles above), so the catch-all always answers 200. Cheap enough
+# against a round-trip the client pays anyway, and not worth hand-rolling validator comparison
+# into the highest-fan-out route in the app.
+SHELL_CACHE_CONTROL = "no-cache"
+
+
+class HashedAssetFiles(StaticFiles):
+    """StaticFiles for the content-hashed tier: immutable, never ranged.
+
+    Ranges are refused because the compressor wraps this mount: FileResponse would cut the slice
+    out of the identity file and the compressor would then gzip it, so `Content-Range` and the
+    strong ETag would describe a representation the client never received — a browser resuming an
+    interrupted download would splice that onto its partial entry and reassemble garbage. A server
+    may always ignore Range (RFC 9110 §14.2) and the full 200 replaces the partial entry; nothing
+    under assets/ (JS, CSS, fonts) is large enough or seekable enough to want ranges anyway. The
+    tiers that DO serve ranges — media, the basemap archives — are their own routes, uncompressed.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Dropped before StaticFiles builds the response: FileResponse reads them straight off the
+        # scope, so this is the only place that decides for both the response and its body.
+        scope = dict(scope)
+        scope["headers"] = [
+            (name, value) for name, value in scope["headers"] if name not in (b"range", b"if-range")
+        ]
+        await super().__call__(scope, receive, send)
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        # On the response rather than at the mount so both also ride the 304, which is what a
+        # revalidating client gets for the rest of the year.
+        response.headers["Cache-Control"] = ASSET_CACHE_CONTROL
+        if response.status_code == 304:
+            # The compressor adds Vary downstream of here and never sees a body to compress on a
+            # 304, so the negotiation dimension the stored 200 carries has to be restated
+            # (RFC 9110 §15.4.5).
+            response.headers["Vary"] = "Accept-Encoding"
+        else:
+            response.headers["Accept-Ranges"] = "none"
+        return response
 
 
 # SPA static serving (frontend/dist is produced by the Vite build stage in Docker).
-if FRONTEND_DIR.is_dir():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
+def mount_spa(target: FastAPI, frontend_dir: Path) -> None:
+    """Register the SPA tiers on `target`: /assets, then the shell catch-all (order matters).
 
-    @app.get("/{path:path}", include_in_schema=False)
+    Takes the app and the directory rather than reading the module globals so the tiers can be
+    stood up over a fixture tree: frontend/dist is a build output and exists only in the image,
+    so in a checkout the branch below is the only one that ever runs.
+    """
+    if not frontend_dir.is_dir():
+        logger.warning("frontend_not_built", path=str(frontend_dir))
+
+        @target.get("/{path:path}", include_in_schema=False)
+        async def serve_spa_fallback(path: str):
+            return JSONResponse(
+                {"error": "Frontend not built. Run 'npm run build' in frontend/."},
+                status_code=503,
+            )
+
+        return
+
+    # The compressor wraps the mounted app ALONE — never app-wide, which would also reach the
+    # media tiers, the Range-served basemap archives and the /api/events stream. Text here
+    # compresses ~4x, and the map chunk is the one asset a phone waits on.
+    target.mount(
+        "/assets",
+        GZipMiddleware(HashedAssetFiles(directory=frontend_dir / "assets")),
+        name="assets",
+    )
+
+    @target.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
         # Highest-fan-out route in the app (every non-/api URL), and its resolve()+is_file()
         # hit the bind-mounted volume — off the event loop.
-        return FileResponse(await to_thread.run_sync(resolve_spa_file, path))
-else:
-    logger.warning("frontend_not_built", path=str(FRONTEND_DIR))
-
-    @app.get("/{path:path}", include_in_schema=False)
-    async def serve_spa_fallback(path: str):
-        return JSONResponse(
-            {"error": "Frontend not built. Run 'npm run build' in frontend/."},
-            status_code=503,
+        return FileResponse(
+            await to_thread.run_sync(resolve_spa_file, path, frontend_dir),
+            headers={"Cache-Control": SHELL_CACHE_CONTROL},
         )
+
+
+mount_spa(app, FRONTEND_DIR)

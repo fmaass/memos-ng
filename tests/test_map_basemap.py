@@ -252,6 +252,20 @@ def test_the_manifest_names_the_archives_that_are_there(logged_in_client, tiles_
     assert body["detail"] is None
 
 
+def test_the_manifest_reports_an_absent_archive_as_a_null_key_it_still_sends(
+    logged_in_client, tiles_dir
+):
+    """Both archive keys are required and carry null when nothing is published. The contract says
+    so — `type: ["object", "null"]`, in `required` — and a generated client decodes a missing key
+    as a broken response rather than as "nothing extracted here yet"."""
+    client, _ = logged_in_client
+    (tiles_dir / PLANET).unlink()
+    body = client.get("/api/map/manifest").json()
+    assert {"planet", "detail"} <= body.keys(), body
+    assert body["planet"] is None
+    assert body["detail"] is None
+
+
 def test_a_new_generation_takes_over_the_manifest_while_the_previous_file_stays(
     logged_in_client, tiles_dir
 ):

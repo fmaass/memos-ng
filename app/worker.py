@@ -76,6 +76,18 @@ HOUSEKEEPING_BOUNDS: dict[str, int] = {
     "frame_share_drain": 120,
     # Two indexed reads and a CAS on one row. Generous by two orders of magnitude; anything near
     # this is the database being unreachable, not a slow query.
+    #
+    # What THIS bound can cost, written down because nothing in the code recovers it: the CAS is
+    # the claim, and `claim_run` commits it inside the call. A database that stalls for ~30 s
+    # exactly across that commit lets the bound expire AFTER the row was claimed, so the supervisor
+    # reads the fallback `None`, never spawns the run, and no later poll can adopt it — the claim
+    # is `heartbeat_at IS NOT NULL` and `digest_runs` records no owner, so a claimed-but-unspawned
+    # row is indistinguishable from one a live worker is executing, and adopting it on a hunch is
+    # how two workers send the same digest. The operator loses that one "Run now": the stale-run
+    # sweep marks the row `failed` after 15 minutes of silence, and pressing Run now again then
+    # works (the single-inflight index only refuses while the dead row is still NULL-status). Worth
+    # more than it costs to fix: recovering it automatically needs an owner column and another
+    # query on this poll path, to close a window that a 30 s database stall has to open first.
     "adopt_manual_digest": 30,
     "digest_is_due": 30,
     # Deletes expired upload sessions and unlinks their part files under plain FOR UPDATE (no SKIP
@@ -420,6 +432,12 @@ async def _notify_terminal_safe(attachment_id: int) -> None:
             await db.commit()
     except Exception as exc:  # push is best-effort; the job is already committed
         logger.warning("push_notify_failed", attachment_id=attachment_id, error=str(exc))
+        if _stop_in_flight():
+            # An error raised while a cancellation was unwinding this call REPLACES it — the
+            # session's own exit is one await that can, closing a connection whose operation was
+            # just cancelled. Swallowing that error here would swallow the stop with it, and the
+            # consumer would go round its loop again while the supervisor's teardown waits for it.
+            raise asyncio.CancelledError from exc
 
 
 async def _record_job_failure(
@@ -626,18 +644,23 @@ async def run_once(db: AsyncSession, job_class: JobClass | None = None) -> str:
     attachment_id = job.attachment_id  # captured before the commits below
     job_id = job.id  # ...and the progress side channel is keyed on it
     job_kind = job.kind  # ...decides whether this job's outcome is the PHOTO's outcome
-    # Commit the claim BEFORE processing (see docstring): `processing` becomes durable and the
-    # media_jobs row lock is released for the transcode's whole duration.
-    await db.commit()
-    # The claim identity THIS attempt owns, read while the instance is still trustworthy: the stop
-    # path's requeue is conditional on it, and after a cancellation the ORM object may describe a
-    # transaction that never committed.
+    # The claim identity THIS attempt owns, read BEFORE the commit rather than after it: claim_one
+    # has already written it, the session does not expire it, and reading it here is what lets the
+    # commit itself sit under the handler below.
     claim = job.claimed_by
-    # One cancellation handler around EVERYTHING that follows the claim commit — the claim-time
-    # clear, the work itself, every outcome branch and the post-outcome clear. A stop can land in
-    # any of them, and each one of those is a window in which the row is `processing` with nobody
-    # left to finish it. The handler's write is conditional, so it is safe wherever it landed.
+    # One cancellation handler around the claim commit and EVERYTHING that follows it — the
+    # claim-time clear, the work itself, every outcome branch and the post-outcome clear. A stop can
+    # land in any of them, and each one is a window in which the row is `processing` with nobody
+    # left to finish it. The COMMIT is inside for the sharpest of those windows: a cancellation
+    # delivered while it is in flight, after Postgres accepted it, is raised out of the commit
+    # itself, and with the handler below it would go past the hand-back and strand the very row the
+    # commit had just made durable. The handler's write is conditional, so it is safe wherever the
+    # stop landed — a commit that never reached the database leaves a row that is still `queued`
+    # for everyone else, which that write matches not at all.
     try:
+        # Commit the claim BEFORE processing (see docstring): `processing` becomes durable and the
+        # media_jobs row lock is released for the transcode's whole duration.
+        await db.commit()
         # Cleanup BEFORE processing (MEMNG-36): drop any progress row a dead attempt left behind,
         # so the snapshot never reports a percentage that goes backwards. Its own committing
         # session; a no-op delete on a fast-lane job that never published.

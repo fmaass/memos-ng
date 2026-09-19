@@ -69,10 +69,13 @@ PNG_EXIF_READ_CAP = 2 * 1024 * 1024
 # A HEIF's `meta` box and its Exif item are metadata too, and the cap bounds BOTH: the box this
 # walk parses in memory, and the one extent it then reads out of the file.
 HEIF_EXIF_READ_CAP = 2 * 1024 * 1024
-# The mimes `uploads.detect_heif_mime` puts on an ISOBMFF still. AVIF is deliberately absent: it
-# is the same container and the walk would work, but nothing in this repo has an AVIF fixture to
-# hold that claim to, and a wrong Exif item is a wrong DATE rather than an error.
-HEIF_MIMES = frozenset({"image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"})
+# The mimes `uploads.detect_heif_mime` puts on an ISOBMFF still. AVIF is one of them: the walk
+# reads `meta` → `iinf`/`iloc` and never a codec, so the AV1 payload it skips is as opaque to it
+# as the HEVC one — and `fixtures/locations/avif-gps.avif` is what holds that claim to a file,
+# because a wrong Exif item would be a wrong DATE rather than an error.
+HEIF_MIMES = frozenset(
+    {"image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence", "image/avif"}
+)
 EXIF_PREFIX = b"Exif\x00\x00"
 TIFF_MAGIC = (b"II*\x00", b"MM\x00*")
 

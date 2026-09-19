@@ -1,0 +1,22 @@
+Make the claim durable only when the whole job commits: flush it instead of committing it.
+
+This is the MEMNG-90 worker, restored. Flushing writes `processing` inside the claim's own
+transaction, so that transaction stays open across process_job — the session sits
+idle-in-transaction for the length of a transcode, which is what Postgres killed mid-job, and no
+other connection can see the claim at all. The probes that must turn red are therefore the two
+that read the property from outside: the one that reads the row from a SEPARATE connection at the
+instant the work starts, and the incident reproduction whose work outlasts
+idle_in_transaction_session_timeout. Nothing else in the module may move — the mutation is silent
+in-process, and a test that only checks this worker's own end state passes straight through it.
+
+--- a/app/worker.py
++++ b/app/worker.py
+@@ -660,7 +660,7 @@
+     try:
+         # Commit the claim BEFORE processing (see docstring): `processing` becomes durable and the
+         # media_jobs row lock is released for the transcode's whole duration.
+-        await db.commit()
++        await db.flush()
+         # Cleanup BEFORE processing (MEMNG-36): drop any progress row a dead attempt left behind,
+         # so the snapshot never reports a percentage that goes backwards. Its own committing
+         # session; a no-op delete on a fast-lane job that never published.

@@ -684,6 +684,115 @@ async def test_a_stop_during_a_bounded_step_still_ends_the_supervisor(harness, m
     assert not _timeouts(caps), "the stop was logged as a step that took too long"
 
 
+async def test_a_stop_arriving_as_the_bound_expires_still_ends_the_supervisor(harness, monkeypatch):
+    # The same hazard at its worst moment, which the test above cannot reach: there the bound is
+    # long and only the stop is ever in flight, here BOTH cancellations are outstanding at the same
+    # `asyncio.timeout` exit. That exit converts only while `uncancel()` brings the cancelling count
+    # back to what it was on entry, and this is the one arrangement that exercises the other side of
+    # that accounting — a `_bounded` catching CancelledError beside TimeoutError, or a timeout that
+    # converted regardless of the census, would read the stop as its own expiry, answer `on_timeout`
+    # and run the worker on through its stop grace until SIGKILL with both claims stranded.
+    #
+    # The two are made to coincide by the step itself, never by a sleep the host could reorder: the
+    # bound cuts the step's await, and the step holds that cancellation inside its own handler until
+    # the test has delivered the stop, so the stop is always part of the same unwind.
+    _bounds_with(monkeypatch, frame_share_drain=_TINY_BOUND)
+    cut_by_the_bound = asyncio.Event()
+    stop_delivered = asyncio.Event()
+    never_set = asyncio.Event()
+    finished: set[str] = set()
+
+    async def drain(job_class=None) -> str:
+        await asyncio.sleep(0)
+        harness.drains[job_class] += 1
+        try:
+            await never_set.wait()
+        except asyncio.CancelledError:
+            finished.add(job_class)
+            raise
+        return "idle"  # unreachable
+
+    async def frame_drain() -> str:
+        try:
+            await never_set.wait()
+        except asyncio.CancelledError:
+            cut_by_the_bound.set()
+            await stop_delivered.wait()  # the stop lands HERE, inside the expiry's own unwind
+            raise
+        return "idle"  # unreachable
+
+    monkeypatch.setattr(worker, "run_media_drain", drain)
+    monkeypatch.setattr(worker, "run_frame_share_drain", frame_drain)
+    with capture_logs() as caps:
+        loop_task = asyncio.create_task(worker.run())
+        await asyncio.wait_for(cut_by_the_bound.wait(), 20)
+        consumers = _consumer_tasks()
+        assert len(consumers) == 2
+        loop_task.cancel()  # the SIGTERM handler's move, made while the bound is already expiring
+        stop_delivered.set()
+        # `wait`, not `wait_for`, for the reason given in the test above: a swallowed stop must
+        # fail here rather than hang on a second cancellation of a supervisor that ignores them.
+        _, pending = await asyncio.wait([loop_task], timeout=20)
+        assert not pending, "the stop never ended the supervisor: the expiring bound swallowed it"
+        with pytest.raises(asyncio.CancelledError):
+            loop_task.result()
+    assert finished == {"transcode", "light"}, "the stop did not reach both consumers' teardown"
+    assert all(t.done() for t in consumers), "a consumer outlived the stop"
+    assert not _timeouts(caps), "the stop was logged as a step that took too long"
+
+
+@pytest.mark.parametrize(
+    ("step", "collaborator"),
+    [
+        ("frame_share_recover", "run_frame_share_recover_safe"),
+        ("media_recover", "run_media_recover_safe"),
+    ],
+)
+async def test_an_hourly_recover_that_never_returns_keeps_the_heartbeat_going(
+    harness, monkeypatch, step: str, collaborator: str
+):
+    # Category 4's other half, and the gap the declared-bounds test below cannot close: both
+    # recover steps are wrapped TWICE — once before the loop, once on the reap cadence — so the SET
+    # of bounded names stays complete even after an hourly wrapper is dropped. Only behaviour tells
+    # the two sites apart, so each hourly one is proved here: a recover that never returns costs a
+    # logged bound and a cycle of lateness, never the heartbeat.
+    beats = _CountingBeat()
+    monkeypatch.setattr(worker, "beat", beats)
+    monkeypatch.setattr(worker, "REAP_INTERVAL_SECONDS", 0)  # the hourly block, every pass
+    _bounds_with(monkeypatch, **{step: _TINY_BOUND})
+    _idle_media_drain(harness, monkeypatch)
+    parked = asyncio.Event()
+    never_set = asyncio.Event()
+    calls = 0
+
+    async def recover() -> int:
+        # The FIRST call — the pre-loop one — returns, so nothing below can be satisfied by the
+        # wrapper that sits before the loop; only the hourly copies hang.
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 0
+        parked.set()
+        await never_set.wait()
+        return 0  # unreachable
+
+    monkeypatch.setattr(worker, collaborator, recover)
+    with capture_logs() as caps:
+        async with _supervisor() as task:
+            await asyncio.wait_for(parked.wait(), 20)
+            try:
+                await beats.wait_for(4)  # two passes' worth of stamps AFTER the hang began
+            except TimeoutError:
+                # An unbounded hourly step does not announce itself — the loop simply stops with
+                # it — so the absence of stamps is what this proof has to name.
+                pytest.fail(f"the hourly {step} is not bounded: the heartbeat stopped with it")
+            assert not task.done()
+            _assert_consumers_unharmed()
+    timed_out = _timeouts(caps)
+    assert timed_out, "the hourly bound expired without saying which step it was"
+    assert {c["step"] for c in timed_out} == {step}, f"a step other than {step} timed out"
+
+
 def test_every_bounded_step_is_declared_and_the_budget_stays_under_half_the_bar():
     # Two ways the budget could quietly stop being true, both cheap to pin: a step bounded by a
     # name nobody declared (a KeyError inside the supervisor, i.e. a dead worker), a declared bound

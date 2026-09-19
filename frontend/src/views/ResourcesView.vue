@@ -4,6 +4,7 @@ import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import SelectButton from 'primevue/selectbutton'
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import { useApi } from '@/composables/useApi'
@@ -11,9 +12,11 @@ import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMedi
 import { fetchPrintMasters, usePrintMaster } from '@/composables/usePrintMaster'
 import type { MemoQuery } from '@/composables/useTimeline'
 import { shouldRemint } from '@/lib/imageRetry'
+import { memoPath } from '@/lib/places/lightbox'
 import { selectPrintMaster, toPrintMasterInfo } from '@/lib/printMaster'
 
 const api = useApi()
+const router = useRouter()
 const queryClient = useQueryClient()
 const confirm = useConfirm()
 const toast = useToast()
@@ -54,6 +57,11 @@ function openAt(index: number) {
     onDelete,
     onAttachPrint,
     onRemovePrint,
+    // A photo found in this gallery is usually wanted in its context; the viewer offers the jump
+    // only on a slide that names a memo, so the orphans here simply never show it.
+    onShowInMemo: (memoUid) => {
+      void router.push(memoPath({ memo_uid: memoUid }))
+    },
     loadPrintMaster: async (uid) => toPrintMasterInfo(selectPrintMaster(await fetchPrintMasters(uid))),
   })
 }

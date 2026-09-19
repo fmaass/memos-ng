@@ -1523,23 +1523,57 @@
             ]
           },
           "detail": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/MapArchive"
+            "description": "One published basemap archive.",
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
               },
-              {
-                "type": "null"
+              "size": {
+                "title": "Size",
+                "type": "integer"
+              },
+              "url": {
+                "title": "Url",
+                "type": "string"
               }
+            },
+            "required": [
+              "name",
+              "url",
+              "size"
+            ],
+            "title": "MapArchive",
+            "type": [
+              "object",
+              "null"
             ]
           },
           "planet": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/MapArchive"
+            "description": "One published basemap archive.",
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
               },
-              {
-                "type": "null"
+              "size": {
+                "title": "Size",
+                "type": "integer"
+              },
+              "url": {
+                "title": "Url",
+                "type": "string"
               }
+            },
+            "required": [
+              "name",
+              "url",
+              "size"
+            ],
+            "title": "MapArchive",
+            "type": [
+              "object",
+              "null"
             ]
           },
           "uncovered": {
