@@ -64,6 +64,10 @@ PRINTREADY_DPI = (300, 300)
 # file and exits on TERM, so this only has to cover finishing the frame in flight.
 KILL_GRACE_SECONDS = 5.0
 GROUP_POLL_SECONDS = 0.25  # cadence of the "is anything left in the group?" probe
+# The stop path's bound for the sweep a waited-out encode leaves behind (_discard_on_stop_if_gone),
+# sized like worker.CANCEL_PROGRESS_CLEAR_SECONDS: a database or a volume that does not answer must
+# not spend the grace the requeue after it has already earned (RELEASING.md, the stop budget).
+CANCEL_SWEEP_TIMEOUT_SECONDS = 1.0
 # Bounded cadence for committed progress samples (see _pump_progress): ffmpeg reports per frame,
 # this publishes at most once per interval, so a long transcode costs a handful of tiny commits.
 PROGRESS_PUBLISH_SECONDS = 2.0
@@ -1527,6 +1531,49 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     await db.flush()
 
 
+async def _discard_on_stop_if_gone(attachment_id: int, uid: str) -> None:
+    """The fence guard_publish would have been, for a thread the STOP waited out.
+
+    The wait-out below lets the encode finish, which means it has already `os.replace`d its
+    rendition into the final path — and then the cancellation is re-raised BEFORE guard_publish,
+    the checkpoint that sweeps what a job published for a photo deleted meanwhile. Nothing sweeps
+    it afterwards either: the delete takes the job row along with the attachment (the claim is
+    committed before processing, so the row is lockable), so the cancel path's conditional requeue
+    moves no row and the job never runs again. Without this, a stop that lands during the encode of
+    a just-deleted photo leaves a multi-megabyte rendition on disk that nothing names.
+
+    A session of its OWN, for the reason worker._requeue_cancelled_claim gives: the consumer's
+    session is being torn down around this call. BOUNDED and SHIELDED for the same reasons too — a
+    second stop must not interrupt a half-done sweep, and a database that does not answer must not
+    hold the process past docker's grace. Past the bound the file stays, which is where a SIGKILL
+    would have left it anyway. Every failure is swallowed on purpose: the caller re-raises the
+    cancellation immediately, and an error from here would REPLACE the stop.
+
+    The row check is guard_publish's own (locked, so a delete committing right now is waited for
+    rather than read around), and the sweep itself goes to a thread: it is a dozen unlinks over
+    NFS, and an unbounded blocking call here would defeat the bound above.
+    """
+
+    async def _sweep() -> None:
+        async with async_session() as db:
+            try:
+                if await attachment_still_exists(db, attachment_id):
+                    return  # a live photo's rendition: the requeued job publishes nothing new
+            finally:
+                await db.rollback()  # the row lock is held for the read alone
+        await to_thread.run_sync(discard_outputs, uid)
+
+    sweep = asyncio.ensure_future(_sweep())
+    try:
+        async with asyncio.timeout(CANCEL_SWEEP_TIMEOUT_SECONDS):
+            await asyncio.shield(sweep)
+    except (TimeoutError, asyncio.CancelledError):
+        sweep.cancel()  # the bound reached, or a second cancel — let the stop proceed
+        logger.warning("printready_cancel_sweep_unfinished", attachment_id=attachment_id, uid=uid)
+    except Exception:
+        logger.exception("printready_cancel_sweep_error", attachment_id=attachment_id, uid=uid)
+
+
 async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: Attachment) -> None:
     """Run one on-demand print rendition (MEMNG-49) — the second kind of slow-lane image work.
 
@@ -1593,6 +1640,9 @@ async def process_printready_job(db: AsyncSession, job: MediaJob, attachment: At
                 await asyncio.shield(encode)  # re-shielded: a second stop must not win either
         if not encode.cancelled():
             encode.exception()  # retrieved, so a failed encode is not logged as never-retrieved
+        # The thread published while the stop was waiting for it, and the guard_publish below is
+        # never reached — so the fence it would have applied is applied here instead.
+        await _discard_on_stop_if_gone(attachment.id, attachment.uid)
         raise
     # The delete endpoint never waits for a running job, so the photo may have been deleted while
     # this ran. Checked under the row lock, which also sweeps the file just published.
@@ -1630,9 +1680,26 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
         else:
             # Heavy image (HEIC/AVIF): the CPU-costly libheif decode + derivative generation runs
             # on the slow (Merkur) worker. process_image never touches the original (ADR-0008).
-            # blocking-ok: this IS the worker's job — a CPU-bound decode that would still occupy
-            # the process in a thread. Nothing else is queued on this loop to yield to.
-            meta = process_image(attachment)
+            # Off the loop for the reason process_printready_job gives, and in the same shape:
+            # "nothing else is queued on this loop" stopped being true with two consumers and a
+            # supervisor sharing it, and this branch is the LIGHT consumer's heaviest job — seconds
+            # of decode per photo, a whole import back to back, during which the transcode
+            # consumer's progress writes and the heartbeat cannot run. `attachment` crosses to the
+            # thread reading only already-loaded columns, as it does there.
+            # The shielded wait-out preserves what the inline call did on a stop exactly: a thread
+            # cannot be interrupted, so the decode finishes and publishes its tiers either way, and
+            # the cancellation is delivered only afterwards — never swallowed, and never leaving a
+            # half-written tier behind.
+            decode = asyncio.create_task(to_thread.run_sync(process_image, attachment))
+            try:
+                meta = await asyncio.shield(decode)
+            except asyncio.CancelledError:
+                while not decode.done():
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await asyncio.shield(decode)  # re-shielded: a second stop must not win
+                if not decode.cancelled():
+                    decode.exception()  # retrieved: not logged as a never-retrieved failure
+                raise
             await guard_publish(db, job, attachment)
             attachment.width = meta.get("width")
             attachment.height = meta.get("height")

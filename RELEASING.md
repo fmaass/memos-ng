@@ -177,7 +177,11 @@ That happens inside docker's stop grace, which is **10 s**: the stack compose se
 transcode's own tree stop first (SIGTERM to the ffmpeg process group, `media.KILL_GRACE_SECONDS` =
 5 s), then up to 3 s for the requeue write (`worker.CANCEL_REQUEUE_TIMEOUT_SECONDS`), then up to
 1 s for the progress row (`worker.CANCEL_PROGRESS_CLEAR_SECONDS`) — 9 s of the 10, with both
-consumers running their own in parallel. These are **designed bounds, not hard caps**: an ffmpeg
+consumers running their own in parallel. The light consumer adds up to 1 s of its own
+(`media.CANCEL_SWEEP_TIMEOUT_SECONDS`) when the stop waited out a print encode: the fence that
+sweeps a rendition published for a photo deleted during it, which the re-raised cancellation skips
+`guard_publish` and therefore its own sweep. That is 5 s on the light path against the transcode
+path's 9, so it does not move the total. These are **designed bounds, not hard caps**: an ffmpeg
 that ignores SIGTERM also needs the SIGKILL step, which adds another 5 s, and nothing in the
 process can bound the kernel.
 
