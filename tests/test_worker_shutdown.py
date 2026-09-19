@@ -764,6 +764,70 @@ async def test_an_error_raised_over_a_stop_in_the_push_does_not_swallow_the_stop
                 await push
 
 
+async def test_a_consumer_that_swallows_its_one_cancellation_holds_the_stop_to_the_kill(
+    supervised,  # noqa: F811 — the imported fixture
+    monkeypatch,
+):
+    """ACCEPTED as it stands: the teardown cancels each consumer ONCE and awaits it unbounded.
+
+    So a consumer that swallows that one cancellation — the trap the push above was one route into
+    — keeps the process alive until docker's SIGKILL, and a second SIGTERM meanwhile is deliberately
+    a no-op. This pins that: the stop does NOT finish inside the grace.
+
+    WHY no deadline is added here instead: there is no room for one. The consumers' own designed
+    bounds already sum to 9 s of docker's default 10 s grace (the transcode's tree stop 5 s, the
+    requeue write 3 s, the progress row 1 s), so a teardown deadline had to sit at or above 9 s to
+    avoid cutting a legitimate hand-back short — and a deadline that can only fire in the last
+    second before SIGKILL buys nothing the SIGKILL does not already do. A deadline worth having
+    needs a raised `stop_grace_period` on the stack compose, which is a production config change
+    and not this lane's. What IS done instead is closing the routes into a swallowed cancellation
+    one at a time, which is what the proof above does for the push.
+    """
+    monkeypatch.setattr(media, "read_temp_millideg", lambda: None)
+    swallowed = asyncio.Event()
+
+    async def swallowing_drain(job_class=None) -> str:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            if job_class == "light" and not swallowed.is_set():
+                swallowed.set()
+                return "idle"  # a lost cancellation leaves exactly this: an ordinary return
+            raise
+        return "idle"
+
+    monkeypatch.setattr(worker, "run_media_drain", swallowing_drain)
+
+    supervisor = asyncio.create_task(worker.run())
+    consumer: asyncio.Task | None = None
+    try:
+        await _until(
+            lambda: any(t.get_name() == "media-consumer-light" for t in asyncio.all_tasks()),
+            "the light consumer to start",
+        )
+        consumer = next(t for t in asyncio.all_tasks() if t.get_name() == "media-consumer-light")
+        supervisor.cancel()
+        # `asyncio.wait`, NOT `await` under a timeout: a timeout cancels the waiting task, and a
+        # task cancelled while awaiting another cancels THAT one too — a second cancellation, which
+        # is exactly what the stop path never gets (a second SIGTERM is a deliberate no-op). This
+        # waits out the whole grace and touches nothing.
+        done, _pending = await asyncio.wait({supervisor}, timeout=STOP_GRACE_SECONDS)
+        assert swallowed.is_set(), "no cancellation was swallowed, so this proves nothing"
+        assert not done, (
+            "the teardown ended although a consumer had swallowed its cancellation — it has "
+            "grown a deadline, and RELEASING.md's stop budget has to grow with it"
+        )
+    finally:
+        # The second cancellation this teardown will never send itself, so the suite is not left
+        # with a worker draining into the next test.
+        if consumer is not None:
+            consumer.cancel()
+        supervisor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            async with asyncio.timeout(30):
+                await supervisor
+
+
 # A worker process with no database and no media work: every collaborator the supervisor calls is
 # replaced in the child itself, and each consumer's drain parks until the shutdown cancels it, so
 # what this proves is the SIGNAL path and nothing else.
