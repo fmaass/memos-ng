@@ -190,6 +190,103 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.7.3
+
+- The SPA's hashed assets are served compressed, long-cached and never ranged. `/assets`, where
+  every file name is content-hashed, goes out gzipped to a client that accepts it and carries
+  `Cache-Control: public, max-age=31536000, immutable` on the 200 and on the 304; the compressor
+  wraps that mount alone, so the media tiers, the Range-served basemap archives and the event
+  stream keep going out as they did. A `Range` request there used to be answered `206` with a
+  slice cut from the identity file and then gzipped, under the same strong ETag as the full 200,
+  so a browser resuming an interrupted map chunk spliced it into garbage; the tier now drops
+  `Range` and `If-Range` and answers `Accept-Ranges: none`. The shell keeps its stable name and
+  `no-cache`, since a copy of it kept across a deploy names chunks that no longer exist.
+- A tap on Places is answered at once. The map loads beside the route behind a fallback pane
+  instead of in front of it, so the view renders while the megabyte of map code arrives, and a
+  navigation that keeps the viewer waiting past 120 ms raises a progress bar in the app shell —
+  cached routes never flash it, and a tap on the route already open takes it down. The chunk is
+  warmed in the background once the app is up and the browser is idle. The map's stylesheet is
+  repairable again: Vite's preload helper skips a CSS dependency it has already seen, so a
+  `map-*.css` that failed once stayed skipped for the life of the document and the map mounted
+  unstyled with nothing on screen to say why. Failed links are now recorded and replaced with
+  fresh elements before the map loads, concurrent loads share the one repair in flight, and a link
+  leaves the failed set only once its replacement has loaded. The pane's last rung is a reload,
+  the only retry certain to reach the network once the browser remembers a module fetch as failed.
+- An AVIF original's Exif is read from the file's headers, so its location and capture instant
+  cost a header walk instead of a full decode. AVIF is the same ISO-BMFF container as HEIC and the
+  walk never touches a codec, so `image/avif` joins the mime set that routes to it. A test holds
+  the cost to the headers: on an AVIF of more than 32 KiB the read stays under a sixteenth of the
+  file, and the image payload the larger fixture adds costs under a kilobyte more of it than the
+  small one. Thumbnailing and the derived tiers are
+  untouched, and a file whose Exif item the headers cannot address takes the existing fallback.
+- A route chunk the current build no longer ships gets one reload onto that build. After a deploy,
+  a page opened before it asked for a hashed chunk that is gone and the tap did nothing at all;
+  the router now reloads once, keyed by route path so the query and fragment variants of a route
+  share one marker, and answers a second failure of the same route within ten minutes with a
+  message offering the reload rather than taking it again. A browser that blocks storage gets that
+  message and never a reload on a bet. The recovery is wired in the document that is running, so a
+  page opened before this deploy still gets the dead tap; it holds from the next deploy on.
+- From the next update on, an open tab is not reloaded mid-session: a build that takes control is
+  picked up on the next navigation, so nothing half-typed is lost, and an open page asks for an
+  update hourly while it is visible instead of never. On this update it is the 1.7.2 document that
+  decides: it registers its worker in `autoUpdate` mode with no `onNeedReload`, and the worker
+  calls `skipWaiting()` and `clientsClaim()` in both versions, so that build's own helper reloads
+  such a tab once as 1.7.3 takes control.
+- What a short connection blip broke is refetched even when the banner never showed. The banner's
+  monitor drives the query client's online state, so a blip that never got past `suspect` — one
+  failed request, or failures inside the 3-second debounce — changed nothing, and a query that
+  does not retry, today the session query, stayed in its error state until something else
+  refetched it. Every recovery now invalidates exactly the queries that are in an error state,
+  once per recovery, and never a healthy one.
+- The Resources viewer offers the jump to the memo. A photo opened from the library was reachable
+  only by scrolling the feed for it; the viewer now navigates with the same helper Places uses,
+  and still withholds the action on a slide that names no memo. The coordinate rounding that keys
+  a place is pinned by vectors read from the runtime itself — the exact binary tie, the negative
+  zero that must never reach a key, and eight near-ties — so the web and the native client cannot
+  drift apart on it while both suites stay green.
+- A worker stop delivered inside the claim's own commit no longer strands the job. The claim
+  identity is read before the commit and the commit sits under the cancel handler that hands the
+  row back, so such a stop requeues the row instead of leaving it `processing` under a claim
+  nobody answers to until the stale-claim sweep — the one window 1.7.2 disclosed as uncovered. If
+  the commit never landed, the conditional hand-back matches no row. An ordinary error raised in
+  the best-effort push while a cancellation was unwinding used to replace it and swallow the stop;
+  it is re-raised now, so the consumer stops instead of draining on.
+- Every checkpoint a worker stop can skip is fenced in the print-ready path. A stop waits out the
+  print encode, so the rendition had already been replaced into its final path by the time the
+  checkpoint that sweeps what a job published for a photo deleted mid-run would have run — and
+  nothing swept it later either, the delete having taken the job row with the attachment. That
+  fence now runs on the stop path itself, under a session of its own and a one-second bound, and
+  it covers the light lane's three publishing sites, not the print encode alone; the transcode's
+  checkpoint unlinks its own temporary file instead. The heavy image decode moved off the event
+  loop into a thread, in the shape the print encode already used, so the seconds of libheif decode
+  a HEIC or AVIF photo costs no longer hold the heartbeat and the transcode consumer's progress
+  writes for that whole time. A failing `unlink` in the stop's cleanup no longer replaces the
+  cancellation it is cleaning up after.
+- Documentation: the release procedure's stop budget names two kinds of job the stop waits out, a
+  print-ready encode and a heavy image decode, instead of the encode alone — both run in a thread,
+  which cannot be interrupted, and the wait sits in front of the bounded steps, so the 5 s quoted
+  for the light path is the bounded part only and neither wait is new. The light consumer's bound
+  now includes up to one second for the checkpoint fence, at most once per stopped job; the
+  transcode path takes no bounded second of its own, its fence being a single synchronous unlink.
+- The hourly housekeeping bounds are proven by behaviour. The declared-bounds test compared a set
+  of step names, while `frame_share_recover` and `media_recover` are each wrapped twice — before
+  the loop and hourly — so an hourly wrapper could be dropped with that set, and the test,
+  unchanged. Both are now reached through the real loop, and an hourly recover that never returns
+  is proven not to stop the heartbeat. A stop and a bound expiring in the same iteration is pinned
+  too: the supervisor still ends with the stop. A mutation control replaces the claim `commit()`
+  before the work with a `flush()` and must turn exactly three named tests red, so none of the
+  three can be deleted with the gate silent.
+- API contract: `openapi.json` changed shape. Under `#/components/schemas/MapManifest`, the
+  `planet` and `detail` properties no longer carry an `anyOf` of `$ref:
+  #/components/schemas/MapArchive` and `{"type": "null"}`. Each now states the archive schema
+  inline — the `name`, `url` and `size` properties, all three required, under
+  `"type": ["object", "null"]` — and `MapArchive` itself stays in `components/schemas`. The
+  rewrite is for generated clients: swift-openapi-generator has no support for a bare `null` arm
+  and drops the property that carries one rather than failing, so a client generated from the
+  previous document had neither basemap archive. A client that vendors `openapi.json` must
+  re-vendor it.
+- No migration.
+
 ### v1.7.2
 
 - `/places` no longer carries a timeline. The map keeps everything it showed: pins, clusters,
