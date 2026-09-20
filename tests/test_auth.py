@@ -9,6 +9,7 @@ from app import auth
 from app.config import settings
 from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import create_engine, text
+from structlog.testing import capture_logs
 
 from tests.conftest import SYNC_URL
 
@@ -339,6 +340,21 @@ def _tx_cookie_deleted(response) -> bool:
     return auth.TX_COOKIE in header and "max-age=0" in header
 
 
+def _the_refusal_event(logs: list[dict], *, status: int, lane: str) -> None:
+    """The one event the refusal leaves behind, and nothing of the request in it.
+
+    A refusal the server answers rather than raises is invisible in the log unless it says so, and
+    a provider outage arrives here as the same exception a spent code does — so the status and the
+    lane are what has to be readable afterwards. Everything else about the request is a secret:
+    the code, the verifier and the state all travel on it.
+    """
+    refusals = [entry for entry in logs if entry["event"] == "oidc_code_exchange_refused"]
+    assert len(refusals) == 1
+    assert refusals[0]["status_code"] == status
+    assert refusals[0]["lane"] == lane
+    assert "already-spent" not in repr(refusals[0])
+
+
 def test_a_refused_code_ends_the_web_login_on_a_readable_page(client, monkeypatch):
     """An authorization code is single-use, so a second arrival of the same callback is refused at
     the provider. The person must get a page they can act on, not a bare Internal Server Error."""
@@ -348,11 +364,13 @@ def test_a_refused_code_ends_the_web_login_on_a_readable_page(client, monkeypatc
     tx = login.cookies[auth.TX_COOKIE]
     client.cookies.set(auth.TX_COOKIE, tx)
 
-    cb = client.get(
-        f"/api/auth/callback?code=already-spent&state={auth.decrypt(tx)['state']}",
-        follow_redirects=False,
-    )
+    with capture_logs() as logs:
+        cb = client.get(
+            f"/api/auth/callback?code=already-spent&state={auth.decrypt(tx)['state']}",
+            follow_redirects=False,
+        )
 
+    _the_refusal_event(logs, status=400, lane="web")
     assert cb.status_code == 400
     assert _REFUSED_MARKER in cb.text
     assert "/api/auth/login" in cb.text  # a way to start again
@@ -364,9 +382,13 @@ def test_a_refused_code_ends_the_web_login_on_a_readable_page(client, monkeypatc
 
 def test_a_refused_code_reaches_the_native_hand_back_page_as_an_error(client, monkeypatch):
     """An app watching an authentication session sees only the callback URL it was told to wait
-    for, so a refusal has to arrive there as a parameter or its sign-on waits for ever."""
+    for, so a refusal has to arrive there as a parameter or its sign-on waits for ever.
+
+    Driven with the provider unavailable rather than refusing a spent code: an outage answers the
+    same exception, and the device has to be let go on that one too.
+    """
     monkeypatch.setattr(settings, "COOKIE_SECURE", False)
-    _token_endpoint_refuses(monkeypatch)
+    _token_endpoint_refuses(monkeypatch, status=503)
     login = client.get(
         "/api/auth/login?"
         + urlencode({"client": "ios", "code_challenge": _CHALLENGE, "device": "AuthTestPhone"}),
@@ -375,11 +397,13 @@ def test_a_refused_code_reaches_the_native_hand_back_page_as_an_error(client, mo
     tx = login.cookies[auth.TX_COOKIE]
     client.cookies.set(auth.TX_COOKIE, tx)
 
-    cb = client.get(
-        f"/api/auth/callback?code=already-spent&state={auth.decrypt(tx)['state']}",
-        follow_redirects=False,
-    )
+    with capture_logs() as logs:
+        cb = client.get(
+            f"/api/auth/callback?code=already-spent&state={auth.decrypt(tx)['state']}",
+            follow_redirects=False,
+        )
 
+    _the_refusal_event(logs, status=503, lane="native")
     assert cb.status_code == 302
     url = urlsplit(cb.headers["location"])
     assert url._replace(query="").geturl() == settings.NATIVE_CALLBACK_URL

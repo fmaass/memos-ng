@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -18,6 +19,8 @@ from app.services import management_grant, native_auth
 from app.services import pats as pats_svc
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+logger = structlog.get_logger(__name__)
 
 # The query value that switches /login and /callback into device-handoff mode. Anything else —
 # including the parameter's absence — is the web flow, unchanged.
@@ -191,7 +194,7 @@ async def callback(
         raise HTTPException(status_code=400, detail="Invalid OIDC state")
     try:
         tokens = await auth.exchange_code(code, tx["verifier"])
-    except httpx.HTTPStatusError:
+    except httpx.HTTPStatusError as refused:
         # An authorization code is single-use at the provider, so ANY second arrival of the same
         # callback — a reload, a restored page, a browser handing the login back to itself — is
         # refused there. That is an ending this flow knows how to give: a spent transaction is
@@ -199,6 +202,16 @@ async def callback(
         # arrival is deliberately not replayed to the second: replaying would mean keeping a live
         # session or a one-shot handoff code retrievable by whoever presents the state again, which
         # turns a credential minted once into one that can be collected twice.
+        #
+        # Answered rather than raised, so this line is the only trace it leaves: without it an
+        # identity provider that is down — a 5xx arrives here as the same refusal — would look
+        # exactly like the household reloading a spent callback. The status and the lane are all it
+        # may carry: the code, the verifier and the state all travel on this request.
+        logger.warning(
+            "oidc_code_exchange_refused",
+            status_code=refused.response.status_code,
+            lane="native" if native else "web",
+        )
         if native:
             return _native_redirect(error=NATIVE_EXCHANGE_FAILED)
         # The web path deletes the transaction cookie wherever it ends (see below); left behind, it
