@@ -1,6 +1,8 @@
 from datetime import timedelta
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlencode, urlsplit
 
+import httpx
 import jwt
 import pytest
 from app import auth
@@ -304,3 +306,85 @@ def test_callback_rejects_a_present_but_wrong_state(client, monkeypatch):
     cb = client.get("/api/auth/callback?code=abc&state=not-the-real-state", follow_redirects=False)
     assert cb.status_code == 400
     assert cb.json()["detail"] == "Invalid OIDC state"
+
+
+# --- the provider refuses the authorization code ----------------------------------------------
+
+# RFC 7636 Appendix B's published S256 challenge — any well-formed one the login accepts will do
+# here; these cases never redeem it.
+_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+# The marker the refusal page carries on <html>, so a case proves that page answered rather than
+# the SPA shell or a JSON detail.
+_REFUSED_MARKER = "data-memosng-signin-refused"
+
+
+def _token_endpoint_refuses(monkeypatch, status: int = 400):
+    """Script the provider's token endpoint to answer `status` UNDER the real `exchange_code`.
+
+    Substituting `exchange_code` with a mock that raises would only prove the route handles an
+    exception the test invented; scripting the transport leaves `raise_for_status()` as the thing
+    that turns the provider's answer into the failure, which is what the traceback came from.
+    """
+
+    real_client = httpx.AsyncClient  # bound BEFORE the patch; the replacement builds a real one
+
+    def _refusing_client(*_args, **_kwargs):
+        return real_client(transport=httpx.MockTransport(lambda _request: httpx.Response(status)))
+
+    monkeypatch.setattr(httpx, "AsyncClient", _refusing_client)
+
+
+def _tx_cookie_deleted(response) -> bool:
+    header = response.headers.get("set-cookie", "").lower()
+    return auth.TX_COOKIE in header and "max-age=0" in header
+
+
+def test_a_refused_code_ends_the_web_login_on_a_readable_page(client, monkeypatch):
+    """An authorization code is single-use, so a second arrival of the same callback is refused at
+    the provider. The person must get a page they can act on, not a bare Internal Server Error."""
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    _token_endpoint_refuses(monkeypatch)
+    login = client.get("/api/auth/login", follow_redirects=False)
+    tx = login.cookies[auth.TX_COOKIE]
+    client.cookies.set(auth.TX_COOKIE, tx)
+
+    cb = client.get(
+        f"/api/auth/callback?code=already-spent&state={auth.decrypt(tx)['state']}",
+        follow_redirects=False,
+    )
+
+    assert cb.status_code == 400
+    assert _REFUSED_MARKER in cb.text
+    assert "/api/auth/login" in cb.text  # a way to start again
+    assert "already-spent" not in cb.text  # nothing the caller supplied is reflected back
+    # The transaction is finished either way: its cookie left behind is a state value that can only
+    # produce the same refusal again.
+    assert _tx_cookie_deleted(cb)
+
+
+def test_a_refused_code_reaches_the_native_hand_back_page_as_an_error(client, monkeypatch):
+    """An app watching an authentication session sees only the callback URL it was told to wait
+    for, so a refusal has to arrive there as a parameter or its sign-on waits for ever."""
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+    _token_endpoint_refuses(monkeypatch)
+    login = client.get(
+        "/api/auth/login?"
+        + urlencode({"client": "ios", "code_challenge": _CHALLENGE, "device": "AuthTestPhone"}),
+        follow_redirects=False,
+    )
+    tx = login.cookies[auth.TX_COOKIE]
+    client.cookies.set(auth.TX_COOKIE, tx)
+
+    cb = client.get(
+        f"/api/auth/callback?code=already-spent&state={auth.decrypt(tx)['state']}",
+        follow_redirects=False,
+    )
+
+    assert cb.status_code == 302
+    url = urlsplit(cb.headers["location"])
+    assert url._replace(query="").geturl() == settings.NATIVE_CALLBACK_URL
+    query = parse_qs(url.query)
+    assert query["error"] == ["exchange_failed"]
+    assert "code" not in query  # nothing to redeem: the login did not complete
+    assert "already-spent" not in cb.headers["location"]
+    assert _tx_cookie_deleted(cb)
