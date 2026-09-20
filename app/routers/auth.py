@@ -2,8 +2,10 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
+import httpx
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Row, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +19,8 @@ from app.services import management_grant, native_auth
 from app.services import pats as pats_svc
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+logger = structlog.get_logger(__name__)
 
 # The query value that switches /login and /callback into device-handoff mode. Anything else —
 # including the parameter's absence — is the web flow, unchanged.
@@ -116,6 +120,46 @@ async def login(
     return resp
 
 
+# What a device is told when the provider would not trade the authorization code. Deliberately one
+# constant and not the provider's own answer: the app puts this straight in front of a person, and
+# a refusal must not become an oracle for why the identity provider said no. It is also the honest
+# width of what this server knows — the exchange did not happen — whatever the status behind it.
+NATIVE_EXCHANGE_FAILED = "exchange_failed"
+
+# No parameter and no caller-supplied text reaches this page by construction: it is one constant
+# document, so the failure that renders it cannot also write into it. `style-src` already allows
+# inline styles app-wide (`app.security_headers.CSP`), and there is no script to allow.
+REFUSED_PAGE = """<!doctype html>
+<html lang="en" data-memosng-signin-refused>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memos-ng</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; padding: 4rem 1.25rem; max-width: 26rem; text-align: center;
+    font: 1rem/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #fff; color: #1c1c1e;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #111214; color: #e6e6e8; } }
+  h1 { font-size: 1.35rem; margin: 0 0 .5rem; }
+  p { margin: 0 0 2rem; opacity: .7; font-size: .95rem; }
+  a.again {
+    display: inline-block; padding: .8rem 1.6rem; border-radius: .7rem;
+    background: #6366f1; color: #fff; font-weight: 600; text-decoration: none;
+  }
+</style>
+</head>
+<body>
+<h1>Sign-in could not be completed</h1>
+<p>Nothing was signed in. Starting again is safe.</p>
+<a class="again" href="/api/auth/login">Start again</a>
+</body>
+</html>
+"""
+
+
 def _native_redirect(**params: str) -> RedirectResponse:
     """302 back to the app's HTTPS callback, dropping the transaction cookie on the way out."""
     resp = RedirectResponse(f"{settings.NATIVE_CALLBACK_URL}?{urlencode(params)}", status_code=302)
@@ -148,7 +192,33 @@ async def callback(
         raise HTTPException(status_code=400, detail="Invalid OIDC state")
     if not code:
         raise HTTPException(status_code=400, detail="Invalid OIDC state")
-    tokens = await auth.exchange_code(code, tx["verifier"])
+    try:
+        tokens = await auth.exchange_code(code, tx["verifier"])
+    except httpx.HTTPStatusError as refused:
+        # An authorization code is single-use at the provider, so ANY second arrival of the same
+        # callback — a reload, a restored page, a browser handing the login back to itself — is
+        # refused there. That is an ending this flow knows how to give: a spent transaction is
+        # finished, so the only thing left to offer is starting a new one. The result of the FIRST
+        # arrival is deliberately not replayed to the second: replaying would mean keeping a live
+        # session or a one-shot handoff code retrievable by whoever presents the state again, which
+        # turns a credential minted once into one that can be collected twice.
+        #
+        # Answered rather than raised, so this line is the only trace it leaves: without it an
+        # identity provider that is down — a 5xx arrives here as the same refusal — would look
+        # exactly like the household reloading a spent callback. The status and the lane are all it
+        # may carry: the code, the verifier and the state all travel on this request.
+        logger.warning(
+            "oidc_code_exchange_refused",
+            status_code=refused.response.status_code,
+            lane="native" if native else "web",
+        )
+        if native:
+            return _native_redirect(error=NATIVE_EXCHANGE_FAILED)
+        # The web path deletes the transaction cookie wherever it ends (see below); left behind, it
+        # is a state value that can only produce this same refusal again.
+        resp = HTMLResponse(REFUSED_PAGE, status_code=400)
+        resp.delete_cookie(auth.TX_COOKIE)
+        return resp
     claims = auth.validate_id_token(tokens["id_token"])
     # The id_token only carries `sub`; pull preferred_username/name/email/groups from userinfo
     # so the user is keyed by their real username, not the opaque sub UUID.
