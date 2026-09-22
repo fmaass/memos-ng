@@ -36,6 +36,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.database import async_session
+from app.version import __version__
 
 logger = structlog.get_logger(__name__)
 
@@ -99,8 +100,11 @@ async def wait_for_migrated_schema(
             while True:
                 have = await current_db_head()
                 if have == want:
-                    if announced_wait:
-                        logger.info("worker_schema_gate_cleared", head=want)
+                    # Unconditional, not only after a wait: this line is the worker's one statement
+                    # of WHICH schema its code is running against, and the steady-state start —
+                    # the gate clearing on its first poll — is exactly when nobody can tell a
+                    # healthy worker from one that never got this far.
+                    logger.info("worker_schema_gate_cleared", head=want, version=__version__)
                     return want
                 if have is not None and settings.ROLLBACK_MODE and have not in known_revisions():
                     # A rollback: the schema is AHEAD of this image, and the expand-only migration
