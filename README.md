@@ -190,6 +190,116 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.8.0
+
+- One memo save can name its whole picture list, in order. `PATCH /api/memos/{uid}` takes an
+  optional `attachment_uids`: the memo's COMPLETE list of pictures, the index of an entry becoming
+  that picture's place. Omitted, the pictures are untouched and the request stays a true partial
+  update, exactly as `upload_uids` is; sent as an empty list, the memo keeps no pictures at all.
+  An attachment the memo has and the list does not name is removed — until now removal was a
+  separate `DELETE` per attachment, and order was whatever the appends left behind. An entry is
+  either an attachment uid or an `upload_uid` named in the same request's `upload_uids`, because a
+  picture being uploaded here has no attachment uid the client could know: that uid is minted while
+  the request runs. Two entries may resolve to one attachment — identical bytes dedup, and a print
+  binds onto its screen — and the attachment takes the EARLIEST place its entries asked for, so the
+  stored list can be shorter than the one sent. An edit that only re-declares the list finalizes
+  nothing, yet still links, reorders and detaches, so it asks for the same single ascending
+  attachment acquisition finalization takes.
+- An entry that cannot be resolved fails the WHOLE request with 422, never a silent skip: the
+  append path skips a uid it cannot link, which on a declared list would answer 200 to a list one
+  picture short, having already detached every picture that list left out. Each rejected entry comes
+  back as one `detail` item whose `loc` ends with the uid and whose `type` names the reason —
+  `attachment_uid.missing`, `attachment_uid.foreign_owner`, `attachment_uid.other_memo` or
+  `attachment_uid.unresolvable_upload_uid` — in the validation-error shape this router already
+  answers 422 in. A uid that is no attachment of anyone's but is an upload of this owner's gets the
+  last of those, which is the difference between a client adding one field and a client hunting a
+  picture it thinks the server lost. The judgement is taken after the one attachment acquisition
+  and before a byte is moved, whether or not the request finalizes an upload — so a refused
+  request has nothing on disk to put back. Taken any later, the same deterministic 422 could fire
+  after a sibling print bind had replaced a committed master in place: those bytes are
+  overwritten, no tracked move names them, and the upload row the rollback restores promises a
+  part file that replacement consumed.
+- What a list omits is detached, not deleted. A file this request cannot delete must not undo an
+  edit the user was told was saved, so each detached row is reclaimed after the commit, judged
+  against the instant that detached it — and a crash in the gap leaves a row that still names its
+  files. A memo delete hands that instant to its own after-commit reclaim too, so a row a
+  concurrent upload has claimed in between is live media and is left alone. Deleting an attachment
+  directly now runs through that same unit, the one the hourly sweep below uses: every reclaim in
+  the process is ONE unit — a task, a session and a transaction of its own, awaited through a
+  shield. The unlinking inside it can be undone by no cancellation — a request that goes away, a
+  stopping process whose wait runs out, the process's own teardown — so a row's lock always
+  outlives the deletion of its files, and a row is never adoptable while its files are being
+  unlinked. What a cancellation can still take is the transaction that follows, the files by then
+  gone: the row stays, naming them. Detached, the next sweep finishes it; still on its memo,
+  deleting that picture again does, an absent file counting as deleted. A reclaim that did not
+  complete is logged either way, and on a memo delete that line names the memo the row came off.
+- An attachment records when it left its memo, and an hourly sweep reclaims the ones that never
+  came back. `attachments.detached_at` is written at the sites that null `memo_id`; nothing on the
+  table could say that before, `created_at` being the public create time — and creation age is the
+  wrong age anyway, because a file uploaded last month and detached ten seconds ago is a month old
+  by it. Nothing looked for those rows either: the commit-race reconcile wants a memo, and the
+  leaked-orphan predicate the maintenance script runs wants an original under a dated memo folder,
+  which an original imported from 0.29.1 never has, because it stays flat. The sweep rides the
+  hourly housekeeping cadence and its grace period is that same interval, so a row becomes a
+  candidate one cadence after it was detached. The cutoff is computed once per pass and carried into
+  each reclaim, so selection and revalidation judge every row against the same instant: a row
+  adopted since carries no instant, a row detached again since carries a newer one, and both are
+  left to whoever touched them last. Discovery holds no lock, and a candidate someone else holds is
+  waited for rather than skipped, because waiting is how the pass gets to judge the row under the
+  lock. A row detached before this release carries no instant and is never a candidate.
+- That sweep's bound is a bound. Its unlinks are blocking calls against the data volume and it runs
+  on the supervisor's own event loop, so one stalled unlink stopped the loop itself: the timeout
+  meant to end the pass could not fire, the heartbeat could not be stamped and the media consumers
+  stopped draining. The unlinks go off the loop now and the remaining time is checked BETWEEN
+  rows, so a spent pass takes no further row and the row in flight keeps its lock to the end. The
+  count is logged on every pass that returns, zero and the caught-error path included, since a
+  pass that found nothing and a worker that never reached its hourly block are the same silence.
+- A stopping process waits for the reclaims still in flight instead of cutting them short: the
+  worker after its consumers, the API after its requests, ten seconds at most, nothing cancelled,
+  and a record of how many outlive the wait. Running out of that wait does not cut them short
+  either — the teardown that follows cancels what is left, and each one holds that cancellation
+  until its files are gone. Only killing the process outright ends a reclaim mid-unlink.
+- An attachment whose files are no longer there is not handed to a memo. A row left behind by a
+  removal that rolled back after its first unlink still matches a dedup candidate by every column it
+  has, and linking it would hand the memo a picture that cannot be served while destroying the
+  upload that still held the bytes. Both dedup paths and the direct link now stat every
+  non-regenerable file the row names — the screen original, the legacy print master, every rendition
+  master, and for a video that has an original its poster tier — under the lock they already hold,
+  and off the request loop, since every stat is a network round-trip on the deployed volume. A dedup
+  caller refused this way still holds the bytes and mints its own row; a caller that named the uid
+  itself is told the picture is missing. An adopted row's detach instant is cleared with the link it
+  gains.
+- A sign-in callback that arrives twice is answered instead of failing. The second arrival presents
+  an authorization code the provider has already spent, and the refusal used to raise out of the
+  exchange and surface as a 500. It is a handled outcome now: the browser lane gets a plain page
+  with a way to start again, the app lane gets the usual redirect with one constant error value and
+  no code, and both drop the transaction cookie. The first arrival's result is not replayed, because
+  that would make a session or a one-shot hand-back code collectable twice, and the error value is
+  the server's own constant with nothing the caller sent reflected into it. The state check is
+  unchanged and the new branch sits after it. One warning event records the provider's status and
+  the lane, and nothing else, so an outage at the provider still leaves a trace.
+- A user's personal access tokens come back newest first. An unordered select let the list arrive in
+  whatever order the planner chose, so a token just minted could appear anywhere; the id keeps the
+  order total when two mints share a `created_at`.
+- The worker says which schema it cleared even when it never waited. It logged only after a
+  wait, so the ordinary start — the schema already at head on the first poll — left no record of
+  which revision the worker's code is running against, and no way to tell a healthy worker from one
+  that never got that far. That line now carries the head revision and the version on every pass
+  the worker clears the schema on.
+- Migration `a4e7c1b20f36`: one nullable column, `attachments.detached_at`, expand-only, with no
+  backfill and no data rewrite. NULL means nothing detached that row — a standalone upload that was
+  never linked, a 0.29.1 import, a row the foreign key's `ON DELETE SET NULL` nulled without the
+  application, and every row detached before the migration. An instant invented for those would be a
+  lie about when their bytes stopped being wanted. The column being nullable is what makes a
+  rollback of this release expand-preserving: the previous image's ORM does not mention it and runs
+  against this schema unchanged.
+- API contract: `openapi.json` gains one property. `#/components/schemas/MemoPatch` now carries
+  `attachment_uids`, optional, `"type": ["array", "null"]` with string items, and its description
+  states the rules above — the two different requests `null` and `[]` are, the removal of what the
+  list does not name, the two kinds of entry, the collapse onto the earliest place, and the four
+  422 reason types. Nothing else in the document changed. A client that vendors `openapi.json` must
+  re-vendor it.
+
 ### v1.7.3
 
 - The SPA's hashed assets are served compressed, long-cached and never ranged. `/assets`, where
