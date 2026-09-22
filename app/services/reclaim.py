@@ -52,10 +52,12 @@ the row gone, and discards its own output). Collecting the DERIVABLE set rather 
 happen to exist is the other half of it — a path that is empty now may not be by step 4.
 """
 
+import asyncio
 import enum
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -66,6 +68,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
+from app.database import async_session
 from app.models import Attachment, MediaJob
 from app.services import printready
 from app.services.asset_paths import all_asset_paths
@@ -98,6 +101,14 @@ class Revalidate(enum.StrEnum):
     delete. Its premise is 'no memo shows this any more', so a row that has since been claimed by a
     concurrent upload is live media and must be left alone."""
 
+    DETACHED = "detached"
+    """A periodic sweep picked this row because it has been detached from its memo for longer than
+    its grace period. Age is the whole of what that establishes — nothing in it says the request
+    that detached the row has finished cleaning up after its own commit — so the premise is the
+    predicate itself, and the instant is re-read under the lock against the SAME cutoff the pass
+    selected on: a row adopted since carries no instant, and a row detached again since carries a
+    newer one, and both belong to whoever touched them last."""
+
     LEAKED_ORPHAN = "leaked_orphan"
     """A blind scan picked this row BECAUSE it looked like garbage — the reconcile script. Its
     premise is both halves of that predicate, and its selection is the oldest thing anyone here
@@ -116,8 +127,12 @@ class ReclaimResult:
 
 
 def leaked_orphans_stmt() -> Select[tuple[Attachment]]:
-    """The attachments a deleted memo left behind, and only those — one definition, shared by the
-    worker sweep and the reconcile script so the two can never disagree about what is garbage."""
+    """Rows no memo points at whose original sits UNDER A DATED MEMO FOLDER — the reconcile
+    script's predicate, and nobody else's. A deleted memo is the ordinary way a row gets here, but
+    it is not the only one: a PATCH whose own reclaim failed leaves a matching row behind while its
+    memo goes on living. What the predicate asserts is just those two things. An original imported
+    from 0.29.1 stays flat in `originals/`, so this path test cannot see a detached import at
+    all."""
     return (
         select(Attachment)
         .where(Attachment.memo_id.is_(None), Attachment.storage_path.op("~")(LEAKED_PATH_RE))
@@ -146,15 +161,75 @@ def _has_leaked_path(att: Attachment) -> bool:
     return att.storage_path is not None and _LEAKED_PATH.search(att.storage_path) is not None
 
 
-def _ineligible(att: Attachment, mode: Revalidate) -> str | None:
-    """Why this row may no longer be reclaimed under `mode`, or None to go ahead."""
+def _ineligible(
+    att: Attachment,
+    mode: Revalidate,
+    *,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
+) -> str | None:
+    """Why this row may no longer be reclaimed under `mode`, or None to go ahead.
+
+    `detached_at` is ORPHANED's fence and `detached_before` is DETACHED's cutoff; each mode reads
+    only its own, because the two ask different questions of the same column — "is this still the
+    detachment I performed?" against "is this still older than the pass's cutoff?".
+    """
     if mode is Revalidate.IDENTITY:
         return None  # the row was named, and re-reading it under the lock IS the revalidation
     if att.memo_id is not None:
         return "relinked"
     if mode is Revalidate.LEAKED_ORPHAN and not _has_leaked_path(att):
         return "path_left_the_predicate"
+    if mode is Revalidate.ORPHANED and detached_at is not None:
+        # The epoch fence: this reclaim was issued ABOUT one detachment, and the row must still
+        # carry it. NULL means a dedup adopted the row; a newer instant means something detached it
+        # again, and that detachment's own cleanup owns it. A caller that names no instant is
+        # asking the older question — "is this row still unlinked?" — and gets the older answer.
+        if att.detached_at != detached_at:
+            return "adopted_or_redetached"
+    if mode is Revalidate.DETACHED:
+        # The same fence, against a pass instead of a transaction — and fail closed without a
+        # cutoff, because "sweep every detached row, whenever it was detached" is the one reading
+        # of this mode that deletes a picture the user is still editing.
+        if detached_before is None or att.detached_at is None or att.detached_at > detached_before:
+            return "adopted_or_redetached"
     return None
+
+
+async def _unlink_off_the_loop(
+    remove: Callable[[list[Path]], list[str]], paths: list[Path]
+) -> tuple[list[str], asyncio.CancelledError | None]:
+    """Unlink OFF the event loop, and come back only once the thread has RETURNED.
+
+    A cancellation delivered to the reclaim itself — `asyncio.run`'s teardown of whatever tasks are
+    left, the API loop's own, a caller cancelling the task directly — arrives at the `await` on
+    this thread AT ONCE, while the thread runs on: nothing about a worker thread can be cancelled.
+    Taken there, the reclaim would unwind mid-unlink, which is precisely the state this module
+    exists to prevent. So the thread is started once, and each cancellation is caught, REMEMBERED
+    and the SAME future awaited again — the shield is what keeps the re-await from passing the
+    cancellation down to it — until the unlinks are actually over. EVERY cancellation, with no
+    case for a future that is already done: nothing cancels this one (it is deliberately not a
+    task), so done at a cancellation means the offload FINISHED, its answer or its error sitting
+    in it, and the re-await hands that back at once instead of unwinding on top of it. The
+    remembered cancellation is handed back for the caller to re-raise after the transaction.
+
+    `run_in_executor` rather than this module's usual `to_thread.run_sync`, for the one reason that
+    decides it: a coroutine has to be driven by a TASK, and a task is exactly what the teardown
+    cancels — `asyncio.run` cancels every task `all_tasks()` returns, this offload's included, and
+    a cancelled offload loses the thread's answer while the thread keeps deleting. The future this
+    returns is not a task, so the teardown leaves it alone and the answer still arrives.
+
+    The profile enumeration above keeps `to_thread.run_sync` and stays cancellable on purpose: it
+    only reads, so a reclaim that ends there has deleted nothing and rolls back with every file
+    still named by its row.
+    """
+    thread = asyncio.get_running_loop().run_in_executor(None, remove, paths)
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(thread), cancellation
+        except asyncio.CancelledError as exc:
+            cancellation = exc
 
 
 async def reclaim_attachment(
@@ -163,13 +238,21 @@ async def reclaim_attachment(
     mode: Revalidate,
     *,
     unlink: Callable[[list[Path]], list[str]] | None = None,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
 ) -> ReclaimResult:
     """Reclaim ONE attachment in its own transaction, in the order this module documents.
 
     The caller commits nothing; this commits its own transaction, because the row lock it takes has
     to be released before the next row is touched.
 
-    `unlink` is the seam the crash-window tests inject at; production passes nothing.
+    `detached_at` and `detached_before` carry the caller's premise about WHEN this row was detached
+    — the instant it detached it with, or the cutoff its pass selected on — so the revalidation
+    under the lock can be about the same instant the decision was taken about (see `_ineligible`).
+
+    `unlink` is the seam the crash-window tests inject at; production passes nothing. It is called
+    OFF the event loop, in a worker thread this coroutine then waits out whatever happens to it
+    (`_unlink_off_the_loop`), so a seam that touches the loop is a test that deadlocks itself.
     """
     remove = unlink or unlink_paths
     # 1. Jobs first — the lock order guard_publish depends on. SKIP LOCKED: a running transcode's
@@ -202,7 +285,7 @@ async def reclaim_attachment(
     if att is None:
         await db.commit()
         return ReclaimResult("vanished")
-    ineligible = _ineligible(att, mode)
+    ineligible = _ineligible(att, mode, detached_at=detached_at, detached_before=detached_before)
     if ineligible is not None:
         uid = att.uid  # read BEFORE the rollback: it expires every instance, and reading an
         # expired column would try to refresh it — blocking IO from a place the async session
@@ -212,8 +295,11 @@ async def reclaim_attachment(
         return ReclaimResult("skipped_ineligible")
     # 3-5. The derivable set PLUS the print profiles that are actually on disk, unlinked, and only
     #      then the row. The profiles have to be enumerated rather than derived (MEMNG-238: the set
-    #      of profiles that ever existed is unbounded), and this runs on the request loop, so the
-    #      one directory listing goes off it — every stat on this volume is a network round-trip.
+    #      of profiles that ever existed is unbounded), and both the listing and the unlinks go off
+    #      the event loop: every stat and every unlink on this volume is a network round-trip. The
+    #      loop they would otherwise hold is the worker's, which stamps the heartbeat and drains
+    #      media, or — for PATCH and DELETE, which run in the API process — the one serving every
+    #      other request.
     uid = att.uid  # read BEFORE any rollback below: it expires every instance (see above)
     try:
         profile_assets = await to_thread.run_sync(printready.profile_variant_paths_sync, uid)
@@ -229,7 +315,7 @@ async def reclaim_attachment(
         )
         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
     paths = all_asset_paths(att) + profile_assets
-    failed = remove(paths)
+    failed, cancellation = await _unlink_off_the_loop(remove, paths)
     if failed:
         # FAIL CLOSED. Deleting the row now would leave these files with nothing naming them — the
         # one outcome this module exists to prevent, arriving on the very failure the journal is
@@ -237,10 +323,151 @@ async def reclaim_attachment(
         # and tolerates the ones this attempt already removed.
         await db.rollback()
         logger.error("reclaim.unlink_failed", attachment_id=attachment_id, paths=failed)
-        return ReclaimResult("failed_unlink", tuple(failed))
-    await db.delete(att)
-    await db.commit()
-    return ReclaimResult("reclaimed")
+        result = ReclaimResult("failed_unlink", tuple(failed))
+    else:
+        await db.delete(att)
+        await db.commit()
+        result = ReclaimResult("reclaimed")
+    if cancellation is not None:
+        # Only NOW, with the unlinks over: the row's lock outlived the thread doing them, which is
+        # the guarantee this holds a cancellation back for. Unwinding at the await above would have
+        # released that lock with the unlinking still going — the row live again, adoptable, and a
+        # thread deleting the adopter's bytes. The TRANSACTION is not guaranteed with it and is
+        # deliberately not shielded: a cancellation that first arrives on the `db.delete` or the
+        # `db.commit` just above — the thread has long returned by then — interrupts it, and what
+        # the database did with it is then unknown here: the COMMIT may have completed before the
+        # interruption reached this side, or never have been sent. So either the row is gone with
+        # its files, or it stays naming files that are gone. That second state is the recoverable
+        # half of the trade, and the reason the row is the journal. The cancellation is not
+        # swallowed either: whoever asked for it still gets it, one step later than they asked.
+        raise cancellation
+    return result
+
+
+# Docker allows 10 s between SIGTERM and SIGKILL (the stack compose sets no `stop_grace_period`),
+# and that is the only outer bound there is: neither entrypoint configures a graceful-shutdown
+# timeout of its own. It is the whole stop's budget, not this step's alone, so what it bounds here
+# is how long a shutdown KEEPS WAITING before it says what is still running — never the reclaim
+# itself, which is exactly what must not be cut short.
+DRAIN_GRACE_SECONDS = 10.0
+
+# Every reclaim this process has in flight, whoever started it: the memo edit and delete routes,
+# the asset delete route and the worker's detached sweep all go through `reclaim_row_shielded`,
+# which is what puts a reclaim in here. A task is added when it is created and discards itself when
+# it ends, so what is left at shutdown is precisely the work no caller is waiting for any more —
+# the sweep whose bound expired, the request whose caller went away — and it is the only handle a
+# shutdown has on it.
+_pending: set[asyncio.Task[ReclaimResult]] = set()
+
+
+async def reclaim_row(
+    attachment_id: int,
+    mode: Revalidate,
+    *,
+    unlink: Callable[[list[Path]], list[str]] | None = None,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
+) -> ReclaimResult:
+    """ONE row's reclaim, session and all, as one inseparable unit — what every caller runs.
+
+    The session is opened HERE rather than handed in, so that the lock, the unlink and the
+    commit-or-rollback belong to the same thing: everything this row holds is released by this
+    coroutine finishing. A caller's own session cannot release the row early, because the reclaim
+    does not use one.
+    """
+    async with async_session() as db:
+        return await reclaim_attachment(
+            db,
+            attachment_id,
+            mode,
+            unlink=unlink,
+            detached_at=detached_at,
+            detached_before=detached_before,
+        )
+
+
+async def reclaim_row_shielded(
+    attachment_id: int,
+    mode: Revalidate,
+    *,
+    unlink: Callable[[list[Path]], list[str]] | None = None,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
+) -> ReclaimResult:
+    """`reclaim_row` as a TASK of its own, awaited through a shield — how every caller calls it.
+
+    Every one of them: the memo edit and delete routes, the asset delete route, the detached sweep.
+    Nothing else in this process reclaims a row.
+
+    What keeps the row's lock alive through its unlinking is not the task: a cancellation reaching
+    the reclaim is held until the unlink thread has RETURNED (`_unlink_off_the_loop`), and it is
+    held the same way for a caller that awaits the unit inline. The task and its shield buy two
+    other things. The CALLER stops where it was cancelled instead of waiting out a thread it is no
+    longer there for — the shield puts its cancellation on this await rather than on the reclaim.
+    And the reclaim is REGISTERED in `_pending`, so a shutdown's drain knows there is something to
+    wait for (`drain_pending_reclaims`) and can wait for it after the request that started it is
+    gone. So the lock outlives the thread in all three cases: the caller cancelled, the drain's
+    grace expired, the teardown cancelling what is left. The transaction is not promised with it —
+    a cancellation first arriving on the delete or the commit that follows interrupts it, and its
+    outcome is then uncertain: committed, or the row left naming files that are already gone.
+
+    The cancellation is then RE-RAISED, never swallowed: the caller was cancelled and is over, and
+    a loop that went on to its next row would be taking rows nobody is waiting for with a
+    cancellation pending. The reclaim already in flight is the one thing that continues, and it is
+    the shutdowns' to await (`drain_pending_reclaims`), not this caller's.
+    """
+    task = asyncio.create_task(
+        reclaim_row(
+            attachment_id,
+            mode,
+            unlink=unlink,
+            detached_at=detached_at,
+            detached_before=detached_before,
+        )
+    )
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.info("reclaim.caller_cancelled", attachment_id=attachment_id)
+        raise
+
+
+async def drain_pending_reclaims(grace_s: float = DRAIN_GRACE_SECONDS) -> None:
+    """Wait for the reclaims still in flight in this process — the last thing either process does.
+
+    Nothing is cancelled here, however long it takes: cancelling a reclaim mid-unlink is the very
+    defect the unit above exists to prevent, and it would be no less one for being done by a
+    shutdown. The grace bounds THIS WAIT and nothing else. Past it the wait simply ends and says
+    what is still running — and what it leaves behind still finishes: the teardown that follows
+    (`asyncio.run`'s in the worker, the loop's own in the API) cancels that task, and the reclaim
+    holds the cancellation until its unlink thread has returned, inside the gather the teardown
+    does after cancelling. Its transaction is the weaker half: a cancellation first arriving on the
+    delete or the commit that follows interrupts it — committed or not, the row may be left naming
+    files that are gone. What ends a
+    reclaim mid-unlink is the process dying outright — SIGKILL at the end of the stop grace — and
+    it ends it the hard way: the connection dies with it, the transaction rolls back, and the row
+    is live again with part of its files gone.
+
+    What finds such a row depends on its state, not on which caller left it. A DETACHED row —
+    `memo_id` NULL with a `detached_at` stamp — is what the sweep selects
+    (`worker.sweep_detached_attachments`), once that stamp is older than the sweep's grace; a pass
+    can still leave it, on an unlink that fails again, and a later one takes it up. A LINKED row —
+    which the asset-delete route can leave, since it reclaims any attachment its owner names,
+    stamped or not — is selected by no sweep's predicate: it stays on its memo, listed, with its
+    files gone, until the caller deletes that attachment again — a reclaim of the same row over a
+    set that is mostly deleted already, and `unlink_paths` takes an absent file for success
+    (`missing_ok`). Either way the row
+    is the journal and the files are not.
+    """
+    pending = tuple(_pending)
+    if not pending:
+        return
+    logger.info("reclaim_drain_waiting", count=len(pending))
+    _, still_running = await asyncio.wait(pending, timeout=grace_s)
+    if still_running:
+        logger.warning("reclaim_drain_timeout", count=len(still_running))
 
 
 def reclaim_attachment_sync(

@@ -70,7 +70,14 @@ async def list_pats(
     user: Annotated[User, Depends(auth.require_session_or_grant)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> list[PatOut]:
-    rows = (await db.execute(select(Pat).where(Pat.user_id == user.id))).scalars().all()
+    stmt = (
+        select(Pat)
+        .where(Pat.user_id == user.id)
+        # Newest first, so a token just minted is the row the client shows at the top; the id
+        # keeps the order total when two mints share a created_at.
+        .order_by(Pat.created_at.desc(), Pat.id.desc())
+    )
+    rows = (await db.execute(stmt)).scalars().all()
     return [
         PatOut(
             id=p.id,

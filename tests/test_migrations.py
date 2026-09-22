@@ -11,9 +11,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import structlog
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from app import migrations, worker
+from app.version import __version__ as app_version
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -51,6 +53,24 @@ async def test_wait_returns_immediately_when_schema_is_current(db_engine):
     # Steady state / a no-migration deploy: the very first poll matches, so the gate clears at once.
     got = await migrations.wait_for_migrated_schema(budget_s=5, interval=0.05)
     assert got == migrations.expected_head()
+
+
+async def test_the_gate_names_the_schema_it_cleared_even_when_it_never_waited(db_engine):
+    """The deployed worker's one statement about WHICH schema and WHICH code are running together.
+    A schema gate that clears on its first poll — the steady state, and every no-migration deploy —
+    logs it too, so the log tells that worker apart from one that never started.
+    """
+    with structlog.testing.capture_logs() as logs:
+        await migrations.wait_for_migrated_schema(budget_s=5, interval=0.05)
+    cleared = [entry for entry in logs if entry["event"] == "worker_schema_gate_cleared"]
+    assert cleared == [
+        {
+            "event": "worker_schema_gate_cleared",
+            "head": migrations.expected_head(),
+            "version": app_version,
+            "log_level": "info",
+        }
+    ]
 
 
 async def test_wait_raises_when_schema_never_reaches_expected_head(db_engine, monkeypatch):

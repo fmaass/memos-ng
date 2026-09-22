@@ -410,9 +410,9 @@ async def test_the_orphaned_reclaim_honours_a_relink_committed_after_the_memo_de
         seen: list[int | None] = []
         real_ineligible = reclaim._ineligible
 
-        def spy(att_arg, mode):  # the decision point, not just the end state
+        def spy(att_arg, mode, **fences):  # the decision point, not just the end state
             seen.append(att_arg.memo_id)
-            return real_ineligible(att_arg, mode)
+            return real_ineligible(att_arg, mode, **fences)
 
         monkeypatch.setattr(reclaim, "_ineligible", spy)
 
@@ -422,7 +422,7 @@ async def test_the_orphaned_reclaim_honours_a_relink_committed_after_the_memo_de
                     select(Memo).where(Memo.id == doomed_id).options(selectinload(Memo.attachments))
                 )
             ).scalar_one()
-            orphaned = await memo_service.delete_memo(db, memo)
+            orphaned, _ = await memo_service.delete_memo(db, memo)
             assert orphaned == [att_id]
             await db.commit()  # PHASE 1 exactly as app/routers/memos.py runs it
 

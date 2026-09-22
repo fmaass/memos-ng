@@ -18,7 +18,7 @@ app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/uploads.py	append_stream	for_update
 app/services/uploads.py	ensure_capture	for_update
-app/services/uploads.py	finalize_pending	for_update
+app/services/uploads.py	_lock_attachments	for_update
 app/services/uploads.py	finalize_pending	for_update
 app/services/uploads.py	finalize	for_update
 app/services/uploads.py	bind_print_to_sibling	refresh

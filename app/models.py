@@ -226,6 +226,12 @@ class Attachment(Base):
     memo_id: Mapped[int | None] = mapped_column(
         ForeignKey("memos.id", ondelete="SET NULL"), index=True
     )
+    # WHEN this row stopped belonging to a memo, written wherever the application nulls `memo_id`
+    # above. NULL means nothing detached it — a standalone upload, a 0.29.1 import, or a detach
+    # that predates the column — and creation age cannot answer the question instead: `created_at`
+    # is the public `createTime` and the map-marker date fallback, and a file uploaded last month
+    # and detached ten seconds ago is a month old by it.
+    detached_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     filename: Mapped[str] = mapped_column(String(512))
     mime: Mapped[str] = mapped_column(String(255))
     size: Mapped[int] = mapped_column(BigInteger, default=0)

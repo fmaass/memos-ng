@@ -1,5 +1,5 @@
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -22,14 +22,15 @@ from app.models import (
     Attachment,
     AttachmentStatus,
     Memo,
+    Upload,
     User,
     Visibility,
 )
 from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
+from app.services import asset_paths, reclaim, storage
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
-from app.services import reclaim, storage
 from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
 
@@ -96,6 +97,20 @@ def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
     for copy in copies:
         for path in copy.discard():
             logger.error("memo.write.poster_discard_failed", path=path)
+
+
+async def _after_commit_seam() -> None:
+    """The instant between a detaching request's commit and its after-commit reclaim.
+
+    Production opens that gap by itself — the commit is an await, the edit route unlinks the
+    uploads it consumed off the loop before the reclaim loop starts, and each reclaim awaits the
+    database in turn — but only by timing, never on demand. And it is exactly the window the epoch
+    fence exists for: a standalone finalize that dedups onto one of the rows this request just
+    detached adopts it there, and a reclaim that did not carry its own detach instant would take
+    the adopter's bytes. So the gap is also a named no-op the interleaving witnesses can hold
+    open, rather than a race no test can time.
+    """
+    return None
 
 
 def _unlink_all(paths: list[str]) -> None:
@@ -370,6 +385,39 @@ def _video_posters_invalid(exc: uploads_svc.VideoPostersInvalid) -> HTTPExceptio
     )
 
 
+ATTACHMENT_UID_MESSAGES = {
+    "missing": "no attachment of yours has this uid, or the files it names are gone",
+    "foreign_owner": "that attachment belongs to another user",
+    "other_memo": "that attachment is on a different memo; move it there or leave it out",
+    "unresolvable_upload_uid": "that upload is not one this request finalizes; "
+    "name it in upload_uids too",
+}
+
+
+def _attachment_uids_invalid(problems: list[tuple[str, str]]) -> HTTPException:
+    """A 422 in FastAPI's OWN validation-error shape, for the same reasons `_video_posters_invalid`
+    gives: a second body shape under one status leaves a generated client unable to decode either,
+    and declaring a model for 422 would REPLACE this operation's HTTPValidationError entry and so
+    describe ordinary pydantic failures as something they are not.
+
+    `loc` names the offending uid — which is what the client has to hear, since a status alone
+    cannot say which picture it lost — and `type` carries the machine-readable reason, namespaced
+    `attachment_uid.<reason>`. The detail is a list because a client fixing its list one round
+    trip per bad uid is a client re-sending pictures.
+    """
+    return HTTPException(
+        status_code=422,
+        detail=[
+            {
+                "loc": ["body", "attachment_uids", uid],
+                "msg": ATTACHMENT_UID_MESSAGES[reason],
+                "type": f"attachment_uid.{reason}",
+            }
+            for uid, reason in problems
+        ],
+    )
+
+
 class MemoCreate(BaseModel):
     content: str
     visibility: RequestVisibility = None  # unset → the user's default_visibility setting
@@ -417,6 +465,28 @@ class MemoPatch(BaseModel):
     # Optional/nullable (not []) so PATCH stays a true partial update: callers that only change
     # content/archived/etc. omit it. (Removing an attachment is DELETE /api/attachments/{uid}.)
     upload_uids: list[str] | None = None
+    attachment_uids: list[str] | None = Field(
+        default=None,
+        description=(
+            "The memo's COMPLETE picture list, in display order — the index of an entry becomes "
+            "that picture's place on the memo. Omitted (null), the pictures are untouched and "
+            "this stays a true partial update, exactly as `upload_uids` is; sent as an empty "
+            "list, the memo keeps no pictures at all. Those two are different requests and are "
+            "answered differently. An attachment the memo has and the list does not name is "
+            "REMOVED. An "
+            "entry is either an attachment uid or an `upload_uid` named in this same request's "
+            "`upload_uids` — a picture being uploaded here has no attachment uid the client could "
+            "know, because that uid is minted while this request runs. Two entries may resolve to "
+            "one attachment (identical bytes dedup, and a print binds onto its screen); that is "
+            "not an error, and the attachment takes the EARLIEST place its entries asked for, so "
+            "the stored list can be shorter than the one sent. An entry that cannot be resolved "
+            "fails the WHOLE request with 422 — never a silent skip, which on a declared list "
+            "would delete the pictures the list omitted. Each rejected entry comes back as one "
+            "`detail` item whose `loc` ends with the uid and whose `type` names the reason: "
+            "attachment_uid.missing, attachment_uid.foreign_owner, attachment_uid.other_memo or "
+            "attachment_uid.unresolvable_upload_uid."
+        ),
+    )
     edit_key: IdempotencyKey | None = Field(
         default=None,
         description=(
@@ -929,6 +999,187 @@ def _replayed_or_conflict(found: Memo, memo_id: int, key: str) -> Memo:
     )
 
 
+async def _judge_picture_list(
+    db: AsyncSession,
+    owner_id: int,
+    memo_id: int,
+    entries: Sequence[str],
+    upload_uids: Collection[str],
+) -> tuple[list[str], dict[str, str]]:
+    """Refuse every entry this list cannot resolve, and hand back the entries in declared order
+    together with the attachment each already-existing one names.
+
+    With uploads this runs at the END OF FINALIZATION'S PASS 0 — after the one ascending attachment
+    acquisition, before pass 1 moves a byte. A list-only edit finalizes nothing, so it calls this
+    straight after its own `acquire_attachment_set`: the same point in the same order, rows held
+    and nothing moved. Either way a refused request has nothing on disk to put back. Taken
+    any later, the same deterministic 422 could fire after a sibling print bind had replaced a
+    committed master in place: those bytes are overwritten, no tracked move names them, and the
+    upload row the rollback restores promises a part file that replacement consumed.
+
+    An entry is an attachment uid or an `upload_uid` of this same request. An entry of the second
+    kind cannot be refused here and must not be: finalization has by now proved every uid in
+    `upload_uids` to be a complete, owner-scoped, locked pending row of this owner's, so what it
+    becomes is a fact finalization settles later — a screen in pass 1, a print in pass 2, where it
+    binds to a sibling or is promoted — not a verdict about the list. The reverse — an entry naming
+    an upload this request never finalizes — is a pure set-membership question and is answered
+    here.
+
+    Everything unresolvable is collected and refused TOGETHER: the request fails whole either way,
+    and a client fixing its list one uid per round trip is a client re-sending pictures. The
+    lookup is owner-AGNOSTIC and takes no lock — it has to be able to say that a uid is someone
+    else's, and answering that must not queue behind a stranger's write. The owner's own rows were
+    covered by the acquisition, so for them this read returns what the lock returned.
+    """
+    wanted = {entry for entry in entries if entry not in upload_uids}
+    rows: dict[str, Attachment] = {}
+    if wanted:
+        rows = {
+            att.uid: att
+            for att in (
+                await db.execute(select(Attachment).where(Attachment.uid.in_(wanted)))
+            ).scalars()
+        }
+    # A uid that is no attachment of anyone's may still be an upload of this owner's — one they
+    # forgot to name in `upload_uids`. Saying so is the difference between a client adding one
+    # field and a client hunting a picture it thinks the server lost.
+    stranded: set[str] = set()
+    unknown = wanted - rows.keys()
+    if unknown:
+        stranded = set(
+            (
+                await db.execute(
+                    select(Upload.upload_uid).where(
+                        Upload.upload_uid.in_(unknown), Upload.owner_id == owner_id
+                    )
+                )
+            ).scalars()
+        )
+    problems: list[tuple[str, str]] = []
+    bound: dict[str, str] = {}
+    for entry in dict.fromkeys(entries):  # the same entry twice asks for one place, not two
+        if entry in upload_uids:
+            continue
+        att = rows.get(entry)
+        if att is None:
+            problems.append((entry, "unresolvable_upload_uid" if entry in stranded else "missing"))
+            continue
+        if att.owner_id != owner_id:
+            problems.append((entry, "foreign_owner"))
+            continue
+        if att.memo_id is not None and att.memo_id != memo_id:
+            # The one `link_attachments` skips in silence, which is right for an append and
+            # catastrophic for a declared list: the skip would answer 200 to a list one picture
+            # short, having already detached every picture that list left out.
+            problems.append((entry, "other_memo"))
+            continue
+        if att.memo_id is None and not await asset_paths.adoptable(att):
+            # The owner's row, free to be linked, missing one of the files only the upload could
+            # have supplied: its original, a print master, a rendition master, or, for a video
+            # that has an original, its poster.
+            # `link_attachments` declines to adopt it and `_apply_picture_list` turns that into
+            # this same `missing`; asking here instead is answer-identical, because nothing
+            # between this point and the link removes bytes a listed attachment owns — pass 1
+            # replaces and places, never deletes, and consumed part files go after the commit —
+            # and the row is held under the acquisition's lock until then.
+            problems.append((entry, "missing"))
+            continue
+        bound[entry] = att.uid
+    if problems:
+        raise _attachment_uids_invalid(problems)
+    return list(dict.fromkeys(entries)), bound
+
+
+def _order_picture_list(
+    entries: Sequence[str],
+    upload_uids: Collection[str],
+    resolved: Mapping[str, str],
+    bound: Mapping[str, str],
+) -> list[str]:
+    """The attachment uids the judged list names, in the order it names them.
+
+    `resolved` is what finalization made of the entries naming an upload of this request; `bound`
+    is what `_judge_picture_list` made of the rest. A later entry resolving to an attachment an
+    earlier one already reached collapses onto that earlier place: dedup and print binding both do
+    that behind the client's back, and refusing would be asking the client to know in advance
+    something the server discovers mid-request.
+    """
+    problems: list[tuple[str, str]] = []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry in upload_uids:
+            attachment_uid = resolved.get(entry)
+            if attachment_uid is None:
+                # No request reaches this: `resolved` is total over `upload_uids`, and an entry
+                # naming an upload this request does NOT finalize was refused before finalization
+                # ran. It stays as the fence over that totality — a finalization branch that stops
+                # recording what an upload became would otherwise silently shorten the list,
+                # and this is where a mutation of that recording lands.
+                problems.append((entry, "unresolvable_upload_uid"))
+                continue
+        else:
+            attachment_uid = bound[entry]
+        if attachment_uid not in seen:
+            seen.add(attachment_uid)
+            ordered.append(attachment_uid)
+    if problems:
+        raise _attachment_uids_invalid(problems)
+    return ordered
+
+
+async def _apply_picture_list(
+    db: AsyncSession,
+    owner_id: int,
+    memo: Memo,
+    ordered: Sequence[str],
+    vouched: Collection[str],
+    moved: list[storage.TrackedMove],
+) -> tuple[list[tuple[int, str]], datetime | None]:
+    """Make the memo hold exactly `ordered`, in that order; hand back what came off it and WHEN.
+
+    What the list omits is DETACHED, never deleted here: the files go in their own transaction
+    after this one commits, and a crash in the gap has to leave a row that still names them (see
+    app/services/reclaim.py). The ids and uids are read out now, while this transaction still holds
+    the rows: the reclaim that follows the commit deletes them, and an instance read after that
+    carries only what this transaction loaded.
+    """
+    refused: list[str] = []
+    await svc.link_attachments(
+        db, owner_id, memo, list(ordered), moved_out=moved, vouched=vouched, refused_out=refused
+    )
+    if refused:
+        # A row the list named that `adoptable` refuses: one of the non-regenerable files it
+        # names is gone. `_judge_picture_list` asks this of every listed entry that already IS an
+        # attachment off a memo — the only rows `link_attachments` stats either: the attachment an
+        # entry this request finalizes became arrives VOUCHED, and a vouched uid is deliberately
+        # never stat'd (this transaction minted that row, or deduped onto a candidate pass 0 had
+        # already locked and proved adoptable — and a video finalized a moment ago has no poster
+        # tier yet, so stat'ing it would refuse the upload that created it), and a row already on
+        # this memo is kept, not adopted. So reaching it here means the bytes went AFTER that
+        # row was locked and held, which nothing in this transaction does. It stands as the
+        # write-time fence: a declared
+        # list cannot let `link_attachments`'s silent skip pass, or it would answer 200 to a
+        # request whose result is one picture short.
+        raise _attachment_uids_invalid([(uid, "missing") for uid in refused])
+    on_memo = (
+        (await db.execute(select(Attachment).where(Attachment.memo_id == memo.id))).scalars().all()
+    )
+    rank = {uid: place for place, uid in enumerate(ordered)}
+    # Renumbered from the list, not shifted: `link_attachments` appends what it linked AFTER the
+    # attachments the memo already carried, which is the right rule for an append and the wrong one
+    # for a list that declares where everything goes.
+    for place, att in enumerate(
+        sorted((a for a in on_memo if a.uid in rank), key=lambda a: rank[a.uid])
+    ):
+        att.position = place
+    taken_off = [a for a in on_memo if a.uid not in rank]
+    detached_at = svc.detach_attachments(taken_off) if taken_off else None
+    pairs = [(a.id, a.uid) for a in taken_off]
+    await db.flush()
+    return pairs, detached_at
+
+
 @router.patch("/memos/{uid}", response_model=MemoOut, responses=PATCH_RESPONSES)
 async def patch_memo(
     uid: str,
@@ -965,6 +1216,12 @@ async def patch_memo(
         # Same as on create: the declared order of the files this edit adds (MEMNG-262). They are
         # appended after the attachments the memo already carries, which keep their saved order.
         positions: dict[str, int] = {}
+        # The pictures the declared list takes OFF this memo, carried past the commit as plain
+        # values: each reclaim below ends a transaction of its own, and the row behind an instance
+        # may be gone by the time the next one is read. The instant is the epoch each of those
+        # reclaims is judged against, and nothing re-derives it.
+        detached_ids: list[tuple[int, str]] = []
+        detached_at: datetime | None = None
         committed = False
         try:
             # The FIRST lock this edit takes, before any upload is finalized or any attachment is
@@ -990,8 +1247,53 @@ async def patch_memo(
                 # It lands in the same transaction as the edit, so the two commit or roll back
                 # together and a recorded key never outlives the edit it names.
                 await svc.record_edit_key(db, locked, owner_id, key)
-            fields = body.model_dump(exclude_unset=True, exclude={"upload_uids", "edit_key"})
+            fields = body.model_dump(
+                exclude_unset=True, exclude={"upload_uids", "attachment_uids", "edit_key"}
+            )
             edited = await svc.update_memo(db, locked, **fields)
+            # The ids behind the existing uids the list names, resolved UNLOCKED and owner-scoped
+            # exactly as create resolves its own, so the ONE ascending attachment acquisition
+            # below covers them too. The link, the renumber and the detaches write these rows a
+            # moment later; taking them THERE would be a second acquisition of the attachment
+            # class in this transaction, in an order nothing else shares — and the worker's media
+            # recovery, which takes its terminal attachments ascending, inverts against exactly
+            # that. The read DECIDES nothing: a row that disappears before the lock is simply not
+            # locked, and the resolution below finds it gone and refuses the request.
+            named_ids = (
+                list(
+                    (
+                        await db.execute(
+                            select(Attachment.id).where(
+                                Attachment.uid.in_(body.attachment_uids),
+                                Attachment.owner_id == owner_id,
+                            )
+                        )
+                    ).scalars()
+                )
+                if body.attachment_uids
+                else []
+            )
+            finalized: list[str] = []
+            # upload_uid -> the attachment it produced, deduped onto, or was bound to: the only
+            # way a list can name a picture this same request is uploading.
+            resolved: dict[str, str] = {}
+            named_upload_uids = set(body.upload_uids or ())
+            # What the judgement leaves for the placement below: the declared entries deduped, in
+            # order, and the attachment each already-existing one names.
+            judged: list[str] = []
+            bound: dict[str, str] = {}
+
+            async def judge_the_list() -> None:
+                # Every refusal the declared list can earn, taken while the request has changed
+                # nothing on disk. Its one correct moment is the end of finalization's pass 0: the
+                # rows are locked and revalidated by then and nothing has moved a file yet — and
+                # pass 2 REPLACES a print master in place when a print binds to a memo sibling,
+                # which no rollback undoes.
+                nonlocal judged, bound
+                judged, bound = await _judge_picture_list(
+                    db, owner_id, memo_id, body.attachment_uids or (), named_upload_uids
+                )
+
             if body.upload_uids:
                 # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto
                 # that screen instead of promoting a second visible copy of the same photo
@@ -1005,6 +1307,11 @@ async def patch_memo(
                         memo=edited,
                         consumed_out=consumed,
                         positions_out=positions,
+                        resolved_out=resolved,
+                        named_attachment_ids=named_ids,
+                        after_acquisition=(
+                            judge_the_list if body.attachment_uids is not None else None
+                        ),
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
@@ -1017,6 +1324,26 @@ async def patch_memo(
                     edited,
                     sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
                     moved_out=moved,
+                    vouched=set(finalized),
+                )
+            elif body.attachment_uids is not None:
+                # A list-only edit finalizes nothing, so nothing else asks for the acquisition —
+                # and it still links, renumbers and detaches attachments. The rows have to be held
+                # before the first of those writes, in the same ascending order as everywhere else.
+                await uploads_svc.acquire_attachment_set(db, memo=edited, attachment_ids=named_ids)
+                # The same judgement, at the same point in the same order: right after the
+                # acquisition, before the link, the renumber or the detaches write anything.
+                await judge_the_list()
+            if body.attachment_uids is not None:
+                # After the uploads: a uid this request is finalizing has to BE an attachment
+                # before the list can place it, and `resolved` is what says which one it became.
+                detached_ids, detached_at = await _apply_picture_list(
+                    db,
+                    owner_id,
+                    edited,
+                    _order_picture_list(judged, named_upload_uids, resolved, bound),
+                    set(finalized),
+                    moved,
                 )
             # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
@@ -1024,8 +1351,37 @@ async def patch_memo(
             await _enqueue_frame_shares_safe(db, edited, user)
             await db.commit()
             committed = True
+            await _after_commit_seam()
             if consumed:
                 await to_thread.run_sync(_unlink_all, consumed)
+            # PHASE 2, exactly as the delete route does it: the edit is durable, and only now does
+            # each detached row get reclaimed, in its own transaction, against the instant that
+            # detached it. Anything else — the `finally` below, or a reclaim before the commit —
+            # would let a file this request could not delete undo an edit the user was told was
+            # saved.
+            for attachment_id, attachment_uid in detached_ids:
+                # The shared unit, in a task of its own: this request's session must not be what
+                # holds the row, or a cancellation arriving while its files are being unlinked off
+                # the loop would close that session and put the row back — adoptable, with a thread
+                # still deleting its bytes. A cancellation here ends the loop (the shield re-raises
+                # it); the row in flight finishes under its own lock and the shutdown awaits it.
+                result = await reclaim.reclaim_row_shielded(
+                    attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
+                )
+                if result.outcome != "reclaimed":
+                    # The edit IS saved, so this cannot become an error response. A reclaim that
+                    # did not take the row changed nothing about it; reclaim logs the skip and the
+                    # unlink failure itself, but a row that had already vanished it reports
+                    # nowhere, and neither tells which memo the row came off — so the line names
+                    # both uids to leave it findable.
+                    logger.warning(
+                        "memo.patch.attachment_not_reclaimed",
+                        memo_uid=uid,
+                        attachment_id=attachment_id,
+                        attachment_uid=attachment_uid,
+                        outcome=result.outcome,
+                        failed_paths=list(result.failed_paths),
+                    )
             await db.refresh(edited)
             return edited
         finally:
@@ -1094,19 +1450,31 @@ async def delete_memo(
     # (app/services/reclaim.py states the principle in full).
     # The LOCKED memo, not the one read before the wait: its `attachments` were reloaded through
     # the lock, so the orphan journal names what the row actually carries now (§3.3).
-    orphaned = await svc.delete_memo(db, locked)
+    orphaned, detached_at = await svc.delete_memo(db, locked)
     await db.commit()
+    await _after_commit_seam()
     # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
     # its files, then the row. Each id gets its own transaction, so a failure part way through
-    # leaves the rest as orphans the sweep will finish rather than rolling the memo delete back.
+    # leaves the rest as detached rows the sweep finishes once their grace elapses, rather than
+    # rolling the memo delete back. Every one of them is judged against THIS delete's detach
+    # instant: between the commit above and the lock below a standalone upload can dedup onto one
+    # of these rows and clear the stamp, and those bytes are live media this loop must not take.
     for attachment_id in orphaned:
-        result = await reclaim.reclaim_attachment(db, attachment_id, reclaim.Revalidate.ORPHANED)
+        # In a task of its own, holding its own session, for the reason the edit route states: a
+        # cancelled request must not be able to release the row while the thread unlinking its
+        # files runs on.
+        result = await reclaim.reclaim_row_shielded(
+            attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
+        )
         if result.outcome != "reclaimed":
             # The memo IS deleted — that is what the caller asked for and it has committed, so
-            # this cannot become an error response. A row left behind here is an orphan the
-            # reconcile sweep and the script both find; logged so it is visible before they run.
+            # this cannot become an error response. A reclaim that did not take the row changed
+            # nothing about it; reclaim logs the skip and the unlink failure itself, but a row
+            # that had already vanished it reports nowhere, and neither of its lines says which
+            # memo delete asked for the row — which is what this one is for.
             logger.warning(
                 "memo.delete.attachment_not_reclaimed",
+                memo_uid=uid,
                 attachment_id=attachment_id,
                 outcome=result.outcome,
                 failed_paths=list(result.failed_paths),

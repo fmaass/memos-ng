@@ -76,6 +76,24 @@ def test_pat_http_create_list_delete(logged_in_client):
     assert client.get("/api/pats").json() == []
 
 
+def test_pat_http_list_is_newest_first_and_a_revoke_leaves_the_others(logged_in_client):
+    client, _ = logged_in_client
+    ids = {}
+    for name in ("first", "second", "third"):
+        created = client.post("/api/pats", json={"name": name})
+        assert created.status_code == 201
+        ids[name] = created.json()["id"]
+
+    # Newest first: the token a user has just minted is the one they are looking at, and the id
+    # keeps the order total when two mints land on the same created_at.
+    listed = client.get("/api/pats").json()
+    assert [p["name"] for p in listed] == ["third", "second", "first"]
+
+    assert client.delete(f"/api/pats/{ids['second']}").status_code == 204
+    remaining = client.get("/api/pats").json()
+    assert [p["id"] for p in remaining] == [ids["third"], ids["first"]]
+
+
 def test_pat_create_rejects_empty_name(logged_in_client):
     client, _ = logged_in_client
     assert client.post("/api/pats", json={"name": ""}).status_code == 422  # name min_length=1

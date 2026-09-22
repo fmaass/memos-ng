@@ -682,7 +682,17 @@ async def delete_attachment(
     # is this route's ORDINARY case (the memo keeps its text, the media goes), never a reason to
     # stand down. Re-reading the row under its own lock is the whole revalidation here, and it is
     # what makes two concurrent deletes resolve to one winner instead of one 500.
-    result = await reclaim.reclaim_attachment(db, att.id, reclaim.Revalidate.IDENTITY)
+    # The shared unit, in a task of its own holding its own session — the way PATCH and DELETE on a
+    # memo run it, and for the same reason: this request's session must not be what holds the row.
+    # The unlinking is held to its end wherever the unit is awaited from, this request's own
+    # session included (`reclaim._unlink_off_the_loop`), so that is not what the task buys. What it
+    # buys is the other two. Cancelled — the client goes away, the process is stopping — this
+    # request ends promptly where it was cancelled instead of waiting out a thread nobody is there
+    # for any more, and the unit re-raises, so the cancellation is not swallowed on the way. And
+    # the reclaim it leaves behind is registered where a shutdown can still await it
+    # (`reclaim.drain_pending_reclaims`), which a reclaim awaited on this request's session would
+    # not be once the request is gone.
+    result = await reclaim.reclaim_row_shielded(att.id, reclaim.Revalidate.IDENTITY)
     if result.outcome == "vanished":  # a concurrent delete won between the read above and the lock
         raise HTTPException(status_code=404, detail="Attachment not found")
     if result.outcome == "failed_unlink":

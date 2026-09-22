@@ -55,6 +55,10 @@ INSERT of a private row, which is not an acquisition (R8).
   acquire the whole A set in one `ORDER BY A.id FOR UPDATE` with `populate_existing=True`;
   **revalidate every candidate under its lock** (`owner_id`, `memo_id IS NULL`), dropping any that
   no longer qualifies. After pass 0 the per-upload loop acquires no further row locks.
+  That one A acquisition is `_lock_attachments`, and `acquire_attachment_set` asks for it on
+  behalf of a caller that finalizes nothing: a PATCH which only re-declares a memo's picture
+  list still links, renumbers and detaches attachments, so it takes A here, in this order,
+  rather than where it writes those rows.
 - **R4 — U covers every upload the transaction will delete.** The poster, the rendition no-ops,
   the rendition finalize and the sibling bind all delete rows this transaction already holds, so
   none of them can wait after A is held.

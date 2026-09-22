@@ -1,8 +1,8 @@
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -21,7 +21,7 @@ from app.models import (
     Visibility,
     memo_tags,
 )
-from app.services import storage
+from app.services import asset_paths, storage
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 
 logger = structlog.get_logger(__name__)
@@ -149,7 +149,12 @@ async def create_memo(
     memo = locked
     finalized = list(await finalize(memo)) if finalize is not None else []
     await link_attachments(
-        db, owner.id, memo, [*(attachment_uids or []), *finalized], moved_out=moved_out
+        db,
+        owner.id,
+        memo,
+        [*(attachment_uids or []), *finalized],
+        moved_out=moved_out,
+        vouched=set(finalized),
     )
     await db.refresh(memo)
     return memo
@@ -247,6 +252,9 @@ async def link_attachments(
     memo: Memo,
     uids: Sequence[str],
     moved_out: list[storage.TrackedMove] | None = None,
+    *,
+    vouched: Collection[str] = (),
+    refused_out: list[str] | None = None,
 ) -> None:
     """Link the caller's OWN attachments to a memo, IN THE ORDER `uids` names them.
 
@@ -276,6 +284,15 @@ async def link_attachments(
     An attachment already linked to this memo keeps its place; one linked to a DIFFERENT memo is
     skipped and consumes no position. It all happens in the caller's transaction, so the renumber
     and the append land together or not at all.
+
+    A PRE-EXISTING unlinked row is stat'd before it is linked (`asset_paths.adoptable`, under the
+    lock taken above), because naming a row is not the same as the row still having its bytes: one
+    left behind by a removal that rolled back after its first unlink names an original that is
+    gone. Its uid goes to `refused_out` — a caller with a typed contract answers for it, and this
+    back-compat path skips it as it has always skipped what it could not link. `vouched` names the
+    uids this transaction MINTED or already adopted through the guarded dedup; they are not
+    re-judged, and must not be: a video uploaded a moment ago has no poster tier yet, so checking
+    it would refuse the very upload that created it.
     """
     if not uids:
         return
@@ -334,8 +351,14 @@ async def link_attachments(
             continue
         if att.id in linked:  # the same uid twice, or one already on this memo: one place only
             continue
+        if uid not in vouched and not await asset_paths.adoptable(att):
+            if refused_out is not None:
+                refused_out.append(uid)
+            continue
         linked.add(att.id)
         att.memo_id = memo.id
+        # The link and the instant move together in both directions (see `detach_attachments`).
+        att.detached_at = None
         att.position = next_position
         next_position += 1
         await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)
@@ -528,9 +551,30 @@ async def update_memo(db: AsyncSession, memo: Memo, **fields) -> Memo:
     return memo
 
 
-async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
-    """Delete a memo, ORPHANING its attachments; returns their ids for the caller to reclaim after
-    this transaction commits.
+def detach_attachments(attachments: Iterable[Attachment]) -> datetime:
+    """Take these attachments off their memo, recording WHEN, and return that one instant.
+
+    The link and the instant move together, and every detach site goes through here, because what
+    reclaims a detached row later has to judge it by the instant that detached it rather than by
+    whatever the row says when the reclaim finally gets to it. A fenced reclaim is given that
+    instant and asks for it, so a row carrying another one — or none — is not the row it was
+    sent for.
+    """
+    at = datetime.now(UTC)
+    for att in attachments:
+        att.memo_id = None
+        att.detached_at = at
+    return at
+
+
+async def delete_memo(db: AsyncSession, memo: Memo) -> tuple[list[int], datetime]:
+    """Delete a memo, ORPHANING its attachments; returns their ids AND the one instant that
+    detached them, for the caller to reclaim against after this transaction commits.
+
+    The instant comes back rather than being re-read, because the caller's reclaim is judged
+    against the detachment that ISSUED it: a row that carries a different instant, or none, was
+    taken by somebody else since and is no longer this request's garbage. Handing it back in the
+    return value is what makes a caller that skips the fence a visible one.
 
     Two phases, and the split is the whole point. Deleting the memo alone was the MEMNG-170 bug —
     the relationship carries no cascade and the FK is ON DELETE SET NULL, so every attachment
@@ -539,10 +583,14 @@ async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
     this commit and the caller's unlink leaves files with no row at all, and nothing can ever find
     them again (`app/services/reclaim.py`).
 
-    So this phase deliberately leaves the rows behind, orphaned. That orphan IS the durable
-    journal: it names its own files, and it is exactly what `reclaim.leaked_orphans_stmt` selects,
-    so a create interrupted here is picked up by the worker sweep or the reconcile script rather
-    than lost. The caller then reclaims each id properly — locked, revalidated, files first.
+    So this phase deliberately leaves the rows behind, orphaned and stamped with the instant they
+    were detached. That orphan IS the durable journal: it names its own files, so a delete
+    interrupted here is recoverable rather than lost. `reclaim.leaked_orphans_stmt` reaches it only
+    when its original sits under the dated `originals/YYYY/MM/` prefix — an original imported from
+    0.29.1 stays FLAT in `originals/` (`app/scripts/migrate_from_memos.py`) and no path predicate
+    can tell it from media nobody's memo ever owned, which is why the instant, not the path, is
+    what records that a row was detached. The caller then reclaims each id properly — locked,
+    revalidated, files first.
 
     Reclaim is unconditional, with no reference counting, because an attachment on a memo is
     exclusively that memo's: `uploads.finalize` only ever dedups onto an UNLINKED attachment
@@ -554,10 +602,15 @@ async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
     make a raw DELETE against the database take the attachment rows with it and leave their files
     orphaned for ever — the forbidden outcome, reachable by hand from a psql prompt.
     """
-    orphaned = [att.id for att in memo.attachments]
+    detached = list(memo.attachments)
+    # Before the delete: the relationship carries no `passive_deletes`, so it is the ORM that nulls
+    # `memo_id` on these loaded rows, and the instant has to already be on them to ride out in the
+    # same UPDATE.
+    detached_at = detach_attachments(detached)
+    orphaned = [att.id for att in detached]
     await db.delete(memo)
     await db.flush()
-    return orphaned
+    return orphaned, detached_at
 
 
 async def list_tags(db: AsyncSession, user: User) -> list[tuple[str, int]]:

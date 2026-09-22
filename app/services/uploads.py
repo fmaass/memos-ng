@@ -3,7 +3,7 @@ import os
 import secrets
 import shutil
 import uuid
-from collections.abc import AsyncIterable, AsyncIterator, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -14,7 +14,7 @@ from typing import BinaryIO, Literal
 import puremagic
 import structlog
 from anyio import fail_after, to_thread
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,7 +30,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import capture, location, poster, storage
+from app.services import asset_paths, capture, location, poster, storage
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -880,6 +880,58 @@ async def _read_location(dest: Path, mime: str) -> tuple[float | None, float | N
     return found.latitude, found.longitude, found.source
 
 
+async def _lock_attachments(
+    db: AsyncSession, predicates: Sequence[ColumnElement[bool]]
+) -> set[int]:
+    """Take ONE ascending FOR UPDATE over every attachment any of `predicates` names, and return
+    the ids it ACTUALLY RETURNED.
+
+    `populate_existing` because a row the caller already read unlocked is in the identity map, and
+    every revalidation behind this has to judge the LOCKED row. The returned ids are the answer to
+    a question `populate_existing` cannot answer on its own: a refresh says nothing about a row
+    that is absent from the result, and absent is precisely what a row deleted between the unlocked
+    read and the lock looks like.
+    """
+    if not predicates:
+        return set()
+    return {
+        row.id
+        for row in (
+            (
+                await db.execute(
+                    select(Attachment)
+                    .where(or_(*predicates))
+                    .order_by(Attachment.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+
+
+async def acquire_attachment_set(
+    db: AsyncSession, *, memo: Memo | None = None, attachment_ids: Sequence[int] = ()
+) -> None:
+    """Take the attachment class the way `finalize_pending`'s pass 0 takes it, for a caller that
+    has no uploads to finalize.
+
+    An edit that only re-declares a memo's picture list still writes attachments — it links,
+    reorders and detaches them — so those rows have to be held before the first of those writes, in
+    the ascending order every other actor takes them in. With uploads, pass 0 carries that; without
+    them there is no pass 0 to carry it, and acquiring the rows where they are first written would
+    be a second acquisition in an order nothing else shares.
+    """
+    predicates: list[ColumnElement[bool]] = []
+    if attachment_ids:
+        predicates.append(Attachment.id.in_(set(attachment_ids)))
+    if memo is not None:
+        predicates.append(Attachment.memo_id == memo.id)
+    await _lock_attachments(db, predicates)
+
+
 async def finalize_pending(
     db: AsyncSession,
     upload_uids: list[str],
@@ -890,7 +942,9 @@ async def finalize_pending(
     poster_copies_out: list[PosterCopy] | None = None,
     consumed_out: list[str] | None = None,
     positions_out: dict[str, int] | None = None,
+    resolved_out: dict[str, str] | None = None,
     named_attachment_ids: Sequence[int] | None = None,
+    after_acquisition: Callable[[], Awaitable[None]] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -940,6 +994,12 @@ async def finalize_pending(
     acquisition covers the whole set the transaction touches (MEMNG-267 R3.4), instead of leaving
     `link_attachments` to acquire them afterwards in an order no other writer shares.
 
+    `after_acquisition` is awaited at the end of pass 0, and is where a caller puts a refusal it
+    wants taken for free. By then every row this transaction judges is locked and revalidated and
+    not one file has moved; from pass 1 on, a refusal is not free, because `bind_print_to_sibling`
+    replaces an existing master IN PLACE and records no tracked move for it (deliberately — see
+    there). Raising from it leaves the caller's rollback with nothing on disk to undo.
+
     `positions_out` collects attachment uid -> the 0-based index, IN `upload_uids`, of the uid that
     produced or named it (MEMNG-262). It is what the caller SORTS the returned uids by, so the
     memo's attachments are linked in the order the client declared (`link_attachments` then ranks
@@ -948,7 +1008,15 @@ async def finalize_pending(
     1, a print promoted in pass 2 (its own uid's index), and an attachment the dedup path handed
     back (the index of the uid that named it). A print BOUND to a screen adds nothing — it rides
     with that screen and takes no place of its own. The returned uid list keeps its pass order;
-    a caller that wants the DECLARED order sorts it by this map."""
+    a caller that wants the DECLARED order sorts it by this map.
+
+    `resolved_out` runs the other way and is TOTAL over `upload_uids`: every uid in the batch ->
+    the uid of the attachment it produced, deduped onto, or was BOUND to. A client that names its
+    pictures cannot name a new one by its attachment uid, because that uid is minted in here and
+    never leaves before this call returns; this is the map that turns what the client CAN say into
+    what the memo holds. `positions_out` cannot serve: it is keyed the other way, so it has no
+    inverse for two uids that deduped onto one attachment, and a print bound to a screen never
+    reaches the code that writes it at all."""
     if video_posters and poster_copies_out is None:
         raise ValueError("video_posters requires poster_copies_out to settle after the commit")
     # First mention wins: the same uid twice, or two uids whose bytes dedup onto one attachment,
@@ -1066,30 +1134,10 @@ async def finalize_pending(
         a_predicates.append(Attachment.id.in_(set(named_attachment_ids)))
     if memo is not None:
         a_predicates.append(Attachment.memo_id == memo.id)
-    # The ids the locking statement ACTUALLY RETURNED. `populate_existing` refreshes what comes
-    # back; it can say nothing about a row that is absent from the result, and absent is precisely
-    # what a row deleted between the unlocked read and the lock looks like. Judging the stale
-    # identity-map object instead would let a reclaimed attachment pass `memo_id IS NULL` and be
-    # handed back as this upload's attachment — a memo stored with no media at all, its upload row
-    # deleted and its part file reaped.
-    live_ids: set[int] = set()
-    if a_predicates:
-        live_ids = {
-            row.id
-            for row in (
-                (
-                    await db.execute(
-                        select(Attachment)
-                        .where(or_(*a_predicates))
-                        .order_by(Attachment.id)
-                        .with_for_update()
-                        .execution_options(populate_existing=True)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        }
+    # Judging the stale identity-map object instead of what the lock returned would let a
+    # reclaimed attachment pass `memo_id IS NULL` and be handed back as this upload's attachment —
+    # a memo stored with no media at all, its upload row deleted and its part file reaped.
+    live_ids = await _lock_attachments(db, a_predicates)
     # Revalidated under the lock, which is what Postgres used to do implicitly by re-evaluating the
     # predicate after the wait: a candidate that has since been deleted, linked or changed hands is
     # dropped, and its upload mints its own attachment and its own file instead of stealing one or
@@ -1099,7 +1147,16 @@ async def finalize_pending(
         for digest, att in locked.candidates.items()
         if att.id in live_ids and att.owner_id == owner_id and att.memo_id is None
     }
+    # …and then the stat, under the same lock and before a single upload is consumed. A row can
+    # satisfy every column above and name bytes that are no longer there (`asset_paths.adoptable`);
+    # the discovery read could not answer that, because the files may go in the gap between it and
+    # the lock. Held to commit, so the answer cannot go stale under this transaction either.
+    locked.candidates = {
+        digest: att for digest, att in locked.candidates.items() if await asset_paths.adoptable(att)
+    }
     # ---- end of pass 0. Nothing below acquires another row. ---------------------------------
+    if after_acquisition is not None:
+        await after_acquisition()
 
     async def _finalize_one(upload: Upload) -> Attachment:
         """Finalize one upload as an attachment and consume its poster override, if it has one.
@@ -1123,6 +1180,12 @@ async def finalize_pending(
         if poster_upload is not None:
             assert poster_copies_out is not None  # guaranteed by the guard above
             await attach_video_poster(db, poster_upload, att, poster_copies_out)
+        if resolved_out is not None:
+            # The only name the CLIENT can use for this picture. It holds the upload uid and never
+            # sees the attachment uid this call minted — or the uid of the unlinked twin dedup
+            # handed back instead — so a declared picture list can reach this attachment through
+            # nothing else.
+            resolved_out[upload.upload_uid] = att.uid
         if positions_out is not None and upload.upload_uid in request_index:
             # The EARLIEST request index wins, not the first one to be finalized. Pass 2 runs after
             # pass 1, and a print promoted there can dedup onto an attachment pass 1 already made
@@ -1155,6 +1218,10 @@ async def finalize_pending(
         if screen is not None and vk is not None and (screen.id, vk) not in seen:
             await finalize_rendition(db, upload, screen, parsed, moved_out, consumed_out)
             seen.add((screen.id, vk))
+            if resolved_out is not None:
+                # A print bound as a rendition mints no attachment of its own, so the picture the
+                # client named by this upload uid IS the screen it bound to.
+                resolved_out[upload.upload_uid] = screen.uid
             continue
         # No screen in THIS batch: before promoting, look for the screen on the memo being saved —
         # a print exported minutes after its screen (a later edit) belongs to that photo, not to a
@@ -1168,6 +1235,10 @@ async def finalize_pending(
                 and await bind_print_to_sibling(db, upload, sibling, memo, moved_out)
             ):
                 bound_siblings.add(sibling.id)
+                if resolved_out is not None:
+                    # Same as the in-batch bind: this upload became the sibling's print master, so
+                    # the sibling is the picture its upload uid names.
+                    resolved_out[upload.upload_uid] = sibling.uid
                 continue
         att = await _finalize_one(upload)
         out.append(att.uid)
@@ -1255,12 +1326,24 @@ async def finalize(
                     # now-linked row, excludes it, and the loser creates its own attachment instead
                     # of stealing.
                     .with_for_update()
+                    # `populate_existing` for the same reason the batch's acquisition carries it: a
+                    # service session that already holds this row would otherwise be judged on the
+                    # snapshot it loaded it in, and `memo_id` / `detached_at` are exactly the
+                    # columns another transaction moves under it.
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
             .first()
         )
+        # The locked stat, in the path the batch's pass 0 does not cover: the same candidate, the
+        # same question, asked where this route resolves it.
+        if existing is not None and not await asset_paths.adoptable(existing):
+            existing = None
     if existing is not None:
+        # Adopting is the inverse of detaching, so the instant goes with the link: a row handed to
+        # a memo is not something a sweep of detached rows may still take.
+        existing.detached_at = None
         await _consume(part, consumed_out)
         await db.delete(upload)
         await db.flush()
