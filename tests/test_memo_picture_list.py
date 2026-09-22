@@ -23,6 +23,7 @@ import pytest
 import structlog
 from app.config import settings
 from app.services import reclaim
+from app.services.uploads import part_path
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
@@ -580,3 +581,63 @@ def test_between_the_commit_and_the_unlink_the_row_is_merely_detached(logged_in_
     assert detached_at is not None
     assert b not in _uids(_get(client, memo["uid"]))
     assert original.exists()
+
+
+# ---- a deterministic refusal comes BEFORE the first byte moves --------------------------------
+
+
+def _pending_upload(upload_uid: str) -> tuple[int, int] | None:
+    """(bytes_received, declared_size) while the upload row is still there, None once it is gone.
+
+    Finalization deletes the row, so its presence IS "still pending" — and a rollback that puts the
+    row back without the bytes it promises is exactly the state this witness refuses to accept.
+    """
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        row = c.execute(
+            text("SELECT bytes_received, declared_size FROM uploads WHERE upload_uid = :u"),
+            {"u": upload_uid},
+        ).first()
+    eng.dispose()
+    return (row[0], row[1]) if row is not None else None
+
+
+def test_a_refused_list_leaves_the_print_it_would_have_replaced(logged_in_client):
+    client, _ = logged_in_client
+    memo = _memo(client, [_upload(client, "Quay.png", _bytes("quay"))])
+    screen_att = _uids(memo)[0]
+    first = _upload(client, "Quay - print (glossy).png", _bytes("quay-print-v1", 3000))
+    assert (
+        client.patch(f"/api/memos/{memo['uid']}", json={"upload_uids": [first]}).status_code == 200
+    )
+    old_print = _print_path(screen_att)
+    assert old_print is not None
+    old_bytes = Path(old_print).read_bytes()
+
+    # The same stored name again: the ONE shape `bind_print_to_sibling` replaces in place, with an
+    # `os.replace` that consumes the part file and records no tracked move to undo it. The list
+    # then names an entry that cannot resolve, so the whole request must fail having changed
+    # nothing — which it can only do if the refusal is decided before that replacement runs.
+    revised = _bytes("quay-print-v2", 3200)
+    second = _upload(client, "Quay - print (glossy).png", revised)
+    r = client.patch(
+        f"/api/memos/{memo['uid']}",
+        json={"upload_uids": [second], "attachment_uids": [screen_att, "no-such"]},
+    )
+
+    assert r.status_code == 422, r.text
+    assert _refusals(r) == [("no-such", "missing")]
+    assert _print_path(screen_att) == old_print
+    assert Path(old_print).read_bytes() == old_bytes  # the committed master, untouched
+    assert part_path(second).exists()  # the bytes the restored row still promises
+    assert _pending_upload(second) == (len(revised), len(revised))
+
+    # …so the client's retry of that very upload — the only recovery it has — still works.
+    again = client.patch(
+        f"/api/memos/{memo['uid']}",
+        json={"upload_uids": [second], "attachment_uids": [screen_att]},
+    )
+
+    assert again.status_code == 200, again.text
+    assert _uids(again.json()) == [screen_att]
+    assert Path(_print_path(screen_att) or "").read_bytes() == revised
