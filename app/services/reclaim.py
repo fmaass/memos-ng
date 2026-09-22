@@ -101,10 +101,11 @@ class Revalidate(enum.StrEnum):
 
     DETACHED = "detached"
     """A periodic sweep picked this row because it has been detached from its memo for longer than
-    its grace period — long enough that no request is still cleaning up after its own commit. Its
-    premise is that whole predicate, so the instant is re-read under the lock against the SAME
-    cutoff the pass selected on: a row adopted since carries no instant, and a row detached again
-    since carries a newer one, and both belong to whoever touched them last."""
+    its grace period. Age is the whole of what that establishes — nothing in it says the request
+    that detached the row has finished cleaning up after its own commit — so the premise is the
+    predicate itself, and the instant is re-read under the lock against the SAME cutoff the pass
+    selected on: a row adopted since carries no instant, and a row detached again since carries a
+    newer one, and both belong to whoever touched them last."""
 
     LEAKED_ORPHAN = "leaked_orphan"
     """A blind scan picked this row BECAUSE it looked like garbage — the reconcile script. Its
@@ -124,9 +125,12 @@ class ReclaimResult:
 
 
 def leaked_orphans_stmt() -> Select[tuple[Attachment]]:
-    """The attachments a deleted memo left behind UNDER A DATED MEMO FOLDER, and only those — the
-    reconcile script's predicate, and nobody else's: an original imported from 0.29.1 stays flat in
-    `originals/`, so this path test cannot see a detached import at all."""
+    """Rows no memo points at whose original sits UNDER A DATED MEMO FOLDER — the reconcile
+    script's predicate, and nobody else's. A deleted memo is the ordinary way a row gets here, but
+    it is not the only one: a PATCH whose own reclaim failed leaves a matching row behind while its
+    memo goes on living. What the predicate asserts is just those two things. An original imported
+    from 0.29.1 stays flat in `originals/`, so this path test cannot see a detached import at
+    all."""
     return (
         select(Attachment)
         .where(Attachment.memo_id.is_(None), Attachment.storage_path.op("~")(LEAKED_PATH_RE))
