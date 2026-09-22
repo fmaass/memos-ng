@@ -59,10 +59,11 @@ async def test_delete_memo_stamps_one_detach_instant_on_the_rows_it_orphans(adb)
     await adb.refresh(memo, ["attachments"])
 
     before = datetime.now(UTC)
-    orphaned = await svc.delete_memo(adb, memo)
+    orphaned, detach_instant = await svc.delete_memo(adb, memo)
     after = datetime.now(UTC)
 
     assert len(orphaned) == 2
+    assert before <= detach_instant <= after
     stamps = await _stamps(adb, ["det-one", "det-two"])
     instants = set()
     for uid in ("det-one", "det-two"):
@@ -73,6 +74,9 @@ async def test_delete_memo_stamps_one_detach_instant_on_the_rows_it_orphans(adb)
         assert before <= detached_at <= after
         instants.add(detached_at)
     assert len(instants) == 1  # one transaction detached them, so one instant names all of it
+    # The caller's reclaim is fenced on the instant this call HANDS BACK, so it has to be the same
+    # one the rows carry: an instant read from the clock again would name a detachment nothing did.
+    assert instants == {detach_instant}
 
 
 async def test_a_delete_stamps_nothing_it_did_not_detach(adb):

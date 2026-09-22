@@ -422,7 +422,7 @@ async def test_the_orphaned_reclaim_honours_a_relink_committed_after_the_memo_de
                     select(Memo).where(Memo.id == doomed_id).options(selectinload(Memo.attachments))
                 )
             ).scalar_one()
-            orphaned = await memo_service.delete_memo(db, memo)
+            orphaned, _ = await memo_service.delete_memo(db, memo)
             assert orphaned == [att_id]
             await db.commit()  # PHASE 1 exactly as app/routers/memos.py runs it
 

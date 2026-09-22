@@ -1356,14 +1356,18 @@ async def delete_memo(
     # (app/services/reclaim.py states the principle in full).
     # The LOCKED memo, not the one read before the wait: its `attachments` were reloaded through
     # the lock, so the orphan journal names what the row actually carries now (§3.3).
-    orphaned = await svc.delete_memo(db, locked)
+    orphaned, detached_at = await svc.delete_memo(db, locked)
     await db.commit()
     # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
     # its files, then the row. Each id gets its own transaction, so a failure part way through
     # leaves the rest as detached rows the sweep finishes once their grace elapses, rather than
-    # rolling the memo delete back.
+    # rolling the memo delete back. Every one of them is judged against THIS delete's detach
+    # instant: between the commit above and the lock below a standalone upload can dedup onto one
+    # of these rows and clear the stamp, and those bytes are live media this loop must not take.
     for attachment_id in orphaned:
-        result = await reclaim.reclaim_attachment(db, attachment_id, reclaim.Revalidate.ORPHANED)
+        result = await reclaim.reclaim_attachment(
+            db, attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
+        )
         if result.outcome != "reclaimed":
             # The memo IS deleted — that is what the caller asked for and it has committed, so
             # this cannot become an error response. A row left behind here keeps the instant that

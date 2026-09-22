@@ -566,9 +566,14 @@ def detach_attachments(attachments: Iterable[Attachment]) -> datetime:
     return at
 
 
-async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
-    """Delete a memo, ORPHANING its attachments; returns their ids for the caller to reclaim after
-    this transaction commits.
+async def delete_memo(db: AsyncSession, memo: Memo) -> tuple[list[int], datetime]:
+    """Delete a memo, ORPHANING its attachments; returns their ids AND the one instant that
+    detached them, for the caller to reclaim against after this transaction commits.
+
+    The instant comes back rather than being re-read, because the caller's reclaim is judged
+    against the detachment that ISSUED it: a row that carries a different instant, or none, was
+    taken by somebody else since and is no longer this request's garbage. Handing it back in the
+    return value is what makes a caller that skips the fence a visible one.
 
     Two phases, and the split is the whole point. Deleting the memo alone was the MEMNG-170 bug —
     the relationship carries no cascade and the FK is ON DELETE SET NULL, so every attachment
@@ -600,11 +605,11 @@ async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
     # Before the delete: the relationship carries no `passive_deletes`, so it is the ORM that nulls
     # `memo_id` on these loaded rows, and the instant has to already be on them to ride out in the
     # same UPDATE.
-    detach_attachments(detached)
+    detached_at = detach_attachments(detached)
     orphaned = [att.id for att in detached]
     await db.delete(memo)
     await db.flush()
-    return orphaned
+    return orphaned, detached_at
 
 
 async def list_tags(db: AsyncSession, user: User) -> list[tuple[str, int]]:
