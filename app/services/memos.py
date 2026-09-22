@@ -1,8 +1,8 @@
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -528,6 +528,21 @@ async def update_memo(db: AsyncSession, memo: Memo, **fields) -> Memo:
     return memo
 
 
+def detach_attachments(attachments: Iterable[Attachment]) -> datetime:
+    """Take these attachments off their memo, recording WHEN, and return that one instant.
+
+    The link and the instant move together, and every detach site goes through here, because what
+    reclaims a detached row later has to judge it by the instant that detached it rather than by
+    whatever the row says when the reclaim finally gets to it. A row with no instant is one nothing
+    ever detached, and is nobody's garbage.
+    """
+    at = datetime.now(UTC)
+    for att in attachments:
+        att.memo_id = None
+        att.detached_at = at
+    return at
+
+
 async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
     """Delete a memo, ORPHANING its attachments; returns their ids for the caller to reclaim after
     this transaction commits.
@@ -539,10 +554,14 @@ async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
     this commit and the caller's unlink leaves files with no row at all, and nothing can ever find
     them again (`app/services/reclaim.py`).
 
-    So this phase deliberately leaves the rows behind, orphaned. That orphan IS the durable
-    journal: it names its own files, and it is exactly what `reclaim.leaked_orphans_stmt` selects,
-    so a create interrupted here is picked up by the worker sweep or the reconcile script rather
-    than lost. The caller then reclaims each id properly — locked, revalidated, files first.
+    So this phase deliberately leaves the rows behind, orphaned and stamped with the instant they
+    were detached. That orphan IS the durable journal: it names its own files, so a delete
+    interrupted here is recoverable rather than lost. `reclaim.leaked_orphans_stmt` reaches it only
+    when its original sits under the dated `originals/YYYY/MM/` prefix — an original imported from
+    0.29.1 stays FLAT in `originals/` (`app/scripts/migrate_from_memos.py`) and no path predicate
+    can tell it from media nobody's memo ever owned, which is why the instant, not the path, is
+    what records that a row was detached. The caller then reclaims each id properly — locked,
+    revalidated, files first.
 
     Reclaim is unconditional, with no reference counting, because an attachment on a memo is
     exclusively that memo's: `uploads.finalize` only ever dedups onto an UNLINKED attachment
@@ -554,7 +573,12 @@ async def delete_memo(db: AsyncSession, memo: Memo) -> list[int]:
     make a raw DELETE against the database take the attachment rows with it and leave their files
     orphaned for ever — the forbidden outcome, reachable by hand from a psql prompt.
     """
-    orphaned = [att.id for att in memo.attachments]
+    detached = list(memo.attachments)
+    # Before the delete: the relationship carries no `passive_deletes`, so it is the ORM that nulls
+    # `memo_id` on these loaded rows, and the instant has to already be on them to ride out in the
+    # same UPDATE.
+    detach_attachments(detached)
+    orphaned = [att.id for att in detached]
     await db.delete(memo)
     await db.flush()
     return orphaned
