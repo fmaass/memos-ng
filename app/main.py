@@ -69,10 +69,12 @@ async def lifespan(app: FastAPI):
     # flight. Give it a bounded moment to land; anything slower is cancelled deliberately here
     # rather than being torn down mid-write by the loop with the engine already going away.
     await auth.drain_pat_stamp_tasks()
-    # The same for a reclaim a cancelled request left behind. Uvicorn's graceful-shutdown timeout
-    # cancels the request task directly, which is delivered at the `await` on its unlink thread
-    # while that thread runs on; the reclaim continues in a task of its own and is awaited here,
-    # because the alternative is the loop going away with the row locked and its files half gone.
+    # The same for a reclaim a cancelled request left behind. A cancelled request — the client
+    # gone, the server stopping — is cancelled at whatever it is awaiting, and for a request in its
+    # reclaim loop that is `await asyncio.shield(task)` inside `reclaim.reclaim_row_shielded`: the
+    # reclaim itself runs in a task of its own, holding its own session, so the request ends there
+    # and the reclaim does not. That task is what this awaits, because the alternative is the loop
+    # going away with the row locked and its files half gone.
     await reclaim.drain_pending_reclaims()
     logger.info("app_stopped")
 

@@ -1590,12 +1590,14 @@ async def run() -> None:
                     logger.exception("worker_consumer_teardown_error")
             # AFTER the consumers, and for a sharper reason than tidiness: a reclaim nobody is
             # awaiting any more — a pass whose bound expired with a row in flight — is holding
-            # that row's lock while a thread deletes its files, and what follows this teardown is
-            # `asyncio.run` cancelling whatever tasks are left. Cancelled there it would unwind
-            # mid-unlink, which is the one state `reclaim` exists to prevent. Bounded by docker's
-            # stop grace, spent after the consumers have spent theirs, and nothing is cancelled
-            # when it runs out: `drain_pending_reclaims` says what is still running and the
-            # process exit is then the only thing that ends it.
+            # that row's lock while a thread deletes its files, and this is the one place that can
+            # still wait for it with the loop running normally. Bounded by docker's stop grace,
+            # spent after the consumers have spent theirs, and nothing is cancelled when it runs
+            # out: `drain_pending_reclaims` says what is still running and returns. What follows is
+            # `asyncio.run` cancelling whatever tasks are left and gathering them, and a reclaim
+            # cancelled there does NOT unwind mid-unlink — it finishes its unlink thread and its
+            # transaction first (`reclaim.reclaim_attachment`) and only then lets the cancellation
+            # through, which the gather is still turning the loop for.
             await reclaim.drain_pending_reclaims()
         finally:
             # Only NOW are the signals given back. Removing them before the teardown would leave

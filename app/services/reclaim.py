@@ -250,8 +250,8 @@ async def reclaim_attachment(
     under the lock can be about the same instant the decision was taken about (see `_ineligible`).
 
     `unlink` is the seam the crash-window tests inject at; production passes nothing. It is called
-    OFF the event loop (`to_thread.run_sync`), so a seam that touches the loop is a test that
-    deadlocks itself.
+    OFF the event loop, in a worker thread this coroutine then waits out whatever happens to it
+    (`_unlink_off_the_loop`), so a seam that touches the loop is a test that deadlocks itself.
     """
     remove = unlink or unlink_paths
     # 1. Jobs first — the lock order guard_publish depends on. SKIP LOCKED: a running transcode's
@@ -337,15 +337,18 @@ async def reclaim_attachment(
 
 
 # Docker allows 10 s between SIGTERM and SIGKILL (the stack compose sets no `stop_grace_period`),
-# and uvicorn's graceful shutdown is bounded on the same order. It is the whole stop's budget, not
-# this step's alone, so what it bounds here is how long a shutdown KEEPS WAITING before it says
-# what is still running — never the reclaim itself, which is exactly what must not be cut short.
+# and that is the only outer bound there is: neither entrypoint configures a graceful-shutdown
+# timeout of its own. It is the whole stop's budget, not this step's alone, so what it bounds here
+# is how long a shutdown KEEPS WAITING before it says what is still running — never the reclaim
+# itself, which is exactly what must not be cut short.
 DRAIN_GRACE_SECONDS = 10.0
 
-# Every reclaim this process has in flight, whoever started it. A task is added when it is created
-# and discards itself when it ends, so what is left in here at shutdown is precisely the work no
-# caller is waiting for any more — the sweep whose bound expired, the request whose caller went
-# away — and it is the only handle a shutdown has on it.
+# Every reclaim this process has in flight, whoever started it: the memo edit and delete routes,
+# the asset delete route and the worker's detached sweep all go through `reclaim_row_shielded`,
+# which is what puts a reclaim in here. A task is added when it is created and discards itself when
+# it ends, so what is left at shutdown is precisely the work no caller is waiting for any more —
+# the sweep whose bound expired, the request whose caller went away — and it is the only handle a
+# shutdown has on it.
 _pending: set[asyncio.Task[ReclaimResult]] = set()
 
 
@@ -385,13 +388,19 @@ async def reclaim_row_shielded(
 ) -> ReclaimResult:
     """`reclaim_row` as a TASK of its own, awaited through a shield — how every caller calls it.
 
-    The unlinks run off the event loop, and a direct `task.cancel()` — uvicorn's graceful-shutdown
-    timeout, `asyncio.run`'s teardown of whatever tasks are left, a caller cancelling its own work
-    — is delivered at that `await` AT ONCE, while the thread it was waiting on runs on. Awaited
-    inline, the reclaim would unwind right there: lock released, row live again, and the thread
-    deleting its files still going, free to take the bytes of whoever adopts it next. So the
-    reclaim is a task, the cancellation lands on this await instead, and the row's lock outlives
-    the thread.
+    Every one of them: the memo edit and delete routes, the asset delete route, the detached sweep.
+    Nothing else in this process reclaims a row.
+
+    The unlinks run off the event loop, and a cancellation — a caller's own, or one delivered to
+    the reclaim directly by a teardown — cannot be made to wait at a worker thread. Awaited inline
+    on the caller's session, a cancelled reclaim would unwind right there: lock released, row live
+    again, and the thread deleting its files still going, free to take the bytes of whoever adopts
+    it next. Two things stop that. The shield keeps the CALLER's cancellation off the task, so it
+    lands on this await and the reclaim carries on holding its own session. And the reclaim itself
+    holds a cancellation delivered to the TASK until its unlink thread has returned and its
+    transaction is finished (`reclaim_attachment`). So the row's lock outlives the thread in all
+    three cases: the caller cancelled, the drain's grace expired, the teardown cancelling what is
+    left.
 
     The cancellation is then RE-RAISED, never swallowed: the caller was cancelled and is over, and
     a loop that went on to its next row would be taking rows nobody is waiting for with a
@@ -420,12 +429,16 @@ async def drain_pending_reclaims(grace_s: float = DRAIN_GRACE_SECONDS) -> None:
     """Wait for the reclaims still in flight in this process — the last thing either process does.
 
     Nothing is cancelled here, however long it takes: cancelling a reclaim mid-unlink is the very
-    defect the shield above exists to prevent, and it would be no less one for being done by a
-    shutdown. Past the grace the wait simply ends and says what is still running; the process exit
-    is then the only thing that ends those, and it ends them the hard way — the connection dies
-    with it, the transaction rolls back, and the row is live again with part of its files gone.
-    That is a state the next sweep finds and finishes, which is the whole reason the row is the
-    journal and the files are not.
+    defect the unit above exists to prevent, and it would be no less one for being done by a
+    shutdown. The grace bounds THIS WAIT and nothing else. Past it the wait simply ends and says
+    what is still running — and what it leaves behind still finishes: the teardown that follows
+    (`asyncio.run`'s in the worker, the loop's own in the API) cancels that task, and the reclaim
+    holds the cancellation until its unlink thread has returned and its transaction is committed or
+    rolled back, inside the gather the teardown does after cancelling. What ends a reclaim
+    mid-unlink is the process dying outright — SIGKILL at the end of the stop grace — and it ends
+    it the hard way: the connection dies with it, the transaction rolls back, and the row is live
+    again with part of its files gone. That is a state the next sweep finds and finishes, which is
+    the whole reason the row is the journal and the files are not.
     """
     pending = tuple(_pending)
     if not pending:
