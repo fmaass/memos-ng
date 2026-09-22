@@ -928,33 +928,62 @@ async def sweep_detached_attachments(
             .all()
         )
     reclaimed = 0
+    deadline = time.monotonic() + HOUSEKEEPING_BOUNDS["detached_attachment_sweep"]
     for attachment_id in candidates:
-        async with async_session() as db:
-            result = await reclaim.reclaim_attachment(
-                db,
-                attachment_id,
-                reclaim.Revalidate.DETACHED,
-                unlink=unlink,
-                detached_before=cutoff,
+        if time.monotonic() >= deadline:
+            logger.info(
+                "detached_attachments.sweep_deadline",
+                reclaimed=reclaimed,
+                candidates=len(candidates),
             )
+            break
+        # SHIELDED, and the session is opened INSIDE the shielded unit: the bound's cancellation
+        # may not land between the row's lock and the end of its unlink. There it would unwind the
+        # transaction — releasing the lock and putting the row back — while the thread doing the
+        # unlinking runs on to completion, which is the one outcome `reclaim` is built to prevent:
+        # a row that is live again and files that are gone. Shielded, the cancellation is delivered
+        # HERE instead, the row's own transaction finishes off the loop with its lock held, and the
+        # pass ends at a row boundary.
+        result = await asyncio.shield(_reclaim_detached_row(attachment_id, cutoff, unlink))
         if result.outcome == "reclaimed":
             reclaimed += 1
     return reclaimed
+
+
+async def _reclaim_detached_row(
+    attachment_id: int, cutoff: datetime, unlink: Callable[[list[Path]], list[str]] | None
+) -> reclaim.ReclaimResult:
+    """One candidate row's reclaim, session and all, as ONE unit the sweep can shield.
+
+    The session lives in here rather than around the shield so that the lock, the unlink and the
+    commit-or-rollback are inseparable: everything this row holds is released by this coroutine
+    finishing, never by a cancellation arriving in the middle of it.
+    """
+    async with async_session() as db:
+        return await reclaim.reclaim_attachment(
+            db,
+            attachment_id,
+            reclaim.Revalidate.DETACHED,
+            unlink=unlink,
+            detached_before=cutoff,
+        )
 
 
 async def sweep_detached_attachments_safe() -> int:
     """Reclaim detached attachments past their grace period, in sessions of its own with ALL errors
     isolated — the same boundary guard the other periodic sweeps get. Returns rows reclaimed.
 
-    The count is logged on every pass, zero included: a pass that found nothing and a worker that
-    never reached its hourly block are otherwise the same silence, and this sweep deletes rows, so
-    what it did each hour is the thing an operator needs on the record.
+    The count is logged on every pass this returns from, zero and the caught-error path included: a
+    pass that found nothing and a worker that never reached its hourly block are otherwise the same
+    silence, and this sweep deletes rows, so what it did each hour is the thing an operator needs on
+    the record. (A pass its bound cancels returns nothing and logs no count; `_bounded` announces
+    that one by name as `worker_housekeeping_timeout`.)
     """
+    reclaimed = 0
     try:
         reclaimed = await sweep_detached_attachments()
     except Exception:
         logger.exception("detached_attachments.sweep_error")
-        return 0
     logger.info("detached_attachments_swept", count=reclaimed)
     return reclaimed
 

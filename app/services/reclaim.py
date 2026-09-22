@@ -208,7 +208,9 @@ async def reclaim_attachment(
     — the instant it detached it with, or the cutoff its pass selected on — so the revalidation
     under the lock can be about the same instant the decision was taken about (see `_ineligible`).
 
-    `unlink` is the seam the crash-window tests inject at; production passes nothing.
+    `unlink` is the seam the crash-window tests inject at; production passes nothing. It is called
+    OFF the event loop (`to_thread.run_sync`), so a seam that touches the loop is a test that
+    deadlocks itself.
     """
     remove = unlink or unlink_paths
     # 1. Jobs first — the lock order guard_publish depends on. SKIP LOCKED: a running transcode's
@@ -251,8 +253,9 @@ async def reclaim_attachment(
         return ReclaimResult("skipped_ineligible")
     # 3-5. The derivable set PLUS the print profiles that are actually on disk, unlinked, and only
     #      then the row. The profiles have to be enumerated rather than derived (MEMNG-238: the set
-    #      of profiles that ever existed is unbounded), and this runs on the request loop, so the
-    #      one directory listing goes off it — every stat on this volume is a network round-trip.
+    #      of profiles that ever existed is unbounded), and both the listing and the unlinks go off
+    #      the event loop: every stat and every unlink on this volume is a network round-trip, and
+    #      the callers run on a loop that also stamps the worker's heartbeat and drains media.
     uid = att.uid  # read BEFORE any rollback below: it expires every instance (see above)
     try:
         profile_assets = await to_thread.run_sync(printready.profile_variant_paths_sync, uid)
@@ -268,7 +271,7 @@ async def reclaim_attachment(
         )
         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
     paths = all_asset_paths(att) + profile_assets
-    failed = remove(paths)
+    failed = await to_thread.run_sync(remove, paths)
     if failed:
         # FAIL CLOSED. Deleting the row now would leave these files with nothing naming them — the
         # one outcome this module exists to prevent, arriving on the very failure the journal is
