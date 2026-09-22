@@ -199,12 +199,13 @@ async def test_a_removal_landing_after_discovery_is_still_caught(adb, monkeypatc
 
     async def removing_in_the_gap(self, statement, *args, **kwargs):
         nonlocal fired
-        result = await real_execute(self, statement, *args, **kwargs)
         text = str(statement)
-        if "attachments.sha256 IN" in text and "FOR UPDATE" not in text and not fired:
+        # In the gap: the unlocked discovery has read this row and named it a candidate, and the
+        # acquisition that will judge it has not run yet.
+        if "FROM attachments" in text and "FOR UPDATE" in text and not fired:
             fired += 1
             original.unlink()
-        return result
+        return await real_execute(self, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", removing_in_the_gap)
     upload = await _upload_of(adb, owner, "again.png")
