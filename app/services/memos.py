@@ -1,7 +1,7 @@
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from app.models import (
     Visibility,
     memo_tags,
 )
-from app.services import storage
+from app.services import asset_paths, storage
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 
 logger = structlog.get_logger(__name__)
@@ -149,7 +149,12 @@ async def create_memo(
     memo = locked
     finalized = list(await finalize(memo)) if finalize is not None else []
     await link_attachments(
-        db, owner.id, memo, [*(attachment_uids or []), *finalized], moved_out=moved_out
+        db,
+        owner.id,
+        memo,
+        [*(attachment_uids or []), *finalized],
+        moved_out=moved_out,
+        vouched=set(finalized),
     )
     await db.refresh(memo)
     return memo
@@ -247,6 +252,9 @@ async def link_attachments(
     memo: Memo,
     uids: Sequence[str],
     moved_out: list[storage.TrackedMove] | None = None,
+    *,
+    vouched: Collection[str] = (),
+    refused_out: list[str] | None = None,
 ) -> None:
     """Link the caller's OWN attachments to a memo, IN THE ORDER `uids` names them.
 
@@ -276,6 +284,15 @@ async def link_attachments(
     An attachment already linked to this memo keeps its place; one linked to a DIFFERENT memo is
     skipped and consumes no position. It all happens in the caller's transaction, so the renumber
     and the append land together or not at all.
+
+    A PRE-EXISTING unlinked row is stat'd before it is linked (`asset_paths.adoptable`, under the
+    lock taken above), because naming a row is not the same as the row still having its bytes: one
+    left behind by a removal that rolled back after its first unlink names an original that is
+    gone. Its uid goes to `refused_out` — a caller with a typed contract answers for it, and this
+    back-compat path skips it as it has always skipped what it could not link. `vouched` names the
+    uids this transaction MINTED or already adopted through the guarded dedup; they are not
+    re-judged, and must not be: a video uploaded a moment ago has no poster tier yet, so checking
+    it would refuse the very upload that created it.
     """
     if not uids:
         return
@@ -334,8 +351,14 @@ async def link_attachments(
             continue
         if att.id in linked:  # the same uid twice, or one already on this memo: one place only
             continue
+        if uid not in vouched and not await asset_paths.adoptable(att):
+            if refused_out is not None:
+                refused_out.append(uid)
+            continue
         linked.add(att.id)
         att.memo_id = memo.id
+        # The link and the instant move together in both directions (see `detach_attachments`).
+        att.detached_at = None
         att.position = next_position
         next_position += 1
         await _place_attachment_masters(db, att, dest_dir, data_root, moved_out)

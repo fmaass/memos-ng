@@ -1017,6 +1017,7 @@ async def patch_memo(
                     edited,
                     sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
                     moved_out=moved,
+                    vouched=set(finalized),
                 )
             # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are

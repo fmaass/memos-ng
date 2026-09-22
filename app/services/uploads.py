@@ -30,7 +30,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import capture, location, poster, storage
+from app.services import asset_paths, capture, location, poster, storage
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -1099,6 +1099,13 @@ async def finalize_pending(
         for digest, att in locked.candidates.items()
         if att.id in live_ids and att.owner_id == owner_id and att.memo_id is None
     }
+    # …and then the stat, under the same lock and before a single upload is consumed. A row can
+    # satisfy every column above and name bytes that are no longer there (`asset_paths.adoptable`);
+    # the discovery read could not answer that, because the files may go in the gap between it and
+    # the lock. Held to commit, so the answer cannot go stale under this transaction either.
+    locked.candidates = {
+        digest: att for digest, att in locked.candidates.items() if await asset_paths.adoptable(att)
+    }
     # ---- end of pass 0. Nothing below acquires another row. ---------------------------------
 
     async def _finalize_one(upload: Upload) -> Attachment:
@@ -1255,12 +1262,24 @@ async def finalize(
                     # now-linked row, excludes it, and the loser creates its own attachment instead
                     # of stealing.
                     .with_for_update()
+                    # `populate_existing` for the same reason the batch's acquisition carries it: a
+                    # service session that already holds this row would otherwise be judged on the
+                    # snapshot it loaded it in, and `memo_id` / `detached_at` are exactly the
+                    # columns another transaction moves under it.
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
             .first()
         )
+        # The locked stat, in the path the batch's pass 0 does not cover: the same candidate, the
+        # same question, asked where this route resolves it.
+        if existing is not None and not await asset_paths.adoptable(existing):
+            existing = None
     if existing is not None:
+        # Adopting is the inverse of detaching, so the instant goes with the link: a row handed to
+        # a memo is not something a sweep of detached rows may still take.
+        existing.detached_at = None
         await _consume(part, consumed_out)
         await db.delete(upload)
         await db.flush()

@@ -9,6 +9,8 @@ needs it, and a service importing a router is an import cycle waiting to happen.
 
 from pathlib import Path
 
+from anyio import to_thread
+
 from app.config import settings
 from app.models import Attachment
 from app.services import poster, printready
@@ -91,3 +93,52 @@ def all_asset_paths(att: Attachment) -> list[Path]:
             paths.append(resolved[0])
             paths.extend(variant_paths(resolved[0]))  # format-negotiated variants
     return paths
+
+
+def _non_regenerable_paths(att: Attachment) -> list[Path]:
+    """The files that only exist because somebody uploaded them: the screen original, the legacy
+    print master, every rendition master, and — for a video — the poster tier.
+
+    The poster is in this set even though it is derived, because it is the one derived file a
+    CLIENT may supply (`uploads.attach_video_poster` writes the worker's own destination and the
+    row records nothing about it), so a missing one cannot be told apart from an override that was
+    removed — but only for a video that HAS an original, since that is what a poster is derived
+    from. Everything else under `all_asset_paths` is regenerable from the original and is
+    deliberately absent: a thumb the worker has not written yet is not damage.
+
+    A row that names no file of its own therefore yields an empty set and is adoptable. That is
+    the intended reading: this asks whether what the row NAMES is still there, and a placeholder
+    that names nothing has lost nothing.
+    """
+    paths: list[Path] = []
+    if att.storage_path:
+        paths.append(Path(att.storage_path))
+    if att.print_path:
+        paths.append(Path(att.print_path))
+    paths.extend(Path(rendition.storage_path) for rendition in att.renditions)
+    if att.storage_path and att.mime.startswith("video/"):
+        resolved = derived_tier_path(att.uid, "poster")
+        if resolved is not None:
+            paths.append(resolved[0])
+    return paths
+
+
+def _all_present_sync(paths: list[Path]) -> bool:
+    return all(path.exists() for path in paths)
+
+
+async def adoptable(att: Attachment) -> bool:
+    """May this existing row be handed to a memo instead of the bytes the caller is holding?
+
+    Only if every non-regenerable file it names is still there. A row whose original was removed
+    under it — what a reclaim leaves behind when the unlink fails after the first file and the
+    transaction rolls back — still matches a dedup candidate by every column it has, and adopting
+    it would hand the memo a picture that cannot be served AND destroy the upload that still had
+    the bytes. Refusing is always the safe direction: the upload keeps its own copy and mints its
+    own row.
+
+    Asked under the candidate's row lock, held to commit, so the answer cannot go stale between
+    the stat and the adoption. Every stat is a network round-trip on the deployed volume, so they
+    go off the request loop.
+    """
+    return await to_thread.run_sync(_all_present_sync, _non_regenerable_paths(att))
