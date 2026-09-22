@@ -556,8 +556,9 @@ def detach_attachments(attachments: Iterable[Attachment]) -> datetime:
 
     The link and the instant move together, and every detach site goes through here, because what
     reclaims a detached row later has to judge it by the instant that detached it rather than by
-    whatever the row says when the reclaim finally gets to it. A row with no instant is one nothing
-    ever detached, and is nobody's garbage.
+    whatever the row says when the reclaim finally gets to it. A fenced reclaim is given that
+    instant and asks for it, so a row carrying another one — or none — is not the row it was
+    sent for.
     """
     at = datetime.now(UTC)
     for att in attachments:

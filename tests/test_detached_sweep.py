@@ -236,14 +236,13 @@ async def test_the_sweep_takes_its_rows_by_id(db_engine, monkeypatch, tmp_path):
 
 
 async def test_a_candidate_redetached_before_the_lock_is_refused(db_engine, monkeypatch, tmp_path):
-    """Relinked and detached again between the pass and the lock: the row is a candidate by the
-    cutoff this pass selected on, but the instant under the lock is a NEW one, inside the grace,
-    and it belongs to whoever wrote it."""
+    """The row is a candidate by the cutoff this call carries, but the instant under the lock is a
+    newer one, inside the grace, and it belongs to whoever wrote it."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         att_id, original = _seed(tmp_path, "redetached", detached_at=datetime.now(UTC) - 2 * GRACE)
         cutoff = datetime.now(UTC) - GRACE
-        _stamp(att_id, datetime.now(UTC))  # the second detach, after this pass selected the row
+        _stamp(att_id, datetime.now(UTC))  # newer than the cutoff the call below carries
 
         async with async_session() as db:
             result = await reclaim_attachment(

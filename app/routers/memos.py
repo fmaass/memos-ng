@@ -401,8 +401,8 @@ def _attachment_uids_invalid(problems: list[tuple[str, str]]) -> HTTPException:
 
     `loc` names the offending uid — which is what the client has to hear, since a status alone
     cannot say which picture it lost — and `type` carries the machine-readable reason, namespaced
-    `attachment_uid.<reason>`. Every rejected entry is reported at once: a client fixing its list
-    one round trip per bad uid is a client re-sending pictures.
+    `attachment_uid.<reason>`. The detail is a list because a client fixing its list one round
+    trip per bad uid is a client re-sending pictures.
     """
     return HTTPException(
         status_code=422,
@@ -1065,8 +1065,8 @@ async def _judge_picture_list(
             continue
         if att.memo_id is not None and att.memo_id != memo_id:
             # The one `link_attachments` skips in silence, which is right for an append and
-            # catastrophic for a declared list: the skip would strand the other memo's picture
-            # AND delete every picture this list left out.
+            # catastrophic for a declared list: the skip would answer 200 to a list one picture
+            # short, having already detached every picture that list left out.
             problems.append((entry, "other_memo"))
             continue
         if att.memo_id is None and not await asset_paths.adoptable(att):
@@ -1134,20 +1134,21 @@ async def _apply_picture_list(
 
     What the list omits is DETACHED, never deleted here: the files go in their own transaction
     after this one commits, and a crash in the gap has to leave a row that still names them (see
-    app/services/reclaim.py). The ids and uids are read out now, while the objects are still live —
-    the reclaim runs on a session this transaction has finished with, and every instance on it is
-    expired by then.
+    app/services/reclaim.py). The ids and uids are read out now, while this transaction still holds
+    the rows: the reclaim that follows the commit deletes them, and an instance read after that
+    carries only what this transaction loaded.
     """
     refused: list[str] = []
     await svc.link_attachments(
         db, owner_id, memo, list(ordered), moved_out=moved, vouched=vouched, refused_out=refused
     )
     if refused:
-        # A row the list named whose original is gone. `_judge_picture_list` asks this of every
-        # listed row before a byte moves, so reaching it here means the bytes went AFTER that —
-        # while the row was locked and held, which nothing in this transaction does. It stands as
-        # the write-time fence: a declared list cannot let `link_attachments`'s silent skip pass,
-        # or it would answer 200 to a request whose result is one picture short.
+        # A row the list named that `adoptable` refuses: one of the non-regenerable files it
+        # names is gone. `_judge_picture_list` asks this of every listed row before a byte moves,
+        # so reaching it here means the bytes went AFTER that — while the row was locked and held,
+        # which nothing in this transaction does. It stands as the write-time fence: a declared
+        # list cannot let `link_attachments`'s silent skip pass, or it would answer 200 to a
+        # request whose result is one picture short.
         raise _attachment_uids_invalid([(uid, "missing") for uid in refused])
     on_memo = (
         (await db.execute(select(Attachment).where(Attachment.memo_id == memo.id))).scalars().all()
@@ -1204,8 +1205,8 @@ async def patch_memo(
         # appended after the attachments the memo already carries, which keep their saved order.
         positions: dict[str, int] = {}
         # The pictures the declared list takes OFF this memo, carried past the commit as plain
-        # values: every reclaim below rolls this session's instances away, so an id or a uid read
-        # after the first one is a lazy-refresh, not a name. The instant is the epoch each of those
+        # values: each reclaim below ends a transaction of its own, and the row behind an instance
+        # may be gone by the time the next one is read. The instant is the epoch each of those
         # reclaims is judged against, and nothing re-derives it.
         detached_ids: list[tuple[int, str]] = []
         detached_at: datetime | None = None
@@ -1350,10 +1351,9 @@ async def patch_memo(
                     db, attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
                 )
                 if result.outcome != "reclaimed":
-                    # The edit IS saved, so this cannot become an error response. The row stays
-                    # detached and stamped, which is what the sweep collects once the grace
-                    # elapses; no automatic process recovers it before then, so the line names
-                    # both uids while the picture it holds is still findable by them.
+                    # The edit IS saved, so this cannot become an error response. A reclaim that
+                    # did not take the row changed nothing about it, and nothing else reports
+                    # that, so the line names both uids to leave it findable.
                     logger.warning(
                         "memo.patch.attachment_not_reclaimed",
                         memo_uid=uid,
@@ -1445,9 +1445,8 @@ async def delete_memo(
         )
         if result.outcome != "reclaimed":
             # The memo IS deleted — that is what the caller asked for and it has committed, so
-            # this cannot become an error response. A row left behind here keeps the instant that
-            # detached it, so the sweep collects it once the grace elapses; no automatic process
-            # recovers it before then, which is what this line is for.
+            # this cannot become an error response. A reclaim that did not take the row changed
+            # nothing about it, and nothing else reports that, which is what this line is for.
             logger.warning(
                 "memo.delete.attachment_not_reclaimed",
                 attachment_id=attachment_id,

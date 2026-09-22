@@ -134,8 +134,8 @@ async def adoptable(att: Attachment) -> bool:
     under it — what a reclaim leaves behind when the unlink fails after the first file and the
     transaction rolls back — still matches a dedup candidate by every column it has, and adopting
     it would hand the memo a picture that cannot be served AND destroy the upload that still had
-    the bytes. Refusing is always the safe direction: the upload keeps its own copy and mints its
-    own row.
+    the bytes. Refusing is always the safe direction: a dedup caller still holds the bytes and mints
+    its own row, and a caller that named the uid itself is told the picture is missing.
 
     Asked under the candidate's row lock, held to commit, so the answer cannot go stale between
     the stat and the adoption. Every stat is a network round-trip on the deployed volume, so they
