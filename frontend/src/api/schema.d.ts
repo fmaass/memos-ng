@@ -2195,6 +2195,11 @@ export interface components {
         MemoPatch: {
             /** Archived */
             archived?: boolean | null;
+            /**
+             * Attachment Uids
+             * @description The memo's COMPLETE picture list, in display order — the index of an entry becomes that picture's place on the memo. Omitted (null), the pictures are untouched and this stays a true partial update, exactly as `upload_uids` is; sent as an empty list, the memo keeps no pictures at all. Those two are different requests and are answered differently. An attachment the memo has and the list does not name is REMOVED. An entry is either an attachment uid or an `upload_uid` named in this same request's `upload_uids` — a picture being uploaded here has no attachment uid the client could know, because that uid is minted while this request runs. Two entries may resolve to one attachment (identical bytes dedup, and a print binds onto its screen); that is not an error, and the attachment takes the EARLIEST place its entries asked for, so the stored list can be shorter than the one sent. An entry that cannot be resolved fails the WHOLE request with 422 — never a silent skip, which on a declared list would delete the pictures the list omitted. Each rejected entry comes back as one `detail` item whose `loc` ends with the uid and whose `type` names the reason: attachment_uid.missing, attachment_uid.foreign_owner, attachment_uid.other_memo or attachment_uid.unresolvable_upload_uid.
+             */
+            attachment_uids?: string[] | null;
             /** Content */
             content?: string | null;
             /**
