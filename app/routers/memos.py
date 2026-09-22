@@ -102,12 +102,13 @@ def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
 async def _after_commit_seam() -> None:
     """The instant between a detaching request's commit and its after-commit reclaim.
 
-    Nothing production does can open that gap — the commit and the reclaim loop are adjacent
-    statements in one coroutine — yet it is exactly the window the epoch fence exists for: a
-    standalone finalize that dedups onto one of the rows this request just detached adopts it
-    there, and a reclaim that did not carry its own detach instant would take the adopter's bytes.
-    So the gap is a named no-op the interleaving witnesses can hold open, rather than a race no
-    test can reach.
+    Production opens that gap by itself — the commit is an await, the edit route unlinks the
+    uploads it consumed off the loop before the reclaim loop starts, and each reclaim awaits the
+    database in turn — but only by timing, never on demand. And it is exactly the window the epoch
+    fence exists for: a standalone finalize that dedups onto one of the rows this request just
+    detached adopts it there, and a reclaim that did not carry its own detach instant would take
+    the adopter's bytes. So the gap is also a named no-op the interleaving witnesses can hold
+    open, rather than a race no test can time.
     """
     return None
 
@@ -1008,8 +1009,10 @@ async def _judge_picture_list(
     """Refuse every entry this list cannot resolve, and hand back the entries in declared order
     together with the attachment each already-existing one names.
 
-    This runs at the END OF FINALIZATION'S PASS 0 — after the one ascending attachment acquisition,
-    before pass 1 moves a byte — so that a refused request has nothing on disk to put back. Taken
+    With uploads this runs at the END OF FINALIZATION'S PASS 0 — after the one ascending attachment
+    acquisition, before pass 1 moves a byte. A list-only edit finalizes nothing, so it calls this
+    straight after its own `acquire_attachment_set`: the same point in the same order, rows held
+    and nothing moved. Either way a refused request has nothing on disk to put back. Taken
     any later, the same deterministic 422 could fire after a sibling print bind had replaced a
     committed master in place: those bytes are overwritten, no tracked move names them, and the
     upload row the rollback restores promises a part file that replacement consumed.
@@ -1017,7 +1020,8 @@ async def _judge_picture_list(
     An entry is an attachment uid or an `upload_uid` of this same request. An entry of the second
     kind cannot be refused here and must not be: finalization has by now proved every uid in
     `upload_uids` to be a complete, owner-scoped, locked pending row of this owner's, so what it
-    becomes is a fact pass 1 settles, not a verdict about the list. The reverse — an entry naming
+    becomes is a fact finalization settles later — a screen in pass 1, a print in pass 2, where it
+    binds to a sibling or is promoted — not a verdict about the list. The reverse — an entry naming
     an upload this request never finalizes — is a pure set-membership question and is answered
     here.
 
@@ -1070,7 +1074,9 @@ async def _judge_picture_list(
             problems.append((entry, "other_memo"))
             continue
         if att.memo_id is None and not await asset_paths.adoptable(att):
-            # The owner's row, free to be linked, naming an original that is gone.
+            # The owner's row, free to be linked, missing one of the files only the upload could
+            # have supplied: its original, a print master, a rendition master, or, for a video
+            # that has an original, its poster.
             # `link_attachments` declines to adopt it and `_apply_picture_list` turns that into
             # this same `missing`; asking here instead is answer-identical, because nothing
             # between this point and the link removes bytes a listed attachment owns — pass 1
@@ -1144,9 +1150,12 @@ async def _apply_picture_list(
     )
     if refused:
         # A row the list named that `adoptable` refuses: one of the non-regenerable files it
-        # names is gone. `_judge_picture_list` asks this of every listed row before a byte moves,
-        # so reaching it here means the bytes went AFTER that — while the row was locked and held,
-        # which nothing in this transaction does. It stands as the write-time fence: a declared
+        # names is gone. `_judge_picture_list` asks this of every listed entry that already IS an
+        # attachment off a memo — the only rows `link_attachments` stats either: an entry this
+        # request finalizes has no row to stat yet, and a row already on this memo is kept, not
+        # adopted. So reaching it here means the bytes went AFTER that judgement, while the
+        # row was locked and held, which nothing in this transaction does. It stands as the
+        # write-time fence: a declared
         # list cannot let `link_attachments`'s silent skip pass, or it would answer 200 to a
         # request whose result is one picture short.
         raise _attachment_uids_invalid([(uid, "missing") for uid in refused])
@@ -1274,8 +1283,9 @@ async def patch_memo(
             async def judge_the_list() -> None:
                 # Every refusal the declared list can earn, taken while the request has changed
                 # nothing on disk. Its one correct moment is the end of finalization's pass 0: the
-                # rows are locked and revalidated by then, and pass 1 has not moved a file — and
-                # pass 1 REPLACES a print master in place, which no rollback undoes.
+                # rows are locked and revalidated by then and nothing has moved a file yet — and
+                # pass 2 REPLACES a print master in place when a print binds to a memo sibling,
+                # which no rollback undoes.
                 nonlocal judged, bound
                 judged, bound = await _judge_picture_list(
                     db, owner_id, memo_id, body.attachment_uids or (), named_upload_uids
@@ -1357,8 +1367,10 @@ async def patch_memo(
                 )
                 if result.outcome != "reclaimed":
                     # The edit IS saved, so this cannot become an error response. A reclaim that
-                    # did not take the row changed nothing about it, and nothing else reports
-                    # that, so the line names both uids to leave it findable.
+                    # did not take the row changed nothing about it; reclaim logs the skip and the
+                    # unlink failure itself, but a row that had already vanished it reports
+                    # nowhere, and neither tells which memo the row came off — so the line names
+                    # both uids to leave it findable.
                     logger.warning(
                         "memo.patch.attachment_not_reclaimed",
                         memo_uid=uid,
@@ -1454,7 +1466,9 @@ async def delete_memo(
         if result.outcome != "reclaimed":
             # The memo IS deleted — that is what the caller asked for and it has committed, so
             # this cannot become an error response. A reclaim that did not take the row changed
-            # nothing about it, and nothing else reports that, which is what this line is for.
+            # nothing about it; reclaim logs the skip and the unlink failure itself, but a row
+            # that had already vanished it reports nowhere, and neither of its lines says which
+            # memo delete asked for the row — which is what this one is for.
             logger.warning(
                 "memo.delete.attachment_not_reclaimed",
                 attachment_id=attachment_id,
