@@ -196,6 +196,41 @@ def _ineligible(
     return None
 
 
+async def _unlink_off_the_loop(
+    remove: Callable[[list[Path]], list[str]], paths: list[Path]
+) -> tuple[list[str], asyncio.CancelledError | None]:
+    """Unlink OFF the event loop, and come back only once the thread has RETURNED.
+
+    A cancellation delivered to the reclaim itself — `asyncio.run`'s teardown of whatever tasks are
+    left, the API loop's own, a caller cancelling the task directly — arrives at the `await` on
+    this thread AT ONCE, while the thread runs on: nothing about a worker thread can be cancelled.
+    Taken there, the reclaim would unwind mid-unlink, which is precisely the state this module
+    exists to prevent. So the thread is started once, and each cancellation is caught, REMEMBERED
+    and the SAME future awaited again — the shield is what keeps the re-await from passing the
+    cancellation down to it — until the unlinks are actually over. The remembered cancellation is
+    handed back for the caller to re-raise after it has finished the transaction.
+
+    `run_in_executor` rather than this module's usual `to_thread.run_sync`, for the one reason that
+    decides it: a coroutine has to be driven by a TASK, and a task is exactly what the teardown
+    cancels — `asyncio.run` cancels every task `all_tasks()` returns, this offload's included, and
+    a cancelled offload loses the thread's answer while the thread keeps deleting. The future this
+    returns is not a task, so the teardown leaves it alone and the answer still arrives.
+
+    The profile enumeration above keeps `to_thread.run_sync` and stays cancellable on purpose: it
+    only reads, so a reclaim that ends there has deleted nothing and rolls back with every file
+    still named by its row.
+    """
+    thread = asyncio.get_running_loop().run_in_executor(None, remove, paths)
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(thread), cancellation
+        except asyncio.CancelledError as exc:
+            if thread.done():
+                raise  # the offload itself ended cancelled: no thread of ours is still running
+            cancellation = exc
+
+
 async def reclaim_attachment(
     db: AsyncSession,
     attachment_id: int,
@@ -279,7 +314,7 @@ async def reclaim_attachment(
         )
         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
     paths = all_asset_paths(att) + profile_assets
-    failed = await to_thread.run_sync(remove, paths)
+    failed, cancellation = await _unlink_off_the_loop(remove, paths)
     if failed:
         # FAIL CLOSED. Deleting the row now would leave these files with nothing naming them — the
         # one outcome this module exists to prevent, arriving on the very failure the journal is
@@ -287,10 +322,18 @@ async def reclaim_attachment(
         # and tolerates the ones this attempt already removed.
         await db.rollback()
         logger.error("reclaim.unlink_failed", attachment_id=attachment_id, paths=failed)
-        return ReclaimResult("failed_unlink", tuple(failed))
-    await db.delete(att)
-    await db.commit()
-    return ReclaimResult("reclaimed")
+        result = ReclaimResult("failed_unlink", tuple(failed))
+    else:
+        await db.delete(att)
+        await db.commit()
+        result = ReclaimResult("reclaimed")
+    if cancellation is not None:
+        # Only NOW, with the thread returned and the transaction finished either way. Unwinding at
+        # the await above would have released the row's lock with the unlinking still going — the
+        # row live again, adoptable, and a thread deleting the adopter's bytes. The cancellation is
+        # not swallowed either: whoever asked for it still gets it, one step later than they asked.
+        raise cancellation
+    return result
 
 
 # Docker allows 10 s between SIGTERM and SIGKILL (the stack compose sets no `stop_grace_period`),
