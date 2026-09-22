@@ -24,7 +24,7 @@ from app.database import async_session
 from app.main import app
 from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, User
 from app.routers import memos as memos_router
-from app.services.reclaim import Revalidate, reclaim_attachment
+from app.services.reclaim import Revalidate, reclaim_attachment, unlink_paths
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
@@ -204,16 +204,28 @@ async def test_an_old_file_detached_just_now_is_not_swept(db_engine, monkeypatch
 
 
 async def test_the_sweep_takes_its_rows_by_id(db_engine, monkeypatch, tmp_path):
-    """Ascending, like every other acquisition here, and it holds no lock while it discovers."""
+    """Ascending, like every other acquisition here, and it holds no lock while it discovers.
+
+    The order is OBSERVED rather than inferred from the outcome: both rows are gone whichever way
+    round the pass took them, so only the sequence of the reclaims themselves says anything. The
+    sweep's own unlink seam is where that sequence shows — one call per row, inside its lock.
+    """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         stale = datetime.now(UTC) - 2 * GRACE
         first, one = _seed(tmp_path, "batch-a", detached_at=stale)
         second, two = _seed(tmp_path, "batch-b", detached_at=stale)
         assert first < second
+        row_of = {one: first, two: second}
+        taken: list[int] = []
 
-        assert await worker.sweep_detached_attachments() == 2
+        def watch(paths: list[Path]) -> list[str]:
+            taken.extend(row_of[path] for path in paths if path in row_of)
+            return unlink_paths(paths)
 
+        assert await worker.sweep_detached_attachments(unlink=watch) == 2
+
+        assert taken == [first, second]
         assert _rows("SELECT id FROM attachments") == []
         assert not one.exists() and not two.exists()
     finally:
