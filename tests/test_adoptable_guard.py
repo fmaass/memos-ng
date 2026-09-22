@@ -331,6 +331,16 @@ async def test_a_reclaim_that_unwound_after_discovery_is_still_caught(
 
         assert fired == 1, "the acquisition never ran — this test proves nothing"
         assert out != [att_uid]
+        # A different uid is not yet the answer this upload needed: what it needed is its own
+        # bytes, on disk, under the row it was given back.
+        [(made_uid, made_path)] = _rows(
+            "SELECT uid, storage_path FROM attachments WHERE uid = :u", u=out[0]
+        )
+        assert made_uid != att_uid
+        assert Path(made_path).read_bytes() == BYTES
+        # And the half-deleted row is still there, still unlinked: the guard refused it, it did
+        # not delete it — the reclaim that half-removed it is the only thing that may finish it.
+        assert _rows("SELECT memo_id FROM attachments WHERE uid = :u", u=att_uid) == [(None,)]
     finally:
         _cleanup()
 
