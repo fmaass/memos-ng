@@ -99,6 +99,19 @@ def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
             logger.error("memo.write.poster_discard_failed", path=path)
 
 
+async def _after_commit_seam() -> None:
+    """The instant between a detaching request's commit and its after-commit reclaim.
+
+    Nothing production does can open that gap — the commit and the reclaim loop are adjacent
+    statements in one coroutine — yet it is exactly the window the epoch fence exists for: a
+    standalone finalize that dedups onto one of the rows this request just detached adopts it
+    there, and a reclaim that did not carry its own detach instant would take the adopter's bytes.
+    So the gap is a named no-op the interleaving witnesses can hold open, rather than a race no
+    test can reach.
+    """
+    return None
+
+
 def _unlink_all(paths: list[str]) -> None:
     """Remove files a memo write no longer has any use for (off-loop). Never raises.
 
@@ -1264,6 +1277,7 @@ async def patch_memo(
             await _enqueue_frame_shares_safe(db, edited, user)
             await db.commit()
             committed = True
+            await _after_commit_seam()
             if consumed:
                 await to_thread.run_sync(_unlink_all, consumed)
             # PHASE 2, exactly as the delete route does it: the edit is durable, and only now does
@@ -1358,6 +1372,7 @@ async def delete_memo(
     # the lock, so the orphan journal names what the row actually carries now (§3.3).
     orphaned, detached_at = await svc.delete_memo(db, locked)
     await db.commit()
+    await _after_commit_seam()
     # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
     # its files, then the row. Each id gets its own transaction, so a failure part way through
     # leaves the rest as detached rows the sweep finishes once their grace elapses, rather than

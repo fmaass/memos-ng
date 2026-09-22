@@ -12,27 +12,42 @@ again (a newer one). Both belong to whoever touched them last, so both are refus
 cutoff the pass selected on.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import structlog
-from app import worker
+from app import auth, worker
 from app.config import settings
+from app.csrf import canonical_origin
 from app.database import async_session
+from app.main import app
 from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, User
+from app.routers import memos as memos_router
 from app.services.reclaim import Revalidate, reclaim_attachment
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from tests.conftest import SYNC_URL
 
 GRACE = timedelta(seconds=worker.REAP_INTERVAL_SECONDS)
+# Generous next to the milliseconds a released park needs: every wait below ends on an OBSERVED
+# state change, so this only bounds a hang.
+SEAM_TIMEOUT = 30.0
 
 
 def _cleanup():
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
-        for table in ("media_jobs", "attachment_renditions", "attachments", "memos", "users"):
+        for table in (
+            "media_jobs",
+            "attachment_renditions",
+            "uploads",
+            "attachments",
+            "memos",
+            "users",
+        ):
             c.execute(text(f"DELETE FROM {table}"))
     eng.dispose()
 
@@ -253,20 +268,174 @@ async def test_a_candidate_adopted_before_the_lock_is_refused(db_engine, monkeyp
         _cleanup()
 
 
-async def test_a_sweep_pass_skips_the_row_an_upload_adopted(db_engine, monkeypatch, tmp_path):
-    """The whole pass, not just the reclaim: an adopted row is still `memo_id IS NULL`, and the
-    upload that adopted it gets to keep its files."""
+# --- the real adoption, driven through the routes -----------------------------------------------
+
+
+class Seam:
+    """A one-shot park for `memos_router._after_commit_seam`, with a SYNCHRONOUS claim.
+
+    `calls` is incremented before any await, so if a second request ever reached the seam the two
+    could not both believe they were the parked one — the rule every one-shot answer here follows.
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.parked = 0
+
+    async def hold(self) -> None:
+        self.calls += 1
+        if self.calls > 1:
+            return
+        self.parked += 1
+        self.entered.set()
+        await asyncio.wait_for(self.release.wait(), timeout=SEAM_TIMEOUT)
+
+    def fired(self) -> None:
+        assert self.parked == 1, (
+            f"the request never parked between its commit and its reclaim ({self.parked}) — "
+            "this test proves nothing"
+        )
+
+
+def _png(marker: bytes) -> bytes:
+    return b"\x89PNG\r\n\x1a\x08" + marker + b"0" * 3000
+
+
+def _upload(client, name: str, data: bytes) -> str:
+    created = client.post(
+        "/api/uploads",
+        json={
+            "filename": name,
+            "mime": "image/png",
+            "size": len(data),
+            "last_modified": 1609459200000,
+        },
+    )
+    assert created.status_code == 201, created.text
+    uid = created.json()["upload_uid"]
+    appended = client.patch(f"/api/uploads/{uid}", content=data, headers={"Upload-Offset": "0"})
+    assert appended.status_code == 200, appended.text
+    return uid
+
+
+def _async_client(client) -> AsyncClient:
+    """An async client on the SAME session as the TestClient fixture: the login flow leaves more
+    than one cookie of that name in the jar, so the LAST one is the live session."""
+    sid = [c.value for c in client.cookies.jar if c.name == auth.SID_COOKIE][-1]
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+        headers={"Origin": canonical_origin()},
+        cookies={auth.SID_COOKIE: sid or ""},
+    )
+
+
+def _the_attachment() -> tuple[str, Path]:
+    """The one attachment in the database, and where its original lives."""
+    rows = _rows("SELECT uid, storage_path FROM attachments")
+    assert len(rows) == 1, rows
+    return rows[0][0], Path(rows[0][1])
+
+
+async def _adopted_in_the_gap(client, monkeypatch, tmp_path, request):
+    """Run `request(async_client, memo_uid)` and let a REAL standalone finalize adopt the row it
+    detaches, in the gap between its commit and its after-commit reclaim.
+
+    Returns `(the request's response, the attachment uid, its original, the captured logs)`.
+    """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    shared = _png(b"adopt")
+    memo = client.post(
+        "/api/memos",
+        json={
+            "content": "pics",
+            "visibility": "PRIVATE",
+            "upload_uids": [_upload(client, "shot.png", shared)],
+        },
+    )
+    assert memo.status_code == 201, memo.text
+    att_uid, original = _the_attachment()
+    assert original.exists()
+    # The adopter's own upload session, holding bytes identical to the attachment's — which is what
+    # makes finalize dedup onto that row instead of minting a new one.
+    twin = _upload(client, "shot.png", shared)
+
+    seam = Seam()
+    monkeypatch.setattr(memos_router, "_after_commit_seam", seam.hold)
+    with structlog.testing.capture_logs() as logs:
+        async with _async_client(client) as detacher, _async_client(client) as adopter:
+            detaching = asyncio.create_task(request(detacher, memo.json()["uid"]))
+            await asyncio.wait_for(seam.entered.wait(), timeout=SEAM_TIMEOUT)
+            # The detach has COMMITTED and its reclaim has not run: this is the window.
+            adopted = await adopter.post(f"/api/uploads/{twin}/finalize")
+            assert adopted.status_code == 200, adopted.text
+            assert adopted.json()["uid"] == att_uid, "the finalize did not dedup onto the row"
+            seam.release.set()
+            answer = await detaching
+    seam.fired()
+    return answer, att_uid, original, logs
+
+
+def _still_adopted(att_uid: str, original: Path) -> None:
+    assert _rows("SELECT uid, memo_id, detached_at FROM attachments WHERE uid=:u", u=att_uid) == [
+        (att_uid, None, None)
+    ], "the reclaim took the row the adopter now owns"
+    assert original.exists(), "the reclaim took the bytes the adopter now owns"
+
+
+def _not_reclaimed(logs, event: str) -> None:
+    refusals = [entry for entry in logs if entry["event"] == event]
+    assert [entry["outcome"] for entry in refusals] == ["skipped_ineligible"], refusals
+
+
+async def test_a_delete_leaves_the_row_a_finalize_adopted_after_its_commit(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """DELETE's after-commit loop, against a REAL adoption in its own gap.
+
+    `memo_id` is NULL either way — the adoption clears the instant, it does not relink — so linkage
+    cannot tell the adopter's row from this delete's garbage. Only the epoch can, which is why the
+    loop has to carry the instant its own transaction stamped.
+    """
+    client, _ = logged_in_client
     try:
-        att_id, original = _seed(tmp_path, "readopted", detached_at=datetime.now(UTC) - 2 * GRACE)
-        _stamp(att_id, None)
 
-        assert await worker.sweep_detached_attachments() == 0
+        async def delete(async_client, memo_uid):
+            return await async_client.delete(f"/api/memos/{memo_uid}")
 
-        assert _rows("SELECT id, detached_at FROM attachments WHERE id=:a", a=att_id) == [
-            (att_id, None)
-        ]
-        assert original.exists()
+        answer, att_uid, original, logs = await _adopted_in_the_gap(
+            client, monkeypatch, tmp_path, delete
+        )
+
+        assert answer.status_code == 204, answer.text
+        assert _rows("SELECT id FROM memos") == []
+        _still_adopted(att_uid, original)
+        _not_reclaimed(logs, "memo.delete.attachment_not_reclaimed")
+    finally:
+        _cleanup()
+
+
+async def test_a_patch_leaves_the_row_a_finalize_adopted_after_its_commit(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """The same experiment on the other caller: a picture list that drops its only picture detaches
+    exactly as a delete does, and its after-commit loop owes the adopter the same fence."""
+    client, _ = logged_in_client
+    try:
+
+        async def patch(async_client, memo_uid):
+            return await async_client.patch(f"/api/memos/{memo_uid}", json={"attachment_uids": []})
+
+        answer, att_uid, original, logs = await _adopted_in_the_gap(
+            client, monkeypatch, tmp_path, patch
+        )
+
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["attachments"] == []
+        _still_adopted(att_uid, original)
+        _not_reclaimed(logs, "memo.patch.attachment_not_reclaimed")
     finally:
         _cleanup()
 
