@@ -62,9 +62,12 @@ REAP_INTERVAL_SECONDS = 3600
 # so in between, a row a live request is about to clean up looks exactly like one nobody wants.
 # Nothing BOUNDS that gap: an after-commit loop has no deadline and no limit on how many rows it
 # walks, and any of them can wait on another transaction's lock. So an hour is a margin against the
-# ordinary case, not a proof — what actually keeps the sweep off a live request's row is the
-# revalidation under the lock (`Revalidate.DETACHED`), which refuses any row whose instant has
-# changed since the pass selected it. The hour is free on top of that: it is the cadence the sweep
+# ordinary case and nothing more. Past it the two do meet: a request still cleaning up left the
+# instant it stamped unchanged, so the revalidation under the lock (`Revalidate.DETACHED`) passes
+# the row — it refuses a row whose instant CHANGED since the pass selected it, an adoption or a
+# re-detachment, and a slow request changes nothing. What keeps that from costing anything is the
+# row's own lock: whichever of the two reaches it first reclaims it, and the other finds the row
+# gone and says so (`vanished`). The hour is free on top of that: it is the cadence the sweep
 # already rides, and the row is off the user's memo the moment the request commits either way.
 DETACH_GRACE_SECONDS = REAP_INTERVAL_SECONDS
 # The worker healthcheck's staleness bar, restated here because the bounds below are chosen
@@ -918,8 +921,10 @@ async def sweep_detached_attachments(
     revalidation judge every row against the same instant. Discovery holds no lock; the reclaim
     then takes the row's jobs and the row itself, in that order, in its own transaction. The
     attachment row is NOT skipped when locked: waiting is how this pass gets to judge the row
-    against what the holder actually did, under the lock and against this pass's own cutoff, and
-    the wait is milliseconds; skipping would defer that judgement by a whole hourly cadence.
+    against what the holder actually did, under the lock and against this pass's own cutoff, where
+    skipping would defer that judgement by a whole hourly cadence. Nothing bounds that wait — the
+    holder may itself be stalled in filesystem work with the row locked — which is why the pass
+    checks its own deadline between rows rather than trusting any one row to be quick.
 
     The pass is bounded by the same number the supervisor bounds it with, spent from its own
     monotonic clock and checked BETWEEN rows, so a sweep that has run out takes no further row and
@@ -956,36 +961,18 @@ async def sweep_detached_attachments(
                 candidates=len(candidates),
             )
             break
-        # SHIELDED, and the session is opened INSIDE the shielded unit: the bound's cancellation
-        # may not land between the row's lock and the end of its unlink. There it would unwind the
-        # transaction — releasing the lock and putting the row back — while the thread doing the
-        # unlinking runs on to completion, which is the one outcome `reclaim` is built to prevent:
-        # a row that is live again and files that are gone. Shielded, the cancellation is delivered
-        # HERE instead, the row's own transaction finishes off the loop with its lock held, and the
-        # pass ends at a row boundary.
-        result = await asyncio.shield(_reclaim_detached_row(attachment_id, cutoff, unlink))
+        # The shared unit every caller runs: a task of its own, holding its own session, awaited
+        # through a shield. The bound's cancellation may not land between the row's lock and the
+        # end of its unlink — there it would unwind the transaction, releasing the lock and putting
+        # the row back, while the thread doing the unlinking ran on to completion, which is the one
+        # outcome `reclaim` is built to prevent. It is delivered HERE instead, and the pass ends at
+        # a row boundary with that row's own reclaim finishing under its lock.
+        result = await reclaim.reclaim_row_shielded(
+            attachment_id, reclaim.Revalidate.DETACHED, unlink=unlink, detached_before=cutoff
+        )
         if result.outcome == "reclaimed":
             reclaimed += 1
     return reclaimed
-
-
-async def _reclaim_detached_row(
-    attachment_id: int, cutoff: datetime, unlink: Callable[[list[Path]], list[str]] | None
-) -> reclaim.ReclaimResult:
-    """One candidate row's reclaim, session and all, as ONE unit the sweep can shield.
-
-    The session lives in here rather than around the shield so that the lock, the unlink and the
-    commit-or-rollback are inseparable: everything this row holds is released by this coroutine
-    finishing, never by a cancellation arriving in the middle of it.
-    """
-    async with async_session() as db:
-        return await reclaim.reclaim_attachment(
-            db,
-            attachment_id,
-            reclaim.Revalidate.DETACHED,
-            unlink=unlink,
-            detached_before=cutoff,
-        )
 
 
 async def sweep_detached_attachments_safe() -> int:
@@ -1564,9 +1551,11 @@ async def run() -> None:
                 # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
                 # is deleted from Dropbox. The retention half is the step this bound was raised on.
                 # The grace period is this block's own interval, so a row becomes a candidate one
-                # cadence after it was detached. That is an age and nothing more — what keeps the
-                # sweep off a row a request is still cleaning up after is the revalidation under
-                # that row's lock, against the cutoff this pass selected on.
+                # cadence after it was detached. That is an age and nothing more: a request still
+                # cleaning up after itself an hour later left its instant unchanged and its row
+                # IS a candidate. The revalidation under that row's lock refuses the rows whose
+                # instant moved since this pass selected it; the lock itself is what keeps the two
+                # from reclaiming the same row twice.
                 await _bounded("detached_attachment_sweep", sweep_detached_attachments_safe(), 0)
                 await _bounded("digest_sweep", sweep_digest_safe(), None)
                 last_reap = time.time()
@@ -1599,6 +1588,15 @@ async def run() -> None:
                     # than left to surface as an unretrieved-task warning, and it must not mask
                     # the shutdown that is in progress.
                     logger.exception("worker_consumer_teardown_error")
+            # AFTER the consumers, and for a sharper reason than tidiness: a reclaim nobody is
+            # awaiting any more — a pass whose bound expired with a row in flight — is holding
+            # that row's lock while a thread deletes its files, and what follows this teardown is
+            # `asyncio.run` cancelling whatever tasks are left. Cancelled there it would unwind
+            # mid-unlink, which is the one state `reclaim` exists to prevent. Bounded by docker's
+            # stop grace, spent after the consumers have spent theirs, and nothing is cancelled
+            # when it runs out: `drain_pending_reclaims` says what is still running and the
+            # process exit is then the only thing that ends it.
+            await reclaim.drain_pending_reclaims()
         finally:
             # Only NOW are the signals given back. Removing them before the teardown would leave
             # the default action installed for exactly the seconds the consumers spend writing

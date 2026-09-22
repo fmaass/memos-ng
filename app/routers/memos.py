@@ -1347,8 +1347,13 @@ async def patch_memo(
             # would let a file this request could not delete undo an edit the user was told was
             # saved.
             for attachment_id, attachment_uid in detached_ids:
-                result = await reclaim.reclaim_attachment(
-                    db, attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
+                # The shared unit, in a task of its own: this request's session must not be what
+                # holds the row, or a cancellation arriving while its files are being unlinked off
+                # the loop would close that session and put the row back — adoptable, with a thread
+                # still deleting its bytes. A cancellation here ends the loop (the shield re-raises
+                # it); the row in flight finishes under its own lock and the shutdown awaits it.
+                result = await reclaim.reclaim_row_shielded(
+                    attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
                 )
                 if result.outcome != "reclaimed":
                     # The edit IS saved, so this cannot become an error response. A reclaim that
@@ -1440,8 +1445,11 @@ async def delete_memo(
     # instant: between the commit above and the lock below a standalone upload can dedup onto one
     # of these rows and clear the stamp, and those bytes are live media this loop must not take.
     for attachment_id in orphaned:
-        result = await reclaim.reclaim_attachment(
-            db, attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
+        # In a task of its own, holding its own session, for the reason the edit route states: a
+        # cancelled request must not be able to release the row while the thread unlinking its
+        # files runs on.
+        result = await reclaim.reclaim_row_shielded(
+            attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
         )
         if result.outcome != "reclaimed":
             # The memo IS deleted — that is what the caller asked for and it has committed, so

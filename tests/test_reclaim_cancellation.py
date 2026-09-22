@@ -74,6 +74,11 @@ class _InFlight:
         self.taken_id, self.taken_original = taken
         self.spared_id, self.spared_original = spared
 
+    async def finish(self) -> None:
+        """Let the parked unlink through and give the reclaim its moment to commit."""
+        self.park.release.set()
+        await _settled(self.taken_id)
+
 
 def _two_pictures(client, tmp_path) -> tuple[str, dict[int, Path]]:
     """A memo carrying two real pictures. Returns its uid and each attachment id's original."""
@@ -144,8 +149,6 @@ async def _cancelled_mid_unlink(client, monkeypatch, tmp_path, request_call):
             yield _InFlight(
                 park, (taken[0], originals[taken[0]]), (spared[0], originals[spared[0]])
             )
-            park.release.set()
-            await _settled(taken[0])
     finally:
         park.release.set()
         await _quiesced(list(originals))
@@ -187,7 +190,8 @@ async def test_a_cancelled_patch_keeps_the_lock_until_its_unlink_ends(
         assert await asyncio.to_thread(_is_locked, inflight.taken_id), (
             "the row was adoptable while the thread unlinking its files ran on"
         )
-    _reclaimed(inflight)
+        await inflight.finish()
+        _reclaimed(inflight)
 
 
 async def test_a_cancelled_delete_keeps_the_lock_until_its_unlink_ends(
@@ -204,7 +208,8 @@ async def test_a_cancelled_delete_keeps_the_lock_until_its_unlink_ends(
         assert await asyncio.to_thread(_is_locked, inflight.taken_id), (
             "the row was adoptable while the thread unlinking its files ran on"
         )
-    _reclaimed(inflight)
+        await inflight.finish()
+        _reclaimed(inflight)
 
 
 async def test_the_worker_stop_waits_for_a_reclaim_its_sweep_abandoned(
@@ -278,6 +283,6 @@ async def test_the_api_shutdown_waits_for_a_reclaim_a_cancelled_request_left(
         stopping = asyncio.create_task(shutdown())
         await asyncio.sleep(0.5)
         assert not stopping.done(), "the lifespan shutdown did not wait for the reclaim in flight"
-        inflight.park.release.set()
+        await inflight.finish()
         await asyncio.wait_for(stopping, timeout=STOP_GRACE_SECONDS)
-    _reclaimed(inflight)
+        _reclaimed(inflight)

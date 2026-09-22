@@ -52,6 +52,7 @@ the row gone, and discards its own output). Collecting the DERIVABLE set rather 
 happen to exist is the other half of it — a path that is empty now may not be by step 4.
 """
 
+import asyncio
 import enum
 import re
 from collections.abc import Callable
@@ -67,6 +68,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
+from app.database import async_session
 from app.models import Attachment, MediaJob
 from app.services import printready
 from app.services.asset_paths import all_asset_paths
@@ -258,8 +260,10 @@ async def reclaim_attachment(
     # 3-5. The derivable set PLUS the print profiles that are actually on disk, unlinked, and only
     #      then the row. The profiles have to be enumerated rather than derived (MEMNG-238: the set
     #      of profiles that ever existed is unbounded), and both the listing and the unlinks go off
-    #      the event loop: every stat and every unlink on this volume is a network round-trip, and
-    #      the callers run on a loop that also stamps the worker's heartbeat and drains media.
+    #      the event loop: every stat and every unlink on this volume is a network round-trip. The
+    #      loop they would otherwise hold is the worker's, which stamps the heartbeat and drains
+    #      media, or — for PATCH and DELETE, which run in the API process — the one serving every
+    #      other request.
     uid = att.uid  # read BEFORE any rollback below: it expires every instance (see above)
     try:
         profile_assets = await to_thread.run_sync(printready.profile_variant_paths_sync, uid)
@@ -287,6 +291,106 @@ async def reclaim_attachment(
     await db.delete(att)
     await db.commit()
     return ReclaimResult("reclaimed")
+
+
+# Docker allows 10 s between SIGTERM and SIGKILL (the stack compose sets no `stop_grace_period`),
+# and uvicorn's graceful shutdown is bounded on the same order. It is the whole stop's budget, not
+# this step's alone, so what it bounds here is how long a shutdown KEEPS WAITING before it says
+# what is still running — never the reclaim itself, which is exactly what must not be cut short.
+DRAIN_GRACE_SECONDS = 10.0
+
+# Every reclaim this process has in flight, whoever started it. A task is added when it is created
+# and discards itself when it ends, so what is left in here at shutdown is precisely the work no
+# caller is waiting for any more — the sweep whose bound expired, the request whose caller went
+# away — and it is the only handle a shutdown has on it.
+_pending: set[asyncio.Task[ReclaimResult]] = set()
+
+
+async def reclaim_row(
+    attachment_id: int,
+    mode: Revalidate,
+    *,
+    unlink: Callable[[list[Path]], list[str]] | None = None,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
+) -> ReclaimResult:
+    """ONE row's reclaim, session and all, as one inseparable unit — what every caller runs.
+
+    The session is opened HERE rather than handed in, so that the lock, the unlink and the
+    commit-or-rollback belong to the same thing: everything this row holds is released by this
+    coroutine finishing. A caller's own session cannot release the row early, because the reclaim
+    does not use one.
+    """
+    async with async_session() as db:
+        return await reclaim_attachment(
+            db,
+            attachment_id,
+            mode,
+            unlink=unlink,
+            detached_at=detached_at,
+            detached_before=detached_before,
+        )
+
+
+async def reclaim_row_shielded(
+    attachment_id: int,
+    mode: Revalidate,
+    *,
+    unlink: Callable[[list[Path]], list[str]] | None = None,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
+) -> ReclaimResult:
+    """`reclaim_row` as a TASK of its own, awaited through a shield — how every caller calls it.
+
+    The unlinks run off the event loop, and a direct `task.cancel()` — uvicorn's graceful-shutdown
+    timeout, `asyncio.run`'s teardown of whatever tasks are left, a caller cancelling its own work
+    — is delivered at that `await` AT ONCE, while the thread it was waiting on runs on. Awaited
+    inline, the reclaim would unwind right there: lock released, row live again, and the thread
+    deleting its files still going, free to take the bytes of whoever adopts it next. So the
+    reclaim is a task, the cancellation lands on this await instead, and the row's lock outlives
+    the thread.
+
+    The cancellation is then RE-RAISED, never swallowed: the caller was cancelled and is over, and
+    a loop that went on to its next row would be taking rows nobody is waiting for with a
+    cancellation pending. The reclaim already in flight is the one thing that continues, and it is
+    the shutdowns' to await (`drain_pending_reclaims`), not this caller's.
+    """
+    task = asyncio.create_task(
+        reclaim_row(
+            attachment_id,
+            mode,
+            unlink=unlink,
+            detached_at=detached_at,
+            detached_before=detached_before,
+        )
+    )
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.info("reclaim.caller_cancelled", attachment_id=attachment_id)
+        raise
+
+
+async def drain_pending_reclaims(grace_s: float = DRAIN_GRACE_SECONDS) -> None:
+    """Wait for the reclaims still in flight in this process — the last thing either process does.
+
+    Nothing is cancelled here, however long it takes: cancelling a reclaim mid-unlink is the very
+    defect the shield above exists to prevent, and it would be no less one for being done by a
+    shutdown. Past the grace the wait simply ends and says what is still running; the process exit
+    is then the only thing that ends those, and it ends them the hard way — the connection dies
+    with it, the transaction rolls back, and the row is live again with part of its files gone.
+    That is a state the next sweep finds and finishes, which is the whole reason the row is the
+    journal and the files are not.
+    """
+    pending = tuple(_pending)
+    if not pending:
+        return
+    logger.info("reclaim_drain_waiting", count=len(pending))
+    _, still_running = await asyncio.wait(pending, timeout=grace_s)
+    if still_running:
+        logger.warning("reclaim_drain_timeout", count=len(still_running))
 
 
 def reclaim_attachment_sync(
