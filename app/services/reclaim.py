@@ -56,6 +56,7 @@ import enum
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -98,6 +99,13 @@ class Revalidate(enum.StrEnum):
     delete. Its premise is 'no memo shows this any more', so a row that has since been claimed by a
     concurrent upload is live media and must be left alone."""
 
+    DETACHED = "detached"
+    """A periodic sweep picked this row because it has been detached from its memo for longer than
+    its grace period — long enough that no request is still cleaning up after its own commit. Its
+    premise is that whole predicate, so the instant is re-read under the lock against the SAME
+    cutoff the pass selected on: a row adopted since carries no instant, and a row detached again
+    since carries a newer one, and both belong to whoever touched them last."""
+
     LEAKED_ORPHAN = "leaked_orphan"
     """A blind scan picked this row BECAUSE it looked like garbage — the reconcile script. Its
     premise is both halves of that predicate, and its selection is the oldest thing anyone here
@@ -116,8 +124,9 @@ class ReclaimResult:
 
 
 def leaked_orphans_stmt() -> Select[tuple[Attachment]]:
-    """The attachments a deleted memo left behind, and only those — one definition, shared by the
-    worker sweep and the reconcile script so the two can never disagree about what is garbage."""
+    """The attachments a deleted memo left behind UNDER A DATED MEMO FOLDER, and only those — the
+    reconcile script's predicate, and nobody else's: an original imported from 0.29.1 stays flat in
+    `originals/`, so this path test cannot see a detached import at all."""
     return (
         select(Attachment)
         .where(Attachment.memo_id.is_(None), Attachment.storage_path.op("~")(LEAKED_PATH_RE))
@@ -146,14 +155,38 @@ def _has_leaked_path(att: Attachment) -> bool:
     return att.storage_path is not None and _LEAKED_PATH.search(att.storage_path) is not None
 
 
-def _ineligible(att: Attachment, mode: Revalidate) -> str | None:
-    """Why this row may no longer be reclaimed under `mode`, or None to go ahead."""
+def _ineligible(
+    att: Attachment,
+    mode: Revalidate,
+    *,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
+) -> str | None:
+    """Why this row may no longer be reclaimed under `mode`, or None to go ahead.
+
+    `detached_at` is ORPHANED's fence and `detached_before` is DETACHED's cutoff; each mode reads
+    only its own, because the two ask different questions of the same column — "is this still the
+    detachment I performed?" against "is this still older than the pass's cutoff?".
+    """
     if mode is Revalidate.IDENTITY:
         return None  # the row was named, and re-reading it under the lock IS the revalidation
     if att.memo_id is not None:
         return "relinked"
     if mode is Revalidate.LEAKED_ORPHAN and not _has_leaked_path(att):
         return "path_left_the_predicate"
+    if mode is Revalidate.ORPHANED and detached_at is not None:
+        # The epoch fence: this reclaim was issued ABOUT one detachment, and the row must still
+        # carry it. NULL means a dedup adopted the row; a newer instant means something detached it
+        # again, and that detachment's own cleanup owns it. A caller that names no instant is
+        # asking the older question — "is this row still unlinked?" — and gets the older answer.
+        if att.detached_at != detached_at:
+            return "adopted_or_redetached"
+    if mode is Revalidate.DETACHED:
+        # The same fence, against a pass instead of a transaction — and fail closed without a
+        # cutoff, because "sweep every detached row, whenever it was detached" is the one reading
+        # of this mode that deletes a picture the user is still editing.
+        if detached_before is None or att.detached_at is None or att.detached_at > detached_before:
+            return "adopted_or_redetached"
     return None
 
 
@@ -163,11 +196,17 @@ async def reclaim_attachment(
     mode: Revalidate,
     *,
     unlink: Callable[[list[Path]], list[str]] | None = None,
+    detached_at: datetime | None = None,
+    detached_before: datetime | None = None,
 ) -> ReclaimResult:
     """Reclaim ONE attachment in its own transaction, in the order this module documents.
 
     The caller commits nothing; this commits its own transaction, because the row lock it takes has
     to be released before the next row is touched.
+
+    `detached_at` and `detached_before` carry the caller's premise about WHEN this row was detached
+    — the instant it detached it with, or the cutoff its pass selected on — so the revalidation
+    under the lock can be about the same instant the decision was taken about (see `_ineligible`).
 
     `unlink` is the seam the crash-window tests inject at; production passes nothing.
     """
@@ -202,7 +241,7 @@ async def reclaim_attachment(
     if att is None:
         await db.commit()
         return ReclaimResult("vanished")
-    ineligible = _ineligible(att, mode)
+    ineligible = _ineligible(att, mode, detached_at=detached_at, detached_before=detached_before)
     if ineligible is not None:
         uid = att.uid  # read BEFORE the rollback: it expires every instance, and reading an
         # expired column would try to refresh it — blocking IO from a place the async session

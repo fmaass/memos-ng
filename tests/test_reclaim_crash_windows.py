@@ -410,9 +410,9 @@ async def test_the_orphaned_reclaim_honours_a_relink_committed_after_the_memo_de
         seen: list[int | None] = []
         real_ineligible = reclaim._ineligible
 
-        def spy(att_arg, mode):  # the decision point, not just the end state
+        def spy(att_arg, mode, **fences):  # the decision point, not just the end state
             seen.append(att_arg.memo_id)
-            return real_ineligible(att_arg, mode)
+            return real_ineligible(att_arg, mode, **fences)
 
         monkeypatch.setattr(reclaim, "_ineligible", spy)
 

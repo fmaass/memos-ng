@@ -20,7 +20,7 @@ import os
 import signal
 import socket
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -44,7 +44,7 @@ from app.models import (
     JobState,
     MediaJob,
 )
-from app.services import frame_share, media, push, reconcile
+from app.services import frame_share, media, push, reclaim, reconcile
 from app.services.digest import gate as digest_gate
 from app.services.digest import runner as digest_runner
 from app.services.uploads import reap_expired_committed
@@ -56,6 +56,14 @@ logger = structlog.get_logger(__name__)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 POLL_SECONDS = 10
 REAP_INTERVAL_SECONDS = 3600
+# How long a detached attachment is left alone before the sweep below treats it as garbage. It has
+# to outlast the longest gap between a request committing its detach and that request reclaiming
+# what it detached — the two are deliberately in separate transactions (`app/services/reclaim.py`),
+# so in between, a row a live request is about to clean up looks exactly like one nobody wants. An
+# hour is far more than that gap and is the cadence the sweep already rides, so the wait costs the
+# user nothing: the row is off their memo the moment the request commits, whatever happens to it
+# afterwards.
+DETACH_GRACE_SECONDS = REAP_INTERVAL_SECONDS
 # The worker healthcheck's staleness bar, restated here because the bounds below are chosen
 # against it: the compose healthcheck calls the worker unhealthy once the heartbeat is older than
 # this, and `autoheal=true` then RECREATES the container — with two consumers mid-job. It is not
@@ -102,6 +110,11 @@ HOUSEKEEPING_BOUNDS: dict[str, int] = {
     # Scans recent memos and re-enqueues poster jobs; the scan is bounded by the window, not by
     # the table.
     "commit_race_reconcile": 120,
+    # One indexed read, then a locked reclaim per candidate — each of which stats a directory on
+    # the data volume, so the cost is the backlog, not the table. Deliberately modest: the sweep is
+    # idempotent and hourly, so a pass cut short mid-backlog finishes next hour, and the rows it
+    # did reach are already committed one by one.
+    "detached_attachment_sweep": 45,
     # The largest by far, and the step the ticket was raised on: the hosted-media retention sweep
     # deletes from Dropbox with per-operation timeouts but no total, so a big expiry batch against
     # a slow remote is exactly the unbounded case. Missing a sweep costs a cycle of retention
@@ -877,6 +890,75 @@ async def run_commit_race_reconcile_safe() -> int:
     return len(report.posters_requeued)
 
 
+async def sweep_detached_attachments(
+    *, unlink: Callable[[list[Path]], list[str]] | None = None, now: datetime | None = None
+) -> int:
+    """Reclaim the attachments that have been off their memo longer than the grace period.
+
+    Nothing else finds them. The commit-race reconcile wants a memo (`app/services/reconcile.py`)
+    and the leaked-orphan predicate wants an original under a dated memo folder
+    (`app/services/reclaim.py`) — which an original imported from 0.29.1 never has, because it
+    stays flat. What both are reaching for is "something detached this and never came back", and
+    the detach instant says that directly, for an import and a native upload alike.
+
+    The cutoff is computed ONCE per pass and carried into each reclaim, so selection and
+    revalidation judge every row against the same instant. Discovery holds no lock; the reclaim
+    then takes the row's jobs and the row itself, in that order, in its own transaction. The
+    attachment row is NOT skipped when locked: a row a dedup is holding is one this pass must wait
+    for and re-read, because skipping it would leave the half-reclaimed row a later dedup could
+    still adopt.
+
+    Returns the number of rows reclaimed. `unlink` is the seam the sweep's tests inject at.
+    """
+    cutoff = (now or datetime.now(UTC)) - timedelta(seconds=DETACH_GRACE_SECONDS)
+    async with async_session() as db:
+        candidates = list(
+            (
+                await db.execute(
+                    select(Attachment.id)
+                    .where(
+                        Attachment.memo_id.is_(None),
+                        Attachment.detached_at.is_not(None),
+                        Attachment.detached_at <= cutoff,
+                    )
+                    .order_by(Attachment.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    reclaimed = 0
+    for attachment_id in candidates:
+        async with async_session() as db:
+            result = await reclaim.reclaim_attachment(
+                db,
+                attachment_id,
+                reclaim.Revalidate.DETACHED,
+                unlink=unlink,
+                detached_before=cutoff,
+            )
+        if result.outcome == "reclaimed":
+            reclaimed += 1
+    return reclaimed
+
+
+async def sweep_detached_attachments_safe() -> int:
+    """Reclaim detached attachments past their grace period, in sessions of its own with ALL errors
+    isolated — the same boundary guard the other periodic sweeps get. Returns rows reclaimed.
+
+    The count is logged on every pass, zero included: a pass that found nothing and a worker that
+    never reached its hourly block are otherwise the same silence, and this sweep deletes rows, so
+    what it did each hour is the thing an operator needs on the record.
+    """
+    try:
+        reclaimed = await sweep_detached_attachments()
+    except Exception:
+        logger.exception("detached_attachments.sweep_error")
+        return 0
+    logger.info("detached_attachments_swept", count=reclaimed)
+    return reclaimed
+
+
 async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:
     """Atomically claim the next due frame-share job (queued AND next_attempt_at reached), skipping
     rows another worker holds. Sets state=claimed so a crash mid-send never re-runs it (at-most-once
@@ -1429,6 +1511,9 @@ async def run() -> None:
                 # The digest's two sweeps ride the same cadence: a run whose process died is marked
                 # `failed` (so the 26 h stale alert can see it), and hosted media past its retention
                 # is deleted from Dropbox. The retention half is the step this bound was raised on.
+                # The same cadence the grace period is measured in: a row detached longer ago
+                # than this block's own interval is one no request is still cleaning up after.
+                await _bounded("detached_attachment_sweep", sweep_detached_attachments_safe(), 0)
                 await _bounded("digest_sweep", sweep_digest_safe(), None)
                 last_reap = time.time()
             if frame_status != "processed":  # idle/deferred → back off
