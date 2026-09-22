@@ -339,7 +339,10 @@ async def test_a_reclaim_that_unwound_after_discovery_is_still_caught(
         assert made_uid != att_uid
         assert Path(made_path).read_bytes() == BYTES
         # And the half-deleted row is still there, still unlinked: the guard refused it, it did
-        # not delete it — the reclaim that half-removed it is the only thing that may finish it.
+        # not delete it. The reclaim that half-removed it has already returned (failed_unlink, its
+        # transaction unwound), and the row keeps the detach stamp it was seeded with — so a LATER
+        # reclaim, the sweep's once the grace elapses, is what finishes it. What this upload may
+        # not do is take it.
         assert _rows("SELECT memo_id FROM attachments WHERE uid = :u", u=att_uid) == [(None,)]
     finally:
         _cleanup()

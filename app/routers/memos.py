@@ -1151,9 +1151,12 @@ async def _apply_picture_list(
     if refused:
         # A row the list named that `adoptable` refuses: one of the non-regenerable files it
         # names is gone. `_judge_picture_list` asks this of every listed entry that already IS an
-        # attachment off a memo — the only rows `link_attachments` stats either: an entry this
-        # request finalizes has no row to stat yet, and a row already on this memo is kept, not
-        # adopted. So reaching it here means the bytes went AFTER that judgement, while the
+        # attachment off a memo — the only rows `link_attachments` stats either: the attachment an
+        # entry this request finalizes became arrives VOUCHED, and a vouched uid is deliberately
+        # never stat'd (this transaction minted that row, or deduped onto a candidate pass 0 had
+        # already locked and proved adoptable — and a video finalized a moment ago has no poster
+        # tier yet, so stat'ing it would refuse the upload that created it), and a row already on
+        # this memo is kept, not adopted. So reaching it here means the bytes went AFTER that
         # row was locked and held, which nothing in this transaction does. It stands as the
         # write-time fence: a declared
         # list cannot let `link_attachments`'s silent skip pass, or it would answer 200 to a
@@ -1471,6 +1474,7 @@ async def delete_memo(
             # memo delete asked for the row — which is what this one is for.
             logger.warning(
                 "memo.delete.attachment_not_reclaimed",
+                memo_uid=uid,
                 attachment_id=attachment_id,
                 outcome=result.outcome,
                 failed_paths=list(result.failed_paths),
