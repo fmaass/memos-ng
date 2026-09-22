@@ -28,9 +28,9 @@ from app.models import (
 )
 from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
+from app.services import asset_paths, reclaim, storage
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
-from app.services import reclaim, storage
 from app.services import uploads as uploads_svc
 from app.services.asset_urls import signed_tier_urls
 
@@ -998,28 +998,34 @@ def _replayed_or_conflict(found: Memo, memo_id: int, key: str) -> Memo:
     )
 
 
-async def _resolve_picture_list(
+async def _judge_picture_list(
     db: AsyncSession,
     owner_id: int,
     memo_id: int,
     entries: Sequence[str],
     upload_uids: Collection[str],
-    resolved: Mapping[str, str],
-) -> list[str]:
-    """The attachment uids the declared list names, in the order it names them.
+) -> tuple[list[str], dict[str, str]]:
+    """Refuse every entry this list cannot resolve, and hand back the entries in declared order
+    together with the attachment each already-existing one names.
 
-    An entry is an attachment uid or an `upload_uid` of this same request; `resolved` is what
-    finalization made of the second kind, and is total over `upload_uids`, so an entry that names
-    one and is missing from it names an upload this request never finalized.
+    This runs at the END OF FINALIZATION'S PASS 0 — after the one ascending attachment acquisition,
+    before pass 1 moves a byte — so that a refused request has nothing on disk to put back. Taken
+    any later, the same deterministic 422 could fire after a sibling print bind had replaced a
+    committed master in place: those bytes are overwritten, no tracked move names them, and the
+    upload row the rollback restores promises a part file that replacement consumed.
 
-    A later entry resolving to an attachment an earlier one already reached collapses onto that
-    earlier place. Dedup and print binding both do that behind the client's back, and refusing
-    would be asking the client to know in advance something the server discovers mid-request.
+    An entry is an attachment uid or an `upload_uid` of this same request. An entry of the second
+    kind cannot be refused here and must not be: finalization has by now proved every uid in
+    `upload_uids` to be a complete, owner-scoped, locked pending row of this owner's, so what it
+    becomes is a fact pass 1 settles, not a verdict about the list. The reverse — an entry naming
+    an upload this request never finalizes — is a pure set-membership question and is answered
+    here.
 
     Everything unresolvable is collected and refused TOGETHER: the request fails whole either way,
     and a client fixing its list one uid per round trip is a client re-sending pictures. The
     lookup is owner-AGNOSTIC and takes no lock — it has to be able to say that a uid is someone
-    else's, and answering that must not queue behind a stranger's write.
+    else's, and answering that must not queue behind a stranger's write. The owner's own rows were
+    covered by the acquisition, so for them this read returns what the lock returned.
     """
     wanted = {entry for entry in entries if entry not in upload_uids}
     rows: dict[str, Attachment] = {}
@@ -1046,31 +1052,68 @@ async def _resolve_picture_list(
             ).scalars()
         )
     problems: list[tuple[str, str]] = []
+    bound: dict[str, str] = {}
+    for entry in dict.fromkeys(entries):  # the same entry twice asks for one place, not two
+        if entry in upload_uids:
+            continue
+        att = rows.get(entry)
+        if att is None:
+            problems.append((entry, "unresolvable_upload_uid" if entry in stranded else "missing"))
+            continue
+        if att.owner_id != owner_id:
+            problems.append((entry, "foreign_owner"))
+            continue
+        if att.memo_id is not None and att.memo_id != memo_id:
+            # The one `link_attachments` skips in silence, which is right for an append and
+            # catastrophic for a declared list: the skip would strand the other memo's picture
+            # AND delete every picture this list left out.
+            problems.append((entry, "other_memo"))
+            continue
+        if att.memo_id is None and not await asset_paths.adoptable(att):
+            # The owner's row, free to be linked, naming an original that is gone (19d).
+            # `link_attachments` declines to adopt it and `_apply_picture_list` turns that into
+            # this same `missing`; asking here instead is answer-identical, because nothing
+            # between this point and the link removes bytes a listed attachment owns — pass 1
+            # replaces and places, never deletes, and consumed part files go after the commit —
+            # and the row is held under the acquisition's lock until then.
+            problems.append((entry, "missing"))
+            continue
+        bound[entry] = att.uid
+    if problems:
+        raise _attachment_uids_invalid(problems)
+    return list(dict.fromkeys(entries)), bound
+
+
+def _order_picture_list(
+    entries: Sequence[str],
+    upload_uids: Collection[str],
+    resolved: Mapping[str, str],
+    bound: Mapping[str, str],
+) -> list[str]:
+    """The attachment uids the judged list names, in the order it names them.
+
+    `resolved` is what finalization made of the entries naming an upload of this request; `bound`
+    is what `_judge_picture_list` made of the rest. A later entry resolving to an attachment an
+    earlier one already reached collapses onto that earlier place: dedup and print binding both do
+    that behind the client's back, and refusing would be asking the client to know in advance
+    something the server discovers mid-request.
+    """
+    problems: list[tuple[str, str]] = []
     ordered: list[str] = []
     seen: set[str] = set()
-    for entry in dict.fromkeys(entries):  # the same entry twice asks for one place, not two
+    for entry in entries:
         if entry in upload_uids:
             attachment_uid = resolved.get(entry)
             if attachment_uid is None:
+                # No request reaches this: `resolved` is total over `upload_uids`, and an entry
+                # naming an upload this request does NOT finalize was refused before finalization
+                # ran. It stays as the fence over that totality — a finalization branch that stops
+                # recording what an upload became would otherwise silently shorten the list,
+                # and this is where a mutation of that recording lands.
                 problems.append((entry, "unresolvable_upload_uid"))
                 continue
         else:
-            att = rows.get(entry)
-            if att is None:
-                problems.append(
-                    (entry, "unresolvable_upload_uid" if entry in stranded else "missing")
-                )
-                continue
-            if att.owner_id != owner_id:
-                problems.append((entry, "foreign_owner"))
-                continue
-            if att.memo_id is not None and att.memo_id != memo_id:
-                # The one `link_attachments` skips in silence, which is right for an append and
-                # catastrophic for a declared list: the skip would strand the other memo's picture
-                # AND delete every picture this list left out.
-                problems.append((entry, "other_memo"))
-                continue
-            attachment_uid = att.uid
+            attachment_uid = bound[entry]
         if attachment_uid not in seen:
             seen.add(attachment_uid)
             ordered.append(attachment_uid)
@@ -1100,9 +1143,11 @@ async def _apply_picture_list(
         db, owner_id, memo, list(ordered), moved_out=moved, vouched=vouched, refused_out=refused
     )
     if refused:
-        # A row the list named whose original is gone. `link_attachments` declines to adopt it and
-        # a back-compat caller lets that pass; a declared list cannot, or it would answer 200 to a
-        # request whose result is one picture short of what the client asked for.
+        # A row the list named whose original is gone. `_judge_picture_list` asks this of every
+        # listed row before a byte moves, so reaching it here means the bytes went AFTER that —
+        # while the row was locked and held, which nothing in this transaction does. It stands as
+        # the write-time fence: a declared list cannot let `link_attachments`'s silent skip pass,
+        # or it would answer 200 to a request whose result is one picture short.
         raise _attachment_uids_invalid([(uid, "missing") for uid in refused])
     on_memo = (
         (await db.execute(select(Attachment).where(Attachment.memo_id == memo.id))).scalars().all()
@@ -1219,6 +1264,22 @@ async def patch_memo(
             # upload_uid -> the attachment it produced, deduped onto, or was bound to: the only
             # way a list can name a picture this same request is uploading.
             resolved: dict[str, str] = {}
+            named_upload_uids = set(body.upload_uids or ())
+            # What the judgement leaves for the placement below: the declared entries deduped, in
+            # order, and the attachment each already-existing one names.
+            judged: list[str] = []
+            bound: dict[str, str] = {}
+
+            async def judge_the_list() -> None:
+                # Every refusal the declared list can earn, taken while the request has changed
+                # nothing on disk. Its one correct moment is the end of finalization's pass 0: the
+                # rows are locked and revalidated by then, and pass 1 has not moved a file — and
+                # pass 1 REPLACES a print master in place, which no rollback undoes.
+                nonlocal judged, bound
+                judged, bound = await _judge_picture_list(
+                    db, owner_id, memo_id, body.attachment_uids or (), named_upload_uids
+                )
+
             if body.upload_uids:
                 # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto
                 # that screen instead of promoting a second visible copy of the same photo
@@ -1234,6 +1295,9 @@ async def patch_memo(
                         positions_out=positions,
                         resolved_out=resolved,
                         named_attachment_ids=named_ids,
+                        after_acquisition=(
+                            judge_the_list if body.attachment_uids is not None else None
+                        ),
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
@@ -1253,6 +1317,9 @@ async def patch_memo(
                 # and it still links, renumbers and detaches attachments. The rows have to be held
                 # before the first of those writes, in the same ascending order as everywhere else.
                 await uploads_svc.acquire_attachment_set(db, memo=edited, attachment_ids=named_ids)
+                # The same judgement, at the same point in the same order: right after the
+                # acquisition, before the link, the renumber or the detaches write anything.
+                await judge_the_list()
             if body.attachment_uids is not None:
                 # After the uploads: a uid this request is finalizing has to BE an attachment
                 # before the list can place it, and `resolved` is what says which one it became.
@@ -1260,14 +1327,7 @@ async def patch_memo(
                     db,
                     owner_id,
                     edited,
-                    await _resolve_picture_list(
-                        db,
-                        owner_id,
-                        memo_id,
-                        body.attachment_uids,
-                        set(body.upload_uids or ()),
-                        resolved,
-                    ),
+                    _order_picture_list(judged, named_upload_uids, resolved, bound),
                     set(finalized),
                     moved,
                 )

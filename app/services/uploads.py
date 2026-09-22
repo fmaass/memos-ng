@@ -3,7 +3,7 @@ import os
 import secrets
 import shutil
 import uuid
-from collections.abc import AsyncIterable, AsyncIterator, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -944,6 +944,7 @@ async def finalize_pending(
     positions_out: dict[str, int] | None = None,
     resolved_out: dict[str, str] | None = None,
     named_attachment_ids: Sequence[int] | None = None,
+    after_acquisition: Callable[[], Awaitable[None]] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -992,6 +993,12 @@ async def finalize_pending(
     finalized here and nothing reads them; they exist so pass 0's single ascending attachment
     acquisition covers the whole set the transaction touches (MEMNG-267 R3.4), instead of leaving
     `link_attachments` to acquire them afterwards in an order no other writer shares.
+
+    `after_acquisition` is awaited at the end of pass 0, and is where a caller puts a refusal it
+    wants taken for free. By then every row this transaction judges is locked and revalidated and
+    not one file has moved; from pass 1 on, a refusal is not free, because `bind_print_to_sibling`
+    replaces an existing master IN PLACE and records no tracked move for it (deliberately — see
+    there). Raising from it leaves the caller's rollback with nothing on disk to undo.
 
     `positions_out` collects attachment uid -> the 0-based index, IN `upload_uids`, of the uid that
     produced or named it (MEMNG-262). It is what the caller SORTS the returned uids by, so the
@@ -1148,6 +1155,8 @@ async def finalize_pending(
         digest: att for digest, att in locked.candidates.items() if await asset_paths.adoptable(att)
     }
     # ---- end of pass 0. Nothing below acquires another row. ---------------------------------
+    if after_acquisition is not None:
+        await after_acquisition()
 
     async def _finalize_one(upload: Upload) -> Attachment:
         """Finalize one upload as an attachment and consume its poster override, if it has one.
