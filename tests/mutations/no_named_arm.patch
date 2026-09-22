@@ -1,6 +1,6 @@
 --- a/app/services/uploads.py
 +++ b/app/services/uploads.py
-@@ -1008,8 +1008,6 @@
+@@ -1130,8 +1130,6 @@ async def finalize_pending(
      a_predicates = []
      if locked.candidates:
          a_predicates.append(Attachment.id.in_({a.id for a in locked.candidates.values()}))
@@ -8,4 +8,4 @@
 -        a_predicates.append(Attachment.id.in_(set(named_attachment_ids)))
      if memo is not None:
          a_predicates.append(Attachment.memo_id == memo.id)
-     # The ids the locking statement ACTUALLY RETURNED. `populate_existing` refreshes what comes
+     # Judging the stale identity-map object instead of what the lock returned would let a
