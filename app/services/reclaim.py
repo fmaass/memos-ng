@@ -207,8 +207,11 @@ async def _unlink_off_the_loop(
     Taken there, the reclaim would unwind mid-unlink, which is precisely the state this module
     exists to prevent. So the thread is started once, and each cancellation is caught, REMEMBERED
     and the SAME future awaited again — the shield is what keeps the re-await from passing the
-    cancellation down to it — until the unlinks are actually over. The remembered cancellation is
-    handed back for the caller to re-raise after it has finished the transaction.
+    cancellation down to it — until the unlinks are actually over. EVERY cancellation, with no
+    case for a future that is already done: nothing cancels this one (it is deliberately not a
+    task), so done at a cancellation means the offload FINISHED, its answer or its error sitting
+    in it, and the re-await hands that back at once instead of unwinding on top of it. The
+    remembered cancellation is handed back for the caller to re-raise after the transaction.
 
     `run_in_executor` rather than this module's usual `to_thread.run_sync`, for the one reason that
     decides it: a coroutine has to be driven by a TASK, and a task is exactly what the teardown
@@ -226,8 +229,6 @@ async def _unlink_off_the_loop(
         try:
             return await asyncio.shield(thread), cancellation
         except asyncio.CancelledError as exc:
-            if thread.done():
-                raise  # the offload itself ended cancelled: no thread of ours is still running
             cancellation = exc
 
 

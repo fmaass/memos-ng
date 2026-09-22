@@ -16,6 +16,7 @@ the worker's stop, and the API's lifespan shutdown.
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import threading
 from datetime import UTC, datetime
@@ -331,6 +332,87 @@ async def test_a_reclaim_cancelled_directly_still_finishes_its_unlink_and_commit
         park.release.set()
         await _quiesced([att_id])
         _cleanup()
+
+
+class _RecordingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """The loop's default executor, keeping the future each offload runs on.
+
+    `_unlink_off_the_loop` keeps that future to itself, and the case below has to cancel in the one
+    instant that only ITS state defines: the offload over, the reclaim not yet resumed. The unlink
+    is picked out by the callable — `asyncio.to_thread` submits through here too.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=4, thread_name_prefix="recording")
+        self.submitted: list[tuple[object, concurrent.futures.Future]] = []
+
+    def submit(self, fn, /, *args, **kwargs):  # type: ignore[override]
+        future = super().submit(fn, *args, **kwargs)
+        self.submitted.append((fn, future))
+        return future
+
+    def future_for(self, fn) -> concurrent.futures.Future:
+        mine = [future for called, future in self.submitted if called is fn]
+        assert len(mine) == 1, f"{len(mine)} offloads of {fn} of {self.submitted}"
+        return mine[0]
+
+
+async def test_a_reclaim_cancelled_after_its_unlink_finished_still_commits(
+    db_engine, monkeypatch, tmp_path
+):
+    """The cancellation that arrives once the offload is OVER and before the reclaim resumed.
+
+    A finished future is not a cancelled one. Nothing cancels this one — it is deliberately not a
+    task — so the only way it is ever done at a cancellation is that the thread RETURNED, with its
+    answer sitting in it and the files already gone. Read there as "the offload ended cancelled",
+    that instant loses everything the offload was for: the reclaim unwinds, and the rollback puts
+    back a row naming files that no longer exist.
+
+    The instant is BUILT, not waited for. The loop is parked on a threading event across the
+    thread's return, so the future's own completion and the cancel are both queued on it before it
+    turns again — and a queue is ordered: the reclaim wakes cancelled with its answer already there.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att_id, original = _seed(
+        tmp_path, "cancelled-after-unlink", detached_at=datetime.now(UTC) - 2 * GRACE
+    )
+    park = _Park(reclaim.unlink_paths)
+    monkeypatch.setattr(reclaim, "unlink_paths", park)
+    loop = asyncio.get_running_loop()
+    executor = _RecordingExecutor()
+    monkeypatch.setattr(loop, "_default_executor", executor)
+    try:
+        task = asyncio.create_task(
+            reclaim.reclaim_row(
+                att_id, reclaim.Revalidate.DETACHED, detached_before=datetime.now(UTC)
+            )
+        )
+        await _wait_for(park.entered, "the reclaim never reached the unlink seam")
+        armed = threading.Event()
+
+        def _cancel_behind_the_answer(_) -> None:
+            """On the unlink's own thread, after the future's own callback queued the answer."""
+            loop.call_soon_threadsafe(task.cancel)
+            armed.set()
+
+        executor.future_for(park).add_done_callback(_cancel_behind_the_answer)
+        park.release.set()
+        # Parked on purpose, and the only place in this file the loop is: it must not turn until
+        # the answer and the cancellation are both on its queue, in that order.
+        assert armed.wait(SEAM_TIMEOUT), "the unlink thread never returned"
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await asyncio.wait_for(task, timeout=STOP_GRACE_SECONDS)
+        assert task.cancelled(), "the reclaim swallowed a cancellation its caller has to see"
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [], (
+            "a finished offload was taken for a cancelled one: the transaction unwound and the "
+            "row is back, naming files the thread had already deleted"
+        )
+        assert not original.exists()
+    finally:
+        park.release.set()
+        await _quiesced([att_id])
+        _cleanup()
+        executor.shutdown(wait=True)
 
 
 async def test_the_worker_process_exit_commits_a_reclaim_the_drain_gave_up_on(
