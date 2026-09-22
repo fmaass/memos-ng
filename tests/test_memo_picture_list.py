@@ -15,9 +15,14 @@ place its entries asked for.
 
 import hashlib
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
+import structlog
 from app.config import settings
+from app.services import reclaim
 from sqlalchemy import create_engine, text
 
 from tests.conftest import SYNC_URL
@@ -167,6 +172,24 @@ def _three(client) -> tuple[dict, list[str]]:
     return memo, uids
 
 
+@contextmanager
+def _unlink_always_fails() -> Iterator[list[str]]:
+    """Hold every reclaim at its unlink seam, where it fails closed: it rolls its own transaction
+    back and leaves the row detached with its files intact. Yields the paths it was asked for."""
+    asked: list[str] = []
+
+    def always_fails(paths: list[Path]) -> list[str]:
+        asked.extend(str(path) for path in paths)
+        return [str(path) for path in paths]
+
+    original = reclaim.unlink_paths
+    reclaim.unlink_paths = always_fails
+    try:
+        yield asked
+    finally:
+        reclaim.unlink_paths = original
+
+
 # ---- the list is the whole list -------------------------------------------------------------
 
 
@@ -201,8 +224,7 @@ def test_an_empty_list_removes_every_picture(logged_in_client):
     assert r.status_code == 200, r.text
     assert _uids(r.json()) == []
     assert _uids(_get(client, memo["uid"])) == []
-    rows = _attachment_rows()
-    assert [rows[u][0] for u in uids] == [None, None, None]
+    assert not set(uids) & set(_attachment_rows())
 
 
 def test_omitting_the_field_removes_none(logged_in_client):
@@ -430,7 +452,7 @@ def test_a_memo_sibling_print_names_the_sibling(logged_in_client):
     # picture, and the list named it by the only uid the client could have.
     assert _uids(r.json()) == [screen_att]
     assert _print_path(screen_att) is not None
-    assert _attachment_rows()[spare_att][0] is None
+    assert spare_att not in _attachment_rows()
 
 
 def test_naming_a_print_and_its_sibling_collapses_to_one_place(logged_in_client):
@@ -466,7 +488,8 @@ def test_a_stamped_detached_row_whose_original_is_gone_is_refused(logged_in_clie
     client, _ = logged_in_client
     donor = _memo(client, [_upload(client, "donor.png", _bytes("donor"))])
     orphan = _uids(donor)[0]
-    assert client.patch(f"/api/memos/{donor['uid']}", json={"attachment_uids": []}).status_code
+    with _unlink_always_fails():
+        assert client.patch(f"/api/memos/{donor['uid']}", json={"attachment_uids": []}).status_code
     assert _attachment_rows()[orphan][1] is not None  # detached, and the instant is recorded
     _strip_original(orphan)
     memo, uids = _three(client)
@@ -499,3 +522,61 @@ def test_an_unstamped_damaged_orphan_is_refused(logged_in_client):
     assert r.status_code == 422, r.text
     assert _refusals(r) == [(orphan, "missing")]
     assert _uids(_get(client, memo["uid"])) == uids
+
+
+# ---- the reclaim runs after the commit and cannot take the save down with it ------------------
+
+
+def test_a_failed_reclaim_leaves_the_save_committed_and_says_so(logged_in_client):
+    client, _ = logged_in_client
+    memo, (a, b, c) = _three(client)
+
+    with _unlink_always_fails(), structlog.testing.capture_logs() as logs:
+        r = client.patch(
+            f"/api/memos/{memo['uid']}",
+            json={"content": "renamed", "attachment_uids": [c, a]},
+        )
+
+    assert r.status_code == 200, r.text
+    # A file this request could not delete must not undo an edit the user was told was saved, so
+    # everything the save declared is here: the content, the order, and the detach.
+    assert r.json()["content"] == "renamed"
+    assert _uids(_get(client, memo["uid"])) == [c, a]
+    assert _positions(memo["uid"]) == [(c, 0), (a, 1)]
+    assert _attachment_rows()[b][0] is None
+    said = [entry for entry in logs if entry["event"] == "memo.patch.attachment_not_reclaimed"]
+    # Both uids, because the line is what points a hand at the row before the grace elapses.
+    assert [(e["log_level"], e["memo_uid"], e["attachment_uid"]) for e in said] == [
+        ("warning", memo["uid"], b)
+    ]
+
+
+def test_a_removed_pictures_row_and_files_are_gone_once_the_request_returns(logged_in_client):
+    client, _ = logged_in_client
+    memo, (a, b, c) = _three(client)
+    original = Path(_storage_path(b))
+    assert original.exists()
+
+    r = client.patch(f"/api/memos/{memo['uid']}", json={"attachment_uids": [c, a]})
+
+    assert r.status_code == 200, r.text
+    assert b not in _attachment_rows()
+    assert not original.exists()
+
+
+def test_between_the_commit_and_the_unlink_the_row_is_merely_detached(logged_in_client):
+    client, _ = logged_in_client
+    memo, (a, b, c) = _three(client)
+    original = Path(_storage_path(b))
+
+    with _unlink_always_fails() as asked:
+        r = client.patch(f"/api/memos/{memo['uid']}", json={"attachment_uids": [c, a]})
+
+    assert r.status_code == 200, r.text
+    # The reclaim got as far as its files and no further, so what stands is what the save left.
+    assert str(original) in asked
+    memo_id, detached_at = _attachment_rows()[b]
+    assert memo_id is None
+    assert detached_at is not None
+    assert b not in _uids(_get(client, memo["uid"]))
+    assert original.exists()

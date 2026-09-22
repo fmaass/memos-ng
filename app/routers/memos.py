@@ -1145,6 +1145,12 @@ async def patch_memo(
         # Same as on create: the declared order of the files this edit adds (MEMNG-262). They are
         # appended after the attachments the memo already carries, which keep their saved order.
         positions: dict[str, int] = {}
+        # The pictures the declared list takes OFF this memo, carried past the commit as plain
+        # values: every reclaim below rolls this session's instances away, so an id or a uid read
+        # after the first one is a lazy-refresh, not a name. The instant is the epoch each of those
+        # reclaims is judged against, and nothing re-derives it.
+        detached_ids: list[tuple[int, str]] = []
+        detached_at: datetime | None = None
         committed = False
         try:
             # The FIRST lock this edit takes, before any upload is finalized or any attachment is
@@ -1260,6 +1266,28 @@ async def patch_memo(
             committed = True
             if consumed:
                 await to_thread.run_sync(_unlink_all, consumed)
+            # PHASE 2, exactly as the delete route does it: the edit is durable, and only now does
+            # each detached row get reclaimed, in its own transaction, against the instant that
+            # detached it. Anything else — the `finally` below, or a reclaim before the commit —
+            # would let a file this request could not delete undo an edit the user was told was
+            # saved.
+            for attachment_id, attachment_uid in detached_ids:
+                result = await reclaim.reclaim_attachment(
+                    db, attachment_id, reclaim.Revalidate.ORPHANED, detached_at=detached_at
+                )
+                if result.outcome != "reclaimed":
+                    # The edit IS saved, so this cannot become an error response. The row stays
+                    # detached and stamped, which is what the sweep collects once the grace
+                    # elapses; no automatic process recovers it before then, so the line names
+                    # both uids while the picture it holds is still findable by them.
+                    logger.warning(
+                        "memo.patch.attachment_not_reclaimed",
+                        memo_uid=uid,
+                        attachment_id=attachment_id,
+                        attachment_uid=attachment_uid,
+                        outcome=result.outcome,
+                        failed_paths=list(result.failed_paths),
+                    )
             await db.refresh(edited)
             return edited
         finally:
@@ -1332,13 +1360,15 @@ async def delete_memo(
     await db.commit()
     # PHASE 2: now reclaim each of them properly — jobs, then the row locked and revalidated, then
     # its files, then the row. Each id gets its own transaction, so a failure part way through
-    # leaves the rest as orphans the sweep will finish rather than rolling the memo delete back.
+    # leaves the rest as detached rows the sweep finishes once their grace elapses, rather than
+    # rolling the memo delete back.
     for attachment_id in orphaned:
         result = await reclaim.reclaim_attachment(db, attachment_id, reclaim.Revalidate.ORPHANED)
         if result.outcome != "reclaimed":
             # The memo IS deleted — that is what the caller asked for and it has committed, so
-            # this cannot become an error response. A row left behind here is an orphan the
-            # reconcile sweep and the script both find; logged so it is visible before they run.
+            # this cannot become an error response. A row left behind here keeps the instant that
+            # detached it, so the sweep collects it once the grace elapses; no automatic process
+            # recovers it before then, which is what this line is for.
             logger.warning(
                 "memo.delete.attachment_not_reclaimed",
                 attachment_id=attachment_id,
