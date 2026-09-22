@@ -391,9 +391,12 @@ def _still_adopted(att_uid: str, original: Path) -> None:
     assert original.exists(), "the reclaim took the bytes the adopter now owns"
 
 
-def _not_reclaimed(logs, event: str) -> None:
+def _not_reclaimed(logs, event: str, memo_uid: str) -> None:
     refusals = [entry for entry in logs if entry["event"] == event]
     assert [entry["outcome"] for entry in refusals] == ["skipped_ineligible"], refusals
+    # Once the memo is gone no table maps the attachment back to it, so the warning is the one
+    # record left of which memo the row came off; a warning without it names nothing findable.
+    assert [entry["memo_uid"] for entry in refusals] == [memo_uid], refusals
 
 
 async def test_a_delete_leaves_the_row_a_finalize_adopted_after_its_commit(
@@ -407,8 +410,10 @@ async def test_a_delete_leaves_the_row_a_finalize_adopted_after_its_commit(
     """
     client, _ = logged_in_client
     try:
+        asked: list[str] = []
 
         async def delete(async_client, memo_uid):
+            asked.append(memo_uid)
             return await async_client.delete(f"/api/memos/{memo_uid}")
 
         answer, att_uid, original, logs = await _adopted_in_the_gap(
@@ -418,7 +423,7 @@ async def test_a_delete_leaves_the_row_a_finalize_adopted_after_its_commit(
         assert answer.status_code == 204, answer.text
         assert _rows("SELECT id FROM memos") == []
         _still_adopted(att_uid, original)
-        _not_reclaimed(logs, "memo.delete.attachment_not_reclaimed")
+        _not_reclaimed(logs, "memo.delete.attachment_not_reclaimed", asked[0])
     finally:
         _cleanup()
 
@@ -430,8 +435,10 @@ async def test_a_patch_leaves_the_row_a_finalize_adopted_after_its_commit(
     exactly as a delete does, and its after-commit loop owes the adopter the same fence."""
     client, _ = logged_in_client
     try:
+        asked: list[str] = []
 
         async def patch(async_client, memo_uid):
+            asked.append(memo_uid)
             return await async_client.patch(f"/api/memos/{memo_uid}", json={"attachment_uids": []})
 
         answer, att_uid, original, logs = await _adopted_in_the_gap(
@@ -441,7 +448,7 @@ async def test_a_patch_leaves_the_row_a_finalize_adopted_after_its_commit(
         assert answer.status_code == 200, answer.text
         assert answer.json()["attachments"] == []
         _still_adopted(att_uid, original)
-        _not_reclaimed(logs, "memo.patch.attachment_not_reclaimed")
+        _not_reclaimed(logs, "memo.patch.attachment_not_reclaimed", asked[0])
     finally:
         _cleanup()
 
