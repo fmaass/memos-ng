@@ -118,6 +118,23 @@ def _stamp(att_id: int, value: datetime | None) -> None:
     eng.dispose()
 
 
+def _left_for_the_sweep(att_uid: str, detached_at: datetime) -> None:
+    """Put a route-made attachment where the sweep finds it: off its memo, stamped, memo gone.
+
+    This is the state a delete leaves behind when its after-commit reclaim never completed — the
+    crash window the hourly sweep exists for. It cannot be reached by waiting out the grace in a
+    test, so the row is aged here; everything the sweep then meets, including the adoption, is real.
+    """
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text("UPDATE attachments SET memo_id = NULL, detached_at = :d WHERE uid = :u"),
+            {"d": detached_at, "u": att_uid},
+        )
+        c.execute(text("DELETE FROM memos"))
+    eng.dispose()
+
+
 # --- the sweep's selection ---------------------------------------------------------------------
 
 
@@ -251,29 +268,6 @@ async def test_a_candidate_redetached_before_the_lock_is_refused(db_engine, monk
 
         assert result.outcome == "skipped_ineligible"
         assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [(att_id,)]
-        assert original.exists()
-    finally:
-        _cleanup()
-
-
-async def test_a_candidate_adopted_before_the_lock_is_refused(db_engine, monkeypatch, tmp_path):
-    """A standalone finalize adopting the row clears its instant while `memo_id` stays NULL, so
-    linkage alone cannot tell this apart from garbage — the missing instant can."""
-    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    try:
-        att_id, original = _seed(tmp_path, "adopted", detached_at=datetime.now(UTC) - 2 * GRACE)
-        cutoff = datetime.now(UTC) - GRACE
-        _stamp(att_id, None)  # the adoption, which clears the instant
-
-        async with async_session() as db:
-            result = await reclaim_attachment(
-                db, att_id, Revalidate.DETACHED, detached_before=cutoff
-            )
-
-        assert result.outcome == "skipped_ineligible"
-        assert _rows("SELECT id, memo_id, detached_at FROM attachments WHERE id=:a", a=att_id) == [
-            (att_id, None, None)
-        ]
         assert original.exists()
     finally:
         _cleanup()
@@ -447,6 +441,92 @@ async def test_a_patch_leaves_the_row_a_finalize_adopted_after_its_commit(
         assert answer.json()["attachments"] == []
         _still_adopted(att_uid, original)
         _not_reclaimed(logs, "memo.patch.attachment_not_reclaimed")
+    finally:
+        _cleanup()
+
+
+class SweepGap:
+    """A one-shot park in the sweep's own gap: candidates SELECTED, no row locked yet.
+
+    It wraps `worker._reclaim_detached_row` rather than replacing it — the pass, the cutoff it
+    carries and the reclaim it calls are all the real ones; the wrapper only holds the coroutine
+    before it opens its session, and records what each row's reclaim answered. The claim is
+    synchronous, like `Seam`'s, so a second row could not also believe it was the parked one.
+    """
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.parked = 0
+        self.outcomes: list[str] = []
+
+    async def paused(self, attachment_id: int, cutoff: datetime, unlink) -> object:
+        self.calls += 1
+        if self.calls == 1:
+            self.parked += 1
+            self.entered.set()
+            await asyncio.wait_for(self.release.wait(), timeout=SEAM_TIMEOUT)
+        result = await self._real(attachment_id, cutoff, unlink)
+        self.outcomes.append(result.outcome)
+        return result
+
+    def fired(self) -> None:
+        assert self.parked == 1, (
+            f"the sweep never parked between its selection and its lock ({self.parked}) — "
+            "this test proves nothing"
+        )
+
+
+async def test_the_sweep_leaves_the_row_an_upload_adopted_in_its_gap(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """The sweep and a byte-identical upload, interleaved: selection, then the adoption, then the
+    lock.
+
+    The row is a candidate by this pass's cutoff and is adopted by a REAL standalone finalize
+    before the pass gets to lock it, so the only thing standing between the adopter and a deleted
+    picture is the revalidation under the lock, against the cutoff the pass came with.
+    """
+    client, _ = logged_in_client
+    try:
+        monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+        shared = _png(b"swept")
+        memo = client.post(
+            "/api/memos",
+            json={
+                "content": "pics",
+                "visibility": "PRIVATE",
+                "upload_uids": [_upload(client, "shot.png", shared)],
+            },
+        )
+        assert memo.status_code == 201, memo.text
+        att_uid, original = _the_attachment()
+        _left_for_the_sweep(att_uid, datetime.now(UTC) - 2 * GRACE)
+        # The adopter's own upload session, holding bytes identical to the attachment's.
+        twin = _upload(client, "shot.png", shared)
+
+        gap = SweepGap(worker._reclaim_detached_row)
+        monkeypatch.setattr(worker, "_reclaim_detached_row", gap.paused)
+        with structlog.testing.capture_logs() as logs:
+            sweeping = asyncio.create_task(worker.sweep_detached_attachments())
+            await asyncio.wait_for(gap.entered.wait(), timeout=SEAM_TIMEOUT)
+            async with _async_client(client) as adopter:
+                adopted = await adopter.post(f"/api/uploads/{twin}/finalize")
+            assert adopted.status_code == 200, adopted.text
+            assert adopted.json()["uid"] == att_uid, "the finalize did not dedup onto the row"
+            gap.release.set()
+            reclaimed = await asyncio.wait_for(sweeping, timeout=SEAM_TIMEOUT)
+        gap.fired()
+
+        assert reclaimed == 0
+        assert gap.outcomes == ["skipped_ineligible"]
+        assert [entry["reason"] for entry in logs if entry["event"] == "reclaim.skipped"] == [
+            "adopted_or_redetached"
+        ]
+        _still_adopted(att_uid, original)
+        assert original.read_bytes() == shared, "the sweep took the bytes the adopter now owns"
     finally:
         _cleanup()
 
