@@ -286,3 +286,122 @@ async def test_the_api_shutdown_waits_for_a_reclaim_a_cancelled_request_left(
         await inflight.finish()
         await asyncio.wait_for(stopping, timeout=STOP_GRACE_SECONDS)
         _reclaimed(inflight)
+
+
+async def test_a_reclaim_cancelled_directly_still_finishes_its_unlink_and_commits(
+    db_engine, monkeypatch, tmp_path
+):
+    """The other door, the one no shield covers: the reclaim TASK cancelled, not its caller.
+
+    `asyncio.run`'s teardown (the worker) and the loop's own (the API) cancel whatever tasks are
+    left, and a reclaim the drain gave up on is exactly such a task. The shield is no answer here
+    — it protects the caller's await, and this cancellation is delivered inside the task itself,
+    at the `await` on its unlink thread. So the unit holds it: the thread is awaited to its return
+    and the transaction is finished before the cancellation is allowed through. Until then the row
+    stays locked — which is what an adopter reaching for it in that instant asks about.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att_id, original = _seed(
+        tmp_path, "cancelled-direct", detached_at=datetime.now(UTC) - 2 * GRACE
+    )
+    park = _Park(reclaim.unlink_paths)
+    monkeypatch.setattr(reclaim, "unlink_paths", park)
+    try:
+        task = asyncio.create_task(
+            reclaim.reclaim_row(
+                att_id, reclaim.Revalidate.DETACHED, detached_before=datetime.now(UTC)
+            )
+        )
+        await _wait_for(park.entered, "the reclaim never reached the unlink seam")
+        task.cancel()
+        await asyncio.sleep(0.5)
+        assert not task.done(), "the cancellation unwound the reclaim while its thread ran on"
+        assert await asyncio.to_thread(_is_locked, att_id), (
+            "the row was adoptable while the thread unlinking its files ran on"
+        )
+        park.release.set()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await asyncio.wait_for(task, timeout=STOP_GRACE_SECONDS)
+        assert task.cancelled(), "the reclaim swallowed a cancellation its caller has to see"
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [], (
+            "the cancellation was let through before the transaction was finished"
+        )
+        assert not original.exists()
+    finally:
+        park.release.set()
+        await _quiesced([att_id])
+        _cleanup()
+
+
+async def test_the_worker_process_exit_commits_a_reclaim_the_drain_gave_up_on(
+    db_engine, monkeypatch, tmp_path
+):
+    """The whole worker teardown, run for real: a reclaim still in flight when the drain's grace
+    runs out, and then `asyncio.run` returning.
+
+    `asyncio.run` cancels whatever tasks are left and gathers them; the loop is still turning
+    while it does. So the reclaim the drain abandoned takes that cancellation, finishes the unlink
+    it started and commits — inside that gather, before the loop closes. Read back after the
+    thread running `asyncio.run` has joined, the row can only have been committed before it
+    returned: there is no loop left to do it afterwards.
+    """
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    att_id, original = _seed(tmp_path, "drain-expired", detached_at=datetime.now(UTC) - 2 * GRACE)
+    park = _Park(reclaim.unlink_paths)
+
+    def worker_process() -> None:
+        async def stopping() -> None:
+            sweep = asyncio.create_task(worker.sweep_detached_attachments(unlink=park))
+            assert await asyncio.to_thread(park.entered.wait, SEAM_TIMEOUT)
+            sweep.cancel()  # what the pass's own bound does, with a row in flight
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweep
+            # The drain's grace, expired: the worker stops WAITING and returns to `asyncio.run`.
+            await reclaim.drain_pending_reclaims(grace_s=0.0)
+
+        asyncio.run(stopping())
+
+    try:
+        exiting = asyncio.create_task(asyncio.to_thread(worker_process))
+        await _wait_for(park.entered, "the sweep never reached the unlink seam")
+        await asyncio.sleep(0.5)  # the drain expires and the teardown's cancellation lands
+        park.release.set()
+        await asyncio.wait_for(exiting, timeout=STOP_GRACE_SECONDS)
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [], (
+            "the process exit unwound the reclaim: the row is live again and its files are gone"
+        )
+        assert not original.exists()
+    finally:
+        park.release.set()
+        await _quiesced([att_id])
+        _cleanup()
+
+
+async def test_a_cancelled_asset_delete_keeps_the_lock_until_its_unlink_ends(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """The fourth caller: `DELETE /api/attachments/{uid}`, which owes an adopter the same lock.
+
+    It deletes one named attachment off a memo that keeps the other, so the row it never touched is
+    the control: still on its memo, files intact.
+    """
+    client, _ = logged_in_client
+
+    async def delete_attachment(async_client, memo_uid):
+        uid = _rows("SELECT uid FROM attachments ORDER BY id")[0][0]
+        return await async_client.delete(f"/api/attachments/{uid}")
+
+    async with _cancelled_mid_unlink(client, monkeypatch, tmp_path, delete_attachment) as inflight:
+        assert await asyncio.to_thread(_is_locked, inflight.taken_id), (
+            "the row was adoptable while the thread unlinking its files ran on"
+        )
+        await inflight.finish()
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=inflight.taken_id) == [], (
+            "the cancellation unwound the reclaim's transaction — the row is live again while its "
+            "files were deleted by a thread that ran on"
+        )
+        assert not inflight.taken_original.exists()
+        assert _rows(
+            "SELECT id FROM attachments WHERE id=:a AND memo_id IS NOT NULL", a=inflight.spared_id
+        ) == [(inflight.spared_id,)], "the request took a row it was never asked about"
+        assert inflight.spared_original.exists()
