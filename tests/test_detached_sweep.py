@@ -394,8 +394,9 @@ def _still_adopted(att_uid: str, original: Path) -> None:
 def _not_reclaimed(logs, event: str, memo_uid: str) -> None:
     refusals = [entry for entry in logs if entry["event"] == event]
     assert [entry["outcome"] for entry in refusals] == ["skipped_ineligible"], refusals
-    # Once the memo is gone no table maps the attachment back to it, so the warning is the one
-    # record left of which memo the row came off; a warning without it names nothing findable.
+    # The attachment the warning names is findable without this: it carries the row's own id, and
+    # PATCH names its uid too. What no table can answer once the delete has committed is which memo
+    # the row came off — so the warning is the only record left of that, and `memo_uid` is it.
     assert [entry["memo_uid"] for entry in refusals] == [memo_uid], refusals
 
 

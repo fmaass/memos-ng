@@ -1595,9 +1595,12 @@ async def run() -> None:
             # spent after the consumers have spent theirs, and nothing is cancelled when it runs
             # out: `drain_pending_reclaims` says what is still running and returns. What follows is
             # `asyncio.run` cancelling whatever tasks are left and gathering them, and a reclaim
-            # cancelled there does NOT unwind mid-unlink — it finishes its unlink thread and its
-            # transaction first (`reclaim.reclaim_attachment`) and only then lets the cancellation
-            # through, which the gather is still turning the loop for.
+            # cancelled there does NOT unwind mid-unlink — it lets the cancellation through only
+            # once its unlink thread has returned (`reclaim.reclaim_attachment`), which the gather
+            # is still turning the loop for. Its transaction it may still lose to that same
+            # cancellation, on the delete or the commit that follows: then the row stays, naming
+            # files that are gone, which is the half of this that a later delete or sweep can
+            # still finish.
             await reclaim.drain_pending_reclaims()
         finally:
             # Only NOW are the signals given back. Removing them before the teardown would leave

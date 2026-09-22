@@ -329,10 +329,15 @@ async def reclaim_attachment(
         await db.commit()
         result = ReclaimResult("reclaimed")
     if cancellation is not None:
-        # Only NOW, with the thread returned and the transaction finished either way. Unwinding at
-        # the await above would have released the row's lock with the unlinking still going — the
-        # row live again, adoptable, and a thread deleting the adopter's bytes. The cancellation is
-        # not swallowed either: whoever asked for it still gets it, one step later than they asked.
+        # Only NOW, with the unlinks over: the row's lock outlived the thread doing them, which is
+        # the guarantee this holds a cancellation back for. Unwinding at the await above would have
+        # released that lock with the unlinking still going — the row live again, adoptable, and a
+        # thread deleting the adopter's bytes. The TRANSACTION is not guaranteed with it and is
+        # deliberately not shielded: a cancellation landing on the `db.delete` or the `db.commit`
+        # just above — the thread has long returned by then — unwinds it and leaves the row naming
+        # files that are gone. That is the recoverable half of the trade, and the reason the row is
+        # the journal. The cancellation is not swallowed either: whoever asked for it still gets
+        # it, one step later than they asked.
         raise cancellation
     return result
 
@@ -392,16 +397,17 @@ async def reclaim_row_shielded(
     Every one of them: the memo edit and delete routes, the asset delete route, the detached sweep.
     Nothing else in this process reclaims a row.
 
-    The unlinks run off the event loop, and a cancellation — a caller's own, or one delivered to
-    the reclaim directly by a teardown — cannot be made to wait at a worker thread. Awaited inline
-    on the caller's session, a cancelled reclaim would unwind right there: lock released, row live
-    again, and the thread deleting its files still going, free to take the bytes of whoever adopts
-    it next. Two things stop that. The shield keeps the CALLER's cancellation off the task, so it
-    lands on this await and the reclaim carries on holding its own session. And the reclaim itself
-    holds a cancellation delivered to the TASK until its unlink thread has returned and its
-    transaction is finished (`reclaim_attachment`). So the row's lock outlives the thread in all
-    three cases: the caller cancelled, the drain's grace expired, the teardown cancelling what is
-    left.
+    What keeps the row's lock alive through its unlinking is not the task: a cancellation reaching
+    the reclaim is held until the unlink thread has RETURNED (`_unlink_off_the_loop`), and it is
+    held the same way for a caller that awaits the unit inline. The task and its shield buy two
+    other things. The CALLER stops where it was cancelled instead of waiting out a thread it is no
+    longer there for — the shield puts its cancellation on this await rather than on the reclaim.
+    And the reclaim is REGISTERED in `_pending`, so a shutdown's drain knows there is something to
+    wait for (`drain_pending_reclaims`) and can wait for it after the request that started it is
+    gone. So the lock outlives the thread in all three cases: the caller cancelled, the drain's
+    grace expired, the teardown cancelling what is left. The transaction is not promised with it —
+    cancelled on the delete or the commit that follows, the reclaim unwinds and the row stays,
+    naming files that are already gone.
 
     The cancellation is then RE-RAISED, never swallowed: the caller was cancelled and is over, and
     a loop that went on to its next row would be taking rows nobody is waiting for with a
@@ -434,12 +440,21 @@ async def drain_pending_reclaims(grace_s: float = DRAIN_GRACE_SECONDS) -> None:
     shutdown. The grace bounds THIS WAIT and nothing else. Past it the wait simply ends and says
     what is still running — and what it leaves behind still finishes: the teardown that follows
     (`asyncio.run`'s in the worker, the loop's own in the API) cancels that task, and the reclaim
-    holds the cancellation until its unlink thread has returned and its transaction is committed or
-    rolled back, inside the gather the teardown does after cancelling. What ends a reclaim
-    mid-unlink is the process dying outright — SIGKILL at the end of the stop grace — and it ends
-    it the hard way: the connection dies with it, the transaction rolls back, and the row is live
-    again with part of its files gone. That is a state the next sweep finds and finishes, which is
-    the whole reason the row is the journal and the files are not.
+    holds the cancellation until its unlink thread has returned, inside the gather the teardown
+    does after cancelling. Its transaction is the weaker half: cancelled on the delete or the
+    commit that follows, it unwinds and the row is left naming files that are gone. What ends a
+    reclaim mid-unlink is the process dying outright — SIGKILL at the end of the stop grace — and
+    it ends it the hard way: the connection dies with it, the transaction rolls back, and the row
+    is live again with part of its files gone.
+
+    What finds such a row depends on which caller left it, and only one of the two has a finder. A
+    DETACHED row — `memo_id` NULL with a `detached_at` stamp — is precisely what the sweep selects
+    (`worker.sweep_detached_attachments`), so the next pass finds it and finishes it. A row the
+    asset-delete route was reclaiming is still LINKED and unstamped: no sweep's predicate selects
+    it, and it stays on its memo, listed, with its files gone, until the caller deletes that
+    attachment again — which is a reclaim of the same row over a set that is mostly deleted
+    already, and `unlink_paths` takes an absent file for success (`missing_ok`). Either way the row
+    is the journal and the files are not.
     """
     pending = tuple(_pending)
     if not pending:
