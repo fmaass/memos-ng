@@ -24,6 +24,7 @@ from app.database import async_session
 from app.main import app
 from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, User
 from app.routers import memos as memos_router
+from app.services import reclaim
 from app.services.reclaim import Revalidate, reclaim_attachment, unlink_paths
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
@@ -448,9 +449,10 @@ async def test_a_patch_leaves_the_row_a_finalize_adopted_after_its_commit(
 class SweepGap:
     """A one-shot park in the sweep's own gap: candidates SELECTED, no row locked yet.
 
-    It wraps `worker._reclaim_detached_row` rather than replacing it — the pass, the cutoff it
-    carries and the reclaim it calls are all the real ones; the wrapper only holds the coroutine
-    before it opens its session, and records what each row's reclaim answered. The claim is
+    It wraps `reclaim.reclaim_row_shielded` — the attribute the sweep looks up on the reclaim
+    module for every row — rather than replacing it, so the pass, the cutoff it carries and the
+    reclaim it calls are all the real ones; the wrapper only holds the call before the reclaim's
+    own task and session exist, and records what each row's reclaim answered. The claim is
     synchronous, like `Seam`'s, so a second row could not also believe it was the parked one.
     """
 
@@ -462,13 +464,27 @@ class SweepGap:
         self.parked = 0
         self.outcomes: list[str] = []
 
-    async def paused(self, attachment_id: int, cutoff: datetime, unlink) -> object:
+    async def paused(
+        self,
+        attachment_id: int,
+        mode: Revalidate,
+        *,
+        unlink=None,
+        detached_at: datetime | None = None,
+        detached_before: datetime | None = None,
+    ) -> object:
         self.calls += 1
         if self.calls == 1:
             self.parked += 1
             self.entered.set()
             await asyncio.wait_for(self.release.wait(), timeout=SEAM_TIMEOUT)
-        result = await self._real(attachment_id, cutoff, unlink)
+        result = await self._real(
+            attachment_id,
+            mode,
+            unlink=unlink,
+            detached_at=detached_at,
+            detached_before=detached_before,
+        )
         self.outcomes.append(result.outcome)
         return result
 
@@ -507,8 +523,8 @@ async def test_the_sweep_leaves_the_row_an_upload_adopted_in_its_gap(
         # The adopter's own upload session, holding bytes identical to the attachment's.
         twin = _upload(client, "shot.png", shared)
 
-        gap = SweepGap(worker._reclaim_detached_row)
-        monkeypatch.setattr(worker, "_reclaim_detached_row", gap.paused)
+        gap = SweepGap(reclaim.reclaim_row_shielded)
+        monkeypatch.setattr(reclaim, "reclaim_row_shielded", gap.paused)
         with structlog.testing.capture_logs() as logs:
             sweeping = asyncio.create_task(worker.sweep_detached_attachments())
             await asyncio.wait_for(gap.entered.wait(), timeout=SEAM_TIMEOUT)
