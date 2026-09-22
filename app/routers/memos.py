@@ -1,5 +1,5 @@
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -22,6 +22,7 @@ from app.models import (
     Attachment,
     AttachmentStatus,
     Memo,
+    Upload,
     User,
     Visibility,
 )
@@ -370,6 +371,39 @@ def _video_posters_invalid(exc: uploads_svc.VideoPostersInvalid) -> HTTPExceptio
     )
 
 
+ATTACHMENT_UID_MESSAGES = {
+    "missing": "no attachment of yours has this uid, or the files it names are gone",
+    "foreign_owner": "that attachment belongs to another user",
+    "other_memo": "that attachment is on a different memo; move it there or leave it out",
+    "unresolvable_upload_uid": "that upload is not one this request finalizes; "
+    "name it in upload_uids too",
+}
+
+
+def _attachment_uids_invalid(problems: list[tuple[str, str]]) -> HTTPException:
+    """A 422 in FastAPI's OWN validation-error shape, for the same reasons `_video_posters_invalid`
+    gives: a second body shape under one status leaves a generated client unable to decode either,
+    and declaring a model for 422 would REPLACE this operation's HTTPValidationError entry and so
+    describe ordinary pydantic failures as something they are not.
+
+    `loc` names the offending uid — which is what the client has to hear, since a status alone
+    cannot say which picture it lost — and `type` carries the machine-readable reason, namespaced
+    `attachment_uid.<reason>`. Every rejected entry is reported at once: a client fixing its list
+    one round trip per bad uid is a client re-sending pictures.
+    """
+    return HTTPException(
+        status_code=422,
+        detail=[
+            {
+                "loc": ["body", "attachment_uids", uid],
+                "msg": ATTACHMENT_UID_MESSAGES[reason],
+                "type": f"attachment_uid.{reason}",
+            }
+            for uid, reason in problems
+        ],
+    )
+
+
 class MemoCreate(BaseModel):
     content: str
     visibility: RequestVisibility = None  # unset → the user's default_visibility setting
@@ -417,6 +451,28 @@ class MemoPatch(BaseModel):
     # Optional/nullable (not []) so PATCH stays a true partial update: callers that only change
     # content/archived/etc. omit it. (Removing an attachment is DELETE /api/attachments/{uid}.)
     upload_uids: list[str] | None = None
+    attachment_uids: list[str] | None = Field(
+        default=None,
+        description=(
+            "The memo's COMPLETE picture list, in display order — the index of an entry becomes "
+            "that picture's place on the memo. Omitted (null), the pictures are untouched and "
+            "this stays a true partial update, exactly as `upload_uids` is; sent as an empty "
+            "list, the memo keeps no pictures at all. Those two are different requests and are "
+            "answered differently. An attachment the memo has and the list does not name is "
+            "REMOVED. An "
+            "entry is either an attachment uid or an `upload_uid` named in this same request's "
+            "`upload_uids` — a picture being uploaded here has no attachment uid the client could "
+            "know, because that uid is minted while this request runs. Two entries may resolve to "
+            "one attachment (identical bytes dedup, and a print binds onto its screen); that is "
+            "not an error, and the attachment takes the EARLIEST place its entries asked for, so "
+            "the stored list can be shorter than the one sent. An entry that cannot be resolved "
+            "fails the WHOLE request with 422 — never a silent skip, which on a declared list "
+            "would delete the pictures the list omitted. Each rejected entry comes back as one "
+            "`detail` item whose `loc` ends with the uid and whose `type` names the reason: "
+            "attachment_uid.missing, attachment_uid.foreign_owner, attachment_uid.other_memo or "
+            "attachment_uid.unresolvable_upload_uid."
+        ),
+    )
     edit_key: IdempotencyKey | None = Field(
         default=None,
         description=(
@@ -929,6 +985,130 @@ def _replayed_or_conflict(found: Memo, memo_id: int, key: str) -> Memo:
     )
 
 
+async def _resolve_picture_list(
+    db: AsyncSession,
+    owner_id: int,
+    memo_id: int,
+    entries: Sequence[str],
+    upload_uids: Collection[str],
+    resolved: Mapping[str, str],
+) -> list[str]:
+    """The attachment uids the declared list names, in the order it names them.
+
+    An entry is an attachment uid or an `upload_uid` of this same request; `resolved` is what
+    finalization made of the second kind, and is total over `upload_uids`, so an entry that names
+    one and is missing from it names an upload this request never finalized.
+
+    A later entry resolving to an attachment an earlier one already reached collapses onto that
+    earlier place. Dedup and print binding both do that behind the client's back, and refusing
+    would be asking the client to know in advance something the server discovers mid-request.
+
+    Everything unresolvable is collected and refused TOGETHER: the request fails whole either way,
+    and a client fixing its list one uid per round trip is a client re-sending pictures. The
+    lookup is owner-AGNOSTIC and takes no lock — it has to be able to say that a uid is someone
+    else's, and answering that must not queue behind a stranger's write.
+    """
+    wanted = {entry for entry in entries if entry not in upload_uids}
+    rows: dict[str, Attachment] = {}
+    if wanted:
+        rows = {
+            att.uid: att
+            for att in (
+                await db.execute(select(Attachment).where(Attachment.uid.in_(wanted)))
+            ).scalars()
+        }
+    # A uid that is no attachment of anyone's may still be an upload of this owner's — one they
+    # forgot to name in `upload_uids`. Saying so is the difference between a client adding one
+    # field and a client hunting a picture it thinks the server lost.
+    stranded: set[str] = set()
+    unknown = wanted - rows.keys()
+    if unknown:
+        stranded = set(
+            (
+                await db.execute(
+                    select(Upload.upload_uid).where(
+                        Upload.upload_uid.in_(unknown), Upload.owner_id == owner_id
+                    )
+                )
+            ).scalars()
+        )
+    problems: list[tuple[str, str]] = []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for entry in dict.fromkeys(entries):  # the same entry twice asks for one place, not two
+        if entry in upload_uids:
+            attachment_uid = resolved.get(entry)
+            if attachment_uid is None:
+                problems.append((entry, "unresolvable_upload_uid"))
+                continue
+        else:
+            att = rows.get(entry)
+            if att is None:
+                problems.append(
+                    (entry, "unresolvable_upload_uid" if entry in stranded else "missing")
+                )
+                continue
+            if att.owner_id != owner_id:
+                problems.append((entry, "foreign_owner"))
+                continue
+            if att.memo_id is not None and att.memo_id != memo_id:
+                # The one `link_attachments` skips in silence, which is right for an append and
+                # catastrophic for a declared list: the skip would strand the other memo's picture
+                # AND delete every picture this list left out.
+                problems.append((entry, "other_memo"))
+                continue
+            attachment_uid = att.uid
+        if attachment_uid not in seen:
+            seen.add(attachment_uid)
+            ordered.append(attachment_uid)
+    if problems:
+        raise _attachment_uids_invalid(problems)
+    return ordered
+
+
+async def _apply_picture_list(
+    db: AsyncSession,
+    owner_id: int,
+    memo: Memo,
+    ordered: Sequence[str],
+    vouched: Collection[str],
+    moved: list[storage.TrackedMove],
+) -> tuple[list[tuple[int, str]], datetime | None]:
+    """Make the memo hold exactly `ordered`, in that order; hand back what came off it and WHEN.
+
+    What the list omits is DETACHED, never deleted here: the files go in their own transaction
+    after this one commits, and a crash in the gap has to leave a row that still names them (see
+    app/services/reclaim.py). The ids and uids are read out now, while the objects are still live —
+    the reclaim runs on a session this transaction has finished with, and every instance on it is
+    expired by then.
+    """
+    refused: list[str] = []
+    await svc.link_attachments(
+        db, owner_id, memo, list(ordered), moved_out=moved, vouched=vouched, refused_out=refused
+    )
+    if refused:
+        # A row the list named whose original is gone. `link_attachments` declines to adopt it and
+        # a back-compat caller lets that pass; a declared list cannot, or it would answer 200 to a
+        # request whose result is one picture short of what the client asked for.
+        raise _attachment_uids_invalid([(uid, "missing") for uid in refused])
+    on_memo = (
+        (await db.execute(select(Attachment).where(Attachment.memo_id == memo.id))).scalars().all()
+    )
+    rank = {uid: place for place, uid in enumerate(ordered)}
+    # Renumbered from the list, not shifted: `link_attachments` appends what it linked AFTER the
+    # attachments the memo already carried, which is the right rule for an append and the wrong one
+    # for a list that declares where everything goes.
+    for place, att in enumerate(
+        sorted((a for a in on_memo if a.uid in rank), key=lambda a: rank[a.uid])
+    ):
+        att.position = place
+    taken_off = [a for a in on_memo if a.uid not in rank]
+    detached_at = svc.detach_attachments(taken_off) if taken_off else None
+    pairs = [(a.id, a.uid) for a in taken_off]
+    await db.flush()
+    return pairs, detached_at
+
+
 @router.patch("/memos/{uid}", response_model=MemoOut, responses=PATCH_RESPONSES)
 async def patch_memo(
     uid: str,
@@ -990,8 +1170,36 @@ async def patch_memo(
                 # It lands in the same transaction as the edit, so the two commit or roll back
                 # together and a recorded key never outlives the edit it names.
                 await svc.record_edit_key(db, locked, owner_id, key)
-            fields = body.model_dump(exclude_unset=True, exclude={"upload_uids", "edit_key"})
+            fields = body.model_dump(
+                exclude_unset=True, exclude={"upload_uids", "attachment_uids", "edit_key"}
+            )
             edited = await svc.update_memo(db, locked, **fields)
+            # The ids behind the existing uids the list names, resolved UNLOCKED and owner-scoped
+            # exactly as create resolves its own, so the ONE ascending attachment acquisition
+            # below covers them too. The link, the renumber and the detaches write these rows a
+            # moment later; taking them THERE would be a second acquisition of the attachment
+            # class in this transaction, in an order nothing else shares — and the worker's media
+            # recovery, which takes its terminal attachments ascending, inverts against exactly
+            # that. The read DECIDES nothing: a row that disappears before the lock is simply not
+            # locked, and the resolution below finds it gone and refuses the request.
+            named_ids = (
+                list(
+                    (
+                        await db.execute(
+                            select(Attachment.id).where(
+                                Attachment.uid.in_(body.attachment_uids),
+                                Attachment.owner_id == owner_id,
+                            )
+                        )
+                    ).scalars()
+                )
+                if body.attachment_uids
+                else []
+            )
+            finalized: list[str] = []
+            # upload_uid -> the attachment it produced, deduped onto, or was bound to: the only
+            # way a list can name a picture this same request is uploading.
+            resolved: dict[str, str] = {}
             if body.upload_uids:
                 # `memo=` is what lets a print uploaded in a LATER edit than its screen bind onto
                 # that screen instead of promoting a second visible copy of the same photo
@@ -1005,6 +1213,8 @@ async def patch_memo(
                         memo=edited,
                         consumed_out=consumed,
                         positions_out=positions,
+                        resolved_out=resolved,
+                        named_attachment_ids=named_ids,
                     )
                 except uploads_svc.UploadsUnlinkable as exc:
                     # The edits applied above are still uncommitted: this raise leaves the session
@@ -1018,6 +1228,29 @@ async def patch_memo(
                     sorted(finalized, key=lambda uid: positions.get(uid, len(finalized))),
                     moved_out=moved,
                     vouched=set(finalized),
+                )
+            elif body.attachment_uids is not None:
+                # A list-only edit finalizes nothing, so nothing else asks for the acquisition —
+                # and it still links, renumbers and detaches attachments. The rows have to be held
+                # before the first of those writes, in the same ascending order as everywhere else.
+                await uploads_svc.acquire_attachment_set(db, memo=edited, attachment_ids=named_ids)
+            if body.attachment_uids is not None:
+                # After the uploads: a uid this request is finalizing has to BE an attachment
+                # before the list can place it, and `resolved` is what says which one it became.
+                detached_ids, detached_at = await _apply_picture_list(
+                    db,
+                    owner_id,
+                    edited,
+                    await _resolve_picture_list(
+                        db,
+                        owner_id,
+                        memo_id,
+                        body.attachment_uids,
+                        set(body.upload_uids or ()),
+                        resolved,
+                    ),
+                    set(finalized),
+                    moved,
                 )
             # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
