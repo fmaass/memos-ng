@@ -141,7 +141,7 @@ async def _reclaim_that_unwinds(att_id: int, original: Path, *, removing: bool) 
     """One reclaim whose unlink fails, leaving the row exactly as production leaves it.
 
     `removing` decides WHEN the failure lands: after the original is gone — the half-deleted row
-    item 19 is about — or before the seam touches anything, which is the control. Either way the
+    this module is about — or before the seam touches anything, which is the control. Either way the
     reclaim fails closed, the whole transaction unwinds, and the row is still there; the only
     difference is whether it still names bytes.
     """
@@ -165,13 +165,13 @@ async def _reclaim_that_unwinds(att_id: int, original: Path, *, removing: bool) 
     assert _rows("SELECT memo_id FROM attachments WHERE id=:a", a=att_id) == [(None,)]
 
 
-# --- 19a / 19b: the half-deleted row is not reused, in BOTH dedup paths ------------------------
+# --- the half-deleted row is not reused, in BOTH dedup paths --------------------------------------
 
 
 async def test_the_batch_path_keeps_its_own_bytes_when_a_failed_reclaim_took_the_original(
     db_engine, monkeypatch, tmp_path
 ):
-    """19a. The half-deleted row is made the only way production makes one: a reclaim removed the
+    """The half-deleted row is made the only way production makes one: a reclaim removed the
     original, then its unlink failed and the whole transaction unwound, so the surviving
     `memo_id IS NULL` row names bytes that are gone. An identical upload keeps its own."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
@@ -195,7 +195,7 @@ async def test_the_batch_path_keeps_its_own_bytes_when_a_failed_reclaim_took_the
 async def test_the_standalone_path_keeps_its_own_bytes_when_a_failed_reclaim_took_the_original(
     db_engine, monkeypatch, tmp_path
 ):
-    """19b. The same half-deleted row, put to the other route: the two paths reach the candidate
+    """The same half-deleted row, put to the other route: the two paths reach the candidate
     differently, so a guard in one does not cover the other."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
@@ -239,14 +239,14 @@ async def test_the_candidate_is_still_reused_when_the_failed_reclaim_left_its_by
         _cleanup()
 
 
-# --- 19c: it is the SET of non-regenerable paths, not just the original ------------------------
+# --- it is the SET of non-regenerable paths, not just the original --------------------------------
 
 
 @pytest.mark.parametrize("case", ["legacy_print", "later_rendition", "video_poster"])
 async def test_a_candidate_missing_any_non_regenerable_file_is_not_reused(
     adb, monkeypatch, tmp_path, case
 ):
-    """19c. The original survives in each case; one of the other files the row owns does not.
+    """The original survives in each case; one of the other files the row owns does not.
 
     `later_rendition` removes the SECOND of two masters, so a guard that checks only the first
     cannot pass it.
@@ -283,7 +283,7 @@ async def test_a_candidate_missing_any_non_regenerable_file_is_not_reused(
 
 
 async def test_a_video_with_its_poster_on_disk_is_reused(adb, monkeypatch, tmp_path):
-    """The video half of 19c needs its own control: the poster is what makes the difference, not
+    """The video case needs its own control: the poster is what makes the difference, not
     the mime."""
     owner, att = await _setup(adb, monkeypatch, tmp_path, "c19_video_ok", mime="video/mp4")
     dest = poster.poster_path(att.uid)
@@ -335,11 +335,11 @@ async def test_a_reclaim_that_unwound_after_discovery_is_still_caught(
         _cleanup()
 
 
-# --- 19d: the direct-link route ---------------------------------------------------------------
+# --- the direct-link route ------------------------------------------------------------------------
 
 
 async def test_direct_linking_refuses_a_row_whose_bytes_are_gone(adb, monkeypatch, tmp_path):
-    """19d, at the seam. Both shapes refuse: a row something detached (stamped) and one a partial
+    """At the seam. Both shapes refuse: a row something detached (stamped) and one a partial
     unlink damaged in place (unstamped — nothing ever took it off a memo).
 
     The uids come back to the caller so a route with a typed contract can answer `missing` for

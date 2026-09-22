@@ -57,8 +57,8 @@ async def test_wait_returns_immediately_when_schema_is_current(db_engine):
 
 async def test_the_gate_names_the_schema_it_cleared_even_when_it_never_waited(db_engine):
     """The deployed worker's one statement about WHICH schema and WHICH code are running together.
-    A gate that cleared on its first poll — the steady state, and every no-migration deploy — used
-    to say nothing at all, so the log could not distinguish it from a worker that never started.
+    A schema gate that clears on its first poll — the steady state, and every no-migration deploy —
+    logs it too, so the log tells that worker apart from one that never started.
     """
     with structlog.testing.capture_logs() as logs:
         await migrations.wait_for_migrated_schema(budget_s=5, interval=0.05)

@@ -474,7 +474,7 @@ def test_naming_a_print_and_its_sibling_collapses_to_one_place(logged_in_client)
     assert _positions(memo["uid"]) == [(other_att, 0), (screen_att, 1)]
 
 
-# ---- a named row whose bytes are gone is refused (19d, through the route) ---------------------
+# ---- a named row whose bytes are gone is refused, through the route ------------------------------
 
 
 def _strip_original(att_uid: str) -> None:

@@ -1070,7 +1070,7 @@ async def _judge_picture_list(
             problems.append((entry, "other_memo"))
             continue
         if att.memo_id is None and not await asset_paths.adoptable(att):
-            # The owner's row, free to be linked, naming an original that is gone (19d).
+            # The owner's row, free to be linked, naming an original that is gone.
             # `link_attachments` declines to adopt it and `_apply_picture_list` turns that into
             # this same `missing`; asking here instead is answer-identical, because nothing
             # between this point and the link removes bytes a listed attachment owns — pass 1
