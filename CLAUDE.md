@@ -202,7 +202,10 @@ met until its tests exist and pass.
   (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17),
   **3844** (two class-routed worker consumers, 2026-09-18), **3857** (v1.7.2 release train,
   2026-09-19), **3865** (v1.7.3 release train, 2026-09-19), **3929** (Photos-style web library
-  view, WP-9, Epic MEMNG-505, 2026-09-23; local copy `docs/plans/PLAN_2026-09-22_photos-style-library.md`).
+  view, WP-9, Epic MEMNG-505, 2026-09-23; local copy `docs/plans/PLAN_2026-09-22_photos-style-library.md`),
+  **3937** (Playbook — UI renovation nightly work packages WP-9/WP-10, 2026-09-23; local copy
+  `docs/plans/PLAYBOOK_2026-09-23_ui-renovation-nightly.md`; handovers 3939 library-foundations,
+  3940 library-views, 3941 library-select in chapter 2689; iterations 27–30 in MEMNG).
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
@@ -212,7 +215,9 @@ met until its tests exist and pass.
   callback brokered by the BFF), ADR-0016 **3209** (universal links skipped — the custom scheme is
   the permanent deep-link lane), ADR-0017 **3307** (daily digest absorbed into memos-ng, the
   satellite retired), ADR-0018 **3828** (Places map: coordinates in Postgres, one whole-set
-  markers endpoint, client-side clustering, self-hosted PMTiles basemap).
+  markers endpoint, client-side clustering, self-hosted PMTiles basemap), ADR-0019 **3935** (shared
+  API major from 2.0: independent semver per product, apiMajor on /health, consumer contract test
+  against the iOS vendored schema).
 - Sibling project **memos-ng-ios** (the reference iOS repo): book **3153** (Decisions **3154**,
   Session Reviews **3155**), Project Overview **3158**, doctrine "Reference iOS Architecture"
   **3156**, ADR-0001 **3157**.
