@@ -1239,7 +1239,7 @@ def _upload_row(uid):
 async def _patch_cut_short(token, uid, offset, pieces, content_length):
     """PATCH through the COMPLETE app, fed the ASGI messages uvicorn sends when the client's
     connection drops mid-body: each piece as a `more_body` request message, then `http.disconnect`
-    for every later receive (uvicorn `httptools_impl.py` `receive`, :572-573). httpx's ASGI
+    for every later receive (uvicorn `httptools_impl.py` `receive`, :571-572). httpx's ASGI
     transport cannot say this — it has no way to end a body except by finishing it."""
     import json
 
