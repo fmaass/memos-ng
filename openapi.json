@@ -2768,10 +2768,12 @@
       "UploadOut": {
         "properties": {
           "bytes_received": {
+            "description": "Bytes the server holds for this upload session \u2014 the offset the next PATCH must start at.",
             "title": "Bytes Received",
             "type": "integer"
           },
           "chunk_size": {
+            "description": "A hint for clients that chunk; the body of a PATCH may be any length from 1 byte to the bytes remaining.",
             "title": "Chunk Size",
             "type": "integer"
           },
@@ -6047,6 +6049,7 @@
         ]
       },
       "patch": {
+        "description": "Append bytes at `Upload-Offset`. The body may be any length from 1 byte to the bytes remaining; `chunk_size` is a hint for clients that chunk. Bytes received before a disconnect are kept, and HEAD reports the offset they reached.",
         "operationId": "append_chunk_api_uploads__upload_uid__patch",
         "parameters": [
           {

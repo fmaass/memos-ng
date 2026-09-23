@@ -739,9 +739,11 @@ async def upload_print(
     # refused mid-stream instead of after the whole master has been buffered.
     staged = data_root / "uploads" / f"print-{uuid.uuid4().hex}.part"
     try:
-        size = await up_svc.spool_stream(
-            _file_chunks(file), staged, start=0, ceiling=settings.MAX_UPLOAD_MIB * 1024 * 1024
-        )
+        size = (
+            await up_svc.spool_stream(
+                _file_chunks(file), staged, start=0, ceiling=settings.MAX_UPLOAD_MIB * 1024 * 1024
+            )
+        ).received
         # Lock this attachment's row for the rest of the request: the placement decision below
         # reads print_path and the post-commit sweep unlinks the file it named, so two concurrent
         # print uploads could otherwise leave the committed print_path pointing at a file the other

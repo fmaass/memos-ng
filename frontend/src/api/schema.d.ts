@@ -1107,7 +1107,10 @@ export interface paths {
         options?: never;
         /** Upload Offset */
         head: operations["upload_offset_api_uploads__upload_uid__head"];
-        /** Append Chunk */
+        /**
+         * Append Chunk
+         * @description Append bytes at `Upload-Offset`. The body may be any length from 1 byte to the bytes remaining; `chunk_size` is a hint for clients that chunk. Bytes received before a disconnect are kept, and HEAD reports the offset they reached.
+         */
         patch: operations["append_chunk_api_uploads__upload_uid__patch"];
         trace?: never;
     };
@@ -2520,9 +2523,15 @@ export interface components {
         };
         /** UploadOut */
         UploadOut: {
-            /** Bytes Received */
+            /**
+             * Bytes Received
+             * @description Bytes the server holds for this upload session — the offset the next PATCH must start at.
+             */
             bytes_received: number;
-            /** Chunk Size */
+            /**
+             * Chunk Size
+             * @description A hint for clients that chunk; the body of a PATCH may be any length from 1 byte to the bytes remaining.
+             */
             chunk_size: number;
             /** Upload Uid */
             upload_uid: string;

@@ -17,6 +17,7 @@ from anyio import fail_after, to_thread
 from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import ClientDisconnect
 
 from app.config import settings
 from app.database import async_session
@@ -464,33 +465,55 @@ async def create_upload(
     return upload
 
 
+@dataclass(frozen=True)
+class Spooled:
+    """What one body left in its spool: `received` bytes, and whether the client disconnected
+    before the body ended (`cut`) — in which case the spool holds exactly the bytes that arrived."""
+
+    received: int
+    cut: bool
+
+
 async def spool_stream(
-    stream: AsyncIterable[bytes], path: Path, *, start: int, ceiling: int
-) -> int:
+    stream: AsyncIterable[bytes],
+    path: Path,
+    *,
+    start: int,
+    ceiling: int,
+    keep_cut: bool = False,
+) -> Spooled:
     """Write `stream` into `path`, chunk by chunk, and stop the moment the RUNNING total — counted
     from `start`, the offset this body claims to continue from — would pass `ceiling`. The bytes
     are never accumulated in memory, so an over-limit body is refused at receive time
-    (UploadTooLarge). Returns the byte count received.
+    (UploadTooLarge).
 
     `path` MUST be private to this request: on any failure it is unlinked, so a request that is
-    rejected or cut short discards only its own bytes and can never disturb shared state."""
+    rejected or cut short discards only its own bytes and can never disturb shared state. The one
+    exception is a client disconnect when `keep_cut` is set: the spool then keeps what arrived and
+    the result says `cut`, for a caller that can merge a partial body."""
     received = 0
+    cut = False
     try:
         f = await to_thread.run_sync(_open_spool_sync, path)
         try:
-            async for chunk in stream:
-                if not chunk:
-                    continue
-                received += len(chunk)
-                if start + received > ceiling:
-                    raise UploadTooLarge(start + received)
-                await to_thread.run_sync(f.write, chunk)
+            try:
+                async for chunk in stream:
+                    if not chunk:
+                        continue
+                    received += len(chunk)
+                    if start + received > ceiling:
+                        raise UploadTooLarge(start + received)
+                    await to_thread.run_sync(f.write, chunk)
+            except ClientDisconnect:
+                if not keep_cut:
+                    raise
+                cut = True
         finally:
             await to_thread.run_sync(f.close)
     except BaseException:
         await to_thread.run_sync(_unlink_sync, path)
         raise
-    return received
+    return Spooled(received=received, cut=cut)
 
 
 def size_ceiling(upload: Upload) -> int:
@@ -505,13 +528,27 @@ def _spool_path(upload_uid: str) -> Path:
     return _data_root() / "uploads" / f"{upload_uid}.{secrets.token_urlsafe(8)}.spool"
 
 
+@dataclass(frozen=True)
+class Appended:
+    """The session as an append left it. `kept_from_cut` counts the bytes of a body the client cut
+    short that this append merged — 0 when the body ended normally or its bytes landed nowhere."""
+
+    upload: Upload
+    kept_from_cut: int = 0
+
+
 async def append_stream(
     db: AsyncSession, upload: Upload, offset: int, stream: AsyncIterable[bytes]
-) -> Upload | None:
+) -> Appended | None:
     """Receive an append at `offset`: spool the body to a private file, then merge it into the
     shared part file. Idempotent — replaying an already-received range is a no-op; a forward gap
     raises ValueError (caller → 409); an over-ceiling body raises UploadTooLarge (caller → 413).
     Answers None when the session is GONE by the time the row lock is granted (caller → 404).
+
+    A body the client cut short (a disconnect mid-stream) merges the bytes that arrived exactly as
+    a whole body of that length would, under the same lock and the same decision, so a resume
+    from HEAD continues where the bytes stopped instead of resending them. A cut after no bytes
+    at all merges nothing and takes no lock.
 
     The offset the body was built against may be STALE by the time it is fully received, so the
     merge re-reads the row FOR UPDATE and re-decides gap/replay/match against the refreshed
@@ -527,13 +564,18 @@ async def append_stream(
     if offset > upload.bytes_received:
         raise ValueError("offset gap")
     if offset < upload.bytes_received:
-        return upload
+        return Appended(upload)
     spool = _spool_path(upload.upload_uid)
     try:
         # Receive-time bound: no single body may exceed the session's whole ceiling, so an oversize
         # upload is refused mid-stream. Where it LANDS is not yet known — that needs the offset the
         # merge settles on, so the offset-relative check is the one under the lock below.
-        received = await spool_stream(stream, spool, start=0, ceiling=size_ceiling(upload))
+        spooled = await spool_stream(
+            stream, spool, start=0, ceiling=size_ceiling(upload), keep_cut=True
+        )
+        received = spooled.received
+        if spooled.cut and received == 0:
+            return Appended(upload)
         # `scalar_one_or_none`, not `scalar_one`: waiting on this lock is exactly when the row can
         # disappear — the writer this append queued behind may have been a finalize, which consumes
         # the session and deletes it. A lock acquisition may lose its row, and losing it is an
@@ -558,6 +600,7 @@ async def append_stream(
             await to_thread.run_sync(_concat_sync, spool, part_path(upload.upload_uid), offset)
             upload.bytes_received = offset + received
             await db.flush()
+            kept_from_cut = received if spooled.cut else 0
             if upload.bytes_received >= upload.declared_size:
                 # The upload just COMPLETED — the one moment its bytes are all here and nothing
                 # has consumed them yet. The capture read happens here, inside the same row lock
@@ -566,8 +609,9 @@ async def append_stream(
                 # This transaction already holds the row, so the read cannot come back empty;
                 # the walrus keeps the type honest without inventing a branch that cannot run.
                 upload = await ensure_capture(db, upload) or upload
+            return Appended(upload, kept_from_cut)
         # offset < bytes_received → a concurrent append already covered this range; no-op
-        return upload
+        return Appended(upload)
     finally:
         await to_thread.run_sync(_unlink_sync, spool)
 
@@ -579,7 +623,8 @@ async def append_chunk(db: AsyncSession, upload: Upload, offset: int, data: byte
     async def _one() -> AsyncIterator[bytes]:
         yield data
 
-    return await append_stream(db, upload, offset, _one())
+    appended = await append_stream(db, upload, offset, _one())
+    return None if appended is None else appended.upload
 
 
 async def _memo_screen_sibling(

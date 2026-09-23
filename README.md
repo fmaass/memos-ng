@@ -190,6 +190,16 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.9.0
+
+- A `PATCH /api/uploads/{upload_uid}` body may be any length from 1 byte to the bytes the upload
+  still needs: `chunk_size` is a hint for clients that chunk, not a size a body has to match, and
+  the upload contract now says so in its descriptions. When a client disconnects in the middle of
+  a body, the bytes that reached the server are kept — `HEAD` reports the offset they reached, and
+  the next `PATCH` continues from there instead of sending them again. A disconnect before any
+  byte arrived changes nothing, and a cut body whose starting offset another append has already
+  moved past is discarded whole, exactly as a complete body would be.
+
 ### v1.8.0
 
 - One memo save can name its whole picture list, in order. `PATCH /api/memos/{uid}` takes an

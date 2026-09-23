@@ -1,0 +1,22 @@
+Discard a cut body instead of keeping it: the disconnect branch unlinks the spool and reports that
+nothing arrived.
+
+This restores the old outcome for the bytes without the old exception: the route still answers
+normally, but the bytes that reached the server are thrown away and the row keeps its offset, so a
+resume from HEAD sends them again. The probes that must turn red are the disconnect probe (HEAD must report the bytes
+that arrived), the race probe (its answer must carry the offset the concurrent append committed,
+which this early return never re-reads), and the spool unit test (a caller that asked to keep a cut
+body must get it). The zero-byte probe must stay green: a cut with nothing in it was already a no-op.
+
+--- a/app/services/uploads.py
++++ b/app/services/uploads.py
+@@ -507,7 +507,8 @@
+             except ClientDisconnect:
+                 if not keep_cut:
+                     raise
+-                cut = True
++                await to_thread.run_sync(_unlink_sync, path)
++                return Spooled(received=0, cut=True)
+         finally:
+             await to_thread.run_sync(f.close)
+     except BaseException:
