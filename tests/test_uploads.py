@@ -607,7 +607,8 @@ async def test_spool_stream_accumulates_received_bytes(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     spool = tmp_path / "uploads" / "acc.spool"
     chunks = [bytes([i]) * 1000 for i in range(5)]
-    assert await svc.spool_stream(_chunks(chunks), spool, start=0, ceiling=10_000) == 5000
+    spooled = await svc.spool_stream(_chunks(chunks), spool, start=0, ceiling=10_000)
+    assert spooled == svc.Spooled(received=5000, cut=False)
     assert spool.read_bytes() == b"".join(chunks)
 
 
@@ -664,7 +665,8 @@ async def test_gap_and_replay_answer_before_consuming_the_body(adb, monkeypatch,
 
     with pytest.raises(ValueError):  # gap wins over the ceiling: 409, not 413
         await svc.append_stream(adb, up, 500, oversize_body())
-    assert await svc.append_stream(adb, up, 0, oversize_body()) is up  # replay wins too: no-op
+    replay = await svc.append_stream(adb, up, 0, oversize_body())
+    assert replay is not None and replay.upload is up  # replay wins too: no-op
     assert pulled == 0  # neither request read a chunk
     assert up.bytes_received == 400
     assert svc.part_path(up.upload_uid).read_bytes() == b"P" * 400
@@ -1221,3 +1223,251 @@ def test_worker_loop_uses_the_committed_reap_entry():
     source = Path(__file__).parent.parent.joinpath("app", "worker.py").read_text()
     assert "reap_expired_committed()" in source
     assert "reap_expired(db)" not in source
+
+
+def _upload_row(uid):
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        row = c.execute(
+            text("SELECT bytes_received, capture_state FROM uploads WHERE upload_uid = :u"),
+            {"u": uid},
+        ).one()
+    eng.dispose()
+    return row
+
+
+async def _patch_cut_short(token, uid, offset, pieces, content_length):
+    """PATCH through the COMPLETE app, fed the ASGI messages uvicorn sends when the client's
+    connection drops mid-body: each piece as a `more_body` request message, then `http.disconnect`
+    for every later receive (uvicorn `httptools_impl.py` `receive`, :572-573). httpx's ASGI
+    transport cannot say this — it has no way to end a body except by finishing it."""
+    import json
+
+    headers = [
+        (b"host", b"testserver"),
+        (b"authorization", f"Bearer {token}".encode()),
+        (b"upload-offset", str(offset).encode()),
+        (b"content-type", b"application/octet-stream"),
+        (b"content-length", str(content_length).encode()),
+    ]
+    path = f"/api/uploads/{uid}"
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "PATCH",
+        "headers": headers,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 50000),
+        "root_path": "",
+    }
+    queue = [{"type": "http.request", "body": p, "more_body": True} for p in pieces]
+    sent = []
+
+    async def receive():
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    await app(scope, receive, send)
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, json.loads(body)
+
+
+async def test_bytes_before_a_disconnect_are_kept_and_the_resume_completes(
+    pat_client, monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    from structlog.testing import capture_logs
+
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    content = os.urandom(10_000)
+    start = await bearer.post(
+        "/api/uploads",
+        json={"filename": "cut.bin", "mime": "application/octet-stream", "size": len(content)},
+    )
+    uid = start.json()["upload_uid"]
+    try:
+        with caplog.at_level(logging.DEBUG), capture_logs() as events:
+            status, out = await _patch_cut_short(
+                token, uid, 0, [content[:2500], content[2500:4000]], len(content)
+            )
+        assert status == 200
+        assert out["bytes_received"] == 4000
+        head = await bearer.head(f"/api/uploads/{uid}")
+        assert head.headers["Upload-Offset"] == "4000"
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+        partials = [e for e in events if e["event"] == "upload.partial_commit"]
+        assert [(e["upload_uid"], e["offset"], e["bytes"]) for e in partials] == [(uid, 0, 4000)]
+        assert not [r for r in caplog.records if r.exc_info or r.levelno >= logging.ERROR]
+        assert "ResponseValidationError" not in caplog.text
+        assert _upload_row(uid) == (4000, "pending")
+
+        rest = await bearer.patch(
+            f"/api/uploads/{uid}", content=content[4000:], headers={"Upload-Offset": "4000"}
+        )
+        assert rest.status_code == 200 and rest.json()["bytes_received"] == len(content)
+        assert _upload_row(uid) == (len(content), "done")  # the completing append read capture
+        assert svc.part_path(uid).read_bytes() == content
+    finally:
+        _cleanup()
+
+
+def test_a_body_longer_than_chunk_size_is_accepted_whole(logged_in_client, monkeypatch, tmp_path):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "UPLOAD_CHUNK_SIZE", 1000)
+    try:
+        content = os.urandom(7_500)
+        uid = _start(client, "long.bin", "application/octet-stream", len(content))
+        r = client.patch(f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"})
+        assert r.status_code == 200
+        assert r.json()["chunk_size"] == 1000
+        assert r.json()["bytes_received"] == len(content)
+        assert client.head(f"/api/uploads/{uid}").headers["Upload-Offset"] == str(len(content))
+
+        # The length above is a pin of what the route already accepts; the served contract is what
+        # tells a client it may send it, so the words are asserted too.
+        served = client.get("/openapi.json").json()
+        patch = served["paths"]["/api/uploads/{upload_uid}"]["patch"]
+        assert "any length from 1 byte to the bytes remaining" in patch["description"]
+        assert "Bytes received before a disconnect are kept" in patch["description"]
+        fields = served["components"]["schemas"]["UploadOut"]["properties"]
+        assert (
+            "any length from 1 byte to the bytes remaining" in fields["chunk_size"]["description"]
+        )
+        assert "the offset the next PATCH must start at" in fields["bytes_received"]["description"]
+    finally:
+        _cleanup()
+
+
+async def test_a_disconnect_before_any_byte_changes_nothing_and_takes_no_lock(
+    pat_client, monkeypatch, tmp_path
+):
+    import threading
+
+    import psycopg2
+    from structlog.testing import capture_logs
+
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    content = os.urandom(6_000)
+    start = await bearer.post(
+        "/api/uploads",
+        json={"filename": "zero.bin", "mime": "application/octet-stream", "size": len(content)},
+    )
+    uid = start.json()["upload_uid"]
+    try:
+        first = await bearer.patch(
+            f"/api/uploads/{uid}", content=content[:3000], headers={"Upload-Offset": "0"}
+        )
+        assert first.json()["bytes_received"] == 3000
+        # Another connection holds the row lock and lets go of it only after 5 s: an append that
+        # asked for the lock would answer only after that release, so the answer must come first.
+        holder = psycopg2.connect(SYNC_URL.replace("postgresql+psycopg2", "postgresql"))
+        released = threading.Event()
+
+        def release():
+            holder.rollback()
+            released.set()
+
+        with holder.cursor() as cur:
+            cur.execute("SELECT 1 FROM uploads WHERE upload_uid = %s FOR UPDATE", (uid,))
+        timer = threading.Timer(5, release)
+        timer.start()
+        try:
+            with capture_logs() as events:
+                status, out = await _patch_cut_short(token, uid, 3000, [], len(content) - 3000)
+            answered_under_the_lock = not released.is_set()
+        finally:
+            timer.join()
+            holder.close()
+        assert answered_under_the_lock
+        assert status == 200
+        assert out["bytes_received"] == 3000
+        assert [e for e in events if e["event"] == "upload.partial_commit"] == []
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+        assert _upload_row(uid) == (3000, "pending")
+        assert svc.part_path(uid).read_bytes() == content[:3000]
+    finally:
+        _cleanup()
+
+
+async def test_a_cut_body_whose_offset_a_concurrent_append_moved_is_discarded(
+    pat_client, monkeypatch, tmp_path
+):
+    from app.database import async_session
+    from sqlalchemy import select
+    from structlog.testing import capture_logs
+
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    content = os.urandom(10_000)
+    start = await bearer.post(
+        "/api/uploads",
+        json={"filename": "race.bin", "mime": "application/octet-stream", "size": len(content)},
+    )
+    uid = start.json()["upload_uid"]
+    real_spool = svc.spool_stream
+    raced = []
+
+    async def spool_then_race(*args, **kwargs):
+        # The cut body is fully spooled; before its append asks for the row lock, another append
+        # of the same range lands and commits through its own session. That append spools through
+        # this same function, so only the first call races.
+        spooled = await real_spool(*args, **kwargs)
+        if not raced:
+            raced.append(True)
+            async with async_session() as other:
+                row = (
+                    await other.execute(select(Upload).where(Upload.upload_uid == uid))
+                ).scalar_one()
+                await svc.append_chunk(other, row, 0, content[:3000])
+                await other.commit()
+        return spooled
+
+    monkeypatch.setattr(svc, "spool_stream", spool_then_race)
+    try:
+        with capture_logs() as events:
+            status, out = await _patch_cut_short(
+                token, uid, 0, [content[:2500], content[2500:4000]], len(content)
+            )
+        assert raced == [True]
+        assert status == 200
+        assert out["bytes_received"] == 3000
+        assert [e for e in events if e["event"] == "upload.partial_commit"] == []
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+        assert _upload_row(uid) == (3000, "pending")
+        assert svc.part_path(uid).read_bytes() == content[:3000]
+    finally:
+        _cleanup()
+
+
+async def test_spool_stream_keeps_a_cut_body_only_for_a_caller_that_asked(monkeypatch, tmp_path):
+    from starlette.requests import ClientDisconnect
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    parts = [b"a" * 700, b"b" * 300]
+
+    async def cut():
+        for p in parts:
+            yield p
+        raise ClientDisconnect()
+
+    kept = tmp_path / "uploads" / "kept.spool"
+    spooled = await svc.spool_stream(cut(), kept, start=0, ceiling=10_000, keep_cut=True)
+    assert spooled == svc.Spooled(received=1000, cut=True)
+    assert kept.read_bytes() == b"".join(parts)
+
+    dropped = tmp_path / "uploads" / "dropped.spool"
+    with pytest.raises(ClientDisconnect):
+        await svc.spool_stream(cut(), dropped, start=0, ceiling=10_000)
+    assert not dropped.exists()

@@ -1,8 +1,9 @@
 from typing import Annotated, Any, Literal
 
+import structlog
 from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,7 @@ from app.models import AttachmentStatus, Upload, User
 from app.services import uploads as svc
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
+logger = structlog.get_logger(__name__)
 
 
 def _upload_offset_header() -> dict[str, Any]:
@@ -37,8 +39,14 @@ class UploadCreate(BaseModel):
 
 class UploadOut(BaseModel):
     upload_uid: str
-    chunk_size: int
-    bytes_received: int
+    chunk_size: int = Field(
+        description="A hint for clients that chunk; the body of a PATCH may be any length from "
+        "1 byte to the bytes remaining."
+    )
+    bytes_received: int = Field(
+        description="Bytes the server holds for this upload session — the offset the next PATCH "
+        "must start at."
+    )
 
 
 class AttachmentOut(BaseModel):
@@ -125,6 +133,9 @@ async def start_upload(
 @router.patch(
     "/{upload_uid}",
     response_model=UploadOut,
+    description="Append bytes at `Upload-Offset`. The body may be any length from 1 byte to the "
+    "bytes remaining; `chunk_size` is a hint for clients that chunk. Bytes received before a "
+    "disconnect are kept, and HEAD reports the offset they reached.",
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -159,7 +170,7 @@ async def append_chunk(
 ) -> UploadOut:
     upload = await _get_upload(db, upload_uid, user.id)
     try:
-        merged = await svc.append_stream(db, upload, upload_offset, request.stream())
+        appended = await svc.append_stream(db, upload, upload_offset, request.stream())
     except svc.UploadTooLarge as exc:
         cap = settings.MAX_UPLOAD_MIB * 1024 * 1024
         detail = (
@@ -170,13 +181,22 @@ async def append_chunk(
         raise HTTPException(status_code=413, detail=detail) from None
     except ValueError:
         raise HTTPException(status_code=409, detail="Offset gap; re-sync via HEAD") from None
-    if merged is None:
+    if appended is None:
         # The session was consumed (or reaped) while this append waited for its row. Same answer as
         # an unknown uid — because that is what it now is — rather than the 500 `.scalar_one()`
         # used to raise on the very interleaving the row lock exists to make safe.
         raise HTTPException(status_code=404, detail="Upload not found")
-    upload = merged
+    upload = appended.upload
     await db.commit()
+    if appended.kept_from_cut:
+        # The client is gone and never reads this answer; the route still returns a valid
+        # UploadOut, because FastAPI validates every return against `response_model`.
+        logger.info(
+            "upload.partial_commit",
+            upload_uid=upload.upload_uid,
+            offset=upload_offset,
+            bytes=appended.kept_from_cut,
+        )
     response.headers["Upload-Offset"] = str(upload.bytes_received)
     return UploadOut(
         upload_uid=upload.upload_uid,

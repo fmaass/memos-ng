@@ -18,3 +18,7 @@ tests/mutations/heif_item_early_return.patch	heif_item_early_return	test_the_who
 # another connection while the work runs, the claiming session stays idle-in-transaction across
 # it, and a claim that was only flushed does not survive an outcome write that fails.
 tests/mutations/claim_flush.patch	claim_flush	test_failure_record_commit_error_leaves_job_for_the_stale_sweep test_run_once_commits_the_claim_before_processing test_result_commits_when_processing_outlasts_idle_in_transaction_timeout		tests/test_media.py
+# The disconnect branch discards what arrived: the disconnect probe, the race probe (its answer
+# is the stale snapshot the early return hands back) and the spool unit test turn red; the
+# zero-byte probe stays green because a cut with nothing in it was already a no-op.
+tests/mutations/partial_commit_discard.patch	partial_commit_discard	test_bytes_before_a_disconnect_are_kept_and_the_resume_completes test_a_cut_body_whose_offset_a_concurrent_append_moved_is_discarded test_spool_stream_keeps_a_cut_body_only_for_a_caller_that_asked		tests/test_uploads.py
