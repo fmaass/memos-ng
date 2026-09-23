@@ -201,7 +201,10 @@ met until its tests exist and pass.
 - Plan pages: **1649** (historical build roadmap), **1884** (feature-parity roadmap), **3151**
   (native iOS client + reference iOS architecture, 2026-08-23), **3819** (Places map, 2026-09-17),
   **3844** (two class-routed worker consumers, 2026-09-18), **3857** (v1.7.2 release train,
-  2026-09-19), **3865** (v1.7.3 release train, 2026-09-19).
+  2026-09-19), **3865** (v1.7.3 release train, 2026-09-19), **3929** (Photos-style web library
+  view, WP-9, Epic MEMNG-505, 2026-09-23; local copy `docs/plans/PLAN_2026-09-22_photos-style-library.md`).
+- Investigation reports (book level): **3926** (aligning the web picture library with the iOS
+  Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
 - Release records (book level): **3872** (v1.7.3, 2026-09-20), **3856** (v1.7.2, 2026-09-19), **3846** (v1.7.1, 2026-09-18), **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
