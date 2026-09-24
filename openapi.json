@@ -5949,6 +5949,597 @@
         ]
       }
     },
+    "/api/tus": {
+      "options": {
+        "description": "The server's tus capabilities. Needs no credential: it discloses no user data.",
+        "operationId": "tus_options",
+        "responses": {
+          "204": {
+            "description": "Successful Response",
+            "headers": {
+              "Tus-Extension": {
+                "description": "The extensions spoken, comma-separated.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Max-Size": {
+                "description": "The largest upload accepted, in bytes.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Tus-Resumable": {
+                "description": "1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Version": {
+                "description": "1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Tus Options",
+        "tags": [
+          "tus"
+        ]
+      },
+      "post": {
+        "description": "Create an upload session of `Upload-Length` bytes. `Upload-Metadata` must carry the keys filename and filetype and may carry lastModified (epoch milliseconds); any other key is refused, so HEAD can echo exactly what was accepted.",
+        "operationId": "tus_create",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Upload-Length",
+            "required": false,
+            "schema": {
+              "title": "Upload-Length",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "Upload-Metadata",
+            "required": false,
+            "schema": {
+              "title": "Upload-Metadata",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "Tus-Resumable",
+            "required": false,
+            "schema": {
+              "title": "Tus-Resumable",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "headers": {
+              "Location": {
+                "description": "`/api/tus/{upload_uid}`, path-absolute.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Resumable": {
+                "description": "1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upload-Expires": {
+                "description": "When the server discards the upload session (RFC 9110 date).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Upload-Length` or `Upload-Metadata` is missing or not accepted.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Tus-Resumable` is missing or is not 1.0.0.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Version": {
+                "description": "The versions the server speaks: 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Upload-Length` exceeds `Tus-Max-Size`.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Tus Create",
+        "tags": [
+          "tus"
+        ]
+      }
+    },
+    "/api/tus/{upload_uid}": {
+      "head": {
+        "operationId": "tus_head",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Tus-Resumable",
+            "required": false,
+            "schema": {
+              "title": "Tus-Resumable",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "headers": {
+              "Cache-Control": {
+                "description": "no-store.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Resumable": {
+                "description": "1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upload-Expires": {
+                "description": "When the server discards the upload session (RFC 9110 date).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upload-Length": {
+                "description": "The size declared at creation.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Upload-Metadata": {
+                "description": "The metadata accepted at creation.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upload-Offset": {
+                "description": "Bytes the server holds for this upload.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such upload session of the caller's.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Tus-Resumable` is missing or is not 1.0.0.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Version": {
+                "description": "The versions the server speaks: 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Tus Head",
+        "tags": [
+          "tus"
+        ]
+      },
+      "patch": {
+        "description": "Append the body at `Upload-Offset`, which must equal the offset the server holds. Bytes received before a disconnect are kept, and HEAD reports the offset they reached.",
+        "operationId": "tus_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Upload-Offset",
+            "required": false,
+            "schema": {
+              "title": "Upload-Offset",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "Tus-Resumable",
+            "required": false,
+            "schema": {
+              "title": "Tus-Resumable",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/offset+octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upload-Expires": {
+                "description": "When the server discards the upload session (RFC 9110 date).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upload-Offset": {
+                "description": "Bytes the server now holds.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Upload-Offset` is missing or not a non-negative integer.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such upload session of the caller's.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Upload-Offset` is not the offset the server holds; nothing was written. Re-sync with HEAD.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "`Tus-Resumable` is missing or is not 1.0.0.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Tus-Version": {
+                "description": "The versions the server speaks: 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The body would exceed the declared length or the server limit.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The Content-Type header is not `application/offset+octet-stream`.",
+            "headers": {
+              "Tus-Resumable": {
+                "description": "Always 1.0.0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Tus Patch",
+        "tags": [
+          "tus"
+        ]
+      }
+    },
     "/api/uploads": {
       "post": {
         "operationId": "start_upload_api_uploads_post",

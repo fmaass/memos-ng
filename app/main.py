@@ -100,6 +100,7 @@ from app.routers import native as native_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
 from app.routers import push as push_router  # noqa: E402
 from app.routers import settings as settings_router  # noqa: E402
+from app.routers import tus as tus_router  # noqa: E402
 from app.routers import uploads as uploads_router  # noqa: E402
 
 # Add eagerly rather than include_router(): FastAPI 0.138's include_router defers to a
@@ -113,6 +114,7 @@ app.router.routes.extend(memos_router.router.routes)
 app.router.routes.extend(pats_router.router.routes)
 app.router.routes.extend(export_router.router.routes)
 app.router.routes.extend(uploads_router.router.routes)
+app.router.routes.extend(tus_router.router.routes)
 app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
@@ -223,6 +225,9 @@ PUBLIC_OPERATIONS: set[tuple[str, str]] = {
     # Authelia authentication minutes ago (MEMNG-138 option 2), so requiring a credential on top
     # would be circular in exactly the way the device exchange above is.
     ("POST", "/api/auth/native/manage-grant"),
+    # The tus capability probe: protocol constants and the size ceiling, no user data, and a tus
+    # client may ask before it holds a token.
+    ("OPTIONS", "/api/tus"),
 }
 
 

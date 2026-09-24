@@ -205,7 +205,9 @@ met until its tests exist and pass.
   view, WP-9, Epic MEMNG-505, 2026-09-23; local copy `docs/plans/PLAN_2026-09-22_photos-style-library.md`),
   **3937** (Playbook — UI renovation nightly work packages WP-9/WP-10, 2026-09-23; local copy
   `docs/plans/PLAYBOOK_2026-09-23_ui-renovation-nightly.md`; handovers 3939 library-foundations,
-  3940 library-views, 3941 library-select in chapter 2689; iterations 27–30 in MEMNG).
+  3940 library-views, 3941 library-select in chapter 2689; iterations 27–30 in MEMNG),
+  **3999** (memos-ng speaks tus 1.0, MEMNG-539, 2026-09-24; local copy
+  `docs/plans/PLAN_2026-09-24_tus-endpoint.md`).
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
