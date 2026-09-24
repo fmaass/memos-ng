@@ -204,8 +204,8 @@ All settings come from the environment (or a `.env` file). Key variables — see
   `Tus-Resumable: 1.0.0` is refused with 412. Completion stays
   `POST /api/uploads/{upload_uid}/finalize` with the uid the `Location` named.
 - The JSON upload routes are unchanged. A `last_modified` sent to `POST /api/uploads` (integer
-  epoch milliseconds) is now stored to the exact millisecond: the old conversion divided by 1000
-  as a float and stored a different millisecond once the seconds passed 2**32.
+  epoch milliseconds) is now applied as integer milliseconds instead of through a float division
+  by 1000, so the stored instant is the millisecond that was sent; 0 still means no date.
 
 ### v1.9.0
 
