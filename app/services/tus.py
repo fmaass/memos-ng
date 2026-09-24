@@ -22,7 +22,9 @@ OFFSET_STREAM = "application/offset+octet-stream"
 # The last millisecond `datetime` can represent (9999-12-31T23:59:59.999Z): a larger value has no
 # `client_mtime` to land in.
 MAX_LAST_MODIFIED_MS = 253402300799999
-_CANONICAL_MS = re.compile(r"[1-9][0-9]*")
+# At most 15 digits (the length of MAX_LAST_MODIFIED_MS): `int()` refuses strings past its digit
+# limit with a bare ValueError, which would escape the 400 path; the grammar stops them first.
+_CANONICAL_MS = re.compile(r"[1-9][0-9]{0,14}")
 _NON_NEGATIVE = re.compile(r"[0-9]+")
 _ACCEPTED_KEYS = frozenset({"filename", "filetype", "lastModified"})
 
@@ -71,14 +73,32 @@ def non_negative_header(value: str | None, name: str) -> int:
     return int(value)
 
 
+def _column_length(column: str) -> int:
+    length = getattr(Upload.__table__.c[column].type, "length", None)
+    assert isinstance(length, int), column
+    return length
+
+
+# `create_upload` creates the part file BEFORE the row is inserted, so a value the row cannot hold
+# would fail the insert after the file exists and orphan it where `reap_expired` (which walks rows)
+# never looks. Everything the column would refuse is therefore refused here, before the store.
+_TEXT_COLUMNS = {"filename": "filename", "filetype": "mime"}
+
+
 def _required_text(pairs: Mapping[str, bytes], key: str) -> str:
     raw = pairs.get(key)
     if not raw:
         raise MetadataRefused(f"Upload-Metadata must carry {key!r} with a value")
     try:
-        return raw.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise MetadataRefused(f"Upload-Metadata {key!r} is not UTF-8") from None
+    if "\x00" in text:
+        raise MetadataRefused(f"Upload-Metadata {key!r} contains a NUL character")
+    limit = _column_length(_TEXT_COLUMNS[key])
+    if len(text) > limit:
+        raise MetadataRefused(f"Upload-Metadata {key!r} is longer than {limit} characters")
+    return text
 
 
 def _last_modified(raw: bytes) -> int:

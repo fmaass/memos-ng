@@ -465,6 +465,8 @@ def test_metadata_without_last_modified_echoes_only_what_was_sent(
         (_metadata(filename="a", filetype="b") + ",filename " + _b64("c"), "malformed"),
         (_metadata(filename="a", filetype="b") + ",", "malformed"),
         ("", "malformed"),
+        # past Python's int() digit limit: must be refused by the grammar, never reach int()
+        (_metadata(filename="a", filetype="b", lastModified="9" * 5000), "lastModified"),
     ],
 )
 def test_creation_refuses_metadata_it_could_not_echo_faithfully(
@@ -491,6 +493,74 @@ def test_creation_without_upload_metadata_is_400(logged_in_client, monkeypatch, 
     assert _upload_count() == before
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("filename", "a" * 513),
+        ("filetype", "t" * 256),
+        ("filename", "clip\x00.mov"),  # Postgres text cannot hold a NUL
+        ("filetype", "video/\x00quicktime"),
+    ],
+)
+def test_metadata_the_row_cannot_hold_is_refused_before_any_file_exists(
+    logged_in_client, monkeypatch, tmp_path, key, value
+):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    pairs = {"filename": "clip.mov", "filetype": "video/quicktime", key: value}
+    before = _upload_count()
+    try:
+        r = client.post("/api/tus", headers=_create_headers(10, _metadata(**pairs)))
+        assert r.status_code == 400, r.status_code
+        assert key in r.json()["detail"]
+        assert _upload_count() == before
+        assert list((tmp_path / "uploads").glob("*")) == []  # no orphaned part file
+    finally:
+        _cleanup()
+
+
+def test_metadata_at_the_column_bounds_is_accepted_and_echoed(
+    logged_in_client, monkeypatch, tmp_path
+):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        filename, filetype = "é" * 512, "t" * 255  # characters, not bytes: 1024 bytes of name
+        uid = _create(client, 10, _metadata(filename=filename, filetype=filetype))
+        head = client.head(f"/api/tus/{uid}", headers=TUS)
+        assert _decoded_metadata(head.headers["Upload-Metadata"]) == {
+            "filename": filename.encode(),
+            "filetype": filetype.encode(),
+        }
+    finally:
+        _cleanup()
+
+
+def test_a_header_shaped_filename_travels_only_base64_encoded(
+    logged_in_client, monkeypatch, tmp_path
+):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    evil = "a.txt\r\nLocation: https://evil.example/\r\nX-Injected: 1"
+    try:
+        created = client.post(
+            "/api/tus", headers=_create_headers(10, _metadata(filename=evil, filetype="text/plain"))
+        )
+        assert created.status_code == 201
+        uid = _uid_from(created.headers["Location"])
+        assert created.headers.get_list("Location") == [f"/api/tus/{uid}"]
+        assert "X-Injected" not in created.headers
+
+        head = client.head(f"/api/tus/{uid}", headers=TUS)
+        assert "X-Injected" not in head.headers and "Location" not in head.headers
+        raw = head.headers["Upload-Metadata"]
+        assert "\r" not in raw and "\n" not in raw and "evil.example" not in raw
+        assert _decoded_metadata(raw)["filename"] == evil.encode()
+        assert _row(uid).filename == evil
+    finally:
+        _cleanup()
+
+
 def test_metadata_codec_holds_the_spec_example():
     from app.services.tus import encode_upload_metadata, parse_upload_metadata
 
@@ -501,6 +571,7 @@ def test_metadata_codec_holds_the_spec_example():
     binary = {"blob": b"\x00\xff\x10", "name": "ü".encode()}
     assert parse_upload_metadata(encode_upload_metadata(binary)) == binary
     assert parse_upload_metadata("filename d29ybGQucG5n, is_confidential") == parsed
+    assert parse_upload_metadata("blob " + _b64(b"a\x00b")) == {"blob": b"a\x00b"}
 
 
 def test_upload_expires_is_an_imf_fixdate_in_gmt_or_absent():
