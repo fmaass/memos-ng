@@ -386,6 +386,9 @@ def _sha256_sync(path: Path) -> str:
     return sha.hexdigest()
 
 
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
 def part_path(upload_uid: str) -> Path:
     return _data_root() / "uploads" / f"{upload_uid}.part"
 
@@ -449,7 +452,10 @@ async def create_upload(
     upload_uid = secrets.token_urlsafe(24)
     part = part_path(upload_uid)
     await to_thread.run_sync(_create_part_sync, part)
-    client_mtime = datetime.fromtimestamp(last_modified / 1000, UTC) if last_modified else None
+    # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
+    # millisecond than the one sent once the seconds pass 2**32, and the tus route echoes this
+    # value back to the client as it was sent.
+    client_mtime = EPOCH + timedelta(milliseconds=last_modified) if last_modified else None
     upload = Upload(
         upload_uid=upload_uid,
         owner_id=owner_id,
@@ -538,12 +544,21 @@ class Appended:
 
 
 async def append_stream(
-    db: AsyncSession, upload: Upload, offset: int, stream: AsyncIterable[bytes]
+    db: AsyncSession,
+    upload: Upload,
+    offset: int,
+    stream: AsyncIterable[bytes],
+    *,
+    strict_offset: bool = False,
 ) -> Appended | None:
     """Receive an append at `offset`: spool the body to a private file, then merge it into the
     shared part file. Idempotent — replaying an already-received range is a no-op; a forward gap
     raises ValueError (caller → 409); an over-ceiling body raises UploadTooLarge (caller → 413).
     Answers None when the session is GONE by the time the row lock is granted (caller → 404).
+
+    `strict_offset` turns the replay into a ValueError as well, at both decision points: tus 1.0
+    answers ANY offset other than the held one with 409 and leaves the resource untouched, and
+    under the lock is the only place that answer can be true rather than a stale snapshot's.
 
     A body the client cut short (a disconnect mid-stream) merges the bytes that arrived exactly as
     a whole body of that length would, under the same lock and the same decision, so a resume
@@ -564,6 +579,8 @@ async def append_stream(
     if offset > upload.bytes_received:
         raise ValueError("offset gap")
     if offset < upload.bytes_received:
+        if strict_offset:
+            raise ValueError("offset mismatch")
         return Appended(upload)
     spool = _spool_path(upload.upload_uid)
     try:
@@ -610,7 +627,9 @@ async def append_stream(
                 # the walrus keeps the type honest without inventing a branch that cannot run.
                 upload = await ensure_capture(db, upload) or upload
             return Appended(upload, kept_from_cut)
-        # offset < bytes_received → a concurrent append already covered this range; no-op
+        # offset < bytes_received → a concurrent append already covered this range
+        if strict_offset:
+            raise ValueError("offset mismatch")
         return Appended(upload)
     finally:
         await to_thread.run_sync(_unlink_sync, spool)
