@@ -190,6 +190,23 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.10.0
+
+- The server speaks tus 1.0 (core, creation and expiration) at `/api/tus`, over the same upload
+  store as `/api/uploads`, so a stock tus client can upload without learning this server's own
+  dialect. `OPTIONS /api/tus` needs no credential and announces `Tus-Resumable` and `Tus-Version`
+  1.0.0, `Tus-Extension: creation,expiration` and `Tus-Max-Size`. `POST /api/tus` creates a session
+  from `Upload-Length` and an `Upload-Metadata` carrying `filename`, `filetype` and an optional
+  `lastModified` in epoch milliseconds, and answers 201 with a path-absolute `Location` and
+  `Upload-Expires`. `HEAD` reports `Upload-Offset`. `PATCH` with
+  `application/offset+octet-stream` appends at the offset the server holds and answers 409 for any
+  other offset, leaving the upload untouched. Every request but `OPTIONS` without
+  `Tus-Resumable: 1.0.0` is refused with 412. Completion stays
+  `POST /api/uploads/{upload_uid}/finalize` with the uid the `Location` named.
+- The JSON upload routes are unchanged. A `last_modified` sent to `POST /api/uploads` (integer
+  epoch milliseconds) is now stored to the exact millisecond: the old conversion divided by 1000
+  as a float and stored a different millisecond once the seconds passed 2**32.
+
 ### v1.9.0
 
 - A `PATCH /api/uploads/{upload_uid}` body may be any length from 1 byte to the bytes the upload
