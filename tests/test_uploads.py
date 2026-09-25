@@ -10,7 +10,7 @@ from app.main import app
 from app.models import Upload
 from app.services import uploads as svc
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 
 from tests.conftest import SYNC_URL
 
@@ -1471,3 +1471,125 @@ async def test_spool_stream_keeps_a_cut_body_only_for_a_caller_that_asked(monkey
     with pytest.raises(ClientDisconnect):
         await svc.spool_stream(cut(), dropped, start=0, ceiling=10_000)
     assert not dropped.exists()
+
+
+# ---------------------------------------------------------------------------------------------
+# The store: strict offsets at both decision points; the sent millisecond kept exactly
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_strict_offset_refuses_on_the_snapshot_without_consuming_the_body(
+    adb, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "store_strict_snapshot")
+    up = await svc.create_upload(
+        adb, owner_id=o.id, filename="s.bin", mime="application/octet-stream", size=900
+    )
+    await svc.append_stream(adb, up, 0, _chunks([b"A" * 300]))
+    pulled = False
+
+    async def body():
+        nonlocal pulled
+        pulled = True
+        yield b"Z" * 100
+
+    for stale in (0, 299, 301):
+        with pytest.raises(ValueError):
+            await svc.append_stream(adb, up, stale, body(), strict_offset=True)
+    assert not pulled  # decided on the snapshot, before the body was read
+    assert up.bytes_received == 300
+    assert svc.part_path(up.upload_uid).read_bytes() == b"A" * 300
+
+    # the default keeps the /api/uploads contract: a replay is a no-op, not a refusal
+    replay = await svc.append_stream(adb, up, 0, body())
+    assert replay is not None and replay.upload.bytes_received == 300
+
+
+async def test_strict_offset_refuses_under_the_row_lock_when_the_snapshot_went_stale(
+    db_engine, monkeypatch, tmp_path
+):
+    # B's snapshot is true when B starts (offset 0), and B's body stays inside the ceiling, so the
+    # only thing that can refuse it is the decision re-taken under the row lock after A committed.
+    # Two real sessions, not the `adb` fixture's one transaction: A's append is COMMITTED before B
+    # asks for the lock, as it would be between two requests.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        owner_id = c.execute(
+            text("INSERT INTO users (subject, role) VALUES ('strict_lock','user') RETURNING id")
+        ).scalar_one()
+    eng.dispose()
+    try:
+        from app.database import async_session
+
+        async with async_session() as s0:
+            up = await svc.create_upload(
+                s0, owner_id=owner_id, filename="l.bin", mime="application/octet-stream", size=900
+            )
+            await s0.commit()
+            uid = up.upload_uid
+
+        async def fetch(session):
+            return (
+                await session.execute(select(Upload).where(Upload.upload_uid == uid))
+            ).scalar_one()
+
+        b_in_flight, a_committed = asyncio.Event(), asyncio.Event()
+
+        async def b_body():
+            yield b"B" * 100
+            b_in_flight.set()
+            await a_committed.wait()
+            yield b"B" * 100
+
+        async with async_session() as sa, async_session() as sb:
+            b_snapshot = await fetch(sb)
+            b_task = asyncio.create_task(
+                svc.append_stream(sb, b_snapshot, 0, b_body(), strict_offset=True)
+            )
+            await b_in_flight.wait()
+            await svc.append_stream(sa, await fetch(sa), 0, _chunks([b"A" * 500]))
+            await sa.commit()
+            a_committed.set()
+            with pytest.raises(ValueError):
+                await b_task
+            await sb.rollback()
+
+        assert _upload_row(uid).bytes_received == 500
+        assert svc.part_path(uid).read_bytes() == b"A" * 500
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+    finally:
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM uploads WHERE owner_id = :o"), {"o": owner_id})
+            c.execute(text("DELETE FROM users WHERE id = :o"), {"o": owner_id})
+        eng.dispose()
+
+
+@pytest.mark.parametrize(
+    ("sent", "stored"),
+    [
+        (1001, datetime(1970, 1, 1, 0, 0, 1, 1000, tzinfo=UTC)),
+        (1700000000123, datetime(2023, 11, 14, 22, 13, 20, 123000, tzinfo=UTC)),
+        (253402300799999, datetime(9999, 12, 31, 23, 59, 59, 999000, tzinfo=UTC)),
+        (None, None),
+        (0, None),
+    ],
+)
+async def test_create_upload_stores_the_sent_millisecond_exactly(
+    adb, monkeypatch, tmp_path, sent, stored
+):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    o = await _owner(adb, "store_mtime")
+    up = await svc.create_upload(
+        adb, owner_id=o.id, filename="m.bin", mime="x/y", size=1, last_modified=sent
+    )
+    reread = (
+        await adb.execute(
+            select(Upload)
+            .where(Upload.upload_uid == up.upload_uid)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert reread.client_mtime == stored
