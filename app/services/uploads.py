@@ -453,8 +453,8 @@ async def create_upload(
     part = part_path(upload_uid)
     await to_thread.run_sync(_create_part_sync, part)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
-    # millisecond than the one sent once the seconds pass 2**32, and the tus route echoes this
-    # value back to the client as it was sent.
+    # millisecond than the one sent once the seconds pass 2**32, and this value is kept exactly
+    # as the client sent it.
     client_mtime = EPOCH + timedelta(milliseconds=last_modified) if last_modified else None
     upload = Upload(
         upload_uid=upload_uid,
@@ -556,9 +556,10 @@ async def append_stream(
     raises ValueError (caller → 409); an over-ceiling body raises UploadTooLarge (caller → 413).
     Answers None when the session is GONE by the time the row lock is granted (caller → 404).
 
-    `strict_offset` turns the replay into a ValueError as well, at both decision points: tus 1.0
-    answers ANY offset other than the held one with 409 and leaves the resource untouched, and
-    under the lock is the only place that answer can be true rather than a stale snapshot's.
+    `strict_offset` turns the replay into a ValueError as well, at both decision points, for a
+    caller whose protocol answers ANY offset other than the held one with 409 and leaves the
+    resource untouched; under the lock is the only place that answer can be true rather than a
+    stale snapshot's.
 
     A body the client cut short (a disconnect mid-stream) merges the bytes that arrived exactly as
     a whole body of that length would, under the same lock and the same decision, so a resume
