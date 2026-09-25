@@ -207,7 +207,10 @@ met until its tests exist and pass.
   `docs/plans/PLAYBOOK_2026-09-23_ui-renovation-nightly.md`; handovers 3939 library-foundations,
   3940 library-views, 3941 library-select in chapter 2689; iterations 27–30 in MEMNG),
   **3999** (memos-ng speaks tus 1.0, MEMNG-539, 2026-09-24; local copy
-  `docs/plans/PLAN_2026-09-24_tus-endpoint.md`).
+  `docs/plans/PLAN_2026-09-24_tus-endpoint.md`; superseded 2026-09-25 — the router it added is removed
+  again by **4043**), **4043** (remove the tus 1.0 router, release 1.11.0, MEMNG-545 narrowed,
+  2026-09-25; local copy `docs/plans/PLAN_2026-09-25_remove-tus.md`; no successor protocol — the
+  owner dropped resumable uploads, memos-ng-ios ADR-0007).
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
