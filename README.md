@@ -190,6 +190,14 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v1.11.0
+
+- The tus 1.0 endpoint at `/api/tus`, added in 1.10.0, is removed. No client used it, and
+  resumable uploads are no longer pursued: a failed upload is retried whole. `/api/uploads` is
+  unchanged and remains the one upload contract.
+- `openapi.json` and the generated frontend schema no longer carry the four `tus_*` operations
+  (73 operations → 69). No migration.
+
 ### v1.10.0
 
 - The server speaks tus 1.0 (core, creation and expiration) at `/api/tus`, over the same upload
