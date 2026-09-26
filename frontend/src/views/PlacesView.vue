@@ -176,7 +176,7 @@ const drawerOpen = computed({
 
     <InViewGrid
       v-if="isPhone"
-      class="min-h-0 flex-1 overflow-y-auto"
+      class="min-h-0 flex-1 overflow-y-auto pb-[var(--dock-clearance)]"
       :markers="gridMarkers"
       :filtered="selection !== null"
       @open="openByUid(gridMarkers, $event)"
