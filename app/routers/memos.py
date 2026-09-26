@@ -1,5 +1,6 @@
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -32,6 +33,7 @@ from app.services import asset_paths, reclaim, storage
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
 from app.services import uploads as uploads_svc
+from app.services.asset_paths import web_ready_uids
 from app.services.asset_urls import signed_tier_urls
 
 router = APIRouter(prefix="/api", tags=["memos"])
@@ -162,6 +164,11 @@ class AttachmentRef(BaseModel):
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
+    # Whether `webUrl` has a file behind it. `webUrl` is minted for every attachment, but only a
+    # video the worker has finished transcoding has a web rendition, so this is always false for
+    # anything that is not a video and false for a video until its transcode is published. Read
+    # off the filesystem (app/services/asset_paths.py `web_ready_uids`), one batched hop per page.
+    webReady: bool
     posterUrl: str
     downloadUrl: str
     printUrl: str
@@ -519,7 +526,7 @@ class TagCount(BaseModel):
     count: int
 
 
-def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
+def _att_ref(att: Attachment, user_id: int, web_ready: AbstractSet[str]) -> AttachmentRef:
     base = f"/api/attachments/{att.uid}"
     now = time.time()
     # Derived tiers get HMAC-signed URLs → served DB-free (no pool pressure on the feed fan-out).
@@ -542,6 +549,7 @@ def _att_ref(att: Attachment, user_id: int) -> AttachmentRef:
         renditions=rendition_items(att),
         position=att.position,
         **signed_tier_urls(att.uid, user_id, now=now),
+        webReady=att.uid in web_ready,
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
     )
@@ -557,7 +565,7 @@ def _reactions(memo: Memo, user_id: int) -> list[ReactionSummary]:
     return [ReactionSummary(emoji=e, count=c, reacted=e in mine) for e, c in sorted(counts.items())]
 
 
-def _out(memo: Memo, user_id: int) -> MemoOut:
+def _out(memo: Memo, user_id: int, web_ready: AbstractSet[str]) -> MemoOut:
     return MemoOut(
         uid=memo.uid,
         owner=memo.owner.subject,
@@ -569,12 +577,17 @@ def _out(memo: Memo, user_id: int) -> MemoOut:
         updated_at=memo.updated_at,
         archived_at=memo.archived_at,
         tags=sorted(t.name for t in memo.tags),
-        attachments=[_att_ref(a, user_id) for a in memo.attachments],
+        attachments=[_att_ref(a, user_id, web_ready) for a in memo.attachments],
         reactions=_reactions(memo, user_id),
         # Summed over the same loaded rows `attachments` is built from, so the two never disagree
         # and no extra query is spent.
         total_size=sum(a.size for a in memo.attachments),
     )
+
+
+async def _render(memo: Memo, user_id: int) -> MemoOut:
+    """`_out` for one memo, with its web-rendition check done off the loop first."""
+    return _out(memo, user_id, await web_ready_uids(memo.attachments))
 
 
 @router.get("/memos", response_model=MemoList)
@@ -627,8 +640,9 @@ async def list_memos(
         limit=limit,
         with_total=with_total,
     )
+    ready = await web_ready_uids(a for m in items for a in m.attachments)
     return MemoList(
-        items=[_out(m, user.id) for m in items], nextCursor=next_cursor, totalCount=total
+        items=[_out(m, user.id, ready) for m in items], nextCursor=next_cursor, totalCount=total
     )
 
 
@@ -808,7 +822,7 @@ async def create_memo(
         # protect, and the memo it is asking about is already stored WITH those attachments.
         replayed = await svc.get_by_idempotency_key(db, owner_id, key)
         if replayed is not None:
-            return _out(replayed, owner_id)
+            return await _render(replayed, owner_id)
 
     async def attempt() -> Memo:
         """One whole create, from finalize to commit. Owns its own `moved` list because it may run
@@ -952,7 +966,7 @@ async def create_memo(
     if key is None:
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
         # before this feature existed.
-        return _out(await attempt(), owner_id)
+        return await _render(await attempt(), owner_id)
 
     async def rollback_for_retry() -> None:
         await db.rollback()
@@ -966,7 +980,7 @@ async def create_memo(
         lookup=lambda: svc.get_by_idempotency_key(db, owner_id, key),
         rollback=rollback_for_retry,
     )
-    return _out(memo, owner_id)
+    return await _render(memo, owner_id)
 
 
 async def _require_owned(db: AsyncSession, user: User, uid: str) -> Memo:
@@ -982,7 +996,7 @@ async def get_memo(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> MemoOut:
-    return _out(await _require_owned(db, user, uid), user.id)
+    return await _render(await _require_owned(db, user, uid), user.id)
 
 
 def _replayed_or_conflict(found: Memo, memo_id: int, key: str) -> Memo:
@@ -1205,7 +1219,7 @@ async def patch_memo(
         # protect, and the edit it is asking about is already applied, media included.
         replayed = await svc.get_memo_by_edit_key(db, owner_id, key)
         if replayed is not None:
-            return _out(_replayed_or_conflict(replayed, memo_id, key), owner_id)
+            return await _render(_replayed_or_conflict(replayed, memo_id, key), owner_id)
 
     async def attempt() -> Memo:
         """One whole edit, from recording the key to commit. Owns its own `moved` list: if the write
@@ -1396,7 +1410,7 @@ async def patch_memo(
     if key is None:
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
         # before this feature existed.
-        return _out(await attempt(), owner_id)
+        return await _render(await attempt(), owner_id)
 
     async def read_back() -> Memo | None:
         found = await svc.get_memo_by_edit_key(db, owner_id, key)
@@ -1423,7 +1437,7 @@ async def patch_memo(
             ).model_dump(),
         ),
     )
-    return _out(settled, owner_id)
+    return await _render(settled, owner_id)
 
 
 @router.delete("/memos/{uid}", status_code=204, responses=MEMO_NOT_FOUND_RESPONSE)
@@ -1495,7 +1509,7 @@ async def pin_memo(
         raise HTTPException(status_code=403, detail="Not your memo")
     memo = await svc.update_memo(db, memo, pinned=True)
     await db.commit()
-    return _out(memo, user.id)
+    return await _render(memo, user.id)
 
 
 @router.post("/memos/{uid}/unpin", response_model=MemoOut)
@@ -1509,7 +1523,7 @@ async def unpin_memo(
         raise HTTPException(status_code=403, detail="Not your memo")
     memo = await svc.update_memo(db, memo, pinned=False)
     await db.commit()
-    return _out(memo, user.id)
+    return await _render(memo, user.id)
 
 
 @router.post("/memos/{uid}/reactions", response_model=MemoOut)
@@ -1523,7 +1537,7 @@ async def react(
     await svc.add_reaction(db, memo, user, body.emoji)
     await db.commit()
     await db.refresh(memo, attribute_names=["reactions"])  # expire_on_commit=False → reload
-    return _out(memo, user.id)
+    return await _render(memo, user.id)
 
 
 @router.delete("/memos/{uid}/reactions/{emoji}", response_model=MemoOut)
@@ -1537,7 +1551,7 @@ async def unreact(
     await svc.remove_reaction(db, memo, user, emoji)
     await db.commit()
     await db.refresh(memo, attribute_names=["reactions"])
-    return _out(memo, user.id)
+    return await _render(memo, user.id)
 
 
 @router.get("/tags", response_model=list[TagCount])

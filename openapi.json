@@ -115,6 +115,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -145,6 +149,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl",
           "downloadUrl",
           "printUrl"
@@ -270,6 +275,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -306,6 +315,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl"
         ],
         "title": "AttachmentMeta",
@@ -518,6 +528,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -550,6 +564,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl",
           "downloadUrl",
           "printUrl"
@@ -1783,6 +1798,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -1815,6 +1834,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl",
           "downloadUrl",
           "printUrl",

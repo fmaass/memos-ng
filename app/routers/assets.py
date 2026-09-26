@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
@@ -34,7 +35,7 @@ from app.models import (
 )
 from app.services import asset_urls, poster, printready, reclaim, storage, variants
 from app.services import uploads as up_svc
-from app.services.asset_paths import derived_tier_path, tier_path
+from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
 from app.services.attachments import (
     BucketSize,
     library_buckets,
@@ -224,6 +225,10 @@ class AttachmentMeta(BaseModel):
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
+    # Whether `webUrl` has a file behind it — same field and same reading as AttachmentRef.webReady
+    # (app/routers/memos.py): false for anything that is not a video, and for a video until its
+    # transcode is published.
+    webReady: bool
     posterUrl: str
 
 
@@ -247,13 +252,21 @@ class AttachmentListItem(BaseModel):
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
+    # Whether `webUrl` has a file behind it — same field and same reading as AttachmentRef.webReady
+    # (app/routers/memos.py): false for anything that is not a video, and for a video until its
+    # transcode is published.
+    webReady: bool
     posterUrl: str
     downloadUrl: str
     printUrl: str
 
 
 def _list_item(
-    att: Attachment, user_id: int, memo_uid: str | None, taken_at: datetime
+    att: Attachment,
+    user_id: int,
+    memo_uid: str | None,
+    taken_at: datetime,
+    web_ready: AbstractSet[str],
 ) -> AttachmentListItem:
     """`memo_uid` and `taken_at` are passed IN, never read off `att` — there is no
     `Attachment.memo` relationship and adding one would lazy-load per row. The caller selects
@@ -275,6 +288,7 @@ def _list_item(
         takenAt=taken_at,
         filename=att.filename,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
+        webReady=att.uid in web_ready,
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
     )
@@ -443,7 +457,8 @@ async def list_attachments(
             else encode_attachment_cursor(last)
         )
         rows = rows[:page]
-    return [_list_item(att, user.id, memo_uid, when) for att, memo_uid, when in rows]
+    ready = await web_ready_uids(att for att, _, _ in rows)
+    return [_list_item(att, user.id, memo_uid, when, ready) for att, memo_uid, when in rows]
 
 
 class AttachmentBucket(BaseModel):
@@ -545,6 +560,7 @@ async def attachment_meta(
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
         **asset_urls.signed_tier_urls(att.uid, user.id, now=time.time()),
+        webReady=att.uid in await web_ready_uids([att]),
     )
 
 

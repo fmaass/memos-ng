@@ -28,6 +28,7 @@ export function marker(over: Partial<MapMarker> = {}): MapMarker {
     thumbnailUrl: `/api/assets/${uid}/thumb?sig=t`,
     previewUrl: `/api/assets/${uid}/preview?sig=p`,
     webUrl: `/api/assets/${uid}/web?sig=w`,
+    webReady: false,
     posterUrl: `/api/assets/${uid}/poster?sig=o`,
     printUrl: `/api/assets/${uid}/print?sig=r`,
     downloadUrl: `/api/attachments/${uid}/original`,

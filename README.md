@@ -195,6 +195,11 @@ All settings come from the environment (or a `.env` file). Key variables — see
 - `total_size` on a memo is now populated — the sum of its attached files' sizes in bytes — on the
   create, get, list, edit (`PATCH`), pin, unpin and reaction responses, where it was always 0
   before; same field and type, so the iOS client needs no change and may now read it.
+- Every attachment payload that carries `webUrl` (memo attachments, `GET /api/attachments` and
+  `/api/attachments/{uid}`, map markers) now also carries `webReady`, true only when the web
+  rendition behind `webUrl` is on disk — always false for a picture and for a video still
+  transcoding. `webUrl` itself is unchanged; a 2.x iOS client may play `webUrl` only when
+  `webReady` is true instead of discovering the 404, and a client that ignores it is unaffected.
 
 ### v2.0.0
 

@@ -748,6 +748,7 @@ def test_list_attachments_without_a_cursor_is_the_unchanged_bare_list(logged_in_
             "thumbnailUrl",
             "previewUrl",
             "webUrl",
+            "webReady",  # MEMNG-208: additive, whether webUrl has a file behind it
             "posterUrl",
             "downloadUrl",
             "printUrl",
@@ -1095,6 +1096,7 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "thumbnailUrl",
             "previewUrl",
             "webUrl",
+            "webReady",  # added deliberately: whether webUrl has a file behind it
             "posterUrl",
         }
         # and a PAT caller is served the identical field set, not a reduced projection

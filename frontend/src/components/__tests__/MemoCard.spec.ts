@@ -69,6 +69,7 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
     webUrl: `/api/attachments/${uid}/web`,
+    webReady: false,
     posterUrl: `/api/attachments/${uid}/poster`,
     downloadUrl: `/api/attachments/${uid}/original`,
     printUrl: `/api/attachments/${uid}/print`,

@@ -7,6 +7,8 @@ It lives in the service layer rather than in the assets router because `app.serv
 needs it, and a service importing a router is an import cycle waiting to happen.
 """
 
+import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from anyio import to_thread
@@ -142,3 +144,34 @@ async def adoptable(att: Attachment) -> bool:
     go off the request loop.
     """
     return await to_thread.run_sync(_all_present_sync, _non_regenerable_paths(att))
+
+
+def _web_ready_sync(candidates: list[tuple[str, Path]]) -> frozenset[str]:
+    # os.path.isfile, not Path.is_file: it answers False on ANY OSError, so one unreadable path
+    # on the network volume reads as not-ready instead of failing the whole feed page with it.
+    return frozenset(uid for uid, path in candidates if os.path.isfile(path))
+
+
+async def web_ready_uids(attachments: Iterable[Attachment]) -> frozenset[str]:
+    """The uids among `attachments` whose web rendition is on disk.
+
+    Existence is read off the filesystem because nothing else records it: a `ready` status or a
+    finished media job is publication, not presence — a reclaim can unlink the file after it, and
+    an imported video never had a job row. The worker publishes the rendition by renaming its temp
+    output onto this final path, so a half-written transcode is never counted.
+
+    Only videos are asked about — no other kind of attachment is ever given a web tier, so a
+    picture is not-ready with no I/O at all. Every candidate is checked in ONE off-loop hop, and
+    none at all when there is nothing to check, so a feed page costs at most one thread round
+    trip however many videos it carries.
+    """
+    candidates: list[tuple[str, Path]] = []
+    for att in attachments:
+        if not att.mime.startswith("video/"):
+            continue
+        resolved = derived_tier_path(att.uid, "web")
+        if resolved is not None:
+            candidates.append((att.uid, resolved[0]))
+    if not candidates:
+        return frozenset()
+    return await to_thread.run_sync(_web_ready_sync, candidates)

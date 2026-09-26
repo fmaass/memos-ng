@@ -1361,6 +1361,8 @@ export interface components {
             thumbnailUrl: string;
             /** Uid */
             uid: string;
+            /** Webready */
+            webReady: boolean;
             /** Weburl */
             webUrl: string;
             /** Width */
@@ -1417,6 +1419,8 @@ export interface components {
             thumbnailUrl: string;
             /** Uid */
             uid: string;
+            /** Webready */
+            webReady: boolean;
             /** Weburl */
             webUrl: string;
             /** Width */
@@ -1500,6 +1504,8 @@ export interface components {
             thumbnailUrl: string;
             /** Uid */
             uid: string;
+            /** Webready */
+            webReady: boolean;
             /** Weburl */
             webUrl: string;
             /** Width */
@@ -2140,6 +2146,8 @@ export interface components {
             thumbnailUrl: string;
             /** Uid */
             uid: string;
+            /** Webready */
+            webReady: boolean;
             /** Weburl */
             webUrl: string;
             /** Width */
