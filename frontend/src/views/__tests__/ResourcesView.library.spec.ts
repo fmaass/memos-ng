@@ -6,6 +6,7 @@ import ToastService from 'primevue/toastservice'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ResourcesView from '@/views/ResourcesView.vue'
+import { useRoute } from 'vue-router'
 
 // Unlike ResourcesView.spec, nothing here fakes the query: the view's REAL query runs through the
 // REAL generated client and its middlewares, and only the transport underneath is scripted. So a
@@ -21,10 +22,11 @@ vi.mock('@/composables/useApi', async () => {
   client.use(reachabilityMiddleware)
   return { useApi: () => client }
 })
+const { route } = vi.hoisted(() => ({ route: { query: {} as Record<string, string> } }))
 vi.mock('vue-router', async () => {
   const { reactive } = await import('vue')
-  const route = reactive({ query: {} })
-  return { useRouter: () => ({ push: vi.fn(), replace: vi.fn() }), useRoute: () => route }
+  const live = reactive(route)
+  return { useRouter: () => ({ push: vi.fn(), replace: vi.fn() }), useRoute: () => live }
 })
 // PhotoSwipe needs a real DOM; the viewer's contract is what it is HANDED.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
@@ -113,6 +115,7 @@ describe('ResourcesView library query', () => {
   afterEach(() => {
     wrapper?.unmount()
     wrapper = null
+    route.query = {}
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
   })
@@ -305,6 +308,172 @@ describe('ResourcesView library query', () => {
 
       expect(has(w, 'resources-empty')).toBe(true)
       expect(has(w, 'resources-error')).toBe(false)
+    })
+  })
+
+  describe('the jump from a Months day into All (decision 3)', () => {
+    // The sentinel is ON SCREEN the whole time, so an unheld sentinel would race the walk for the
+    // page after the one holding the day.
+    beforeEach(() => {
+      vi.stubGlobal(
+        'IntersectionObserver',
+        class {
+          constructor(private cb: IntersectionObserverCallback) {}
+          observe(target: Element) {
+            queueMicrotask(() =>
+              this.cb(
+                [{ isIntersecting: true, target } as IntersectionObserverEntry],
+                this as unknown as IntersectionObserver,
+              ),
+            )
+          }
+          disconnect() {}
+          unobserve() {}
+        },
+      )
+    })
+
+    const at = (uid: string, takenAt: string) => ({ ...row(uid), takenAt })
+    const dayBucket = (key: string, count: number) => ({
+      key,
+      count,
+      coverUid: `c-${key}`,
+      coverThumbnailUrl: `/api/attachments/c-${key}/thumb`,
+    })
+
+    it('walks the same list through the page holding the Zurich day, never the page after, and scrolls its first tile into view', async () => {
+      route.query = { view: 'months' }
+      const listRequests: URL[] = []
+      transport.mockImplementation(async (req) => {
+        const url = new URL(req.url)
+        if (url.pathname === '/api/attachments/buckets') {
+          return ok([dayBucket('2026-09-02', 2), dayBucket('2026-09-01', 2)])
+        }
+        listRequests.push(url)
+        const cursor = url.searchParams.get('cursor')
+        if (!cursor) return ok([at('p1a', '2026-09-02T12:00:00Z'), at('p1b', '2026-09-02T09:00:00Z')], { 'X-Next-Cursor': 'c1' })
+        if (cursor === 'c1') {
+          // 22:30Z on 31 August is 00:30 on 1 September in Zurich: the first tile of the 1st.
+          return ok([at('target', '2026-08-31T22:30:00Z'), at('p2b', '2026-08-31T12:00:00Z')], { 'X-Next-Cursor': 'c2' })
+        }
+        return ok([at('p3a', '2026-08-30T10:00:00Z')])
+      })
+      const scrolled: { uid: string | undefined; requests: number }[] = []
+      vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(function (this: Element) {
+        scrolled.push({ uid: (this as HTMLElement).dataset.uid, requests: listRequests.length })
+      })
+
+      const w = mountView()
+      await settle()
+      expect(listRequests).toHaveLength(1)
+      const tiles = w.findAll('[data-test="mosaic-tile"]')
+      expect(tiles.map((t) => t.find('[data-test="mosaic-day"]').text())).toEqual(['1', '2'])
+
+      await tiles[0]!.trigger('click')
+      await vi.waitFor(() => expect(scrolled).toHaveLength(1))
+
+      // The receiver is the real tile of that uid, and when it scrolled only the two pages the walk
+      // needed had been asked for, the second with the first's cursor and the same limit.
+      expect(scrolled[0]).toEqual({ uid: 'target', requests: 2 })
+      expect(listRequests[1]!.searchParams.get('cursor')).toBe('c1')
+      expect(listRequests.slice(0, 2).map((u) => u.searchParams.get('limit'))).toEqual(['500', '500'])
+      const receiver = vi.mocked(Element.prototype.scrollIntoView).mock.contexts[0] as HTMLElement
+      expect(receiver.closest('[data-test="justified-gallery"]')).not.toBeNull()
+      expect(receiver.matches('[data-test="media-tile"]')).toBe(true)
+    })
+
+    it('stops a superseded walk: it asks for no further page, and only the newer jump scrolls and releases', async () => {
+      // The sentinel stays OFF screen here, so every list request after the first page is a walk's.
+      const sentinelObserves: Element[] = []
+      vi.stubGlobal(
+        'IntersectionObserver',
+        class {
+          constructor(private cb: IntersectionObserverCallback) {}
+          observe(target: Element) {
+            sentinelObserves.push(target)
+            queueMicrotask(() =>
+              this.cb(
+                [{ isIntersecting: false, target } as IntersectionObserverEntry],
+                this as unknown as IntersectionObserver,
+              ),
+            )
+          }
+          disconnect() {}
+          unobserve() {}
+        },
+      )
+      route.query = { view: 'months' }
+      let release!: () => void
+      const held = new Promise<void>((r) => (release = r))
+      const listRequests: URL[] = []
+      transport.mockImplementation(async (req) => {
+        const url = new URL(req.url)
+        if (url.pathname === '/api/attachments/buckets') {
+          return ok([dayBucket('2026-09-02', 1), dayBucket('2026-08-01', 1)])
+        }
+        listRequests.push(url)
+        const cursor = url.searchParams.get('cursor')
+        if (!cursor) return ok([at('p1a', '2026-09-02T12:00:00Z')], { 'X-Next-Cursor': 'c1' })
+        if (cursor === 'c1') {
+          await held
+          return ok([at('p2a', '2026-08-20T12:00:00Z')], { 'X-Next-Cursor': 'c2' })
+        }
+        return ok([at('aug', '2026-08-01T10:00:00Z')])
+      })
+      const scrolled: (string | undefined)[] = []
+      vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(function (this: Element) {
+        scrolled.push((this as HTMLElement).dataset.uid)
+      })
+
+      const w = mountView()
+      await settle()
+      // First jump: to 1 August, two pages away; its first page (c1) stays on the wire.
+      await w.findAll('[data-test="mosaic-tile"]')[1]!.trigger('click')
+      await settle()
+      expect(listRequests.map((u) => u.searchParams.get('cursor'))).toEqual([null, 'c1'])
+      expect(has(w, 'day-jump-spinner')).toBe(true)
+
+      // Back to Months through the pill, then a second jump to a day already loaded.
+      useRoute().query = { view: 'months' }
+      await settle()
+      await w.findAll('[data-test="mosaic-tile"]')[0]!.trigger('click')
+      await vi.waitFor(() => expect(scrolled).toEqual(['p1a']))
+      await settle()
+      expect(has(w, 'day-jump-spinner')).toBe(false)
+      const observesAfterSecond = sentinelObserves.length
+
+      // The superseded walk's page lands now: it must stop there.
+      release()
+      await settle()
+      await new Promise((r) => setTimeout(r, 50))
+      await settle()
+      expect(listRequests.map((u) => u.searchParams.get('cursor'))).toEqual([null, 'c1'])
+      expect(scrolled).toEqual(['p1a'])
+      expect(has(w, 'day-jump-spinner')).toBe(false)
+      expect(sentinelObserves).toHaveLength(observesAfterSecond) // no second release, no re-arm
+    })
+
+    it('shows a spinner while it walks', async () => {
+      route.query = { view: 'months' }
+      let release!: () => void
+      const held = new Promise<void>((r) => (release = r))
+      transport.mockImplementation(async (req) => {
+        const url = new URL(req.url)
+        if (url.pathname === '/api/attachments/buckets') return ok([dayBucket('2026-08-01', 1)])
+        if (!url.searchParams.get('cursor')) return ok([at('p1a', '2026-09-02T12:00:00Z')], { 'X-Next-Cursor': 'c1' })
+        await held
+        return ok([at('aug', '2026-08-01T10:00:00Z')])
+      })
+      vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {})
+      const w = mountView()
+      await settle()
+      await w.find('[data-test="mosaic-tile"]').trigger('click')
+      await settle()
+      expect(has(w, 'day-jump-spinner')).toBe(true)
+      release()
+      await vi.waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled())
+      await settle()
+      expect(has(w, 'day-jump-spinner')).toBe(false)
     })
   })
 })

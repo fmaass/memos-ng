@@ -3,8 +3,8 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, h, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { useAttachmentLibrary, useAttachmentTags } from '@/composables/useAttachmentLibrary'
-import type { LibraryFilter, LibraryKind } from '@/lib/libraryFilter'
+import { useAttachmentBuckets, useAttachmentLibrary, useAttachmentTags } from '@/composables/useAttachmentLibrary'
+import type { BucketSize, LibraryFilter, LibraryKind } from '@/lib/libraryFilter'
 
 // The real composable and the real generated client over a scripted transport: the assertions are
 // on the requests the client actually sends, not on items a fake query hands back.
@@ -51,7 +51,7 @@ describe('useAttachmentLibrary', () => {
     await flushPromises()
 
     expect(sent(0).searchParams.has('cursor')).toBe(false)
-    expect(sent(0).searchParams.get('limit')).toBe('200')
+    expect(sent(0).searchParams.get('limit')).toBe('500')
     expect(lib.hasNextPage.value).toBe(true)
 
     await lib.fetchNextPage()
@@ -59,7 +59,7 @@ describe('useAttachmentLibrary', () => {
 
     expect(transport).toHaveBeenCalledTimes(2)
     expect(sent(1).searchParams.get('cursor')).toBe('cur-1')
-    expect(sent(1).searchParams.get('limit')).toBe('200')
+    expect(sent(1).searchParams.get('limit')).toBe('500')
     expect(lib.items.value.map((i) => i.uid)).toEqual(['a', 'b', 'c'])
     // No header on the last page: nothing further to ask for.
     expect(lib.hasNextPage.value).toBe(false)
@@ -90,7 +90,7 @@ describe('useAttachmentLibrary', () => {
       expect(sent(n).searchParams.get('order')).toBe('taken_asc')
       expect(sent(n).searchParams.get('type')).toBe('video')
       expect(sent(n).searchParams.get('tag')).toBe('recap')
-      expect(sent(n).searchParams.get('limit')).toBe('200')
+      expect(sent(n).searchParams.get('limit')).toBe('500')
     }
     expect(sent(1).searchParams.get('cursor')).toBe('cur-1')
   })
@@ -219,5 +219,88 @@ describe('useAttachmentTags', () => {
     expect(transport).toHaveBeenCalledTimes(2)
     expect(sent(1).searchParams.get('type')).toBe('image')
     expect(tags.data.value).toEqual([{ name: 'recap', count: 2 }])
+  })
+})
+
+describe('useAttachmentBuckets', () => {
+  beforeEach(() => transport.mockReset())
+
+  const bucket = (key: string, count: number) => ({
+    key,
+    count,
+    coverUid: `c-${key}`,
+    coverThumbnailUrl: `/api/attachments/c-${key}/thumb`,
+  })
+  function buckets(body: unknown[]): Response {
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  function mountBuckets(size: BucketSize, initial: LibraryFilter, on = true) {
+    const filter = ref<LibraryFilter>(initial)
+    const enabled = ref(on)
+    let result!: ReturnType<typeof useAttachmentBuckets>
+    const Host = defineComponent({
+      setup() {
+        result = useAttachmentBuckets(size, filter, enabled)
+        return () => h('div')
+      },
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    mount(Host, { global: { plugins: [[VueQueryPlugin, { queryClient }]] } })
+    return { result, filter, enabled, queryClient }
+  }
+
+  it('asks for the size in Zurich with the kind and the tag, and never an order', async () => {
+    transport.mockResolvedValueOnce(buckets([bucket('2026-09-01', 3)]))
+    const { result } = mountBuckets('day', { type: 'video', order: 'oldest', tag: 'recap' })
+    await flushPromises()
+
+    expect(transport).toHaveBeenCalledTimes(1)
+    const url = sent(0)
+    expect(url.pathname).toBe('/api/attachments/buckets')
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      size: 'day',
+      tz: 'Europe/Zurich',
+      type: 'video',
+      tag: 'recap',
+    })
+    expect(result.data.value).toEqual([bucket('2026-09-01', 3)])
+  })
+
+  it('asks for nothing while it is not enabled (the All view needs no buckets)', async () => {
+    const { enabled } = mountBuckets('year', { order: 'newest' }, false)
+    await flushPromises()
+    expect(transport).not.toHaveBeenCalled()
+
+    transport.mockResolvedValueOnce(buckets([bucket('2026', 9)]))
+    enabled.value = true
+    await flushPromises()
+    expect(Object.fromEntries(sent(0).searchParams)).toEqual({ size: 'year', tz: 'Europe/Zurich' })
+  })
+
+  it("lives under ['attachments', 'buckets', size, filter] and is reached by every invalidation of ['attachments']", async () => {
+    transport
+      .mockResolvedValueOnce(buckets([bucket('2026-09', 3)]))
+      .mockResolvedValueOnce(buckets([bucket('2026-09', 2)]))
+    const { result, queryClient } = mountBuckets('month', { order: 'newest', tag: 'recap' })
+    await flushPromises()
+    expect(queryClient.getQueryData(['attachments', 'buckets', 'month', { order: 'newest', tag: 'recap' }])).toEqual([
+      bucket('2026-09', 3),
+    ])
+
+    await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+    await flushPromises()
+
+    expect(transport).toHaveBeenCalledTimes(2)
+    expect(result.data.value).toEqual([bucket('2026-09', 2)])
+  })
+
+  it('surfaces a server error as an error, not as an empty set of buckets', async () => {
+    transport.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'nope' }), { status: 422, headers: { 'Content-Type': 'application/json' } }),
+    )
+    const { result } = mountBuckets('day', { order: 'newest' })
+    await flushPromises()
+    expect(result.isError.value).toBe(true)
+    expect(result.data.value).toBeUndefined()
   })
 })

@@ -72,6 +72,7 @@ const rows = computed(() => {
       <MediaTile
         v-for="li in row.items"
         :key="li.item.uid"
+        :data-uid="li.item.uid"
         :att="li.item"
         :width="li.item.width"
         :height="li.item.height"

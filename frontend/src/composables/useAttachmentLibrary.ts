@@ -4,14 +4,21 @@ import { computed, type MaybeRefOrGetter, toValue } from 'vue'
 import type { components } from '@/api/schema'
 import { useApi } from '@/composables/useApi'
 import { appendPage, nextCursorFrom } from '@/lib/attachmentPaging'
-import { type LibraryFilter, type LibraryKind, toApiParams } from '@/lib/libraryFilter'
+import {
+  type BucketSize,
+  type LibraryFilter,
+  type LibraryKind,
+  toApiParams,
+  toBucketParams,
+} from '@/lib/libraryFilter'
 
 type AttachmentListItem = components['schemas']['AttachmentListItem']
 
-// The server's own default page size (app/routers/assets.py `limit: int = 200`), sent explicitly
-// because the cursor is only valid with the SAME `type`, `limit`, `order` and `tag` it was minted
-// for.
-export const LIBRARY_PAGE_SIZE = 200
+// The server's maximum page (app/routers/assets.py allows up to 500), so the jump from a Months
+// day into All walks as few pages as it can. Sent explicitly with every page because the cursor is
+// only valid with the SAME `type`, `limit`, `order` and `tag` it was minted for — which is why the
+// jump advances THIS query rather than walking a second list beside it.
+export const LIBRARY_PAGE_SIZE = 500
 
 interface LibraryPage {
   items: AttachmentListItem[]
@@ -63,6 +70,29 @@ export function useAttachmentTags(
       const kind = queryKey[2]
       const { data, error } = await api.GET('/api/attachments/tags', {
         params: { query: kind ? { type: kind } : {} },
+      })
+      if (error) throw error
+      return data
+    },
+    enabled: computed(() => toValue(enabled)),
+  })
+}
+
+// Counts and covers per Zurich calendar day, month or year for the Years and Months views. The
+// key is ['attachments', 'buckets', size, filter], under the ['attachments'] prefix, so a delete or a
+// print-master change refreshes the counts along with the list. Its params are toBucketParams's —
+// never the list's, which carry an order the endpoint does not take.
+export function useAttachmentBuckets(
+  size: MaybeRefOrGetter<BucketSize>,
+  filter: MaybeRefOrGetter<LibraryFilter>,
+  enabled: MaybeRefOrGetter<boolean> = true,
+) {
+  const api = useApi()
+  return useQuery({
+    queryKey: computed(() => ['attachments', 'buckets', toValue(size), { ...toValue(filter) }] as const),
+    queryFn: async ({ queryKey }) => {
+      const { data, error } = await api.GET('/api/attachments/buckets', {
+        params: { query: toBucketParams(queryKey[2], queryKey[3]) },
       })
       if (error) throw error
       return data
