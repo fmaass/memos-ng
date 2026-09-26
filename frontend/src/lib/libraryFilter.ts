@@ -1,4 +1,5 @@
 import type { operations } from '@/api/schema'
+import { LIBRARY_TIME_ZONE } from '@/lib/librarySections'
 
 // The Library's filter as the UI holds it, and the ONE place its three forms are derived: the
 // address bar (linkable, reload-stable), the route query (for router.replace) and the list API's
@@ -73,4 +74,40 @@ export function toApiParams(f: LibraryFilter): LibraryApiParams {
 
 export function sameLibraryFilter(a: LibraryFilter, b: LibraryFilter): boolean {
   return toSearchParams(a).toString() === toSearchParams(b).toString()
+}
+
+// Years | Months | All lives in the route BESIDE the filter, never inside it: the list's and the
+// buckets' query keys are built from the filter record, so a segment change must not reach them.
+// Like the filter's defaults, All is left out of the URL.
+export type LibraryView = 'years' | 'months' | 'all'
+const VIEWS: readonly LibraryView[] = ['years', 'months', 'all']
+
+export function viewFromQuery(input: URLSearchParams | LocationQueryLike): LibraryView {
+  const view = first(input, 'view')
+  return VIEWS.includes(view as LibraryView) ? (view as LibraryView) : 'all'
+}
+
+export function viewToQuery(view: LibraryView): Record<string, string> {
+  return view === 'all' ? {} : { view }
+}
+
+// Every other field of the query is kept as it is, so a segment change never drops the filter.
+export function withView(input: LocationQueryLike, view: LibraryView): LocationQueryLike {
+  const rest = { ...input }
+  delete rest.view
+  return { ...rest, ...viewToQuery(view) }
+}
+
+// GET /api/attachments/buckets takes size, tz, type and tag and NO order, so its params are named
+// one by one here rather than taken from toApiParams, which always carries an order.
+export type BucketSize = 'day' | 'month' | 'year'
+type BucketQuery = operations['attachment_buckets_api_attachments_buckets_get']['parameters']['query']
+
+export function toBucketParams(size: BucketSize, f: LibraryFilter): BucketQuery {
+  return {
+    size,
+    tz: LIBRARY_TIME_ZONE,
+    ...(f.type ? { type: f.type } : {}),
+    ...(f.tag ? { tag: f.tag } : {}),
+  }
 }

@@ -85,7 +85,7 @@ vi.mock('@tanstack/vue-query', async (importOriginal) => {
   }
 })
 function fakeTags() {
-  return { data: ref(undefined), isError: ref(false), isPending: ref(true) }
+  return { data: ref(undefined), isError: ref(false), isPending: ref(true), isFetching: ref(false), refetch: vi.fn() }
 }
 function fakeLibrary() {
   return {
@@ -203,7 +203,7 @@ describe('ResourcesView', () => {
     expect(wrapper.findAll('[data-test="justified-gallery"]')).toHaveLength(1)
   })
 
-  it('registers its Years | Months | All pill with the shell’s dock, All active, the rest disabled', async () => {
+  it('registers its Years | Months | All pill with the shell’s dock, All active, every segment enabled', async () => {
     const registration = createDockSegment()
     const wrapper = mount(ResourcesView, {
       global: {
@@ -217,7 +217,7 @@ describe('ResourcesView', () => {
     })
     const buttons = pill.findAll('button')
     expect(buttons.map((b) => b.text())).toEqual(['Years', 'Months', 'All'])
-    expect(buttons.map((b) => b.attributes('disabled') !== undefined)).toEqual([true, true, false])
+    expect(buttons.map((b) => b.attributes('disabled') !== undefined)).toEqual([false, false, false])
     expect(buttons[2]!.attributes('aria-pressed')).toBe('true')
     wrapper.unmount()
     await nextTick()
@@ -229,11 +229,15 @@ describe('ResourcesView', () => {
     // an earlier view's requests.
     const mounted: { unmount(): void }[] = []
     afterEach(() => mounted.splice(0).forEach((w) => w.unmount()))
-    function mountReal() {
+    function mountReal(bucketsBody: unknown = [], bucketsStatus = 200) {
       real.on = true
-      transport.mockImplementation(async () =>
-        new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }),
-      )
+      transport.mockImplementation(async (req) => {
+        const buckets = new URL(req.url).pathname === '/api/attachments/buckets'
+        return new Response(JSON.stringify(buckets ? bucketsBody : []), {
+          status: buckets ? bucketsStatus : 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      })
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
       const wrapper = mount(ResourcesView, {
         global: {
@@ -247,6 +251,117 @@ describe('ResourcesView', () => {
       transport.mock.calls
         .map(([req]) => new URL(req.url))
         .filter((u) => u.pathname === '/api/attachments')
+    const bucketCalls = () =>
+      transport.mock.calls
+        .map(([req]) => new URL(req.url))
+        .filter((u) => u.pathname === '/api/attachments/buckets')
+    const bucket = (key: string, count: number) => ({
+      key,
+      count,
+      coverUid: `c-${key}`,
+      coverThumbnailUrl: `/api/attachments/c-${key}/thumb`,
+    })
+
+    it('passes ?type=video&tag=recap to the day buckets on Months, in Zurich and with no order', async () => {
+      route.query = { type: 'video', order: 'oldest', tag: 'recap', view: 'months' }
+      mountReal()
+      await flushPromises()
+      const sent = bucketCalls()
+      expect(sent).toHaveLength(1)
+      expect(Object.fromEntries(sent[0]!.searchParams)).toEqual({
+        size: 'day',
+        tz: 'Europe/Zurich',
+        type: 'video',
+        tag: 'recap',
+      })
+      expect(sent[0]!.searchParams.has('order')).toBe(false)
+    })
+
+    it('asks for the year buckets on Years, and for no buckets at all on All', async () => {
+      route.query = { view: 'years' }
+      mountReal([bucket('2026', 4)])
+      await flushPromises()
+      expect(bucketCalls().map((u) => u.searchParams.get('size'))).toEqual(['year'])
+      mounted.splice(0).forEach((w) => w.unmount())
+      transport.mockClear()
+
+      route.query = {}
+      mountReal()
+      await flushPromises()
+      expect(bucketCalls()).toHaveLength(0)
+    })
+
+    it('renders Years as cards and Months as the day mosaic, and All keeps its month headers', async () => {
+      route.query = { view: 'years' }
+      const years = mountReal([bucket('2026', 4), bucket('2025', 1)])
+      await flushPromises()
+      expect(years.findAll('[data-test="year-card"]')).toHaveLength(2)
+      expect(years.find('[data-test="justified-gallery"]').exists()).toBe(false)
+
+      route.query = { view: 'months' }
+      const months = mountReal([bucket('2026-09-02', 4), bucket('2026-08-01', 1)])
+      await flushPromises()
+      expect(months.findAll('[data-test="mosaic-title"]').map((t) => t.text())).toEqual(['Sep 2026', 'Aug 2026'])
+    })
+
+    it('does not refetch the list when only the segment changes', async () => {
+      route.query = { tag: 'recap' }
+      mountReal()
+      await flushPromises()
+      useRoute().query = { tag: 'recap', view: 'months' }
+      await flushPromises()
+      useRoute().query = { tag: 'recap', view: 'years' }
+      await flushPromises()
+      expect(listCalls()).toHaveLength(1)
+      expect(replace).not.toHaveBeenCalled()
+    })
+
+    it('keeps the segment when the filter changes', async () => {
+      route.query = { type: 'video', view: 'months' }
+      const wrapper = mountReal()
+      await flushPromises()
+      wrapper
+        .findComponent({ name: 'LibraryHeader' })
+        .vm.$emit('update:filter', { type: 'video', order: 'oldest', tag: 'recap' })
+      await flushPromises()
+      expect(replace).toHaveBeenCalledWith({
+        query: { type: 'video', order: 'oldest', tag: 'recap', view: 'months' },
+      })
+    })
+
+    it('keeps the filter when a year card opens Months, and shows only that year’s months', async () => {
+      route.query = { type: 'video', tag: 'recap', view: 'years' }
+      const days = [bucket('2027-01-02', 1), bucket('2026-12-31', 2), bucket('2026-06-21', 3), bucket('2025-12-31', 4)]
+      const wrapper = mountReal([bucket('2027', 1), bucket('2026', 5), bucket('2025', 4)])
+      await flushPromises()
+      transport.mockImplementation(async (req) =>
+        new Response(JSON.stringify(new URL(req.url).pathname === '/api/attachments/buckets' ? days : []), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      await wrapper.findAll('[data-test="year-card"]')[1]!.trigger('click')
+      await flushPromises()
+      expect(replace).toHaveBeenCalledWith({ query: { type: 'video', tag: 'recap', view: 'months' } })
+      expect(wrapper.findAll('[data-test="mosaic-title"]').map((t) => t.text())).toEqual(['Dec 2026', 'Jun 2026'])
+    })
+
+    it('keeps the filter when a day tile opens All', async () => {
+      route.query = { type: 'video', view: 'months' }
+      const wrapper = mountReal([bucket('2026-09-02', 4)])
+      await flushPromises()
+      await wrapper.find('[data-test="mosaic-tile"]').trigger('click')
+      await flushPromises()
+      expect(replace).toHaveBeenCalledWith({ query: { type: 'video' } })
+    })
+
+    it('says so when the buckets fail instead of showing an empty library', async () => {
+      route.query = { view: 'months' }
+      const wrapper = mountReal({ detail: 'bad' }, 422)
+      await flushPromises()
+      expect(wrapper.find('[data-test="buckets-error"]').exists()).toBe(true)
+      expect(wrapper.find('[data-test="resources-empty"]').exists()).toBe(false)
+    })
 
     it('reads ?type=video&order=oldest from the route and asks for order=taken_asc&type=video', async () => {
       route.query = { type: 'video', order: 'oldest' }

@@ -1,15 +1,26 @@
 <script setup lang="ts">
 import SelectButton from 'primevue/selectbutton'
-import { ref } from 'vue'
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
-// The Library's segment in the dock: Years | Months | All. Only All exists in this phase; Years and
-// Months are shown, disabled, so the dock already has its final shape.
-const OPTIONS = [
-  { label: 'Years', value: 'years', disabled: true },
-  { label: 'Months', value: 'months', disabled: true },
-  { label: 'All', value: 'all', disabled: false },
+import { type LibraryView, viewFromQuery, withView } from '@/lib/libraryFilter'
+
+// The Library's segment in the dock: Years | Months | All. The dock is the shell's, so the pill
+// shares no component state with the Library view: the route query's `view` is the one place the
+// segment lives, read here and written back with the filter fields kept.
+const OPTIONS: { label: string; value: LibraryView }[] = [
+  { label: 'Years', value: 'years' },
+  { label: 'Months', value: 'months' },
+  { label: 'All', value: 'all' },
 ]
-const view = ref('all')
+const route = useRoute()
+const router = useRouter()
+const view = computed<LibraryView>({
+  get: () => viewFromQuery(route.query),
+  set: (next) => {
+    if (next !== viewFromQuery(route.query)) void router.replace({ query: withView(route.query, next) })
+  },
+})
 </script>
 
 <template>
@@ -18,7 +29,6 @@ const view = ref('all')
     :options="OPTIONS"
     option-label="label"
     option-value="value"
-    option-disabled="disabled"
     :allow-empty="false"
     aria-label="Library view"
     data-test="library-segment"

@@ -3,21 +3,33 @@ import { useQueryClient } from '@tanstack/vue-query'
 import Button from 'primevue/button'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
-import { computed, onUnmounted, ref, watch, watchEffect } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch, watchEffect } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import DayMosaic from '@/components/DayMosaic.vue'
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import LibraryHeader from '@/components/LibraryHeader.vue'
 import LibrarySegment from '@/components/LibrarySegment.vue'
-import { useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
+import YearCards from '@/components/YearCards.vue'
+import { useAttachmentBuckets, useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
 import { useApi } from '@/composables/useApi'
 import { useDockSegment } from '@/composables/useDockSegment'
 import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
 import { fetchPrintMasters, usePrintMaster } from '@/composables/usePrintMaster'
-import { shouldLoadMore } from '@/lib/attachmentPaging'
+import { appendPage, shouldLoadMore } from '@/lib/attachmentPaging'
+import { scrollToDay } from '@/lib/dayJump'
 import { shouldRemint } from '@/lib/imageRetry'
-import { fromSearchParams, type LibraryFilter, sameLibraryFilter, toRouteQuery } from '@/lib/libraryFilter'
+import {
+  fromSearchParams,
+  type LibraryFilter,
+  type LibraryView,
+  sameLibraryFilter,
+  toRouteQuery,
+  viewFromQuery,
+  viewToQuery,
+} from '@/lib/libraryFilter'
 import { groupByMonth } from '@/lib/librarySections'
+import { daysOfYear } from '@/lib/mosaic'
 import { memoPath } from '@/lib/places/lightbox'
 import { selectPrintMaster, toPrintMasterInfo } from '@/lib/printMaster'
 
@@ -31,19 +43,60 @@ const toast = useToast()
 // The filter lives in the URL (linkable, reload-stable), synced both ways like SearchView's: seeded
 // from the route, written back on a change, re-seeded on a query-only navigation (back/forward).
 // Equal filters serialize identically, which is the loop guard in both directions.
+// The Years | Months | All segment rides the same query BESIDE the filter (the dock's pill writes it
+// there too): each write carries both, so a filter change keeps the segment and a segment change
+// keeps the filter, and neither query key — both built from the filter alone — moves on a segment.
 const filter = ref<LibraryFilter>(fromSearchParams(route.query))
-watch(filter, (f) => {
-  if (!sameLibraryFilter(f, fromSearchParams(route.query))) {
-    void router.replace({ query: toRouteQuery(f) })
+const view = ref<LibraryView>(viewFromQuery(route.query))
+function writeRoute() {
+  if (sameLibraryFilter(filter.value, fromSearchParams(route.query)) && view.value === viewFromQuery(route.query)) {
+    return
   }
-})
+  void router.replace({ query: { ...toRouteQuery(filter.value), ...viewToQuery(view.value) } })
+}
+watch(filter, writeRoute)
+function setView(next: LibraryView) {
+  view.value = next
+  writeRoute()
+}
 watch(
   () => route.query,
   () => {
     const fromUrl = fromSearchParams(route.query)
     if (!sameLibraryFilter(fromUrl, filter.value)) filter.value = fromUrl
+    view.value = viewFromQuery(route.query)
   },
 )
+
+// A year card opens Months narrowed to that year — client-side, by the day keys' year prefix; the
+// narrowing is this view's own and ends when Months is left.
+const monthsYear = ref<string | null>(null)
+watch(view, (v) => {
+  if (v !== 'months') monthsYear.value = null
+})
+function openYear(year: string) {
+  setView('months')
+  monthsYear.value = year
+}
+
+const dayBuckets = useAttachmentBuckets('day', filter, () => view.value === 'months')
+const yearBuckets = useAttachmentBuckets('year', filter, () => view.value === 'years')
+const mosaicDays = computed(() => {
+  const days = dayBuckets.data.value ?? []
+  return monthsYear.value ? daysOfYear(days, monthsYear.value) : days
+})
+// What the Years or Months view shows, so both share one loading/error/empty ladder — a failed
+// buckets load is never shown as an empty library (MEMNG-504).
+const bucketView = computed(() => {
+  const query = view.value === 'years' ? yearBuckets : dayBuckets
+  return {
+    pending: query.isPending.value,
+    error: query.isError.value,
+    fetching: query.isFetching.value,
+    empty: (view.value === 'years' ? (yearBuckets.data.value ?? []) : mosaicDays.value).length === 0,
+    retry: () => void query.refetch(),
+  }
+})
 
 // Years | Months | All, shown by the shell's dock once the Library is scrolled.
 useDockSegment(LibrarySegment)
@@ -88,6 +141,7 @@ function retryLoad() {
 // leaves the sentinel on screen would otherwise never load a second. The button below is the
 // fallback wherever there is no IntersectionObserver.
 const sentinel = ref<HTMLElement | null>(null)
+const jumping = ref(false)
 const sentinelVisible = ref(false)
 let observer: IntersectionObserver | null = null
 watch(sentinel, (el) => {
@@ -102,7 +156,10 @@ watch(sentinel, (el) => {
 })
 onUnmounted(() => observer?.disconnect())
 watchEffect(() => {
+  // A jump walks the list itself (below); the sentinel waits, so it cannot race the walk for the page
+  // after the one holding the day.
   if (
+    !jumping.value &&
     shouldLoadMore({
       visible: sentinelVisible.value,
       hasNextPage: hasNextPage.value,
@@ -113,6 +170,75 @@ watchEffect(() => {
     loadMore()
   }
 })
+
+// The jump from a Months day (or its "more days" row) into All, decision 3: All opens, the walk
+// advances the SAME infinite query — same limit, same cursors — through the first page holding that
+// Zurich day, and that day's first tile is scrolled into view. A later jump supersedes an earlier
+// one (the token), so only the latest tap ever scrolls.
+const root = ref<HTMLElement | null>(null)
+let jumpToken = 0
+onUnmounted(() => {
+  jumpToken += 1
+})
+function settled(): Promise<void> {
+  if (!isPending.value) return Promise.resolve()
+  return new Promise((resolve) => {
+    const stop = watch(isPending, (pending) => {
+      if (pending) return
+      stop()
+      resolve()
+    })
+  })
+}
+const pager = {
+  current: async () => {
+    await settled()
+    return { items: items.value, hasNext: hasNextPage.value }
+  },
+  // The page's own result, not the view's refs, which catch up a tick later. cancelRefetch: false
+  // joins a request already in flight instead of cancelling it.
+  fetchNext: async () => {
+    const result = await fetchNextPage({ cancelRefetch: false })
+    if (result.isError) return null
+    return { items: appendPage(result.data?.pages.map((p) => p.items) ?? []), hasNext: result.hasNextPage }
+  },
+}
+// The tile exists once the list refs caught up and the gallery measured its width, a few frames on.
+async function tileFor(uid: string, token: number): Promise<HTMLElement | null> {
+  for (let frame = 0; frame < 120 && token === jumpToken; frame++) {
+    await nextTick()
+    const tiles = root.value?.querySelectorAll<HTMLElement>('[data-uid]') ?? []
+    const tile = [...tiles].find((el) => el.dataset.uid === uid)
+    if (tile) return tile
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  }
+  return null
+}
+// Let the sentinel speak afresh: what it reported before the scroll is stale, and an observer only
+// reports a CHANGE — re-observing makes it report where the sentinel is now.
+function rearmSentinel() {
+  sentinelVisible.value = false
+  const el = sentinel.value
+  if (!observer || !el) return
+  observer.unobserve(el)
+  observer.observe(el)
+}
+async function jumpToDay(day: string) {
+  const token = ++jumpToken
+  setView('all')
+  jumping.value = true
+  try {
+    const uid = await scrollToDay(day, pager)
+    if (!uid || token !== jumpToken) return
+    const tile = await tileFor(uid, token)
+    if (tile && token === jumpToken) tile.scrollIntoView({ block: 'center' })
+  } finally {
+    if (token === jumpToken) {
+      jumping.value = false
+      rearmSentinel()
+    }
+  }
+}
 
 let lastRemint = 0
 function onTileRetry() {
@@ -192,9 +318,43 @@ function onDelete(uid: string) {
 </script>
 
 <template>
-  <section class="mx-auto flex max-w-6xl flex-col gap-4 p-4" data-test="view-resources">
+  <section ref="root" class="mx-auto flex max-w-6xl flex-col gap-4 p-4" data-test="view-resources">
     <LibraryHeader v-model:filter="filter" />
-    <p v-if="isPending" class="text-sm text-muted-color">Loading…</p>
+    <div
+      v-if="jumping"
+      class="pointer-events-none fixed inset-x-0 top-1/2 z-20 flex justify-center"
+      data-test="day-jump-spinner"
+    >
+      <i class="pi pi-spinner pi-spin text-3xl text-muted-color" aria-label="Loading" />
+    </div>
+    <template v-if="view !== 'all'">
+      <p v-if="bucketView.pending" class="text-sm text-muted-color">Loading…</p>
+      <div
+        v-else-if="bucketView.error"
+        class="flex flex-col items-start gap-2 text-sm text-muted-color"
+        data-test="buckets-error"
+      >
+        <p>Couldn't load your media.</p>
+        <Button
+          label="Retry"
+          icon="pi pi-refresh"
+          size="small"
+          outlined
+          :loading="bucketView.fetching"
+          data-test="buckets-retry"
+          @click="bucketView.retry"
+        />
+      </div>
+      <p v-else-if="bucketView.empty" class="text-sm text-muted-color" data-test="resources-empty">
+        No attachments yet.
+      </p>
+      <!-- A phone keeps the cards full width; a desktop centres them in the mosaic's 720 px column. -->
+      <div v-else-if="view === 'years'" class="md:mx-auto md:w-full md:max-w-[720px]">
+        <YearCards :years="yearBuckets.data.value ?? []" @select="openYear" />
+      </div>
+      <DayMosaic v-else :days="mosaicDays" @jump="jumpToDay" />
+    </template>
+    <p v-else-if="isPending" class="text-sm text-muted-color">Loading…</p>
     <!-- A failed load is never shown as an empty library (MEMNG-504): nothing loaded + an error is
          the error state; an error after tiles loaded keeps them and says so below them. -->
     <div
