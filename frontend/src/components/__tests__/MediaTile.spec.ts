@@ -1,4 +1,5 @@
 import { mount } from '@vue/test-utils'
+import { defineComponent, h, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import MediaTile from '@/components/MediaTile.vue'
@@ -294,5 +295,58 @@ describe('MediaTile', () => {
     await w.setProps({ att: att('ready', 'image/png', { thumbnailUrl: '/api/attachments/a1/thumb?exp=2' }) })
     await vi.advanceTimersByTimeAsync(1)
     expect(w.find('[data-test="tile-image"]').attributes('src')).toBe('/api/attachments/a1/thumb?exp=2')
+  })
+})
+
+// A parent that owns the selection the way the Library does: it flips `selected` on `select`, so the
+// tile's aria-pressed changes only through the real emit → prop round trip.
+const SelectHarness = defineComponent({
+  setup() {
+    const selected = ref(false)
+    return () =>
+      h(MediaTile, {
+        att: att('ready', 'image/png'),
+        selection: { selected: selected.value, selectable: true, label: 'Photo, 1 January' },
+        onSelect: () => {
+          selected.value = !selected.value
+        },
+      })
+  },
+})
+
+describe('MediaTile select mode, by keyboard', () => {
+  const selectButton = (w: ReturnType<typeof mount>) => w.find('[data-test="tile-select"]')
+
+  it('toggles aria-pressed through the parent on each activation', async () => {
+    const w = mount(SelectHarness)
+    expect(selectButton(w).attributes('aria-pressed')).toBe('false')
+    await selectButton(w).trigger('click')
+    expect(selectButton(w).attributes('aria-pressed')).toBe('true')
+    await selectButton(w).trigger('click')
+    expect(selectButton(w).attributes('aria-pressed')).toBe('false')
+  })
+
+  // Enter and Space reach the tile through the browser's own activation of a native <button>: the key
+  // becomes a click, and the click is the only listener. happy-dom does not synthesize that click
+  // (its HTMLButtonElement only acts on click events), so a key toggle cannot be observed here.
+  // What CAN be pinned is the contract that makes the browser do it: a native button of type
+  // "button", no key listener of the tile's own (one would double-toggle in a real browser, where the
+  // native click also fires), and key events that on their own emit nothing.
+  it('is a native type="button" whose only listener is click, so Enter and Space toggle natively', async () => {
+    const w = mount(SelectHarness)
+    const btn = selectButton(w)
+    expect(btn.element.tagName).toBe('BUTTON')
+    expect(btn.attributes('type')).toBe('button')
+    // The listeners Vue binds are the element vnode's on* props (@keydown.enter would add onKeydown).
+    const el = btn.element as Element & { __vnode?: { props?: Record<string, unknown> } }
+    const listeners = Object.keys(el.__vnode?.props ?? {}).filter((k) => /^on[A-Z]/.test(k))
+    expect(listeners).toEqual(['onClick'])
+
+    for (const key of ['Enter', ' ']) {
+      await btn.trigger('keydown', { key })
+      await btn.trigger('keyup', { key })
+    }
+    expect(w.findComponent(MediaTile).emitted('select')).toBeUndefined()
+    expect(btn.attributes('aria-pressed')).toBe('false')
   })
 })

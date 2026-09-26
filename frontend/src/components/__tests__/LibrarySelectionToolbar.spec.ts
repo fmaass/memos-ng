@@ -49,6 +49,10 @@ describe('LibrarySelectionToolbar', () => {
     expect(find(w, 'selection-count').exists()).toBe(true)
   })
 
+  it('renders the share button where the platform can share files', () => {
+    expect(find(mountBar({ count: 2, canShare: true }), 'selection-share').exists()).toBe(true)
+  })
+
   it('disables delete and share at zero, and a tap then emits nothing', async () => {
     const w = mountBar({ count: 0 })
     for (const t of ['selection-share', 'selection-delete']) {
