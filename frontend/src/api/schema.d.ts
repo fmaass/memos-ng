@@ -312,7 +312,8 @@ export interface paths {
          * Attachment Buckets
          * @description The library the list shows — same visibility, same `type` and `tag` filters — counted per
          *     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
-         *     first. Each bucket names its newest item as the cover, with that item's signed thumbnail.
+         *     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
+         *     for a video its poster frame, the one picture a video has.
          */
         get: operations["attachment_buckets_api_attachments_buckets_get"];
         put?: never;

@@ -1,5 +1,6 @@
 import re
 
+import pytest
 from app.config import settings
 from app.services import asset_urls
 
@@ -92,3 +93,25 @@ def test_scope_none_guard_rejects_even_a_crafted_matching_sig(monkeypatch):
     exp = asset_urls.bucketed_exp(1000)
     crafted = asset_urls._sig("uidA", "thumb", exp, "None", asset_urls._secret())
     assert not asset_urls.verify_asset_sig("uidA", "thumb", exp, None, crafted, now=1000)
+
+
+@pytest.mark.parametrize(
+    ("mime", "tier"),
+    [
+        ("video/quicktime", "poster"),
+        ("video/mp4", "poster"),
+        ("image/jpeg", "thumb"),
+        ("image/heic", "thumb"),
+        ("application/pdf", "thumb"),
+        ("image/x-video", "thumb"),  # "video" inside the mime is not a video
+        ("", "thumb"),
+    ],
+)
+def test_signed_cover_url_is_the_poster_for_a_video_else_the_thumb(monkeypatch, mime, tier):
+    # A video has a poster and never a thumb (app/services/poster.py): a cover minted as its thumb
+    # names a file that is never written.
+    _fixed(monkeypatch)
+    url = asset_urls.signed_cover_url("uidC", mime, 7, now=1000)
+    assert url.split("?")[0] == f"/api/attachments/uidC/{tier}"
+    q = _q(url)
+    assert asset_urls.verify_asset_sig("uidC", tier, q["exp"], q["scope"], q["sig"], now=1000)

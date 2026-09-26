@@ -56,6 +56,14 @@ def signed_tier_urls(uid: str, scope: int | str, *, now: float) -> dict[str, str
     }
 
 
+def signed_cover_url(uid: str, mime: str, scope: int | str, *, now: float) -> str:
+    """The signed picture that stands for one item on a cover: its poster when it is a video, else
+    its thumb. A video is given a poster and never a thumb (app/services/poster.py), so a thumb URL
+    for it names a file the worker never writes."""
+    tier = "poster" if mime.startswith("video/") else "thumb"
+    return sign_asset_url(uid, tier, scope, now=now)
+
+
 def verify_asset_sig(
     uid: str, tier: str, exp: str | int | None, scope: str | None, sig: str | None, *, now: float
 ) -> bool:

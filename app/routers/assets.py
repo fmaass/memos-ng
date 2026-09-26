@@ -61,30 +61,55 @@ DEFAULT_PRINT_VARIANT_KEY = "print"
 REV_LENGTH = 8
 
 
-def _negotiated_path_sync(path: Path, media_type: str, want_webp: bool) -> tuple[Path, str] | None:
+def _negotiated_path_sync(
+    path: Path,
+    media_type: str,
+    want_webp: bool,
+    fallback: tuple[Path, str] | None = None,
+) -> tuple[Path, str] | None:
     """Pick the pre-generated webp variant when it was negotiated AND exists, else confirm the
-    original tier is there. None means 'nothing to serve' → the caller's 404.
+    original tier is there, else try `fallback` the same way. None means 'nothing to serve' → the
+    caller's 404.
 
     Both existence checks live in ONE off-loop hop: this is the highest-fan-out path in the app
     and the data volume is a bind-mounted share, so every stat is a network round-trip. (A webp
     hit needs a single stat here — the old code re-stat'd the file it had just found.)"""
-    if want_webp:
-        webp = path.with_suffix(".webp")
-        if webp.exists():
-            return webp, "image/webp"
-    if not path.exists():
-        return None
-    return path, media_type
+    candidates = [(path, media_type)] if fallback is None else [(path, media_type), fallback]
+    for candidate, candidate_type in candidates:
+        if want_webp and candidate_type == "image/jpeg":
+            webp = candidate.with_suffix(".webp")
+            if webp.exists():
+                return webp, "image/webp"
+        if candidate.exists():
+            return candidate, candidate_type
+    return None
+
+
+def _thumb_fallback(uid: str, tier: str) -> tuple[Path, str] | None:
+    """What a `thumb` request is answered with when the thumb file is absent: the poster.
+
+    A video is given a poster and never a thumb (app/services/poster.py), yet every serializer
+    mints a thumbnailUrl for it, so without this the URL names a file that is never written. The
+    fallback resolves from the uid alone, which keeps the signed path DB-free; `derived_tier_path`
+    and `tier_path` stay one tier → one file, because the export and the delete set read them."""
+    return derived_tier_path(uid, "poster") if tier == "thumb" else None
 
 
 async def _serve_file(
-    path: Path, media_type: str, request: Request, format: str | None, cache_control: str
+    path: Path,
+    media_type: str,
+    request: Request,
+    format: str | None,
+    cache_control: str,
+    fallback: tuple[Path, str] | None = None,
 ) -> FileResponse:
     # Prefer a pre-generated webp variant for image tiers when asked (falls back to JPEG if absent).
     want_webp = media_type == "image/jpeg" and (
         format == "webp" or "image/webp" in request.headers.get("accept", "")
     )
-    resolved = await to_thread.run_sync(_negotiated_path_sync, path, media_type, want_webp)
+    resolved = await to_thread.run_sync(
+        _negotiated_path_sync, path, media_type, want_webp, fallback
+    )
     if resolved is None:
         raise HTTPException(status_code=404, detail="Asset not generated yet")
     # Cache-Control is `private` (never `public`): these responses are either signature-scoped or
@@ -451,7 +476,8 @@ async def attachment_buckets(
 ) -> list[AttachmentBucket]:
     """The library the list shows — same visibility, same `type` and `tag` filters — counted per
     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
-    first. Each bucket names its newest item as the cover, with that item's signed thumbnail."""
+    first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
+    for a video its poster frame, the one picture a video has."""
     if tz not in _known_zones():
         raise HTTPException(status_code=422, detail="tz is not a known IANA time zone")
     now = time.time()
@@ -460,9 +486,9 @@ async def attachment_buckets(
             key=key,
             count=count,
             coverUid=uid,
-            coverThumbnailUrl=asset_urls.signed_tier_urls(uid, user.id, now=now)["thumbnailUrl"],
+            coverThumbnailUrl=asset_urls.signed_cover_url(uid, mime, user.id, now=now),
         )
-        for key, count, uid in await library_buckets(db, user, size, tz, type, tag)
+        for key, count, uid, mime in await library_buckets(db, user, size, tz, type, tag)
     ]
 
 
@@ -754,7 +780,8 @@ async def serve_asset(
         # checker; verify_asset_sig already rejected a None/non-numeric exp.)
         remaining = (int(exp) - int(time.time())) if exp is not None else settings.ASSET_URL_TTL
         cache = f"private, max-age={max(1, remaining)}, immutable"
-        return await _serve_file(resolved[0], resolved[1], request, format, cache)
+        fallback = _thumb_fallback(uid, tier)
+        return await _serve_file(resolved[0], resolved[1], request, format, cache, fallback)
     # UNSIGNED / AUTH PATH (original/print on THIS route): DB work in a short-lived session released
     # BEFORE streaming, so the download holds no pool connection either. (The /file/* compat route
     # is separate — app/routers/compat.py — and serves derived tiers only, per ADR-0004 /
@@ -770,7 +797,8 @@ async def serve_asset(
         raise HTTPException(status_code=404, detail="Unknown tier")
     # immutable uid-keyed bytes, but private (one authed viewer) — never cached by a shared proxy.
     cache = f"private, max-age={settings.ASSET_CACHE_SECONDS}, immutable"
-    return await _serve_file(resolved[0], resolved[1], request, format, cache)
+    fallback = _thumb_fallback(uid, tier)
+    return await _serve_file(resolved[0], resolved[1], request, format, cache, fallback)
 
 
 def _unlink_all(paths: list[Path]) -> None:

@@ -11,8 +11,10 @@ written by hand, never derived from another endpoint of the same server.
 """
 
 import pytest
+from app.config import settings
 from app.main import app
 from app.routers import assets
+from PIL import Image
 from sqlalchemy import create_engine, text
 from starlette.routing import Match
 
@@ -103,7 +105,11 @@ def _buckets(client, query):
     for b in body:
         # F2: the signed thumbnail is the cover's OWN url, minted after authorisation — never
         # another row's. Asserting the uid alone would pass a url signed for a different item.
-        assert b["coverThumbnailUrl"].split("?")[0] == f"/api/attachments/{b['coverUid']}/thumb"
+        # A video has no thumb file, only a poster (app/services/poster.py), so its cover is the
+        # poster tier; the mime comes from SQL here, not from the endpoint under test.
+        (mime,) = _sql("SELECT mime FROM attachments WHERE uid=:u", {"u": b["coverUid"]})[0]
+        tier = "poster" if mime.startswith("video/") else "thumb"
+        assert b["coverThumbnailUrl"].split("?")[0] == f"/api/attachments/{b['coverUid']}/{tier}"
         assert "sig=" in b["coverThumbnailUrl"]
     return [(b["key"], b["count"], b["coverUid"]) for b in body]
 
@@ -268,6 +274,40 @@ def test_buckets_honour_the_type_filter(lib):
     assert _buckets(client, "size=month&type=image") == [("2026-09", 1, "bt-img")]
     assert _buckets(client, "size=month&type=video") == [("2026-09", 1, "bt-vid")]
     assert _buckets(client, "size=month") == [("2026-09", 2, "bt-vid")]
+
+
+@pytest.mark.parametrize("size", ["day", "month"])
+def test_a_video_bucket_covers_with_its_poster_and_an_image_bucket_with_its_thumb(
+    lib, monkeypatch, tmp_path, size
+):
+    """A video gets a poster and never a thumb (app/services/poster.py), so a cover minted as the
+    thumb tier 404s. The two items sit in different months so they are separate buckets under
+    both sizes, and only the files production has are on disk: the image's thumb, the video's
+    poster."""
+    client, me = lib
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _att("cv-img", me, capture_instant="2026-08-02T10:00:00Z")
+    _att("cv-vid", me, mime="video/quicktime", capture_instant="2026-09-03T10:00:00Z")
+    thumb = tmp_path / "assets" / "thumbs" / "cv-img.jpg"
+    poster = tmp_path / "assets" / "web" / "cv-vid.poster.jpg"
+    for path, colour in ((thumb, (10, 20, 30)), (poster, (200, 100, 50))):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), colour).save(path, "JPEG")
+    keys = {"day": ("2026-09-03", "2026-08-02"), "month": ("2026-09", "2026-08")}[size]
+    assert _buckets(client, f"size={size}") == [(keys[0], 1, "cv-vid"), (keys[1], 1, "cv-img")]
+    covers = {
+        b["coverUid"]: b["coverThumbnailUrl"]
+        for b in client.get(f"/api/attachments/buckets?size={size}").json()
+    }
+    # The literal tier, not just a 200: the route also answers a thumb request with the poster, so
+    # a fetch alone would stay green with the bucket still minting /thumb for a video.
+    assert covers["cv-vid"].split("?")[0] == "/api/attachments/cv-vid/poster"
+    assert covers["cv-img"].split("?")[0] == "/api/attachments/cv-img/thumb"
+    for uid, path in (("cv-vid", poster), ("cv-img", thumb)):
+        r = client.get(covers[uid])
+        assert r.status_code == 200, (uid, r.text)
+        assert r.headers["content-type"] == "image/jpeg"
+        assert r.content == path.read_bytes()
 
 
 @pytest.mark.parametrize(

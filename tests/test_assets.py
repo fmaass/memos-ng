@@ -1,12 +1,14 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
 from app.config import settings
 from app.database import engine as async_engine
 from app.main import app
 from app.routers.assets import (
     _negotiated_path_sync,
     _ready_meta,
+    _thumb_fallback,
     _user_snapshot,
     media_event_stream,
 )
@@ -105,6 +107,104 @@ def test_serve_thumb_with_range_etag_lastmodified(logged_in_client, monkeypatch,
         assert meta["webUrl"].split("?")[0].endswith("/web") and meta["blurhash"] == "LKO2"
     finally:
         _cleanup(aid)
+
+
+def _jpeg(path, colour):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (8, 8), colour).save(path, "JPEG")
+    return path.read_bytes()
+
+
+def _listed(client, uid):
+    return next(i for i in client.get("/api/attachments").json() if i["uid"] == uid)
+
+
+def test_a_video_thumb_request_is_answered_with_its_poster(logged_in_client, monkeypatch, tmp_path):
+    """A video gets a poster and never a thumb (app/services/poster.py), yet every serializer mints
+    a thumbnailUrl for it: that URL reads the rendition that exists, on the signed path (no DB
+    row) and on the authed path alike."""
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid = _seed_attachment("vid-poster", subject, mime="video/quicktime")
+    try:
+        poster = _jpeg(tmp_path / "assets" / "web" / "vid-poster.poster.jpg", (200, 100, 50))
+        item = _listed(client, "vid-poster")
+        assert item["thumbnailUrl"].split("?")[0] == "/api/attachments/vid-poster/thumb"
+        signed = client.get(item["thumbnailUrl"])
+        assert signed.status_code == 200, signed.text
+        assert signed.headers["content-type"] == "image/jpeg"
+        assert signed.content == poster
+        # the signed path's cache bound (the signature's remaining life) holds for the fallback
+        max_age = int(signed.headers["cache-control"].split("max-age=")[1].split(",")[0])
+        assert signed.headers["cache-control"].startswith("private,")
+        assert 0 < max_age <= settings.ASSET_URL_TTL
+        authed = client.get("/api/attachments/vid-poster/thumb")
+        assert authed.status_code == 200, authed.text
+        assert authed.content == poster
+        # only the thumb tier falls back: a video's mobile tier is still absent, still a 404
+        assert client.get(item["previewUrl"]).status_code == 404
+        assert client.get("/api/attachments/vid-poster/mobile").status_code == 404
+    finally:
+        _cleanup(aid)
+
+
+def test_a_thumb_request_with_neither_thumb_nor_poster_is_404(
+    logged_in_client, monkeypatch, tmp_path
+):
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid = _seed_attachment("vid-bare", subject, mime="video/quicktime")
+    try:
+        _jpeg(tmp_path / "assets" / "web" / "someone-else.poster.jpg", (1, 2, 3))
+        signed = client.get(_listed(client, "vid-bare")["thumbnailUrl"])
+        assert signed.status_code == 404
+        assert signed.json()["detail"] == "Asset not generated yet"
+        assert client.get("/api/attachments/vid-bare/thumb").status_code == 404
+    finally:
+        _cleanup(aid)
+
+
+def test_an_existing_thumb_wins_over_a_poster(logged_in_client, monkeypatch, tmp_path):
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    aid = _seed_attachment("img-both", subject)
+    try:
+        thumb = _jpeg(tmp_path / "assets" / "thumbs" / "img-both.jpg", (10, 20, 30))
+        _jpeg(tmp_path / "assets" / "web" / "img-both.poster.jpg", (200, 100, 50))
+        signed = client.get(_listed(client, "img-both")["thumbnailUrl"])
+        assert signed.status_code == 200 and signed.content == thumb
+        assert client.get("/api/attachments/img-both/thumb").content == thumb
+    finally:
+        _cleanup(aid)
+
+
+def test_the_poster_fallback_never_skips_the_signature_or_the_visibility_check(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """The fallback runs AFTER each path's own refusal: a tampered signature is still a 403, and
+    another member's orphan video is still a 404 on the authed path, poster on disk or not."""
+    client, subject = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject='poster_other'"))
+        c.execute(text("INSERT INTO users (subject, role) VALUES ('poster_other','user')"))
+    eng.dispose()
+    mine = _seed_attachment("vid-mine", subject, mime="video/quicktime")
+    theirs = _seed_attachment("vid-theirs", "poster_other", mime="video/quicktime")
+    try:
+        for uid in ("vid-mine", "vid-theirs"):
+            _jpeg(tmp_path / "assets" / "web" / f"{uid}.poster.jpg", (9, 9, 9))
+        url = _listed(client, "vid-mine")["thumbnailUrl"]
+        tampered = url[:-1] + ("0" if url[-1] != "0" else "1")
+        assert client.get(tampered).status_code == 403
+        assert client.get("/api/attachments/vid-theirs/thumb").status_code == 404
+    finally:
+        _cleanup(mine, theirs)
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("DELETE FROM users WHERE subject='poster_other'"))
+        eng.dispose()
 
 
 def test_other_users_attachment_is_404(logged_in_client, monkeypatch, tmp_path):
@@ -1106,6 +1206,39 @@ def test_negotiated_path_is_none_when_nothing_exists(tmp_path):
     missing = tmp_path / "gone.jpg"
     assert _negotiated_path_sync(missing, "image/jpeg", False) is None
     assert _negotiated_path_sync(missing, "image/jpeg", True) is None
+
+
+def test_negotiated_path_serves_the_fallback_only_when_the_tier_is_absent(tmp_path):
+    thumb, poster = tmp_path / "t.jpg", tmp_path / "p.poster.jpg"
+    fallback = (poster, "image/jpeg")
+    assert _negotiated_path_sync(thumb, "image/jpeg", False, fallback) is None  # neither
+    poster.write_bytes(b"p")
+    assert _negotiated_path_sync(thumb, "image/jpeg", False, fallback) == fallback
+    thumb.write_bytes(b"t")
+    assert _negotiated_path_sync(thumb, "image/jpeg", False, fallback) == (thumb, "image/jpeg")
+
+
+@pytest.mark.parametrize("tier", ["mobile", "web", "poster", "original", "print", "printready"])
+def test_only_the_thumb_tier_falls_back_to_the_poster(monkeypatch, tmp_path, tier):
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    assert _thumb_fallback("u1", "thumb") == (
+        tmp_path / "assets" / "web" / "u1.poster.jpg",
+        "image/jpeg",
+    )
+    assert _thumb_fallback("u1", tier) is None
+
+
+def test_negotiated_path_negotiates_webp_on_the_fallback_too(tmp_path):
+    poster = tmp_path / "p.poster.jpg"
+    poster.write_bytes(b"p")
+    webp = poster.with_suffix(".webp")
+    webp.write_bytes(b"w")
+    fallback = (poster, "image/jpeg")
+    assert _negotiated_path_sync(tmp_path / "t.jpg", "image/jpeg", True, fallback) == (
+        webp,
+        "image/webp",
+    )
+    assert _negotiated_path_sync(tmp_path / "t.jpg", "image/jpeg", False, fallback) == fallback
 
 
 def test_negotiated_path_404s_when_only_the_webp_is_missing_and_original_gone(tmp_path):
