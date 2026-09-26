@@ -82,6 +82,41 @@ def json_key(value: Any) -> Any:
     return value if isinstance(value, str | int | float | bool | type(None)) else repr(value)
 
 
+def _conjoin(a: Json, b: Json) -> Json:
+    """Both constraints at once — what `allOf: [a, b]` or a `$ref` with siblings means. Plain
+    annotations (title, description, default) are taken from `b`."""
+    out = {**a, **b}
+    if "properties" in a and "properties" in b:
+        properties = dict(a["properties"])
+        for name, schema in b["properties"].items():
+            properties[name] = (
+                {"allOf": [properties[name], schema]} if name in properties else schema
+            )
+        out["properties"] = properties
+    if "required" in a or "required" in b:
+        out["required"] = list(dict.fromkeys([*a.get("required", []), *b.get("required", [])]))
+    a_types, b_types = _types(a), _types(b)
+    if a_types is not None and b_types is not None:
+        out["type"] = sorted(set(a_types) & set(b_types))
+    a_members, b_members = _members(a), _members(b)
+    if a_members is not None or b_members is not None:
+        if a_members is None:
+            members = b_members or set()
+        elif b_members is None:
+            members = a_members
+        else:
+            members = a_members & b_members
+        out.pop("const", None)
+        out["enum"] = sorted(members, key=repr)
+    for keyword in ("items", "additionalProperties"):
+        if isinstance(a.get(keyword), dict) and isinstance(b.get(keyword), dict):
+            out[keyword] = {"allOf": [a[keyword], b[keyword]]}
+    for keyword in ("anyOf", "oneOf"):
+        if keyword in a and keyword in b:
+            raise ValueError(f"conjoining two {keyword} lists is not supported: extend the walker")
+    return out
+
+
 class _Walker:
     def __init__(self, snapshot: Json, served: Json, result: Comparison):
         self.snapshot = snapshot
@@ -89,19 +124,69 @@ class _Walker:
         self.result = result
 
     @staticmethod
-    def _resolve(doc: Json, node: Json) -> tuple[Json, str | None]:
+    def _lookup(doc: Json, ref: str) -> Json:
+        target: Any = doc
+        for part in ref.removeprefix("#/").split("/"):
+            target = target[part]  # a dangling reference raises: it must never compare clean
+        return target
+
+    def _resolve(self, doc: Json, node: Json) -> tuple[Json, str | None]:
+        """A parameter, request body or response object behind its `$ref`, siblings winning."""
         name = None
         seen: set[str] = set()
-        while "$ref" in node:
+        while "$ref" in node and node["$ref"] not in seen:
             ref = node["$ref"]
-            if ref in seen:
-                break
             seen.add(ref)
-            target: Any = doc
-            for part in ref.removeprefix("#/").split("/"):
-                target = target[part]
-            node, name = target, ref.rsplit("/", 1)[-1]
+            siblings = {k: v for k, v in node.items() if k != "$ref"}
+            node, name = {**self._lookup(doc, ref), **siblings}, ref.rsplit("/", 1)[-1]
         return node, name
+
+    def _normalise(
+        self, doc: Json, node: Json, active: frozenset[str] = frozenset()
+    ) -> tuple[Json, str | None]:
+        """One schema node as a single flat constraint, before any rule looks at it.
+
+        OAS 3.1 lets keywords sit beside `$ref`, and `allOf` spreads one object over several
+        members: read literally, either hides a constraint from the rules. So a `$ref` is replaced
+        by its target CONJOINED with its siblings (JSON Schema 2020-12 semantics — for an enum
+        beside a `$ref` that is the sibling's values whenever they are a subset of the target's),
+        and every `allOf` member is conjoined into the node. `active` stops a `$ref`/`allOf` chain
+        that leads back to itself; recursion through properties is the caller's cycle guard.
+        """
+        if "$ref" in node:
+            ref = node["$ref"]
+            name = ref.rsplit("/", 1)[-1]
+            siblings = {k: v for k, v in node.items() if k != "$ref"}
+            if ref in active:
+                return siblings, name
+            target, inner = self._normalise(doc, self._lookup(doc, ref), active | {ref})
+            if siblings:
+                target = _conjoin(target, self._normalise(doc, siblings, active)[0])
+            return target, inner or name
+        if "allOf" in node:
+            flat = {k: v for k, v in node.items() if k != "allOf"}
+            for member in node["allOf"]:
+                flat = _conjoin(flat, self._normalise(doc, member, active)[0])
+            return flat, None
+        return node, None
+
+    def _alternatives(self, doc: Json, node: Json) -> tuple[str | None, list[Json]]:
+        """`anyOf`/`oneOf` distributed over the node's other constraints: `base ∧ (m1 ∨ m2)` is
+        `(base ∧ m1) ∨ (base ∧ m2)`, so a requirement written inside one alternative is judged
+        like one written on the node. A node without either is its own single alternative."""
+        present = [k for k in ("oneOf", "anyOf") if k in node]
+        if not present:
+            return None, [node]
+        if len(present) > 1:
+            raise ValueError(
+                "a schema with both oneOf and anyOf is not supported: extend the walker"
+            )
+        keyword = present[0]
+        base = {k: v for k, v in node.items() if k != keyword}
+        return keyword, [
+            self._normalise(doc, _conjoin(base, self._normalise(doc, m)[0]))[0]
+            for m in node[keyword]
+        ]
 
     def operation(
         self, loc: str, snap_item: Json, snap_op: Json, served_item: Json, served_op: Json
@@ -193,14 +278,26 @@ class _Walker:
                 )
 
     def _schema(self, loc: str, snap: Json, served: Json, direction: str, stack: tuple) -> None:
-        snap, snap_name = self._resolve(self.snapshot, snap)
-        served, served_name = self._resolve(self.served, served)
+        snap, snap_name = self._normalise(self.snapshot, snap)
+        served, served_name = self._normalise(self.served, served)
         if snap_name is not None:
             loc = f"{loc} → {snap_name}"
         frame = (snap_name, served_name)
         if snap_name is not None and frame in stack:
             return  # a reference cycle: this pair is already being compared further up
         stack = (*stack, frame)
+
+        snap_keyword, snap_alternatives = self._alternatives(self.snapshot, snap)
+        served_keyword, served_alternatives = self._alternatives(self.served, served)
+        if snap_keyword is not None or served_keyword is not None:
+            self._match(
+                loc,
+                (snap_keyword, snap_alternatives),
+                (served_keyword, served_alternatives),
+                direction,
+                stack,
+            )
+            return
 
         snap_types, served_types = _types(snap), _types(served)
         if snap_types is not None and snap_types != served_types:
@@ -225,9 +322,6 @@ class _Walker:
                     direction,
                     stack,
                 )
-        for keyword in ("anyOf", "oneOf", "allOf"):
-            if keyword in snap:
-                self._members_of(loc, keyword, snap[keyword], served.get(keyword), direction, stack)
 
     def _enum(self, loc: str, snap: Json, served: Json, direction: str) -> None:
         snap_members, served_members = _members(snap), _members(served)
@@ -267,36 +361,35 @@ class _Walker:
                 if name not in snap_required:
                     self._fail(f"{loc}.{name}", "request property became required")
 
-    def _members_of(
+    def _match(
         self,
         loc: str,
-        keyword: str,
-        snap_members: list,
-        served_members: Any,
+        snap: tuple[str | None, list[Json]],
+        served: tuple[str | None, list[Json]],
         direction: str,
         stack: tuple,
     ) -> None:
-        if not isinstance(served_members, list):
-            self._fail(loc, f"{keyword} removed")
-            return
-        matched: set[int] = set()
-        for i, snap_member in enumerate(snap_members):
-            match = next(
-                (
-                    j
-                    for j, served_member in enumerate(served_members)
-                    if self._clean(snap_member, served_member, direction, stack)
-                ),
-                None,
-            )
-            if match is None:
-                self._fail(f"{loc}.{keyword}[{i}]", "member no longer served")
-            else:
-                matched.add(match)
-        if direction == RESPONSE and keyword != "allOf":
-            for j in range(len(served_members)):
-                if j not in matched:
-                    self._fail(f"{loc}.{keyword}[{j}]", "new member the client cannot decode")
+        """Alternatives, judged like enum members: on a REQUEST every snapshot alternative must
+        still be accepted by some served one (a served member may be added, not dropped); on a
+        RESPONSE every served alternative must still decode as some snapshot one (a served member
+        may be dropped, not added)."""
+        (snap_keyword, snap_alts), (served_keyword, served_alts) = snap, served
+        if direction == REQUEST:
+            for i, alt in enumerate(snap_alts):
+                if not any(self._clean(alt, other, direction, stack) for other in served_alts):
+                    if snap_keyword is None:
+                        self._fail(loc, "no served alternative accepts it")
+                    else:
+                        self._fail(f"{loc}.{snap_keyword}[{i}]", "member no longer served")
+        else:
+            for j, other in enumerate(served_alts):
+                if not any(self._clean(alt, other, direction, stack) for alt in snap_alts):
+                    if served_keyword is None:
+                        self._fail(loc, "served shape the client cannot decode")
+                    else:
+                        self._fail(
+                            f"{loc}.{served_keyword}[{j}]", "new member the client cannot decode"
+                        )
 
     def _clean(self, snap: Json, served: Json, direction: str, stack: tuple) -> bool:
         """Whether one pair compares without a failure — asked without counting or reporting."""

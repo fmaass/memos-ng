@@ -268,3 +268,122 @@ def test_a_dangling_reference_raises_rather_than_comparing_clean():
     served = _doc({"/api/x": {"get": _op(response={"$ref": "#/components/schemas/Gone"})}})
     with pytest.raises(KeyError):
         compare(snap, served)
+
+
+# --- composition and $ref siblings: normalised on both sides before any rule runs ---------------
+
+VISIBILITY = {"type": "string", "enum": ["PRIVATE", "PROTECTED", "PUBLIC"]}
+
+
+def test_a_required_request_property_added_through_allof_fails():
+    base = _obj({"content": STR}, ["content"])
+    snap = _doc(
+        {"/api/x": {"post": _op(body={"$ref": "#/components/schemas/MemoCreate"})}},
+        {"MemoCreate": base},
+    )
+    grown = {
+        **base,
+        "allOf": [{"required": ["new_required"], "properties": {"new_required": STR}}],
+    }
+    served = _doc(
+        {"/api/x": {"post": _op(body={"$ref": "#/components/schemas/MemoCreate"})}},
+        {"MemoCreate": grown},
+    )
+    assert compare(snap, served).failures == [
+        "paths./api/x.post.requestBody → MemoCreate.new_required: request property became required"
+    ]
+
+
+def test_a_snapshot_property_inside_an_allof_member_is_still_found():
+    snap = _doc(
+        {"/api/x": {"get": _op(response={"allOf": [{"$ref": "#/components/schemas/Base"}]})}},
+        {"Base": _obj({"a": STR, "b": INT}, ["a"])},
+    )
+    flattened = _doc({"/api/x": {"get": _op(response=_obj({"a": STR, "b": INT}, ["a"]))}})
+    lost = _doc({"/api/x": {"get": _op(response=_obj({"a": STR}, ["a"]))}})
+    assert compare(snap, flattened).failures == []
+    assert compare(snap, lost).failures == ["paths./api/x.get.responses.200.b: property removed"]
+
+
+def test_a_served_request_oneof_may_grow_but_not_drop_a_member():
+    snap = _doc({"/api/x": {"post": _op(body={"oneOf": [_obj({"a": STR}), _obj({"b": INT})]})}})
+    grown = _doc(
+        {"/api/x": {"post": _op(body={"oneOf": [_obj({"a": STR}), _obj({"b": INT}), INT]})}}
+    )
+    dropped = _doc({"/api/x": {"post": _op(body={"oneOf": [_obj({"a": STR})]})}})
+    assert compare(snap, grown).failures == []
+    assert compare(snap, dropped).failures == [
+        "paths./api/x.post.requestBody.oneOf[1]: member no longer served"
+    ]
+
+
+def test_a_requirement_hidden_in_a_served_only_oneof_fails():
+    snap = _doc({"/api/x": {"post": _op(body=_obj({"a": STR, "b": STR}))}})
+    served = _doc(
+        {
+            "/api/x": {
+                "post": _op(
+                    body={
+                        **_obj({"a": STR, "b": STR}),
+                        "oneOf": [{"required": ["a"]}, {"required": ["b"]}],
+                    }
+                )
+            }
+        }
+    )
+    assert compare(snap, served).failures == [
+        "paths./api/x.post.requestBody: no served alternative accepts it"
+    ]
+
+
+def test_an_enum_beside_a_served_ref_narrows_what_is_accepted():
+    snap = _doc(
+        {
+            "/api/x": {
+                "post": _op(body=_obj({"visibility": {"$ref": "#/components/schemas/Visibility"}}))
+            }
+        },
+        {"Visibility": VISIBILITY},
+    )
+    served = copy.deepcopy(snap)
+    served["paths"]["/api/x"]["post"]["requestBody"]["content"]["application/json"]["schema"][
+        "properties"
+    ]["visibility"] = {"$ref": "#/components/schemas/Visibility", "enum": ["PRIVATE"]}
+    assert compare(snap, served).failures == [
+        "paths./api/x.post.requestBody.visibility → Visibility: "
+        "enum no longer accepts ['PROTECTED', 'PUBLIC']"
+    ]
+
+
+def test_an_enum_beside_a_snapshot_ref_is_what_the_client_decodes():
+    snap = _doc(
+        {
+            "/api/x": {
+                "get": _op(
+                    response=_obj(
+                        {
+                            "visibility": {
+                                "$ref": "#/components/schemas/Visibility",
+                                "enum": ["PRIVATE"],
+                            }
+                        }
+                    )
+                )
+            }
+        },
+        {"Visibility": VISIBILITY},
+    )
+    served = _doc(
+        {
+            "/api/x": {
+                "get": _op(
+                    response=_obj({"visibility": {"$ref": "#/components/schemas/Visibility"}})
+                )
+            }
+        },
+        {"Visibility": VISIBILITY},
+    )
+    assert compare(snap, served).failures == [
+        "paths./api/x.get.responses.200.visibility → Visibility: "
+        "enum may now return ['PROTECTED', 'PUBLIC']"
+    ]
