@@ -1976,6 +1976,8 @@ export interface components {
         };
         /** HealthResponse */
         HealthResponse: {
+            /** Apimajor */
+            apiMajor: number;
             /** Db */
             db?: string | null;
             /** Status */

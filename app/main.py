@@ -30,7 +30,7 @@ from app.security_headers import CSP
 from app.services import management_grant, reclaim
 from app.services.cursors import InvalidCursor
 from app.services.digest import metrics as digest_metrics
-from app.version import __version__
+from app.version import API_MAJOR, __version__
 
 configure_logging()  # before the first log line: a rendered row detail cannot be taken back
 logger = structlog.get_logger(__name__)
@@ -451,6 +451,7 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     db: str | None = None
+    apiMajor: int  # app/version.py says why this is not derived from `version`
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -460,8 +461,10 @@ async def health(response: Response) -> HealthResponse:
             await session.execute(sa_text("SELECT 1"))
     except Exception:
         response.status_code = 503
-        return HealthResponse(status="degraded", version=__version__, db="unreachable")
-    return HealthResponse(status="ok", version=__version__, db="ok")
+        return HealthResponse(
+            status="degraded", version=__version__, db="unreachable", apiMajor=API_MAJOR
+        )
+    return HealthResponse(status="ok", version=__version__, db="ok", apiMajor=API_MAJOR)
 
 
 PRIVACY_PAGE = STATIC_DIR / "privacy-policy.html"

@@ -1,3 +1,6 @@
+import pytest
+from app.version import API_MAJOR
+
 from tests.conftest import session_factory
 
 
@@ -20,6 +23,17 @@ def test_health_degraded_when_db_unreachable(client, monkeypatch):
     body = r.json()
     assert body["status"] == "degraded"
     assert body["db"] == "unreachable"
+
+
+@pytest.mark.parametrize(("fail", "status"), [(False, 200), (True, 503)])
+def test_health_reports_api_major(client, monkeypatch, fail, status):
+    # A client decides whether it can talk to this server from /health alone, and a degraded
+    # server is exactly when it has to: both branches carry the major, as an integer.
+    monkeypatch.setattr("app.main.async_session", session_factory(fail=fail))
+    r = client.get("/health")
+    assert r.status_code == status
+    assert r.json()["apiMajor"] == API_MAJOR
+    assert type(r.json()["apiMajor"]) is int
 
 
 def test_unknown_api_route_returns_json_404(client):
