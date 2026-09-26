@@ -26,7 +26,13 @@ type GalleryAttachment = Pick<
 > & { renditions?: components['schemas']['RenditionItem'][] }
 
 const props = withDefaults(
-  defineProps<{ items: GalleryAttachment[]; targetHeight?: number; gap?: number }>(),
+  defineProps<{
+    items: GalleryAttachment[]
+    targetHeight?: number
+    gap?: number
+    /** A tile's scroll-margin-top, so a caller that scrolls a tile to the top can clear what sticks there. */
+    tileScrollMargin?: string
+  }>(),
   { targetHeight: 200, gap: 4 },
 )
 const emit = defineEmits<{
@@ -78,7 +84,7 @@ const rows = computed(() => {
         :height="li.item.height"
         :sizes="justifiedTileSizes(li.width)"
         :print-chip="printChipFor(li.item)"
-        :style="{ width: li.width + 'px', height: li.height + 'px' }"
+        :style="{ width: li.width + 'px', height: li.height + 'px', scrollMarginTop: tileScrollMargin }"
         @open="emit('open', li.index)"
         @retry="emit('retry', $event)"
         @print-retry="emit('print-retry', $event)"

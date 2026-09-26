@@ -177,6 +177,11 @@ watchEffect(() => {
 // one (the token), so only the latest tap ever scrolls.
 const root = ref<HTMLElement | null>(null)
 let jumpToken = 0
+// The jump lands a day's first tile at the TOP of what is visible: under the shell's fixed chrome
+// and the sticky month header. The header's height is measured (it depends on the font and the
+// label), carried on the view as a variable, and the tile's scroll margin adds the two.
+const monthHeaderHeight = ref(0)
+const TILE_SCROLL_MARGIN = 'calc(var(--chrome-height, 0px) + var(--month-header-height, 0px))'
 onUnmounted(() => {
   jumpToken += 1
 })
@@ -231,7 +236,11 @@ async function jumpToDay(day: string) {
     const uid = await scrollToDay(day, pager, undefined, () => token === jumpToken)
     if (!uid || token !== jumpToken) return
     const tile = await tileFor(uid, token)
-    if (tile && token === jumpToken) tile.scrollIntoView({ block: 'center' })
+    if (!tile || token !== jumpToken) return
+    const header = root.value?.querySelector<HTMLElement>('[data-test="month-header"]')
+    monthHeaderHeight.value = header?.getBoundingClientRect().height ?? 0
+    await nextTick()
+    if (token === jumpToken) tile.scrollIntoView({ block: 'start' })
   } finally {
     if (token === jumpToken) {
       jumping.value = false
@@ -318,7 +327,12 @@ function onDelete(uid: string) {
 </script>
 
 <template>
-  <section ref="root" class="mx-auto flex max-w-6xl flex-col gap-4 p-4" data-test="view-resources">
+  <section
+    ref="root"
+    class="mx-auto flex max-w-6xl flex-col gap-4 p-4"
+    :style="{ '--month-header-height': `${monthHeaderHeight}px` }"
+    data-test="view-resources"
+  >
     <LibraryHeader v-model:filter="filter" />
     <div
       v-if="jumping"
@@ -388,6 +402,7 @@ function onDelete(uid: string) {
         <JustifiedGallery
           :items="section.items"
           :target-height="200"
+          :tile-scroll-margin="TILE_SCROLL_MARGIN"
           @open="openAt(section.start + $event)"
           @retry="onTileRetry"
           @print-retry="printMaster.retry($event)"
