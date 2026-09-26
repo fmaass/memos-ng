@@ -330,10 +330,11 @@ async def list_attachments(
     # created_at tie (bulk import, same-second upload batch) is broken by construction. It is also
     # the one order this table is indexed for (attachments carries no created_at index), and it is
     # the order the library already displayed; (created_at DESC, id DESC) would have reshuffled it.
-    # Probed against production 2026-08-26 and re-probed 2026-08-27: 0 of 1355 (resp. 1339) rows
-    # disagree between id order and created_at order, so "oldest/newest first" means the same thing
-    # either way and `order=asc` needs no created_at ordering, composite cursor, index or
-    # migration — it is this same keyset read backwards.
+    # Probed against production 2026-08-26 and re-probed 2026-08-27: no row disagreed between id
+    # order and created_at order, so "oldest/newest first" means the same thing either way and
+    # `order=asc` needs no created_at ordering, composite cursor, index or migration — it is this
+    # same keyset read backwards. The table held 1795 attachments on 2026-09-22 (MEMNG-501); the
+    # order probe was not re-run at that count.
     by_id = Attachment.id.asc() if order == "asc" else Attachment.id.desc()
     page = max(1, min(limit, 500))
     # limit + 1: one extra row is how the page learns another page exists, without a second query
