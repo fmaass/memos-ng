@@ -190,6 +190,38 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.0.0
+
+- memos-ng and the iOS client keep independent semantic versions and share only the MAJOR, which
+  is the API contract's major. Within a major the contract only grows: a minor may add paths,
+  operations, optional parameters and response properties, while removing or retyping anything,
+  or making a request demand something it did not before, ships only with a new major. A 2.x
+  client works with any 2.x server. `GET /health` reports that major as the integer `apiMajor`,
+  without a credential and in its `ok` and `degraded` answers alike; from this release it is 2.
+- The major moves to 2 without breaking a 1.11.0 client: nothing 1.11.0 served is removed,
+  retyped or made stricter, and every change since 1.11.0 is an addition: `apiMajor` above and
+  the library's routes, parameters and properties below.
+  `tests/test_ios_client_contract.py` holds the served schema to the `openapi.json` the iOS client
+  was generated from, which is byte for byte the 1.11.0 document: every path, operation,
+  parameter, request body, response and property it names must still be served with the same
+  type, and no operation it names may gain a required input.
+- The library can be read by the date a picture was taken (#211). Every item of
+  `GET /api/attachments` carries `takenAt` and `filename`; `order=taken_desc` or `taken_asc` walks
+  the library by taken date, and `tag=` keeps only media whose memo carries exactly that tag (an
+  unknown tag is an empty page). `GET /api/attachments/buckets?size=day|month|year&tz=` counts the
+  visible library per taken day, month or year, newest first, each bucket naming its newest item
+  as the cover; `GET /api/attachments/tags` counts the visible media per tag. The default order,
+  the bare-array body and the id cursors are unchanged.
+- The picture library at `/resources` reads like a Photos app. It pages through the whole library
+  instead of stopping at the first 200 tiles (#210), in taken order under sticky month headers,
+  with a Library header whose menu sets sort, kind and one tag, and an app-wide dock (#212). Years
+  shows a card per year, Months a mosaic of each month's busiest days, and a day opens All at that
+  day's first picture, under the sticky header (#213, #214). Select mode in All shares or deletes
+  several of my own pictures at once (#216). Four gallery tile defects are fixed with it (#210): a
+  video's play overlay opens the lightbox, a tile whose thumbnail failed heals when a fresh URL
+  arrives, each blurhash placeholder is cached per picture, and Enter and Space open a tile.
+- No migration. The one migration since the last tag, `a4e7c1b20f36`, shipped with 1.8.0.
+
 ### v1.11.0
 
 - The tus 1.0 endpoint at `/api/tus`, added in 1.10.0, is removed. No client used it, and
