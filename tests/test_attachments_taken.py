@@ -415,6 +415,10 @@ def test_the_literal_routes_are_answered_by_their_own_handlers(lib):
 
 
 def test_the_new_endpoints_refuse_an_anonymous_caller(client):
+    # The `{uid}` route refuses an anonymous caller too, so a 401 alone would stay green with
+    # either literal route gone: the refusal must come from the handler the path is matched to.
+    assert _matched_endpoint("/api/attachments/buckets") == "attachment_buckets"
+    assert _matched_endpoint("/api/attachments/tags") == "attachment_tags"
     assert client.get("/api/attachments/buckets?size=month").status_code == 401
     assert client.get("/api/attachments/tags").status_code == 401
 
