@@ -47,10 +47,12 @@ vi.mock('@/composables/usePrintMaster', () => ({
   fetchPrintMasters: vi.fn().mockResolvedValue([]),
   printMasterUploads: () => new Map(),
 }))
+// The paged library is exercised for real (transport-level) in ResourcesView.library.spec.ts; here
+// one already-loaded page is enough to pin the view's wiring around it.
 vi.mock('@tanstack/vue-query', () => ({
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
-  useQuery: () => ({
-    data: ref([
+  useInfiniteQuery: () => ({
+    data: ref({ pages: [{ nextCursor: undefined, items: [
       {
         uid: 'a1',
         mime: 'image/jpeg',
@@ -89,9 +91,14 @@ vi.mock('@tanstack/vue-query', () => ({
         printUrl: '/api/attachments/a2/print',
         memoUid: 'memo-7',
       },
-    ]),
+    ] }] }),
     isPending: ref(false),
     isFetching: ref(false),
+    isError: ref(false),
+    isFetchNextPageError: ref(false),
+    hasNextPage: ref(false),
+    isFetchingNextPage: ref(false),
+    fetchNextPage: vi.fn(),
     refetch,
   }),
 }))
