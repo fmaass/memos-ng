@@ -643,6 +643,8 @@ def test_list_attachments_without_a_cursor_is_the_unchanged_bare_list(logged_in_
             "renditions",
             "orphan",
             "memoUid",  # MEMNG-171: the ONE key added since; everything else is untouched
+            "takenAt",  # MEMNG-507: additive, the native client ignores unknown keys
+            "filename",  # MEMNG-507: additive, names each file in the share sheet
             "thumbnailUrl",
             "previewUrl",
             "webUrl",

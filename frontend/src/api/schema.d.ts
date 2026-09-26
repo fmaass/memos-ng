@@ -285,12 +285,58 @@ export interface paths {
          *     filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
          *     memo it does hang on. Another user's PRIVATE or orphan media is excluded — the same visibility
          *     rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
+         *     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
+         *     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
          *
          *     Paged by keyset, like the memo feed: when more rows follow, the response carries an
          *     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
          *     not carry — for the page after. The body is a plain array on every page, cursor or not.
          */
         get: operations["list_attachments_api_attachments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/buckets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Attachment Buckets
+         * @description The library the list shows — same visibility, same `type` and `tag` filters — counted per
+         *     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
+         *     first. Each bucket names its newest item as the cover, with that item's signed thumbnail.
+         */
+        get: operations["attachment_buckets_api_attachments_buckets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Attachment Tags
+         * @description Every tag on a memo carrying media the user can see, with the number of such media under
+         *     the same `type` filter the list applies — so a tag's count is the length of the list under
+         *     `?tag=` and that `type`. Most items first, then by name; a tag with no media is absent.
+         */
+        get: operations["attachment_tags_api_attachments_tags_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1263,12 +1309,25 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AttachmentBucket */
+        AttachmentBucket: {
+            /** Count */
+            count: number;
+            /** Coverthumbnailurl */
+            coverThumbnailUrl: string;
+            /** Coveruid */
+            coverUid: string;
+            /** Key */
+            key: string;
+        };
         /** AttachmentListItem */
         AttachmentListItem: {
             /** Blurhash */
             blurhash: string | null;
             /** Downloadurl */
             downloadUrl: string;
+            /** Filename */
+            filename: string;
             /** Haslegacyprint */
             hasLegacyPrint: boolean;
             /** Hasprint */
@@ -1292,6 +1351,11 @@ export interface components {
             /** Renditions */
             renditions: components["schemas"]["RenditionItem"][];
             status: components["schemas"]["AttachmentStatus"];
+            /**
+             * Takenat
+             * Format: date-time
+             */
+            takenAt: string;
             /** Thumbnailurl */
             thumbnailUrl: string;
             /** Uid */
@@ -1445,6 +1509,13 @@ export interface components {
          * @enum {string}
          */
         AttachmentStatus: "uploading" | "pending" | "processing" | "ready" | "failed";
+        /** AttachmentTagCount */
+        AttachmentTagCount: {
+            /** Count */
+            count: number;
+            /** Name */
+            name: string;
+        };
         /** Body_upload_print_api_attachments__uid__print_post */
         Body_upload_print_api_attachments__uid__print_post: {
             /** File */
@@ -2995,7 +3066,8 @@ export interface operations {
                 type?: string | null;
                 limit?: number;
                 cursor?: string | null;
-                order?: "desc" | "asc";
+                order?: "desc" | "asc" | "taken_desc" | "taken_asc";
+                tag?: string | null;
             };
             header?: never;
             path?: never;
@@ -3006,12 +3078,77 @@ export interface operations {
             /** @description Successful Response */
             200: {
                 headers: {
-                    /** @description Opaque continuation token — resend it as `?cursor=` (with the same `type`, `limit` and `order`) to get the next page. Absent on the last page. */
+                    /** @description Opaque continuation token — resend it as `?cursor=` (with the same `type`, `tag`, `limit` and `order`) to get the next page. Absent on the last page. */
                     "X-Next-Cursor"?: string;
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["AttachmentListItem"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    attachment_buckets_api_attachments_buckets_get: {
+        parameters: {
+            query: {
+                size: "day" | "month" | "year";
+                type?: string | null;
+                tz?: string;
+                tag?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentBucket"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    attachment_tags_api_attachments_tags_get: {
+        parameters: {
+            query?: {
+                type?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentTagCount"][];
                 };
             };
             /** @description Validation Error */
