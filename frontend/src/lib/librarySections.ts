@@ -35,6 +35,20 @@ function monthKey(instant: Date, tz: string): string {
   return `${year}-${month}`
 }
 
+const dayFormats = new Map<string, Intl.DateTimeFormat>()
+
+/** The `tz` calendar day of an ISO instant as `YYYY-MM-DD` — the buckets endpoint's day key — or
+ * null for an instant that cannot be read. */
+export function dayKey(takenAt: string, tz: string = LIBRARY_TIME_ZONE): string | null {
+  const instant = new Date(takenAt)
+  if (Number.isNaN(instant.getTime())) return null
+  const parts = cached(dayFormats, tz, { year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(
+    instant,
+  )
+  const part = (type: string) => parts.find((p) => p.type === type)?.value
+  return `${part('year')}-${part('month')}-${part('day')}`
+}
+
 // Sections follow the list's own order (the server sorts by takenAt in either direction), so the
 // grid never re-sorts what it was handed; a month's items keep their list order too.
 export function groupByMonth<T extends { takenAt: string }>(
