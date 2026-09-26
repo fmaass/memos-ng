@@ -65,11 +65,15 @@ class Settings(BaseSettings):
     # The CPU the worker container actually has. The validator checks the configured consumers fit
     # inside it; it is a budget the worker refuses to exceed, not a limit it can impose on ffmpeg.
     WORKER_CPU_BUDGET: int = 8
-    # What ONE transcode really costs, MEASURED rather than nominal: a nominal one-thread transcode
-    # was observed at 242 % CPU in production on 2026-09-18, so its honest cost is 3 cores.
-    # Deliberately NOT `FFMPEG_THREADS`: `-threads` sits AFTER `-i` in slow_ffmpeg_cmd, which makes
-    # it an OUTPUT option bounding libx264 alone, while decode and filter threads stay on ffmpeg's
-    # own auto-selection. So `slots x FFMPEG_THREADS` would be a thread count that bounds nothing;
+    # What ONE transcode really costs, MEASURED rather than nominal. Measured 2026-09-27 on jupiter
+    # (a 29 s 1080p120 h264 clip, two runs each): with FFMPEG_THREADS=1 bounding only the encoder,
+    # the decoder stayed on ffmpeg's auto thread count and the transcode ran at a mean 3.4 and a
+    # peak 3.8 cores — over this cost. slow_ffmpeg_cmd therefore passes `-threads` before `-i` as
+    # well; with the decoder bounded too the same clip ran at a mean 2.0 and a peak 2.2 cores, so
+    # 3 is a ceiling again, bought with about 1.5x the wall-clock (16 s -> 24 s). Bounding the
+    # filter threads as well made no measurable difference, so they stay on auto.
+    # Deliberately NOT `FFMPEG_THREADS`: even at one decoder and one encoder thread the transcode
+    # took 2.2 cores, so `slots x FFMPEG_THREADS` would be a thread count that bounds nothing;
     # this product is a CPU BUDGET. The validator refuses a cost below FFMPEG_THREADS, which is
     # what stops the arithmetic being decorative.
     WORKER_TRANSCODE_CPU_COST: int = 3

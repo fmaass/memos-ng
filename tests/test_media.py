@@ -862,6 +862,20 @@ def test_both_ffmpeg_lanes_pin_the_probed_stream():
     assert not any(a.startswith("0:a") for a in poster)  # a JPEG has no audio to map
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+def test_ffmpeg_threads_bounds_the_decoder_as_well_as_the_encoder(threads):
+    # ffmpeg options are positional: before `-i` they configure the INPUT (the decoder), after it
+    # the OUTPUT (libx264). Measured 2026-09-27 on a 1080p120 clip, the output option alone left
+    # the decoder on auto threads and the "one-thread" transcode peaked at 3.8 cores.
+    cmd = media.slow_ffmpeg_cmd("/in.mov", "/out.mp4", threads)
+    i = cmd.index("-i")
+    assert cmd[i + 1] == "/in.mov"
+    before = [cmd[k + 1] for k, a in enumerate(cmd[:i]) if a == "-threads"]
+    after = [cmd[k + 1] for k, a in enumerate(cmd) if a == "-threads" and k > i]
+    assert before == [str(threads)]
+    assert after == [str(threads)]
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_probe_and_transcode_agree_on_a_multi_stream_container(tmp_path):
     # End-to-end proof of the skew and its fix: a container whose FIRST video stream is the
