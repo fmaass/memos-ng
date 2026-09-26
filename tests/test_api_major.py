@@ -46,16 +46,16 @@ def app_version_from_env(monkeypatch):
     importlib.reload(app_version)
 
 
-@pytest.mark.parametrize("value", ["1.11.0", "1.11.0+de31f2e", "1.0.0"])
+@pytest.mark.parametrize("value", ["2.0.0", "2.0.0+780c002", "2.1.0"])
 def test_a_built_version_with_the_same_major_agrees(app_version_from_env, value):
     module = app_version_from_env(value)
     assert module.__version__ == value
     module.check_api_major(module.__version__)
 
 
-@pytest.mark.parametrize("value", ["2.0.0", "0.9.0", "10.0.0+abc1234", "11.0.0", "garbage", ""])
+@pytest.mark.parametrize("value", ["1.11.0", "0.9.0", "20.0.0+abc1234", "21.0.0", "garbage", ""])
 def test_a_built_version_with_another_major_is_refused(app_version_from_env, value):
-    # 10.x and 11.x start with the digit 1: a prefix comparison would wave them through.
+    # 20.x and 21.x start with the digit 2: a prefix comparison would wave them through.
     module = app_version_from_env(value)
     assert module.__version__ == value
     with pytest.raises(ValueError, match="API_MAJOR"):

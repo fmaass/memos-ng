@@ -4,7 +4,7 @@ __version__ = os.environ.get("APP_VERSION", "dev")
 
 # The API major a client checks /health for. It cannot be derived from `__version__`, which is
 # "dev" whenever APP_VERSION is unset; tests/test_api_major.py holds it to pyproject.toml's major.
-API_MAJOR = 1
+API_MAJOR = 2
 
 
 def check_api_major(version: str) -> None:
