@@ -22,11 +22,14 @@ vi.mock('@/composables/useApi', async () => {
   client.use(reachabilityMiddleware)
   return { useApi: () => client }
 })
-const { route } = vi.hoisted(() => ({ route: { query: {} as Record<string, string> } }))
+const { route, routerReplace } = vi.hoisted(() => ({
+  route: { query: {} as Record<string, string> },
+  routerReplace: vi.fn(),
+}))
 vi.mock('vue-router', async () => {
   const { reactive } = await import('vue')
   const live = reactive(route)
-  return { useRouter: () => ({ push: vi.fn(), replace: vi.fn() }), useRoute: () => live }
+  return { useRouter: () => ({ push: vi.fn(), replace: routerReplace }), useRoute: () => live }
 })
 // PhotoSwipe needs a real DOM; the viewer's contract is what it is HANDED.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
@@ -97,6 +100,7 @@ describe('ResourcesView library query', () => {
   beforeEach(() => {
     transport.mockReset()
     lightboxOpen.mockReset()
+    routerReplace.mockReset()
     // A 5xx makes the reachability middleware probe /health with the global fetch; answer it here
     // so the case never reaches for a real socket.
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 200 })))
@@ -308,6 +312,68 @@ describe('ResourcesView library query', () => {
 
       expect(has(w, 'resources-empty')).toBe(true)
       expect(has(w, 'resources-error')).toBe(false)
+    })
+  })
+
+  describe('the empty state under a filter (MEMNG-566)', () => {
+    const emptyText = (w: VueWrapper) => w.find('[data-test="resources-empty"]').text()
+
+    it('says the Library is empty, with no clear action, when nothing filters it', async () => {
+      route.query = { order: 'oldest' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(emptyText(w)).toBe('No attachments yet.')
+      expect(has(w, 'resources-empty-clear')).toBe(false)
+    })
+
+    it('names the tag in All and clears the filter, keeping the order, on the clear action', async () => {
+      route.query = { tag: 'no-such-tag-zz', order: 'oldest' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(sent(0).searchParams.get('tag')).toBe('no-such-tag-zz')
+      expect(emptyText(w)).toContain('No pictures tagged #no-such-tag-zz.')
+
+      transport.mockResolvedValueOnce(ok([row('a1')]))
+      await w.find('[data-test="resources-empty-clear"]').trigger('click')
+      await settle()
+
+      expect(routerReplace).toHaveBeenLastCalledWith({ query: { order: 'oldest' } })
+      const refetch = sent(transport.mock.calls.length - 1)
+      expect(refetch.pathname).toBe('/api/attachments')
+      expect(refetch.searchParams.get('tag')).toBeNull()
+      expect(refetch.searchParams.get('order')).toBe('taken_asc')
+      expect(has(w, 'justified-gallery')).toBe(true)
+    })
+
+    it('shows a tag that looks like markup as text', async () => {
+      route.query = { tag: '<b>x</b>' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(emptyText(w)).toContain('No pictures tagged #<b>x</b>.')
+      expect(w.find('[data-test="resources-empty"] b').exists()).toBe(false)
+    })
+
+    it('names the kind in a bucket view and keeps the segment on the clear action', async () => {
+      route.query = { type: 'video', view: 'years' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(sent(0).pathname).toBe('/api/attachments/buckets')
+      expect(emptyText(w)).toContain('No videos match this filter.')
+
+      transport.mockResolvedValueOnce(ok([]))
+      await w.find('[data-test="resources-empty-clear"]').trigger('click')
+      await settle()
+
+      expect(routerReplace).toHaveBeenLastCalledWith({ query: { view: 'years' } })
+      expect(sent(transport.mock.calls.length - 1).searchParams.get('type')).toBeNull()
     })
   })
 

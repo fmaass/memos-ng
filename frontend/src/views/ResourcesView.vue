@@ -24,8 +24,10 @@ import { appendPage, shouldLoadMore } from '@/lib/attachmentPaging'
 import { scrollToDay } from '@/lib/dayJump'
 import { shouldRemint } from '@/lib/imageRetry'
 import {
+  clearedLibraryFilter,
   fromSearchParams,
   type LibraryFilter,
+  libraryEmptyState,
   type LibraryView,
   sameLibraryFilter,
   toRouteQuery,
@@ -59,6 +61,11 @@ function writeRoute() {
   void router.replace({ query: { ...toRouteQuery(filter.value), ...viewToQuery(view.value) } })
 }
 watch(filter, writeRoute)
+const emptyState = computed(() => libraryEmptyState(filter.value))
+// A new object, never a mutation: the route write above watches the ref, not its fields.
+function clearFilter() {
+  filter.value = clearedLibraryFilter(filter.value)
+}
 function setView(next: LibraryView) {
   view.value = next
   writeRoute()
@@ -458,9 +465,22 @@ function onDelete(uid: string) {
           @click="bucketView.retry"
         />
       </div>
-      <p v-else-if="bucketView.empty" class="text-sm text-muted-color" data-test="resources-empty">
-        No attachments yet.
-      </p>
+      <div
+        v-else-if="bucketView.empty"
+        class="flex flex-col items-start gap-2 text-sm text-muted-color"
+        data-test="resources-empty"
+      >
+        <p>{{ emptyState.message }}</p>
+        <Button
+          v-if="emptyState.filtered"
+          label="Clear filter"
+          icon="pi pi-filter-slash"
+          size="small"
+          outlined
+          data-test="resources-empty-clear"
+          @click="clearFilter"
+        />
+      </div>
       <!-- A phone keeps the cards full width; a desktop centres them in the mosaic's 720 px column. -->
       <div v-else-if="view === 'years'" class="md:mx-auto md:w-full md:max-w-[720px]">
         <YearCards :years="yearBuckets.data.value ?? []" @select="openYear" />
@@ -486,9 +506,22 @@ function onDelete(uid: string) {
         @click="retryLoad"
       />
     </div>
-    <p v-else-if="!items.length" class="text-sm text-muted-color" data-test="resources-empty">
-      No attachments yet.
-    </p>
+    <div
+      v-else-if="!items.length"
+      class="flex flex-col items-start gap-2 text-sm text-muted-color"
+      data-test="resources-empty"
+    >
+      <p>{{ emptyState.message }}</p>
+      <Button
+        v-if="emptyState.filtered"
+        label="Clear filter"
+        icon="pi pi-filter-slash"
+        size="small"
+        outlined
+        data-test="resources-empty-clear"
+        @click="clearFilter"
+      />
+    </div>
     <template v-else>
       <!-- The month header sticks under the shell's chrome, whose height the shell measures. -->
       <div v-for="section in sections" :key="section.key" class="flex flex-col gap-2">

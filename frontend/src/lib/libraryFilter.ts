@@ -111,3 +111,24 @@ export function toBucketParams(size: BucketSize, f: LibraryFilter): BucketQuery 
     ...(f.tag ? { tag: f.tag } : {}),
   }
 }
+
+// What an empty Library says. `order` narrows nothing, so an order-only filter is still the whole
+// Library; a tag or a kind is a restriction, and then the copy names it and the view offers a way out.
+export interface LibraryEmptyState {
+  message: string
+  filtered: boolean
+}
+
+const KIND_NOUN: Record<LibraryKind, string> = { image: 'photos', video: 'videos' }
+
+export function libraryEmptyState(f: LibraryFilter): LibraryEmptyState {
+  if (!f.type && !f.tag) return { message: 'No attachments yet.', filtered: false }
+  const noun = f.type ? KIND_NOUN[f.type] : 'pictures'
+  const what = f.tag ? `tagged #${f.tag}` : 'match this filter'
+  return { message: `No ${noun} ${what}.`, filtered: true }
+}
+
+// Clearing drops what restricts the result and keeps the direction the viewer chose.
+export function clearedLibraryFilter(f: LibraryFilter): LibraryFilter {
+  return { order: f.order }
+}
