@@ -80,6 +80,23 @@ describe('scrollToDay', () => {
     expect(fetchNext).not.toHaveBeenCalled()
   })
 
+  it('stops a superseded walk before its next page and returns null', async () => {
+    const { pager, fetchNext } = pagerOver(newestFirst)
+    let live = true
+    fetchNext.mockImplementationOnce(async () => {
+      live = false // a newer jump took over while this page was on the wire
+      return { items: newestFirst.slice(0, 2).flat(), hasNext: true }
+    })
+    expect(await scrollToDay('2026-08-29', pager, undefined, () => live)).toBeNull()
+    expect(fetchNext).toHaveBeenCalledTimes(1)
+  })
+
+  it('asks for no page at all when it is superseded before it starts', async () => {
+    const { pager, fetchNext } = pagerOver(newestFirst)
+    expect(await scrollToDay('2026-09-03', pager, undefined, () => false)).toBeNull()
+    expect(fetchNext).not.toHaveBeenCalled()
+  })
+
   it('skips an item whose takenAt cannot be read instead of throwing', async () => {
     const pages = [[at('bad', 'not a date'), at('good', '2026-09-02T10:00:00Z')]]
     expect(await scrollToDay('2026-09-02', pagerOver(pages).pager)).toBe('good')

@@ -21,18 +21,22 @@ export interface DayPager<T> {
 // What is already loaded is searched first, and each fetched page is searched before another is
 // asked for, so the walk ends on the first page holding the day and never requests the page after
 // it. The end of the list or a failed page ends it with null: the caller stays where it is.
+// `shouldContinue` is asked after every wait and before every page: a walk a newer jump superseded
+// ends there with null, and never puts another request on the wire.
 export async function scrollToDay<T extends { uid: string; takenAt: string }>(
   key: string,
   pager: DayPager<T>,
   tz: string = LIBRARY_TIME_ZONE,
+  shouldContinue: () => boolean = () => true,
 ): Promise<string | null> {
   let snapshot: PageSnapshot<T> | null = await pager.current()
   while (snapshot) {
+    if (!shouldContinue()) return null
     // The whole list each time: a page joined in flight may have been a refetch that rewrote rows
     // already searched.
     const hit = snapshot.items.find((item) => dayKey(item.takenAt, tz) === key)
     if (hit) return hit.uid
-    if (!snapshot.hasNext) return null
+    if (!snapshot.hasNext || !shouldContinue()) return null
     snapshot = await pager.fetchNext()
   }
   return null

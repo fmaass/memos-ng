@@ -228,7 +228,7 @@ async function jumpToDay(day: string) {
   setView('all')
   jumping.value = true
   try {
-    const uid = await scrollToDay(day, pager)
+    const uid = await scrollToDay(day, pager, undefined, () => token === jumpToken)
     if (!uid || token !== jumpToken) return
     const tile = await tileFor(uid, token)
     if (tile && token === jumpToken) tile.scrollIntoView({ block: 'center' })
