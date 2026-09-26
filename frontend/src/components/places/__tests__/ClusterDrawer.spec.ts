@@ -26,8 +26,12 @@ async function mountDrawer() {
   return wrapper
 }
 
+// A tile is a MediaTile; what a tap lands on is its native button (image or video).
 function tiles(): HTMLElement[] {
-  return Array.from(document.querySelectorAll<HTMLElement>('[data-test="gallery-img"]'))
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-test="media-tile"]'))
+}
+function tap(tile: HTMLElement): void {
+  tile.querySelector<HTMLElement>('[data-test="tile-open"], [data-test="tile-video"]')!.click()
 }
 
 describe('ClusterDrawer', () => {
@@ -62,9 +66,9 @@ describe('ClusterDrawer', () => {
 
   it("opens the tapped tile's marker by its index in the cluster", async () => {
     const w = await mountDrawer()
-    tiles()[2]!.click()
-    tiles()[0]!.click()
-    tiles()[1]!.click()
+    tap(tiles()[2]!)
+    tap(tiles()[0]!)
+    tap(tiles()[1]!)
     expect(w.emitted('open')).toEqual([[2], [0], [1]])
   })
 })
