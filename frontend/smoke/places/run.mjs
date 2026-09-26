@@ -12,19 +12,23 @@
 // Browser: a Chromium the machine already has. `PLACES_SMOKE_CHROME` wins; otherwise the newest
 // Playwright browser build under `PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`, then
 // `/usr/bin/chromium`. `playwright-core` is a devDependency that downloads nothing on install.
+//
+// Port: with `PLACES_SMOKE_PORT` unset (or empty) the server listens on port 0 and the OS picks a
+// free one, read back from the server; every origin below derives from that bound port. So two
+// smokes started at once cannot collide (a fixed 8741 made the second die with EADDRINUSE,
+// MEMNG-431). Set `PLACES_SMOKE_PORT` to pin a port; anything but a decimal 0-65535 is refused.
 
 import { existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright-core'
 
-import { createSmokeServer, SMOKE_MANIFEST } from './server.mjs'
+import { createSmokeServer, SMOKE_MANIFEST, smokePort } from './server.mjs'
 
 const VIEWPORTS = [
   { label: 'desktop', width: 1440, height: 900 },
   { label: 'phone', width: 390, height: 844 },
 ]
-const PORT = Number(process.env.PLACES_SMOKE_PORT ?? 8741)
 const SETTLE_MS = Number(process.env.PLACES_SMOKE_SETTLE_MS ?? 6000)
 const SHOTS = process.env.PLACES_SMOKE_SHOTS ?? ''
 
@@ -57,7 +61,7 @@ function check(ok, message) {
   return ok
 }
 
-async function runViewport(browser, viewport) {
+async function runViewport(browser, viewport, origin) {
   const context = await browser.newContext({
     viewport: { width: viewport.width, height: viewport.height },
     deviceScaleFactor: 1,
@@ -75,7 +79,7 @@ async function runViewport(browser, viewport) {
     if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`)
   })
 
-  await page.goto(`http://127.0.0.1:${PORT}/places`, { waitUntil: 'load' })
+  await page.goto(`${origin}/places`, { waitUntil: 'load' })
   await page.waitForTimeout(SETTLE_MS)
 
   const seen = await page.evaluate(() => {
@@ -92,8 +96,6 @@ async function runViewport(browser, viewport) {
       pins: [...document.querySelectorAll('.maplibregl-marker')].map(rect),
     }
   })
-
-  const origin = `http://127.0.0.1:${PORT}`
 
   const label = `[${viewport.label} ${viewport.width}x${viewport.height}]`
   check(!!seen.pane, `${label} no map pane rendered`)
@@ -188,10 +190,12 @@ async function runViewport(browser, viewport) {
 }
 
 const { server } = createSmokeServer()
-await new Promise((done) => server.listen(PORT, '127.0.0.1', done))
+await new Promise((done) => server.listen(smokePort(process.env), '127.0.0.1', done))
+const origin = `http://127.0.0.1:${server.address().port}`
+process.stdout.write(`places smoke serving ${origin}\n`)
 const browser = await chromium.launch({ executablePath: findChrome(), headless: true })
 try {
-  for (const viewport of VIEWPORTS) await runViewport(browser, viewport)
+  for (const viewport of VIEWPORTS) await runViewport(browser, viewport, origin)
 } finally {
   await browser.close()
   server.close()

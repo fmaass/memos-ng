@@ -120,6 +120,23 @@ function sendFile(res, path) {
   })
 }
 
+/**
+ * The port the smoke listens on. Unset (or empty) is 0: the OS picks a free port, which the
+ * caller reads back from the server, so two smokes started together cannot both want the same
+ * one — a fixed default made the second die with EADDRINUSE. An explicit `PLACES_SMOKE_PORT`
+ * wins; anything but a plain decimal 0–65535 is refused, since `Number()` would quietly turn
+ * `0x1F` or `1e3` into some other port.
+ */
+export function smokePort(env) {
+  const raw = env.PLACES_SMOKE_PORT
+  if (raw === undefined || raw === '') return 0
+  const port = /^\d{1,5}$/.test(raw) ? Number(raw) : NaN
+  if (!(port <= 65535)) {
+    throw new Error(`PLACES_SMOKE_PORT must be a decimal port 0-65535 (or unset for a free one), got ${JSON.stringify(raw)}`)
+  }
+  return port
+}
+
 export function createSmokeServer({ markers = 8, months = 4 } = {}) {
   const unstubbed = new Set()
   const server = createServer((req, res) => {

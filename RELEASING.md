@@ -81,6 +81,12 @@ rounds. The browser is found via `PLACES_SMOKE_CHROME`, else the newest Playwrig
 with a message saying so. `playwright-core` is a devDependency and downloads no browser on
 install.
 
+The smoke serves on `127.0.0.1` at a port the OS picks: with `PLACES_SMOKE_PORT` unset (or empty)
+it listens on port 0 and reads the bound port back, and every origin it checks derives from that
+port, so two smokes started at the same time (two lanes on one host) do not collide. Before, the
+default was a fixed 8741 and the second run died with `EADDRINUSE`. Set `PLACES_SMOKE_PORT` to a
+decimal port 0-65535 to pin one; any other value fails the run with an error naming the variable.
+
 ## Migrations
 
 Alembic. Applied automatically at app-container boot (`docker-entrypoint.sh` runs
