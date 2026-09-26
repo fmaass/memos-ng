@@ -9,21 +9,12 @@ private photo its location.
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Attachment, AttachmentStatus, Memo, User
+from app.services.attachments import taken_at_expr
 from app.services.memos import visible_clause
-
-
-def taken_at_expr():
-    """When the photo was taken, as an EXPRESSION — no stored date is ever rewritten to fill it.
-
-    `capture_instant` and `captured_at` are both nullable and the archive importer creates rows
-    with neither, so the chain has to end in a NOT NULL column for a marker to be placeable on a
-    timeline at all.
-    """
-    return func.coalesce(Attachment.capture_instant, Attachment.captured_at, Attachment.created_at)
 
 
 async def located_markers(

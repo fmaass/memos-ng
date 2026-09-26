@@ -49,7 +49,9 @@ async def _member(adb, subject: str) -> User:
 _uid_counter = iter(range(1, 10_000))
 
 
-async def _memo(adb, owner: User, *, visibility=Visibility.PUBLIC, archived=False) -> Memo:
+async def _memo(
+    adb, owner: User, *, visibility=Visibility.PUBLIC, archived=False, created_at=None
+) -> Memo:
     memo = Memo(
         uid=f"memo-{next(_uid_counter)}",
         owner_id=owner.id,
@@ -57,6 +59,8 @@ async def _memo(adb, owner: User, *, visibility=Visibility.PUBLIC, archived=Fals
         visibility=visibility,
         archived_at=datetime.now(UTC) if archived else None,
     )
+    if created_at is not None:
+        memo.created_at = created_at
     adb.add(memo)
     await adb.flush()
     return memo
@@ -195,29 +199,26 @@ async def test_another_members_protected_memo_is_a_marker(adb):
     assert [att.uid for att, _, _ in await map_markers.located_markers(adb, viewer)] == ["shared1"]
 
 
-async def test_taken_at_falls_back_through_the_chain_and_orders_ascending(adb):
-    # `captured_at` is nullable and the archive importer creates rows with NEITHER capture field,
-    # so the chain has to end in a NOT NULL column. No stored date is ever rewritten to make that
-    # true — the fallback is an expression, not an UPDATE.
+async def test_taken_at_falls_back_to_the_memo_date_and_orders_ascending(adb):
+    # NAMED BEHAVIOUR CHANGE (MEMNG-507): the chain is the library's —
+    # coalesce(capture_instant, memo.created_at, attachment.created_at) — and `captured_at` is no
+    # longer in it. `captured_at` is `capture_instant or client_mtime or now`, so a migrated item
+    # (no instant, captured_at = the migration day) used to date from the migration day; it now
+    # dates from its memo. A marker always has a memo (the join is inner), so the last link is
+    # never reached here. No stored date is rewritten — the fallback is an expression.
     from app.services import map_markers
 
     owner = await _member(adb, "viewer")
-    memo = await _memo(adb, owner)
     base = datetime(2026, 3, 1, tzinfo=UTC)
-    await _located(adb, memo, uid="third", capture_instant=base + timedelta(days=2))
-    await _located(adb, memo, uid="second", captured_at=base + timedelta(days=1))
-    imported = await _located(adb, memo, uid="first")  # neither capture field: created_at wins
+    memo = await _memo(adb, owner, created_at=base)
+    await _located(adb, memo, uid="exif", capture_instant=base + timedelta(days=2))
+    # migrated: captured_at is the migration day, AFTER the exif item — the old chain put it there
+    await _located(adb, memo, uid="migrated", captured_at=base + timedelta(days=100))
+    await _located(adb, memo, uid="imported")  # neither capture field: the memo's date too
 
     rows = await map_markers.located_markers(adb, owner)
-    # Inserted third/second/first, answered oldest-first — so the order is the taken date's, not
-    # the row order's. The imported row lands last because the end of its chain is its UPLOAD time.
-    assert [att.uid for att, _, _ in rows] == ["second", "third", "first"]
-    assert [taken for _, _, taken in rows[:2]] == [
-        base + timedelta(days=1),
-        base + timedelta(days=2),
-    ]
-    assert rows[2][2] == imported.created_at
-    assert all(taken is not None for _, _, taken in rows)
+    assert [att.uid for att, _, _ in rows] == ["migrated", "imported", "exif"]
+    assert [taken for _, _, taken in rows] == [base, base, base + timedelta(days=2)]
 
 
 # --------------------------------------------------------------------------------------------

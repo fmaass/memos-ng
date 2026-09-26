@@ -4,15 +4,18 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from zoneinfo import available_timezones
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
@@ -32,6 +35,13 @@ from app.models import (
 from app.services import asset_urls, poster, printready, reclaim, storage, variants
 from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path
+from app.services.attachments import (
+    BucketSize,
+    library_buckets,
+    library_filters,
+    library_tag_counts,
+    taken_at_expr,
+)
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 from app.services.memos import visible_clause
 
@@ -205,6 +215,10 @@ class AttachmentListItem(BaseModel):
     renditions: list[RenditionItem]
     orphan: bool  # not linked to a memo
     memoUid: str | None  # the memo this hangs on, null for orphans (MEMNG-171)
+    # When it was taken: the capture instant, else the memo's date, else (orphans) the upload's —
+    # never `captured_at` (app/services/attachments.py `taken_at_expr`). MEMNG-507, additive.
+    takenAt: Rfc3339Datetime
+    filename: str  # the stored original name, so a share sheet can name the file (MEMNG-507)
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -213,9 +227,12 @@ class AttachmentListItem(BaseModel):
     printUrl: str
 
 
-def _list_item(att: Attachment, user_id: int, memo_uid: str | None) -> AttachmentListItem:
-    """`memo_uid` is passed IN, never read off `att` — there is no `Attachment.memo` relationship
-    and adding one would lazy-load per row. The caller selects it in the same statement."""
+def _list_item(
+    att: Attachment, user_id: int, memo_uid: str | None, taken_at: datetime
+) -> AttachmentListItem:
+    """`memo_uid` and `taken_at` are passed IN, never read off `att` — there is no
+    `Attachment.memo` relationship and adding one would lazy-load per row. The caller selects
+    both in the same statement."""
     base = f"/api/attachments/{att.uid}"
     return AttachmentListItem(
         uid=att.uid,
@@ -230,6 +247,8 @@ def _list_item(att: Attachment, user_id: int, memo_uid: str | None) -> Attachmen
         renditions=rendition_items(att),
         orphan=att.memo_id is None,
         memoUid=memo_uid,
+        takenAt=taken_at,
+        filename=att.filename,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
@@ -251,7 +270,7 @@ def _next_cursor_header() -> dict[str, Any]:
     return {
         NEXT_CURSOR_HEADER: {
             "description": "Opaque continuation token — resend it as `?cursor=` (with the same "
-            "`type`, `limit` and `order`) to get the next page. Absent on the last page.",
+            "`type`, `tag`, `limit` and `order`) to get the next page. Absent on the last page.",
             "schema": {"type": "string"},
         }
     }
@@ -275,6 +294,37 @@ def decode_attachment_cursor(cursor: str) -> int:
         raise InvalidCursor("cursor is not an attachment id") from None
 
 
+TAKEN_CURSOR_TAG = "t"
+
+
+def encode_taken_cursor(taken_at: datetime, att_id: int) -> str:
+    """The keyset cursor of the TAKEN orders: `t|<instant>|<id>`, the instant in UTC at FULL
+    microsecond precision. It is never the rendered `takenAt`, which is truncated to the second
+    (app/api_types.py): three rows tied at 12:00:00.5 and paged two at a time would lose the third
+    if the cursor resumed from 12:00:00. The `t` prefix is what lets each decode path refuse the
+    other kind — an id cursor is digits only."""
+    utc = taken_at.astimezone(UTC).replace(tzinfo=None)
+    return encode_cursor_payload(
+        f"{TAKEN_CURSOR_TAG}|{utc.isoformat(timespec='microseconds')}Z|{att_id}"
+    )
+
+
+def decode_taken_cursor(cursor: str) -> tuple[datetime, int]:
+    """`InvalidCursor` (→ 422) for an id cursor, a naive or unparsable instant, or a missing id —
+    never a silent restart from the top."""
+    parts = decode_cursor_payload(cursor).split("|")
+    if len(parts) != 3 or parts[0] != TAKEN_CURSOR_TAG:
+        raise InvalidCursor("cursor is not a taken-order cursor")
+    try:
+        taken_at = datetime.fromisoformat(parts[1])
+        att_id = int(parts[2])
+    except ValueError:
+        raise InvalidCursor("cursor is not a taken-order cursor") from None
+    if taken_at.tzinfo is None:
+        raise InvalidCursor("cursor instant carries no zone")
+    return taken_at, att_id
+
+
 @router.get(
     "/attachments",
     response_model=list[AttachmentListItem],
@@ -287,63 +337,148 @@ async def list_attachments(
     type: str | None = None,
     limit: int = 200,
     cursor: str | None = None,
-    order: Literal["desc", "asc"] = "desc",
+    order: Literal["desc", "asc", "taken_desc", "taken_asc"] = "desc",
+    tag: str | None = None,
 ) -> list[AttachmentListItem]:
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
     filters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the
     memo it does hang on. Another user's PRIVATE or orphan media is excluded — the same visibility
     rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
+    ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
+    keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
 
     Paged by keyset, like the memo feed: when more rows follow, the response carries an
     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
     not carry — for the page after. The body is a plain array on every page, cursor or not.
     """
+    taken = taken_at_expr()
     stmt = (
-        # `Memo.uid` rides along on the row the join already produces: the memo is many-to-one
-        # from the attachment, so selecting it multiplies no rows, and it costs no statement — a
-        # relationship + per-item read would be one SELECT per tile (pinned by a statement-count
-        # test in tests/test_assets.py).
-        select(Attachment, Memo.uid)
+        # `Memo.uid` and the taken date ride along on the row the join already produces: the memo
+        # is many-to-one from the attachment, so selecting them multiplies no rows, and it costs
+        # no statement — a relationship + per-item read would be one SELECT per tile (pinned by a
+        # statement-count test in tests/test_assets.py).
+        select(Attachment, Memo.uid, taken)
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
-        # own (incl. orphans, where Memo is NULL) OR on a memo the user can see (non-PRIVATE)
-        .where((Attachment.owner_id == user.id) | visible_clause(user))
+        # own (incl. orphans, where Memo is NULL) OR on a memo the user can see (non-PRIVATE),
+        # then the kind and tag filters — app/services/attachments.py, shared with /buckets
+        .where(*library_filters(user, type, tag))
     )
-    if type == "image":
-        stmt = stmt.where(Attachment.mime.like("image/%"))
-    elif type == "video":
-        stmt = stmt.where(Attachment.mime.like("video/%"))
-    if cursor is not None:
-        # STRICT comparison, exactly as the memo feed's cursor compares: `<=`/`>=` would serve the
-        # boundary row a second time. The filters above are re-applied per page, so a page is never
-        # cut before the filter runs. The direction follows `order`, and the cursor itself stays
-        # what it always was — an opaque id, carrying NO direction, so an already-issued cursor
-        # keeps working. Replaying one under the other order does not fail: it simply continues
-        # from that id the other way. Keeping order consistent across a walk is the client's job,
-        # exactly as it already is for `type` and `limit`, which the cursor does not carry either.
-        cursor_id = decode_attachment_cursor(cursor)
-        stmt = stmt.where(
-            Attachment.id > cursor_id if order == "asc" else Attachment.id < cursor_id
+    if order in ("taken_desc", "taken_asc"):
+        # A composite keyset: taken_at alone is not unique (a burst, a memo date shared by every
+        # migrated item), so `id` breaks the tie in the same direction and the pair is total.
+        # The chain ends in NOT NULL `created_at`, so no row escapes the comparison as NULL.
+        ascending = order == "taken_asc"
+        if cursor is not None:
+            c_taken, c_id = decode_taken_cursor(cursor)
+            if ascending:
+                after = or_(taken > c_taken, and_(taken == c_taken, Attachment.id > c_id))
+            else:
+                after = or_(taken < c_taken, and_(taken == c_taken, Attachment.id < c_id))
+            stmt = stmt.where(after)
+        by = (
+            (taken.asc(), Attachment.id.asc())
+            if ascending
+            else (taken.desc(), Attachment.id.desc())
         )
-    # Ordering is `id` alone in either direction, and that order is already TOTAL: id is the
-    # primary key, so no two rows can tie and a keyset walk can neither skip nor repeat — a
-    # created_at tie (bulk import, same-second upload batch) is broken by construction. It is also
-    # the one order this table is indexed for (attachments carries no created_at index), and it is
-    # the order the library already displayed; (created_at DESC, id DESC) would have reshuffled it.
-    # Probed against production 2026-08-26 and re-probed 2026-08-27: no row disagreed between id
-    # order and created_at order, so "oldest/newest first" means the same thing either way and
-    # `order=asc` needs no created_at ordering, composite cursor, index or migration — it is this
-    # same keyset read backwards. The table held 1795 attachments on 2026-09-22 (MEMNG-501); the
-    # order probe was not re-run at that count.
-    by_id = Attachment.id.asc() if order == "asc" else Attachment.id.desc()
+    else:
+        if cursor is not None:
+            # STRICT comparison, exactly as the memo feed's cursor compares: `<=`/`>=` would serve
+            # the boundary row a second time. The filters above are re-applied per page, so a page
+            # is never cut before the filter runs. The direction follows `order`, and the cursor
+            # itself stays what it always was — an opaque id, carrying NO direction, so an
+            # already-issued cursor keeps working. Replaying one under the other order does not
+            # fail: it simply continues from that id the other way. Keeping order consistent
+            # across a walk is the client's job, exactly as it already is for `type` and `limit`,
+            # which the cursor does not carry either. A taken cursor is refused here (422).
+            cursor_id = decode_attachment_cursor(cursor)
+            stmt = stmt.where(
+                Attachment.id > cursor_id if order == "asc" else Attachment.id < cursor_id
+            )
+        # Ordering is `id` alone in either direction, and that order is already TOTAL: id is the
+        # primary key, so no two rows can tie and a keyset walk can neither skip nor repeat — a
+        # created_at tie (bulk import, same-second upload batch) is broken by construction. It is
+        # also the one order this table is indexed for (attachments carries no created_at index),
+        # and it is the order the library already displayed; (created_at DESC, id DESC) would
+        # have reshuffled it. Probed against production 2026-08-26 and re-probed 2026-08-27: no
+        # row disagreed between id order and created_at order, so "oldest/newest first" means the
+        # same thing either way and `order=asc` needs no created_at ordering, composite cursor,
+        # index or migration — it is this same keyset read backwards. The table held 1795
+        # attachments on 2026-09-22 (MEMNG-501); the order probe was not re-run at that count.
+        by = (Attachment.id.asc() if order == "asc" else Attachment.id.desc(),)
     page = max(1, min(limit, 500))
     # limit + 1: one extra row is how the page learns another page exists, without a second query
     # (list_memos does the same). It is dropped before serializing, so the body is unchanged.
-    rows = list((await db.execute(stmt.order_by(by_id).limit(page + 1))).all())
+    rows = list((await db.execute(stmt.order_by(*by).limit(page + 1))).all())
     if len(rows) > page:
-        response.headers[NEXT_CURSOR_HEADER] = encode_attachment_cursor(rows[page - 1][0])
+        last, _, last_taken = rows[page - 1]
+        response.headers[NEXT_CURSOR_HEADER] = (
+            encode_taken_cursor(last_taken, last.id)
+            if order in ("taken_desc", "taken_asc")
+            else encode_attachment_cursor(last)
+        )
         rows = rows[:page]
-    return [_list_item(att, user.id, memo_uid) for att, memo_uid in rows]
+    return [_list_item(att, user.id, memo_uid, when) for att, memo_uid, when in rows]
+
+
+class AttachmentBucket(BaseModel):
+    key: str  # the bucket's local start: "2026-09-04" (day), "2026-09" (month), "2026" (year)
+    count: int
+    coverUid: str  # the bucket's newest item by (takenAt, upload order)
+    coverThumbnailUrl: str  # that item's signed thumbnail, minted for the requesting viewer
+
+
+class AttachmentTagCount(BaseModel):
+    name: str
+    count: int  # media items, not memos: a memo with three pictures counts three
+
+
+@cache
+def _known_zones() -> frozenset[str]:
+    return frozenset(available_timezones())
+
+
+# Both literal routes are registered BEFORE `/attachments/{uid}` below: FastAPI matches in
+# registration order, and `{uid}` would otherwise answer `buckets` and `tags` as attachment uids.
+@router.get("/attachments/buckets", response_model=list[AttachmentBucket])
+async def attachment_buckets(
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+    size: BucketSize,
+    type: str | None = None,
+    tz: str = "Europe/Zurich",
+    tag: str | None = None,
+) -> list[AttachmentBucket]:
+    """The library the list shows — same visibility, same `type` and `tag` filters — counted per
+    calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
+    first. Each bucket names its newest item as the cover, with that item's signed thumbnail."""
+    if tz not in _known_zones():
+        raise HTTPException(status_code=422, detail="tz is not a known IANA time zone")
+    now = time.time()
+    return [
+        AttachmentBucket(
+            key=key,
+            count=count,
+            coverUid=uid,
+            coverThumbnailUrl=asset_urls.signed_tier_urls(uid, user.id, now=now)["thumbnailUrl"],
+        )
+        for key, count, uid in await library_buckets(db, user, size, tz, type, tag)
+    ]
+
+
+@router.get("/attachments/tags", response_model=list[AttachmentTagCount])
+async def attachment_tags(
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+    type: str | None = None,
+) -> list[AttachmentTagCount]:
+    """Every tag on a memo carrying media the user can see, with the number of such media under
+    the same `type` filter the list applies — so a tag's count is the length of the list under
+    `?tag=` and that `type`. Most items first, then by name; a tag with no media is absent."""
+    return [
+        AttachmentTagCount(name=name, count=count)
+        for name, count in await library_tag_counts(db, user, type)
+    ]
 
 
 # PAT-or-session like the original-tier download below (not a docstring: FastAPI would publish it

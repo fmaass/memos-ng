@@ -1,6 +1,34 @@
 {
   "components": {
     "schemas": {
+      "AttachmentBucket": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "coverThumbnailUrl": {
+            "title": "Coverthumbnailurl",
+            "type": "string"
+          },
+          "coverUid": {
+            "title": "Coveruid",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "count",
+          "coverUid",
+          "coverThumbnailUrl"
+        ],
+        "title": "AttachmentBucket",
+        "type": "object"
+      },
       "AttachmentListItem": {
         "properties": {
           "blurhash": {
@@ -12,6 +40,10 @@
           },
           "downloadUrl": {
             "title": "Downloadurl",
+            "type": "string"
+          },
+          "filename": {
+            "title": "Filename",
             "type": "string"
           },
           "hasLegacyPrint": {
@@ -70,6 +102,11 @@
           "status": {
             "$ref": "#/components/schemas/AttachmentStatus"
           },
+          "takenAt": {
+            "format": "date-time",
+            "title": "Takenat",
+            "type": "string"
+          },
           "thumbnailUrl": {
             "title": "Thumbnailurl",
             "type": "string"
@@ -103,6 +140,8 @@
           "renditions",
           "orphan",
           "memoUid",
+          "takenAt",
+          "filename",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
@@ -528,6 +567,24 @@
         ],
         "title": "AttachmentStatus",
         "type": "string"
+      },
+      "AttachmentTagCount": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "count"
+        ],
+        "title": "AttachmentTagCount",
+        "type": "object"
       },
       "Body_upload_print_api_attachments__uid__print_post": {
         "properties": {
@@ -3538,7 +3595,7 @@
     },
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -3583,10 +3640,24 @@
               "default": "desc",
               "enum": [
                 "desc",
-                "asc"
+                "asc",
+                "taken_desc",
+                "taken_asc"
               ],
               "title": "Order",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "title": "Tag",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -3606,7 +3677,7 @@
             "description": "Successful Response",
             "headers": {
               "X-Next-Cursor": {
-                "description": "Opaque continuation token \u2014 resend it as `?cursor=` (with the same `type`, `limit` and `order`) to get the next page. Absent on the last page.",
+                "description": "Opaque continuation token \u2014 resend it as `?cursor=` (with the same `type`, `tag`, `limit` and `order`) to get the next page. Absent on the last page.",
                 "schema": {
                   "type": "string"
                 }
@@ -3633,6 +3704,158 @@
           }
         ],
         "summary": "List Attachments",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/api/attachments/buckets": {
+      "get": {
+        "description": "The library the list shows \u2014 same visibility, same `type` and `tag` filters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail.",
+        "operationId": "attachment_buckets_api_attachments_buckets_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "size",
+            "required": true,
+            "schema": {
+              "enum": [
+                "day",
+                "month",
+                "year"
+              ],
+              "title": "Size",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "title": "Type",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "Europe/Zurich",
+              "title": "Tz",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "title": "Tag",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AttachmentBucket"
+                  },
+                  "title": "Response Attachment Buckets Api Attachments Buckets Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Attachment Buckets",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/api/attachments/tags": {
+      "get": {
+        "description": "Every tag on a memo carrying media the user can see, with the number of such media under\nthe same `type` filter the list applies \u2014 so a tag's count is the length of the list under\n`?tag=` and that `type`. Most items first, then by name; a tag with no media is absent.",
+        "operationId": "attachment_tags_api_attachments_tags_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "title": "Type",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AttachmentTagCount"
+                  },
+                  "title": "Response Attachment Tags Api Attachments Tags Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Attachment Tags",
         "tags": [
           "assets"
         ]
