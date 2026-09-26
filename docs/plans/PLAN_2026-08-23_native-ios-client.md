@@ -854,7 +854,9 @@ Phase 5's text above is edited accordingly.
   extends the AASA service to applinks matching /m/* (today it serves webcredentials and an
   applinks match for /ios/auth/callback only — native_auth.py:176), deployed BEFORE the app
   change; the app entitlement gains applinks:memos.discomarder.live; in-app routing opens the
-  memo. Do NOT: APNs push (separate backend enabler ticket — the server already stores
+  memo. (Superseded 2026-09-26: ADR-0016 rejected universal links, so the custom URL scheme is
+  the permanent deep-link lane and the AASA claims only /ios/auth/callback*, not /m/*; the SPA
+  route /m/{uid} stays as the canonical web URL.) Do NOT: APNs push (separate backend enabler ticket — the server already stores
   web-push subscriptions, APNs is a new transport + key infra), multi-account/server (doctrine:
   out of scope), watch/iPad idioms (post-TestFlight). Verification: intent-driven capture lands in the outbox with a test INCLUDING a cold/offline
   invocation; widget snapshot pure-function tests + purge-on-sign-out test; privacy purging goes through ONE shared purge

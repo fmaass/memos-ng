@@ -212,16 +212,12 @@ def aasa_document(team_id: str, bundle_id: str, keys: list[str]) -> dict:
             "details": [
                 {
                     "appIDs": [app_id],
-                    # Two URL families belong to the app: the login handoff callback, and the memo
-                    # permalink — the canonical web URL for a memo, which the app opens directly
-                    # rather than bouncing the reader through the browser. Both are the same app,
-                    # so they are components of ONE details entry: Apple matches the components of
-                    # an entry in order, and a second entry with identical appIDs would only
-                    # restate the claim. A device without the app installed follows the same URL
-                    # to the SPA route, which is why the permalink stays a plain HTTPS link.
+                    # Only the login handoff callback is claimed. Memo permalinks stay plain HTTPS
+                    # links answered by the SPA: the app's custom scheme is its permanent deep-link
+                    # lane, and claiming /m/* would have Apple's CDN promise a universal link the
+                    # app does not handle.
                     "components": [
                         {"/": "/ios/auth/callback*"},
-                        {"/": "/m/*"},
                     ],
                 }
             ]
