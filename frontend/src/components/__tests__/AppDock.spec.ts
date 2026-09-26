@@ -1,7 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { defineComponent, h, markRaw, nextTick } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import AppDock from '@/components/AppDock.vue'
 import { createDockSegment, DOCK_SEGMENT_KEY } from '@/composables/useDockSegment'
@@ -127,9 +127,23 @@ describe('AppDock', () => {
     expect(pill(wrapper)).toBe(false)
   })
 
-  it('stops listening to the window once it is gone', async () => {
-    const { wrapper } = await mountDock('/resources')
-    wrapper.unmount()
-    expect(() => window.dispatchEvent(new Event('scroll'))).not.toThrow()
+  it('removes the very scroll listener it added, once it is gone', async () => {
+    const add = vi.spyOn(window, 'addEventListener')
+    const remove = vi.spyOn(window, 'removeEventListener')
+    try {
+      const { wrapper } = await mountDock('/resources')
+      const added = add.mock.calls.filter(([type]) => type === 'scroll')
+      expect(added).toHaveLength(1)
+      const [, handler, options] = added[0]!
+      expect(options).toEqual({ passive: true })
+
+      wrapper.unmount()
+
+      const removed = remove.mock.calls.filter(([type]) => type === 'scroll')
+      expect(removed.map(([, h]) => h)).toContain(handler)
+    } finally {
+      add.mockRestore()
+      remove.mockRestore()
+    }
   })
 })
