@@ -3,19 +3,23 @@ import { useQueryClient } from '@tanstack/vue-query'
 import Button from 'primevue/button'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
-import { computed, nextTick, onUnmounted, ref, watch, watchEffect } from 'vue'
+import { computed, defineComponent, h, nextTick, onUnmounted, ref, watch, watchEffect } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import DayMosaic from '@/components/DayMosaic.vue'
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import LibraryHeader from '@/components/LibraryHeader.vue'
 import LibrarySegment from '@/components/LibrarySegment.vue'
+import LibrarySelectionToolbar from '@/components/LibrarySelectionToolbar.vue'
 import YearCards from '@/components/YearCards.vue'
 import { useAttachmentBuckets, useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
 import { useApi } from '@/composables/useApi'
-import { useDockSegment } from '@/composables/useDockSegment'
+import { useBulkDelete } from '@/composables/useBulkDelete'
+import { useDockOverride, useDockSegment } from '@/composables/useDockSegment'
+import { useLibrarySelection } from '@/composables/useLibrarySelection'
 import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
 import { fetchPrintMasters, usePrintMaster } from '@/composables/usePrintMaster'
+import { useShareSelection } from '@/composables/useShareSelection'
 import { appendPage, shouldLoadMore } from '@/lib/attachmentPaging'
 import { scrollToDay } from '@/lib/dayJump'
 import { shouldRemint } from '@/lib/imageRetry'
@@ -112,6 +116,93 @@ const {
   fetchNextPage,
   refetch,
 } = useAttachmentLibrary(filter)
+
+// Select mode (MEMNG-510), in the All view only: the selectable uids are the LOADED items of mine
+// (useLibrarySelection), and anything that changes what All shows — leaving All, another kind or tag
+// (another query), leaving the Library — ends select mode, clears it and dismisses a delete confirm
+// it had open. `selectSession` fences that confirm: an accept from a session that has ended deletes
+// nothing, and the batch it deletes is the one captured when it opened.
+const selection = useLibrarySelection(items)
+const { selecting, selected, allSelected } = selection
+const bulkDelete = useBulkDelete()
+const sharer = useShareSelection()
+let selectSession = 0
+let confirmOpen = false
+
+function enterSelect() {
+  if (view.value !== 'all' || selecting.value) return
+  selectSession++
+  selection.enter()
+}
+function leaveSelect() {
+  selectSession++
+  if (confirmOpen) {
+    confirmOpen = false
+    confirm.close()
+  }
+  selection.exit()
+}
+watch(view, (v) => {
+  if (v !== 'all') leaveSelect()
+})
+watch(filter, leaveSelect)
+onUnmounted(leaveSelect)
+
+// Escape leaves select mode — but not while the confirm is up, where Escape is the dialog's.
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && selecting.value && !confirmOpen) leaveSelect()
+}
+watch(selecting, (on) =>
+  on ? window.addEventListener('keydown', onKeydown) : window.removeEventListener('keydown', onKeydown),
+)
+onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+
+function deleteSelected() {
+  const batch = selection.capture()
+  if (batch.length === 0 || confirmOpen || bulkDelete.pending.value) return
+  const session = selectSession
+  confirmOpen = true
+  const n = batch.length
+  confirm.require({
+    header: `Delete ${n} ${n === 1 ? 'item' : 'items'}?`,
+    message: 'They are deleted permanently. This cannot be undone.',
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
+    acceptProps: { label: 'Delete', severity: 'danger' },
+    accept: async () => {
+      confirmOpen = false
+      if (session !== selectSession) return
+      await bulkDelete.run(batch)
+      if (session === selectSession) leaveSelect()
+    },
+    reject: () => {
+      confirmOpen = false
+    },
+    onHide: () => {
+      confirmOpen = false
+    },
+  })
+}
+
+function shareSelected() {
+  const batch = new Set(selection.capture())
+  void sharer.share(items.value.filter((i) => batch.has(i.uid)))
+}
+
+// While selecting, the shell's dock shows this toolbar and nothing else.
+const SelectionDock = defineComponent({
+  name: 'LibrarySelectionDock',
+  setup: () => () =>
+    h(LibrarySelectionToolbar, {
+      count: selection.count.value,
+      canShare: sharer.supported,
+      sharing: sharer.pending.value,
+      deleting: bulkDelete.pending.value,
+      onShare: shareSelected,
+      onDelete: deleteSelected,
+    }),
+})
+useDockOverride(SelectionDock, () => selecting.value)
 
 // One gallery per Zurich calendar month, in the list's own (takenAt) order. Each gallery reports a
 // tile index within its month; `start` maps it back onto the whole loaded list the viewer walks.
@@ -333,7 +424,15 @@ function onDelete(uid: string) {
     :style="{ '--month-header-height': `${monthHeaderHeight}px` }"
     data-test="view-resources"
   >
-    <LibraryHeader v-model:filter="filter" />
+    <LibraryHeader
+      v-model:filter="filter"
+      :selecting="selecting"
+      :can-select="view === 'all'"
+      :all-selected="allSelected"
+      @select="enterSelect"
+      @select-all="selection.selectAllLoaded"
+      @select-close="leaveSelect"
+    />
     <div
       v-if="jumping"
       class="pointer-events-none fixed inset-x-0 top-1/2 z-20 flex justify-center"
@@ -403,6 +502,9 @@ function onDelete(uid: string) {
           :items="section.items"
           :target-height="200"
           :tile-scroll-margin="TILE_SCROLL_MARGIN"
+          :selecting="selecting"
+          :selected="selected"
+          @select="selection.toggle"
           @open="openAt(section.start + $event)"
           @retry="onTileRetry"
           @print-retry="printMaster.retry($event)"

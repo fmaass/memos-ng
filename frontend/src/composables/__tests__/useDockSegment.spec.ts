@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import {
   createDockSegment,
   DOCK_SEGMENT_KEY,
+  useDockOverride,
   useDockSegment,
 } from '@/composables/useDockSegment'
 
@@ -48,5 +49,51 @@ describe('useDockSegment', () => {
     const View = viewRegistering(PillA)
     const wrapper = mount(View)
     expect(() => wrapper.unmount()).not.toThrow()
+  })
+
+  describe('override', () => {
+    function viewOverriding(bar: typeof PillA, active: () => boolean) {
+      return defineComponent({
+        setup() {
+          useDockOverride(bar, active)
+          return () => h('div')
+        },
+      })
+    }
+
+    it('shows the override while the view says so, withdraws it when it stops and on unmount', async () => {
+      const registration = createDockSegment()
+      const active = ref(false)
+      const shown = ref(true)
+      const View = viewOverriding(PillA, () => active.value)
+      const Host = defineComponent({ render: () => (shown.value ? h(View) : null) })
+      mount(Host, { global: { provide: { [DOCK_SEGMENT_KEY as symbol]: registration } } })
+
+      expect(registration.override.value).toBeNull()
+      active.value = true
+      await nextTick()
+      expect(registration.override.value).toBe(PillA)
+      active.value = false
+      await nextTick()
+      expect(registration.override.value).toBeNull()
+      active.value = true
+      await nextTick()
+      shown.value = false
+      await nextTick()
+      expect(registration.override.value).toBeNull()
+    })
+
+    it('never lets a stale owner clear a newer override', () => {
+      const registration = createDockSegment()
+      registration.setOverride(PillA)
+      registration.setOverride(PillB)
+      registration.clearOverride(PillA)
+      expect(registration.override.value).toBe(PillB)
+    })
+
+    it('is a no-op outside a shell', () => {
+      const wrapper = mount(viewOverriding(PillA, () => true))
+      expect(() => wrapper.unmount()).not.toThrow()
+    })
   })
 })

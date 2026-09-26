@@ -11,6 +11,8 @@ import { printChipState } from '@/lib/printMaster'
 
 // What a gallery tile needs, taken from the generated list item so both callers — the Resources
 // list (AttachmentListItem) and the Places cluster drawer (MapMarker) — satisfy it field for field.
+// `mine` and `filename` are optional because only the Library selects: an item that does not say it
+// is mine is never selectable.
 type GalleryAttachment = Pick<
   components['schemas']['AttachmentListItem'],
   | 'uid'
@@ -23,7 +25,11 @@ type GalleryAttachment = Pick<
   | 'previewUrl'
   | 'posterUrl'
   | 'webUrl'
-> & { renditions?: components['schemas']['RenditionItem'][] }
+> & {
+  renditions?: components['schemas']['RenditionItem'][]
+  mine?: boolean
+  filename?: string
+}
 
 const props = withDefaults(
   defineProps<{
@@ -32,11 +38,15 @@ const props = withDefaults(
     gap?: number
     /** A tile's scroll-margin-top, so a caller that scrolls a tile to the top can clear what sticks there. */
     tileScrollMargin?: string
+    /** Select mode: a tap selects instead of opening. */
+    selecting?: boolean
+    selected?: ReadonlySet<string>
   }>(),
-  { targetHeight: 200, gap: 4 },
+  { targetHeight: 200, gap: 4, selecting: false, selected: () => new Set<string>() },
 )
 const emit = defineEmits<{
   open: [index: number]
+  select: [uid: string]
   retry: [uid: string]
   'print-retry': [uid: string]
 }>()
@@ -47,6 +57,17 @@ const emit = defineEmits<{
 const printUploads = printMasterUploads()
 function printChipFor(att: GalleryAttachment) {
   return printChipState(att, printUploads.get(att.uid))
+}
+
+// THE gate between the two meanings of a tap: while selecting nothing opens, whichever of the tile's
+// buttons the tap reached (the tile's content is inert then, and this holds where inert is not).
+function onOpen(index: number) {
+  if (props.selecting) return
+  emit('open', index)
+}
+function selectionFor(att: GalleryAttachment) {
+  if (!props.selecting) return null
+  return { selected: props.selected.has(att.uid), selectable: att.mine === true, label: att.filename || att.uid }
 }
 
 const root = ref<HTMLElement | null>(null)
@@ -85,7 +106,9 @@ const rows = computed(() => {
         :sizes="justifiedTileSizes(li.width)"
         :print-chip="printChipFor(li.item)"
         :style="{ width: li.width + 'px', height: li.height + 'px', scrollMarginTop: tileScrollMargin }"
-        @open="emit('open', li.index)"
+        :selection="selectionFor(li.item)"
+        @open="onOpen(li.index)"
+        @select="emit('select', $event)"
         @retry="emit('retry', $event)"
         @print-retry="emit('print-retry', $event)"
       />

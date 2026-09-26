@@ -23,12 +23,15 @@ function json(body: unknown, status = 200): Response {
   })
 }
 
-function mountHeader(query: string) {
+function mountHeader(
+  query: string,
+  selection: { selecting?: boolean; canSelect?: boolean; allSelected?: boolean } = {},
+) {
   const filter = fromSearchParams(new URLSearchParams(query))
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return mount(LibraryHeader, {
     attachTo: document.body,
-    props: { filter },
+    props: { filter, ...selection },
     global: { plugins: [[VueQueryPlugin, { queryClient }], PrimeVue] },
   })
 }
@@ -48,7 +51,7 @@ describe('LibraryHeader', () => {
     document.body.innerHTML = ''
   })
 
-  it('shows the title, the round glass options button and the inert glass Select capsule', () => {
+  it('shows the title, the round glass options button and the live glass Select capsule', () => {
     transport.mockResolvedValue(json([]))
     const wrapper = mountHeader('')
     expect(wrapper.find('h1').text()).toBe('Library')
@@ -57,9 +60,55 @@ describe('LibraryHeader', () => {
     const select = wrapper.find('[data-test="library-select"]')
     expect(select.text()).toBe('Select')
     expect(select.classes()).toContain('glass')
-    expect(select.attributes('aria-disabled')).toBe('true')
+    expect(select.attributes('aria-disabled')).toBeUndefined()
+    expect(select.attributes('disabled')).toBeUndefined()
     // The tags are asked for when the menu opens, not on every visit.
     expect(transport).not.toHaveBeenCalled()
+  })
+
+  describe('select mode', () => {
+    it('the Select capsule asks to enter select mode', async () => {
+      const wrapper = mountHeader('')
+      await wrapper.find('[data-test="library-select"]').trigger('click')
+      expect(wrapper.emitted('select')).toHaveLength(1)
+    })
+
+    it('the Select capsule is disabled outside the All view', async () => {
+      const wrapper = mountHeader('', { canSelect: false })
+      const select = wrapper.find('[data-test="library-select"]')
+      expect(select.attributes('disabled')).toBeDefined()
+      await select.trigger('click')
+      expect(wrapper.emitted('select')).toBeUndefined()
+    })
+
+    it('while selecting shows the select-all toggle and the close button INSTEAD of options and Select', () => {
+      const wrapper = mountHeader('', { selecting: true })
+      expect(wrapper.find('[data-test="library-options"]').exists()).toBe(false)
+      expect(wrapper.find('[data-test="library-select"]').exists()).toBe(false)
+      for (const test of ['library-select-all', 'library-select-close']) {
+        const button = wrapper.find(`[data-test="${test}"]`)
+        expect(button.element.tagName).toBe('BUTTON')
+        expect(button.attributes('type')).toBe('button')
+        expect(button.classes()).toEqual(expect.arrayContaining(['glass', 'rounded-full']))
+        expect(button.attributes('aria-label')).toBeTruthy()
+      }
+    })
+
+    it.each([
+      [false, 'false'],
+      [true, 'true'],
+    ])('the select-all toggle is aria-pressed=%s when allSelected is %s', (allSelected, pressed) => {
+      const wrapper = mountHeader('', { selecting: true, allSelected })
+      expect(wrapper.find('[data-test="library-select-all"]').attributes('aria-pressed')).toBe(pressed)
+    })
+
+    it('the toggle and the close button emit their own events', async () => {
+      const wrapper = mountHeader('', { selecting: true })
+      await wrapper.find('[data-test="library-select-all"]').trigger('click')
+      await wrapper.find('[data-test="library-select-close"]').trigger('click')
+      expect(wrapper.emitted('select-all')).toHaveLength(1)
+      expect(wrapper.emitted('select-close')).toHaveLength(1)
+    })
   })
 
   it('says the current view, order and tag under the title', () => {
