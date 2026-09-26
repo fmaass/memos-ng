@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 import LibraryOptionsMenu from '@/components/LibraryOptionsMenu.vue'
 import type { LibraryFilter } from '@/lib/libraryFilter'
@@ -36,6 +36,19 @@ const subtitle = computed(() =>
 )
 
 const menu = ref<InstanceType<typeof LibraryOptionsMenu> | null>(null)
+
+// Entering or leaving select mode swaps out the very button that was activated, which would drop
+// keyboard focus onto <body>. So focus follows the swap: to the select-all toggle on entry, back to
+// the Select capsule on any exit (close, Escape, a view or filter change) — once the new buttons exist.
+const selectAllButton = ref<HTMLButtonElement | null>(null)
+const selectButton = ref<HTMLButtonElement | null>(null)
+watch(
+  () => props.selecting,
+  async (on) => {
+    await nextTick()
+    ;(on ? selectAllButton : selectButton).value?.focus()
+  },
+)
 </script>
 
 <template>
@@ -46,6 +59,7 @@ const menu = ref<InstanceType<typeof LibraryOptionsMenu> | null>(null)
     </div>
     <template v-if="selecting">
       <button
+        ref="selectAllButton"
         type="button"
         class="glass flex h-10 w-10 items-center justify-center rounded-full"
         :class="{ 'text-primary': allSelected }"
@@ -79,6 +93,7 @@ const menu = ref<InstanceType<typeof LibraryOptionsMenu> | null>(null)
         <i class="pi pi-ellipsis-h" aria-hidden="true" />
       </button>
       <button
+        ref="selectButton"
         type="button"
         class="glass h-10 rounded-full px-4 text-sm font-medium disabled:opacity-50"
         :disabled="!canSelect"

@@ -63,7 +63,19 @@ describe('useShareSelection', () => {
 
   it('a non-OK response aborts before any file is built', async () => {
     fetchMock.mockResolvedValueOnce(bytes('image/jpeg')).mockResolvedValueOnce(bytes('text/plain', 404))
+    let built = 0
+    const RealFile = File
+    vi.stubGlobal(
+      'File',
+      class extends RealFile {
+        constructor(...args: ConstructorParameters<typeof RealFile>) {
+          super(...args)
+          built++
+        }
+      },
+    )
     expect(await buildShareFiles([item('a', 'a.jpg'), item('b', 'b.jpg')])).toBeNull()
+    expect(built).toBe(0)
   })
 
   it('a transport failure aborts too', async () => {

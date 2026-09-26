@@ -1,5 +1,6 @@
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
+import { nextTick } from 'vue'
 import PrimeVue from 'primevue/config'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -100,6 +101,31 @@ describe('LibraryHeader', () => {
     ])('the select-all toggle is aria-pressed=%s when allSelected is %s', (allSelected, pressed) => {
       const wrapper = mountHeader('', { selecting: true, allSelected })
       expect(wrapper.find('[data-test="library-select-all"]').attributes('aria-pressed')).toBe(pressed)
+    })
+
+    it('moves focus to the select-all toggle on entry and back to the Select capsule on leaving', async () => {
+      const wrapper = mountHeader('')
+      const select = wrapper.find<HTMLButtonElement>('[data-test="library-select"]')
+      select.element.focus()
+      await select.trigger('click')
+      // The parent answers the emit by entering select mode, which swaps the focused capsule out.
+      await wrapper.setProps({ selecting: true })
+      await nextTick()
+      expect(document.activeElement?.getAttribute('data-test')).toBe('library-select-all')
+
+      wrapper.find<HTMLButtonElement>('[data-test="library-select-close"]').element.focus()
+      await wrapper.find('[data-test="library-select-close"]').trigger('click')
+      await wrapper.setProps({ selecting: false })
+      await nextTick()
+      expect(document.activeElement?.getAttribute('data-test')).toBe('library-select')
+    })
+
+    it('an exit the header did not start (Escape, a view or filter change) also returns focus to Select', async () => {
+      const wrapper = mountHeader('', { selecting: true })
+      wrapper.find<HTMLButtonElement>('[data-test="library-select-all"]').element.focus()
+      await wrapper.setProps({ selecting: false })
+      await nextTick()
+      expect(document.activeElement?.getAttribute('data-test')).toBe('library-select')
     })
 
     it('the toggle and the close button emit their own events', async () => {
