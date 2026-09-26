@@ -23,3 +23,31 @@
     background-color: var(--p-surface-950);
   }
 }
+
+/* The app dock's height and what a scrolling view keeps clear beneath its last row: the dock, its
+   12px lift off the bottom edge, the home-indicator inset and 12px of air. One definition, read by
+   the dock itself and by every scroll host that must not hide content under it. */
+:root {
+  --dock-height: 3.5rem;
+  --dock-clearance: calc(var(--dock-height) + 24px + env(safe-area-inset-bottom));
+}
+
+/* Liquid glass (plan decision 10): translucent blurred surface, hairline border, top highlight.
+   Used by the dock, the Library header's buttons and menu, and the Timeline header's buttons. */
+@utility glass {
+  background-color: color-mix(in srgb, var(--p-surface-0) 65%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid color-mix(in srgb, var(--p-surface-400) 35%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.55),
+    0 6px 20px rgb(0 0 0 / 0.12);
+
+  &:where(.app-dark, .app-dark *) {
+    background-color: color-mix(in srgb, var(--p-surface-900) 60%, transparent);
+    border-color: color-mix(in srgb, var(--p-surface-500) 35%, transparent);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.12),
+      0 6px 20px rgb(0 0 0 / 0.4);
+  }
+}
