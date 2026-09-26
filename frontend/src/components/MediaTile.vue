@@ -57,7 +57,7 @@ const emit = defineEmits<{
 // passed either before, so every transcoding video read 0% from start to finish.
 const percent = computed(() => props.progress ?? props.att.progress_pct ?? 0)
 const kind = computed(() => tileKind(props.att.status, props.att.mime))
-const blur = computed(() => blurhashToDataUrl(props.att.blurhash))
+const blur = computed(() => blurhashToDataUrl(props.att.blurhash, props.att.uid))
 // Videos take their probed ratio exactly like images (#37): the probe applies the container's
 // rotation tag since v1.3.2 (displayed_size), so a portrait clip's stored dims now describe the
 // same orientation the poster and web tier are written in. No dims (probe pending or failed) still
