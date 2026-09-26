@@ -1486,6 +1486,10 @@
       },
       "HealthResponse": {
         "properties": {
+          "apiMajor": {
+            "title": "Apimajor",
+            "type": "integer"
+          },
           "db": {
             "title": "Db",
             "type": [
@@ -1504,7 +1508,8 @@
         },
         "required": [
           "status",
-          "version"
+          "version",
+          "apiMajor"
         ],
         "title": "HealthResponse",
         "type": "object"

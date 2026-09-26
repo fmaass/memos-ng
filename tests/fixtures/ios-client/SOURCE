@@ -1,0 +1,12 @@
+# The OpenAPI document the iOS client (memos-ng-ios) builds its generated client from, copied
+# byte for byte from Packages/MemosAPI/Sources/MemosAPI/openapi.json in that repo.
+# tests/test_ios_client_contract.py holds the served schema to it: everything the client was
+# generated against must still be served. Refresh it only when the iOS client re-vendors — copy the
+# file again and update both commits below — never from this repo's own openapi.json.
+ios_repo=memos-ng-ios
+ios_commit=03c24e1571283c7202b2302d0ecf9c1d5b5cd9c0
+sha256=ddc6d87fafcbe04f1a51911b29cb6af5265dc4d146486f41d09092399991ec51
+# The memos-ng commit the iOS client vendored the document from (the commit= line of that repo's
+# Packages/MemosAPI/OPENAPI_SOURCE).
+memos_ng_commit=c1a79bd09bbaaba3adcdb18652059fa80f3cb0ed
+# No release tag names the iOS commit yet: its builds are untagged, so there is no tag= line.
