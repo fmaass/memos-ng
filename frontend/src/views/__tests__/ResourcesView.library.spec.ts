@@ -358,9 +358,23 @@ describe('ResourcesView library query', () => {
         }
         return ok([at('p3a', '2026-08-30T10:00:00Z')])
       })
-      const scrolled: { uid: string | undefined; requests: number }[] = []
-      vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(function (this: Element) {
-        scrolled.push({ uid: (this as HTMLElement).dataset.uid, requests: listRequests.length })
+      // happy-dom has no layout: the sticky month header measures 44 px here, as a phone's does.
+      const realRect = Element.prototype.getBoundingClientRect
+      vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+        if (this.matches('[data-test="month-header"]')) return new DOMRect(0, 0, 390, 44)
+        return realRect.call(this)
+      })
+      const scrolled: { uid: string | undefined; requests: number; options: unknown; margin: string; header: string }[] = []
+      vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(function (this: Element, options?: unknown) {
+        const tile = this as HTMLElement
+        const view = tile.closest<HTMLElement>('[data-test="view-resources"]')
+        scrolled.push({
+          uid: tile.dataset.uid,
+          requests: listRequests.length,
+          options,
+          margin: tile.style.getPropertyValue('scroll-margin-top'),
+          header: view?.style.getPropertyValue('--month-header-height') ?? '',
+        })
       })
 
       const w = mountView()
@@ -374,7 +388,15 @@ describe('ResourcesView library query', () => {
 
       // The receiver is the real tile of that uid, and when it scrolled only the two pages the walk
       // needed had been asked for, the second with the first's cursor and the same limit.
-      expect(scrolled[0]).toEqual({ uid: 'target', requests: 2 })
+      // It lands at the TOP: the tile is the first one under the fixed chrome and the sticky month
+      // header, whose measured height the view carries as a variable the tile's scroll margin adds.
+      expect(scrolled[0]).toEqual({
+        uid: 'target',
+        requests: 2,
+        options: { block: 'start' },
+        margin: 'calc(var(--chrome-height, 0px) + var(--month-header-height, 0px))',
+        header: '44px',
+      })
       expect(listRequests[1]!.searchParams.get('cursor')).toBe('c1')
       expect(listRequests.slice(0, 2).map((u) => u.searchParams.get('limit'))).toEqual(['500', '500'])
       const receiver = vi.mocked(Element.prototype.scrollIntoView).mock.contexts[0] as HTMLElement
