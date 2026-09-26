@@ -22,7 +22,7 @@ export interface DockSegmentRegistration {
 export const DOCK_SEGMENT_KEY: InjectionKey<DockSegmentRegistration> = Symbol('dockSegment')
 
 export function createDockSegment(): DockSegmentRegistration {
-  const segment = shallowRef<Component | null>(null)
+  const segment: ShallowRef<Component | null> = shallowRef(null)
   return {
     segment,
     register(component) {
@@ -31,7 +31,8 @@ export function createDockSegment(): DockSegmentRegistration {
     // Only the registrant may withdraw: a view that unmounts after its successor mounted must not
     // take the successor's segment with it.
     unregister(component) {
-      if (segment.value === component) segment.value = null
+      const current: Component | null = segment.value
+      if (current === component) segment.value = null
     },
   }
 }
