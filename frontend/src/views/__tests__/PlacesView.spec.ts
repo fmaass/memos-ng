@@ -135,6 +135,17 @@ describe('PlacesView map wiring', () => {
     wrapper.unmount()
   })
 
+  it('keeps the phone grid’s last row above the app dock, in the region that scrolls', async () => {
+    // Places is viewport-high and scrolls the grid, not the document, so the grid itself must pad
+    // for the dock (the shell's <main> does not on this route).
+    const wrapper = await mountView(true)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findComponent({ name: 'InViewGrid' }).classes()).toEqual(
+      expect.arrayContaining(['overflow-y-auto', 'pb-[var(--dock-clearance)]']),
+    )
+    wrapper.unmount()
+  })
+
   it('opens the viewer on the photos in view when a single pin is tapped', async () => {
     const wrapper = await mountView()
     await wrapper.vm.$nextTick()

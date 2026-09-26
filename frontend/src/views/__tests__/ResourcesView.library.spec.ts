@@ -2,7 +2,6 @@ import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
-import SelectButton from 'primevue/selectbutton'
 import ToastService from 'primevue/toastservice'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -22,7 +21,11 @@ vi.mock('@/composables/useApi', async () => {
   client.use(reachabilityMiddleware)
   return { useApi: () => client }
 })
-vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock('vue-router', async () => {
+  const { reactive } = await import('vue')
+  const route = reactive({ query: {} })
+  return { useRouter: () => ({ push: vi.fn(), replace: vi.fn() }), useRoute: () => route }
+})
 // PhotoSwipe needs a real DOM; the viewer's contract is what it is HANDED.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
 vi.mock('@/composables/useMediaLightbox', () => ({
@@ -51,6 +54,7 @@ function row(uid: string) {
     downloadUrl: `/api/attachments/${uid}/original`,
     printUrl: `/api/attachments/${uid}/print`,
     memoUid: null,
+    takenAt: '2026-09-02T10:00:00Z',
   }
 }
 
@@ -279,11 +283,17 @@ describe('ResourcesView library query', () => {
       await settle()
       expect(has(w, 'justified-gallery')).toBe(true)
 
-      transport.mockResolvedValueOnce(serverError())
-      w.findComponent(SelectButton).vm.$emit('update:modelValue', 'video')
+      // The kind is picked in the header's options menu now (the inline SelectButton is gone). The
+      // menu's tags request comes first, then the list for the new kind — which fails.
+      transport.mockResolvedValueOnce(ok([])).mockResolvedValueOnce(serverError())
+      await w.find('[data-test="library-options"]').trigger('click')
+      await settle()
+      document.body.querySelector<HTMLElement>('[data-test="menu-kind-video"]')!.click()
       await settle()
 
-      expect(sent(1).searchParams.get('type')).toBe('video')
+      expect(sent(1).pathname).toBe('/api/attachments/tags')
+      expect(sent(2).pathname).toBe('/api/attachments')
+      expect(sent(2).searchParams.get('type')).toBe('video')
       expect(has(w, 'resources-error')).toBe(true)
       expect(has(w, 'resources-empty')).toBe(false)
     })

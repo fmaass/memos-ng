@@ -2,8 +2,10 @@ import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
 import ConfirmationService from 'primevue/confirmationservice'
 import ToastService from 'primevue/toastservice'
-import { describe, expect, it, vi } from 'vitest'
+import { ref } from 'vue'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { TIMELINE_COMPOSER_KEY } from '@/composables/useTimelineComposer'
 import HomeView from '@/views/HomeView.vue'
 
 // CaptureEditor (rendered by Home) depends on the API; mock it (not the view under test).
@@ -22,19 +24,48 @@ vi.mock('@/composables/useSettings', async () => {
 
 const FeedStub = { template: '<div data-test="feed-stub" />' }
 
+function mountHome(composerOpen = false) {
+  return mount(HomeView, {
+    global: {
+      plugins: [PrimeVue, ConfirmationService, ToastService],
+      stubs: { MemoFeed: FeedStub },
+      provide: { [TIMELINE_COMPOSER_KEY as symbol]: ref(composerOpen) },
+    },
+  })
+}
+function phone(isPhone: boolean) {
+  vi.stubGlobal(
+    'matchMedia',
+    vi.fn(() => ({ matches: isPhone, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+  )
+}
+
 describe('HomeView', () => {
-  it('composes the capture editor above the memo feed', () => {
-    const wrapper = mount(HomeView, {
-      global: { plugins: [PrimeVue, ConfirmationService, ToastService], stubs: { MemoFeed: FeedStub } },
-    })
-    expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(true)
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('renders no inline editor at rest: the feed alone, the editor waits behind new memo', () => {
+    const wrapper = mountHome(false)
+    expect(wrapper.find('[data-test="capture-editor"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="feed-stub"]').exists()).toBe(true)
   })
 
+  it('composes the capture editor above the memo feed once new memo is pressed on md+', () => {
+    phone(false)
+    const wrapper = mountHome(true)
+    const editor = wrapper.find('[data-test="capture-editor"]')
+    expect(editor.exists()).toBe(true)
+    // Above the feed: the editor precedes it in document order.
+    const feed = wrapper.find('[data-test="feed-stub"]').element
+    expect(editor.element.compareDocumentPosition(feed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('leaves the editor to the header dialog on a phone', () => {
+    phone(true)
+    expect(mountHome(true).find('[data-test="capture-editor"]').exists()).toBe(false)
+  })
+
   it('reads in the shared content column (wider on xl desktops)', () => {
-    const wrapper = mount(HomeView, {
-      global: { plugins: [PrimeVue, ConfirmationService, ToastService], stubs: { MemoFeed: FeedStub } },
-    })
+    const wrapper = mountHome()
     const classes = wrapper.find('[data-test="view-home"]').classes()
     expect(classes).toContain('max-w-2xl')
     expect(classes).toContain('xl:max-w-4xl')

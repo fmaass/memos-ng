@@ -3,7 +3,8 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, h, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { type LibraryFilter, useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
+import { useAttachmentLibrary, useAttachmentTags } from '@/composables/useAttachmentLibrary'
+import type { LibraryFilter, LibraryKind } from '@/lib/libraryFilter'
 
 // The real composable and the real generated client over a scripted transport: the assertions are
 // on the requests the client actually sends, not on items a fake query hands back.
@@ -27,7 +28,7 @@ function ok(uids: string[], cursor?: string): Response {
 }
 const sent = (n: number) => new URL(transport.mock.calls[n]![0].url)
 
-function mountLibrary(initial: LibraryFilter = 'all') {
+function mountLibrary(initial: LibraryFilter = { order: 'newest' }) {
   const filter = ref<LibraryFilter>(initial)
   let lib!: ReturnType<typeof useAttachmentLibrary>
   const Host = defineComponent({
@@ -70,7 +71,7 @@ describe('useAttachmentLibrary', () => {
     await flushPromises()
     expect(sent(0).searchParams.has('type')).toBe(false)
 
-    filter.value = 'video'
+    filter.value = { type: 'video', order: 'newest' }
     await flushPromises()
 
     expect(sent(1).searchParams.get('type')).toBe('video')
@@ -78,9 +79,48 @@ describe('useAttachmentLibrary', () => {
     expect(lib.items.value.map((i) => i.uid)).toEqual(['v'])
   })
 
+  it('walks the library by takenAt and forwards the kind and the tag with every page', async () => {
+    transport.mockResolvedValueOnce(ok(['a'], 'cur-1')).mockResolvedValueOnce(ok(['b']))
+    const { lib } = mountLibrary({ type: 'video', order: 'oldest', tag: 'recap' })
+    await flushPromises()
+    await lib.fetchNextPage()
+    await flushPromises()
+
+    for (const n of [0, 1]) {
+      expect(sent(n).searchParams.get('order')).toBe('taken_asc')
+      expect(sent(n).searchParams.get('type')).toBe('video')
+      expect(sent(n).searchParams.get('tag')).toBe('recap')
+      expect(sent(n).searchParams.get('limit')).toBe('200')
+    }
+    expect(sent(1).searchParams.get('cursor')).toBe('cur-1')
+  })
+
+  it('asks for newest first by takenAt when nothing else is set', async () => {
+    transport.mockResolvedValueOnce(ok(['a']))
+    mountLibrary()
+    await flushPromises()
+
+    expect(sent(0).searchParams.get('order')).toBe('taken_desc')
+    expect(sent(0).searchParams.has('type')).toBe(false)
+    expect(sent(0).searchParams.has('tag')).toBe(false)
+  })
+
+  it("never serves one tag's pages under another: a tag switch is a fresh first page", async () => {
+    transport.mockResolvedValueOnce(ok(['r1'], 'cur-r')).mockResolvedValueOnce(ok(['h1']))
+    const { lib, filter } = mountLibrary({ order: 'newest', tag: 'recap' })
+    await flushPromises()
+
+    filter.value = { order: 'newest', tag: 'holiday' }
+    await flushPromises()
+
+    expect(sent(1).searchParams.get('tag')).toBe('holiday')
+    expect(sent(1).searchParams.has('cursor')).toBe(false)
+    expect(lib.items.value.map((i) => i.uid)).toEqual(['h1'])
+  })
+
   it("is reached by every invalidation of ['attachments'] (delete, print-master changes)", async () => {
     transport.mockResolvedValueOnce(ok(['a'])).mockResolvedValueOnce(ok(['b']))
-    const { lib, queryClient } = mountLibrary('image')
+    const { lib, queryClient } = mountLibrary({ type: 'image', order: 'newest' })
     await flushPromises()
 
     await queryClient.invalidateQueries({ queryKey: ['attachments'] })
@@ -107,5 +147,77 @@ describe('useAttachmentLibrary', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+})
+
+function tagCounts(rows: { name: string; count: number }[]): Response {
+  return new Response(JSON.stringify(rows), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+function mountTags(initialType: LibraryKind | undefined, initialEnabled: boolean) {
+  const type = ref<LibraryKind | undefined>(initialType)
+  const enabled = ref(initialEnabled)
+  let tags!: ReturnType<typeof useAttachmentTags>
+  const Host = defineComponent({
+    setup() {
+      tags = useAttachmentTags(type, enabled)
+      return () => h('div')
+    },
+  })
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  mount(Host, { global: { plugins: [[VueQueryPlugin, { queryClient }]] } })
+  return { tags, type, enabled, queryClient }
+}
+
+describe('useAttachmentTags', () => {
+  beforeEach(() => transport.mockReset())
+
+  it('asks for nothing until it is enabled (the menu is closed at rest)', async () => {
+    transport.mockResolvedValueOnce(tagCounts([{ name: 'recap', count: 3 }]))
+    const { tags, enabled } = mountTags(undefined, false)
+    await flushPromises()
+    expect(transport).not.toHaveBeenCalled()
+
+    enabled.value = true
+    await flushPromises()
+
+    expect(sent(0).pathname).toBe('/api/attachments/tags')
+    expect(sent(0).searchParams.has('type')).toBe(false)
+    expect(tags.data.value).toEqual([{ name: 'recap', count: 3 }])
+  })
+
+  it('counts per kind: the kind is sent and keyed, so Videos never shows the photo counts', async () => {
+    transport
+      .mockResolvedValueOnce(tagCounts([{ name: 'recap', count: 9 }]))
+      .mockResolvedValueOnce(tagCounts([{ name: 'recap', count: 2 }]))
+    const { tags, type, queryClient } = mountTags(undefined, true)
+    await flushPromises()
+
+    type.value = 'video'
+    await flushPromises()
+
+    expect(sent(1).searchParams.get('type')).toBe('video')
+    expect(tags.data.value).toEqual([{ name: 'recap', count: 2 }])
+    expect(queryClient.getQueryData(['attachments', 'tags', 'video'])).toEqual([
+      { name: 'recap', count: 2 },
+    ])
+  })
+
+  it("is reached by every invalidation of ['attachments'] (a delete changes the counts)", async () => {
+    transport
+      .mockResolvedValueOnce(tagCounts([{ name: 'recap', count: 3 }]))
+      .mockResolvedValueOnce(tagCounts([{ name: 'recap', count: 2 }]))
+    const { tags, queryClient } = mountTags('image', true)
+    await flushPromises()
+
+    await queryClient.invalidateQueries({ queryKey: ['attachments'] })
+    await flushPromises()
+
+    expect(transport).toHaveBeenCalledTimes(2)
+    expect(sent(1).searchParams.get('type')).toBe('image')
+    expect(tags.data.value).toEqual([{ name: 'recap', count: 2 }])
   })
 })

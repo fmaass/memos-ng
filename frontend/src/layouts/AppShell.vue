@@ -1,32 +1,76 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import Drawer from 'primevue/drawer'
-import { computed, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
+import AppDock from '@/components/AppDock.vue'
 import CalendarHeatmap from '@/components/CalendarHeatmap.vue'
 import ConnectionBanner from '@/components/ConnectionBanner.vue'
 import NavigationProgressBar from '@/components/NavigationProgressBar.vue'
 import TagList from '@/components/TagList.vue'
+import TimelineHeader from '@/components/TimelineHeader.vue'
+import { createDockSegment, DOCK_SEGMENT_KEY } from '@/composables/useDockSegment'
+import { TIMELINE_COMPOSER_KEY } from '@/composables/useTimelineComposer'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useSession } from '@/composables/useSession'
 import { useNavigationProgress } from '@/composables/useNavigationProgress'
 import { useSettings } from '@/composables/useSettings'
 
-// The primary destinations, mirroring the original memos sidebar. One list, both navigations.
+// The secondary destinations, one list for the sidebar and the drawer. Library, Timeline and Places
+// are the dock's tabs (AppDock.vue); Search is here because no header carries a search button.
 interface NavItem {
   label: string
   icon: string
   to: string
+  /** Overrides the `nav-<label>` test id. */
+  testId?: string
 }
 const NAV: NavItem[] = [
-  { label: 'Home', icon: 'pi pi-home', to: '/' },
   { label: 'Explore', icon: 'pi pi-compass', to: '/explore' },
-  { label: 'Places', icon: 'pi pi-map', to: '/places' },
+  // Not `nav-search`: that id named the header search link this list replaces, and the checks that
+  // it is gone must not be answered by this entry.
+  { label: 'Search', icon: 'pi pi-search', to: '/search', testId: 'nav-text-search' },
   { label: 'Archived', icon: 'pi pi-inbox', to: '/archived' },
-  { label: 'Resources', icon: 'pi pi-images', to: '/resources' },
   { label: 'Settings', icon: 'pi pi-cog', to: '/settings' },
 ]
+
+const route = useRoute()
+const onTimeline = computed(() => route.path === '/')
+
+// The dock is ours and a routed view is our descendant, so the view's dock segment has to come to
+// us: we provide the registration, the Library registers its pill on it (useDockSegment).
+provide(DOCK_SEGMENT_KEY, createDockSegment())
+
+// The Timeline's new-memo editor: its button is in our header, the inline editor in the view.
+const composerOpen = ref(false)
+provide(TIMELINE_COMPOSER_KEY, composerOpen)
+watch(onTimeline, (on) => {
+  if (!on) composerOpen.value = false
+})
+
+// The chrome's rendered height, for whatever sticks beneath it (the Library's month headers). It
+// grows by a row while the connection banner shows, so it is measured, never assumed.
+const chrome = ref<HTMLElement | null>(null)
+const chromeHeight = ref(0)
+let chromeObserver: ResizeObserver | null = null
+onMounted(() => {
+  const el = chrome.value
+  if (!el) return
+  chromeHeight.value = el.getBoundingClientRect().height
+  if (typeof ResizeObserver === 'undefined') return
+  chromeObserver = new ResizeObserver(() => {
+    chromeHeight.value = el.getBoundingClientRect().height
+  })
+  chromeObserver.observe(el)
+})
+onBeforeUnmount(() => chromeObserver?.disconnect())
+
+// The document scrolls every route but Places, so <main> keeps its last row above the dock; Places
+// is a viewport-high view that scrolls an inner region and pads that region itself.
+const mainPadClass = computed(() =>
+  route.path === '/places' ? 'pb-[env(safe-area-inset-bottom)]' : 'pb-[var(--dock-clearance)]',
+)
 
 // A tap on a lazy route (Places above all) can take a second over the tunnel; until now nothing
 // on screen said the tap had been taken at all.
@@ -64,7 +108,10 @@ const headerInsetClass = computed(() =>
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col md:flex-row">
+  <div
+    class="min-h-screen flex flex-col md:flex-row"
+    :style="{ '--chrome-height': `${chromeHeight}px` }"
+  >
     <!-- Persistent sidebar on md+ -->
     <aside
       class="hidden md:flex md:flex-col w-60 shrink-0 border-r border-surface-200 dark:border-surface-700 p-4 gap-1 pt-[calc(1rem+env(safe-area-inset-top))] pl-[calc(1rem+env(safe-area-inset-left))]"
@@ -77,7 +124,7 @@ const headerInsetClass = computed(() =>
         :to="item.to"
         class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-surface-100 dark:hover:bg-surface-800"
         active-class="bg-primary-50 dark:bg-primary-400/10 text-primary"
-        :data-test="`nav-${item.label.toLowerCase()}`"
+        :data-test="item.testId ?? `nav-${item.label.toLowerCase()}`"
       >
         <i :class="item.icon" />
         <span>{{ item.label }}</span>
@@ -117,6 +164,7 @@ const headerInsetClass = computed(() =>
            covers none of the header's controls. The background and blur live here so both rows
            share them in either theme. -->
       <div
+        ref="chrome"
         class="relative sticky top-0 z-30 bg-surface-50/90 backdrop-blur-sm dark:bg-surface-950/90"
         data-test="app-chrome"
       >
@@ -127,7 +175,9 @@ const headerInsetClass = computed(() =>
           class="flex items-center gap-2 min-h-14 border-b border-surface-200 dark:border-surface-700 pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))]"
           :class="headerInsetClass"
         >
+          <TimelineHeader v-if="onTimeline" v-model:open="composerOpen" />
           <Button
+            v-else
             class="md:hidden"
             text
             rounded
@@ -137,9 +187,6 @@ const headerInsetClass = computed(() =>
             @click="mobileOpen = true"
           />
           <div class="flex-1" />
-          <RouterLink to="/search" aria-label="Search" data-test="nav-search">
-            <Button text rounded icon="pi pi-search" aria-label="Search" />
-          </RouterLink>
           <Button
             text
             rounded
@@ -158,9 +205,11 @@ const headerInsetClass = computed(() =>
         </header>
       </div>
 
-      <main class="flex-1 min-w-0 pb-[env(safe-area-inset-bottom)]">
+      <main class="flex-1 min-w-0" :class="mainPadClass">
         <slot />
       </main>
     </div>
+
+    <AppDock />
   </div>
 </template>
