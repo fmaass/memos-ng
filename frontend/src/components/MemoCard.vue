@@ -321,6 +321,8 @@ function onRemoveAllAttachments() {
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Remove all', severity: 'danger' },
+    // PrimeVue focuses the accept button by default, so an Enter meant to dismiss would remove them all.
+    defaultFocus: 'reject',
     accept: () => {
       // ONE event with all uids — the parent deletes them sequentially. Emitting N single deletes
       // would fan out N concurrent requests and exhaust the bounded shared Postgres pool (5/5).

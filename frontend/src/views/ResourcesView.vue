@@ -176,6 +176,8 @@ function deleteSelected() {
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Delete', severity: 'danger' },
+    // PrimeVue focuses Delete by default, so an Enter meant to dismiss would delete the batch.
+    defaultFocus: 'reject',
     accept: async () => {
       confirmOpen = false
       if (session !== selectSession) return
@@ -185,8 +187,15 @@ function deleteSelected() {
     reject: () => {
       confirmOpen = false
     },
+    // An Escape reaches PrimeVue's document listener, which closes the confirm and lands here, BEFORE
+    // it bubbles on to this view's window listener: cleared now, that same keypress would read as a
+    // second Escape and end select mode, taking the toolbar that should get the focus back with it.
+    // A task (not a microtask, which a browser runs between the two listeners) clears the flag once
+    // the dispatch is over — whichever element the Escape was aimed at, inside the dialog or not.
     onHide: () => {
-      confirmOpen = false
+      setTimeout(() => {
+        confirmOpen = false
+      })
     },
   })
 }
