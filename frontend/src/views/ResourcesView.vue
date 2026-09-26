@@ -3,31 +3,50 @@ import { useQueryClient } from '@tanstack/vue-query'
 import Button from 'primevue/button'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
-import SelectButton from 'primevue/selectbutton'
-import { onUnmounted, ref, watch, watchEffect } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onUnmounted, ref, watch, watchEffect } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import JustifiedGallery from '@/components/JustifiedGallery.vue'
-import { type LibraryFilter, useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
+import LibraryHeader from '@/components/LibraryHeader.vue'
+import LibrarySegment from '@/components/LibrarySegment.vue'
+import { useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
 import { useApi } from '@/composables/useApi'
+import { useDockSegment } from '@/composables/useDockSegment'
 import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
 import { fetchPrintMasters, usePrintMaster } from '@/composables/usePrintMaster'
 import { shouldLoadMore } from '@/lib/attachmentPaging'
 import { shouldRemint } from '@/lib/imageRetry'
+import { fromSearchParams, type LibraryFilter, sameLibraryFilter, toRouteQuery } from '@/lib/libraryFilter'
+import { groupByMonth } from '@/lib/librarySections'
 import { memoPath } from '@/lib/places/lightbox'
 import { selectPrintMaster, toPrintMasterInfo } from '@/lib/printMaster'
 
 const api = useApi()
+const route = useRoute()
 const router = useRouter()
 const queryClient = useQueryClient()
 const confirm = useConfirm()
 const toast = useToast()
-const filter = ref<LibraryFilter>('all')
-const options = [
-  { label: 'All', value: 'all' },
-  { label: 'Images', value: 'image' },
-  { label: 'Videos', value: 'video' },
-]
+
+// The filter lives in the URL (linkable, reload-stable), synced both ways like SearchView's: seeded
+// from the route, written back on a change, re-seeded on a query-only navigation (back/forward).
+// Equal filters serialize identically, which is the loop guard in both directions.
+const filter = ref<LibraryFilter>(fromSearchParams(route.query))
+watch(filter, (f) => {
+  if (!sameLibraryFilter(f, fromSearchParams(route.query))) {
+    void router.replace({ query: toRouteQuery(f) })
+  }
+})
+watch(
+  () => route.query,
+  () => {
+    const fromUrl = fromSearchParams(route.query)
+    if (!sameLibraryFilter(fromUrl, filter.value)) filter.value = fromUrl
+  },
+)
+
+// Years | Months | All, shown by the shell's dock once the Library is scrolled.
+useDockSegment(LibrarySegment)
 
 const {
   items,
@@ -40,6 +59,17 @@ const {
   fetchNextPage,
   refetch,
 } = useAttachmentLibrary(filter)
+
+// One gallery per Zurich calendar month, in the list's own (takenAt) order. Each gallery reports a
+// tile index within its month; `start` maps it back onto the whole loaded list the viewer walks.
+const sections = computed(() => {
+  let start = 0
+  return groupByMonth(items.value).map((section) => {
+    const withStart = { ...section, start }
+    start += section.items.length
+    return withStart
+  })
+})
 
 // One request at a time: the sentinel and the button can both ask, and a second call while the
 // first is in flight is ignored instead of cancelling it (cancelRefetch: false).
@@ -163,16 +193,7 @@ function onDelete(uid: string) {
 
 <template>
   <section class="mx-auto flex max-w-6xl flex-col gap-4 p-4" data-test="view-resources">
-    <h1 class="text-2xl font-semibold">Resources</h1>
-    <SelectButton
-      v-model="filter"
-      :options="options"
-      option-label="label"
-      option-value="value"
-      :allow-empty="false"
-      aria-label="Filter media type"
-      data-test="type-filter"
-    />
+    <LibraryHeader v-model:filter="filter" />
     <p v-if="isPending" class="text-sm text-muted-color">Loading…</p>
     <!-- A failed load is never shown as an empty library (MEMNG-504): nothing loaded + an error is
          the error state; an error after tiles loaded keeps them and says so below them. -->
@@ -196,13 +217,22 @@ function onDelete(uid: string) {
       No attachments yet.
     </p>
     <template v-else>
-      <JustifiedGallery
-        :items="items"
-        :target-height="200"
-        @open="openAt"
-        @retry="onTileRetry"
-        @print-retry="printMaster.retry($event)"
-      />
+      <!-- The month header sticks under the shell's chrome, whose height the shell measures. -->
+      <div v-for="section in sections" :key="section.key" class="flex flex-col gap-2">
+        <h2
+          class="sticky top-[var(--chrome-height,0px)] z-10 -mx-4 bg-surface-50/90 px-4 py-2 text-lg font-semibold backdrop-blur-sm dark:bg-surface-950/90"
+          data-test="month-header"
+        >
+          {{ section.label }}
+        </h2>
+        <JustifiedGallery
+          :items="section.items"
+          :target-height="200"
+          @open="openAt(section.start + $event)"
+          @retry="onTileRetry"
+          @print-retry="printMaster.retry($event)"
+        />
+      </div>
       <div ref="sentinel" aria-hidden="true" data-test="resources-sentinel" />
       <div
         v-if="isError"
