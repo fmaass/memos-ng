@@ -190,6 +190,12 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.1.0 (unreleased)
+
+- `total_size` on a memo is now populated — the sum of its attached files' sizes in bytes — on the
+  create, get, list, edit (`PATCH`), pin, unpin and reaction responses, where it was always 0
+  before; same field and type, so the iOS client needs no change and may now read it.
+
 ### v2.0.0
 
 - memos-ng and the iOS client keep independent semantic versions and share only the MAJOR, which

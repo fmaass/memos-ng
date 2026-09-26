@@ -571,6 +571,9 @@ def _out(memo: Memo, user_id: int) -> MemoOut:
         tags=sorted(t.name for t in memo.tags),
         attachments=[_att_ref(a, user_id) for a in memo.attachments],
         reactions=_reactions(memo, user_id),
+        # Summed over the same loaded rows `attachments` is built from, so the two never disagree
+        # and no extra query is spent.
+        total_size=sum(a.size for a in memo.attachments),
     )
 
 
