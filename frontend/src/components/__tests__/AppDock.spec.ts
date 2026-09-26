@@ -10,7 +10,9 @@ import { DOCK_SEGMENT_THRESHOLD } from '@/lib/dockState'
 const Pill = markRaw(defineComponent({ render: () => h('div', { 'data-test': 'injected-pill' }) }))
 const stub = { template: '<div />' }
 
-async function mountDock(path: string, withSegment = true) {
+const Bar = markRaw(defineComponent({ render: () => h('div', { 'data-test': 'injected-bar' }) }))
+
+async function mountDock(path: string, withSegment = true, withOverride = false) {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: ['/', '/resources', '/places', '/search'].map((p) => ({ path: p, component: stub })),
@@ -19,6 +21,7 @@ async function mountDock(path: string, withSegment = true) {
   await router.isReady()
   const registration = createDockSegment()
   if (withSegment) registration.register(Pill)
+  if (withOverride) registration.setOverride(Bar)
   const wrapper = mount(AppDock, {
     attachTo: document.body,
     global: { plugins: [router], provide: { [DOCK_SEGMENT_KEY as symbol]: registration } },
@@ -145,5 +148,26 @@ describe('AppDock', () => {
       add.mockRestore()
       remove.mockRestore()
     }
+  })
+
+  describe('selection override', () => {
+    it('renders the override and NOTHING else on the Library, in either dock state', async () => {
+      const { wrapper } = await mountDock('/resources', true, true)
+      const only = () => {
+        expect(wrapper.find('[data-test="injected-bar"]').exists()).toBe(true)
+        expect(tabs(wrapper)).toEqual([])
+        expect(pill(wrapper)).toBe(false)
+        expect(wrapper.find('[data-test="dock-library-toggle"]').exists()).toBe(false)
+      }
+      only()
+      await scrollTo(DOCK_SEGMENT_THRESHOLD + 50)
+      only()
+    })
+
+    it('never shows an override off the Library', async () => {
+      const { wrapper } = await mountDock('/', true, true)
+      expect(wrapper.find('[data-test="injected-bar"]').exists()).toBe(false)
+      expect(tabs(wrapper)).toHaveLength(3)
+    })
   })
 })

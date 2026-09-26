@@ -43,6 +43,12 @@ const segment = computed(() =>
     : null,
 )
 
+// The Library's select mode replaces the whole dock with its toolbar; like the segment, only on the
+// Library route.
+const override = computed(() =>
+  route.path === LIBRARY_ROUTE ? (registration?.override.value ?? null) : null,
+)
+
 // A tap on the tab that is already active toggles the Library's two states instead of navigating:
 // following the link would land on the bare route and drop the filter in its query.
 function onTab(event: MouseEvent, active: boolean, navigate: (e?: MouseEvent) => unknown) {
@@ -61,7 +67,8 @@ function onTab(event: MouseEvent, active: boolean, navigate: (e?: MouseEvent) =>
     aria-label="Main"
     data-test="app-dock"
   >
-    <template v-if="segment">
+    <component :is="override" v-if="override" />
+    <template v-else-if="segment">
       <button
         type="button"
         class="flex h-full items-center justify-center rounded-full bg-primary/10 px-4 text-primary"

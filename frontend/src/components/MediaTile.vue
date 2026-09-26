@@ -44,10 +44,15 @@ const props = defineProps<{
   // The photo's print-master state (see printChipState) — null renders no chip at all. Computed by
   // the parent, which is where both the memo's attachments and the upload queue are in scope.
   printChip?: PrintChipState | null
+  // Select mode (the Library): present means selecting. The tile's content goes inert and ONE native
+  // button covers it, whatever state the tile is in — a processing or failed item of mine is
+  // selectable too, since select-all takes it. Absent (every other caller) changes nothing.
+  selection?: { selected: boolean; selectable: boolean; label: string } | null
 }>()
 const emit = defineEmits<{
   retry: [uid: string]
   open: [uid: string]
+  select: [uid: string]
   'print-retry': [uid: string]
 }>()
 
@@ -152,111 +157,140 @@ onBeforeUnmount(() => window.removeEventListener('online', onOnline))
     :style="ratio === null ? undefined : { aspectRatio: String(ratio) }"
     data-test="media-tile"
   >
-    <!-- pending/uploading: blurhash placeholder (or shimmer) + Processing tag.
-         The hash decodes square (32×32) but encodes the WHOLE frame, so it is stretched (object-fill)
-         to whatever ratio the tile box has — cropping it to cover would throw away part of the preview. -->
-    <template v-if="kind === 'placeholder'">
-      <img
-        v-if="blur"
-        :src="blur"
-        alt=""
-        class="w-full h-full object-fill"
-        data-test="tile-placeholder"
-      />
-      <div v-else class="w-full h-full animate-pulse" data-test="tile-placeholder" />
-      <span class="absolute bottom-1 left-1 text-xs px-1.5 py-0.5 rounded bg-black/50 text-white">
-        Processing
-      </span>
-    </template>
-
-    <!-- processing: poster + percent overlay (% arrives via SSE) -->
-    <template v-else-if="kind === 'processing'">
-      <img
-        :src="att.posterUrl"
-        alt=""
-        decoding="async"
-        class="w-full h-full object-cover"
-        data-test="tile-processing"
-      />
-      <div class="absolute inset-0 flex items-center justify-center">
-        <span class="text-xs px-1.5 py-0.5 rounded bg-black/60 text-white">{{ percent }}%</span>
-      </div>
-    </template>
-
-    <!-- failed (backend status OR the thumbnail/poster failed to load after retries): warning + retry.
-         Checked before image/video so a load failure surfaces the recovery affordance. -->
     <div
-      v-else-if="showFailed"
-      class="w-full h-full flex flex-col items-center justify-center gap-1 text-sm"
-      data-test="tile-failed"
+      class="h-full w-full"
+      :class="{ 'opacity-40': selection && !selection.selectable }"
+      :inert="selection ? true : undefined"
+      data-test="tile-content"
     >
-      <i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true" />
-      <button class="text-primary underline" data-test="tile-retry" @click="manualRetry">
-        Retry
+      <!-- pending/uploading: blurhash placeholder (or shimmer) + Processing tag.
+           The hash decodes square (32×32) but encodes the WHOLE frame, so it is stretched (object-fill)
+           to whatever ratio the tile box has — cropping it to cover would throw away part of the preview. -->
+      <template v-if="kind === 'placeholder'">
+        <img
+          v-if="blur"
+          :src="blur"
+          alt=""
+          class="w-full h-full object-fill"
+          data-test="tile-placeholder"
+        />
+        <div v-else class="w-full h-full animate-pulse" data-test="tile-placeholder" />
+        <span class="absolute bottom-1 left-1 text-xs px-1.5 py-0.5 rounded bg-black/50 text-white">
+          Processing
+        </span>
+      </template>
+
+      <!-- processing: poster + percent overlay (% arrives via SSE) -->
+      <template v-else-if="kind === 'processing'">
+        <img
+          :src="att.posterUrl"
+          alt=""
+          decoding="async"
+          class="w-full h-full object-cover"
+          data-test="tile-processing"
+        />
+        <div class="absolute inset-0 flex items-center justify-center">
+          <span class="text-xs px-1.5 py-0.5 rounded bg-black/60 text-white">{{ percent }}%</span>
+        </div>
+      </template>
+
+      <!-- failed (backend status OR the thumbnail/poster failed to load after retries): warning + retry.
+           Checked before image/video so a load failure surfaces the recovery affordance. -->
+      <div
+        v-else-if="showFailed"
+        class="w-full h-full flex flex-col items-center justify-center gap-1 text-sm"
+        data-test="tile-failed"
+      >
+        <i class="pi pi-exclamation-triangle text-red-500 dark:text-red-400" aria-hidden="true" />
+        <button class="text-primary underline" data-test="tile-retry" @click="manualRetry">
+          Retry
+        </button>
+      </div>
+
+      <!-- ready image: the blurhash shows instantly (tiny client-decoded preview) behind the real
+           thumb, so the feed never renders as empty gray boxes while thumbnails download.
+           A real <button> (same treatment as the video tile) so the viewer opens by keyboard too — a
+           click handler on the <img> alone was mouse/touch-only. -->
+      <button
+        v-else-if="kind === 'image'"
+        type="button"
+        class="relative h-full w-full cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+        data-test="tile-open"
+        aria-label="Open image"
+        @click="emit('open', att.uid)"
+      >
+        <img
+          v-if="blur"
+          :src="blur"
+          alt=""
+          aria-hidden="true"
+          class="absolute inset-0 w-full h-full object-fill"
+          data-test="tile-blur"
+        />
+        <img
+          :src="imgSrc"
+          :srcset="srcset"
+          :sizes="srcset ? sizes : undefined"
+          alt=""
+          loading="lazy"
+          decoding="async"
+          class="relative w-full h-full object-cover"
+          data-test="tile-image"
+          @error="onImgError"
+        />
       </button>
+
+      <button
+        v-else-if="kind === 'video'"
+        type="button"
+        class="relative h-full w-full cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+        data-test="tile-video"
+        aria-label="Play video"
+        @click="emit('open', att.uid)"
+      >
+        <img
+          v-if="blur"
+          :src="blur"
+          alt=""
+          aria-hidden="true"
+          class="absolute inset-0 h-full w-full object-fill"
+        />
+        <img
+          :src="imgSrc"
+          alt=""
+          loading="lazy"
+          decoding="async"
+          class="relative h-full w-full object-cover"
+          @error="onImgError"
+        />
+        <span class="absolute inset-0 flex items-center justify-center">
+          <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
+        </span>
+      </button>
+
+      <PrintChip v-if="printChip" :chip="printChip" @retry="emit('print-retry', att.uid)" />
     </div>
 
-    <!-- ready image: the blurhash shows instantly (tiny client-decoded preview) behind the real
-         thumb, so the feed never renders as empty gray boxes while thumbnails download.
-         A real <button> (same treatment as the video tile) so the viewer opens by keyboard too — a
-         click handler on the <img> alone was mouse/touch-only. -->
+    <!-- Native, so Enter and Space toggle it with no key handler of ours; aria-pressed is the state
+         and the label names the item. Disabled when the item is not mine: a tap does nothing. -->
     <button
-      v-else-if="kind === 'image'"
+      v-if="selection"
       type="button"
-      class="relative h-full w-full cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
-      data-test="tile-open"
-      aria-label="Open image"
-      @click="emit('open', att.uid)"
+      class="absolute inset-0 z-10 cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary disabled:cursor-default"
+      :aria-pressed="selection.selected ? 'true' : 'false'"
+      :aria-label="selection.label"
+      :disabled="!selection.selectable"
+      data-test="tile-select"
+      @click="emit('select', att.uid)"
     >
-      <img
-        v-if="blur"
-        :src="blur"
-        alt=""
+      <span
+        v-if="selection.selected"
+        class="absolute bottom-1.5 right-1.5 flex h-6 w-6 items-center justify-center rounded-full bg-blue-500 text-white shadow ring-2 ring-white"
         aria-hidden="true"
-        class="absolute inset-0 w-full h-full object-fill"
-        data-test="tile-blur"
-      />
-      <img
-        :src="imgSrc"
-        :srcset="srcset"
-        :sizes="srcset ? sizes : undefined"
-        alt=""
-        loading="lazy"
-        decoding="async"
-        class="relative w-full h-full object-cover"
-        data-test="tile-image"
-        @error="onImgError"
-      />
-    </button>
-
-    <button
-      v-else-if="kind === 'video'"
-      type="button"
-      class="relative h-full w-full cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
-      data-test="tile-video"
-      aria-label="Play video"
-      @click="emit('open', att.uid)"
-    >
-      <img
-        v-if="blur"
-        :src="blur"
-        alt=""
-        aria-hidden="true"
-        class="absolute inset-0 h-full w-full object-fill"
-      />
-      <img
-        :src="imgSrc"
-        alt=""
-        loading="lazy"
-        decoding="async"
-        class="relative h-full w-full object-cover"
-        @error="onImgError"
-      />
-      <span class="absolute inset-0 flex items-center justify-center">
-        <i class="pi pi-play-circle text-4xl text-white/90 drop-shadow-lg" aria-hidden="true" />
+        data-test="tile-check"
+      >
+        <i class="pi pi-check text-xs" />
       </span>
     </button>
-
-    <PrintChip v-if="printChip" :chip="printChip" @retry="emit('print-retry', att.uid)" />
   </div>
 </template>
