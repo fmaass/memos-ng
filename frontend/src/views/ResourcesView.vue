@@ -14,7 +14,7 @@ import LibrarySelectionToolbar from '@/components/LibrarySelectionToolbar.vue'
 import YearCards from '@/components/YearCards.vue'
 import { useAttachmentBuckets, useAttachmentLibrary } from '@/composables/useAttachmentLibrary'
 import { useApi } from '@/composables/useApi'
-import { useBulkDelete } from '@/composables/useBulkDelete'
+import { deleteAttachment, useBulkDelete } from '@/composables/useBulkDelete'
 import { useDockOverride, useDockSegment } from '@/composables/useDockSegment'
 import { useLibrarySelection } from '@/composables/useLibrarySelection'
 import { type AttachPrintPayload, useMediaLightbox } from '@/composables/useMediaLightbox'
@@ -413,8 +413,7 @@ function onDelete(uid: string) {
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Delete', severity: 'danger' },
     accept: async () => {
-      const { error } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
-      if (error) {
+      if (!(await deleteAttachment(api, uid))) {
         toast.add({ severity: 'error', summary: 'Delete failed', life: 4000 })
         return
       }
