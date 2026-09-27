@@ -3,11 +3,11 @@ import { useQueryClient } from '@tanstack/vue-query'
 import Button from 'primevue/button'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
-import { computed, defineComponent, h, nextTick, onUnmounted, ref, watch, watchEffect } from 'vue'
+import { computed, defineComponent, h, nextTick, onMounted, onUnmounted, ref, watch, watchEffect } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import DayGroup from '@/components/DayGroup.vue'
 import DayMosaic from '@/components/DayMosaic.vue'
-import JustifiedGallery from '@/components/JustifiedGallery.vue'
 import LibraryHeader from '@/components/LibraryHeader.vue'
 import LibrarySegment from '@/components/LibrarySegment.vue'
 import LibrarySelectionToolbar from '@/components/LibrarySelectionToolbar.vue'
@@ -34,7 +34,7 @@ import {
   viewFromQuery,
   viewToQuery,
 } from '@/lib/libraryFilter'
-import { groupByMonth } from '@/lib/librarySections'
+import { dayPillLabel, groupByDay, groupByMonth, topDay, UNDATED_KEY } from '@/lib/librarySections'
 import { daysOfYear } from '@/lib/mosaic'
 import { memoPath } from '@/lib/places/lightbox'
 import { selectPrintMaster, toPrintMasterInfo } from '@/lib/printMaster'
@@ -90,7 +90,9 @@ function openYear(year: string) {
   monthsYear.value = year
 }
 
-const dayBuckets = useAttachmentBuckets('day', filter, () => view.value === 'months')
+// The day buckets feed Months' mosaic and All's day-heading counts (the whole day, not the loaded
+// fragment of it), from one query under the same filter.
+const dayBuckets = useAttachmentBuckets('day', filter, () => view.value === 'months' || view.value === 'all')
 const yearBuckets = useAttachmentBuckets('year', filter, () => view.value === 'years')
 const mosaicDays = computed(() => {
   const days = dayBuckets.data.value ?? []
@@ -220,16 +222,32 @@ const SelectionDock = defineComponent({
 })
 useDockOverride(SelectionDock, () => selecting.value)
 
-// One gallery per Zurich calendar month, in the list's own (takenAt) order. Each gallery reports a
-// tile index within its month; `start` maps it back onto the whole loaded list the viewer walks.
+// One section per Zurich calendar month, in the list's own (takenAt) order, and in it one group per
+// Zurich day (decision 13). Each group reports a tile index within its day; `start` maps it back
+// onto the whole loaded list the viewer walks, and `index` counts days across the whole list so the
+// frame cycle runs on over a month boundary.
 const sections = computed(() => {
   let start = 0
-  return groupByMonth(items.value).map((section) => {
-    const withStart = { ...section, start }
-    start += section.items.length
-    return withStart
-  })
+  let dayIndex = 0
+  return groupByMonth(items.value).map((section) => ({
+    ...section,
+    days: groupByDay(section.items).map((day) => {
+      const withStart = { ...day, start, index: dayIndex++ }
+      start += day.items.length
+      return withStart
+    }),
+  }))
 })
+// A day heading's count is the server's for the whole day; while the buckets are pending or failed
+// the cell stays empty rather than showing how many of the day happen to be loaded.
+const dayCounts = computed(() => {
+  if (!dayBuckets.isSuccess.value) return null
+  return new Map((dayBuckets.data.value ?? []).map((b) => [b.key, b.count]))
+})
+function dayCount(key: string): number | null {
+  if (key === UNDATED_KEY) return null
+  return dayCounts.value?.get(key) ?? null
+}
 
 // One request at a time: the sentinel and the button can both ask, and a second call while the
 // first is in flight is ignored instead of cancelling it (cancelRefetch: false).
@@ -280,18 +298,145 @@ watchEffect(() => {
 
 // The jump from a Months day (or its "more days" row) into All, decision 3: All opens, the walk
 // advances the SAME infinite query — same limit, same cursors — through the first page holding that
-// Zurich day, and that day's first tile is scrolled into view. A later jump supersedes an earlier
+// Zurich day, and that day's heading is scrolled into view (decision 13). A later jump supersedes an earlier
 // one (the token), so only the latest tap ever scrolls.
 const root = ref<HTMLElement | null>(null)
 let jumpToken = 0
-// The jump lands a day's first tile at the TOP of what is visible: under the shell's fixed chrome
-// and the sticky month header. The header's height is measured (it depends on the font and the
-// label), carried on the view as a variable, and the tile's scroll margin adds the two.
+// The jump lands a day's heading at the TOP of what is visible: under the shell's fixed chrome and
+// the sticky month header. The header's height is measured (it depends on the font and the label),
+// carried on the view as a variable, and the heading's scroll margin adds the two.
 const monthHeaderHeight = ref(0)
 const TILE_SCROLL_MARGIN = 'calc(var(--chrome-height, 0px) + var(--month-header-height, 0px))'
 onUnmounted(() => {
   jumpToken += 1
 })
+// Kept current while All shows (a font swap or a rotation changes it): the jump's landing row and
+// the date pill both sit under it. The border box, since the header's padding is part of what sticks.
+let headerObserver: ResizeObserver | null = null
+let observedHeader: HTMLElement | null = null
+function firstMonthHeader(): HTMLElement | null {
+  return root.value?.querySelector<HTMLElement>('[data-test="month-header"]') ?? null
+}
+function measureMonthHeader() {
+  const header = firstMonthHeader()
+  if (header) monthHeaderHeight.value = header.getBoundingClientRect().height
+}
+function unobserveMonthHeader() {
+  headerObserver?.disconnect()
+  headerObserver = null
+  observedHeader = null
+}
+// `root` is watched too: an immediate run in setup sees no DOM yet, and a list already cached at
+// mount changes neither the view nor the sections afterwards, so the ref's arrival is the only cue.
+watch(
+  () => [view.value, sections.value, root.value] as const,
+  () => {
+    const header = view.value === 'all' ? firstMonthHeader() : null
+    if (header === observedHeader) return
+    unobserveMonthHeader()
+    if (!header) return
+    observedHeader = header
+    monthHeaderHeight.value = header.getBoundingClientRect().height
+    if (typeof ResizeObserver === 'undefined') return
+    headerObserver = new ResizeObserver(() => {
+      monthHeaderHeight.value = header.getBoundingClientRect().height
+    })
+    headerObserver.observe(header)
+  },
+  { flush: 'post', immediate: true },
+)
+onUnmounted(unobserveMonthHeader)
+
+// The date while scrolling (decision 13): a pill names the day whose heading has reached the line
+// under the chrome and the month header, shows on scroll and hides one second after the last
+// scroll event; a tap opens Months at that day's month.
+const PILL_HIDE_MS = 1000
+const pillDay = ref<string | null>(null)
+let pillTimer: ReturnType<typeof setTimeout> | null = null
+function chromeHeight(): number {
+  const el = root.value
+  if (!el) return 0
+  return parseFloat(getComputedStyle(el).getPropertyValue('--chrome-height')) || 0
+}
+function hidePill() {
+  if (pillTimer !== null) clearTimeout(pillTimer)
+  pillTimer = null
+  pillDay.value = null
+}
+function onScroll() {
+  if (view.value !== 'all' || !root.value) {
+    hidePill()
+    return
+  }
+  const headings = [...root.value.querySelectorAll<HTMLElement>('[data-day]')].map((el) => ({
+    key: el.dataset.day ?? '',
+    top: el.getBoundingClientRect().top,
+  }))
+  pillDay.value = topDay(headings, chromeHeight() + monthHeaderHeight.value)
+  if (pillTimer !== null) clearTimeout(pillTimer)
+  pillTimer = setTimeout(hidePill, PILL_HIDE_MS)
+}
+onMounted(() => document.addEventListener('scroll', onScroll, { passive: true }))
+onUnmounted(() => {
+  document.removeEventListener('scroll', onScroll)
+  hidePill()
+})
+watch(view, (v) => {
+  if (v !== 'all') hidePill()
+})
+
+// The pill's way up: Months opens and, once its day buckets have loaded and rendered, that month's
+// section is scrolled to the top under the chrome; a month Months does not show lands at the top.
+// A later view or filter change, or a newer tap, cancels a landing still waiting.
+let monthJumpToken = 0
+watch(view, (v) => {
+  if (v !== 'months') monthJumpToken++
+})
+watch(filter, () => {
+  monthJumpToken++
+})
+onUnmounted(() => {
+  monthJumpToken++
+})
+function bucketsSettled(token: number): Promise<boolean> {
+  const done = () => dayBuckets.isSuccess.value || dayBuckets.isError.value || token !== monthJumpToken
+  return new Promise((resolve) => {
+    if (done()) {
+      resolve(dayBuckets.isSuccess.value && token === monthJumpToken)
+      return
+    }
+    const stop = watch(done, (d) => {
+      if (!d) return
+      stop()
+      resolve(dayBuckets.isSuccess.value && token === monthJumpToken)
+    })
+  })
+}
+async function openMonthFromPill() {
+  const day = pillDay.value
+  if (!day) return
+  hidePill()
+  const month = day.slice(0, 7)
+  setView('months')
+  const token = ++monthJumpToken
+  // A failed load drops the target: Months shows its own error and retry.
+  if (!(await bucketsSettled(token))) return
+  for (let frame = 0; frame < 120 && token === monthJumpToken; frame++) {
+    await nextTick()
+    const mosaic = root.value?.querySelector<HTMLElement>('[data-test="day-mosaic"]')
+    const target = [...(mosaic?.querySelectorAll<HTMLElement>('[data-test="mosaic-section"]') ?? [])].find(
+      (el) => el.dataset.month === month,
+    )
+    if (target) {
+      target.style.scrollMarginTop = 'var(--chrome-height, 0px)'
+      target.scrollIntoView({ block: 'start' })
+      return
+    }
+    if (mosaic) break
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  }
+  if (token === monthJumpToken) window.scrollTo({ top: 0 })
+}
 function settled(): Promise<void> {
   if (!isPending.value) return Promise.resolve()
   return new Promise((resolve) => {
@@ -315,13 +460,13 @@ const pager = {
     return { items: appendPage(result.data?.pages.map((p) => p.items) ?? []), hasNext: result.hasNextPage }
   },
 }
-// The tile exists once the list refs caught up and the gallery measured its width, a few frames on.
-async function tileFor(uid: string, token: number): Promise<HTMLElement | null> {
+// The day's heading exists once the list refs caught up and the view rendered, a few frames on.
+async function headingFor(day: string, token: number): Promise<HTMLElement | null> {
   for (let frame = 0; frame < 120 && token === jumpToken; frame++) {
     await nextTick()
-    const tiles = root.value?.querySelectorAll<HTMLElement>('[data-uid]') ?? []
-    const tile = [...tiles].find((el) => el.dataset.uid === uid)
-    if (tile) return tile
+    const headings = root.value?.querySelectorAll<HTMLElement>('[data-day]') ?? []
+    const heading = [...headings].find((el) => el.dataset.day === day)
+    if (heading) return heading
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
   }
   return null
@@ -342,12 +487,12 @@ async function jumpToDay(day: string) {
   try {
     const uid = await scrollToDay(day, pager, undefined, () => token === jumpToken)
     if (!uid || token !== jumpToken) return
-    const tile = await tileFor(uid, token)
-    if (!tile || token !== jumpToken) return
-    const header = root.value?.querySelector<HTMLElement>('[data-test="month-header"]')
-    monthHeaderHeight.value = header?.getBoundingClientRect().height ?? 0
+    // Decision 13: the landing row is the day's heading, not its first tile.
+    const heading = await headingFor(day, token)
+    if (!heading || token !== jumpToken) return
+    measureMonthHeader()
     await nextTick()
-    if (token === jumpToken) tile.scrollIntoView({ block: 'start' })
+    if (token === jumpToken) heading.scrollIntoView({ block: 'start' })
   } finally {
     if (token === jumpToken) {
       jumping.value = false
@@ -539,18 +684,35 @@ function onDelete(uid: string) {
         >
           {{ section.label }}
         </h2>
-        <JustifiedGallery
-          :items="section.items"
-          :target-height="200"
-          :tile-scroll-margin="TILE_SCROLL_MARGIN"
+        <DayGroup
+          v-for="day in section.days"
+          :key="day.key"
+          :day="day.key"
+          :items="day.items"
+          :day-index="day.index"
+          :count="dayCount(day.key)"
+          :heading-scroll-margin="TILE_SCROLL_MARGIN"
           :selecting="selecting"
           :selected="selected"
           @select="selection.toggle"
-          @open="openAt(section.start + $event)"
+          @open="openAt(day.start + $event)"
           @retry="onTileRetry"
           @print-retry="printMaster.retry($event)"
         />
       </div>
+      <!-- Top centre under the header, clear of the header's buttons; above the sticky month header. -->
+      <Transition name="date-pill">
+        <button
+          v-if="pillDay"
+          type="button"
+          class="glass fixed left-1/2 z-20 -translate-x-1/2 rounded-full px-4 py-1.5 text-sm font-semibold shadow-md"
+          :style="{ top: 'calc(var(--chrome-height, 0px) + var(--month-header-height, 0px) + 8px)' }"
+          data-test="date-pill"
+          @click="openMonthFromPill"
+        >
+          {{ dayPillLabel(pillDay) }}
+        </button>
+      </Transition>
       <div ref="sentinel" aria-hidden="true" data-test="resources-sentinel" />
       <div
         v-if="isError"
@@ -581,3 +743,12 @@ function onDelete(uid: string) {
     </template>
   </section>
 </template>
+
+<style scoped>
+.date-pill-leave-active {
+  transition: opacity 0.3s ease;
+}
+.date-pill-leave-to {
+  opacity: 0;
+}
+</style>

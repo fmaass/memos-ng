@@ -95,7 +95,7 @@ async function deleteFromViewer(uid: string) {
     },
   })
   await settle()
-  wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+  await wrapper.find('[data-test="tile-open"]').trigger('click')
   const handlers = lightboxOpen.mock.calls.at(-1)![2] as { onDelete: (uid: string) => void }
   handlers.onDelete(uid)
   const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
