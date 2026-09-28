@@ -169,6 +169,11 @@ async def append_chunk(
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
 ) -> UploadOut:
     upload = await _get_upload(db, upload_uid, user.id)
+    # End the lookup transaction before the body arrives: left open, it pins a pooled connection
+    # for as long as the client takes to send the bytes, and a few slow uploads drain the pool for
+    # every request (MEMNG-621). Commit, not rollback — `expire_on_commit=False` keeps `upload`
+    # readable for append_stream's snapshot checks, and its merge re-reads the row FOR UPDATE.
+    await db.commit()
     try:
         appended = await svc.append_stream(db, upload, upload_offset, request.stream())
     except svc.UploadTooLarge as exc:

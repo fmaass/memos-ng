@@ -4,13 +4,16 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from app import auth
 from app.config import settings
 from app.csrf import canonical_origin
+from app.database import engine as async_engine
 from app.main import app
 from app.models import Upload
 from app.services import uploads as svc
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, text
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import create_engine, event, select, text
 
 from tests.conftest import SYNC_URL
 
@@ -870,6 +873,111 @@ async def test_failed_append_cannot_destroy_a_concurrent_appends_bytes(adb, monk
     # a later append still carrying the stale offset is a replay no-op, not a second write at 0
     await svc.append_stream(adb, up, 0, _chunks([b"C" * 500]))
     assert up.bytes_received == 500 and part.read_bytes() == b"A" * 500
+
+
+def _cookie_client(client) -> AsyncClient:
+    """An async client on the SAME cookie session as the `logged_in_client` TestClient, so a PATCH
+    can stream an async-generator body (TestClient cannot) and no PAT bookkeeping task opens a
+    connection of its own. The login flow leaves more than one cookie of that name in the jar; the
+    LAST one is the live session (tests/test_lock_protocol_concurrency.py `_async_client`)."""
+    sid = [c.value for c in client.cookies.jar if c.name == auth.SID_COOKIE][-1]
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+        headers={"Origin": canonical_origin()},
+        cookies={auth.SID_COOKIE: sid or ""},
+    )
+
+
+async def test_append_holds_no_connection_while_its_body_spools(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # MEMNG-621: a PATCH used to keep its lookup transaction — and so a pooled connection — open
+    # for as long as the client took to send the body, so a handful of slow uploads could drain
+    # the pool for every other request. Mid-body, every connection checked out must be back.
+    # Counted with pool events because tests run on NullPool, which has no `checkedout()`.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    counts = {"checkout": 0, "checkin": 0}
+    mid_body: dict[str, int] = {}
+
+    def on_checkout(*_):
+        counts["checkout"] += 1
+
+    def on_checkin(*_):
+        counts["checkin"] += 1
+
+    async def body():
+        yield b"a" * 100
+        mid_body.update(counts)  # the route is now inside the spool, waiting for more bytes
+        yield b"b" * 100
+
+    try:
+        uid = _start(client, "held.bin", "application/octet-stream", 200)
+        target = async_engine.sync_engine
+        event.listen(target, "checkout", on_checkout)
+        event.listen(target, "checkin", on_checkin)
+        try:
+            async with _cookie_client(client) as ac:
+                r = await ac.patch(
+                    f"/api/uploads/{uid}", content=body(), headers={"Upload-Offset": "0"}
+                )
+        finally:
+            event.remove(target, "checkout", on_checkout)
+            event.remove(target, "checkin", on_checkin)
+        assert r.status_code == 200, r.text
+        assert r.headers["Upload-Offset"] == "200"
+        assert mid_body["checkout"] >= 1  # the auth + lookup really did use a connection
+        assert mid_body["checkin"] == mid_body["checkout"], mid_body
+        assert svc.part_path(uid).read_bytes() == b"a" * 100 + b"b" * 100
+    finally:
+        _cleanup()
+
+
+async def test_concurrent_http_appends_at_one_offset_land_only_the_winner(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # Without a connection held across the body, two PATCHes at one offset can both be mid-body at
+    # once, each on its own DB session. The one that merges second must re-decide against the
+    # offset the first COMMITTED — a replay no-op answering 200 (the route is not strict_offset, so
+    # a 409 here would be a protocol change) — and must not write its bytes over the winner's.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    a_in_flight, b_in_flight, a_answered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def a_body():
+        yield b"A" * 300
+        a_in_flight.set()
+        await b_in_flight.wait()  # both bodies are now half-sent at offset 0
+        yield b"A" * 300
+
+    async def b_body():
+        yield b"B" * 200
+        b_in_flight.set()
+        await a_answered.wait()  # ... A merges and commits here
+        yield b"B" * 200
+
+    try:
+        uid = _start(client, "race.bin", "application/octet-stream", 1000)
+        async with _cookie_client(client) as ca, _cookie_client(client) as cb:
+            b_task = asyncio.create_task(
+                cb.patch(f"/api/uploads/{uid}", content=b_body(), headers={"Upload-Offset": "0"})
+            )
+            # Bounded: a server that serialized the two requests would park A on B forever.
+            a = await asyncio.wait_for(
+                ca.patch(f"/api/uploads/{uid}", content=a_body(), headers={"Upload-Offset": "0"}),
+                timeout=30,
+            )
+            a_answered.set()
+            b = await asyncio.wait_for(b_task, timeout=30)
+        assert (a.status_code, b.status_code) == (200, 200), (a.text, b.text)
+        assert a.headers["Upload-Offset"] == "600"
+        assert b.headers["Upload-Offset"] == "600"  # the winner's offset, not B's own 400
+        assert svc.part_path(uid).read_bytes() == b"A" * 600
+        assert _upload_row(uid)[0] == 600
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+    finally:
+        _cleanup()
 
 
 def test_append_rejects_body_over_declared_size(logged_in_client, monkeypatch, tmp_path):
