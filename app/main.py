@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from prometheus_client import REGISTRY
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import text as sa_text
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.gzip import GZipMiddleware
@@ -375,6 +376,54 @@ def collapse_nullable_anyof(
             collapse_nullable_anyof(value, f"{path}/{index}", root, inlining)
 
 
+POOL_RETRY_AFTER_SECONDS = 5
+DATABASE_BUSY = "DatabaseBusy"
+DATABASE_BUSY_HEAD = "DatabaseBusyHead"
+_OPERATION_METHODS = frozenset({"get", "put", "post", "patch", "delete", "head", "options"})
+
+
+def _database_busy_response(*, body: bool) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "description": "The server could not get a database connection in time. Resend the "
+        "request after Retry-After seconds.",
+        "headers": {
+            "Retry-After": {
+                "description": "Seconds to wait before sending the request again.",
+                "schema": {"type": "integer"},
+            }
+        },
+    }
+    if body:
+        response["content"] = {
+            "application/json": {
+                "schema": {"type": "object", "properties": {"detail": {"type": "string"}}}
+            }
+        }
+    return response
+
+
+def attach_database_busy_responses(schema: dict[str, Any]) -> None:
+    """Publish the pool-exhaustion 503 (`_pool_exhausted` below) on every operation.
+
+    Any route that touches the database can answer it, so it is declared here once rather than per
+    route. An operation that already declares a 503 of its own keeps it untouched: the typed memo
+    create/edit 503s are part of the vendored native contract, and neither replacing their schema
+    nor widening it to a union is an additive change. HEAD operations get a body-less variant,
+    because a HEAD answer carries no body to describe (the reason the offset HEAD declares none).
+    """
+    responses = schema.setdefault("components", {}).setdefault("responses", {})
+    responses[DATABASE_BUSY] = _database_busy_response(body=True)
+    responses[DATABASE_BUSY_HEAD] = _database_busy_response(body=False)
+    for item in schema["paths"].values():
+        for method, operation in item.items():
+            if method not in _OPERATION_METHODS:
+                continue
+            name = DATABASE_BUSY_HEAD if method == "head" else DATABASE_BUSY
+            operation.setdefault("responses", {}).setdefault(
+                "503", {"$ref": f"#/components/responses/{name}"}
+            )
+
+
 def custom_openapi() -> dict[str, Any]:
     """The served schema, the two credentials the API accepts, and where each one is required.
 
@@ -390,6 +439,7 @@ def custom_openapi() -> dict[str, Any]:
         schema.setdefault("components", {})["securitySchemes"] = SECURITY_SCHEMES
         collapse_nullable_anyof(schema)
         attach_route_security(schema, app.routes)
+        attach_database_busy_responses(schema)
         app.openapi_schema = schema
     return app.openapi_schema
 
@@ -438,6 +488,19 @@ class SecurityHeadersMiddleware:
 async def _invalid_cursor(request: Request, exc: InvalidCursor) -> JSONResponse:
     logger.info("invalid_cursor", path=request.url.path, reason=str(exc))
     return JSONResponse(status_code=422, content={"detail": "Invalid cursor"})
+
+
+# A request that waited DB_POOL_TIMEOUT for a pooled connection and got none is overload, not a
+# fault of that request: answer it with a status and a pause a client can act on instead of a bare
+# 500, and log it, because exhaustion is a hold-time bug to find, not a wait to tune.
+@app.exception_handler(sa_exc.TimeoutError)
+async def _pool_exhausted(request: Request, exc: sa_exc.TimeoutError) -> JSONResponse:
+    logger.warning("db.pool_exhausted", path=request.url.path)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database busy; retry later"},
+        headers={"Retry-After": str(POOL_RETRY_AFTER_SECONDS)},
+    )
 
 
 # Order matters: `add_middleware` inserts at the OUTSIDE of the stack, so the last one added runs

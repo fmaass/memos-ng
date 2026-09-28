@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     # queue silently and hang the feed. Exhaustion is a hold-time bug to fix, not a wait to tune.
     DB_POOL_TIMEOUT: int = 10
 
+    # Upload bodies streamed at once, per user and in total, before a PATCH to /api/uploads/{uid}
+    # is answered 429 with this Retry-After. A body holds its request for as long as the client
+    # takes to send it, so a burst of slow uploads is the one load that answering fast cannot
+    # shed. The counters live in process memory, per uvicorn worker: one worker today, and a
+    # second worker would double the effective caps.
+    UPLOAD_BODIES_PER_USER: int = 3
+    UPLOAD_BODIES_PER_PROCESS: int = 6
+    UPLOAD_RETRY_AFTER_SECONDS: int = 2
+
     # Derived media tiers are immutable (uid-keyed) — let browsers cache them hard so re-renders
     # of the feed/gallery don't re-request every image (1 year, immutable).
     ASSET_CACHE_SECONDS: int = 31536000

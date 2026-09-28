@@ -2681,7 +2681,30 @@ export interface components {
          */
         Visibility: "PRIVATE" | "PROTECTED" | "PUBLIC";
     };
-    responses: never;
+    responses: {
+        /** @description The server could not get a database connection in time. Resend the request after Retry-After seconds. */
+        DatabaseBusy: {
+            headers: {
+                /** @description Seconds to wait before sending the request again. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": {
+                    detail?: string;
+                };
+            };
+        };
+        /** @description The server could not get a database connection in time. Resend the request after Retry-After seconds. */
+        DatabaseBusyHead: {
+            headers: {
+                /** @description Seconds to wait before sending the request again. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content?: never;
+        };
+    };
     parameters: never;
     requestBodies: never;
     headers: never;
@@ -2707,6 +2730,7 @@ export interface operations {
                     "application/json": components["schemas"]["DigestHostingOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     preview_digest_api_admin_digest_preview_get: {
@@ -2727,6 +2751,7 @@ export interface operations {
                     "application/json": components["schemas"]["DigestPreviewOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_digest_recipients_api_admin_digest_recipients_get: {
@@ -2747,6 +2772,7 @@ export interface operations {
                     "application/json": components["schemas"]["DigestRecipientOut"][];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     add_digest_recipient_api_admin_digest_recipients_post: {
@@ -2780,6 +2806,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     remove_digest_recipient_api_admin_digest_recipients__recipient_id__delete: {
@@ -2809,6 +2836,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     update_digest_recipient_api_admin_digest_recipients__recipient_id__patch: {
@@ -2844,6 +2872,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     run_digest_now_api_admin_digest_run_post: {
@@ -2866,6 +2895,7 @@ export interface operations {
                     "application/json": components["schemas"]["DigestRunClaimOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_digest_runs_api_admin_digest_runs_get: {
@@ -2899,6 +2929,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     get_digest_run_api_admin_digest_runs__run_id__get: {
@@ -2930,6 +2961,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     get_digest_settings_api_admin_digest_settings_get: {
@@ -2950,6 +2982,7 @@ export interface operations {
                     "application/json": components["schemas"]["DigestSettingsOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     put_digest_settings_api_admin_digest_settings_put: {
@@ -2983,6 +3016,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     test_send_digest_api_admin_digest_test_send_post: {
@@ -3016,6 +3050,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     get_export_settings_api_admin_export_settings_get: {
@@ -3036,6 +3071,7 @@ export interface operations {
                     "application/json": components["schemas"]["ExportSettingsOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     put_export_settings_api_admin_export_settings_put: {
@@ -3069,6 +3105,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_attachments_api_attachments_get: {
@@ -3106,6 +3143,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     attachment_buckets_api_attachments_buckets_get: {
@@ -3140,6 +3178,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     attachment_tags_api_attachments_tags_get: {
@@ -3171,6 +3210,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     attachment_meta_api_attachments__uid__get: {
@@ -3202,6 +3242,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     delete_attachment_api_attachments__uid__delete: {
@@ -3231,6 +3272,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     upload_print_api_attachments__uid__print_post: {
@@ -3266,6 +3308,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     serve_rendition_api_attachments__uid__rendition__variant_key__get: {
@@ -3298,6 +3341,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     delete_rendition_api_attachments__uid__rendition__variant_key__delete: {
@@ -3328,6 +3372,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_renditions_api_attachments__uid__renditions_get: {
@@ -3359,6 +3404,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     attach_rendition_api_attachments__uid__renditions_post: {
@@ -3394,6 +3440,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     serve_asset_api_attachments__uid___tier__get: {
@@ -3431,6 +3478,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     logout_api_auth_logout_post: {
@@ -3451,6 +3499,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     native_exchange_api_auth_native_exchange_post: {
@@ -3484,6 +3533,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     native_logout_api_auth_native_logout_post: {
@@ -3502,6 +3552,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     native_manage_grant_api_auth_native_manage_grant_post: {
@@ -3535,6 +3586,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     native_renew_api_auth_native_renew_post: {
@@ -3555,6 +3607,7 @@ export interface operations {
                     "application/json": components["schemas"]["NativeExchangeOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     native_token_api_auth_native_token_get: {
@@ -3575,6 +3628,7 @@ export interface operations {
                     "application/json": components["schemas"]["NativeTokenOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     rename_native_token_api_auth_native_token_patch: {
@@ -3608,6 +3662,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     whoami_api_auth_user_get: {
@@ -3628,6 +3683,7 @@ export interface operations {
                     "application/json": components["schemas"]["UserOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     events_api_events_get: {
@@ -3648,6 +3704,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     export_memos_api_export_get: {
@@ -3686,6 +3743,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     export_photobook_api_exports_photobook_get: {
@@ -3724,6 +3782,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     serve_basemap_asset_api_map_assets__path__get: {
@@ -3755,6 +3814,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     basemap_manifest_api_map_manifest_get: {
@@ -3775,6 +3835,7 @@ export interface operations {
                     "application/json": components["schemas"]["MapManifest"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_markers_api_map_markers_get: {
@@ -3795,6 +3856,7 @@ export interface operations {
                     "application/json": components["schemas"]["MapMarkerList"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     serve_basemap_archive_api_map_tiles__name__get: {
@@ -3826,6 +3888,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     serve_basemap_archive_api_map_tiles__name__head: {
@@ -3857,6 +3920,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusyHead"];
         };
     };
     list_members_api_members_get: {
@@ -3877,6 +3941,7 @@ export interface operations {
                     "application/json": components["schemas"]["MemberOut"][];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_memos_api_memos_get: {
@@ -3920,6 +3985,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     create_memo_api_memos_post: {
@@ -4002,6 +4068,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     delete_memo_api_memos__uid__delete: {
@@ -4040,6 +4107,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     patch_memo_api_memos__uid__patch: {
@@ -4133,6 +4201,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     react_api_memos__uid__reactions_post: {
@@ -4168,6 +4237,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     unreact_api_memos__uid__reactions__emoji__delete: {
@@ -4200,6 +4270,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     unpin_memo_api_memos__uid__unpin_post: {
@@ -4231,6 +4302,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_pats_api_pats_get: {
@@ -4251,6 +4323,7 @@ export interface operations {
                     "application/json": components["schemas"]["PatOut"][];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     create_pat_api_pats_post: {
@@ -4284,6 +4357,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     revoke_pat_api_pats__pat_id__delete: {
@@ -4313,6 +4387,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     subscribe_api_push_subscribe_post: {
@@ -4344,6 +4419,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     unsubscribe_api_push_subscribe_delete: {
@@ -4375,6 +4451,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     vapid_public_key_api_push_vapid_public_key_get: {
@@ -4395,6 +4472,7 @@ export interface operations {
                     "application/json": components["schemas"]["VapidKeyOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     get_settings_api_settings_get: {
@@ -4415,6 +4493,7 @@ export interface operations {
                     "application/json": components["schemas"]["SettingsOut"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     update_settings_api_settings_patch: {
@@ -4448,6 +4527,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     stats_heatmap_api_stats_heatmap_get: {
@@ -4470,6 +4550,7 @@ export interface operations {
                     };
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_tags_api_tags_get: {
@@ -4490,6 +4571,7 @@ export interface operations {
                     "application/json": components["schemas"]["TagCount"][];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     start_upload_api_uploads_post: {
@@ -4523,6 +4605,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     upload_offset_api_uploads__upload_uid__head: {
@@ -4554,6 +4637,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusyHead"];
         };
     };
     append_chunk_api_uploads__upload_uid__patch: {
@@ -4604,6 +4688,20 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            /** @description Too many uploads are streaming at once, for this account or for the server. The body was not read and nothing was stored; resend the same request after Retry-After seconds. */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before sending the request again. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     upload_capture_api_uploads__upload_uid__capture_get: {
@@ -4635,6 +4733,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     finalize_upload_api_uploads__upload_uid__finalize_post: {
@@ -4666,6 +4765,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_memos_compat_api_v1_memos_get: {
@@ -4699,6 +4799,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     get_memo_compat_api_v1_memos__memo_id__get: {
@@ -4730,6 +4831,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     serve_file_compat_file_attachments__uid___filename__get: {
@@ -4764,6 +4866,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     health_health_get: {
@@ -4784,6 +4887,7 @@ export interface operations {
                     "application/json": components["schemas"]["HealthResponse"];
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     privacy_privacy_get: {
@@ -4804,6 +4908,7 @@ export interface operations {
                     "text/html": string;
                 };
             };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
 }
