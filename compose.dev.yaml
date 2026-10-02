@@ -1,6 +1,8 @@
 services:
   db:
     image: postgres:17
+    labels:
+      - wud.watch=false
     environment:
       POSTGRES_USER: memosng
       POSTGRES_PASSWORD: memosng
