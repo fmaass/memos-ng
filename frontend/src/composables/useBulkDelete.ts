@@ -12,25 +12,29 @@ export interface BulkDeleteResult {
   unattempted: string[]
 }
 
+// One attachment delete, true only when the server answered 2xx. A 404 is a failure: already
+// deleted, deleted concurrently and not mine all answer 404, and the client cannot tell them apart.
+// The STATUS decides, not openapi-fetch's `error` — a 404 without a body comes back as `error: ''`
+// (or `undefined` under `Content-Length: 0`), which is falsy. A request that got no answer fails too.
+export async function deleteAttachment(api: ReturnType<typeof useApi>, uid: string): Promise<boolean> {
+  try {
+    const { response } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
 // ONE delete at a time, like the memo card's "Remove all" (MemoFeed): a parallel fan-out would take
 // a pooled DB connection per request and exhaust the bounded shared pool. The first failure stops
-// the batch, and a 404 is a failure: already deleted, deleted concurrently and not mine all answer
-// 404, and the client cannot tell them apart. The STATUS decides, not openapi-fetch's `error` — a
-// 404 without a body comes back as `error: ''`, which is falsy.
+// the batch.
 export async function bulkDelete(
   api: ReturnType<typeof useApi>,
   uids: readonly string[],
 ): Promise<BulkDeleteResult> {
   const done: string[] = []
   for (const [i, uid] of uids.entries()) {
-    let ok = false
-    try {
-      const { response } = await api.DELETE('/api/attachments/{uid}', { params: { path: { uid } } })
-      ok = response.ok
-    } catch {
-      ok = false
-    }
-    if (!ok) return { done, failed: uid, unattempted: uids.slice(i + 1) }
+    if (!(await deleteAttachment(api, uid))) return { done, failed: uid, unattempted: uids.slice(i + 1) }
     done.push(uid)
   }
   return { done, failed: null, unattempted: [] }

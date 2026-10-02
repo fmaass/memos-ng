@@ -35,6 +35,30 @@ export function mosaicSlots(n: number, offset = 0): MosaicSlot[] {
   return out
 }
 
+// The All view's day blocks (plan decision 13 and its 20:05 amendment) walk the same patterns in the
+// order A B C B D, and a day starts one step later than the day before it (`dayIndex`, counted
+// across month boundaries), so neighbouring days never open alike. A pattern is placed whole or
+// not at all: a remainder too short for the next one is squares, a single leftover one wide frame,
+// and a day of one or two pictures is wide frames only.
+const DAY_CYCLE: readonly (readonly MosaicSlot[])[] = [PATTERNS[0]!, PATTERNS[1]!, PATTERNS[2]!, PATTERNS[1]!, PATTERNS[3]!]
+
+export function daySlots(n: number, dayIndex = 0): MosaicSlot[] {
+  if (n <= 2) return Array.from({ length: Math.max(n, 0) }, () => 'wide' as const)
+  const out: MosaicSlot[] = []
+  let p = ((dayIndex % DAY_CYCLE.length) + DAY_CYCLE.length) % DAY_CYCLE.length
+  while (out.length < n) {
+    const pattern = DAY_CYCLE[p]!
+    const left = n - out.length
+    if (left < pattern.length) {
+      out.push(...(left === 1 ? (['wide'] as const) : Array.from({ length: left }, () => 'square' as const)))
+      break
+    }
+    out.push(...pattern)
+    p = (p + 1) % DAY_CYCLE.length
+  }
+  return out
+}
+
 const byDate = (a: DayBucket, b: DayBucket) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
 
 // The `cap` days with the most items; a tie goes to the later day (keys are ISO dates, so string

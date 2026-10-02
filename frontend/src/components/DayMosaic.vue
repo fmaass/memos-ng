@@ -29,6 +29,7 @@ const sections = computed(() =>
       v-for="section in sections"
       :key="section.key"
       class="flex flex-col gap-2"
+      :data-month="section.key"
       data-test="mosaic-section"
     >
       <h2 class="px-4 text-xl font-bold md:px-0" data-test="mosaic-title">{{ section.label }}</h2>

@@ -212,7 +212,7 @@ async def test_memo_out_serializes_attachment_tier_urls(adb):
     )
     # Re-select so the selectin attachments/owner/tags relationships are eagerly loaded.
     m2 = (await adb.execute(select(Memo).where(Memo.uid == memo.uid))).scalar_one()
-    out = _out(m2, alice.id)
+    out = _out(m2, alice.id, frozenset())
     assert len(out.attachments) == 1
     a = out.attachments[0]
     assert a.uid == "att1" and a.status is AttachmentStatus.processing and a.blurhash == "LKO2"
@@ -220,6 +220,7 @@ async def test_memo_out_serializes_attachment_tier_urls(adb):
     assert a.thumbnailUrl.split("?")[0] == "/api/attachments/att1/thumb"
     assert "sig=" in a.thumbnailUrl
     assert a.webUrl.split("?")[0] == "/api/attachments/att1/web"
+    assert a.webReady is False  # still processing: the URL is minted, the file is not there
     assert a.posterUrl.split("?")[0] == "/api/attachments/att1/poster"
     assert a.downloadUrl == "/api/attachments/att1/original"
 

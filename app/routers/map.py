@@ -27,6 +27,7 @@ Three things about the shape of the archive routes are deliberate:
 
 import mimetypes
 import re
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -42,7 +43,7 @@ from app.database import async_session, get_session
 from app.models import Attachment, User
 from app.routers.memos import AttachmentRef, _att_ref
 from app.services import map_coverage, map_markers
-from app.services.asset_paths import tiles_dir
+from app.services.asset_paths import tiles_dir, web_ready_uids
 
 router = APIRouter(prefix="/api/map", tags=["map"])
 
@@ -114,10 +115,12 @@ class MapManifest(BaseModel):
     uncovered: int | None
 
 
-def _marker(att: Attachment, memo_uid: str, taken_at, user_id: int) -> MapMarker:
+def _marker(
+    att: Attachment, memo_uid: str, taken_at, user_id: int, web_ready: AbstractSet[str]
+) -> MapMarker:
     assert att.latitude is not None and att.longitude is not None  # noqa: S101 — the query's filter
     return MapMarker(
-        **_att_ref(att, user_id).model_dump(),
+        **_att_ref(att, user_id, web_ready).model_dump(),
         memo_uid=memo_uid,
         latitude=att.latitude,
         longitude=att.longitude,
@@ -227,8 +230,9 @@ async def list_markers(
 ) -> MapMarkerList:
     """Every located photo the caller may see, oldest first."""
     rows = await map_markers.located_markers(db, user)
+    ready = await web_ready_uids(att for att, _, _ in rows)
     return MapMarkerList(
-        markers=[_marker(att, memo_uid, when, user.id) for att, memo_uid, when in rows]
+        markers=[_marker(att, memo_uid, when, user.id, ready) for att, memo_uid, when in rows]
     )
 
 

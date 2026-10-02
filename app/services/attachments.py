@@ -83,10 +83,11 @@ def bucket_key(start: datetime, size: BucketSize) -> str:
 
 async def library_buckets(
     db: AsyncSession, user: User, size: BucketSize, tz: str, kind: str | None, tag: str | None
-) -> list[tuple[str, int, str]]:
-    """(key, count, cover uid) per calendar bucket of `tz`, newest first. The cover is the
-    bucket's newest row by (taken_at, id) among the rows the filters ADMITTED — it is picked in
+) -> list[tuple[str, int, str, str]]:
+    """(key, count, cover uid, cover mime) per calendar bucket of `tz`, newest first. The cover is
+    the bucket's newest row by (taken_at, id) among the rows the filters ADMITTED — it is picked in
     the same statement, after the visibility predicate, so no excluded row can ever be a cover.
+    Its mime rides along from the same ranked row: a video cover is shown by its poster.
 
     `AT TIME ZONE` converts before `date_trunc`: every link of the chain is `timestamptz`, so an
     item at 22:30Z on 31 August is 00:30 on 1 September in Zurich and lands there. The bucket is
@@ -97,6 +98,7 @@ async def library_buckets(
         select(
             Attachment.id.label("id"),
             Attachment.uid.label("uid"),
+            Attachment.mime.label("mime"),
             taken.label("taken"),
             func.date_trunc(size, func.timezone(tz, taken)).label("bucket"),
         )
@@ -108,17 +110,20 @@ async def library_buckets(
     ranked = select(
         rows.c.bucket,
         rows.c.uid,
+        rows.c.mime,
         func.count().over(partition_by=rows.c.bucket).label("n"),
         func.row_number()
         .over(partition_by=rows.c.bucket, order_by=(rows.c.taken.desc(), rows.c.id.desc()))
         .label("rank"),
     ).subquery()
     stmt = (
-        select(ranked.c.bucket, ranked.c.n, ranked.c.uid)
+        select(ranked.c.bucket, ranked.c.n, ranked.c.uid, ranked.c.mime)
         .where(ranked.c.rank == 1)
         .order_by(ranked.c.bucket.desc())
     )
-    return [(bucket_key(b, size), n, uid) for b, n, uid in (await db.execute(stmt)).all()]
+    return [
+        (bucket_key(b, size), n, uid, mime) for b, n, uid, mime in (await db.execute(stmt)).all()
+    ]
 
 
 async def library_tag_counts(

@@ -1,5 +1,41 @@
 {
   "components": {
+    "responses": {
+      "DatabaseBusy": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          }
+        },
+        "description": "The server could not get a database connection in time. Resend the request after Retry-After seconds.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before sending the request again.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "DatabaseBusyHead": {
+        "description": "The server could not get a database connection in time. Resend the request after Retry-After seconds.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before sending the request again.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
     "schemas": {
       "AttachmentBucket": {
         "properties": {
@@ -115,6 +151,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -145,6 +185,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl",
           "downloadUrl",
           "printUrl"
@@ -270,6 +311,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -306,6 +351,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl"
         ],
         "title": "AttachmentMeta",
@@ -518,6 +564,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -550,6 +600,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl",
           "downloadUrl",
           "printUrl"
@@ -1783,6 +1834,10 @@
             "title": "Uid",
             "type": "string"
           },
+          "webReady": {
+            "title": "Webready",
+            "type": "boolean"
+          },
           "webUrl": {
             "title": "Weburl",
             "type": "string"
@@ -1815,6 +1870,7 @@
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
+          "webReady",
           "posterUrl",
           "downloadUrl",
           "printUrl",
@@ -3044,6 +3100,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3071,6 +3130,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3101,6 +3163,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3145,6 +3210,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3185,6 +3253,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3240,6 +3311,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3275,6 +3349,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3348,6 +3425,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3396,6 +3476,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3422,6 +3505,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3467,6 +3553,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3514,6 +3603,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3540,6 +3632,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3585,6 +3680,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3698,6 +3796,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3716,7 +3817,7 @@
     },
     "/api/attachments/buckets": {
       "get": {
-        "description": "The library the list shows \u2014 same visibility, same `type` and `tag` filters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail.",
+        "description": "The library the list shows \u2014 same visibility, same `type` and `tag` filters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail \u2014\nfor a video its poster frame, the one picture a video has.",
         "operationId": "attachment_buckets_api_attachments_buckets_get",
         "parameters": [
           {
@@ -3792,6 +3893,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3850,6 +3954,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3894,6 +4001,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -3942,6 +4052,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4003,6 +4116,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4056,6 +4172,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4112,6 +4231,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4167,6 +4289,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4226,6 +4351,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4331,6 +4459,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4359,6 +4490,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "summary": "Logout",
@@ -4401,6 +4535,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "summary": "Native Exchange",
@@ -4416,6 +4553,9 @@
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4463,6 +4603,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "summary": "Native Manage Grant",
@@ -4485,6 +4628,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4512,6 +4658,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4557,6 +4706,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4583,6 +4735,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4610,6 +4765,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4751,6 +4909,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4887,6 +5048,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4936,6 +5100,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4966,6 +5133,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -4996,6 +5166,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5045,6 +5218,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5092,6 +5268,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusyHead"
           }
         },
         "security": [
@@ -5126,6 +5305,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5309,6 +5491,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5429,6 +5614,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5477,6 +5665,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5623,6 +5814,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5683,6 +5877,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5742,6 +5939,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5792,6 +5992,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5825,6 +6028,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5872,6 +6078,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5915,6 +6124,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5957,6 +6169,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -5997,6 +6212,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6027,6 +6245,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "summary": "Vapid Public Key",
@@ -6048,6 +6269,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6095,6 +6319,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6128,6 +6355,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6161,6 +6391,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6210,6 +6443,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6261,6 +6497,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusyHead"
           }
         },
         "security": [
@@ -6354,6 +6593,32 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Too many uploads are streaming at once, for this account or for the server. The body was not read and nothing was stored; resend the same request after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before sending the request again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6405,6 +6670,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6455,6 +6723,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6528,6 +6799,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6574,6 +6848,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6640,6 +6917,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "security": [
@@ -6667,6 +6947,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "summary": "Health"
@@ -6686,6 +6969,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
           }
         },
         "summary": "Privacy"

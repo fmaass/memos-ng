@@ -1073,14 +1073,11 @@ def test_aasa_emits_applinks_when_the_switch_asks_for_it(client, monkeypatch):
     assert body["applinks"]["details"] == [
         {
             "appIDs": ["ABCDE12345.live.discomarder.memosng"],
-            "components": [
-                {"/": "/ios/auth/callback*"},
-                {"/": "/m/*"},
-            ],
+            "components": [{"/": "/ios/auth/callback*"}],
         }
     ]
-    # Claiming the permalink must not cost the credential claim: both sections travel in the one
-    # document Apple caches, so dropping either is a silent regression on the served file.
+    # Claiming the login callback must not cost the credential claim: both sections travel in the
+    # one document Apple caches, so dropping either is a silent regression on the served file.
     assert body["webcredentials"] == {"apps": ["ABCDE12345.live.discomarder.memosng"]}
 
 
@@ -1146,19 +1143,18 @@ def test_aasa_document_emits_only_the_requested_sections():
 
 
 @pytest.mark.real_clock
-def test_applinks_claims_both_the_callback_and_the_memo_permalink():
-    """Drift guard: the app is entitled to two URL families, and losing either is invisible until
-    a device stops opening one of them. The callback is what a device login lands on; /m/* is the
-    memo permalink shared out of the app. Both are claimed for the same app id."""
+def test_applinks_claims_only_the_login_callback():
+    """Drift guard: the login callback is the one URL family the app is entitled to. Losing it is
+    invisible until a device login stops landing in the app; claiming anything more (the memo
+    permalink was once claimed here) promises Apple's CDN a universal link the app no longer
+    handles, because the custom scheme is the permanent deep-link lane."""
     details = native_auth.aasa_document("T", "b", ["applinks"])["applinks"]["details"]
 
-    # One entry carrying both components — not two entries, where the second silently shadows.
+    # One entry, one component, and no `"exclude": true` flag that would claim the pattern and
+    # then hand it straight back to the browser.
     assert len(details) == 1
     assert details[0]["appIDs"] == ["T.b"]
-    assert [c["/"] for c in details[0]["components"]] == ["/ios/auth/callback*", "/m/*"]
-    # No component is an exclusion: an `"exclude": true` entry would claim the pattern and then
-    # hand it straight back to the browser.
-    assert all(set(c) == {"/"} for c in details[0]["components"])
+    assert details[0]["components"] == [{"/": "/ios/auth/callback*"}]
 
 
 @pytest.mark.real_clock

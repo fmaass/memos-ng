@@ -1197,10 +1197,17 @@ def slow_ffmpeg_cmd(src: str, dest: str, threads: int) -> list[str]:
       drop the audio track from every transcoded clip. The trailing `?` is load-bearing too: the
       map is otherwise fatal on a source with no audio ("Stream map '' matches no streams",
       exit 234) — which is most phone screen recordings, and every fixture in this test suite.
+
+    `-threads` appears twice because ffmpeg options are positional: before `-i` it is an INPUT
+    option and bounds the decoder, after it an OUTPUT option and bounds libx264. The output one
+    alone left decoding on ffmpeg's auto thread count, which on a 1080p120 source pushed a
+    "one-thread" transcode to 3.8 cores (measured 2026-09-27, see WORKER_TRANSCODE_CPU_COST).
     """
     return [
         "ffmpeg",
         "-y",
+        "-threads",
+        str(threads),
         "-i",
         src,
         "-map",

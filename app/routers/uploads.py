@@ -30,6 +30,47 @@ def _upload_offset_header() -> dict[str, Any]:
     }
 
 
+def _retry_after_header() -> dict[str, Any]:
+    return {
+        "Retry-After": {
+            "description": "Seconds to wait before sending the request again.",
+            "schema": {"type": "integer"},
+        }
+    }
+
+
+class BodyAdmission:
+    """How many upload bodies are streaming right now, per user and in total."""
+
+    def __init__(self) -> None:
+        self.per_user: dict[int, int] = {}
+        self.total = 0
+
+    def admit(self, user_id: int) -> bool:
+        # No lock: every request runs on the one event loop, and nothing between the check and the
+        # increment awaits, so no other request can interleave there.
+        held = self.per_user.get(user_id, 0)
+        if (
+            held >= settings.UPLOAD_BODIES_PER_USER
+            or self.total >= settings.UPLOAD_BODIES_PER_PROCESS
+        ):
+            return False
+        self.per_user[user_id] = held + 1
+        self.total += 1
+        return True
+
+    def release(self, user_id: int) -> None:
+        held = self.per_user[user_id] - 1
+        if held:
+            self.per_user[user_id] = held
+        else:
+            del self.per_user[user_id]
+        self.total -= 1
+
+
+body_admission = BodyAdmission()
+
+
 class UploadCreate(BaseModel):
     filename: str
     mime: str
@@ -157,6 +198,20 @@ async def start_upload(
                     }
                 },
             },
+            "429": {
+                "description": "Too many uploads are streaming at once, for this account or for "
+                "the server. The body was not read and nothing was stored; resend the same "
+                "request after Retry-After seconds.",
+                "headers": _retry_after_header(),
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"detail": {"type": "string"}},
+                        }
+                    }
+                },
+            },
         },
     },
 )
@@ -169,25 +224,43 @@ async def append_chunk(
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
 ) -> UploadOut:
     upload = await _get_upload(db, upload_uid, user.id)
-    try:
-        appended = await svc.append_stream(db, upload, upload_offset, request.stream())
-    except svc.UploadTooLarge as exc:
-        cap = settings.MAX_UPLOAD_MIB * 1024 * 1024
-        detail = (
-            f"Upload exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
-            if exc.total > cap
-            else f"Upload exceeds its declared size of {upload.declared_size} bytes"
-        )
-        raise HTTPException(status_code=413, detail=detail) from None
-    except ValueError:
-        raise HTTPException(status_code=409, detail="Offset gap; re-sync via HEAD") from None
-    if appended is None:
-        # The session was consumed (or reaped) while this append waited for its row. Same answer as
-        # an unknown uid — because that is what it now is — rather than the 500 `.scalar_one()`
-        # used to raise on the very interleaving the row lock exists to make safe.
-        raise HTTPException(status_code=404, detail="Upload not found")
-    upload = appended.upload
+    # End the lookup transaction before the body arrives: left open, it pins a pooled connection
+    # for as long as the client takes to send the bytes, and a few slow uploads drain the pool for
+    # every request (MEMNG-621). Commit, not rollback — `expire_on_commit=False` keeps `upload`
+    # readable for append_stream's snapshot checks, and its merge re-reads the row FOR UPDATE.
     await db.commit()
+    # Admission comes after the lookup because authentication and ownership need the database,
+    # and before the first read of the body: an over-cap request is refused at once, never parked
+    # waiting for a permit, and its bytes stay unread.
+    if not body_admission.admit(user.id):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many uploads in progress; retry later",
+            headers={"Retry-After": str(settings.UPLOAD_RETRY_AFTER_SECONDS)},
+        )
+    try:
+        try:
+            appended = await svc.append_stream(db, upload, upload_offset, request.stream())
+        except svc.UploadTooLarge as exc:
+            cap = settings.MAX_UPLOAD_MIB * 1024 * 1024
+            detail = (
+                f"Upload exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
+                if exc.total > cap
+                else f"Upload exceeds its declared size of {upload.declared_size} bytes"
+            )
+            raise HTTPException(status_code=413, detail=detail) from None
+        except ValueError:
+            raise HTTPException(status_code=409, detail="Offset gap; re-sync via HEAD") from None
+        if appended is None:
+            # The session was consumed (or reaped) while this append waited for its row. Same
+            # answer as an unknown uid — because that is what it now is — rather than the 500
+            # `.scalar_one()` used to raise on the very interleaving the row lock exists to make
+            # safe.
+            raise HTTPException(status_code=404, detail="Upload not found")
+        upload = appended.upload
+        await db.commit()
+    finally:
+        body_admission.release(user.id)
     if appended.kept_from_cut:
         # The client is gone and never reads this answer; the route still returns a valid
         # UploadOut, because FastAPI validates every return against `response_model`.

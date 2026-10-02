@@ -74,8 +74,22 @@ errors; a run whose summary line cannot be found is failed, not waved through.
 
 Before the loop the module is run ONCE with MEMNG267_MUTATION removed from the environment (not
 merely unset in the manifest) as the positive control; it must exit 0.
-One line is printed per mutation (`<marker>: PASS|FAIL — <reason>`), then a summary line.
-The exit status is non-zero if the control, any row, or any revert failed.
+One line is printed per mutation (`<marker>: PASS|FAIL|STALE — <reason>`), then a summary line.
+
+A PATCH THAT NO LONGER APPLIES IS STALE, NOT A SURVIVING MUTANT. Before the control, every row's
+patch is dry-run with `git apply --check`, and each one that fails is named up front as
+`<marker>: STALE — <patch> no longer applies to <target> (context drift, ...)`, so one run lists
+all of them. A stale row is not run: a neighbouring change rewrote the lines around the mutation,
+which says nothing about whether the probes still catch it. Refresh the patch against the current
+target. (tests/test_mutation_patches_apply.py makes the same check in the ordinary pytest gate.)
+
+Exit status:
+  0   the control and every row behaved as the manifest names them
+  1   the control failed, a row was judged FAIL (a surviving mutant, an error, a wrong failed
+      set, or a patch that passed the pre-check but did not apply in the loop because its target
+      changed during the run), or a revert could not be proved — this wins over 3 when both occur
+  2   refused before anything was patched (lock held, dirty target, bad manifest or argument)
+  3   nothing was judged FAIL, but one or more patches are STALE
 
 The manifest is tab-separated: patch<TAB>marker<TAB>expected_failed<TAB>sqlstate<TAB>module.
 expected_failed is a space-separated list of test ids — a bare id is read as a node of THAT ROW's
@@ -498,6 +512,19 @@ echo "check-mutations: JUnit reports go to $xmldir and are deleted on exit, havi
 
 failures=0
 
+# A dry run of every row before anything is applied, so a run names ALL stale patches at once
+# instead of one per release. `--check` writes nothing, so no revert is owed for it.
+stale=()
+stale_n=0
+for i in "${!patches[@]}"; do
+    stale[i]=0
+    if ! git apply --check "${patches[$i]}"; then
+        stale[i]=1
+        stale_n=$((stale_n + 1))
+        echo "${markers[$i]}: STALE — ${patches[$i]} no longer applies to ${targets[$i]} (context drift, not a surviving mutant)"
+    fi
+done
+
 # ------------------------------------------------------------------------------------------
 # an applied patch is reverted even if the run is interrupted or the caller set errexit
 # ------------------------------------------------------------------------------------------
@@ -587,6 +614,7 @@ for i in "${!patches[@]}"; do
     module="${modules[$i]}"
     log="$logdir/$marker.log"
     xml="$xmldir/$marker.xml"
+    [ "${stale[$i]}" -eq 0 ] || continue
 
     # Recorded BEFORE the apply, so the trap can revert whatever the apply managed to write.
     applied_patch="$patch"
@@ -597,7 +625,9 @@ for i in "${!patches[@]}"; do
     apply_rc=$?
     if [ "$apply_rc" -ne 0 ]; then
         revert_applied || exit 1
-        echo "$marker: FAIL — $patch does not apply to $target"
+        # It passed the dry run, so the target changed DURING this locked run (or the apply failed
+        # for a runtime reason): that is not pre-existing drift, and it must never pass as exit 3.
+        echo "$marker: FAIL — $patch passed the pre-check but did not apply in the loop: $target changed during the locked run"
         failures=$((failures + 1))
         continue
     fi
@@ -616,10 +646,16 @@ for i in "${!patches[@]}"; do
         failures=$((failures + 1))
 done
 
-passed=$((${#patches[@]} - failures))
-if [ "$failures" -eq 0 ]; then
-    echo "SUMMARY: $passed/${#patches[@]} mutations behaved as $MANIFEST names them, control green"
-    exit 0
+passed=$((${#patches[@]} - failures - stale_n))
+if [ "$failures" -gt 0 ]; then
+    stale_note=""
+    [ "$stale_n" -eq 0 ] || stale_note=", $stale_n STALE"
+    echo "SUMMARY: $failures/${#patches[@]} mutations did NOT behave as $MANIFEST names them$stale_note (logs in $logdir)"
+    exit 1
 fi
-echo "SUMMARY: $failures/${#patches[@]} mutations did NOT behave as $MANIFEST names them (logs in $logdir)"
-exit 1
+if [ "$stale_n" -gt 0 ]; then
+    echo "SUMMARY: $passed/${#patches[@]} mutations behaved as $MANIFEST names them, $stale_n STALE — no longer apply (context drift, refresh the patch; not a surviving mutant), control green"
+    exit 3
+fi
+echo "SUMMARY: $passed/${#patches[@]} mutations behaved as $MANIFEST names them, control green"
+exit 0

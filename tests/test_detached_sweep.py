@@ -22,7 +22,7 @@ from app.config import settings
 from app.csrf import canonical_origin
 from app.database import async_session
 from app.main import app
-from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, User
+from app.models import Attachment, AttachmentStatus, JobLane, JobState, MediaJob, Memo, User
 from app.routers import memos as memos_router
 from app.services import reclaim
 from app.services.reclaim import Revalidate, reclaim_attachment, unlink_paths
@@ -217,6 +217,54 @@ async def test_an_old_file_detached_just_now_is_not_swept(db_engine, monkeypatch
 
         assert _rows("SELECT id FROM attachments WHERE id=:a", a=att_id) == [(att_id,)]
         assert original.exists()
+    finally:
+        _cleanup()
+
+
+async def test_a_linked_row_with_a_stale_detach_instant_is_never_taken(
+    db_engine, monkeypatch, tmp_path
+):
+    """The positive control for the memo half of the predicate. The linked row carries a detach
+    instant older than the cutoff on purpose, so only `memo_id IS NULL` can keep it out of the
+    pass — and it has to be kept out at SELECTION: the lock-time re-check would refuse it as
+    relinked either way, and the row surviving could not tell those two apart. What the pass
+    handed to the reclaim can."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        stale = datetime.now(UTC) - 2 * GRACE
+        detached, gone = _seed(tmp_path, "left", detached_at=stale)
+        linked, kept = _seed(tmp_path, "linked", detached_at=stale)
+        eng = create_engine(SYNC_URL)
+        with Session(eng) as seed:
+            owner = seed.execute(text("SELECT id FROM users LIMIT 1")).scalar_one()
+            memo = Memo(uid="sweep-linked-memo", owner_id=owner)
+            seed.add(memo)
+            seed.flush()
+            seed.execute(
+                text("UPDATE attachments SET memo_id = :m WHERE id = :a"),
+                {"m": memo.id, "a": linked},
+            )
+            memo_id = memo.id
+            seed.commit()
+        eng.dispose()
+        handed: list[int] = []
+        real = reclaim.reclaim_row_shielded
+
+        async def record(attachment_id: int, *args, **kwargs):
+            handed.append(attachment_id)
+            return await real(attachment_id, *args, **kwargs)
+
+        monkeypatch.setattr(reclaim, "reclaim_row_shielded", record)
+
+        assert await worker.sweep_detached_attachments() == 1
+
+        assert handed == [detached]
+        assert _rows("SELECT id FROM attachments WHERE id=:a", a=detached) == []
+        assert not gone.exists()
+        assert _rows("SELECT id, memo_id FROM attachments WHERE id=:a", a=linked) == [
+            (linked, memo_id)
+        ]
+        assert kept.exists()
     finally:
         _cleanup()
 

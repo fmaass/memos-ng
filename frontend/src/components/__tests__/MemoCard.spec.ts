@@ -69,6 +69,7 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     thumbnailUrl: `/api/attachments/${uid}/thumb`,
     previewUrl: `/api/attachments/${uid}/mobile`,
     webUrl: `/api/attachments/${uid}/web`,
+    webReady: false,
     posterUrl: `/api/attachments/${uid}/poster`,
     downloadUrl: `/api/attachments/${uid}/original`,
     printUrl: `/api/attachments/${uid}/print`,
@@ -451,6 +452,20 @@ describe('MemoCard', () => {
     // a SINGLE bulk event (not N single deletes — those would fan out N concurrent DB connections)
     expect(wrapper.emitted('delete-attachments')).toEqual([[['img1', 'img2']]])
     expect(wrapper.emitted('delete-attachment')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  // PrimeVue's ConfirmDialog focuses its accept button unless told otherwise; with the dialog itself
+  // mounted, ResourcesView.confirm.spec shows this option is what puts the focus on Cancel.
+  it('Remove all asks its confirm to open with focus on Cancel, not on Remove all', async () => {
+    requireSpy.mockClear()
+    const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1'), imageAtt('img2')]) })
+    const editItem = await openAction(wrapper, 'memo-action-edit')
+    editItem.click()
+    await nextTick()
+    await wrapper.find('[data-test="edit-remove-all"]').trigger('click')
+    expect(requireSpy).toHaveBeenCalledTimes(1)
+    expect(requireSpy.mock.calls[0][0]).toMatchObject({ header: 'Remove all photos', defaultFocus: 'reject' })
     wrapper.unmount()
   })
 

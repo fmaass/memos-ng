@@ -11,22 +11,35 @@ import { useRoute } from 'vue-router'
 // Unlike ResourcesView.spec, nothing here fakes the query: the view's REAL query runs through the
 // REAL generated client and its middlewares, and only the transport underneath is scripted. So a
 // request the view never sends, or a header it never reads, fails these cases at the wire.
-const { transport } = vi.hoisted(() => ({
+const { transport, dayBuckets } = vi.hoisted(() => ({
   transport: vi.fn<(req: Request) => Promise<Response>>(),
+  // All asks for the DAY buckets beside its list (decision 13's heading counts). They are scripted
+  // here, apart from `transport`, so the list's own request order stays what each case scripts.
+  dayBuckets: vi.fn<(req: Request) => Promise<Response>>(),
 }))
 vi.mock('@/composables/useApi', async () => {
   const { default: createClient } = await import('openapi-fetch')
   const { authMiddleware, reachabilityMiddleware } = await import('@/api/client')
-  const client = createClient({ baseUrl: '/', fetch: (req: Request) => transport(req) })
+  const isDayBuckets = (req: Request) => {
+    const url = new URL(req.url)
+    return url.pathname === '/api/attachments/buckets' && url.searchParams.get('size') === 'day'
+  }
+  const client = createClient({
+    baseUrl: '/',
+    fetch: (req: Request) => (isDayBuckets(req) ? dayBuckets(req) : transport(req)),
+  })
   client.use(authMiddleware)
   client.use(reachabilityMiddleware)
   return { useApi: () => client }
 })
-const { route } = vi.hoisted(() => ({ route: { query: {} as Record<string, string> } }))
+const { route, routerReplace } = vi.hoisted(() => ({
+  route: { query: {} as Record<string, string> },
+  routerReplace: vi.fn(),
+}))
 vi.mock('vue-router', async () => {
   const { reactive } = await import('vue')
   const live = reactive(route)
-  return { useRouter: () => ({ push: vi.fn(), replace: vi.fn() }), useRoute: () => live }
+  return { useRouter: () => ({ push: vi.fn(), replace: routerReplace }), useRoute: () => live }
 })
 // PhotoSwipe needs a real DOM; the viewer's contract is what it is HANDED.
 const { lightboxOpen } = vi.hoisted(() => ({ lightboxOpen: vi.fn() }))
@@ -96,7 +109,10 @@ const has = (w: VueWrapper, test: string) => w.find(`[data-test="${test}"]`).exi
 describe('ResourcesView library query', () => {
   beforeEach(() => {
     transport.mockReset()
+    dayBuckets.mockReset()
+    dayBuckets.mockImplementation(async () => ok([]))
     lightboxOpen.mockReset()
+    routerReplace.mockReset()
     // A 5xx makes the reachability middleware probe /health with the global fetch; answer it here
     // so the case never reaches for a real socket.
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 200 })))
@@ -155,7 +171,7 @@ describe('ResourcesView library query', () => {
       expect(sent(1).searchParams.get('limit')).toBe(sent(0).searchParams.get('limit'))
 
       // Both pages landed, and the lightbox opened from the LAST tile walks every loaded item.
-      w.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 2)
+      await w.find('[data-uid="p2a"] [data-test="tile-open"]').trigger('click')
       expect(lightboxOpen).toHaveBeenCalledTimes(1)
       const [slides, index] = lightboxOpen.mock.calls[0]!
       expect((slides as { uid: string }[]).map((s) => s.uid)).toEqual(['p1a', 'p1b', 'p2a'])
@@ -210,7 +226,7 @@ describe('ResourcesView library query', () => {
       await settle()
 
       expect(transport).toHaveBeenCalledTimes(2)
-      expect(has(w, 'justified-gallery')).toBe(true)
+      expect(has(w, 'day-group')).toBe(true)
       expect(has(w, 'resources-page-error')).toBe(true)
       expect(has(w, 'resources-error')).toBe(false)
 
@@ -277,14 +293,14 @@ describe('ResourcesView library query', () => {
 
       expect(transport).toHaveBeenCalledTimes(2)
       expect(has(w, 'resources-error')).toBe(false)
-      expect(has(w, 'justified-gallery')).toBe(true)
+      expect(has(w, 'day-group')).toBe(true)
     })
 
     it('shows the error state when a filter change fails', async () => {
       transport.mockResolvedValueOnce(ok([row('a1')]))
       const w = mountView()
       await settle()
-      expect(has(w, 'justified-gallery')).toBe(true)
+      expect(has(w, 'day-group')).toBe(true)
 
       // The kind is picked in the header's options menu now (the inline SelectButton is gone). The
       // menu's tags request comes first, then the list for the new kind — which fails.
@@ -308,6 +324,68 @@ describe('ResourcesView library query', () => {
 
       expect(has(w, 'resources-empty')).toBe(true)
       expect(has(w, 'resources-error')).toBe(false)
+    })
+  })
+
+  describe('the empty state under a filter (MEMNG-566)', () => {
+    const emptyText = (w: VueWrapper) => w.find('[data-test="resources-empty"]').text()
+
+    it('says the Library is empty, with no clear action, when nothing filters it', async () => {
+      route.query = { order: 'oldest' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(emptyText(w)).toBe('No attachments yet.')
+      expect(has(w, 'resources-empty-clear')).toBe(false)
+    })
+
+    it('names the tag in All and clears the filter, keeping the order, on the clear action', async () => {
+      route.query = { tag: 'no-such-tag-zz', order: 'oldest' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(sent(0).searchParams.get('tag')).toBe('no-such-tag-zz')
+      expect(emptyText(w)).toContain('No pictures tagged #no-such-tag-zz.')
+
+      transport.mockResolvedValueOnce(ok([row('a1')]))
+      await w.find('[data-test="resources-empty-clear"]').trigger('click')
+      await settle()
+
+      expect(routerReplace).toHaveBeenLastCalledWith({ query: { order: 'oldest' } })
+      const refetch = sent(transport.mock.calls.length - 1)
+      expect(refetch.pathname).toBe('/api/attachments')
+      expect(refetch.searchParams.get('tag')).toBeNull()
+      expect(refetch.searchParams.get('order')).toBe('taken_asc')
+      expect(has(w, 'day-group')).toBe(true)
+    })
+
+    it('shows a tag that looks like markup as text', async () => {
+      route.query = { tag: '<b>x</b>' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(emptyText(w)).toContain('No pictures tagged #<b>x</b>.')
+      expect(w.find('[data-test="resources-empty"] b').exists()).toBe(false)
+    })
+
+    it('names the kind in a bucket view and keeps the segment on the clear action', async () => {
+      route.query = { type: 'video', view: 'years' }
+      transport.mockResolvedValueOnce(ok([]))
+      const w = mountView()
+      await settle()
+
+      expect(sent(0).pathname).toBe('/api/attachments/buckets')
+      expect(emptyText(w)).toContain('No videos match this filter.')
+
+      transport.mockResolvedValueOnce(ok([]))
+      await w.find('[data-test="resources-empty-clear"]').trigger('click')
+      await settle()
+
+      expect(routerReplace).toHaveBeenLastCalledWith({ query: { view: 'years' } })
+      expect(sent(transport.mock.calls.length - 1).searchParams.get('type')).toBeNull()
     })
   })
 
@@ -341,14 +419,12 @@ describe('ResourcesView library query', () => {
       coverThumbnailUrl: `/api/attachments/c-${key}/thumb`,
     })
 
-    it('walks the same list through the page holding the Zurich day, never the page after, and scrolls its first tile into view', async () => {
+    it('walks the same list through the page holding the Zurich day, never the page after, and scrolls its heading into view', async () => {
       route.query = { view: 'months' }
       const listRequests: URL[] = []
+      dayBuckets.mockImplementation(async () => ok([dayBucket('2026-09-02', 2), dayBucket('2026-09-01', 2)]))
       transport.mockImplementation(async (req) => {
         const url = new URL(req.url)
-        if (url.pathname === '/api/attachments/buckets') {
-          return ok([dayBucket('2026-09-02', 2), dayBucket('2026-09-01', 2)])
-        }
         listRequests.push(url)
         const cursor = url.searchParams.get('cursor')
         if (!cursor) return ok([at('p1a', '2026-09-02T12:00:00Z'), at('p1b', '2026-09-02T09:00:00Z')], { 'X-Next-Cursor': 'c1' })
@@ -364,12 +440,12 @@ describe('ResourcesView library query', () => {
         if (this.matches('[data-test="month-header"]')) return new DOMRect(0, 0, 390, 44)
         return realRect.call(this)
       })
-      const scrolled: { uid: string | undefined; requests: number; options: unknown; margin: string; header: string }[] = []
+      const scrolled: { day: string | undefined; requests: number; options: unknown; margin: string; header: string }[] = []
       vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(function (this: Element, options?: unknown) {
         const tile = this as HTMLElement
         const view = tile.closest<HTMLElement>('[data-test="view-resources"]')
         scrolled.push({
-          uid: tile.dataset.uid,
+          day: tile.dataset.day,
           requests: listRequests.length,
           options,
           margin: tile.style.getPropertyValue('scroll-margin-top'),
@@ -386,12 +462,13 @@ describe('ResourcesView library query', () => {
       await tiles[0]!.trigger('click')
       await vi.waitFor(() => expect(scrolled).toHaveLength(1))
 
-      // The receiver is the real tile of that uid, and when it scrolled only the two pages the walk
-      // needed had been asked for, the second with the first's cursor and the same limit.
-      // It lands at the TOP: the tile is the first one under the fixed chrome and the sticky month
-      // header, whose measured height the view carries as a variable the tile's scroll margin adds.
+      // The receiver is that day's heading (decision 13: the landing row, not the day's first tile),
+      // and when it scrolled only the two pages the walk needed had been asked for, the second with
+      // the first's cursor and the same limit. It lands at the TOP: under the fixed chrome and the
+      // sticky month header, whose measured height the view carries as a variable the heading's
+      // scroll margin adds.
       expect(scrolled[0]).toEqual({
-        uid: 'target',
+        day: '2026-09-01',
         requests: 2,
         options: { block: 'start' },
         margin: 'calc(var(--chrome-height, 0px) + var(--month-header-height, 0px))',
@@ -400,8 +477,10 @@ describe('ResourcesView library query', () => {
       expect(listRequests[1]!.searchParams.get('cursor')).toBe('c1')
       expect(listRequests.slice(0, 2).map((u) => u.searchParams.get('limit'))).toEqual(['500', '500'])
       const receiver = vi.mocked(Element.prototype.scrollIntoView).mock.contexts[0] as HTMLElement
-      expect(receiver.closest('[data-test="justified-gallery"]')).not.toBeNull()
-      expect(receiver.matches('[data-test="media-tile"]')).toBe(true)
+      expect(receiver.matches('[data-test="day-heading"]')).toBe(true)
+      // The day it names is the one holding the target tile — 00:30 on 1 September in Zurich.
+      const group = receiver.closest('[data-test="day-group"]')!
+      expect(group.querySelector('[data-uid]')?.getAttribute('data-uid')).toBe('target')
     })
 
     it('stops a superseded walk: it asks for no further page, and only the newer jump scrolls and releases', async () => {
@@ -428,11 +507,9 @@ describe('ResourcesView library query', () => {
       let release!: () => void
       const held = new Promise<void>((r) => (release = r))
       const listRequests: URL[] = []
+      dayBuckets.mockImplementation(async () => ok([dayBucket('2026-09-02', 1), dayBucket('2026-08-01', 1)]))
       transport.mockImplementation(async (req) => {
         const url = new URL(req.url)
-        if (url.pathname === '/api/attachments/buckets') {
-          return ok([dayBucket('2026-09-02', 1), dayBucket('2026-08-01', 1)])
-        }
         listRequests.push(url)
         const cursor = url.searchParams.get('cursor')
         if (!cursor) return ok([at('p1a', '2026-09-02T12:00:00Z')], { 'X-Next-Cursor': 'c1' })
@@ -444,7 +521,7 @@ describe('ResourcesView library query', () => {
       })
       const scrolled: (string | undefined)[] = []
       vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(function (this: Element) {
-        scrolled.push((this as HTMLElement).dataset.uid)
+        scrolled.push((this as HTMLElement).dataset.day)
       })
 
       const w = mountView()
@@ -459,7 +536,7 @@ describe('ResourcesView library query', () => {
       useRoute().query = { view: 'months' }
       await settle()
       await w.findAll('[data-test="mosaic-tile"]')[0]!.trigger('click')
-      await vi.waitFor(() => expect(scrolled).toEqual(['p1a']))
+      await vi.waitFor(() => expect(scrolled).toEqual(['2026-09-02']))
       await settle()
       expect(has(w, 'day-jump-spinner')).toBe(false)
       const observesAfterSecond = sentinelObserves.length
@@ -470,7 +547,7 @@ describe('ResourcesView library query', () => {
       await new Promise((r) => setTimeout(r, 50))
       await settle()
       expect(listRequests.map((u) => u.searchParams.get('cursor'))).toEqual([null, 'c1'])
-      expect(scrolled).toEqual(['p1a'])
+      expect(scrolled).toEqual(['2026-09-02'])
       expect(has(w, 'day-jump-spinner')).toBe(false)
       expect(sentinelObserves).toHaveLength(observesAfterSecond) // no second release, no re-arm
     })
@@ -479,9 +556,9 @@ describe('ResourcesView library query', () => {
       route.query = { view: 'months' }
       let release!: () => void
       const held = new Promise<void>((r) => (release = r))
+      dayBuckets.mockImplementation(async () => ok([dayBucket('2026-08-01', 1)]))
       transport.mockImplementation(async (req) => {
         const url = new URL(req.url)
-        if (url.pathname === '/api/attachments/buckets') return ok([dayBucket('2026-08-01', 1)])
         if (!url.searchParams.get('cursor')) return ok([at('p1a', '2026-09-02T12:00:00Z')], { 'X-Next-Cursor': 'c1' })
         await held
         return ok([at('aug', '2026-08-01T10:00:00Z')])

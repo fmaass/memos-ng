@@ -307,8 +307,13 @@ async def reclaim_attachment(
         # FAIL CLOSED, for the same reason a failed unlink does. The enumeration could not be
         # ESTABLISHED — an unreadable mount, an I/O error — so we do not know what this row owns,
         # and deleting it now would leave whatever is in those directories with nothing naming it.
-        # The row stays and the whole transaction unwinds; the caller retries (the reconcile sweep
-        # finds it again), and by then the mount is either back or the problem is visible.
+        # The row stays and the whole transaction unwinds; a later pass retries it, and by then the
+        # mount is either back or the problem is visible. That pass is the worker's detached-row
+        # sweep (`worker.sweep_detached_attachments`) once the row's `detached_at` is past the
+        # grace — not the commit-race reconcile, which only selects rows that still have a memo. A
+        # row whose `detached_at` is NULL is invisible to that sweep too: only the reconcile
+        # script finds it, and only while its original sits under a dated memo folder
+        # (`leaked_orphans_stmt`).
         await db.rollback()
         logger.warning(
             "reclaim.profile_scan_failed", attachment_id=attachment_id, uid=uid, error=str(exc)

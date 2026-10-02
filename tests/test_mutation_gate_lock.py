@@ -79,6 +79,8 @@ case "$kind" in
             : > "$UV_GATE_READY"
             read -r _ < "$UV_GATE_FIFO"
         fi
+        # A file changed by someone else while the run holds the lock, after the dry check.
+        [ -n "${UV_CONTROL_REWRITES:-}" ] && printf 'VALUE = 5\n' > "$UV_CONTROL_REWRITES"
         printf '1 passed in 0.01s\n'
         exit 0
         ;;
@@ -393,6 +395,7 @@ def _sandbox(tmp_path: Path, name: str = "repo") -> Sandbox:
         "DOCKER_GATE_READY",
         "DOCKER_GATE_FIFO",
         "IMAGE_TAG",
+        "UV_CONTROL_REWRITES",
     ):
         env.pop(leaked, None)
     return Sandbox(root=root, bindir=bindir, env=env)
@@ -655,6 +658,139 @@ def test_the_release_procedure_builds_through_the_script(sandbox: Sandbox) -> No
     assert "scripts/build-image.sh <version>+<short-sha>" in releasing
     assert re.search(r"docker build[^\n]*-t memos-ng:local", releasing) is None
     assert BUILD_IMAGE.stat().st_mode & 0o111, "the documented script is not executable"
+
+
+# --------------------------------------------------------------------------------------------
+# a patch that no longer applies is STALE, not a surviving mutant (MEMNG-500)
+# --------------------------------------------------------------------------------------------
+# A neighbouring change that rewrites a patch's context lines says nothing about the mutated
+# function, yet it used to end the run exactly like a lost mutation. The sandbox is the same one
+# the lock tests use: the real script, a uv stub whose mutation run fails `test_probe`.
+
+_STALE_PATCH = """--- a/app/thing.py
++++ b/app/thing.py
+@@ -1 +1 @@
+-VALUE = 7
++VALUE = 8
+"""
+
+
+def _stale_patch(sandbox: Sandbox, name: str) -> str:
+    """An untracked patch whose context the target no longer has; returns its manifest path."""
+    rel = f"tests/mutations/{name}.patch"
+    (sandbox.root / rel).write_text(_STALE_PATCH)
+    return rel
+
+
+def _manifest(sandbox: Sandbox, *rows: str) -> None:
+    (sandbox.root / "tests" / "mutations" / "expected.tsv").write_text(
+        "# marker\ttest\n" + "".join(f"{row}\n" for row in rows)
+    )
+
+
+def _stale_line(marker: str, patch: str) -> str:
+    return (
+        f"{marker}: STALE — {patch} no longer applies to {TARGET}"
+        " (context drift, not a surviving mutant)"
+    )
+
+
+GOOD_ROW = "tests/mutations/one.patch\tone\ttest_probe"
+
+
+def test_a_stale_patch_is_reported_as_stale_and_not_as_a_surviving_mutant(
+    sandbox: Sandbox,
+) -> None:
+    stale = _stale_patch(sandbox, "drifted")
+    _manifest(sandbox, GOOD_ROW, f"{stale}\tdrifted\ttest_probe")
+    before = _sha(sandbox.target)
+
+    run = sandbox.run("scripts/check-mutations.sh", timeout=180)
+
+    assert run.returncode == 3, run.stdout + run.stderr
+    lines = run.stdout.splitlines()
+    assert _stale_line("drifted", stale) in lines, run.stdout
+    assert [line for line in lines if ": FAIL" in line] == [], run.stdout
+    assert any(line.startswith("one: PASS") for line in lines), run.stdout
+    summary = [line for line in lines if line.startswith("SUMMARY:")]
+    assert len(summary) == 1 and "1 STALE" in summary[0], run.stdout
+    assert "did NOT behave" not in summary[0], run.stdout
+    assert _sha(sandbox.target) == before
+
+
+def test_every_stale_patch_is_named_before_any_mutation_runs(sandbox: Sandbox) -> None:
+    first = _stale_patch(sandbox, "drift_a")
+    second = _stale_patch(sandbox, "drift_b")
+    _manifest(sandbox, f"{first}\tdrift_a\ttest_probe", GOOD_ROW, f"{second}\tdrift_b\ttest_probe")
+
+    run = sandbox.run("scripts/check-mutations.sh", timeout=180)
+
+    assert run.returncode == 3, run.stdout + run.stderr
+    lines = run.stdout.splitlines()
+    first_control = next(i for i, line in enumerate(lines) if line.startswith("control:"))
+    for marker, patch in (("drift_a", first), ("drift_b", second)):
+        assert _stale_line(marker, patch) in lines[:first_control], run.stdout
+        assert lines.count(_stale_line(marker, patch)) == 1, run.stdout
+    assert "2 STALE" in lines[-1], run.stdout
+
+
+def test_a_judged_failure_wins_over_a_stale_patch(sandbox: Sandbox) -> None:
+    stale = _stale_patch(sandbox, "drifted")
+    # A real, applicable mutation whose stub run fails test_probe, not the named test_other.
+    _manifest(
+        sandbox,
+        "tests/mutations/one.patch\twrong\ttest_other",
+        f"{stale}\tdrifted\ttest_probe",
+    )
+
+    run = sandbox.run("scripts/check-mutations.sh", timeout=180)
+
+    assert run.returncode == 1, run.stdout + run.stderr
+    lines = run.stdout.splitlines()
+    assert any(line.startswith("wrong: FAIL — ") for line in lines), run.stdout
+    assert _stale_line("drifted", stale) in lines, run.stdout
+    assert "did NOT behave" in lines[-1] and "1 STALE" in lines[-1], run.stdout
+
+
+def test_a_patch_file_the_manifest_does_not_name_is_not_checked(sandbox: Sandbox) -> None:
+    _stale_patch(sandbox, "unlisted")
+
+    run = sandbox.run("scripts/check-mutations.sh", timeout=180)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "STALE" not in run.stdout + run.stderr
+
+
+def test_a_run_refused_for_the_lock_reports_no_stale_patch(holder: Sandbox) -> None:
+    """The dry check reads the tree, so it runs only once the lock is ours."""
+    stale = _stale_patch(holder, "drifted")
+    _manifest(holder, f"{stale}\tdrifted\ttest_probe")
+
+    run = holder.run("scripts/check-mutations.sh", timeout=120)
+
+    assert run.returncode == 2, run.stdout + run.stderr
+    assert "STALE" not in run.stdout + run.stderr
+    assert holder.uv_record() == []
+
+
+def test_a_patch_that_passed_the_dry_check_but_does_not_apply_is_a_failure(
+    sandbox: Sandbox,
+) -> None:
+    """Drift is what the tree held BEFORE the locked run; a target that changes during it (here
+    under the positive control) is a runtime failure, and must not pass as exit 3."""
+    sandbox.env["UV_CONTROL_REWRITES"] = str(sandbox.target)
+
+    run = sandbox.run("scripts/check-mutations.sh", timeout=180)
+
+    assert run.returncode == 1, run.stdout + run.stderr
+    lines = run.stdout.splitlines()
+    assert (
+        "one: FAIL — tests/mutations/one.patch passed the pre-check but did not apply in the"
+        f" loop: {TARGET} changed during the locked run"
+    ) in lines, run.stdout
+    assert "STALE" not in run.stdout
+    assert "did NOT behave" in lines[-1], run.stdout
+    assert sandbox.target.read_text() == "VALUE = 5\n"  # the other writer's content, untouched
 
 
 # --------------------------------------------------------------------------------------------

@@ -76,3 +76,75 @@ export function groupByMonth<T extends { takenAt: string }>(
   }
   return sections
 }
+
+// The All view's day groups (plan decision 13): each `tz` calendar day of the list is one group,
+// in the list's own order, like groupByMonth; an unreadable takenAt keeps a group of its own.
+export interface DaySection<T> {
+  /** `YYYY-MM-DD` in `tz`, or UNDATED_KEY. */
+  key: string
+  items: T[]
+}
+
+export function groupByDay<T extends { takenAt: string }>(
+  items: T[],
+  tz: string = LIBRARY_TIME_ZONE,
+): DaySection<T>[] {
+  const sections: DaySection<T>[] = []
+  const byKey = new Map<string, DaySection<T>>()
+  for (const item of items) {
+    const key = dayKey(item.takenAt, tz) ?? UNDATED_KEY
+    let section = byKey.get(key)
+    if (!section) {
+      section = { key, items: [] }
+      byKey.set(key, section)
+      sections.push(section)
+    }
+    section.items.push(item)
+  }
+  return sections
+}
+
+// A day key is already a `tz` calendar date, so it is formatted as a UTC noon in UTC — a pure
+// calendar date no zone can move (as mosaicSections does for months). The parts are assembled by
+// hand because en-GB abbreviates September "Sept" and en orders the month first.
+const dayLabelFormat = new Intl.DateTimeFormat('en', {
+  weekday: 'short',
+  day: 'numeric',
+  month: 'short',
+  year: 'numeric',
+  timeZone: 'UTC',
+})
+
+function dayLabelParts(key: string): Record<'weekday' | 'day' | 'month' | 'year', string> | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key)
+  if (!match) return null
+  const [year, month, day] = match.slice(1).map(Number) as [number, number, number]
+  const date = new Date(Date.UTC(year, month - 1, day, 12))
+  // Date.UTC rolls 30 February over into March; a key that names no real day is not a day.
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null
+  const parts = dayLabelFormat.formatToParts(date)
+  const part = (type: string) => parts.find((p) => p.type === type)?.value ?? ''
+  return { weekday: part('weekday'), day: part('day'), month: part('month'), year: part('year') }
+}
+
+/** The day heading row: `{ weekday: 'Sat', date: '26 Sep' }`. */
+export function dayHeadingParts(key: string): { weekday: string; date: string } {
+  const p = dayLabelParts(key)
+  return p ? { weekday: p.weekday, date: `${p.day} ${p.month}` } : { weekday: 'Undated', date: '' }
+}
+
+/** The scroll pill: `'Sat · 26 Sep 2026'`. */
+export function dayPillLabel(key: string): string {
+  const p = dayLabelParts(key)
+  return p ? `${p.weekday} · ${p.day} ${p.month} ${p.year}` : 'Undated'
+}
+
+// The day the scroll pill names: the last heading, in document order, whose top has reached the
+// threshold line; null while none has (the page is at its top and the pill stays hidden).
+export function topDay(headings: readonly { key: string; top: number }[], threshold: number): string | null {
+  let found: string | null = null
+  for (const h of headings) {
+    if (h.top <= threshold) found = h.key
+  }
+  return found
+}

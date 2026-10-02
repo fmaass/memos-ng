@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  clearedLibraryFilter,
   defaultLibraryFilter,
   fromSearchParams,
+  libraryEmptyState,
   type LibraryFilter,
   toApiParams,
   toBucketParams,
@@ -114,5 +116,51 @@ describe('toBucketParams', () => {
 
   it('leaves out the fields the filter does not set', () => {
     expect(toBucketParams('year', defaultLibraryFilter())).toEqual({ size: 'year', tz: 'Europe/Zurich' })
+  })
+})
+
+describe('libraryEmptyState', () => {
+  it('keeps the plain copy for the whole Library', () => {
+    expect(libraryEmptyState(defaultLibraryFilter())).toEqual({ message: 'No attachments yet.', filtered: false })
+  })
+
+  it('treats an order-only filter as the whole Library', () => {
+    expect(libraryEmptyState({ order: 'oldest' })).toEqual({ message: 'No attachments yet.', filtered: false })
+  })
+
+  it('treats an empty tag as no tag', () => {
+    expect(libraryEmptyState({ order: 'newest', tag: '' })).toEqual({ message: 'No attachments yet.', filtered: false })
+  })
+
+  it('names the tag of a tag-only filter', () => {
+    expect(libraryEmptyState({ order: 'newest', tag: 'no-such-tag-zz' })).toEqual({
+      message: 'No pictures tagged #no-such-tag-zz.',
+      filtered: true,
+    })
+  })
+
+  it('names the kind of a kind-only filter, for each kind', () => {
+    expect(libraryEmptyState({ order: 'newest', type: 'image' })).toEqual({
+      message: 'No photos match this filter.',
+      filtered: true,
+    })
+    expect(libraryEmptyState({ order: 'oldest', type: 'video' })).toEqual({
+      message: 'No videos match this filter.',
+      filtered: true,
+    })
+  })
+
+  it('names both the kind and the tag of a combined filter', () => {
+    expect(libraryEmptyState({ order: 'newest', type: 'video', tag: 'recap' })).toEqual({
+      message: 'No videos tagged #recap.',
+      filtered: true,
+    })
+  })
+})
+
+describe('clearedLibraryFilter', () => {
+  it('drops the kind and the tag and keeps the order', () => {
+    expect(clearedLibraryFilter({ order: 'oldest', type: 'video', tag: 'recap' })).toEqual({ order: 'oldest' })
+    expect(clearedLibraryFilter({ order: 'newest', tag: 'x' })).toEqual(defaultLibraryFilter())
   })
 })

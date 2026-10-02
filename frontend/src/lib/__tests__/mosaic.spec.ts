@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { daysOfYear, mosaicSections, type MosaicSlot, mosaicSlots, pickDays } from '@/lib/mosaic'
+import { daySlots, daysOfYear, mosaicSections, type MosaicSlot, mosaicSlots, pickDays } from '@/lib/mosaic'
 
 const A: MosaicSlot[] = ['hero-left', 'side-right', 'side-right']
 const B: MosaicSlot[] = ['square', 'square', 'square']
@@ -167,5 +167,70 @@ describe('mosaicSections', () => {
   it('titles January and December of their own year', () => {
     const sections = mosaicSections([day('2027-01-01', 1), day('2026-12-31', 1)])
     expect(sections.map((s) => s.label)).toEqual(['Jan 2027', 'Dec 2026'])
+  })
+})
+
+// The All view's day blocks (plan decision 13, amendment 20:05 CEST): the cycle is A B C B D, each
+// day one step later. Expected layouts are spelled from the pattern constants above, never from
+// the code under test.
+describe('daySlots', () => {
+  it('gives a day of one or two pictures wide frames only, whatever its index', () => {
+    for (let k = 0; k <= 4; k++) {
+      expect(daySlots(1, k)).toEqual(['wide'])
+      expect(daySlots(2, k)).toEqual(['wide', 'wide'])
+    }
+  })
+
+  it('lays out no slots for no pictures', () => {
+    expect(daySlots(0, 0)).toEqual([])
+  })
+
+  it('walks A B C B D from day 0', () => {
+    expect(daySlots(13, 0)).toEqual([...A, ...B, ...C, ...B, ...D])
+  })
+
+  it('wraps the day index past the end of the cycle', () => {
+    expect(daySlots(3, 5)).toEqual(A)
+    expect(daySlots(3, 9)).toEqual(['wide', 'square', 'square'])
+  })
+
+  it('opens each of five neighbouring days on its own step of the cycle', () => {
+    expect([0, 1, 2, 3, 4].map((k) => daySlots(3, k))).toEqual([
+      A,
+      B,
+      C,
+      B,
+      ['wide', 'square', 'square'],
+    ])
+    expect(daySlots(6, 0)).toEqual([...A, ...B])
+    expect(daySlots(6, 1)).toEqual([...B, ...C])
+    expect(daySlots(6, 2)).toEqual([...C, ...B])
+    expect(daySlots(6, 3)).toEqual([...B, ...D, 'square', 'square'])
+    expect(daySlots(6, 4)).toEqual([...D, ...A, 'square', 'square'])
+  })
+
+  it('turns a single leftover into a wide frame', () => {
+    expect(daySlots(4, 0)).toEqual([...A, 'wide'])
+    expect(daySlots(7, 0)).toEqual([...A, ...B, 'wide'])
+  })
+
+  it('turns a leftover of two into squares, not a cut pattern', () => {
+    expect(daySlots(5, 0)).toEqual([...A, 'square', 'square'])
+    expect(daySlots(3, 4)).toEqual(['wide', 'square', 'square'])
+  })
+
+  it('reaches D on a leftover of one without a stray square', () => {
+    expect(daySlots(10, 1)).toEqual([...B, ...C, ...B, ...D])
+  })
+
+  it('treats a negative day index as its place in the cycle', () => {
+    expect(daySlots(3, -1)).toEqual(['wide', 'square', 'square'])
+  })
+
+  it('hands out a fresh list, so a caller that edits it cannot change the next day', () => {
+    const first = daySlots(3, 0)
+    first[0] = 'wide'
+    expect(daySlots(3, 0)).toEqual(A)
+    expect(mosaicSlots(3, 0)).toEqual(A)
   })
 })

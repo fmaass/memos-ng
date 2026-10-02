@@ -85,7 +85,7 @@ vi.mock('@tanstack/vue-query', async (importOriginal) => {
   }
 })
 function fakeTags() {
-  return { data: ref(undefined), isError: ref(false), isPending: ref(true), isFetching: ref(false), refetch: vi.fn() }
+  return { data: ref(undefined), isError: ref(false), isPending: ref(true), isSuccess: ref(false), isFetching: ref(false), refetch: vi.fn() }
 }
 function fakeLibrary() {
   return {
@@ -158,23 +158,23 @@ describe('ResourcesView', () => {
     push.mockClear()
   })
 
-  it('leaves the viewer for the memo the photo hangs on', () => {
+  it('leaves the viewer for the memo the photo hangs on', async () => {
     // Resources is the one gallery that shows everything at once, so a photo found here is often
     // wanted in context; the jump goes to the same permalink the Places viewer uses.
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 1)
+    await wrapper.find('[data-uid="a2"] [data-test="tile-open"]').trigger('click')
 
     lightboxOpen.mock.calls[0][2].onShowInMemo('memo-7')
 
     expect(push).toHaveBeenCalledWith('/m/memo-7')
   })
 
-  it('hands the viewer an orphan with no memo to jump to', () => {
+  it('hands the viewer an orphan with no memo to jump to', async () => {
     // The action is offered per slide, and the viewer withholds it on one that knows no memo
     // (composables/__tests__/useMediaLightbox.spec.ts) — that guard only holds while this view
     // passes the orphan's empty memoUid through instead of inventing one.
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+    await wrapper.find('[data-uid="a1"] [data-test="tile-open"]').trigger('click')
 
     // Both halves, or the case says nothing: with no handler supplied the viewer offers the action
     // on no slide at all, and an empty memoUid would then pass for the wrong reason.
@@ -182,25 +182,28 @@ describe('ResourcesView', () => {
     expect(lightboxOpen.mock.calls[0][0][0].memoUid).toBeNull()
   })
 
-  it('renders the justified gallery + the Library header (not the old grid or inline type filter)', () => {
+  it('renders the day groups + the Library header (not the old grid or inline type filter)', () => {
     // Layout/image sizing needs real DOM width (covered by lib/justified.spec); here we assert the
     // gallery container + header are wired and the legacy grid/tile markup and the inline type
     // SelectButton are gone (the kind moved into the header's options menu).
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
-    expect(wrapper.find('[data-test="justified-gallery"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="day-group"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="library-header"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="library-options"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="type-filter"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="resource-grid"]').exists()).toBe(false)
   })
 
-  it('files the tiles under Zurich month headers, one gallery per month', () => {
+  it('files the tiles under Zurich month headers, one group per Zurich day', () => {
     route.query = {}
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
     const headers = wrapper.findAll('[data-test="month-header"]')
     expect(headers.map((h) => h.text())).toEqual(['September 2026'])
     expect(headers[0]!.classes()).toEqual(expect.arrayContaining(['sticky', 'top-[var(--chrome-height,0px)]']))
-    expect(wrapper.findAll('[data-test="justified-gallery"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-test="day-heading"]').map((h) => h.attributes('data-day'))).toEqual([
+      '2026-09-02',
+      '2026-09-01',
+    ])
   })
 
   it('registers its Years | Months | All pill with the shell’s dock, All active, every segment enabled', async () => {
@@ -277,7 +280,7 @@ describe('ResourcesView', () => {
       expect(sent[0]!.searchParams.has('order')).toBe(false)
     })
 
-    it('asks for the year buckets on Years, and for no buckets at all on All', async () => {
+    it('asks for the year buckets on Years, and for the day buckets on All (its day counts)', async () => {
       route.query = { view: 'years' }
       mountReal([bucket('2026', 4)])
       await flushPromises()
@@ -288,7 +291,7 @@ describe('ResourcesView', () => {
       route.query = {}
       mountReal()
       await flushPromises()
-      expect(bucketCalls()).toHaveLength(0)
+      expect(bucketCalls().map((u) => u.searchParams.get('size'))).toEqual(['day'])
     })
 
     it('renders Years as cards and Months as the day mosaic, and All keeps its month headers', async () => {
@@ -296,7 +299,7 @@ describe('ResourcesView', () => {
       const years = mountReal([bucket('2026', 4), bucket('2025', 1)])
       await flushPromises()
       expect(years.findAll('[data-test="year-card"]')).toHaveLength(2)
-      expect(years.find('[data-test="justified-gallery"]').exists()).toBe(false)
+      expect(years.find('[data-test="day-group"]').exists()).toBe(false)
 
       route.query = { view: 'months' }
       const months = mountReal([bucket('2026-09-02', 4), bucket('2026-08-01', 1)])
@@ -419,9 +422,9 @@ describe('ResourcesView', () => {
     expect(classes).not.toContain('xl:max-w-4xl')
   })
 
-  it('sends a first print-master attach straight through the shared mutation', () => {
+  it('sends a first print-master attach straight through the shared mutation', async () => {
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+    await wrapper.find('[data-uid="a1"] [data-test="tile-open"]').trigger('click')
     const file = new File(['tiff-bytes'], 'master.tif', { type: 'image/tiff' })
 
     lightboxOpen.mock.calls[0][2].onAttachPrint({
@@ -440,15 +443,15 @@ describe('ResourcesView', () => {
     // upload would be unrecoverable once its toast is gone.
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
 
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('print-retry', 'a1')
+    wrapper.findComponent({ name: 'DayGroup' }).vm.$emit('print-retry', 'a1')
 
     expect(printRetry).toHaveBeenCalledWith('a1')
   })
 
-  it('holds a REPLACE and a REMOVE behind a confirmation', () => {
+  it('holds a REPLACE and a REMOVE behind a confirmation', async () => {
     // Both destroy a master that is already there; neither may fire on the click alone.
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('open', 0)
+    await wrapper.find('[data-uid="a1"] [data-test="tile-open"]').trigger('click')
     const handlers = lightboxOpen.mock.calls[0][2]
 
     handlers.onAttachPrint({
@@ -466,9 +469,9 @@ describe('ResourcesView', () => {
   it('re-mints Resources when gallery retry bubbles, throttled to one refetch per cooldown', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(30_000)
     const wrapper = mount(ResourcesView, { global: { plugins: [PrimeVue, ConfirmationService, ToastService] } })
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('retry', 'a1')
+    wrapper.findComponent({ name: 'DayGroup' }).vm.$emit('retry', 'a1')
     expect(refetch).toHaveBeenCalledTimes(1)
-    wrapper.findComponent({ name: 'JustifiedGallery' }).vm.$emit('retry', 'a1')
+    wrapper.findComponent({ name: 'DayGroup' }).vm.$emit('retry', 'a1')
     expect(refetch).toHaveBeenCalledTimes(1)
   })
 })

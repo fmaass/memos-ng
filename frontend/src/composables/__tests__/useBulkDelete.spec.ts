@@ -3,7 +3,7 @@ import { mount } from '@vue/test-utils'
 import { defineComponent } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { bulkDelete, deleteSummary, useBulkDelete } from '@/composables/useBulkDelete'
+import { bulkDelete, deleteAttachment, deleteSummary, useBulkDelete } from '@/composables/useBulkDelete'
 
 // The REAL generated client over a scripted transport, so the method, the path and the status the
 // batch reacts to are all on the wire.
@@ -110,6 +110,35 @@ describe('bulkDelete', () => {
     [{ done: [], failed: 'a', unattempted: [] }, 'Deleted 0, 1 failed'],
   ])('summarises %j as "%s"', (result, text) => {
     expect(deleteSummary(result)).toBe(text)
+  })
+})
+
+describe('deleteAttachment', () => {
+  beforeEach(() => {
+    transport.mockReset()
+  })
+
+  it.each([
+    ['204', true, noContent], // the contract's only success (openapi.json)
+    ['404 with a JSON body', false, notFound],
+    ['404 with no body (error is the empty string)', false, bareNotFound],
+    [
+      '404 with Content-Length: 0 (error is undefined)',
+      false,
+      () => new Response(null, { status: 404, headers: { 'Content-Length': '0' } }),
+    ],
+    ['500 with no body', false, () => new Response(null, { status: 500 })],
+  ])('a %s answer: deleted = %s', async (_, ok, respond) => {
+    transport.mockImplementation(async () => respond())
+    const { useApi } = await import('@/composables/useApi')
+    expect(await deleteAttachment(useApi(), 'a')).toBe(ok)
+    expect(sentPaths()).toEqual(['DELETE /api/attachments/a'])
+  })
+
+  it('a request that got no answer is a failure, not a throw', async () => {
+    transport.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const { useApi } = await import('@/composables/useApi')
+    expect(await deleteAttachment(useApi(), 'a')).toBe(false)
   })
 })
 
