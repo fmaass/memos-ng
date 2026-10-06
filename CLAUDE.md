@@ -222,7 +222,8 @@ met until its tests exist and pass.
   satellite retired), ADR-0018 **3828** (Places map: coordinates in Postgres, one whole-set
   markers endpoint, client-side clustering, self-hosted PMTiles basemap), ADR-0019 **3935** (shared
   API major from 2.0: independent semver per product, apiMajor on /health, consumer contract test
-  against the iOS vendored schema).
+  against the iOS vendored schema), ADR-0020 **4249** (a signed asset URL is a bearer capability
+  until its `exp`; the `scope` claim is informational, not re-authorised at serve time).
 - Sibling project **memos-ng-ios** (the reference iOS repo): book **3153** (Decisions **3154**,
   Session Reviews **3155**), Project Overview **3158**, doctrine "Reference iOS Architecture"
   **3156**, ADR-0001 **3157**.
