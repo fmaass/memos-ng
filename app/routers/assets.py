@@ -41,6 +41,7 @@ from app.services.attachments import (
     library_buckets,
     library_filters,
     library_tag_counts,
+    memo_tag_names_expr,
     taken_at_expr,
 )
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
@@ -249,6 +250,9 @@ class AttachmentListItem(BaseModel):
     # never `captured_at` (app/services/attachments.py `taken_at_expr`). MEMNG-507, additive.
     takenAt: Rfc3339Datetime
     filename: str  # the stored original name, so a share sheet can name the file (MEMNG-507)
+    # The tags of the memo this hangs on, sorted by name like MemoOut.tags; empty for an orphan
+    # and for an untagged memo. MEMNG-651, additive.
+    tags: list[str]
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -266,11 +270,12 @@ def _list_item(
     user_id: int,
     memo_uid: str | None,
     taken_at: datetime,
+    tags: list[str],
     web_ready: AbstractSet[str],
 ) -> AttachmentListItem:
-    """`memo_uid` and `taken_at` are passed IN, never read off `att` — there is no
+    """`memo_uid`, `taken_at` and `tags` are passed IN, never read off `att` — there is no
     `Attachment.memo` relationship and adding one would lazy-load per row. The caller selects
-    both in the same statement."""
+    all three in the same statement."""
     base = f"/api/attachments/{att.uid}"
     return AttachmentListItem(
         uid=att.uid,
@@ -287,6 +292,7 @@ def _list_item(
         memoUid=memo_uid,
         takenAt=taken_at,
         filename=att.filename,
+        tags=tags,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         webReady=att.uid in web_ready,
         downloadUrl=f"{base}/original",
@@ -386,6 +392,7 @@ async def list_attachments(
     rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
+    Each item names the tags of its memo, by name; an orphan's are empty.
 
     Paged by keyset, like the memo feed: when more rows follow, the response carries an
     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -397,7 +404,7 @@ async def list_attachments(
         # is many-to-one from the attachment, so selecting them multiplies no rows, and it costs
         # no statement — a relationship + per-item read would be one SELECT per tile (pinned by a
         # statement-count test in tests/test_assets.py).
-        select(Attachment, Memo.uid, taken)
+        select(Attachment, Memo.uid, taken, memo_tag_names_expr())
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
         # own (incl. orphans, where Memo is NULL) OR on a memo the user can see (non-PRIVATE),
         # then the kind and tag filters — app/services/attachments.py, shared with /buckets
@@ -450,15 +457,18 @@ async def list_attachments(
     # (list_memos does the same). It is dropped before serializing, so the body is unchanged.
     rows = list((await db.execute(stmt.order_by(*by).limit(page + 1))).all())
     if len(rows) > page:
-        last, _, last_taken = rows[page - 1]
+        last, _, last_taken, _ = rows[page - 1]
         response.headers[NEXT_CURSOR_HEADER] = (
             encode_taken_cursor(last_taken, last.id)
             if order in ("taken_desc", "taken_asc")
             else encode_attachment_cursor(last)
         )
         rows = rows[:page]
-    ready = await web_ready_uids(att for att, _, _ in rows)
-    return [_list_item(att, user.id, memo_uid, when, ready) for att, memo_uid, when in rows]
+    ready = await web_ready_uids(att for att, _, _, _ in rows)
+    return [
+        _list_item(att, user.id, memo_uid, when, list(tags), ready)
+        for att, memo_uid, when, tags in rows
+    ]
 
 
 class AttachmentBucket(BaseModel):
@@ -466,6 +476,9 @@ class AttachmentBucket(BaseModel):
     count: int
     coverUid: str  # the bucket's newest item by (takenAt, upload order)
     coverThumbnailUrl: str  # that item's signed thumbnail, minted for the requesting viewer
+    # The tags of the memos the bucket's pictures hang on: the tag on the most of them first, then
+    # by name, every one of them (a client showing three counts the rest). MEMNG-651, additive.
+    tags: list[str]
 
 
 class AttachmentTagCount(BaseModel):
@@ -492,7 +505,8 @@ async def attachment_buckets(
     """The library the list shows — same visibility, same `type` and `tag` filters — counted per
     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
-    for a video its poster frame, the one picture a video has."""
+    for a video its poster frame, the one picture a video has — and the tags of the memos its
+    items hang on, the tag on the most items first, then by name."""
     if tz not in _known_zones():
         raise HTTPException(status_code=422, detail="tz is not a known IANA time zone")
     now = time.time()
@@ -502,8 +516,9 @@ async def attachment_buckets(
             count=count,
             coverUid=uid,
             coverThumbnailUrl=asset_urls.signed_cover_url(uid, mime, user.id, now=now),
+            tags=tags,
         )
-        for key, count, uid, mime in await library_buckets(db, user, size, tz, type, tag)
+        for key, count, uid, mime, tags in await library_buckets(db, user, size, tz, type, tag)
     ]
 
 

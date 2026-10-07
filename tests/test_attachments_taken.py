@@ -12,10 +12,11 @@ written by hand, never derived from another endpoint of the same server.
 
 import pytest
 from app.config import settings
+from app.database import engine as async_engine
 from app.main import app
 from app.routers import assets
 from PIL import Image
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from starlette.routing import Match
 
 from tests.conftest import SYNC_URL
@@ -448,7 +449,7 @@ def test_the_literal_routes_are_answered_by_their_own_handlers(lib):
     assert _matched_endpoint("/api/attachments/ro-a") == "attachment_meta"  # control
     b = client.get("/api/attachments/buckets?size=month")
     assert b.status_code == 200, b.text
-    assert [set(i) for i in b.json()] == [{"key", "count", "coverUid", "coverThumbnailUrl"}]
+    assert [set(i) for i in b.json()] == [{"key", "count", "coverUid", "coverThumbnailUrl", "tags"}]
     t = client.get("/api/attachments/tags")
     assert t.status_code == 200, t.text
     assert t.json() == [{"name": "ro", "count": 1}]  # not {uid}'s AttachmentMeta or its 404
@@ -546,3 +547,137 @@ def test_an_insert_racing_a_taken_walk_neither_repeats_nor_skips(lib):
     cursor = first.headers["x-next-cursor"]
     rest = client.get(f"/api/attachments?order=taken_desc&limit=10&cursor={cursor}")
     assert [i["uid"] for i in rest.json()] == ["rc-1", "rc-new-mid", "rc-0"]
+
+
+# --- (n) the tags of the memo a picture hangs on, on the list and on the buckets ------------
+
+
+def _seed_bucket_tags(me):
+    """`_seed_tags` plus what a bucket's tags must keep out: another member's PRIVATE memo with a
+    tag of its own on a day that is visible, and a memo with more tags than a client shows."""
+    _seed_tags(me)
+    secret = _memo("tg-secret", OTHER, visibility="PRIVATE", tags=("secret",))
+    _att("tg-secret-a", OTHER, secret, capture_instant="2026-06-01T11:00:00Z")
+    many = _memo("tg-many", me, tags=("e5", "a1", "d4", "c3", "b2"))
+    _att("tg-many-a", me, many, capture_instant="2025-01-05T10:00:00Z")
+
+
+def _bucket_tags(client, query):
+    r = client.get(f"/api/attachments/buckets?{query}")
+    assert r.status_code == 200, r.text
+    return [(b["key"], b["tags"]) for b in r.json()]
+
+
+def test_every_list_item_carries_the_tags_of_its_memo_sorted_by_name(lib):
+    client, me = lib
+    _seed_bucket_tags(me)
+    r = client.get("/api/attachments?limit=500")
+    assert r.status_code == 200, r.text
+    tags = {i["uid"]: i["tags"] for i in r.json()}
+    assert tags == {
+        "tg-m1-a": ["dog", "hike"],
+        "tg-m1-b": ["dog", "hike"],
+        "tg-m1-c": ["dog", "hike"],
+        "tg-m2-v": ["hike"],
+        "tg-m4-a": ["dog"],
+        "tg-m4-b": ["dog"],
+        "tg-m6-a": [],  # a memo without tags
+        "tg-orph": [],  # no memo at all
+        "tg-many-a": ["a1", "b2", "c3", "d4", "e5"],  # every tag, the server truncates nothing
+    }
+    # the taken orders select through their own branch and must carry the field too
+    walked = client.get("/api/attachments?order=taken_asc&limit=500&tag=hike").json()
+    assert [(i["uid"], i["tags"]) for i in walked] == [
+        ("tg-m1-a", ["dog", "hike"]),
+        ("tg-m1-b", ["dog", "hike"]),
+        ("tg-m1-c", ["dog", "hike"]),
+        ("tg-m2-v", ["hike"]),
+    ]
+
+
+BUCKET_TAGS = {
+    # tags of the bucket's visible pictures' memos: most pictures first, then by name
+    "day": [
+        ("2026-07-02", ["hike"]),
+        ("2026-07-01", ["dog", "hike"]),
+        ("2026-06-04", []),
+        ("2026-06-03", []),
+        ("2026-06-02", ["dog", "hike"]),
+        ("2026-06-01", ["dog", "hike"]),  # the PRIVATE "secret" picture of that day stays out
+        ("2026-05-02", ["dog"]),
+        ("2026-05-01", ["dog"]),
+        ("2025-01-05", ["a1", "b2", "c3", "d4", "e5"]),
+    ],
+    "month": [
+        ("2026-07", ["hike", "dog"]),  # hike 2 pictures, dog 1
+        ("2026-06", ["dog", "hike"]),  # 2 each: by name
+        ("2026-05", ["dog"]),
+        ("2025-01", ["a1", "b2", "c3", "d4", "e5"]),
+    ],
+    "year": [("2026", ["dog", "hike"]), ("2025", ["a1", "b2", "c3", "d4", "e5"])],
+}
+
+
+@pytest.mark.parametrize("size", ["day", "month", "year"])
+def test_bucket_tags_are_its_visible_memos_tags_most_pictures_first(lib, size):
+    client, me = lib
+    _seed_bucket_tags(me)
+    assert _bucket_tags(client, f"size={size}") == BUCKET_TAGS[size]
+
+
+def test_bucket_tags_follow_the_type_and_tag_filters(lib):
+    client, me = lib
+    _seed_bucket_tags(me)
+    # the video's memo carries hike alone: dog came only from the July picture the filter drops
+    assert _bucket_tags(client, "size=month&type=video") == [("2026-07", ["hike"])]
+    # a tag filter keeps the pictures, and the tags shown are all of their memos' tags
+    assert _bucket_tags(client, "size=month&tag=dog") == [
+        ("2026-07", ["dog", "hike"]),
+        ("2026-06", ["dog", "hike"]),
+        ("2026-05", ["dog"]),
+    ]
+
+
+def test_a_tag_name_with_list_punctuation_round_trips_whole(lib):
+    """An array read back through a joined string would split this name in three."""
+    client, me = lib
+    odd = 'a,b "c" {d}'
+    m = _memo("tg-odd", me, tags=(odd, "plain"))
+    _att("tg-odd-a", me, m, capture_instant="2026-02-02T10:00:00Z")
+    item = client.get("/api/attachments").json()[0]
+    assert item["tags"] == [odd, "plain"]
+    assert _bucket_tags(client, "size=day") == [("2026-02-02", [odd, "plain"])]
+
+
+def _statements(client, path):
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        seen.append(" ".join(statement.split()))
+
+    event.listen(async_engine.sync_engine, "before_cursor_execute", record)
+    try:
+        r = client.get(path)
+    finally:
+        event.remove(async_engine.sync_engine, "before_cursor_execute", record)
+    assert r.status_code == 200, r.text
+    return r.json(), seen
+
+
+def test_tags_cost_the_list_and_the_buckets_no_extra_statement(lib):
+    """The counts are the ones the untouched tree measured (`test_assets.py`, MEMNG-171): the list
+    is the session and user lookups, the library SELECT and the renditions load; the buckets the
+    two lookups and the one bucket SELECT. Tags read per row or per bucket add statements; tags
+    read in a second statement let the count and the tags see two different moments."""
+    client, me = lib
+    for n in range(3):
+        m = _memo(f"tg-n1-{n}", me, tags=(f"t{n}", "shared"))
+        _att(f"tg-n1-a{n}", me, m, capture_instant=f"2026-03-0{n + 1}T10:00:00Z")
+    body, seen = _statements(client, "/api/attachments?limit=3")
+    assert [i["tags"] for i in body] == [["shared", "t2"], ["shared", "t1"], ["shared", "t0"]]
+    assert any("FROM attachments" in s for s in seen)  # positive control
+    assert len(seen) == 4, seen
+    body, seen = _statements(client, "/api/attachments/buckets?size=day")
+    assert [b["tags"] for b in body] == [["shared", "t2"], ["shared", "t1"], ["shared", "t0"]]
+    assert any("FROM attachments" in s for s in seen)  # positive control
+    assert len(seen) == 3, seen

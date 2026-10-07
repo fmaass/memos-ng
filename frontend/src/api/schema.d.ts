@@ -287,6 +287,7 @@ export interface paths {
          *     rule the memo surfaces apply. ?order=asc walks the same library oldest-first.
          *     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
          *     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
+         *     Each item names the tags of its memo, by name; an orphan's are empty.
          *
          *     Paged by keyset, like the memo feed: when more rows follow, the response carries an
          *     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -313,7 +314,8 @@ export interface paths {
          * @description The library the list shows — same visibility, same `type` and `tag` filters — counted per
          *     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
          *     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
-         *     for a video its poster frame, the one picture a video has.
+         *     for a video its poster frame, the one picture a video has — and the tags of the memos its
+         *     items hang on, the tag on the most items first, then by name.
          */
         get: operations["attachment_buckets_api_attachments_buckets_get"];
         put?: never;
@@ -1320,6 +1322,8 @@ export interface components {
             coverUid: string;
             /** Key */
             key: string;
+            /** Tags */
+            tags: string[];
         };
         /** AttachmentListItem */
         AttachmentListItem: {
@@ -1352,6 +1356,8 @@ export interface components {
             /** Renditions */
             renditions: components["schemas"]["RenditionItem"][];
             status: components["schemas"]["AttachmentStatus"];
+            /** Tags */
+            tags: string[];
             /**
              * Takenat
              * Format: date-time
