@@ -3714,7 +3714,7 @@
     },
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\nEach item names the tags of its memo, by name; an orphan's are empty.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\nEach item names the tags of its memo, by name; an orphan's are empty.\n?bucket=<key> opens a taken-order walk at a day, month or year \u2014 a `key` exactly as the\nbuckets of `tz` (an IANA zone, default Europe/Zurich) name it \u2014 so the first item is that\nbucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the\nnext item beyond it. A key the buckets could not name, an unknown zone or a bucket under an\nupload order is a 422.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -3777,6 +3777,28 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "bucket",
+            "required": false,
+            "schema": {
+              "title": "Bucket",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "Europe/Zurich",
+              "title": "Tz",
+              "type": "string"
             }
           }
         ],

@@ -6,6 +6,7 @@ two surfaces come to disagree about which photo exists, or when it was taken —
 copy that drifts hands another member's private photo to a bucket cover.
 """
 
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal
@@ -95,6 +96,35 @@ def bucket_key(start: datetime, size: BucketSize) -> str:
     if size == "month":
         return f"{start.year:04d}-{start.month:02d}"
     return f"{start.year:04d}-{start.month:02d}-{start.day:02d}"
+
+
+# ASCII digits only, matched whole: `\d` takes any Unicode digit and `$` a trailing newline.
+_BUCKET_KEY = re.compile(r"([0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2}))?)?")
+
+
+def parse_bucket_key(key: str) -> tuple[BucketSize, datetime] | None:
+    """The inverse of `bucket_key`: the size a key names and its local start, or None for a key
+    `bucket_key` could not have written (a malformed one, or a date the calendar lacks)."""
+    m = _BUCKET_KEY.fullmatch(key)
+    if m is None:
+        return None
+    year, month, day = m.groups()
+    try:
+        start = datetime(int(year), int(month or 1), int(day or 1))
+    except ValueError:
+        return None
+    return ("day" if day else "month" if month else "year"), start
+
+
+def bucket_bound_clause(
+    size: BucketSize, start: datetime, tz: str, ascending: bool
+) -> ColumnElement[bool]:
+    """The rows a taken-order walk opened at a bucket begins with: the bucket and everything
+    before it in the walk's direction. It is the buckets' own expression compared with the
+    bucket's local start, so the first row is exactly where `library_buckets` counted it, and no
+    end of the bucket is ever computed (the last year has no next one)."""
+    local = func.date_trunc(size, func.timezone(tz, taken_at_expr()))
+    return local >= start if ascending else local <= start
 
 
 async def library_buckets(

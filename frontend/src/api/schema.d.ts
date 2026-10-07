@@ -288,6 +288,11 @@ export interface paths {
          *     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
          *     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
          *     Each item names the tags of its memo, by name; an orphan's are empty.
+         *     ?bucket=<key> opens a taken-order walk at a day, month or year — a `key` exactly as the
+         *     buckets of `tz` (an IANA zone, default Europe/Zurich) name it — so the first item is that
+         *     bucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the
+         *     next item beyond it. A key the buckets could not name, an unknown zone or a bucket under an
+         *     upload order is a 422.
          *
          *     Paged by keyset, like the memo feed: when more rows follow, the response carries an
          *     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
@@ -3122,6 +3127,8 @@ export interface operations {
                 cursor?: string | null;
                 order?: "desc" | "asc" | "taken_desc" | "taken_asc";
                 tag?: string | null;
+                bucket?: string | null;
+                tz?: string;
             };
             header?: never;
             path?: never;

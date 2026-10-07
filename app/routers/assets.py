@@ -38,10 +38,12 @@ from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
 from app.services.attachments import (
     BucketSize,
+    bucket_bound_clause,
     library_buckets,
     library_filters,
     library_tag_counts,
     memo_tag_names_expr,
+    parse_bucket_key,
     taken_at_expr,
 )
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
@@ -384,6 +386,8 @@ async def list_attachments(
     cursor: str | None = None,
     order: Literal["desc", "asc", "taken_desc", "taken_asc"] = "desc",
     tag: str | None = None,
+    bucket: str | None = None,
+    tz: str = "Europe/Zurich",
 ) -> list[AttachmentListItem]:
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
@@ -393,11 +397,25 @@ async def list_attachments(
     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
     Each item names the tags of its memo, by name; an orphan's are empty.
+    ?bucket=<key> opens a taken-order walk at a day, month or year — a `key` exactly as the
+    buckets of `tz` (an IANA zone, default Europe/Zurich) name it — so the first item is that
+    bucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the
+    next item beyond it. A key the buckets could not name, an unknown zone or a bucket under an
+    upload order is a 422.
 
     Paged by keyset, like the memo feed: when more rows follow, the response carries an
     `X-Next-Cursor` header; resend it as `?cursor=` — with the same filters, which the cursor does
     not carry — for the page after. The body is a plain array on every page, cursor or not.
     """
+    if tz not in _known_zones():
+        raise HTTPException(status_code=422, detail="tz is not a known IANA time zone")
+    opened = None
+    if bucket is not None:
+        if order not in ("taken_desc", "taken_asc"):
+            raise HTTPException(status_code=422, detail="bucket needs a taken order")
+        opened = parse_bucket_key(bucket)
+        if opened is None:
+            raise HTTPException(status_code=422, detail="bucket is not a bucket key")
     taken = taken_at_expr()
     stmt = (
         # `Memo.uid` and the taken date ride along on the row the join already produces: the memo
@@ -415,6 +433,10 @@ async def list_attachments(
         # migrated item), so `id` breaks the tie in the same direction and the pair is total.
         # The chain ends in NOT NULL `created_at`, so no row escapes the comparison as NULL.
         ascending = order == "taken_asc"
+        if opened is not None:
+            # Beside the cursor, not instead of it: a continuation's cursor already lies beyond
+            # the bucket's start, so resending the bucket with it changes nothing.
+            stmt = stmt.where(bucket_bound_clause(*opened, tz, ascending))
         if cursor is not None:
             c_taken, c_id = decode_taken_cursor(cursor)
             if ascending:
