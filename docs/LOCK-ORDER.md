@@ -8,6 +8,9 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
 ## The total order
 
     M  <  U  <  J  <  A  <  R  <  F        (E and D: isolated, never co-held — R11)
+              J  <  A  <  C                (C: explicitly one row, after A's KEY SHARE; implicitly,
+                                            reclaim's J → A then MANY C rows via SET NULL /
+                                            CASCADE; never with M/U/R/F, E or D — R11)
 
 | | Table | Canonical key |
 |---|---|---|
@@ -19,6 +22,7 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
 | F | `frame_share_jobs` | `frame_share_jobs.id` |
 | E | `export_settings` | singleton |
 | D | digest settings / runs | singleton |
+| C | `collections` (+ `collection_exclusions`) | `collections.id` — after A, never before; one row when taken explicitly (`update_collection`), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |
 
 Within a class, acquire **ascending by canonical key, in ONE statement per class per
 transaction**.
@@ -104,8 +108,19 @@ INSERT of a private row, which is not an acquisition (R8).
   carries `populate_existing=True`, so the revalidation judges the locked row rather than the
   stale copy already in the identity map.
 - **R11 — isolated domains.** No path may hold E or D together with any of M/U/J/A/R/F, in either
-  direction. F is acquired only after A and the frame worker reads A/M unlocked, so F sits last
-  and never inverts.
+  direction, and no path may hold C together with M/U/J/R/F, E or D explicitly. C's one explicit
+  neighbour is A, and the edge is **A < C**. Reclaim (`reclaim.reclaim_attachment`) acquires
+  **J → A** — its media-job rows (`app/services/reclaim.py:258-266`), then the attachment row
+  (`:278-283`) — and deleting that row then waits IMPLICITLY on C through the FKs: ON DELETE SET
+  NULL writes EVERY collection whose committed cover is that attachment, and ON DELETE CASCADE
+  removes every `collection_exclusions` row naming it — possibly many C rows, not one. So the
+  order is **J < A < C**, with C possibly several rows on the implicit side, and every path that
+  holds A and C takes A first.
+  `collections.update_collection` (and `create_collection`, which holds no C row) takes FOR KEY
+  SHARE on the cover attachment's row (`collections._hold_cover`) BEFORE its one FOR UPDATE on
+  the collection row, and nothing else; a cover deleted before it could be held is `CoverGone`,
+  never a foreign-key violation at flush. F is acquired only after A and the frame worker reads
+  A/M unlocked, so F sits last and never inverts.
 
 This is not a claim that all application writes are deadlock-free. Unique-key arbitration on
 `tags` is a separate class with its own settlement and is out of the protocol's scope.

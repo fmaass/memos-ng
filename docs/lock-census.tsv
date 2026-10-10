@@ -3,6 +3,8 @@ app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	upload_print	refresh
 app/scripts/import_digest_state.py	run_import	for_update
+app/services/collections.py	_hold_cover	for_update
+app/services/collections.py	update_collection	for_update
 app/services/digest/domain.py	settings_row	for_update
 app/services/export_settings.py	settings_row	for_update
 app/services/frame_share.py	recover_stale_claimed	for_update

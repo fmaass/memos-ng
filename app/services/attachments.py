@@ -11,11 +11,11 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal
 
-from sqlalchemy import ColumnElement, Text, and_, exists, func, select
+from sqlalchemy import ColumnElement, Text, and_, exists, false, func, or_, select
 from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Attachment, Memo, Tag, User, memo_tags
+from app.models import Attachment, Collection, CollectionExclusion, Memo, Tag, User, memo_tags
 from app.services.memos import visible_clause
 
 BucketSize = Literal["day", "month", "year"]
@@ -86,6 +86,40 @@ def library_filters(user: User, kind: str | None, tag: str | None) -> list[Colum
     if tag is not None:
         conds.append(tagged_clause(tag))
     return conds
+
+
+def collection_member_clause(collection: Collection) -> ColumnElement[bool]:
+    """Which attachments belong to `collection` (MEMNG-746): members have a memo, are not detached,
+    match the collection's tag OR lie inside its span, and are not excluded.
+
+    "Have a memo" is `memo_id IS NOT NULL` — a trip is the memos with that tag or in that range, so
+    an orphan never belongs. "Not detached" is `detached_at IS NULL`, which also catches a row
+    stamped without its link being cleared; detachments older than that column carry no stamp and
+    are caught by the memo part alone. The tag arm is the library's own `tagged_clause`; the span
+    arm reads the library's own date, `taken_at_expr()`, between both bounds INCLUSIVE — so
+    membership and the grid's ordering agree, and a photo without a capture instant is dated by its
+    memo. Each arm is present only when the collection has it.
+
+    Visibility stays in `library_filters`, never here: a caller appends this clause to that list
+    over `attachments` OUTER JOINED to `memos`, exactly as `GET /api/attachments` builds its query,
+    so the correlated `Memo` columns resolve against that join and nothing a member sees can differ
+    from what the library shows the same caller.
+    """
+    arms: list[ColumnElement[bool]] = []
+    if collection.tag is not None:
+        arms.append(tagged_clause(collection.tag))
+    if collection.span_start is not None and collection.span_end is not None:
+        arms.append(taken_at_expr().between(collection.span_start, collection.span_end))
+    excluded = exists().where(
+        CollectionExclusion.collection_id == collection.id,
+        CollectionExclusion.attachment_id == Attachment.id,
+    )
+    return and_(
+        Attachment.memo_id.is_not(None),
+        Attachment.detached_at.is_(None),
+        or_(*arms) if arms else false(),
+        ~excluded,
+    )
 
 
 def bucket_key(start: datetime, size: BucketSize) -> str:
