@@ -211,8 +211,9 @@ All settings come from the environment (or a `.env` file). Key variables — see
   The list puts the newest `spanStart` first and collections without a range last. A create may
   carry an `idempotencyKey`; a retry with the same key answers 201 with the record already stored,
   as memo creation does. On `PATCH` an omitted field stays as it is and an explicit null clears
-  it. A record left with neither a tag nor a range, with one end of the range only, or with the
-  range reversed is a 422 and nothing is stored. Each record carries `memberCount`, counted for the
+  the tag, the range, `tz` or the cover; the title can be changed but not cleared, so a null title
+  is a 422. A record left with neither a tag nor a range, with one end of the range only, or with
+  the range reversed is a 422 and nothing is stored. Each record carries `memberCount`, counted for the
   caller, and `cover`, which is null when the caller may not see that picture.
 - `PUT` and `DELETE /api/collections/{uid}/exclusions/{attachment_uid}` take one picture out of a
   collection and put it back; both answer 204 however often they are sent. An unknown collection,
