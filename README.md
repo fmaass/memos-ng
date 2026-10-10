@@ -190,7 +190,7 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
-### v2.1.0 (unreleased)
+### v2.1.0
 
 - `total_size` on a memo is now populated — the sum of its attached files' sizes in bytes — on the
   create, get, list, edit (`PATCH`), pin, unpin and reaction responses, where it was always 0
@@ -200,6 +200,35 @@ All settings come from the environment (or a `.env` file). Key variables — see
   rendition behind `webUrl` is on disk — always false for a picture and for a video still
   transcoding. `webUrl` itself is unchanged; a 2.x iOS client may play `webUrl` only when
   `webReady` is true instead of discovering the 404, and a client that ignores it is unaffected.
+- Collections, a household record kept on the server: a title plus a tag, a date range
+  (`spanStart` and `spanEnd`, both ends inclusive), or both, with an optional IANA `tz` and an
+  optional cover. Its members are the pictures and videos on memos that carry the tag or whose
+  `takenAt` lies inside the range, less the ones taken out of it; media on no memo never belongs.
+  Members are filtered per viewer exactly as `GET /api/attachments` filters them, so a collection
+  never shows anyone another member's private media.
+- `GET` and `POST /api/collections`, and `GET`, `PATCH` and `DELETE /api/collections/{uid}`: any
+  signed-in member may list, create, edit and delete any collection, and the last write wins.
+  The list puts the newest `spanStart` first and collections without a range last. A create may
+  carry an `idempotencyKey`; a retry with the same key answers 201 with the record already stored,
+  as memo creation does. On `PATCH` an omitted field stays as it is and an explicit null clears
+  it. A record left with neither a tag nor a range, with one end of the range only, or with the
+  range reversed is a 422 and nothing is stored. Each record carries `memberCount`, counted for the
+  caller, and `cover`, which is null when the caller may not see that picture.
+- `PUT` and `DELETE /api/collections/{uid}/exclusions/{attachment_uid}` take one picture out of a
+  collection and put it back; both answer 204 however often they are sent. An unknown collection,
+  and an attachment that is unknown or not visible to the caller, are a 404.
+- `GET /api/collections/{uid}/attachments` lists a collection's members in the item shape and with
+  the `X-Next-Cursor` paging of `GET /api/attachments`, taking `type`, `limit`, `cursor` and
+  `order` (default `taken_desc`).
+- `GET /api/attachments` takes `bucket=<key>` beside `order=taken_desc` or `taken_asc` and opens
+  the walk at that day, month or year — the `key` exactly as `GET /api/attachments/buckets` names
+  it for the same `tz` (default Europe/Zurich) — so the first item is that bucket's newest, or its
+  oldest; an empty bucket opens at the next item beyond it. A key the buckets could not name, an
+  unknown `tz`, or `bucket` under an upload order is a 422.
+- Every item of `GET /api/attachments` now carries `tags`, the tags of its memo by name (empty for
+  media on no memo or on an untagged memo), and every entry of `GET /api/attachments/buckets`
+  carries `tags`, the tags of the memos its items hang on, the tag on the most of them first, then
+  by name, every one of them.
 
 ### v2.0.0
 
