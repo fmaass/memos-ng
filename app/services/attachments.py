@@ -122,6 +122,76 @@ def collection_member_clause(collection: Collection) -> ColumnElement[bool]:
     )
 
 
+LibraryOrder = Literal["desc", "asc", "taken_desc", "taken_asc"]
+TAKEN_ORDERS = ("taken_desc", "taken_asc")
+
+
+def library_page_statement(
+    filters: Sequence[ColumnElement[bool]],
+    order: LibraryOrder,
+    *,
+    after_id: int | None = None,
+    after_taken: tuple[datetime, int] | None = None,
+):
+    """The keyset read of the media library, ordered and resumed after a decoded cursor: rows of
+    `(Attachment, Memo.uid, takenAt, tag names)` over `attachments` OUTER JOINED to `memos`, so
+    every predicate in `filters` resolves against the same join `library_filters` is written for.
+
+    ONE definition for every surface that pages the library — `GET /api/attachments` and a
+    collection's member read — so cursors, ordering and the item's columns cannot drift between
+    them. `after_taken` resumes a taken order, `after_id` an upload order; the caller decodes the
+    cursor and refuses the wrong kind, and adds its own LIMIT."""
+    taken = taken_at_expr()
+    stmt = (
+        # `Memo.uid` and the taken date ride along on the row the join already produces: the memo
+        # is many-to-one from the attachment, so selecting them multiplies no rows, and it costs
+        # no statement — a relationship + per-item read would be one SELECT per tile (pinned by a
+        # statement-count test in tests/test_assets.py).
+        select(Attachment, Memo.uid, taken, memo_tag_names_expr())
+        .outerjoin(Memo, Memo.id == Attachment.memo_id)
+        .where(*filters)
+    )
+    if order in TAKEN_ORDERS:
+        # A composite keyset: taken_at alone is not unique (a burst, a memo date shared by every
+        # migrated item), so `id` breaks the tie in the same direction and the pair is total.
+        # The chain ends in NOT NULL `created_at`, so no row escapes the comparison as NULL.
+        ascending = order == "taken_asc"
+        if after_taken is not None:
+            c_taken, c_id = after_taken
+            if ascending:
+                after = or_(taken > c_taken, and_(taken == c_taken, Attachment.id > c_id))
+            else:
+                after = or_(taken < c_taken, and_(taken == c_taken, Attachment.id < c_id))
+            stmt = stmt.where(after)
+        return stmt.order_by(
+            *(
+                (taken.asc(), Attachment.id.asc())
+                if ascending
+                else (taken.desc(), Attachment.id.desc())
+            )
+        )
+    if after_id is not None:
+        # STRICT comparison, exactly as the memo feed's cursor compares: `<=`/`>=` would serve
+        # the boundary row a second time. The filters are re-applied per page, so a page is never
+        # cut before the filter runs. The direction follows `order`, and the cursor itself stays
+        # what it always was — an opaque id, carrying NO direction, so an already-issued cursor
+        # keeps working. Replaying one under the other order does not fail: it simply continues
+        # from that id the other way. Keeping order consistent across a walk is the client's job,
+        # exactly as it already is for `type` and `limit`, which the cursor does not carry either.
+        stmt = stmt.where(Attachment.id > after_id if order == "asc" else Attachment.id < after_id)
+    # Ordering is `id` alone in either direction, and that order is already TOTAL: id is the
+    # primary key, so no two rows can tie and a keyset walk can neither skip nor repeat — a
+    # created_at tie (bulk import, same-second upload batch) is broken by construction. It is
+    # also the one order this table is indexed for (attachments carries no created_at index),
+    # and it is the order the library already displayed; (created_at DESC, id DESC) would have
+    # reshuffled it. Probed against production 2026-08-26 and re-probed 2026-08-27: no row
+    # disagreed between id order and created_at order, so "oldest/newest first" means the same
+    # thing either way and `order=asc` needs no created_at ordering, composite cursor, index or
+    # migration — it is this same keyset read backwards. The table held 1795 attachments on
+    # 2026-09-22 (MEMNG-501); the order probe was not re-run at that count.
+    return stmt.order_by(Attachment.id.asc() if order == "asc" else Attachment.id.desc())
+
+
 def bucket_key(start: datetime, size: BucketSize) -> str:
     """The bucket's local start as `2026-09-04` / `2026-09` / `2026`. Formatted field by field:
     `%Y` does not zero-pad years below 1000 on this runtime (see app/api_types.py)."""

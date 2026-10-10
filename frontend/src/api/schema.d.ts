@@ -674,6 +674,110 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/collections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Collections
+         * @description Every collection of the household, the latest span first and span-less ones last, each
+         *     with the caller's member count and cover.
+         */
+        get: operations["list_collections_api_collections_get"];
+        put?: never;
+        /**
+         * Create Collection
+         * @description Store a collection: it needs a tag, or both span bounds, or all three. A cover the caller
+         *     may not see is a 404. With `idempotencyKey`, a replay answers 201 with the stored record.
+         */
+        post: operations["create_collection_api_collections_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/collections/{uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Collection
+         * @description One collection, with the caller's member count and cover.
+         */
+        get: operations["get_collection_api_collections__uid__get"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete Collection
+         * @description Delete a collection and its exclusions. The media and the memos are untouched.
+         */
+        delete: operations["delete_collection_api_collections__uid__delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Update Collection
+         * @description Change the named fields: an absent field stays, null clears it (`title` excepted). The
+         *     resulting record must still be a valid collection (422 otherwise, nothing changed). Any member
+         *     may edit any collection; the last write wins. A cover the caller may not see is a 404.
+         */
+        patch: operations["update_collection_api_collections__uid__patch"];
+        trace?: never;
+    };
+    "/api/collections/{uid}/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Members
+         * @description The collection's members as the caller may see them — its tag's media and its span's,
+         *     minus its exclusions — in exactly the shape, order and paging of `GET /api/attachments`.
+         *     `type` narrows to images or videos. When more rows follow, the `X-Next-Cursor` header carries
+         *     the token to resend as `?cursor=` with the same `type`, `limit` and `order`.
+         */
+        get: operations["list_members_api_collections__uid__attachments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/collections/{uid}/exclusions/{attachment_uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Exclude Attachment
+         * @description Take one attachment out of this collection's members. Idempotent: excluding it again
+         *     changes nothing and answers 204 again.
+         */
+        put: operations["exclude_attachment_api_collections__uid__exclusions__attachment_uid__put"];
+        post?: never;
+        /**
+         * Include Attachment
+         * @description Put an excluded attachment back. Idempotent: one that is not excluded stays a member.
+         */
+        delete: operations["include_attachment_api_collections__uid__exclusions__attachment_uid__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/events": {
         parameters: {
             query?: never;
@@ -1562,6 +1666,162 @@ export interface components {
              * @enum {string}
              */
             state: "pending" | "done";
+        };
+        /** CollectionCreate */
+        CollectionCreate: {
+            /** Coverattachmentuid */
+            coverAttachmentUid?: string | null;
+            /**
+             * Idempotencykey
+             * @description Optional client-generated retry token, unique per logical create. Posting it again returns the collection the first call stored, with 201 like the original, whatever the retry's other fields say. Without a key, a retry stores a second collection.
+             */
+            idempotencyKey?: string | null;
+            /**
+             * Spanend
+             * Format: date-time
+             * @description An instant with its UTC offset; a value without one is refused.
+             */
+            spanEnd?: string | null;
+            /**
+             * Spanstart
+             * Format: date-time
+             * @description An instant with its UTC offset; a value without one is refused.
+             */
+            spanStart?: string | null;
+            /**
+             * Tag
+             * @description A tag name exactly as memos carry it, without the hash sign: letters, digits and underscores. Matched exactly, case included.
+             */
+            tag?: string | null;
+            /** Title */
+            title: string;
+            /**
+             * Tz
+             * @description The IANA zone the span was picked in; display only.
+             */
+            tz?: string | null;
+        };
+        /** CollectionOut */
+        CollectionOut: {
+            /**
+             * AttachmentListItem
+             * @description The cover as the library lists it, or null when there is none or the caller may not see it.
+             */
+            cover: {
+                /** Blurhash */
+                blurhash: string | null;
+                /** Downloadurl */
+                downloadUrl: string;
+                /** Filename */
+                filename: string;
+                /** Haslegacyprint */
+                hasLegacyPrint: boolean;
+                /** Hasprint */
+                hasPrint: boolean;
+                /** Height */
+                height: number | null;
+                /** Memouid */
+                memoUid: string | null;
+                /** Mime */
+                mime: string;
+                /** Mine */
+                mine: boolean;
+                /** Orphan */
+                orphan: boolean;
+                /** Posterurl */
+                posterUrl: string;
+                /** Previewurl */
+                previewUrl: string;
+                /** Printurl */
+                printUrl: string;
+                /** Renditions */
+                renditions: components["schemas"]["RenditionItem"][];
+                status: components["schemas"]["AttachmentStatus"];
+                /** Tags */
+                tags: string[];
+                /**
+                 * Takenat
+                 * Format: date-time
+                 */
+                takenAt: string;
+                /** Thumbnailurl */
+                thumbnailUrl: string;
+                /** Uid */
+                uid: string;
+                /** Webready */
+                webReady: boolean;
+                /** Weburl */
+                webUrl: string;
+                /** Width */
+                width: number | null;
+            } | null;
+            /**
+             * Createdat
+             * Format: date-time
+             */
+            createdAt: string;
+            /**
+             * Createdby
+             * @description Who created it; null once that member is gone.
+             */
+            createdBy: string | null;
+            /**
+             * Membercount
+             * @description How many members the CALLER can see.
+             */
+            memberCount: number;
+            /**
+             * Spanend
+             * Format: date-time
+             */
+            spanEnd: string | null;
+            /**
+             * Spanstart
+             * Format: date-time
+             */
+            spanStart: string | null;
+            /** Tag */
+            tag: string | null;
+            /** Title */
+            title: string;
+            /** Tz */
+            tz: string | null;
+            /** Uid */
+            uid: string;
+            /**
+             * Updatedat
+             * Format: date-time
+             */
+            updatedAt: string;
+        };
+        /** CollectionPatch */
+        CollectionPatch: {
+            /** Coverattachmentuid */
+            coverAttachmentUid?: string | null;
+            /**
+             * Spanend
+             * Format: date-time
+             * @description An instant with its UTC offset; a value without one is refused.
+             */
+            spanEnd?: string | null;
+            /**
+             * Spanstart
+             * Format: date-time
+             * @description An instant with its UTC offset; a value without one is refused.
+             */
+            spanStart?: string | null;
+            /**
+             * Tag
+             * @description A tag name exactly as memos carry it, without the hash sign: letters, digits and underscores. Matched exactly, case included.
+             */
+            tag?: string | null;
+            /** Title */
+            title?: string;
+            /**
+             * Tz
+             * @description The IANA zone the span was picked in; display only.
+             */
+            tz?: string | null;
         };
         /**
          * CreateRacedDetail
@@ -3694,6 +3954,427 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UserOut"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    list_collections_api_collections_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionOut"][];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    create_collection_api_collections_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CollectionCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    get_collection_api_collections__uid__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    delete_collection_api_collections__uid__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    update_collection_api_collections__uid__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CollectionPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    list_members_api_collections__uid__attachments_get: {
+        parameters: {
+            query?: {
+                type?: "image" | "video" | null;
+                limit?: number;
+                cursor?: string | null;
+                order?: "desc" | "asc" | "taken_desc" | "taken_asc";
+            };
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    /** @description Opaque continuation token — resend it as `?cursor=` (with the same `type`, `tag`, `limit` and `order`) to get the next page. Absent on the last page. */
+                    "X-Next-Cursor"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentListItem"][];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description A query parameter failed validation (the `detail` array), or `cursor` could not be decoded or belongs to the other order kind (the `detail` string). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | {
+                        detail: string;
+                    };
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    exclude_attachment_api_collections__uid__exclusions__attachment_uid__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                attachment_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    include_attachment_api_collections__uid__exclusions__attachment_uid__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                attachment_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection, or the attachment it names does not exist or is not visible to the caller — one answer for all three. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
             503: components["responses"]["DatabaseBusy"];

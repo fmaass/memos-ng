@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Upload
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
@@ -37,14 +37,15 @@ from app.services import asset_urls, poster, printready, reclaim, storage, varia
 from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
 from app.services.attachments import (
+    TAKEN_ORDERS,
     BucketSize,
+    LibraryOrder,
     bucket_bound_clause,
     library_buckets,
     library_filters,
+    library_page_statement,
     library_tag_counts,
-    memo_tag_names_expr,
     parse_bucket_key,
-    taken_at_expr,
 )
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 from app.services.memos import visible_clause
@@ -416,73 +417,46 @@ async def list_attachments(
         opened = parse_bucket_key(bucket)
         if opened is None:
             raise HTTPException(status_code=422, detail="bucket is not a bucket key")
-    taken = taken_at_expr()
-    stmt = (
-        # `Memo.uid` and the taken date ride along on the row the join already produces: the memo
-        # is many-to-one from the attachment, so selecting them multiplies no rows, and it costs
-        # no statement — a relationship + per-item read would be one SELECT per tile (pinned by a
-        # statement-count test in tests/test_assets.py).
-        select(Attachment, Memo.uid, taken, memo_tag_names_expr())
-        .outerjoin(Memo, Memo.id == Attachment.memo_id)
-        # own (incl. orphans, where Memo is NULL) OR on a memo the user can see (non-PRIVATE),
-        # then the kind and tag filters — app/services/attachments.py, shared with /buckets
-        .where(*library_filters(user, type, tag))
+    filters = library_filters(user, type, tag)
+    if opened is not None:
+        # Beside the cursor, not instead of it: a continuation's cursor already lies beyond the
+        # bucket's start, so resending the bucket with it changes nothing.
+        filters.append(bucket_bound_clause(*opened, tz, order == "taken_asc"))
+    return await library_page(db, user, response, filters, order, limit, cursor)
+
+
+async def library_page(
+    db: AsyncSession,
+    user: User,
+    response: Response,
+    filters: list[Any],
+    order: LibraryOrder,
+    limit: int,
+    cursor: str | None,
+) -> list[AttachmentListItem]:
+    """One keyset page of the library under `filters` — own (incl. orphans, where Memo is NULL) OR
+    on a memo the user can see, then whatever narrows it — with the `X-Next-Cursor` header set
+    when more rows follow. Shared by `GET /api/attachments` and a collection's member read, so the
+    two cannot differ in cursor, order or item shape. A cursor of the wrong kind is a 422
+    (`InvalidCursor`), never a silent restart from the top."""
+    taken_order = order in TAKEN_ORDERS
+    stmt = library_page_statement(
+        filters,
+        order,
+        after_taken=decode_taken_cursor(cursor) if taken_order and cursor is not None else None,
+        after_id=decode_attachment_cursor(cursor)
+        if not taken_order and cursor is not None
+        else None,
     )
-    if order in ("taken_desc", "taken_asc"):
-        # A composite keyset: taken_at alone is not unique (a burst, a memo date shared by every
-        # migrated item), so `id` breaks the tie in the same direction and the pair is total.
-        # The chain ends in NOT NULL `created_at`, so no row escapes the comparison as NULL.
-        ascending = order == "taken_asc"
-        if opened is not None:
-            # Beside the cursor, not instead of it: a continuation's cursor already lies beyond
-            # the bucket's start, so resending the bucket with it changes nothing.
-            stmt = stmt.where(bucket_bound_clause(*opened, tz, ascending))
-        if cursor is not None:
-            c_taken, c_id = decode_taken_cursor(cursor)
-            if ascending:
-                after = or_(taken > c_taken, and_(taken == c_taken, Attachment.id > c_id))
-            else:
-                after = or_(taken < c_taken, and_(taken == c_taken, Attachment.id < c_id))
-            stmt = stmt.where(after)
-        by = (
-            (taken.asc(), Attachment.id.asc())
-            if ascending
-            else (taken.desc(), Attachment.id.desc())
-        )
-    else:
-        if cursor is not None:
-            # STRICT comparison, exactly as the memo feed's cursor compares: `<=`/`>=` would serve
-            # the boundary row a second time. The filters above are re-applied per page, so a page
-            # is never cut before the filter runs. The direction follows `order`, and the cursor
-            # itself stays what it always was — an opaque id, carrying NO direction, so an
-            # already-issued cursor keeps working. Replaying one under the other order does not
-            # fail: it simply continues from that id the other way. Keeping order consistent
-            # across a walk is the client's job, exactly as it already is for `type` and `limit`,
-            # which the cursor does not carry either. A taken cursor is refused here (422).
-            cursor_id = decode_attachment_cursor(cursor)
-            stmt = stmt.where(
-                Attachment.id > cursor_id if order == "asc" else Attachment.id < cursor_id
-            )
-        # Ordering is `id` alone in either direction, and that order is already TOTAL: id is the
-        # primary key, so no two rows can tie and a keyset walk can neither skip nor repeat — a
-        # created_at tie (bulk import, same-second upload batch) is broken by construction. It is
-        # also the one order this table is indexed for (attachments carries no created_at index),
-        # and it is the order the library already displayed; (created_at DESC, id DESC) would
-        # have reshuffled it. Probed against production 2026-08-26 and re-probed 2026-08-27: no
-        # row disagreed between id order and created_at order, so "oldest/newest first" means the
-        # same thing either way and `order=asc` needs no created_at ordering, composite cursor,
-        # index or migration — it is this same keyset read backwards. The table held 1795
-        # attachments on 2026-09-22 (MEMNG-501); the order probe was not re-run at that count.
-        by = (Attachment.id.asc() if order == "asc" else Attachment.id.desc(),)
     page = max(1, min(limit, 500))
     # limit + 1: one extra row is how the page learns another page exists, without a second query
     # (list_memos does the same). It is dropped before serializing, so the body is unchanged.
-    rows = list((await db.execute(stmt.order_by(*by).limit(page + 1))).all())
+    rows = list((await db.execute(stmt.limit(page + 1))).all())
     if len(rows) > page:
         last, _, last_taken, _ = rows[page - 1]
         response.headers[NEXT_CURSOR_HEADER] = (
             encode_taken_cursor(last_taken, last.id)
-            if order in ("taken_desc", "taken_asc")
+            if taken_order
             else encode_attachment_cursor(last)
         )
         rows = rows[:page]
