@@ -10,7 +10,9 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
     M  <  U  <  J  <  A  <  R  <  F        (E and D: isolated, never co-held — R11)
               J  <  A  <  C                (C: explicitly one row, after A's KEY SHARE; implicitly,
                                             reclaim's J → A then MANY C rows via SET NULL /
-                                            CASCADE; never with M/U/R/F, E or D — R11)
+                                            CASCADE; never with U/R/F, E or D — R11)
+    M  <  C                                (the inclusion route only: M first, then the
+                                            requested exclusion rows — R11)
 
 | | Table | Canonical key |
 |---|---|---|
@@ -108,8 +110,9 @@ INSERT of a private row, which is not an acquisition (R8).
   carries `populate_existing=True`, so the revalidation judges the locked row rather than the
   stale copy already in the identity map.
 - **R11 — isolated domains.** No path may hold E or D together with any of M/U/J/A/R/F, in either
-  direction, and no path may hold C together with M/U/J/R/F, E or D explicitly. C's one explicit
-  neighbour is A, and the edge is **A < C**. Reclaim (`reclaim.reclaim_attachment`) acquires
+  direction, and no path may hold C together with U/J/R/F, E or D explicitly, nor with M except in
+  the one inclusion operation below. C's explicit neighbours are A, with the edge **A < C**, and M
+  for that operation, with the edge **M < C**. Reclaim (`reclaim.reclaim_attachment`) acquires
   **J → A** — its media-job rows (`app/services/reclaim.py:258-266`), then the attachment row
   (`:278-283`) — and deleting that row then waits IMPLICITLY on C through the FKs: ON DELETE SET
   NULL writes EVERY collection whose committed cover is that attachment, and ON DELETE CASCADE
@@ -121,9 +124,21 @@ INSERT of a private row, which is not an acquisition (R8).
   the collection row, and nothing else; a cover deleted before it could be held is `CoverGone`,
   never a foreign-key violation at flush. F is acquired only after A and the frame worker reads
   A/M unlocked, so F sits last and never inverts.
+  **The one M–C operation (MEMNG-785):** `POST /api/collections/{uid}/attachments`
+  (`routers.collections._include_from_memo`) runs one transaction per memo: `lock_memo_for_write`
+  (M) FIRST, then the memo's content and `memo_tags` rebuild, then ONE `DELETE` of the requested
+  attachments' `collection_exclusions` rows of that collection (C, `include_attachments`), then
+  commit — **M then C, never C then M**. It takes no A, J, U, R or F lock. No other path holds C
+  and then takes M: the collection routes (`update_collection`, `create_collection`,
+  `delete_collection`, `exclude`, `include`) take no memo lock, and reclaim's implicit C rows
+  follow J → A with no M (an attachment delete does not lock its parent memo row). So the edge
+  adds no cycle. The lock orders the append against edits that COMMITTED before it was granted;
+  it cannot stop a later full-content PATCH from a client holding older text.
 
 This is not a claim that all application writes are deadlock-free. Unique-key arbitration on
-`tags` is a separate class with its own settlement and is out of the protocol's scope.
+`tags` is a separate class with its own settlement and is out of the protocol's scope: a missing
+tag is created by `INSERT … ON CONFLICT (name) DO NOTHING` and re-read, missing names in sorted
+order (`memos._get_or_create_tags`, MEMNG-785).
 
 ## What the protocol does not change
 

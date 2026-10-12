@@ -15,7 +15,16 @@ from sqlalchemy import ColumnElement, Text, and_, exists, false, func, or_, sele
 from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Attachment, Collection, CollectionExclusion, Memo, Tag, User, memo_tags
+from app.models import (
+    Attachment,
+    Collection,
+    CollectionExclusion,
+    Memo,
+    Tag,
+    User,
+    Visibility,
+    memo_tags,
+)
 from app.services.memos import visible_clause
 
 BucketSize = Literal["day", "month", "year"]
@@ -78,8 +87,26 @@ def memo_tag_names_expr() -> ColumnElement[Sequence[str]]:
     return func.array(names, type_=ARRAY(Text))
 
 
-def library_filters(user: User, kind: str | None, tag: str | None) -> list[ColumnElement[bool]]:
+def library_filters(
+    user: User,
+    kind: str | None,
+    tag: str | None,
+    *,
+    mine: bool = False,
+    visibility: Visibility | None = None,
+) -> list[ColumnElement[bool]]:
+    """`library_visible` and whatever NARROWS it — never a substitute for it, so no combination
+    of these reaches a row the caller could not already see (MEMNG-785).
+
+    `mine` is ATTACHMENT ownership, the item's own `mine`, so the caller's orphans stay under it
+    and another member's picture on the caller's memo does not. `visibility` compares the
+    outer-joined memo's, so an orphan (NULL memo) is absent under every value; PRIVATE is accepted
+    as the memo listing accepts it, and `library_visible` still bounds it to the caller's own."""
     conds = [library_visible(user)]
+    if mine:
+        conds.append(Attachment.owner_id == user.id)
+    if visibility is not None:
+        conds.append(Memo.visibility == visibility)
     by_kind = kind_clause(kind)
     if by_kind is not None:
         conds.append(by_kind)
@@ -134,8 +161,9 @@ def library_page_statement(
     after_taken: tuple[datetime, int] | None = None,
 ):
     """The keyset read of the media library, ordered and resumed after a decoded cursor: rows of
-    `(Attachment, Memo.uid, takenAt, tag names)` over `attachments` OUTER JOINED to `memos`, so
-    every predicate in `filters` resolves against the same join `library_filters` is written for.
+    `(Attachment, Memo.uid, takenAt, tag names, Memo.visibility)` — the last NULL for an orphan —
+    over `attachments` OUTER JOINED to `memos`, so every predicate in `filters` resolves against
+    the same join `library_filters` is written for.
 
     ONE definition for every surface that pages the library — `GET /api/attachments` and a
     collection's member read — so cursors, ordering and the item's columns cannot drift between
@@ -147,7 +175,7 @@ def library_page_statement(
         # is many-to-one from the attachment, so selecting them multiplies no rows, and it costs
         # no statement — a relationship + per-item read would be one SELECT per tile (pinned by a
         # statement-count test in tests/test_assets.py).
-        select(Attachment, Memo.uid, taken, memo_tag_names_expr())
+        select(Attachment, Memo.uid, taken, memo_tag_names_expr(), Memo.visibility)
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
         .where(*filters)
     )
@@ -232,7 +260,15 @@ def bucket_bound_clause(
 
 
 async def library_buckets(
-    db: AsyncSession, user: User, size: BucketSize, tz: str, kind: str | None, tag: str | None
+    db: AsyncSession,
+    user: User,
+    size: BucketSize,
+    tz: str,
+    kind: str | None,
+    tag: str | None,
+    *,
+    mine: bool = False,
+    visibility: Visibility | None = None,
 ) -> list[tuple[str, int, str, str, list[str]]]:
     """(key, count, cover uid, cover mime, tags) per calendar bucket of `tz`, newest first. The
     cover is the bucket's newest row by (taken_at, id) among the rows the filters ADMITTED — it is
@@ -260,7 +296,7 @@ async def library_buckets(
         )
         .select_from(Attachment)
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
-        .where(*library_filters(user, kind, tag))
+        .where(*library_filters(user, kind, tag, mine=mine, visibility=visibility))
         .cte("library_rows")
     )
     ranked = select(
@@ -304,7 +340,12 @@ async def library_buckets(
 
 
 async def library_tag_counts(
-    db: AsyncSession, user: User, kind: str | None
+    db: AsyncSession,
+    user: User,
+    kind: str | None,
+    *,
+    mine: bool = False,
+    visibility: Visibility | None = None,
 ) -> list[tuple[str, int]]:
     """Each tag with the number of library items (not memos) under it that `user` may see, under
     the same kind filter the grid applies — so a count equals the grid's length under that tag.
@@ -316,7 +357,7 @@ async def library_tag_counts(
         .join(Memo, Memo.id == Attachment.memo_id)
         .join(memo_tags, memo_tags.c.memo_id == Memo.id)
         .join(Tag, Tag.id == memo_tags.c.tag_id)
-        .where(*library_filters(user, kind, None))
+        .where(*library_filters(user, kind, None, mine=mine, visibility=visibility))
         .group_by(Tag.name)
         .order_by(count.desc(), Tag.name.asc())
     )

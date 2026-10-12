@@ -166,6 +166,19 @@
             "title": "Uid",
             "type": "string"
           },
+          "visibility": {
+            "enum": [
+              "PRIVATE",
+              "PROTECTED",
+              "PUBLIC",
+              null
+            ],
+            "title": "Visibility",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "webReady": {
             "title": "Webready",
             "type": "boolean"
@@ -198,6 +211,7 @@
           "takenAt",
           "filename",
           "tags",
+          "visibility",
           "thumbnailUrl",
           "previewUrl",
           "webUrl",
@@ -779,6 +793,42 @@
         "title": "CollectionCreate",
         "type": "object"
       },
+      "CollectionInclusion": {
+        "properties": {
+          "attachmentUids": {
+            "description": "The pictures to make members. A uid named twice is answered once.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Attachmentuids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "attachmentUids"
+        ],
+        "title": "CollectionInclusion",
+        "type": "object"
+      },
+      "CollectionInclusionOut": {
+        "properties": {
+          "results": {
+            "description": "One answer per distinct requested uid, in the order first named.",
+            "items": {
+              "$ref": "#/components/schemas/InclusionResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "CollectionInclusionOut",
+        "type": "object"
+      },
       "CollectionOut": {
         "properties": {
           "cover": {
@@ -875,6 +925,19 @@
                 "title": "Uid",
                 "type": "string"
               },
+              "visibility": {
+                "enum": [
+                  "PRIVATE",
+                  "PROTECTED",
+                  "PUBLIC",
+                  null
+                ],
+                "title": "Visibility",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "webReady": {
                 "title": "Webready",
                 "type": "boolean"
@@ -907,6 +970,7 @@
               "takenAt",
               "filename",
               "tags",
+              "visibility",
               "thumbnailUrl",
               "previewUrl",
               "webUrl",
@@ -1923,6 +1987,32 @@
           "apiMajor"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "InclusionResult": {
+        "properties": {
+          "attachmentUid": {
+            "title": "Attachmentuid",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`added`: it is a member now \u2014 its memo carries the trip's tag and its exclusion, if any, is gone. `alreadyMember`: it was one; nothing was written. `notOwner`: it hangs on another member's memo, or it does not exist or is not visible to the caller \u2014 one answer for all three; nothing was written. `orphan`: it hangs on no memo, so no tag can make it a member. `error`: its memo's edit failed and was rolled back; the other memos' answers stand.",
+            "enum": [
+              "added",
+              "alreadyMember",
+              "notOwner",
+              "orphan",
+              "error"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachmentUid",
+          "outcome"
+        ],
+        "title": "InclusionResult",
         "type": "object"
       },
       "MailSubsampling": {
@@ -4058,7 +4148,7 @@
     },
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\nEach item names the tags of its memo, by name; an orphan's are empty.\n?bucket=<key> opens a taken-order walk at a day, month or year \u2014 a `key` exactly as the\nbuckets of `tz` (an IANA zone, default Europe/Zurich) name it \u2014 so the first item is that\nbucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the\nnext item beyond it. A key the buckets could not name, an unknown zone or a bucket under an\nupload order is a 422.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\nEach item names the tags of its memo, by name; an orphan's are empty.\n?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps\nonly media on a memo of that visibility, so no orphan. Both only narrow what the caller may\nalready see. Each item names its memo's visibility, null for an orphan.\n?bucket=<key> opens a taken-order walk at a day, month or year \u2014 a `key` exactly as the\nbuckets of `tz` (an IANA zone, default Europe/Zurich) name it \u2014 so the first item is that\nbucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the\nnext item beyond it. A key the buckets could not name, an unknown zone or a bucket under an\nupload order is a 422.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -4144,6 +4234,24 @@
               "title": "Tz",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "mine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Mine",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Visibility"
+            }
           }
         ],
         "responses": {
@@ -4199,7 +4307,7 @@
     },
     "/api/attachments/buckets": {
       "get": {
-        "description": "The library the list shows \u2014 same visibility, same `type` and `tag` filters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail \u2014\nfor a video its poster frame, the one picture a video has \u2014 and the tags of the memos its\nitems hang on, the tag on the most items first, then by name.",
+        "description": "The library the list shows \u2014 same visibility, same `type`, `tag`, `mine` and `visibility`\nfilters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail \u2014\nfor a video its poster frame, the one picture a video has \u2014 and the tags of the memos its\nitems hang on, the tag on the most items first, then by name.",
         "operationId": "attachment_buckets_api_attachments_buckets_get",
         "parameters": [
           {
@@ -4249,6 +4357,24 @@
                 "null"
               ]
             }
+          },
+          {
+            "in": "query",
+            "name": "mine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Mine",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Visibility"
+            }
           }
         ],
         "responses": {
@@ -4296,7 +4422,7 @@
     },
     "/api/attachments/tags": {
       "get": {
-        "description": "Every tag on a memo carrying media the user can see, with the number of such media under\nthe same `type` filter the list applies \u2014 so a tag's count is the length of the list under\n`?tag=` and that `type`. Most items first, then by name; a tag with no media is absent.",
+        "description": "Every tag on a memo carrying media the user can see, with the number of such media under\nthe same `type`, `mine` and `visibility` filters the list applies \u2014 so a tag's count is the\nlength of the list under `?tag=` and those filters. Most items first, then by name; a tag\nwith no media is absent.",
         "operationId": "attachment_tags_api_attachments_tags_get",
         "parameters": [
           {
@@ -4309,6 +4435,24 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "mine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Mine",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Visibility"
             }
           }
         ],
@@ -5522,7 +5666,7 @@
     },
     "/api/collections/{uid}/attachments": {
       "get": {
-        "description": "The collection's members as the caller may see them \u2014 its tag's media and its span's,\nminus its exclusions \u2014 in exactly the shape, order and paging of `GET /api/attachments`.\n`type` narrows to images or videos. When more rows follow, the `X-Next-Cursor` header carries\nthe token to resend as `?cursor=` with the same `type`, `limit` and `order`.",
+        "description": "The collection's members as the caller may see them \u2014 its tag's media and its span's,\nminus its exclusions \u2014 in exactly the shape, order and paging of `GET /api/attachments`.\n`type` narrows to images or videos; `mine` and `visibility` narrow exactly as on the library.\nWhen more rows follow, the `X-Next-Cursor` header carries\nthe token to resend as `?cursor=` with the same `type`, `mine`, `visibility`, `limit` and\n`order`.",
         "operationId": "list_members_api_collections__uid__attachments_get",
         "parameters": [
           {
@@ -5541,7 +5685,8 @@
             "schema": {
               "enum": [
                 "image",
-                "video"
+                "video",
+                null
               ],
               "title": "Type",
               "type": [
@@ -5586,6 +5731,24 @@
               ],
               "title": "Order",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Mine",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Visibility"
             }
           }
         ],
@@ -5680,6 +5843,113 @@
           }
         ],
         "summary": "List Members",
+        "tags": [
+          "collections"
+        ]
+      },
+      "post": {
+        "description": "Make pictures members of this trip by tagging their memos with the trip's tag: the tag is\nappended to each memo's text once (its other tags kept), and each named picture's exclusion\nis cleared. Tagging a memo admits its other pictures too; their own exclusions stay. Only the\ncaller's own memos are edited, one transaction per memo, and each uid gets its own answer.\nA collection without a tag is a 409.",
+        "operationId": "include_attachments_api_collections__uid__attachments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CollectionInclusion"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollectionInclusionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such collection. Nothing was changed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The collection has no tag, so no memo can be tagged into it. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Include Attachments",
         "tags": [
           "collections"
         ]

@@ -11,7 +11,7 @@ loser gets the winner's row), and the record's shape is validated in full before
 bad record is a `CollectionInvalid`, never an IntegrityError from the CHECKs that back it.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -259,10 +259,20 @@ async def exclude(db: AsyncSession, collection: Collection, attachment: Attachme
 
 async def include(db: AsyncSession, collection: Collection, attachment: Attachment) -> None:
     """Undo `exclude`. Idempotent: deleting a row that is not there deletes nothing."""
+    await include_attachments(db, collection.id, [attachment.id])
+
+
+async def include_attachments(
+    db: AsyncSession, collection_id: int, attachment_ids: Sequence[int]
+) -> None:
+    """Undo `exclude` for several attachments of one collection in ONE statement — the class is
+    acquired once per transaction (docs/LOCK-ORDER.md R2). Idempotent like `include`. Takes the
+    collection's id rather than the record, because the inclusion route calls it after a memo
+    transaction may have rolled back and expired every loaded object."""
     await db.execute(
         delete(CollectionExclusion).where(
-            CollectionExclusion.collection_id == collection.id,
-            CollectionExclusion.attachment_id == attachment.id,
+            CollectionExclusion.collection_id == collection_id,
+            CollectionExclusion.attachment_id.in_(attachment_ids),
         )
     )
 

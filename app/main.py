@@ -283,6 +283,10 @@ def _merge_nullable(keep: dict[str, Any], parent: dict[str, Any], path: str) -> 
     merged = dict(keep)
     merged.update(rest)
     merged["type"] = [keep["type"], "null"]
+    if isinstance(merged.get("enum"), list) and None not in merged["enum"]:
+        # An instance must satisfy `type` AND `enum`: without null among the members the field
+        # would admit no null at all, whatever its type array says (MEMNG-785).
+        merged["enum"] = [*merged["enum"], None]
     return merged
 
 

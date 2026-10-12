@@ -11,16 +11,18 @@ import re
 from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
-from sqlalchemy import select
+from pydantic.json_schema import SkipJsonSchema
+from sqlalchemy import ColumnElement, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.api_types import Rfc3339Datetime
 from app.database import get_session
-from app.models import Attachment, Collection, User
+from app.models import Attachment, Collection, Memo, User, Visibility
 from app.routers.assets import (
     AttachmentListItem,
     _list_item,
@@ -30,12 +32,16 @@ from app.routers.assets import (
 )
 from app.routers.memos import IdempotencyKey
 from app.services import collections as coll_svc
+from app.services import memos as memos_svc
 from app.services.asset_paths import web_ready_uids
 from app.services.attachments import (
     collection_member_clause,
     library_filters,
     library_page_statement,
+    library_visible,
 )
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api", tags=["collections"])
 
@@ -178,10 +184,10 @@ async def _render(
             [*library_filters(user, None, None), Attachment.id.in_(cover_ids)], "desc"
         )
         rows = list((await db.execute(stmt)).all())
-        ready = await web_ready_uids(att for att, _, _, _ in rows)
+        ready = await web_ready_uids(att for att, _, _, _, _ in rows)
         covers = {
-            att.id: _list_item(att, user_id, memo_uid, when, list(tags), ready)
-            for att, memo_uid, when, tags in rows
+            att.id: _list_item(att, user_id, memo_uid, when, list(tags), ready, visibility)
+            for att, memo_uid, when, tags, visibility in rows
         }
     creator_ids = {c.created_by for c in collections if c.created_by is not None}
     creators: dict[int, str] = {}
@@ -398,11 +404,180 @@ async def list_members(
     limit: int = 200,
     cursor: str | None = None,
     order: Literal["desc", "asc", "taken_desc", "taken_asc"] = "taken_desc",
+    mine: bool = False,
+    visibility: Visibility | SkipJsonSchema[None] = None,
 ) -> list[AttachmentListItem]:
     """The collection's members as the caller may see them — its tag's media and its span's,
     minus its exclusions — in exactly the shape, order and paging of `GET /api/attachments`.
-    `type` narrows to images or videos. When more rows follow, the `X-Next-Cursor` header carries
-    the token to resend as `?cursor=` with the same `type`, `limit` and `order`."""
+    `type` narrows to images or videos; `mine` and `visibility` narrow exactly as on the library.
+    When more rows follow, the `X-Next-Cursor` header carries
+    the token to resend as `?cursor=` with the same `type`, `mine`, `visibility`, `limit` and
+    `order`."""
     collection = await _collection(db, uid)
-    filters = [*library_filters(user, type, None), collection_member_clause(collection)]
+    filters = [
+        *library_filters(user, type, None, mine=mine, visibility=visibility),
+        collection_member_clause(collection),
+    ]
     return await library_page(db, user, response, filters, order, limit, cursor)
+
+
+InclusionOutcome = Literal["added", "alreadyMember", "notOwner", "orphan", "error"]
+
+
+class CollectionInclusion(BaseModel):
+    attachmentUids: list[str] = Field(
+        min_length=1,
+        max_length=500,
+        description="The pictures to make members. A uid named twice is answered once.",
+    )
+
+
+class InclusionResult(BaseModel):
+    attachmentUid: str
+    outcome: InclusionOutcome = Field(
+        description="`added`: it is a member now — its memo carries the trip's tag and its "
+        "exclusion, if any, is gone. `alreadyMember`: it was one; nothing was written. "
+        "`notOwner`: it hangs on another member's memo, or it does not exist or is not visible "
+        "to the caller — one answer for all three; nothing was written. `orphan`: it hangs on no "
+        "memo, so no tag can make it a member. `error`: its memo's edit failed and was rolled "
+        "back; the other memos' answers stand."
+    )
+
+
+class CollectionInclusionOut(BaseModel):
+    results: list[InclusionResult] = Field(
+        description="One answer per distinct requested uid, in the order first named."
+    )
+
+
+_INCLUSION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_UNAUTHORIZED,
+    404: {"description": "No such collection. Nothing was changed.", "content": _DETAIL},
+    409: {
+        "description": "The collection has no tag, so no memo can be tagged into it. Nothing "
+        "was changed.",
+        "content": _DETAIL,
+    },
+}
+
+
+async def _before_memo_lock() -> None:
+    """A seam between an inclusion's unlocked read of a memo and its lock — the window in which a
+    concurrent edit can commit. Tests hold requests here; in production it does nothing."""
+
+
+async def _include_from_memo(
+    db: AsyncSession,
+    memo_id: int,
+    uids: list[str],
+    user_id: int,
+    tag: str,
+    collection_id: int,
+    member: ColumnElement[bool],
+) -> dict[str, InclusionOutcome]:
+    """One memo's part of an inclusion, inside the caller's transaction, which commits it.
+
+    The memo lock comes FIRST and is held to the commit, as on `PATCH /api/memos/{uid}`; the
+    content the tag is appended to is the one the lock RE-READ, so an edit that committed after
+    this request's unlocked read is kept rather than overwritten. The exclusion rows come after
+    the memo (M before C, docs/LOCK-ORDER.md). Every attachment is judged again under the lock: one
+    detached meanwhile is an orphan now."""
+    memo = (await db.execute(select(Memo).where(Memo.id == memo_id))).scalar_one_or_none()
+    gone: dict[str, InclusionOutcome] = dict.fromkeys(uids, "orphan")
+    if memo is None:
+        return gone
+    await _before_memo_lock()
+    locked = await memos_svc.lock_memo_for_write(db, memo)
+    if locked is None:
+        return gone
+    if locked.owner_id != user_id:
+        return dict.fromkeys(uids, "notOwner")
+    rows = (
+        await db.execute(
+            select(Attachment.id, Attachment.uid, member.label("is_member"))
+            .outerjoin(Memo, Memo.id == Attachment.memo_id)
+            .where(
+                Attachment.uid.in_(uids),
+                Attachment.memo_id == memo_id,
+                Attachment.detached_at.is_(None),
+            )
+        )
+    ).all()
+    out = gone
+    to_add: list[int] = []
+    for att_id, att_uid, is_member in rows:
+        if is_member:
+            out[att_uid] = "alreadyMember"
+        else:
+            out[att_uid] = "added"
+            to_add.append(att_id)
+    if not to_add:
+        return out
+    content = locked.content
+    if tag not in memos_svc.parse_tags(content):
+        separator = "" if not content or content.endswith("\n") else "\n"
+        await memos_svc.update_memo(db, locked, content=f"{content}{separator}#{tag}")
+    # Only the REQUESTED pictures: the tag admits the memo's other pictures too, and an exclusion
+    # one of them carries is a choice somebody made about that picture, which stands.
+    await coll_svc.include_attachments(db, collection_id, to_add)
+    return out
+
+
+@router.post(
+    "/collections/{uid}/attachments",
+    response_model=CollectionInclusionOut,
+    responses=_INCLUSION_RESPONSES,
+)
+async def include_attachments(
+    uid: str,
+    body: CollectionInclusion,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> CollectionInclusionOut:
+    """Make pictures members of this trip by tagging their memos with the trip's tag: the tag is
+    appended to each memo's text once (its other tags kept), and each named picture's exclusion
+    is cleared. Tagging a memo admits its other pictures too; their own exclusions stay. Only the
+    caller's own memos are edited, one transaction per memo, and each uid gets its own answer.
+    A collection without a tag is a 409."""
+    collection = await _collection(db, uid)
+    if collection.tag is None:
+        raise HTTPException(status_code=409, detail="This collection has no tag to add")
+    # Plain values and one built clause: a memo transaction that rolls back expires every loaded
+    # object, and the next memo must not lazy-load the collection (MissingGreenlet).
+    tag, collection_id, user_id = collection.tag, collection.id, user.id
+    member = collection_member_clause(collection)
+    wanted = list(dict.fromkeys(body.attachmentUids))
+    # Missing and invisible get the same answer, `_viewable`'s rule: the read is bounded by the
+    # library's own visibility, so a hidden row is simply not found.
+    outcomes: dict[str, InclusionOutcome] = dict.fromkeys(wanted, "notOwner")
+    seen = (
+        await db.execute(
+            select(Attachment.uid, Attachment.memo_id, Attachment.detached_at, Memo.owner_id)
+            .outerjoin(Memo, Memo.id == Attachment.memo_id)
+            .where(Attachment.uid.in_(wanted), library_visible(user))
+        )
+    ).all()
+    by_memo: dict[int, list[str]] = {}
+    for att_uid, memo_id, detached_at, memo_owner in seen:
+        if memo_id is None or detached_at is not None:
+            outcomes[att_uid] = "orphan"
+        elif memo_owner != user_id:
+            outcomes[att_uid] = "notOwner"
+        else:
+            by_memo.setdefault(memo_id, []).append(att_uid)
+    for memo_id, uids in sorted(by_memo.items()):
+        try:
+            result = await _include_from_memo(
+                db, memo_id, uids, user_id, tag, collection_id, member
+            )
+            await db.commit()
+        except Exception:
+            # Reported per uid, never swallowed: this memo's edit is rolled back whole and its
+            # pictures answer `error`, while the memos already committed keep their answers.
+            await db.rollback()
+            logger.exception("collection.include.memo_failed", memo_id=memo_id, uids=uids)
+            result: dict[str, InclusionOutcome] = dict.fromkeys(uids, "error")
+        outcomes.update(result)
+    return CollectionInclusionOut(
+        results=[InclusionResult(attachmentUid=u, outcome=outcomes[u]) for u in wanted]
+    )

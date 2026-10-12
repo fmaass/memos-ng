@@ -46,7 +46,8 @@ INSIDE = "2031-03-05T12:00:00Z"
 OUTSIDE = "2031-06-01T12:00:00Z"
 TAG = "c746t"
 
-# The eight operations this phase adds, and nothing else under the prefix.
+# The eight operations MEMNG-746 added and the inclusion MEMNG-785 adds, and nothing else under
+# the prefix.
 OPERATIONS = {
     ("get", "/api/collections"),
     ("post", "/api/collections"),
@@ -56,6 +57,7 @@ OPERATIONS = {
     ("put", "/api/collections/{uid}/exclusions/{attachment_uid}"),
     ("delete", "/api/collections/{uid}/exclusions/{attachment_uid}"),
     ("get", "/api/collections/{uid}/attachments"),
+    ("post", "/api/collections/{uid}/attachments"),
 }
 
 
@@ -312,6 +314,7 @@ def test_anonymous_is_401_on_every_route(lib):
         ("PUT", f"/api/collections/{uid}/exclusions/anon-a", None),
         ("DELETE", f"/api/collections/{uid}/exclusions/anon-a", None),
         ("GET", f"/api/collections/{uid}/attachments", None),
+        ("POST", f"/api/collections/{uid}/attachments", {"attachmentUids": ["anon-a"]}),
     ]
     assert {(m.lower(), p.replace(uid, "{uid}").replace("anon-a", "{attachment_uid}"))
             for m, p, _ in calls} == OPERATIONS  # fmt: skip
@@ -904,7 +907,7 @@ def _document(routes: list[Any]) -> dict[str, Any]:
     return schema
 
 
-def test_openapi_names_exactly_the_eight_collection_operations():
+def test_openapi_names_exactly_the_nine_collection_operations():
     paths = app.openapi()["paths"]
     found = {
         (method, path)
@@ -921,7 +924,7 @@ def test_openapi_names_exactly_the_eight_collection_operations():
     member_read = paths["/api/collections/{uid}/attachments"]["get"]
     assert "X-Next-Cursor" in member_read["responses"]["200"]["headers"]
     params = {p["name"]: p for p in member_read["parameters"]}
-    assert set(params) == {"uid", "type", "limit", "cursor", "order"}
+    assert set(params) == {"uid", "type", "limit", "cursor", "order", "mine", "visibility"}
     # A query that fails validation answers the array shape; an undecodable or wrong-kind cursor
     # the string one (the library's global cursor handler) — the contract must name both.
     refused = member_read["responses"]["422"]["content"]["application/json"]["schema"]
@@ -946,7 +949,7 @@ def test_openapi_names_exactly_the_eight_collection_operations():
 
 def test_the_collection_routes_change_no_other_path_or_schema():
     """Built with and without this module's routes, the document differs ONLY by the collection
-    paths and the three schemas they introduce — no shared model renamed or reshaped, no other
+    paths and the six schemas they introduce — no shared model renamed or reshaped, no other
     path touched. Selected by the endpoint's module, not by path, so a route this module added
     under another prefix would show up here as a changed path."""
     routes = list(app.routes)
@@ -964,6 +967,9 @@ def test_the_collection_routes_change_no_other_path_or_schema():
         "CollectionOut",
         "CollectionCreate",
         "CollectionPatch",
+        "CollectionInclusion",
+        "CollectionInclusionOut",
+        "InclusionResult",
     }
     for name, schema in without_schemas.items():
         assert full_schemas[name] == schema, name

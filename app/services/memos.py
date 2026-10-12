@@ -7,6 +7,7 @@ from pathlib import Path
 
 import structlog
 from sqlalchemy import String, and_, cast, exists, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -87,15 +88,28 @@ def visible_clause(user: User):
 
 
 async def _get_or_create_tags(db: AsyncSession, names: Sequence[str]) -> list[Tag]:
-    out = []
-    for name in names:
-        tag = (await db.execute(select(Tag).where(Tag.name == name))).scalar_one_or_none()
-        if tag is None:
-            tag = Tag(name=name)
-            db.add(tag)
-            await db.flush()
-        out.append(tag)
-    return out
+    """The `Tag` rows for `names`, in that order, creating the missing ones.
+
+    The unique name settles a concurrent create, never a read before the write: two edits of
+    DIFFERENT memos hold different memo locks, so both can miss the same new tag (a collection
+    stores its tag as a string, with no row, MEMNG-785). A plain INSERT failed the loser on the
+    unique constraint; ON CONFLICT DO NOTHING waits for the winner instead and the re-read finds
+    its committed row. Missing names are inserted in sorted order, so two edits creating the same
+    pair of new tags wait on each other in one direction and cannot deadlock."""
+    if not names:
+        return []
+    found = {
+        t.name: t for t in (await db.execute(select(Tag).where(Tag.name.in_(names)))).scalars()
+    }
+    missing = sorted(set(names) - set(found))
+    if missing:
+        for name in missing:
+            await db.execute(
+                pg_insert(Tag).values(name=name).on_conflict_do_nothing(index_elements=[Tag.name])
+            )
+        created = await db.execute(select(Tag).where(Tag.name.in_(missing)))
+        found.update({t.name: t for t in created.scalars()})
+    return [found[name] for name in names]
 
 
 async def create_memo(

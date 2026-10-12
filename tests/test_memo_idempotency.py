@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 from app.config import settings
-from app.models import CREATE_KEY_CONSTRAINT, Memo, User, Visibility
+from app.models import CREATE_KEY_CONSTRAINT, Memo, Tag, User, Visibility
 from app.routers.memos import _create_or_replay
 from app.services import memos as memo_svc
 from fastapi import HTTPException
-from sqlalchemy import create_engine, delete, text
+from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.exc import IntegrityError
 
 from tests.conftest import SYNC_URL
@@ -181,10 +181,15 @@ async def test_two_concurrent_creates_with_one_key_store_exactly_one_memo(pat_cl
 async def test_a_foreign_conflict_that_self_heals_still_stores_both_memos(pat_client, monkeypatch):
     """Two creates with DISTINCT keys, colliding on the tags index — not on the key at all.
 
-    Both posts invent the same brand-new hashtag, so `_get_or_create_tags` has them both select
-    nothing and both insert; one loses on `ix_tags_name`. That is the loser's OWN write
-    conflicting, and it is TRANSIENT: by the time the loser tries again the winner's tag is
-    committed, so the retry finds it and the memo lands. Both memos are stored.
+    Both posts invent the same brand-new hashtag and both insert it with a plain INSERT behind a
+    SELECT; one loses on `ix_tags_name`. That is the loser's OWN write conflicting, and it is
+    TRANSIENT: by the time the loser tries again the winner's tag is committed, so the retry finds
+    it and the memo lands. Both memos are stored.
+
+    The plain INSERT is staged here: since MEMNG-785 `_get_or_create_tags` itself settles a new
+    tag with ON CONFLICT DO NOTHING and no longer collides, so the test writes the colliding row
+    the way that function used to, as the cheapest foreign unique conflict there is. The retry
+    under test does not care which index the loser's own write collided on.
 
     This is the regression guard for MEMNG-131: narrowing `replayable` to the key constraint —
     the obvious way to stop foreign conflicts being called a raced create — would delete that
@@ -193,7 +198,7 @@ async def test_a_foreign_conflict_that_self_heals_still_stores_both_memos(pat_cl
 
     The barrier holds each request between its tag SELECT and its tag INSERT until the other has
     got there too, which is what makes both of them try the insert instead of one reusing the
-    other's committed tag.
+    other's committed tag. The loser's retry goes through the real function.
     """
     bearer, _, _ = pat_client
     tag = f"race{uuid.uuid4().hex[:12]}"
@@ -206,7 +211,11 @@ async def test_a_foreign_conflict_that_self_heals_still_stores_both_memos(pat_cl
         nonlocal entered
         entered += 1
         if entered <= 2:  # only the first pair is held; the loser's retry must not wait for a peer
+            found = (await db.execute(select(Tag.name).where(Tag.name.in_(names)))).scalars()
+            missing = set(names) - set(found)
             await both_past_the_select.wait()
+            db.add_all(Tag(name=name) for name in sorted(missing))
+            await db.flush()
         return await real_get_or_create_tags(db, names)
 
     monkeypatch.setattr(memo_svc, "_get_or_create_tags", barriered)

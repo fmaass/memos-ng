@@ -555,3 +555,43 @@ def test_a_vanished_memo_is_a_declared_404_on_both_patch_and_delete():
         assert model["required"] == ["detail"], method
         # `type: string`, not a `$ref` to a nested detail object: the plain shape is the assertion.
         assert model["properties"]["detail"]["type"] == "string", method
+
+
+def _accepts(schema: dict, value: object) -> bool:
+    """JSON Schema's own reading of the two keywords a nullable enum uses: the value must have one
+    of the `type`s AND, when `enum` is present, be one of its members — so a `null` type beside an
+    enum that lacks `null` admits nothing null."""
+    kinds = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
+    kind = "null" if value is None else "string" if isinstance(value, str) else "other"
+    return kind in kinds and ("enum" not in schema or value in schema["enum"])
+
+
+ENUM = {"type": "string", "enum": ["PRIVATE", "PROTECTED", "PUBLIC"], "title": "Visibility"}
+
+
+def test_a_nullable_enum_reference_admits_null_and_keeps_its_target_unchanged():
+    """Adding `"null"` to `type` alone leaves `enum` refusing it: by JSON Schema an instance must
+    satisfy both keywords, so the published field could never be null (MEMNG-785)."""
+    from app.main import collapse_nullable_anyof
+
+    document = _document(_nullable_ref("Archive"), ENUM)
+    collapse_nullable_anyof(document)
+
+    detail = document["properties"]["detail"]
+    for value in (None, "PRIVATE", "PROTECTED", "PUBLIC"):
+        assert _accepts(detail, value), value
+    assert not _accepts(detail, "SECRET")
+    assert document["components"]["schemas"]["Archive"] == ENUM
+
+
+def test_the_items_visibility_is_published_as_a_nullable_enum_beside_the_shared_one():
+    from app.main import app
+
+    schemas = app.openapi()["components"]["schemas"]
+    field = schemas["AttachmentListItem"]["properties"]["visibility"]
+    for value in (None, "PRIVATE", "PROTECTED", "PUBLIC"):
+        assert _accepts(field, value), value
+    assert not _accepts(field, "SECRET")
+    assert "visibility" in schemas["AttachmentListItem"]["required"]
+    # The shared component every non-nullable use references is not widened by the copy.
+    assert schemas["Visibility"] == ENUM

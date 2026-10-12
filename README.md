@@ -190,6 +190,28 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.2.0
+
+- `GET /api/attachments`, `/api/attachments/buckets`, `/api/attachments/tags` and a collection's
+  member read `GET /api/collections/{uid}/attachments` take two optional filters: `mine=true` keeps
+  only the caller's own attachments, orphans included, and `visibility=PUBLIC|PROTECTED|PRIVATE`
+  keeps only media on a memo of that visibility, so no orphan. Both only narrow what the caller may
+  already see — `visibility=PRIVATE` is the caller's own private memos — and the four surfaces
+  answer every combination with the same rows. Without them every response is unchanged.
+- Every library item (`GET /api/attachments`, the member read, a collection's `cover`) now carries
+  `visibility`, its memo's visibility, or null for an orphan. Additive; a client that ignores it
+  is unaffected.
+- `POST /api/collections/{uid}/attachments` with `{"attachmentUids": [...]}` makes pictures members
+  of a tagged collection: the collection's tag is appended once to each of the caller's memos the
+  pictures hang on (its other tags kept), and each named picture's exclusion is cleared. Tagging
+  a memo admits its other pictures too; their own exclusions stay. One answer per uid — `added`,
+  `alreadyMember`, `notOwner` (another member's memo, or a uid that is missing or not visible),
+  `orphan`, or `error` when that memo's edit failed and was rolled back. A collection without a
+  tag answers 409.
+- Two edits creating the same new tag at once no longer fail one of them on the unique name.
+- The published schema of a nullable enum now lists `null` among its values, so a validator
+  accepts the null the field allows.
+
 ### v2.1.0
 
 - `total_size` on a memo is now populated — the sum of its attached files' sizes in bytes — on the

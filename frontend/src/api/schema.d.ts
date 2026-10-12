@@ -288,6 +288,9 @@ export interface paths {
          *     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
          *     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
          *     Each item names the tags of its memo, by name; an orphan's are empty.
+         *     ?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps
+         *     only media on a memo of that visibility, so no orphan. Both only narrow what the caller may
+         *     already see. Each item names its memo's visibility, null for an orphan.
          *     ?bucket=<key> opens a taken-order walk at a day, month or year — a `key` exactly as the
          *     buckets of `tz` (an IANA zone, default Europe/Zurich) name it — so the first item is that
          *     bucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the
@@ -316,7 +319,8 @@ export interface paths {
         };
         /**
          * Attachment Buckets
-         * @description The library the list shows — same visibility, same `type` and `tag` filters — counted per
+         * @description The library the list shows — same visibility, same `type`, `tag`, `mine` and `visibility`
+         *     filters — counted per
          *     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
          *     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
          *     for a video its poster frame, the one picture a video has — and the tags of the memos its
@@ -341,8 +345,9 @@ export interface paths {
         /**
          * Attachment Tags
          * @description Every tag on a memo carrying media the user can see, with the number of such media under
-         *     the same `type` filter the list applies — so a tag's count is the length of the list under
-         *     `?tag=` and that `type`. Most items first, then by name; a tag with no media is absent.
+         *     the same `type`, `mine` and `visibility` filters the list applies — so a tag's count is the
+         *     length of the list under `?tag=` and those filters. Most items first, then by name; a tag
+         *     with no media is absent.
          */
         get: operations["attachment_tags_api_attachments_tags_get"];
         put?: never;
@@ -741,12 +746,22 @@ export interface paths {
          * List Members
          * @description The collection's members as the caller may see them — its tag's media and its span's,
          *     minus its exclusions — in exactly the shape, order and paging of `GET /api/attachments`.
-         *     `type` narrows to images or videos. When more rows follow, the `X-Next-Cursor` header carries
-         *     the token to resend as `?cursor=` with the same `type`, `limit` and `order`.
+         *     `type` narrows to images or videos; `mine` and `visibility` narrow exactly as on the library.
+         *     When more rows follow, the `X-Next-Cursor` header carries
+         *     the token to resend as `?cursor=` with the same `type`, `mine`, `visibility`, `limit` and
+         *     `order`.
          */
         get: operations["list_members_api_collections__uid__attachments_get"];
         put?: never;
-        post?: never;
+        /**
+         * Include Attachments
+         * @description Make pictures members of this trip by tagging their memos with the trip's tag: the tag is
+         *     appended to each memo's text once (its other tags kept), and each named picture's exclusion
+         *     is cleared. Tagging a memo admits its other pictures too; their own exclusions stay. Only the
+         *     caller's own memos are edited, one transaction per memo, and each uid gets its own answer.
+         *     A collection without a tag is a 409.
+         */
+        post: operations["include_attachments_api_collections__uid__attachments_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1476,6 +1491,11 @@ export interface components {
             thumbnailUrl: string;
             /** Uid */
             uid: string;
+            /**
+             * Visibility
+             * @enum {string|null}
+             */
+            visibility: "PRIVATE" | "PROTECTED" | "PUBLIC" | null;
             /** Webready */
             webReady: boolean;
             /** Weburl */
@@ -1701,6 +1721,22 @@ export interface components {
              */
             tz?: string | null;
         };
+        /** CollectionInclusion */
+        CollectionInclusion: {
+            /**
+             * Attachmentuids
+             * @description The pictures to make members. A uid named twice is answered once.
+             */
+            attachmentUids: string[];
+        };
+        /** CollectionInclusionOut */
+        CollectionInclusionOut: {
+            /**
+             * Results
+             * @description One answer per distinct requested uid, in the order first named.
+             */
+            results: components["schemas"]["InclusionResult"][];
+        };
         /** CollectionOut */
         CollectionOut: {
             /**
@@ -1748,6 +1784,11 @@ export interface components {
                 thumbnailUrl: string;
                 /** Uid */
                 uid: string;
+                /**
+                 * Visibility
+                 * @enum {string|null}
+                 */
+                visibility: "PRIVATE" | "PROTECTED" | "PUBLIC" | null;
                 /** Webready */
                 webReady: boolean;
                 /** Weburl */
@@ -2262,6 +2303,17 @@ export interface components {
             status: string;
             /** Version */
             version: string;
+        };
+        /** InclusionResult */
+        InclusionResult: {
+            /** Attachmentuid */
+            attachmentUid: string;
+            /**
+             * Outcome
+             * @description `added`: it is a member now — its memo carries the trip's tag and its exclusion, if any, is gone. `alreadyMember`: it was one; nothing was written. `notOwner`: it hangs on another member's memo, or it does not exist or is not visible to the caller — one answer for all three; nothing was written. `orphan`: it hangs on no memo, so no tag can make it a member. `error`: its memo's edit failed and was rolled back; the other memos' answers stand.
+             * @enum {string}
+             */
+            outcome: "added" | "alreadyMember" | "notOwner" | "orphan" | "error";
         };
         /**
          * MailSubsampling
@@ -3389,6 +3441,8 @@ export interface operations {
                 tag?: string | null;
                 bucket?: string | null;
                 tz?: string;
+                mine?: boolean;
+                visibility?: components["schemas"]["Visibility"];
             };
             header?: never;
             path?: never;
@@ -3426,6 +3480,8 @@ export interface operations {
                 type?: string | null;
                 tz?: string;
                 tag?: string | null;
+                mine?: boolean;
+                visibility?: components["schemas"]["Visibility"];
             };
             header?: never;
             path?: never;
@@ -3458,6 +3514,8 @@ export interface operations {
         parameters: {
             query?: {
                 type?: string | null;
+                mine?: boolean;
+                visibility?: components["schemas"]["Visibility"];
             };
             header?: never;
             path?: never;
@@ -4218,6 +4276,8 @@ export interface operations {
                 limit?: number;
                 cursor?: string | null;
                 order?: "desc" | "asc" | "taken_desc" | "taken_asc";
+                mine?: boolean;
+                visibility?: components["schemas"]["Visibility"];
             };
             header?: never;
             path: {
@@ -4269,6 +4329,75 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"] | {
                         detail: string;
                     };
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    include_attachments_api_collections__uid__attachments_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CollectionInclusion"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionInclusionOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The collection has no tag, so no memo can be tagged into it. Nothing was changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
             503: components["responses"]["DatabaseBusy"];

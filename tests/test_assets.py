@@ -746,6 +746,7 @@ def test_list_attachments_without_a_cursor_is_the_unchanged_bare_list(logged_in_
             "takenAt",  # MEMNG-507: additive, the native client ignores unknown keys
             "filename",  # MEMNG-507: additive, names each file in the share sheet
             "tags",  # MEMNG-651: additive, the memo's tags for the day group's tags line
+            "visibility",  # MEMNG-785: additive, the memo's visibility, null for an orphan
             "thumbnailUrl",
             "previewUrl",
             "webUrl",

@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Upload
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
+from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +33,7 @@ from app.models import (
     Memo,
     Upload,
     User,
+    Visibility,
 )
 from app.services import asset_urls, poster, printready, reclaim, storage, variants
 from app.services import uploads as up_svc
@@ -256,6 +258,9 @@ class AttachmentListItem(BaseModel):
     # The tags of the memo this hangs on, sorted by name like MemoOut.tags; empty for an orphan
     # and for an untagged memo. MEMNG-651, additive.
     tags: list[str]
+    # The visibility of the memo this hangs on; null for an orphan, which has none. MEMNG-785,
+    # additive.
+    visibility: Visibility | None
     thumbnailUrl: str
     previewUrl: str
     webUrl: str
@@ -275,10 +280,11 @@ def _list_item(
     taken_at: datetime,
     tags: list[str],
     web_ready: AbstractSet[str],
+    visibility: Visibility | None,
 ) -> AttachmentListItem:
-    """`memo_uid`, `taken_at` and `tags` are passed IN, never read off `att` — there is no
-    `Attachment.memo` relationship and adding one would lazy-load per row. The caller selects
-    all three in the same statement."""
+    """`memo_uid`, `taken_at`, `tags` and `visibility` are passed IN, never read off `att` —
+    there is no `Attachment.memo` relationship and adding one would lazy-load per row. The caller
+    selects them in the same statement."""
     base = f"/api/attachments/{att.uid}"
     return AttachmentListItem(
         uid=att.uid,
@@ -296,6 +302,7 @@ def _list_item(
         takenAt=taken_at,
         filename=att.filename,
         tags=tags,
+        visibility=visibility,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         webReady=att.uid in web_ready,
         downloadUrl=f"{base}/original",
@@ -389,6 +396,10 @@ async def list_attachments(
     tag: str | None = None,
     bucket: str | None = None,
     tz: str = "Europe/Zurich",
+    mine: bool = False,
+    # SkipJsonSchema like the memo listing's own `visibility`: a query string cannot carry a JSON
+    # null, so absent is the only way it arrives unset.
+    visibility: Visibility | SkipJsonSchema[None] = None,
 ) -> list[AttachmentListItem]:
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
@@ -398,6 +409,9 @@ async def list_attachments(
     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
     Each item names the tags of its memo, by name; an orphan's are empty.
+    ?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps
+    only media on a memo of that visibility, so no orphan. Both only narrow what the caller may
+    already see. Each item names its memo's visibility, null for an orphan.
     ?bucket=<key> opens a taken-order walk at a day, month or year — a `key` exactly as the
     buckets of `tz` (an IANA zone, default Europe/Zurich) name it — so the first item is that
     bucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the
@@ -417,7 +431,7 @@ async def list_attachments(
         opened = parse_bucket_key(bucket)
         if opened is None:
             raise HTTPException(status_code=422, detail="bucket is not a bucket key")
-    filters = library_filters(user, type, tag)
+    filters = library_filters(user, type, tag, mine=mine, visibility=visibility)
     if opened is not None:
         # Beside the cursor, not instead of it: a continuation's cursor already lies beyond the
         # bucket's start, so resending the bucket with it changes nothing.
@@ -453,17 +467,17 @@ async def library_page(
     # (list_memos does the same). It is dropped before serializing, so the body is unchanged.
     rows = list((await db.execute(stmt.limit(page + 1))).all())
     if len(rows) > page:
-        last, _, last_taken, _ = rows[page - 1]
+        last, _, last_taken, _, _ = rows[page - 1]
         response.headers[NEXT_CURSOR_HEADER] = (
             encode_taken_cursor(last_taken, last.id)
             if taken_order
             else encode_attachment_cursor(last)
         )
         rows = rows[:page]
-    ready = await web_ready_uids(att for att, _, _, _ in rows)
+    ready = await web_ready_uids(att for att, _, _, _, _ in rows)
     return [
-        _list_item(att, user.id, memo_uid, when, list(tags), ready)
-        for att, memo_uid, when, tags in rows
+        _list_item(att, user.id, memo_uid, when, list(tags), ready, visibility)
+        for att, memo_uid, when, tags, visibility in rows
     ]
 
 
@@ -497,8 +511,11 @@ async def attachment_buckets(
     type: str | None = None,
     tz: str = "Europe/Zurich",
     tag: str | None = None,
+    mine: bool = False,
+    visibility: Visibility | SkipJsonSchema[None] = None,
 ) -> list[AttachmentBucket]:
-    """The library the list shows — same visibility, same `type` and `tag` filters — counted per
+    """The library the list shows — same visibility, same `type`, `tag`, `mine` and `visibility`
+    filters — counted per
     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
     for a video its poster frame, the one picture a video has — and the tags of the memos its
@@ -514,7 +531,9 @@ async def attachment_buckets(
             coverThumbnailUrl=asset_urls.signed_cover_url(uid, mime, user.id, now=now),
             tags=tags,
         )
-        for key, count, uid, mime, tags in await library_buckets(db, user, size, tz, type, tag)
+        for key, count, uid, mime, tags in await library_buckets(
+            db, user, size, tz, type, tag, mine=mine, visibility=visibility
+        )
     ]
 
 
@@ -523,13 +542,18 @@ async def attachment_tags(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
     type: str | None = None,
+    mine: bool = False,
+    visibility: Visibility | SkipJsonSchema[None] = None,
 ) -> list[AttachmentTagCount]:
     """Every tag on a memo carrying media the user can see, with the number of such media under
-    the same `type` filter the list applies — so a tag's count is the length of the list under
-    `?tag=` and that `type`. Most items first, then by name; a tag with no media is absent."""
+    the same `type`, `mine` and `visibility` filters the list applies — so a tag's count is the
+    length of the list under `?tag=` and those filters. Most items first, then by name; a tag
+    with no media is absent."""
     return [
         AttachmentTagCount(name=name, count=count)
-        for name, count in await library_tag_counts(db, user, type)
+        for name, count in await library_tag_counts(
+            db, user, type, mine=mine, visibility=visibility
+        )
     ]
 
 
