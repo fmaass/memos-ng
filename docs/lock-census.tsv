@@ -18,6 +18,8 @@ app/services/reclaim.py	reclaim_attachment	for_update
 app/services/reclaim.py	reclaim_attachment	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update
+app/services/sibling.py	_write_result	for_update
+app/services/sibling.py	_write_result	for_update
 app/services/uploads.py	append_stream	for_update
 app/services/uploads.py	ensure_capture	for_update
 app/services/uploads.py	_lock_attachments	for_update

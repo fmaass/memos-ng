@@ -35,6 +35,9 @@ transaction**.
 would cost four. It is also what keeps MEMNG-41 closed: with A taken first, a delete would have to
 wait behind a job row it deliberately skips. Reversing **only** reclaim or **only** worker
 publication manufactures a new cycle; they change together or not at all.
+`sibling._write_result` (MEMNG-796) acquires in the same order — its own job row, then its
+attachment, each `FOR UPDATE` — and `tests/test_sibling_job.py` races it against
+`reclaim_attachment` on two connections (the attachment-first order there is a 40P01).
 
 `uploads.upload_uid` is a text PK and text ordering is collation-dependent. The rule is therefore
 that every path uses the identical `ORDER BY Upload.upload_uid` clause against the one database —

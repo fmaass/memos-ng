@@ -25,6 +25,7 @@ from app.models import (
     Attachment,
     AttachmentRendition,
     AttachmentStatus,
+    JobKind,
     JobLane,
     JobState,
     MediaJob,
@@ -945,6 +946,17 @@ async def _read_location(dest: Path, mime: str) -> tuple[float | None, float | N
     return found.latitude, found.longitude, found.source
 
 
+def _wants_sibling_lookup(attachment: Attachment) -> bool:
+    """Whether img-manager should be asked for this new attachment's missing date or location
+    (MEMNG-796): the feature is on, the owner's library is the one img-manager indexes, it is an
+    image, and its own file left a capture date (neither instant nor civil time) or a location
+    unsaid."""
+    if not settings.sibling_enabled or attachment.owner_id not in settings.sibling_owner_ids:
+        return False
+    nothing_said = attachment.capture_instant is None and attachment.capture_civil is None
+    return attachment.mime.startswith("image/") and (nothing_said or attachment.latitude is None)
+
+
 async def _lock_attachments(
     db: AsyncSession, predicates: Sequence[ColumnElement[bool]]
 ) -> set[int]:
@@ -1469,6 +1481,17 @@ async def finalize(
     # decode runs on the Merkur worker, off the thermally-bound NAS; ordinary images stay fast.
     initial_lane = JobLane.slow if mime in HEAVY_IMAGE_MIMES else JobLane.fast
     db.add(MediaJob(attachment_id=attachment.id, lane=initial_lane, state=JobState.queued))
+    if _wants_sibling_lookup(attachment):
+        # Added AFTER the derive job, in the same flush, so it carries the higher id and
+        # `_order_guard` drains it second. Light-lane metadata work, never on this request path.
+        db.add(
+            MediaJob(
+                attachment_id=attachment.id,
+                lane=JobLane.fast,
+                kind=JobKind.sibling,
+                state=JobState.queued,
+            )
+        )
     await db.delete(upload)
     await db.flush()
     return attachment

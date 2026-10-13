@@ -22,3 +22,6 @@ tests/mutations/claim_flush.patch	claim_flush	test_failure_record_commit_error_l
 # is the stale snapshot the early return hands back) and the spool unit test turn red; the
 # zero-byte probe stays green because a cut with nothing in it was already a no-op.
 tests/mutations/partial_commit_discard.patch	partial_commit_discard	test_bytes_before_a_disconnect_are_kept_and_the_resume_completes test_a_cut_body_whose_offset_a_concurrent_append_moved_is_discarded test_spool_stream_keeps_a_cut_body_only_for_a_caller_that_asked		tests/test_uploads.py
+# A borrowed capture date is written only when the file said NOTHING: dropping the capture_civil
+# half of the guard lets img-manager overwrite an offset-less EXIF date and its provenance.
+tests/mutations/sibling_civil_guard.patch	sibling_civil_guard	test_a_civil_only_capture_is_never_overwritten_while_a_missing_location_is_filled		tests/test_sibling_job.py

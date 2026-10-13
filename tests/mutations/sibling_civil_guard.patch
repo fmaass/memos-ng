@@ -1,0 +1,10 @@
+--- a/app/services/sibling.py
++++ b/app/services/sibling.py
+@@ -289,7 +289,6 @@
+     # file provided too (EXIF DateTimeOriginal without an offset) and keeps its provenance.
+     nothing_said = and_(
+         Attachment.capture_instant.is_(None),
+-        Attachment.capture_civil.is_(None),
+     )
+     return (
+         update(Attachment)

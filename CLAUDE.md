@@ -210,7 +210,10 @@ met until its tests exist and pass.
   `docs/plans/PLAN_2026-09-24_tus-endpoint.md`; superseded 2026-09-25 — the router it added is removed
   again by **4043**), **4043** (remove the tus 1.0 router, release 1.11.0, MEMNG-545 narrowed,
   2026-09-25; local copy `docs/plans/PLAN_2026-09-25_remove-tus.md`; no successor protocol — the
-  owner dropped resumable uploads, memos-ng-ios ADR-0007).
+  owner dropped resumable uploads, memos-ng-ios ADR-0007). **4288** (sibling metadata for undated
+  Lightroom exports — img-manager stem lookup + memos-ng `sibling` job and backfill, IMGMGR-519 +
+  MEMNG-796, 2026-10-13; local copy `docs/plans/PLAN_2026-10-13_sibling-metadata.md`; Phase 4
+  release train still open — see MEMNG-796).
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).

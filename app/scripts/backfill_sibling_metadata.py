@@ -1,0 +1,199 @@
+"""Backfill: enqueue the img-manager `sibling` lookup for attachments uploaded before it existed.
+
+The script only ENQUEUES `sibling` media jobs; the WORKER drains them through the very code path an
+upload's finalize uses (`app/services/sibling.py`). The script itself never asks img-manager, never
+writes an attachment column and never opens an original.
+
+Three populations, each reached only by its own switch and DISJOINT by construction:
+
+* default — image attachments, `status='ready'`, owned by a `SIBLING_OWNER_IDS` member, whose own
+  file left the capture date (neither instant nor civil time) or the location unsaid, with
+  `sibling_outcome IS NULL` and NO `sibling` job that is queued, claimed, processing or failed. A
+  `done` job with a NULL outcome is an anomaly the job forbids; such a row is re-enqueued here
+  rather than stranded.
+* `--retry-failed` — `sibling_outcome IS NULL` and the attachment's most recent `sibling` job is
+  `failed` (img-manager was unavailable for every attempt), with none live.
+* `--include-ambiguous` — `sibling_outcome = 'ambiguous'` with no live `sibling` job, for a later
+  change of the election rule.
+
+A second default `--execute` enqueues nothing: every row the first one selected now has a queued
+job, and later an outcome.
+
+    docker exec memos-ng-app python -m app.scripts.backfill_sibling_metadata             # dry run
+    docker exec memos-ng-app python -m app.scripts.backfill_sibling_metadata --execute --limit 1
+    docker exec memos-ng-app python -m app.scripts.backfill_sibling_metadata --execute
+
+Add `--retry-failed` or `--include-ambiguous` to reach the other two populations instead.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import enum
+from collections import Counter
+from dataclasses import dataclass, field
+
+from app.config import settings
+from app.database import async_session
+from app.models import Attachment, AttachmentStatus, JobKind, JobLane, JobState, MediaJob
+from sqlalchemy import Select, and_, exists, func, or_, select
+from sqlalchemy.orm import aliased
+
+LIVE_STATES = (JobState.queued, JobState.claimed, JobState.processing)
+
+
+class Population(enum.StrEnum):
+    default = "default"
+    retry_failed = "retry-failed"
+    include_ambiguous = "include-ambiguous"
+
+
+def _sibling_job_in(states: tuple[JobState, ...]):
+    job = aliased(MediaJob)
+    return exists().where(
+        job.attachment_id == Attachment.id,
+        job.kind == JobKind.sibling,
+        job.state.in_(states),
+    )
+
+
+def _latest_sibling_job_failed():
+    job = aliased(MediaJob)
+    latest_state = (
+        select(job.state)
+        .where(job.attachment_id == Attachment.id, job.kind == JobKind.sibling)
+        .order_by(job.id.desc())
+        .limit(1)
+        .correlate(Attachment)
+        .scalar_subquery()
+    )
+    return latest_state == JobState.failed
+
+
+def candidate_statement(
+    population: Population, *, limit: int | None = None
+) -> Select[tuple[int, str]]:
+    """The attachments to enqueue a `sibling` job for, lowest id first."""
+    stmt = select(Attachment.id, Attachment.mime)
+    if population is Population.default:
+        nothing_said = and_(
+            Attachment.capture_instant.is_(None), Attachment.capture_civil.is_(None)
+        )
+        stmt = stmt.where(
+            Attachment.mime.startswith("image/"),
+            Attachment.status == AttachmentStatus.ready,
+            Attachment.owner_id.in_(sorted(settings.sibling_owner_ids)),
+            or_(nothing_said, Attachment.latitude.is_(None)),
+            Attachment.sibling_outcome.is_(None),
+            ~_sibling_job_in((*LIVE_STATES, JobState.failed)),
+        )
+    elif population is Population.retry_failed:
+        stmt = stmt.where(
+            Attachment.sibling_outcome.is_(None),
+            _latest_sibling_job_failed(),
+            ~_sibling_job_in(LIVE_STATES),
+        )
+    else:
+        stmt = stmt.where(
+            Attachment.sibling_outcome == "ambiguous",
+            ~_sibling_job_in(LIVE_STATES),
+        )
+    stmt = stmt.order_by(Attachment.id)
+    return stmt if limit is None else stmt.limit(limit)
+
+
+@dataclass
+class Report:
+    population: Population
+    execute: bool
+    selected: int = 0
+    enqueued: int = 0
+    by_mime: Counter[str] = field(default_factory=Counter)
+    outcomes: Counter[str] = field(default_factory=Counter)
+
+    def format(self) -> str:
+        mode = "EXECUTE" if self.execute else "DRY RUN (nothing written)"
+        lines = [
+            f"backfill_sibling_metadata — {mode}, population={self.population.value}",
+            f"  selected: {self.selected}",
+            f"  enqueued: {self.enqueued}",
+            "  selected by mime:",
+            *(f"    {mime}: {n}" for mime, n in sorted(self.by_mime.items())),
+            "  sibling_outcome across all attachments (before this run):",
+            *(f"    {outcome}: {n}" for outcome, n in sorted(self.outcomes.items())),
+        ]
+        return "\n".join(lines)
+
+
+async def run(population: Population, *, execute: bool, limit: int | None = None) -> Report:
+    report = Report(population=population, execute=execute)
+    async with async_session() as db:
+        for outcome, n in (
+            await db.execute(
+                select(Attachment.sibling_outcome, func.count(Attachment.id)).group_by(
+                    Attachment.sibling_outcome
+                )
+            )
+        ).all():
+            report.outcomes[outcome or "NULL"] = n
+        rows = (await db.execute(candidate_statement(population, limit=limit))).all()
+        report.selected = len(rows)
+        report.by_mime.update(mime for _, mime in rows)
+        if execute:
+            # One transaction for the batch: the population is re-evaluated by the next run, so a
+            # run that fails part-way leaves nothing half-enqueued to reason about.
+            db.add_all(
+                MediaJob(
+                    attachment_id=attachment_id,
+                    lane=JobLane.fast,
+                    kind=JobKind.sibling,
+                    state=JobState.queued,
+                )
+                for attachment_id, _ in rows
+            )
+            await db.commit()
+            report.enqueued = len(rows)
+        else:
+            await db.rollback()
+    return report
+
+
+def main() -> None:  # pragma: no cover
+    ap = argparse.ArgumentParser(
+        description="Enqueue img-manager sibling lookups for undated or unlocated photos."
+    )
+    ap.add_argument(
+        "--execute",
+        action="store_true",
+        help="actually enqueue; the default is a dry run that selects and reports only",
+    )
+    ap.add_argument("--limit", type=int, default=None, help="enqueue at most N attachments")
+    which = ap.add_mutually_exclusive_group()
+    which.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="ONLY rows whose latest sibling job failed (img-manager was unavailable)",
+    )
+    which.add_argument(
+        "--include-ambiguous",
+        action="store_true",
+        help="ONLY rows recorded as ambiguous (after a change of the election rule)",
+    )
+    args = ap.parse_args()
+    if args.execute and not settings.sibling_enabled:
+        # Every job enqueued now could only fail: the worker re-queues a disabled lookup.
+        raise SystemExit("IMGMANAGER_URL, IMGMANAGER_TOKEN and SIBLING_OWNER_IDS are not all set")
+    population = (
+        Population.retry_failed
+        if args.retry_failed
+        else Population.include_ambiguous
+        if args.include_ambiguous
+        else Population.default
+    )
+    report = asyncio.run(run(population, execute=args.execute, limit=args.limit))
+    print(report.format())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

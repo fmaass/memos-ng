@@ -211,6 +211,20 @@ class Settings(BaseSettings):
     FRAME_API_URL: str = ""
     FRAME_ALBUM_ID: int = 0
     FRAME_API_TOKEN: str = Field(default="", repr=False)
+
+    # img-manager's stem lookup, asked by the `sibling` media job for a photo whose own file said
+    # nothing about when or where (MEMNG-796). All three or none: an empty value disables the
+    # feature, and `validate_runtime_secrets` refuses a partial set. The token is a PAT and a
+    # secret (repr=False, never logged); it stays a plain str for the same truthiness reason as
+    # SMTP_PASSWORD above.
+    IMGMANAGER_URL: str = ""
+    IMGMANAGER_TOKEN: str = Field(default="", repr=False)
+    # A connect+read ceiling for one indexed lookup on the same host, not a tuned value.
+    IMGMANAGER_TIMEOUT_S: float = 5.0
+    # Comma-separated users.id values whose attachments may be enriched. The RAW library is ONE
+    # member's data: without this fence another member could learn a donor photo's date and GPS
+    # by uploading a file with a chosen name. Checked at enqueue AND again by the job.
+    SIBLING_OWNER_IDS: str = ""
     # Stale-claim horizon (MEMNG-35): a job still `claimed` this many minutes after the tombstone
     # commit is assumed orphaned by a crashed/recreated worker and is re-queued (or failed at the
     # attempt ceiling). One render+upload takes seconds, so 15 minutes is far outside a healthy
@@ -293,6 +307,21 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         return self.ENV != "development"
 
+    @property
+    def sibling_owner_ids(self) -> frozenset[int]:
+        """`SIBLING_OWNER_IDS` parsed; a non-integer entry raises ValueError."""
+        return frozenset(int(part) for part in self.SIBLING_OWNER_IDS.split(",") if part.strip())
+
+    @property
+    def sibling_enabled(self) -> bool:
+        # The PARSED set: ", " is a non-empty string naming nobody, and would enable a feature with
+        # no member allowed to use it. A malformed value reads as off here; startup refuses it.
+        try:
+            owners = self.sibling_owner_ids
+        except ValueError:
+            return False
+        return bool(self.IMGMANAGER_URL and self.IMGMANAGER_TOKEN and owners)
+
     def validate_runtime_secrets(self) -> None:
         """Refuse to start production on the published dev-default secret (forgeable media
         signatures + decryptable BFF tokens). Called from the app lifespan at startup — NOT at
@@ -303,6 +332,26 @@ class Settings(BaseSettings):
                 "SESSION_SECRET is the built-in dev default in production — set a unique value "
                 "(and optionally ASSET_URL_SECRET) via the stack .env. The default key makes BFF "
                 "session tokens decryptable and media URL signatures forgeable."
+            )
+        try:
+            owners = self.sibling_owner_ids
+        except ValueError:
+            raise RuntimeError(
+                "SIBLING_OWNER_IDS must be comma-separated integer user ids"
+            ) from None
+        sibling = {
+            "IMGMANAGER_URL": bool(self.IMGMANAGER_URL),
+            "IMGMANAGER_TOKEN": bool(self.IMGMANAGER_TOKEN),
+            # Parsed, not the raw string: ", " names no member and counts as absent.
+            "SIBLING_OWNER_IDS": bool(owners),
+        }
+        # Half a configuration would enqueue jobs that can only ever fail, or silently never
+        # enqueue at all — either way the owner believes the enrichment is running.
+        if any(sibling.values()) and not all(sibling.values()):
+            missing = ", ".join(name for name, present in sibling.items() if not present)
+            raise RuntimeError(
+                "IMGMANAGER_URL, IMGMANAGER_TOKEN and SIBLING_OWNER_IDS are set together or not "
+                f"at all — missing: {missing}"
             )
 
 

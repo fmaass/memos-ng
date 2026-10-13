@@ -1450,6 +1450,11 @@ async def run() -> None:
         sensor=str(media.thermal_sensor() or ""),
         max_c=settings.THERMAL_MAX_C,
     )
+    if not settings.sibling_enabled:
+        # Once, here, for the reason the thermal line above is here. Off means a `sibling` job that
+        # still reaches this worker is re-queued (SiblingUnavailable), never finished without an
+        # outcome.
+        logger.info("sibling.disabled")
     beat()  # blocking-ok: the liveness stamp itself — see beat()
     # A deliberate stop is a signal, and it is installed HERE — before the schema gate, which can
     # wait minutes — so that a recreate arriving during startup also ends through the teardown

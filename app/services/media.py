@@ -36,7 +36,7 @@ from app.models import (
     MediaJob,
     MediaJobProgress,
 )
-from app.services import blurhash_pure, export_settings, poster, printready
+from app.services import blurhash_pure, export_settings, poster, printready, sibling
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
@@ -1720,7 +1720,11 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     await db.commit()
 
     # Dispatched on KIND first: a printready job is slow-lane image work, so the lane+mime rules
-    # below would otherwise route it into the HEIC branch and re-derive the photo's own tiers.
+    # below would otherwise route it into the HEIC branch and re-derive the photo's own tiers. A
+    # sibling job is fast-lane image work for the same reason: it must never re-derive anything.
+    if job.kind == JobKind.sibling:
+        await sibling.process_sibling_job(db, job)
+        return
     if job.kind == JobKind.printready:
         await process_printready_job(db, job, attachment)
         return

@@ -190,6 +190,31 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.3.0
+
+- A photo whose own file says nothing about when or where it was taken — a Lightroom PNG export
+  carries no EXIF — can now borrow both from the RAW original img-manager indexes. A new `sibling`
+  media job, enqueued at upload after the derive job for an image of an enabled owner that lacks a
+  capture date or a location, asks img-manager's stem lookup once (`POST /api/lookup/stems`, the
+  export suffix and Lightroom's `-Edit` / `-<n>` rename stripped) and fills only what the file left
+  empty: a date the file provided, even one without an offset, and a location the file provided
+  are never overwritten. A borrowed value is recorded as `capture_source` / `location_source`
+  `'sibling'`. Only an unambiguous sibling is believed — exactly one pick, or with no pick exactly
+  one image; a stem shared by several RAWs stays undated. The lookup never runs on a request path,
+  never touches the original, and an img-manager that cannot be reached is retried rather than
+  recorded as an absence.
+- `attachments.sibling_outcome` (additive, nullable, no default) records the lookup's answer:
+  `unique`, `ambiguous` or `none`; NULL means never asked.
+- Three settings switch it on, all together or not at all (startup refuses a partial set):
+  `IMGMANAGER_URL`, `IMGMANAGER_TOKEN` (a PAT, never logged) and `SIBLING_OWNER_IDS`, the
+  comma-separated user ids whose photos may be enriched — the RAW library is one member's; a list
+  with no id counts as unset. `IMGMANAGER_TIMEOUT_S` (default 5 s) is optional. Unset, nothing is
+  enqueued and nothing changes.
+- `python -m app.scripts.backfill_sibling_metadata` enqueues the same job for existing photos: dry
+  run by default, `--execute`, `--limit N`, and the disjoint `--retry-failed` and
+  `--include-ambiguous` populations. It never asks img-manager itself and writes no attachment
+  column; the worker drains the queue.
+
 ### v2.2.0
 
 - `GET /api/attachments`, `/api/attachments/buckets`, `/api/attachments/tags` and a collection's
