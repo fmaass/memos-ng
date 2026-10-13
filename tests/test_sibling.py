@@ -93,6 +93,99 @@ def test_elect_empty_is_none():
     assert election.chosen is None
 
 
+# MEMNG-797: the same RAW held in both img-manager tiers answers as two candidates that agree on
+# everything; agreement on the second and on the exact GPS pair is a consensus, never a guess.
+AGREED_AT = datetime(2023, 7, 14, 9, 30, 15, tzinfo=UTC)
+
+
+def _twin(
+    image_id: int,
+    *,
+    pick: bool = False,
+    at: datetime | None = AGREED_AT,
+    lat: float | None = 46.5,
+    lon: float | None = 7.25,
+) -> Candidate:
+    return Candidate(
+        image_id=image_id,
+        datetime_original=at,
+        gps_latitude=lat,
+        gps_longitude=lon,
+        is_pick=pick,
+    )
+
+
+def test_elect_two_agreeing_candidates_without_a_pick_is_consensus_on_the_first():
+    first, second = _twin(1), _twin(2)
+    election = elect([first, second])
+    assert election.outcome == "consensus"
+    assert election.chosen == first
+
+
+def test_elect_agreeing_candidates_with_no_gps_at_all_is_consensus():
+    first = _twin(1, lat=None, lon=None)
+    election = elect([first, _twin(2, lat=None, lon=None)])
+    assert election.outcome == "consensus"
+    assert election.chosen == first
+
+
+def test_elect_two_agreeing_picks_is_consensus_and_names_a_pick():
+    pick = _twin(2, pick=True)
+    election = elect([_twin(1), pick, _twin(3, pick=True)])
+    assert election.outcome == "consensus"
+    assert election.chosen == pick
+
+
+def test_elect_one_pick_wins_over_a_disagreeing_non_pick():
+    pick = _twin(1, pick=True)
+    election = elect([pick, _twin(2, at=datetime(2020, 1, 1, tzinfo=UTC), lat=1.0, lon=2.0)])
+    assert election.outcome == "unique"
+    assert election.chosen == pick
+
+
+def test_elect_gps_on_one_candidate_only_is_ambiguous():
+    election = elect([_twin(1), _twin(2, lat=None, lon=None)])
+    assert election.outcome == "ambiguous"
+    assert election.chosen is None
+
+
+def test_elect_different_gps_is_ambiguous():
+    election = elect([_twin(1), _twin(2, lon=7.250001)])
+    assert election.outcome == "ambiguous"
+    assert election.chosen is None
+
+
+def test_elect_datetimes_one_second_apart_are_ambiguous():
+    election = elect([_twin(1), _twin(2, at=AGREED_AT.replace(second=16))])
+    assert election.outcome == "ambiguous"
+    assert election.chosen is None
+
+
+def test_elect_datetimes_differing_only_below_the_second_are_consensus():
+    first = _twin(1, at=AGREED_AT.replace(microsecond=999_999))
+    election = elect([first, _twin(2)])
+    assert election.outcome == "consensus"
+    assert election.chosen == first
+
+
+def test_elect_a_candidate_without_a_datetime_is_ambiguous():
+    assert elect([_twin(1), _twin(2, at=None)]).outcome == "ambiguous"
+    assert elect([_twin(1, at=None), _twin(2, at=None)]).outcome == "ambiguous"
+
+
+def test_elect_a_truncated_list_of_agreeing_candidates_is_ambiguous():
+    election = elect([_twin(1), _twin(2)], truncated=True)
+    assert election.outcome == "ambiguous"
+    assert election.chosen is None
+
+
+def test_elect_a_single_candidate_is_still_unique_not_consensus():
+    only = _twin(1)
+    election = elect([only])
+    assert election.outcome == "unique"
+    assert election.chosen == only
+
+
 @pytest.fixture
 def enabled(monkeypatch):
     monkeypatch.setattr(settings, "IMGMANAGER_URL", "http://img-manager.test:8000/")

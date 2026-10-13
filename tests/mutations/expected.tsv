@@ -25,3 +25,7 @@ tests/mutations/partial_commit_discard.patch	partial_commit_discard	test_bytes_b
 # A borrowed capture date is written only when the file said NOTHING: dropping the capture_civil
 # half of the guard lets img-manager overwrite an offset-less EXIF date and its provenance.
 tests/mutations/sibling_civil_guard.patch	sibling_civil_guard	test_a_civil_only_capture_is_never_overwritten_while_a_missing_location_is_filled		tests/test_sibling_job.py
+# The consensus rule (MEMNG-797) needs the place to agree as well as the second: dropping the GPS
+# check lets two RAWs shot the same second in different places, or one with and one without GPS,
+# elect a consensus and lend one of their locations to the export.
+tests/mutations/sibling_consensus_gps.patch	sibling_consensus_gps	test_elect_gps_on_one_candidate_only_is_ambiguous test_elect_different_gps_is_ambiguous		tests/test_sibling.py

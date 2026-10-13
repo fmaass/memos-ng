@@ -247,8 +247,10 @@ def test_ambiguous_writes_only_the_outcome(enabled, monkeypatch):
     allowed, _ = enabled
     aid, jid = _seed(allowed)
     before = _row(aid)
+    # Two RAWs that disagree on the place: agreeing ones would be a consensus (MEMNG-797).
     calls = _spy(
-        monkeypatch, [[_cand(image_id=1, is_pick=False), _cand(image_id=2, is_pick=False)]]
+        monkeypatch,
+        [[_cand(image_id=1, is_pick=False), _cand(image_id=2, is_pick=False, gps_latitude=1.0)]],
     )
 
     asyncio.run(_process(jid))
@@ -258,6 +260,44 @@ def test_ambiguous_writes_only_the_outcome(enabled, monkeypatch):
     assert after.pop("sibling_outcome") == "ambiguous"
     before.pop("sibling_outcome")
     assert after == before
+
+
+def test_two_agreeing_candidates_fill_the_row_as_a_consensus(enabled, monkeypatch):
+    # The same RAW in both img-manager tiers (MEMNG-797): no pick, same second, same place.
+    allowed, _ = enabled
+    aid, jid = _seed(allowed)
+    calls = _spy(
+        monkeypatch, [[_cand(image_id=1, is_pick=False), _cand(image_id=2, is_pick=False)]]
+    )
+
+    asyncio.run(_process(jid))
+
+    assert calls == [{"stems": ["_ARA8207"]}]
+    row = _row(aid)
+    assert row["capture_instant"] == SIBLING_DATE
+    assert row["capture_source"] == "sibling"
+    assert (row["latitude"], row["longitude"]) == (SIBLING_LAT, SIBLING_LON)
+    assert row["location_source"] == "sibling"
+    assert row["sibling_outcome"] == "consensus"
+
+
+def test_a_consensus_never_overwrites_an_exif_instant_while_a_missing_location_is_filled(
+    enabled, monkeypatch
+):
+    allowed, _ = enabled
+    aid, jid = _seed(allowed, capture_instant=EXIF_DATE, capture_source="exif")
+    calls = _spy(
+        monkeypatch, [[_cand(image_id=1, is_pick=False), _cand(image_id=2, is_pick=False)]]
+    )
+
+    asyncio.run(_process(jid))
+
+    assert calls == [{"stems": ["_ARA8207"]}]
+    row = _row(aid)
+    assert (row["capture_instant"], row["capture_source"]) == (EXIF_DATE, "exif")
+    assert (row["latitude"], row["longitude"]) == (SIBLING_LAT, SIBLING_LON)
+    assert row["location_source"] == "sibling"
+    assert row["sibling_outcome"] == "consensus"
 
 
 def test_every_variant_travels_in_one_request_and_the_first_with_candidates_elects(
@@ -276,7 +316,7 @@ def test_every_variant_travels_in_one_request_and_the_first_with_candidates_elec
 def test_the_first_variant_with_candidates_decides_even_when_it_is_ambiguous(enabled, monkeypatch):
     allowed, _ = enabled
     aid, jid = _seed(allowed, filename="_AR5123-Edit - web.png")
-    two = [_cand(image_id=1, is_pick=False), _cand(image_id=2, is_pick=False)]
+    two = [_cand(image_id=1, is_pick=False), _cand(image_id=2, is_pick=False, gps_latitude=1.0)]
     calls = _spy(monkeypatch, [two, [_cand(image_id=3)]])
 
     asyncio.run(_process(jid))

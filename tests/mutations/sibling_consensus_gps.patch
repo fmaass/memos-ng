@@ -1,0 +1,11 @@
+--- a/app/services/sibling.py
++++ b/app/services/sibling.py
+@@ -149,8 +149,6 @@
+     for c in candidates:
+         if c.datetime_original is None or c.datetime_original.replace(microsecond=0) != second:
+             return False
+-        if (c.gps_latitude, c.gps_longitude) != place:
+-            return False
+     return True
+ 
+ 

@@ -266,11 +266,12 @@ class Attachment(Base):
     latitude: Mapped[float | None] = mapped_column(Double)
     longitude: Mapped[float | None] = mapped_column(Double)
     location_source: Mapped[str | None] = mapped_column(String(16))
-    # What the img-manager sibling lookup concluded (MEMNG-796): 'unique' | 'ambiguous' | 'none';
-    # NULL = never asked. Its own column rather than a sentinel in `capture_source` or
-    # `location_source`, because those already drive the capture and location backfills, and the
-    # sibling backfill needs a per-row answer it can select on (`--include-ambiguous`). An
-    # img-manager that could not be asked is NOT an outcome — it stays NULL and the job retries.
+    # What the img-manager sibling lookup concluded (MEMNG-796): 'unique' | 'consensus'
+    # (MEMNG-797) | 'ambiguous' | 'none'; NULL = never asked. Its own column rather than a
+    # sentinel in `capture_source` or `location_source`, because those already drive the capture
+    # and location backfills, and the sibling backfill needs a per-row answer it can select on
+    # (`--include-ambiguous`). An img-manager that could not be asked is NOT an outcome — it stays
+    # NULL and the job retries.
     sibling_outcome: Mapped[str | None] = mapped_column(String(16))
     # 0-based place in this memo's attachment order, written at finalize from the order the client
     # declared (`upload_uids`). NULL on every row that predates the column, and on an attachment

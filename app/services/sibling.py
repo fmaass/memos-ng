@@ -13,6 +13,9 @@ The rules that make borrowing safe:
 * **Only an unambiguous sibling is believed.** Exactly one pick, or — with no pick at all — exactly
   one candidate. Camera counters wrap every 10,000 frames, so a stem shared by several RAWs is
   recorded as `ambiguous` and left undated: a date the app cannot prove is worth less than no date.
+  The one exception is a `consensus` (MEMNG-797): the common ambiguous case is one RAW held in
+  both img-manager tiers (121 of 254 on 2026-10-13), so when every candidate carries the same
+  capture second and the identical GPS pair, whichever one is borrowed the value is the same.
 * **Could-not-ask is not an answer.** Only a 200 is an outcome; a 422 (the stems themselves were
   refused) is `none`; everything else — transport error, timeout, 5xx, 401/403, 404 — raises
   `SiblingUnavailable`, which the worker's failure path retries, so an infrastructure state is
@@ -42,8 +45,9 @@ from app.services import media
 
 logger = structlog.get_logger()
 
-Outcome = Literal["unique", "ambiguous", "none"]
+Outcome = Literal["unique", "consensus", "ambiguous", "none"]
 OUTCOME_UNIQUE: Outcome = "unique"
+OUTCOME_CONSENSUS: Outcome = "consensus"
 OUTCOME_AMBIGUOUS: Outcome = "ambiguous"
 OUTCOME_NONE: Outcome = "none"
 
@@ -112,7 +116,8 @@ def derive_stems(filename: str | None) -> list[str]:
 
 
 def elect(candidates: Sequence[Candidate], *, truncated: bool = False) -> Election:
-    """One pick wins; with no pick, one candidate wins; anything else is ambiguous.
+    """One pick wins; several candidates that all agree are a consensus; with no pick, one
+    candidate wins; anything else is ambiguous.
 
     A truncated list is ambiguous whatever it holds: img-manager orders picks first, but a client
     that leaned on that ordering would turn a server-side sort into a correctness rule — a second
@@ -122,6 +127,8 @@ def elect(candidates: Sequence[Candidate], *, truncated: bool = False) -> Electi
     picks = [c for c in candidates if c.is_pick]
     if len(picks) == 1:
         return Election(OUTCOME_UNIQUE, picks[0])
+    if len(candidates) >= 2 and _all_agree(candidates):
+        return Election(OUTCOME_CONSENSUS, picks[0] if picks else candidates[0])
     if picks:
         return Election(OUTCOME_AMBIGUOUS)
     if len(candidates) == 1:
@@ -129,6 +136,22 @@ def elect(candidates: Sequence[Candidate], *, truncated: bool = False) -> Electi
     if candidates:
         return Election(OUTCOME_AMBIGUOUS)
     return Election(OUTCOME_NONE)
+
+
+def _all_agree(candidates: Sequence[Candidate]) -> bool:
+    """Every candidate has a capture date, all on the same second, and the identical GPS pair —
+    `(None, None)` included. Exact float equality: two copies of one RAW carry the same EXIF."""
+    first = candidates[0]
+    if first.datetime_original is None:
+        return False
+    second = first.datetime_original.replace(microsecond=0)
+    place = (first.gps_latitude, first.gps_longitude)
+    for c in candidates:
+        if c.datetime_original is None or c.datetime_original.replace(microsecond=0) != second:
+            return False
+        if (c.gps_latitude, c.gps_longitude) != place:
+            return False
+    return True
 
 
 def _parse_instant(raw: Any) -> datetime | None:
@@ -302,7 +325,7 @@ async def _write_result(
 
 def _result_statement(attachment_id: int, election: Election):
     chosen = election.chosen
-    if election.outcome != OUTCOME_UNIQUE or chosen is None:
+    if election.outcome not in (OUTCOME_UNIQUE, OUTCOME_CONSENSUS) or chosen is None:
         return (
             update(Attachment)
             .where(Attachment.id == attachment_id)
@@ -332,6 +355,6 @@ def _result_statement(attachment_id: int, election: Election):
                 (and_(Attachment.latitude.is_(None), lat.is_not(None)), SOURCE_SIBLING),
                 else_=Attachment.location_source,
             ),
-            sibling_outcome=OUTCOME_UNIQUE,
+            sibling_outcome=election.outcome,
         )
     )

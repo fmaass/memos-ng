@@ -190,6 +190,14 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.3.1
+
+- The sibling lookup now believes a consensus: when every RAW img-manager returns for a stem has
+  the same capture second and the identical GPS pair (or none at all), they are one RAW held in
+  both of its tiers, so I borrow the date and the place and record the outcome as `consensus`.
+  Candidates that disagree in time or place stay `ambiguous` unless exactly one of them is a
+  pick, which wins as before; `--include-ambiguous` re-runs the ambiguous rows.
+
 ### v2.3.0
 
 - A photo whose own file says nothing about when or where it was taken — a Lightroom PNG export
