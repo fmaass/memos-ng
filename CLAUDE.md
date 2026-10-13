@@ -213,11 +213,11 @@ met until its tests exist and pass.
   owner dropped resumable uploads, memos-ng-ios ADR-0007). **4288** (sibling metadata for undated
   Lightroom exports — img-manager stem lookup + memos-ng `sibling` job and backfill, IMGMGR-519 +
   MEMNG-796, 2026-10-13; local copy `docs/plans/PLAN_2026-10-13_sibling-metadata.md`; Phase 4
-  release train still open — see MEMNG-796).
+  release train executed 2026-10-13 — record 4290; MEMNG-796 Delivered).
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
-- Release records (book level): **4089** (v2.0.0, 2026-09-26), **3872** (v1.7.3, 2026-09-20), **3856** (v1.7.2, 2026-09-19), **3846** (v1.7.1, 2026-09-18), **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
+- Release records (book level): **4290** (v2.3.0, 2026-10-13, sibling metadata; img-manager counterpart v0.22.0 is page 4291 in book 2597), **4089** (v2.0.0, 2026-09-26), **3872** (v1.7.3, 2026-09-20), **3856** (v1.7.2, 2026-09-19), **3846** (v1.7.1, 2026-09-18), **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
   ADR-0013 **2316**, ADR-0014 **2584**, ADR-0015 **3152** (native client; PAT bearer; HTTPS
   callback brokered by the BFF), ADR-0016 **3209** (universal links skipped — the custom scheme is
