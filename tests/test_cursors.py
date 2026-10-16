@@ -111,8 +111,9 @@ def test_a_bad_cursor_on_the_memo_feed_is_422(logged_in_client, bad):
 
 
 @pytest.mark.parametrize("bad", ["not base64 at all!", "M!Q==", encode_cursor_payload("foo")])
-def test_a_bad_pagetoken_on_the_compat_feed_is_422(client, bad):
+def test_a_bad_pagetoken_on_the_compat_feed_is_422(logged_in_client, bad):
     """/api/v1/memos decodes the same keyset payload — the satellites' feed must not 500 either."""
+    client, _ = logged_in_client
     r = client.get("/api/v1/memos", params={"pageToken": bad})
     assert r.status_code == 422, f"{bad!r} → {r.status_code}"
 

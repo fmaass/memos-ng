@@ -8179,7 +8179,9 @@
           {
             "bearerAuth": []
           },
-          {}
+          {
+            "sessionCookie": []
+          }
         ],
         "summary": "List Memos Compat",
         "tags": [
@@ -8228,7 +8230,9 @@
           {
             "bearerAuth": []
           },
-          {}
+          {
+            "sessionCookie": []
+          }
         ],
         "summary": "Get Memo Compat",
         "tags": [
@@ -8238,7 +8242,7 @@
     },
     "/file/attachments/{uid}/{filename}": {
       "get": {
-        "description": "Derived tiers only: ?thumbnail=true \u2192 thumb, mobile UA \u2192 mobile, video \u2192 web.\nThe original path stays 404, as prod is today. Visibility-gated like the memo surfaces:\nanonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's\nvisible set, and anything else (private, orphaned, deleted) is 404 \u2014 never 403, so the\ndenial does not disclose that the uid exists.",
+        "description": "Derived tiers only: ?thumbnail=true \u2192 thumb, mobile UA \u2192 mobile, video \u2192 web.\nThe original path stays 404, as prod is today. Credential first, so an anonymous caller is\na 401 whatever it asks for; then visibility-gated like the memo surfaces, and anything the\ncaller may not see (private, orphaned, deleted) is 404 \u2014 never 403, so the denial does not\ndisclose that the uid exists.",
         "operationId": "serve_file_compat_file_attachments__uid___filename__get",
         "parameters": [
           {
@@ -8297,7 +8301,9 @@
           {
             "bearerAuth": []
           },
-          {}
+          {
+            "sessionCookie": []
+          }
         ],
         "summary": "Serve File Compat",
         "tags": [

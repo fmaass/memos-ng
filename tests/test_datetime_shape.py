@@ -23,6 +23,7 @@ Three things are asserted here, and all three are needed:
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, get_args
@@ -193,8 +194,14 @@ def test_the_v1_compat_surface_keeps_the_shape_it_always_had():
                 ),
                 {"o": owner, "t": datetime(2026, 8, 21, 20, 41, 49, 443210, tzinfo=UTC)},
             )
+            token = "memos_pat_dtshapecompat1234567890"
+            c.execute(
+                text("INSERT INTO pats (hashed_token, name, user_id) VALUES (:h,'dt',:u)"),
+                {"h": hashlib.sha256(token.encode()).hexdigest(), "u": owner},
+            )
         with TestClient(app) as client:
-            body = client.get("/api/v1/memos?pageSize=50").json()
+            headers = {"Authorization": f"Bearer {token}"}
+            body = client.get("/api/v1/memos?pageSize=50", headers=headers).json()
         mine = [m for m in body["memos"] if m["name"] == "memos/dtshapecompat"]
         assert len(mine) == 1, body
         assert mine[0]["createTime"] == "2026-08-21T20:41:49Z"

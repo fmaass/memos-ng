@@ -527,10 +527,13 @@ def test_a_handler_that_authenticates_inline_is_not_published_as_public():
     ]
 
 
-def test_the_compat_reads_publish_their_optional_credential():
-    from app.main import app
+def test_the_compat_reads_publish_a_required_credential():
+    """No `{}` arm any more (MEMNG-835): the compat surfaces 401 a caller with no credential."""
+    from app.main import USER_SECURITY, app
 
-    assert app.openapi()["paths"]["/api/v1/memos"]["get"]["security"] == [{"bearerAuth": []}, {}]
+    paths = app.openapi()["paths"]
+    for path in ("/api/v1/memos", "/api/v1/memos/{memo_id}", "/file/attachments/{uid}/{filename}"):
+        assert paths[path]["get"]["security"] == USER_SECURITY, path
 
 
 def test_a_vanished_memo_is_a_declared_404_on_both_patch_and_delete():

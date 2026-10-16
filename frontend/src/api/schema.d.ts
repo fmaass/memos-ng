@@ -1378,10 +1378,10 @@ export interface paths {
         /**
          * Serve File Compat
          * @description Derived tiers only: ?thumbnail=true → thumb, mobile UA → mobile, video → web.
-         *     The original path stays 404, as prod is today. Visibility-gated like the memo surfaces:
-         *     anonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's
-         *     visible set, and anything else (private, orphaned, deleted) is 404 — never 403, so the
-         *     denial does not disclose that the uid exists.
+         *     The original path stays 404, as prod is today. Credential first, so an anonymous caller is
+         *     a 401 whatever it asks for; then visibility-gated like the memo surfaces, and anything the
+         *     caller may not see (private, orphaned, deleted) is 404 — never 403, so the denial does not
+         *     disclose that the uid exists.
          */
         get: operations["serve_file_compat_file_attachments__uid___filename__get"];
         put?: never;

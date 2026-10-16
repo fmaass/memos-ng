@@ -1,15 +1,19 @@
 """Read-only memos 0.29.1-compatible API for unmigrated satellite clients (daily-mail,
 slideshow, transcoder). Contract is the captured live fixtures in fixtures/live-0.29.1/.
 
-Two ground-truth deviations from the original plan (see NOTES.md):
-- F1: no/invalid token → HTTP 200 with PUBLIC-only memos (NOT 401). A PAT widens the set.
+Every route here requires a credential — a PAT or the session cookie, `auth.require_pat_or_user`
+— and answers 401 without one (MEMNG-835). That deliberately departs from fixture F1 (0.29.1
+answered no/invalid token with 200 and its PUBLIC memos): in this household PUBLIC means every
+signed-in member, never an unauthenticated caller, and the app must hold that itself rather than
+trust the edge router to.
+
 - F2: original files are NOT served over /file/* (404, as prod is today); only derived tiers
   (thumbnail / mobile-UA / video) are HTTP-served.
 
-Derived tiers are served under the SAME visibility rules as the memo surfaces above, not
-unconditionally (MEMNG-25): anonymous → PUBLIC memos only, a PAT → that user's visible set.
-So a PUBLIC→PRIVATE flip, a memo deletion, or an attachment deletion revokes the media on the
-next request, instead of leaving every derived tier world-readable by uid forever.
+Derived tiers are served under the SAME visibility rules as the memo surfaces, not unconditionally
+(MEMNG-25): a caller sees its own attachments and those on memos `visible_clause` lets it see. So a
+PUBLIC→PRIVATE flip, a memo deletion, or an attachment deletion revokes the media on the next
+request.
 """
 
 import re
@@ -36,15 +40,6 @@ router = APIRouter(tags=["compat"])
 VIDEO_EXTS = (".mov", ".mp4", ".m4v", ".webm", ".avi", ".mkv")
 TAG_IN_RE = re.compile(r"tag\s+in\s+\[([^\]]*)\]")
 TAG_EQ_RE = re.compile(r"tag\s*==")
-
-
-async def optional_user(request: Request, db: Annotated[AsyncSession, Depends(get_session)]):
-    """The PAT user if a valid `Bearer memos_pat_…` is present, else None. No 401 — an
-    anonymous (or bad-token) caller simply gets the PUBLIC-only result set (F1)."""
-    authz = request.headers.get("authorization", "")
-    if authz.startswith("Bearer ") and authz[7:].startswith(auth.PAT_PREFIX):
-        return await auth.authenticate_pat(db, authz[7:])
-    return None
 
 
 def _iso(dt: datetime) -> str:
@@ -127,15 +122,14 @@ def _decode_token(token: str) -> tuple[datetime, int]:
 @router.get("/api/v1/memos")
 async def list_memos_compat(
     db: Annotated[AsyncSession, Depends(get_session)],
-    user: Annotated[User | None, Depends(optional_user)],
+    user: Annotated[User, Depends(auth.require_pat_or_user)],
     pageSize: int = 10,
     pageToken: str | None = None,
     filter: str | None = None,
 ):
     tags = _parse_filter(filter)
     conds: list[Any] = [Memo.archived_at.is_(None)]
-    # F1: anonymous → PUBLIC-only; a PAT user → their full visible set.
-    conds.append(Memo.visibility == Visibility.PUBLIC if user is None else visible_clause(user))
+    conds.append(visible_clause(user))
     if tags:
         conds.append(Memo.tags.any(Tag.name.in_(tags)))
     if pageToken:
@@ -157,28 +151,24 @@ async def list_memos_compat(
 async def get_memo_compat(
     memo_id: str,
     db: Annotated[AsyncSession, Depends(get_session)],
-    user: Annotated[User | None, Depends(optional_user)],
+    user: Annotated[User, Depends(auth.require_pat_or_user)],
 ):
     memo = (await db.execute(select(Memo).where(Memo.uid == memo_id))).scalar_one_or_none()
     if memo is None:
         raise HTTPException(status_code=404, detail="memo not found")
-    visible = memo.visibility == Visibility.PUBLIC or (
-        user is not None and (memo.owner_id == user.id or memo.visibility != Visibility.PRIVATE)
-    )
-    if not visible:
+    if memo.owner_id != user.id and memo.visibility == Visibility.PRIVATE:
         raise HTTPException(status_code=404, detail="memo not found")
     return _compat_memo(memo)
 
 
-async def file_visible(db: AsyncSession, user: User | None, uid: str) -> bool:
-    """May `user` (None = anonymous) fetch a derived tier of attachment `uid` over /file/*?
+async def file_visible(db: AsyncSession, user: User, uid: str) -> bool:
+    """May `user` fetch a derived tier of attachment `uid` over /file/*?
 
     Mirrors the visibility rules already enforced elsewhere — it does not add a second model:
     - authenticated: `assets._viewable` — they own the attachment, OR it hangs on a memo
       `services.memos.visible_clause` lets them see (theirs, or non-PRIVATE).
-    - anonymous: the F1 rule the compat memo surfaces use (list :129, get :159) — PUBLIC only.
-      An orphan attachment (its memo was deleted → memo_id SET NULL) is therefore never
-      anonymously readable, which is what makes deletion revoke access.
+      An orphan attachment (its memo was deleted → memo_id SET NULL) is readable by its owner
+      alone, which is what makes deletion revoke everyone else's access.
     A missing attachment row is a denial, not an error, so a deleted attachment 404s.
     """
     row = (
@@ -191,8 +181,6 @@ async def file_visible(db: AsyncSession, user: User | None, uid: str) -> bool:
     if row is None:
         return False
     owner_id, memo_id, visibility = row
-    if user is None:
-        return memo_id is not None and visibility == Visibility.PUBLIC
     if owner_id is not None and owner_id == user.id:
         return True
     return memo_id is not None and visibility != Visibility.PRIVATE
@@ -201,10 +189,17 @@ async def file_visible(db: AsyncSession, user: User | None, uid: str) -> bool:
 @router.get("/file/attachments/{uid}/{filename}")
 async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail: bool = False):
     """Derived tiers only: ?thumbnail=true → thumb, mobile UA → mobile, video → web.
-    The original path stays 404, as prod is today. Visibility-gated like the memo surfaces:
-    anonymous callers get derived tiers of PUBLIC memos only, a PAT widens to that user's
-    visible set, and anything else (private, orphaned, deleted) is 404 — never 403, so the
-    denial does not disclose that the uid exists."""
+    The original path stays 404, as prod is today. Credential first, so an anonymous caller is
+    a 401 whatever it asks for; then visibility-gated like the memo surfaces, and anything the
+    caller may not see (private, orphaned, deleted) is 404 — never 403, so the denial does not
+    disclose that the uid exists."""
+    # Authorize in a short-lived session that is released BEFORE the file is streamed, so this
+    # high-fan-out media path never pins a pool connection for the length of a download (same
+    # reason assets.py opens its own session instead of taking the request-scoped dependency).
+    # Ahead of the tier choice, so even the never-served original is a 401 to an anonymous caller.
+    async with async_session() as db:
+        user = await auth.require_pat_or_user(request, db)
+        allowed = await file_visible(db, user, uid)
     assets = Path(settings.DATA_ROOT) / "assets"
     is_mobile = "Mobile" in request.headers.get("user-agent", "")
     is_video = filename.lower().endswith(VIDEO_EXTS)
@@ -217,12 +212,6 @@ async def serve_file_compat(uid: str, filename: str, request: Request, thumbnail
     else:
         # Original over /file/* is not served (F2).
         return JSONResponse({"message": "not found"}, status_code=404)
-    # Authorize in a short-lived session that is released BEFORE the file is streamed, so this
-    # high-fan-out media path never pins a pool connection for the length of a download (same
-    # reason assets.py opens its own session instead of taking the request-scoped dependency).
-    async with async_session() as db:
-        user = await optional_user(request, db)
-        allowed = await file_visible(db, user, uid)
     # Short-circuit preserved: a denied caller never costs a stat. The existence check itself
     # goes off-loop — this is a high-fan-out media route on the bind-mounted volume.
     if not allowed or not await to_thread.run_sync(path.exists):

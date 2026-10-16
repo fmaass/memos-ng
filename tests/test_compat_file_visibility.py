@@ -85,6 +85,12 @@ def _assets(tmp_path):
     web.write_bytes(b"\x00\x00\x00\x18ftypmp42")
 
 
+# Another household member: the caller PUBLIC and PROTECTED media are for. Since MEMNG-835 nobody
+# without a credential reads any tier, so the visibility rules are exercised through this caller.
+MEMBER = {"Authorization": f"Bearer {OTHER_PAT}"}
+ANON_REFUSED = (401, 401, 401)
+
+
 def _tiers(client, headers=None):
     """(thumb, mobile, video) status codes for the seeded attachments."""
     h = headers or {}
@@ -96,27 +102,28 @@ def _tiers(client, headers=None):
 
 
 def test_public_to_private_flip_revokes_every_derived_tier(client, monkeypatch, tmp_path):
-    """AC1: anonymous reads every tier while PUBLIC; after the flip, every tier is 404."""
+    """AC1: a member reads every tier while PUBLIC; after the flip, every tier is 404."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     _assets(tmp_path)
     _seed("PUBLIC")
     try:
-        assert _tiers(client) == (200, 200, 200)
+        assert _tiers(client, MEMBER) == (200, 200, 200)
         _exec("UPDATE memos SET visibility='PRIVATE' WHERE uid='fv-memo'")
-        assert _tiers(client) == (404, 404, 404)  # revoked on the very next request
+        assert _tiers(client, MEMBER) == (404, 404, 404)  # revoked on the very next request
         _exec("UPDATE memos SET visibility='PUBLIC' WHERE uid='fv-memo'")
-        assert _tiers(client) == (200, 200, 200)  # and restored on a flip back
+        assert _tiers(client, MEMBER) == (200, 200, 200)  # and restored on a flip back
+        assert _tiers(client) == ANON_REFUSED  # PUBLIC is never the internet
     finally:
         _cleanup()
 
 
 def test_protected_is_not_anonymous_but_is_household_visible(client, monkeypatch, tmp_path):
-    """PROTECTED mirrors the memo surfaces: hidden from anonymous (F1), visible to any user."""
+    """PROTECTED mirrors the memo surfaces: refused to anonymous, visible to any user."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     _assets(tmp_path)
     _seed("PROTECTED")
     try:
-        assert _tiers(client) == (404, 404, 404)
+        assert _tiers(client) == ANON_REFUSED
         auth = {"Authorization": f"Bearer {OTHER_PAT}"}
         assert _tiers(client, auth) == (200, 200, 200)
     finally:
@@ -129,9 +136,9 @@ def test_memo_deletion_revokes_derived_tiers(client, monkeypatch, tmp_path):
     _assets(tmp_path)
     _seed("PUBLIC")
     try:
-        assert _tiers(client) == (200, 200, 200)
+        assert _tiers(client, MEMBER) == (200, 200, 200)
         _exec("DELETE FROM memos WHERE uid='fv-memo'")
-        assert _tiers(client) == (404, 404, 404)
+        assert _tiers(client, MEMBER) == (404, 404, 404)
         # the orphaned attachment is still the owner's, so a PAT of theirs may still read it
         assert _tiers(client, {"Authorization": f"Bearer {OWNER_PAT}"}) == (200, 200, 200)
     finally:
@@ -144,14 +151,16 @@ def test_attachment_deletion_and_unknown_uid_are_404(client, monkeypatch, tmp_pa
     _assets(tmp_path)
     _seed("PUBLIC")
     try:
-        assert client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true").status_code == 200
+        url = "/file/attachments/fv-img/IMG.jpeg?thumbnail=true"
+        assert client.get(url, headers=MEMBER).status_code == 200
         _exec("DELETE FROM attachments WHERE uid='fv-img'")
-        assert client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true").status_code == 404
+        assert client.get(url, headers=MEMBER).status_code == 404
         owner = {"Authorization": f"Bearer {OWNER_PAT}"}
         assert (
             client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true", headers=owner)
         ).status_code == 404  # not even the owner: the row is gone
-        assert client.get("/file/attachments/nosuch/IMG.jpeg?thumbnail=true").status_code == 404
+        nosuch = "/file/attachments/nosuch/IMG.jpeg?thumbnail=true"
+        assert client.get(nosuch, headers=MEMBER).status_code == 404
     finally:
         _cleanup()
 
@@ -164,9 +173,9 @@ def test_private_media_owner_pat_allowed_other_user_denied(client, monkeypatch, 
     try:
         assert _tiers(client, {"Authorization": f"Bearer {OWNER_PAT}"}) == (200, 200, 200)
         assert _tiers(client, {"Authorization": f"Bearer {OTHER_PAT}"}) == (404, 404, 404)
-        assert _tiers(client) == (404, 404, 404)  # anonymous
-        # an invalid PAT is anonymous (F1: no 401 on this surface), not an error
-        assert _tiers(client, {"Authorization": "Bearer memos_pat_bogus"}) == (404, 404, 404)
+        assert _tiers(client) == ANON_REFUSED  # anonymous
+        # an invalid PAT is refused like no credential at all — never downgraded to anonymous
+        assert _tiers(client, {"Authorization": "Bearer memos_pat_bogus"}) == ANON_REFUSED
     finally:
         _cleanup()
 
@@ -177,8 +186,8 @@ def test_denial_is_indistinguishable_from_a_missing_file(client, monkeypatch, tm
     _assets(tmp_path)
     _seed("PRIVATE")
     try:
-        denied = client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true")
-        unknown = client.get("/file/attachments/nosuch/IMG.jpeg?thumbnail=true")
+        denied = client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true", headers=MEMBER)
+        unknown = client.get("/file/attachments/nosuch/IMG.jpeg?thumbnail=true", headers=MEMBER)
         assert denied.status_code == unknown.status_code == 404
         assert denied.json() == unknown.json() == {"message": "not found"}
     finally:
@@ -191,7 +200,7 @@ def test_served_tier_is_not_cacheable_by_a_shared_cache(client, monkeypatch, tmp
     _assets(tmp_path)
     _seed("PUBLIC")
     try:
-        r = client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true")
+        r = client.get("/file/attachments/fv-img/IMG.jpeg?thumbnail=true", headers=MEMBER)
         assert r.status_code == 200
         assert "no-store" in r.headers["cache-control"]
         assert "public" not in r.headers["cache-control"]

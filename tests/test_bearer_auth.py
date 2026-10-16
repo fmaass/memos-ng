@@ -238,10 +238,10 @@ def test_bearer_carrying_no_credential_is_refused_not_ignored(logged_in_client):
     assert client.get("/api/memos", headers={"Authorization": "Bearer"}).status_code == 401
 
 
-def test_expired_pat_is_anonymous_on_the_compat_surface(logged_in_client):
-    """The compat surface downgrades an unusable token to anonymous rather than 401ing (F1), so
-    expiry has to be visible in the RESULT SET, not the status: the same request lists the owner's
-    PRIVATE memo while the token is live and stops listing it once the token has expired."""
+def test_expired_pat_is_refused_on_the_compat_surface(logged_in_client):
+    """The compat surface used to downgrade an unusable token to anonymous (F1); since MEMNG-835
+    it refuses it like every other route: the same request lists the owner's PRIVATE memo while
+    the token is live and is a 401 once the token has expired."""
     client, _ = logged_in_client
     private = client.post("/api/memos", json={"content": "compat private", "visibility": "PRIVATE"})
     assert private.status_code == 201
@@ -258,9 +258,7 @@ def test_expired_pat_is_anonymous_on_the_compat_surface(logged_in_client):
             "UPDATE pats SET expires_at = now() - interval '1 minute' WHERE hashed_token = :h",
             h=auth.hash_token(token),
         )
-        degraded = anon.get("/api/v1/memos", headers=headers)
-        assert degraded.status_code == 200  # F1 shape kept: anonymous, not refused
-        assert f"memos/{uid}" not in {m["name"] for m in degraded.json()["memos"]}
+        assert anon.get("/api/v1/memos", headers=headers).status_code == 401
     finally:
         client.delete(f"/api/memos/{uid}")
 

@@ -190,6 +190,13 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.3.2
+
+- Reading memo data now always takes a credential: an anonymous or bad-token request to the compat
+  memo list, the single compat memo or the compat file route answers 401 instead of the public
+  slice. Nothing changes for a signed-in browser or a caller holding a valid token, and a signed
+  media URL still serves without a credential, as before.
+
 ### v2.3.1
 
 - The sibling lookup now believes a consensus: when every RAW img-manager returns for a stem has

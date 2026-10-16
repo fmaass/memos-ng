@@ -177,10 +177,9 @@ BEARER_SECURITY = [{"bearerAuth": []}]
 # Token management: the browser session as before, or a grant for a client that holds no session.
 # A bearer is in neither arm and reaches these routes under no circumstances.
 SESSION_OR_GRANT_SECURITY = [{"sessionCookie": []}, {"grantAuth": []}]
-# `{}` is the OAS spelling of "no credential also works": these surfaces answer an anonymous
-# caller with the PUBLIC-only slice (fixtures F1) and widen when a credential is presented, so
-# neither a hard requirement nor silence would describe them truthfully.
-OPTIONAL_PAT_SECURITY = [{"bearerAuth": []}, {}]
+# `{}` is the OAS spelling of "no credential also works". Only the signed asset fast path says it:
+# there the HMAC signature in the URL is the credential, minted by an authenticated read
+# (ADR-0009, ADR-0020). No route answers a caller that presents nothing at all (MEMNG-835).
 SIGNED_OR_USER_SECURITY = [{"bearerAuth": []}, {"sessionCookie": []}, {}]
 
 # Keyed on the dependency NAME, and `route_security` takes the FIRST entry it recognises on a
@@ -192,7 +191,6 @@ DEPENDENCY_SECURITY: dict[str, list[dict[str, list[str]]]] = {
     "require_session_user": SESSION_SECURITY,
     "require_admin": SESSION_SECURITY,
     "require_session_or_grant": SESSION_OR_GRANT_SECURITY,
-    "optional_user": OPTIONAL_PAT_SECURITY,
 }
 
 # These handlers authenticate INSIDE the body, in a short-lived session released before the
@@ -204,7 +202,7 @@ INLINE_AUTH_SECURITY: dict[tuple[str, str], list[dict[str, list[str]]]] = {
     ("GET", "/api/events"): USER_SECURITY,
     ("GET", "/api/attachments/{uid}/rendition/{variant_key}"): USER_SECURITY,
     ("GET", "/api/attachments/{uid}/{tier}"): SIGNED_OR_USER_SECURITY,
-    ("GET", "/file/attachments/{uid}/{filename}"): OPTIONAL_PAT_SECURITY,
+    ("GET", "/file/attachments/{uid}/{filename}"): USER_SECURITY,
     # The basemap routes authenticate in the handler for a reason of their own: an archive
     # transfer must not hold a pool connection for its duration (app/routers/map.py).
     ("GET", "/api/map/manifest"): USER_SECURITY,

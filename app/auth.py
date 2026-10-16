@@ -434,8 +434,8 @@ async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
     if pat is None:
         return None
     # Expiry is enforced HERE rather than in the callers so every bearer surface inherits it from
-    # one place — the compat surface (which downgrades an unusable token to anonymous/PUBLIC-only)
-    # as much as the routes that 401. An expired token is also not worth a last_used stamp.
+    # one place — the compat surface and the media routes as much as every other route that 401s.
+    # An expired token is also not worth a last_used stamp.
     if pat.expires_at is not None and pat.expires_at <= datetime.now(UTC):
         return None
     # Read the FK BEFORE the stamp commits: a session configured to expire on commit would have to
