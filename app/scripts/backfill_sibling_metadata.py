@@ -24,6 +24,16 @@ job, and later an outcome.
     docker exec memos-ng-app python -m app.scripts.backfill_sibling_metadata --execute
 
 Add `--retry-failed` or `--include-ambiguous` to reach the other two populations instead.
+
+`--audit` is a fourth, READ-ONLY mode for a change of the plausibility rule (MEMNG-843): it
+re-judges every date the lookup already borrowed (`capture_source = 'sibling'`) against
+`sibling.plausible`, with the same anchors the job uses, and lists the rows the rule would have
+refused. It also opens each such row's ORIGINAL — the one place this script reads a file — and
+lists the rows whose own metadata now dates them (MEMNG-844: the XMP packet of a Lightroom export),
+which a fill of their own should replace. It enqueues nothing, writes nothing and refuses
+`--execute`; correcting a listed row is a separate, reviewed step.
+
+    docker exec memos-ng-app python -m app.scripts.backfill_sibling_metadata --audit
 """
 
 from __future__ import annotations
@@ -33,14 +43,19 @@ import asyncio
 import enum
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+from anyio import to_thread
 from app.config import settings
 from app.database import async_session
-from app.models import Attachment, AttachmentStatus, JobKind, JobLane, JobState, MediaJob
+from app.models import Attachment, AttachmentStatus, JobKind, JobLane, JobState, MediaJob, Memo
+from app.services import capture, sibling
 from sqlalchemy import Select, and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
 LIVE_STATES = (JobState.queued, JobState.claimed, JobState.processing)
+DAY = timedelta(days=1)
 
 
 class Population(enum.StrEnum):
@@ -159,6 +174,130 @@ async def run(population: Population, *, execute: bool, limit: int | None = None
     return report
 
 
+@dataclass(frozen=True)
+class Refusal:
+    attachment_id: int
+    memo_id: int | None
+    borrowed: datetime
+    reason: str  # 'after-export' | 'before-window'
+    days_off: float
+
+
+@dataclass(frozen=True)
+class SelfDated:
+    attachment_id: int
+    memo_id: int | None
+    borrowed: datetime
+    source: str
+    instant: datetime | None
+    civil: str | None
+
+
+@dataclass
+class AuditReport:
+    sibling_dated: int = 0
+    location_only: int = 0
+    unreadable: int = 0
+    refused: list[Refusal] = field(default_factory=list)
+    self_dated: list[SelfDated] = field(default_factory=list)
+
+    def format(self) -> str:
+        lines = [
+            "backfill_sibling_metadata — AUDIT (read-only, nothing written)",
+            f"  rows dated by a sibling: {self.sibling_dated}",
+            f"  refused by the plausibility window (MEMNG-843): {len(self.refused)}",
+            *(
+                f"    attachment {r.attachment_id} memo {r.memo_id}: borrowed"
+                f" {r.borrowed.astimezone(UTC).isoformat()} — {r.reason} by {r.days_off:.1f} days"
+                for r in self.refused
+            ),
+            f"  dated by their own file now (MEMNG-844): {len(self.self_dated)}",
+            *(
+                f"    attachment {d.attachment_id} memo {d.memo_id}: {d.source}"
+                f" {d.instant.isoformat() if d.instant else f'{d.civil} (civil)'}"
+                f" — borrowed {d.borrowed.astimezone(UTC).isoformat()}"
+                for d in self.self_dated
+            ),
+            f"  originals not readable here (own metadata not checked): {self.unreadable}",
+            f"  rows with only a borrowed location (no candidate date kept): {self.location_only}",
+        ]
+        return "\n".join(lines)
+
+
+def _refusal(row) -> Refusal | None:
+    existed_by, posted_at = sibling.time_anchors(
+        row.captured_at, row.created_at, row.memo_created_at
+    )
+    taken = row.capture_instant
+    if sibling.plausible(taken, existed_by=existed_by, posted_at=posted_at):
+        return None
+    ceiling = existed_by + sibling.CAPTURE_SKEW
+    if taken > ceiling:
+        return Refusal(row.id, row.memo_id, taken, "after-export", (taken - ceiling) / DAY)
+    floor = posted_at - sibling.SIBLING_WINDOW
+    return Refusal(row.id, row.memo_id, taken, "before-window", (floor - taken) / DAY)
+
+
+def _own_capture(storage_path: str | None, mime: str) -> capture.CaptureResult | None:
+    """What the original's own metadata says, or None when there is no original to ask — which
+    `read_capture` alone would report as a file that says nothing."""
+    if not storage_path or not Path(storage_path).is_file():
+        return None
+    return capture.read_capture(storage_path, mime)
+
+
+async def audit() -> AuditReport:
+    report = AuditReport()
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(
+                    Attachment.id,
+                    Attachment.memo_id,
+                    Attachment.capture_instant,
+                    Attachment.captured_at,
+                    Attachment.created_at,
+                    Attachment.storage_path,
+                    Attachment.mime,
+                    Memo.created_at.label("memo_created_at"),
+                )
+                .outerjoin(Memo, Memo.id == Attachment.memo_id)
+                .where(Attachment.capture_source == sibling.SOURCE_SIBLING)
+                .order_by(Attachment.id)
+            )
+        ).all()
+        report.sibling_dated = len(rows)
+        report.refused = [r for r in map(_refusal, rows) if r is not None]
+        for row in rows:
+            own = await to_thread.run_sync(_own_capture, row.storage_path, row.mime)
+            if own is None:
+                report.unreadable += 1
+            elif own.capture_source is not None:
+                report.self_dated.append(
+                    SelfDated(
+                        row.id,
+                        row.memo_id,
+                        row.capture_instant,
+                        own.capture_source,
+                        own.capture_instant,
+                        own.capture_civil,
+                    )
+                )
+        report.location_only = (
+            await db.execute(
+                select(func.count(Attachment.id)).where(
+                    Attachment.location_source == sibling.SOURCE_SIBLING,
+                    or_(
+                        Attachment.capture_source.is_(None),
+                        Attachment.capture_source != sibling.SOURCE_SIBLING,
+                    ),
+                )
+            )
+        ).scalar_one()
+        await db.rollback()
+    return report
+
+
 def main() -> None:  # pragma: no cover
     ap = argparse.ArgumentParser(
         description="Enqueue img-manager sibling lookups for undated or unlocated photos."
@@ -180,7 +319,17 @@ def main() -> None:  # pragma: no cover
         action="store_true",
         help="ONLY rows recorded as ambiguous (after a change of the election rule)",
     )
+    which.add_argument(
+        "--audit",
+        action="store_true",
+        help="READ-ONLY: list the sibling-borrowed dates the plausibility rule would refuse",
+    )
     args = ap.parse_args()
+    if args.audit:
+        if args.execute or args.limit is not None:
+            ap.error("--audit is read-only and takes neither --execute nor --limit")
+        print(asyncio.run(audit()).format())
+        return
     if args.execute and not settings.sibling_enabled:
         # Every job enqueued now could only fail: the worker re-queues a disabled lookup.
         raise SystemExit("IMGMANAGER_URL, IMGMANAGER_TOKEN and SIBLING_OWNER_IDS are not all set")

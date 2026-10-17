@@ -6,7 +6,7 @@ not the unit: the request it builds and the status handling it applies are the r
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -184,6 +184,34 @@ def test_elect_a_single_candidate_is_still_unique_not_consensus():
     election = elect([only])
     assert election.outcome == "unique"
     assert election.chosen == only
+
+
+# MEMNG-843: the plausibility window, at its edges. `existed_by` is the earliest moment the export
+# itself is known to have existed; `posted_at` is the memo the file belongs to.
+EXISTED_BY = datetime(2026, 8, 12, 20, 30, 6, tzinfo=UTC)
+POSTED_AT = datetime(2026, 8, 16, 8, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("taken", "expected"),
+    [
+        (EXISTED_BY, True),
+        (EXISTED_BY + timedelta(days=1), True),
+        (EXISTED_BY + timedelta(days=1, seconds=1), False),
+        (POSTED_AT - timedelta(days=90), True),
+        (POSTED_AT - timedelta(days=90, seconds=1), False),
+        (datetime(2011, 2, 28, tzinfo=UTC), False),
+        (None, True),
+    ],
+    ids=["at-existence", "ceiling", "past-ceiling", "floor", "past-floor", "years-off", "undated"],
+)
+def test_plausible_vectors(taken, expected):
+    assert sibling.plausible(taken, existed_by=EXISTED_BY, posted_at=POSTED_AT) is expected
+
+
+def test_the_window_constants_are_the_documented_ones():
+    assert sibling.CAPTURE_SKEW == timedelta(days=1)
+    assert sibling.SIBLING_WINDOW == timedelta(days=90)
 
 
 @pytest.fixture

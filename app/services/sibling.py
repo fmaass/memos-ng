@@ -16,6 +16,12 @@ The rules that make borrowing safe:
   The one exception is a `consensus` (MEMNG-797): the common ambiguous case is one RAW held in
   both img-manager tiers (121 of 254 on 2026-10-13), so when every candidate carries the same
   capture second and the identical GPS pair, whichever one is borrowed the value is the same.
+* **A stem is not an identity** (MEMNG-843). iPhone `IMG_####` and Sony `_AR5####` counters repeat
+  across bodies and years, so a candidate is first judged against the attachment's own timeline
+  (`plausible`) and dropped before the election when it could not be this file's RAW: shot more
+  than `CAPTURE_SKEW` after the export is known to have existed, or more than `SIBLING_WINDOW`
+  before the memo it was posted on. The second signal the ticket considered — file size or pixel
+  dimensions — is not in img-manager's answer, and a RAW's would not match its export's anyway.
 * **Could-not-ask is not an answer.** Only a 200 is an outcome; a 422 (the stems themselves were
   refused) is `none`; everything else — transport error, timeout, 5xx, 401/403, 404 — raises
   `SiblingUnavailable`, which the worker's failure path retries, so an infrastructure state is
@@ -31,7 +37,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 import httpx
@@ -40,7 +46,7 @@ from sqlalchemy import DateTime, Double, and_, case, cast, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Attachment, MediaJob
+from app.models import Attachment, MediaJob, Memo
 from app.services import media
 
 logger = structlog.get_logger()
@@ -59,6 +65,20 @@ LOOKUP_PATH = "/api/lookup/stems"
 EXPORT_SUFFIX_SEPARATOR = " - "
 # Lightroom's own rename of an edited or duplicated master: `_AR5123-Edit`, `_AR5123-2`.
 LIGHTROOM_SUFFIX = re.compile(r"-(Edit|\d+)$")
+
+# A RAW is shot before anything is exported from it, so a candidate later than the export's own
+# file time is another frame. The day of slack is the clock disagreement between a camera that
+# recorded no offset (img-manager resolved it in a configured zone) and the device that stamped
+# the export — the same day `capture.MAX_HEADER_SKEW` allows a movie header.
+CAPTURE_SKEW = timedelta(days=1)
+# How long before its memo a borrowed capture may lie. A counter repeats every 10,000 frames, so
+# the further back a candidate is, the likelier it is another pass of the counter; the wrong
+# borrowings found in production lay between 129 days and 15 years before the file they dated
+# (MEMNG-843). Ninety days covers the workflow this
+# lookup serves — export a shoot, post it within the season — and a refusal costs only a date
+# the file never had: the photo groups under its memo day, exactly as before MEMNG-796. A memo
+# DATED back to an old shoot moves the anchor with it, so posting an old RAW stays possible.
+SIBLING_WINDOW = timedelta(days=90)
 
 
 class SiblingUnavailable(Exception):
@@ -136,6 +156,29 @@ def elect(candidates: Sequence[Candidate], *, truncated: bool = False) -> Electi
     if candidates:
         return Election(OUTCOME_AMBIGUOUS)
     return Election(OUTCOME_NONE)
+
+
+def plausible(taken: datetime | None, *, existed_by: datetime, posted_at: datetime) -> bool:
+    """Whether a candidate shot at `taken` can be the RAW of a file that existed by `existed_by`
+    and was posted on a memo of `posted_at`. An undated candidate cannot be judged by time and is
+    left to the election, which never borrows a date from it."""
+    if taken is None:
+        return True
+    return posted_at - SIBLING_WINDOW <= taken <= existed_by + CAPTURE_SKEW
+
+
+def time_anchors(
+    captured_at: datetime | None, created_at: datetime, memo_created_at: datetime | None
+) -> tuple[datetime, datetime]:
+    """`(existed_by, posted_at)` out of the attachment's own columns.
+
+    `captured_at` is the file's capture read, else the client's file time, else the upload instant
+    (`uploads.finalize`), and the upload row's `created_at` is when the bytes arrived; the file
+    existed by both, so the earlier is the tighter ceiling. A borrowed date is never written to
+    either, so re-judging a borrowed row reads the same anchors the lookup did. A standalone
+    upload has no memo yet and is anchored on its upload instant."""
+    existed_by = created_at if captured_at is None else min(captured_at, created_at)
+    return existed_by, memo_created_at or created_at
 
 
 def _all_agree(candidates: Sequence[Candidate]) -> bool:
@@ -264,7 +307,12 @@ async def process_sibling_job(db: AsyncSession, job: MediaJob) -> None:
                 Attachment.capture_instant,
                 Attachment.capture_civil,
                 Attachment.latitude,
-            ).where(Attachment.id == job.attachment_id)
+                Attachment.captured_at,
+                Attachment.created_at,
+                Memo.created_at.label("memo_created_at"),
+            )
+            .outerjoin(Memo, Memo.id == Attachment.memo_id)
+            .where(Attachment.id == job.attachment_id)
         )
     ).one_or_none()
     # NO transaction is held across the HTTP call below: the read ends here.
@@ -280,12 +328,22 @@ async def process_sibling_job(db: AsyncSession, job: MediaJob) -> None:
         and bool(stems)
     )
     election = Election(OUTCOME_NONE)
-    candidates = 0
+    candidates = refused = 0
     if asked:
+        existed_by, posted_at = time_anchors(row.captured_at, row.created_at, row.memo_created_at)
         for found in await lookup(stems):
-            if found.candidates or found.truncated:
-                election = elect(found.candidates, truncated=found.truncated)
-                candidates = len(found.candidates)
+            # Dropped BEFORE the election: a refused candidate is another frame, so it neither
+            # wins nor makes the real one ambiguous, and a variant left with none falls through
+            # to the next exactly as an empty answer does.
+            kept = [
+                c
+                for c in found.candidates
+                if plausible(c.datetime_original, existed_by=existed_by, posted_at=posted_at)
+            ]
+            refused += len(found.candidates) - len(kept)
+            if kept or found.truncated:
+                election = elect(kept, truncated=found.truncated)
+                candidates = len(kept)
                 break
     await _write_result(db, job.id, job.attachment_id, election)
     logger.info(
@@ -294,6 +352,7 @@ async def process_sibling_job(db: AsyncSession, job: MediaJob) -> None:
         asked=asked,
         stem_variants=len(stems) if asked else 0,
         candidates=candidates,
+        refused=refused,
     )
 
 

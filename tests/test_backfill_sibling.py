@@ -204,3 +204,163 @@ def test_the_script_never_asks_img_manager_nor_writes_an_attachment_column(seede
     for population in bf.Population:
         asyncio.run(bf.run(population, execute=True))
     assert _attachments_snapshot() == before
+
+
+# --- `--audit` (MEMNG-843): the read-only re-judgement of every date the lookup already borrowed.
+MAY_POST = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+AUG_EXPORT = datetime(2026, 8, 12, 20, 30, 6, tzinfo=UTC)
+AUG_POST = datetime(2026, 8, 16, 8, 0, tzinfo=UTC)
+
+
+def _memo(owner: int, at: datetime) -> int:
+    return _sql(
+        "INSERT INTO memos (uid, owner_id, content, visibility, pinned, created_at, updated_at)"
+        " VALUES (:u, :o, 'm', CAST('PUBLIC' AS visibility), false, :t, :t) RETURNING id",
+        u=secrets.token_urlsafe(10),
+        o=owner,
+        t=at,
+    )[0][0]
+
+
+def _borrowed(
+    owner: int,
+    memo: int | None,
+    *,
+    borrowed: datetime | None,
+    created_at: datetime,
+    captured_at: datetime | None,
+    capture_source: str | None = "sibling",
+    location_source: str = "none",
+    storage_path: str = "/nonexistent",
+) -> int:
+    return _sql(
+        "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status,"
+        " storage_path, capture_instant, capture_source, location_source, latitude, longitude,"
+        " sibling_outcome, created_at, captured_at) VALUES (:u, :o, :m, 'IMG_9052.png',"
+        " 'image/png', 1, 'ready', :sp, :ci, :cs, :ls, :la, :lo, 'unique', :ca, :cap)"
+        " RETURNING id",
+        u=secrets.token_urlsafe(10),
+        o=owner,
+        m=memo,
+        sp=storage_path,
+        ci=borrowed,
+        cs=capture_source,
+        ls=location_source,
+        la=1.0 if location_source == "sibling" else None,
+        lo=2.0 if location_source == "sibling" else None,
+        ca=created_at,
+        cap=captured_at,
+    )[0][0]
+
+
+@pytest.fixture
+def audited(db_engine):
+    _sql("DELETE FROM media_jobs")
+    _sql("DELETE FROM attachments")
+    owner = _user()
+    may, aug = _memo(owner, MAY_POST), _memo(owner, AUG_POST)
+    rows = {
+        "years_off": _borrowed(
+            owner,
+            may,
+            borrowed=datetime(2011, 2, 28, tzinfo=UTC),
+            created_at=MAY_POST,
+            captured_at=MAY_POST,
+        ),
+        "after_export": _borrowed(
+            owner,
+            aug,
+            borrowed=datetime(2026, 8, 15, 17, 0, 12, tzinfo=UTC),
+            created_at=AUG_POST,
+            captured_at=AUG_EXPORT,
+        ),
+        "plausible": _borrowed(
+            owner,
+            aug,
+            borrowed=datetime(2026, 8, 12, 13, 2, 3, tzinfo=UTC),
+            created_at=AUG_POST,
+            captured_at=AUG_EXPORT,
+        ),
+        "own_exif": _borrowed(
+            owner,
+            may,
+            borrowed=datetime(2011, 2, 28, tzinfo=UTC),
+            created_at=MAY_POST,
+            captured_at=MAY_POST,
+            capture_source="exif",
+            location_source="sibling",
+        ),
+    }
+    yield owner, rows
+    _sql("DELETE FROM media_jobs")
+    _sql("DELETE FROM attachments")
+    _sql("DELETE FROM users WHERE id = :o", o=owner)
+
+
+def test_the_audit_lists_every_borrowed_date_the_window_refuses_and_why(audited):
+    _, rows = audited
+
+    report = asyncio.run(bf.audit())
+
+    assert report.sibling_dated == 3
+    assert {(r.attachment_id, r.reason) for r in report.refused} == {
+        (rows["years_off"], "before-window"),
+        (rows["after_export"], "after-export"),
+    }
+    # The EXIF-dated row borrowed only a location; no candidate date was kept to judge it by.
+    assert report.location_only == 1
+
+
+def test_the_audit_writes_nothing_and_enqueues_nothing(audited, monkeypatch):
+    def refuse(*_a, **_k):
+        raise AssertionError("the audit asked img-manager")
+
+    monkeypatch.setattr(sibling, "lookup", refuse)
+    before, jobs = _attachments_snapshot(), _job_count()
+
+    report = asyncio.run(bf.audit())
+
+    assert report.refused
+    assert _attachments_snapshot() == before
+    assert _job_count() == jobs
+    assert "AUDIT (read-only" in report.format()
+
+
+def _lightroom_png(path) -> str:
+    """A real PNG whose only date is the XMP packet Lightroom writes (MEMNG-844)."""
+    from PIL import Image, PngImagePlugin
+
+    info = PngImagePlugin.PngInfo()
+    info.add_itxt(
+        "XML:com.adobe.xmp",
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF'
+        ' xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about=""'
+        ' xmlns:exif="http://ns.adobe.com/exif/1.0/"'
+        ' exif:DateTimeOriginal="2026-08-12T18:45:48.298+01:00"/></rdf:RDF></x:xmpmeta>',
+    )
+    Image.new("RGB", (4, 3)).save(path, "PNG", pnginfo=info)
+    return str(path)
+
+
+def test_the_audit_lists_the_borrowed_rows_whose_own_xmp_now_dates_them(audited, tmp_path):
+    owner, rows = audited
+    memo = _memo(owner, AUG_POST)
+    own = _borrowed(
+        owner,
+        memo,
+        borrowed=datetime(2026, 4, 5, 11, 0, tzinfo=UTC),
+        created_at=AUG_POST,
+        captured_at=AUG_EXPORT,
+        storage_path=_lightroom_png(tmp_path / "_AR59974 - screen.png"),
+    )
+    before = _attachments_snapshot()
+
+    report = asyncio.run(bf.audit())
+
+    assert [(r.attachment_id, r.source, r.instant) for r in report.self_dated] == [
+        (own, "xmp", datetime(2026, 8, 12, 17, 45, 48, tzinfo=UTC))
+    ]
+    # The seeded rows point at no file: counted, never guessed at.
+    assert report.unreadable == len([k for k in rows if k != "own_exif"])
+    assert _attachments_snapshot() == before
+    assert f"attachment {own} memo {memo}: xmp 2026-08-12T17:45:48+00:00" in report.format()

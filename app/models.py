@@ -251,7 +251,8 @@ class Attachment(Base):
     # inferred (MEMNG-262). NULL means the file said nothing — which is different from
     # `captured_at`, which always holds something. `capture_civil` is a wall-clock reading whose
     # zone the file never recorded (EXIF without OffsetTimeOriginal); only a client knows the zone
-    # to resolve it in, so it travels unresolved. `capture_source` is 'exif' or 'quicktime'.
+    # to resolve it in, so it travels unresolved. `capture_source` is 'exif', 'quicktime' or 'xmp'
+    # (MEMNG-844), or 'sibling' for a date borrowed from img-manager (MEMNG-796).
     capture_instant: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     capture_civil: Mapped[str | None] = mapped_column(String(32))
     capture_source: Mapped[str | None] = mapped_column(String(16))

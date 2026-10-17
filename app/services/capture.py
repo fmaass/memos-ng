@@ -10,9 +10,11 @@ module different from the EXIF code already in `services/media.py`:
   `MOOV_READ_CAP`. A HEIC is walked the same way (`heif_exif_from`), because opening one costs
   the WHOLE file — pillow-heif parses the image payload to open it, and only the `meta` box and
   the Exif item's own extent are wanted, capped by `HEIF_EXIF_READ_CAP`.
-* **A date-tag WHITELIST.** Exactly three EXIF tags and one QuickTime key are read. GPS and
-  everything else is neither read nor logged, and no failure ever carries metadata content into a
-  log line — only the exception's type.
+* **A date-tag WHITELIST.** Exactly three EXIF tags and one QuickTime key are read — and, for a
+  PNG or JPEG whose EXIF holds no date, `DateTimeOriginal` out of its XMP packet (MEMNG-844):
+  Lightroom's PNG exports carry the capture date there and nothing in EXIF. GPS and everything
+  else is neither read nor logged, and no failure ever carries metadata content into a log line —
+  only the exception's type.
 
 Absence is the normal answer: anything unreadable, malformed or absent yields `NOTHING`, never an
 exception to the caller. A capture date the app cannot prove is worth less than no date at all.
@@ -21,11 +23,13 @@ exception to the caller. A capture date the app cannot prove is worth less than 
 import logging
 import re
 import struct
+import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
+from xml.etree import ElementTree
 
 import pillow_heif
 import structlog
@@ -77,6 +81,24 @@ HEIF_MIMES = frozenset(
     {"image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence", "image/avif"}
 )
 EXIF_PREFIX = b"Exif\x00\x00"
+# The iTXt keyword Adobe registered for an XMP packet in a PNG.
+PNG_XMP_KEYWORD = b"XML:com.adobe.xmp"
+# A Lightroom packet is a few KB; anything this large is not one worth parsing, and the cap also
+# bounds what a compressed iTXt may inflate to.
+XMP_READ_CAP = 1024 * 1024
+_RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
+# exif:DateTimeOriginal is the property the XMP spec defines; xmp:DateTimeOriginal is not in the
+# spec but is written by some exporters, so it is accepted second. Nothing else — xmp:CreateDate
+# and photoshop:DateCreated name when the RESOURCE was made, which for an export is ambiguous.
+XMP_DATE_PROPERTIES = (
+    "{http://ns.adobe.com/exif/1.0/}DateTimeOriginal",
+    "{http://ns.adobe.com/xap/1.0/}DateTimeOriginal",
+)
+# XMP's ISO 8601 profile, whole-second precision required: a date or a minute is not a capture
+# instant the app can prove. Fractions are matched and dropped (floored), as everywhere else.
+_XMP_DATETIME = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+)
 TIFF_MAGIC = (b"II*\x00", b"MM\x00*")
 
 _EXIF_DATETIME = "%Y:%m:%d %H:%M:%S"
@@ -145,6 +167,112 @@ def capture_from_exif(datetime_original: object, offset: object) -> CaptureResul
         return CaptureResult(None, civil, "exif")
     instant = datetime.fromisoformat(civil).replace(tzinfo=timezone(delta)).astimezone(UTC)
     return CaptureResult(instant, None, "exif")
+
+
+def capture_from_xmp_date(raw: str) -> CaptureResult:
+    """An XMP date as a capture result: with an offset (or `Z`) an instant, without one a civil
+    time — the same split EXIF's OffsetTimeOriginal makes."""
+    m = _XMP_DATETIME.match(raw.strip())
+    if m is None:
+        return NOTHING
+    year, month, day, hour, minute, second = (int(g) for g in m.groups()[:6])
+    try:
+        civil = datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return NOTHING
+    zone = m.group(7)
+    if zone is None:
+        return CaptureResult(None, civil.isoformat(), "xmp")
+    delta = timedelta(0) if zone == "Z" else parse_exif_offset(zone)
+    if delta is None:
+        return NOTHING
+    return CaptureResult(civil.replace(tzinfo=timezone(delta)).astimezone(UTC), None, "xmp")
+
+
+def capture_from_xmp(packet: bytes) -> CaptureResult:
+    """`DateTimeOriginal` out of one XMP packet, and nothing else from it.
+
+    A packet that declares a DOCTYPE or an entity is refused before it reaches a parser: XMP never
+    needs either, and refusing them closes entity expansion whatever the parser would do. That
+    check only means something if it reads the same characters the parser will, so the packet must
+    decode as UTF-8 — what Lightroom writes — with no NUL, and the check reads the DECODED text. A
+    UTF-16 packet would otherwise slip its declarations past a byte search while expat
+    auto-detects UTF-16 from the first bytes (which an `encoding=` override does not stop) and
+    expands them. The parser is still told UTF-8, which does override an `encoding` declaration,
+    so a declared single-byte encoding cannot re-read the checked bytes as other characters. Every
+    container path (JPEG APP1, PNG iTXt plain or compressed) ends here, so this is the one place it
+    is enforced.
+    The first whitelisted property present decides; a malformed value is no date, not a reason to
+    look further."""
+    if len(packet) > XMP_READ_CAP:
+        return NOTHING
+    try:
+        text = packet.decode("utf-8")
+    except UnicodeDecodeError:
+        return NOTHING
+    if "\x00" in text or "<!DOCTYPE" in text or "<!ENTITY" in text:
+        return NOTHING
+    parser = ElementTree.XMLParser(encoding="utf-8")
+    try:
+        parser.feed(packet)
+        root = parser.close()
+    except ElementTree.ParseError:
+        return NOTHING
+    for description in root.iter(f"{_RDF}Description"):
+        for prop in XMP_DATE_PROPERTIES:
+            raw = description.get(prop)
+            if raw is None:
+                element = description.find(prop)
+                raw = element.text if element is not None else None
+            if raw is not None:
+                return capture_from_xmp_date(raw)
+    return NOTHING
+
+
+def png_xmp(path: Path) -> bytes | None:
+    """The XMP packet of a PNG's `iTXt` chunk, found by the same seek-only chunk walk as
+    `png_exif` (and for the same reason: Pillow stops at the first IDAT) — or None."""
+    with open(path, "rb") as f:
+        if f.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+            return None
+        while True:
+            header = f.read(8)
+            if len(header) < 8:
+                return None
+            length = int.from_bytes(header[:4], "big")
+            kind = header[4:8]
+            if kind == b"IEND":
+                return None
+            if kind == b"iTXt" and length <= XMP_READ_CAP:
+                packet = _itxt_xmp(f.read(length))
+                if packet is not None:
+                    return packet
+                f.seek(4, 1)  # CRC
+                continue
+            f.seek(length + 4, 1)  # payload + CRC, unread
+
+
+def _itxt_xmp(payload: bytes) -> bytes | None:
+    # keyword NUL compression-flag compression-method language NUL translated-keyword NUL text
+    keyword, sep, rest = payload.partition(b"\x00")
+    if keyword != PNG_XMP_KEYWORD or not sep or len(rest) < 2:
+        return None
+    flag, method, rest = rest[0], rest[1], rest[2:]
+    parts = rest.split(b"\x00", 2)
+    if len(parts) != 3:
+        return None
+    text = parts[2]
+    if flag == 0:
+        return text
+    if flag != 1 or method != 0:
+        return None
+    inflater = zlib.decompressobj()
+    try:
+        packet = inflater.decompress(text, XMP_READ_CAP)
+    except zlib.error:
+        return None
+    # Output left unproduced means the packet inflates past the cap: refused, not truncated.
+    return None if inflater.unconsumed_tail else packet
 
 
 def parse_quicktime_creationdate(text: object) -> datetime | None:
@@ -587,18 +715,28 @@ def _read_image(path: Path, mime: str) -> CaptureResult:
         logger.info("capture.heif_fallback", mime=mime)
     with Image.open(path) as im:
         if isinstance(im, TiffImagePlugin.TiffImageFile):
-            exif = im.getexif()  # from tag_v2, parsed at open; no sample decode
-        else:
-            raw = png_exif(path) if isinstance(im, PngImagePlugin.PngImageFile) else None
-            if raw is None:
-                raw = im.info.get("exif")
-            if not raw:
-                return NOTHING
+            # Inside the `with`: a TIFF's Exif object resolves the sub-IFD by seeking in the FILE,
+            # so the handle has to still be open.
+            return _whitelisted_tags(im.getexif())  # from tag_v2, parsed at open; no decode
+        is_png = isinstance(im, PngImagePlugin.PngImageFile)
+        raw = png_exif(path) if is_png else None
+        if raw is None:
+            raw = im.info.get("exif")
+        if raw:
             exif = Image.Exif()
             exif.load(raw)
-        # Inside the `with`: a TIFF's Exif object resolves the sub-IFD by seeking in the FILE, so
-        # the handle has to still be open. (A standalone Exif built from bytes does not care.)
-        return _whitelisted_tags(exif)
+            found = _whitelisted_tags(exif)
+            if found != NOTHING:
+                return found
+        # EXIF said nothing: the XMP packet is the second and last place a date is looked for.
+        # JPEG's APP1 packet is the one Pillow's header parse already picked up.
+        if is_png:
+            packet = png_xmp(path)
+        elif im.format in ("JPEG", "MPO"):
+            packet = im.info.get("xmp")
+        else:
+            packet = None
+        return capture_from_xmp(packet) if isinstance(packet, bytes) else NOTHING
 
 
 def boxes(buf: bytes, start: int = 0, end: int | None = None) -> Iterator[tuple[bytes, int, int]]:

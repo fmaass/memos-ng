@@ -837,3 +837,251 @@ def test_a_promoted_print_takes_the_place_of_the_uid_that_asked_first(
         assert _filenames_in_order(memo["uid"]) == ["_AR9.png", "b.png"]
     finally:
         _cleanup()
+
+
+# --- MEMNG-844: XMP DateTimeOriginal when EXIF has no date. Lightroom's PNG exports carry the
+# capture date, the RAW's file name and the camera in an XMP packet and nothing in EXIF. Every
+# file below is a real PNG / JPEG written by Pillow around a real XMP packet.
+def _xmp(body: str) -> bytes:
+    return (
+        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000">\n'
+        ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        '  <rdf:Description rdf:about=""\n'
+        '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
+        '    xmlns:exif="http://ns.adobe.com/exif/1.0/"\n'
+        '    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"\n'
+        '    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"\n'
+        f'    crs:RawFileName="_AR59974.ARW"{body}\n'
+        " </rdf:RDF>\n"
+        "</x:xmpmeta>\n"
+        '<?xpacket end="w"?>'
+    ).encode()
+
+
+LIGHTROOM_XMP = _xmp('\n    exif:DateTimeOriginal="2026-08-12T18:45:48.298+01:00"/>')
+LIGHTROOM_INSTANT = datetime(2026, 8, 12, 17, 45, 48, tzinfo=UTC)
+
+
+def _xmp_png(tmp_path: Path, packet: bytes | None, *, zip_text: bool = False, exif=None) -> Path:
+    from PIL import Image, PngImagePlugin
+
+    info = PngImagePlugin.PngInfo()
+    if packet is not None:
+        info.add_itxt("XML:com.adobe.xmp", packet.decode(), zip=zip_text)
+    path = tmp_path / "_AR59974 - screen.png"
+    kwargs = {"pnginfo": info}
+    if exif is not None:
+        kwargs["exif"] = exif
+    Image.new("RGB", (4, 3), (10, 20, 30)).save(path, "PNG", **kwargs)
+    return path
+
+
+def test_a_png_with_only_an_xmp_packet_is_dated_by_it(tmp_path):
+    result = capture.read_capture(_xmp_png(tmp_path, LIGHTROOM_XMP), "image/png")
+    assert result == capture.CaptureResult(LIGHTROOM_INSTANT, None, "xmp")
+
+
+def test_a_compressed_itxt_packet_is_read_too(tmp_path):
+    result = capture.read_capture(_xmp_png(tmp_path, LIGHTROOM_XMP, zip_text=True), "image/png")
+    assert result == capture.CaptureResult(LIGHTROOM_INSTANT, None, "xmp")
+
+
+def test_a_png_with_neither_exif_nor_xmp_stays_undated(tmp_path):
+    assert capture.read_capture(_xmp_png(tmp_path, None), "image/png") == capture.NOTHING
+
+
+def test_a_jpeg_app1_xmp_packet_dates_a_jpeg_without_exif(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "IMG_9052.jpg"
+    Image.new("RGB", (4, 3)).save(path, "JPEG", xmp=LIGHTROOM_XMP)
+    result = capture.read_capture(path, "image/jpeg")
+    assert result == capture.CaptureResult(LIGHTROOM_INSTANT, None, "xmp")
+
+
+def test_exif_wins_over_a_disagreeing_xmp_packet(tmp_path):
+    # The artefact's own EXIF-dated PNG, re-written with the Lightroom packet beside its eXIf.
+    exif = capture.png_exif(BINARIES / "png-exif.png")
+    path = _xmp_png(tmp_path, LIGHTROOM_XMP, exif=exif)
+    expect = ARTEFACT["binaries"]["png-exif.png"]["expect"]
+    result = capture.read_capture(path, "image/png")
+    assert result.capture_source == "exif"
+    assert (_instant(result.capture_instant), result.capture_civil) == (
+        expect["capture_instant"],
+        expect["capture_civil"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            '\n    exif:DateTimeOriginal="2026-08-12T18:45:48Z"/>',
+            LIGHTROOM_INSTANT.replace(hour=18),
+        ),
+        (
+            ">\n   <exif:DateTimeOriginal>2026-08-12T18:45:48+01:00</exif:DateTimeOriginal>\n"
+            "  </rdf:Description>",
+            LIGHTROOM_INSTANT,
+        ),
+        ('\n    xmp:DateTimeOriginal="2026-08-12T18:45:48.9+01:00"/>', LIGHTROOM_INSTANT),
+        ('\n    exif:DateTimeOriginal="2026-08-12T18:45:48"/>', "2026-08-12T18:45:48"),
+        ('\n    exif:DateTimeOriginal="2026-08-12"/>', None),
+        ('\n    exif:DateTimeOriginal="2026-08-12T18:45+01:00"/>', None),
+        ('\n    exif:DateTimeOriginal="0000-00-00T00:00:00"/>', None),
+        ('\n    exif:DateTimeOriginal="2026-08-12T18:45:48+25:00"/>', None),
+        ('\n    xmp:CreateDate="2026-08-12T18:45:48+01:00"/>', None),
+        ('\n    photoshop:DateCreated="2026-08-12T18:45:48+01:00"/>', None),
+    ],
+    ids=[
+        "zulu",
+        "element-form",
+        "xmp-namespace-fraction-floored",
+        "no-offset-is-civil",
+        "date-only",
+        "no-seconds",
+        "unset",
+        "offset-out-of-range",
+        "create-date-is-not-whitelisted",
+        "photoshop-date-is-not-whitelisted",
+    ],
+)
+def test_xmp_date_vectors(tmp_path, body, expected):
+    result = capture.read_capture(_xmp_png(tmp_path, _xmp(body)), "image/png")
+    if expected is None:
+        assert result == capture.NOTHING
+    elif isinstance(expected, str):
+        assert result == capture.CaptureResult(None, expected, "xmp")
+    else:
+        assert result == capture.CaptureResult(expected, None, "xmp")
+
+
+def test_an_xmp_packet_declaring_entities_is_refused_unparsed(tmp_path):
+    hostile = (
+        b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY d "2026-08-12T18:45:48Z">]>'
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF'
+        b' xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description'
+        b' xmlns:exif="http://ns.adobe.com/exif/1.0/" exif:DateTimeOriginal="&d;"/>'
+        b"</rdf:RDF></x:xmpmeta>"
+    )
+    assert capture.read_capture(_xmp_png(tmp_path, hostile), "image/png") == capture.NOTHING
+
+
+def test_a_malformed_xmp_packet_is_no_date_and_no_error(tmp_path):
+    path = _xmp_png(tmp_path, b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF")
+    assert capture.read_capture(path, "image/png") == capture.NOTHING
+
+
+def test_a_date_property_spelled_inside_another_value_is_not_read(tmp_path):
+    # Namespace-aware parsing, not a text search: the literal inside a label is a label.
+    body = '\n    xmp:Label="exif:DateTimeOriginal=&quot;2026-08-12T18:45:48Z&quot;"/>'
+    assert capture.read_capture(_xmp_png(tmp_path, _xmp(body)), "image/png") == capture.NOTHING
+
+
+def _xmp_after_idat(tmp_path: Path, packet: bytes, *, compressed: bool) -> Path:
+    """A PNG whose XMP iTXt sits AFTER the image data, where Pillow's own header parse never
+    looks — so only this module's chunk walk can find it, and only its caps can refuse it."""
+    import zlib
+
+    plain = _xmp_png(tmp_path, None)
+    data = plain.read_bytes()
+    text = zlib.compress(packet) if compressed else packet
+    body = b"XML:com.adobe.xmp\x00" + (b"\x01\x00" if compressed else b"\x00\x00") + b"\x00\x00"
+    body += text
+    chunk = (
+        len(body).to_bytes(4, "big")
+        + b"iTXt"
+        + body
+        + zlib.crc32(b"iTXt" + body).to_bytes(4, "big")
+    )
+    iend = data.rindex(b"IEND") - 4
+    plain.write_bytes(data[:iend] + chunk + data[iend:])
+    return plain
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["plain", "compressed"])
+def test_an_xmp_packet_after_the_image_data_is_found_by_the_chunk_walk(tmp_path, compressed):
+    path = _xmp_after_idat(tmp_path, LIGHTROOM_XMP, compressed=compressed)
+    assert capture.read_capture(path, "image/png") == capture.CaptureResult(
+        LIGHTROOM_INSTANT, None, "xmp"
+    )
+
+
+def test_a_compressed_packet_inflating_past_the_cap_is_refused_not_truncated(tmp_path):
+    # Well-formed up to any cut inside the padding, so only the cap itself can refuse it.
+    padded = LIGHTROOM_XMP + b" " * (2 * capture.XMP_READ_CAP)
+    path = _xmp_after_idat(tmp_path, padded, compressed=True)
+    assert path.stat().st_size < capture.XMP_READ_CAP
+    assert capture.read_capture(path, "image/png") == capture.NOTHING
+
+
+def test_a_webp_xmp_packet_is_outside_the_whitelist(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "x.webp"
+    Image.new("RGB", (4, 3)).save(path, "WEBP", xmp=LIGHTROOM_XMP)
+    assert Image.open(path).info.get("xmp")  # the packet IS there to be read
+    assert capture.read_capture(path, "image/webp") == capture.NOTHING
+
+
+# r1: the DOCTYPE/ENTITY refusal must hold whatever encoding the packet's bytes are in. Every
+# container path a packet reaches the parser by — JPEG APP1, PNG iTXt plain and compressed.
+HOSTILE_ENTITY_XML = (
+    '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY d "2026-08-12T18:45:48Z">]>'
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF'
+    ' xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description'
+    ' xmlns:exif="http://ns.adobe.com/exif/1.0/" exif:DateTimeOriginal="&d;"/>'
+    "</rdf:RDF></x:xmpmeta>"
+)
+ENCODINGS = ["utf-16-le", "utf-16-be", "utf-16"]  # bare, bare, with a BOM
+
+
+def _packet_file(tmp_path: Path, packet: bytes, container: str) -> tuple[Path, str]:
+    if container == "jpeg-app1":
+        from PIL import Image
+
+        path = tmp_path / "x.jpg"
+        Image.new("RGB", (4, 3)).save(path, "JPEG", xmp=packet)
+        return path, "image/jpeg"
+    return _xmp_after_idat(tmp_path, packet, compressed=container == "itxt-zip"), "image/png"
+
+
+@pytest.mark.parametrize("container", ["jpeg-app1", "itxt-plain", "itxt-zip"])
+@pytest.mark.parametrize("encoding", ENCODINGS)
+def test_an_entity_packet_in_any_encoding_is_refused(tmp_path, encoding, container):
+    from xml.etree import ElementTree
+
+    packet = HOSTILE_ENTITY_XML.encode(encoding)
+    # Positive control: a plain parser DOES read this packet and expands the entity into a date,
+    # so a NOTHING below is the refusal and not an unreadable input.
+    root = ElementTree.fromstring(packet)
+    desc = next(root.iter("{http://www.w3.org/1999/02/22-rdf-syntax-ns#}Description"))
+    assert desc.get("{http://ns.adobe.com/exif/1.0/}DateTimeOriginal") == "2026-08-12T18:45:48Z"
+
+    path, mime = _packet_file(tmp_path, packet, container)
+    assert capture.read_capture(path, mime) == capture.NOTHING
+
+
+@pytest.mark.parametrize("container", ["jpeg-app1", "itxt-plain", "itxt-zip"])
+def test_a_utf8_packet_with_a_bom_still_dates_on_every_path(tmp_path, container):
+    path, mime = _packet_file(tmp_path, b"\xef\xbb\xbf" + LIGHTROOM_XMP, container)
+    assert capture.read_capture(path, mime) == capture.CaptureResult(LIGHTROOM_INSTANT, None, "xmp")
+
+
+def test_a_packet_declaring_another_encoding_is_still_read_as_utf8(tmp_path):
+    # A packet DECLARING another encoding is still read (as UTF-8): the override refuses nothing.
+    packet = LIGHTROOM_XMP.replace(
+        b'<?xpacket begin="\xef\xbb\xbf"', b'<?xml version="1.0" encoding="ISO-8859-1"?><?xpacket'
+    )
+    path, mime = _packet_file(tmp_path, packet, "itxt-plain")
+    assert capture.read_capture(path, mime) == capture.CaptureResult(LIGHTROOM_INSTANT, None, "xmp")
+
+
+@pytest.mark.parametrize("container", ["jpeg-app1", "itxt-plain", "itxt-zip"])
+@pytest.mark.parametrize("encoding", ["utf-32", "utf-32-le", "utf-32-be"])
+def test_a_utf32_entity_packet_is_refused(tmp_path, encoding, container):
+    # expat cannot read UTF-32 today, so no positive control is possible; the refusal is pinned
+    # anyway, because it must not rest on which encodings a parser happens to support.
+    path, mime = _packet_file(tmp_path, HOSTILE_ENTITY_XML.encode(encoding), container)
+    assert capture.read_capture(path, mime) == capture.NOTHING

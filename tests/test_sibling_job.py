@@ -11,7 +11,7 @@ import hashlib
 import io
 import secrets
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from anyio import to_thread
@@ -29,6 +29,7 @@ from structlog.testing import capture_logs
 from tests.conftest import SYNC_URL
 
 SIBLING_DATE = datetime(2023, 7, 14, 9, 30, 15, tzinfo=UTC)
+UPLOADED_AT = SIBLING_DATE + timedelta(days=2)
 EXIF_DATE = datetime(2021, 2, 3, 4, 5, 6, tzinfo=UTC)
 SIBLING_LAT, SIBLING_LON = 46.123456, 7.654321
 
@@ -87,14 +88,30 @@ def _seed(
     storage_path: str = "/nonexistent",
     sha256: str | None = None,
     job_state: str = "processing",
+    created_at: datetime = UPLOADED_AT,
+    captured_at: datetime | None = None,
+    memo_created_at: datetime | None = None,
 ) -> tuple[int, int]:
+    # The upload instant defaults to two days after SIBLING_DATE so every candidate below is
+    # PLAUSIBLE (MEMNG-843) unless a test moves one of the time anchors on purpose.
+    memo_id = None
+    if memo_created_at is not None:
+        memo_id = _sql(
+            "INSERT INTO memos (uid, owner_id, content, visibility, pinned, created_at,"
+            " updated_at) VALUES (:u, :o, 'm', CAST('PUBLIC' AS visibility), false, :t, :t)"
+            " RETURNING id",
+            u=secrets.token_urlsafe(10),
+            o=owner,
+            t=memo_created_at,
+        )[0][0]
     aid = _sql(
-        "INSERT INTO attachments (uid, owner_id, filename, mime, size, status, storage_path,"
-        " sha256, capture_instant, capture_civil, capture_source, latitude, longitude,"
-        " location_source) VALUES (:u, :o, :f, :m, 1, 'ready', :sp, :sha, :ci, :cc, :cs, :la,"
-        " :lo, :ls) RETURNING id",
+        "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status,"
+        " storage_path, sha256, capture_instant, capture_civil, capture_source, latitude,"
+        " longitude, location_source, created_at, captured_at) VALUES (:u, :o, :mid, :f, :m, 1,"
+        " 'ready', :sp, :sha, :ci, :cc, :cs, :la, :lo, :ls, :ca, :cap) RETURNING id",
         u=secrets.token_urlsafe(10),
         o=owner,
+        mid=memo_id,
         f=filename,
         m=mime,
         sp=storage_path,
@@ -105,6 +122,8 @@ def _seed(
         la=latitude,
         lo=longitude,
         ls=location_source,
+        ca=created_at,
+        cap=captured_at,
     )[0][0]
     jid = _sql(
         "INSERT INTO media_jobs (attachment_id, lane, kind, state, attempts, progress_pct)"
@@ -336,6 +355,125 @@ def test_no_candidates_records_none(enabled, monkeypatch):
 
     assert calls == [{"stems": ["_ARA8207"]}]
     assert _row(aid)["sibling_outcome"] == "none"
+
+
+# --- MEMNG-843: a stem is not an identity. iPhone `IMG_####` and Sony `_AR5####` counters repeat
+# across cameras and years, so a candidate whose capture time the attachment's own timeline rules
+# out is not this file's RAW. The shapes below are the production rows that borrowed wrongly.
+MAY_POST = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+AUG_EXPORT = datetime(2026, 8, 12, 20, 30, 6, tzinfo=UTC)
+AUG_POST = datetime(2026, 8, 16, 8, 0, tzinfo=UTC)
+
+
+def _assert_nothing_borrowed(row: dict) -> None:
+    assert row["sibling_outcome"] == "none"
+    assert row["capture_instant"] is None and row["capture_source"] is None
+    assert row["latitude"] is None and row["location_source"] == "none"
+
+
+def test_an_iphone_counter_matching_a_frame_years_older_than_the_memo_borrows_nothing(
+    enabled, monkeypatch
+):
+    # Rows 243/244/251: memo of 2026-05-12, IMG_9052 matched a 2011 frame.
+    allowed, _ = enabled
+    aid, jid = _seed(
+        allowed,
+        filename="IMG_9052.png",
+        created_at=MAY_POST,
+        captured_at=MAY_POST - timedelta(minutes=10),
+        memo_created_at=MAY_POST,
+    )
+    _spy(monkeypatch, [[_cand(datetime_original=datetime(2011, 2, 28, 12, 0, tzinfo=UTC))]])
+
+    asyncio.run(_process(jid))
+
+    _assert_nothing_borrowed(_row(aid))
+
+
+def test_a_raw_captured_after_the_export_existed_borrows_nothing(enabled, monkeypatch):
+    # Row 1280: the export's own file time is 2026-08-12 20:30:06 UTC; the candidate was shot
+    # three days later, which no RAW of this export can have been. Inside any window around the
+    # memo, so only the ceiling refuses it.
+    allowed, _ = enabled
+    aid, jid = _seed(
+        allowed,
+        filename="_AR59735.png",
+        created_at=AUG_POST,
+        captured_at=AUG_EXPORT,
+        memo_created_at=AUG_POST,
+    )
+    _spy(monkeypatch, [[_cand(datetime_original=datetime(2026, 8, 15, 17, 0, 12, tzinfo=UTC))]])
+
+    asyncio.run(_process(jid))
+
+    _assert_nothing_borrowed(_row(aid))
+
+
+def test_a_raw_months_before_the_memo_borrows_nothing(enabled, monkeypatch):
+    # Row 1257: `_AR59974` of a 2026-08-12 shoot matched another shoot's 2026-04-05 frame.
+    allowed, _ = enabled
+    aid, jid = _seed(
+        allowed,
+        filename="_AR59974.png",
+        created_at=AUG_POST,
+        captured_at=AUG_EXPORT,
+        memo_created_at=AUG_POST,
+    )
+    _spy(monkeypatch, [[_cand(datetime_original=datetime(2026, 4, 5, 11, 0, tzinfo=UTC))]])
+
+    asyncio.run(_process(jid))
+
+    _assert_nothing_borrowed(_row(aid))
+
+
+def test_a_refused_pick_leaves_the_one_plausible_candidate_to_win(enabled, monkeypatch):
+    allowed, _ = enabled
+    aid, jid = _seed(allowed, filename="IMG_9052.png", memo_created_at=UPLOADED_AT)
+    old_pick = _cand(image_id=1, is_pick=True, datetime_original=datetime(2011, 2, 28, tzinfo=UTC))
+    right = _cand(image_id=2, is_pick=False)
+    _spy(monkeypatch, [[old_pick, right]])
+
+    asyncio.run(_process(jid))
+
+    row = _row(aid)
+    assert row["sibling_outcome"] == "unique"
+    assert row["capture_instant"] == SIBLING_DATE
+
+
+def test_a_variant_whose_candidates_are_all_refused_falls_through_to_the_next(enabled, monkeypatch):
+    allowed, _ = enabled
+    aid, jid = _seed(allowed, filename="_AR5123-Edit - web.png", memo_created_at=UPLOADED_AT)
+    stale = _cand(image_id=1, datetime_original=datetime(2016, 7, 2, tzinfo=UTC))
+    calls = _spy(monkeypatch, [[stale], [_cand(image_id=2)]])
+
+    asyncio.run(_process(jid))
+
+    assert calls == [{"stems": ["_AR5123-Edit", "_AR5123"]}]
+    row = _row(aid)
+    assert row["sibling_outcome"] == "unique"
+    assert row["capture_instant"] == SIBLING_DATE
+
+
+def test_an_old_photo_posted_on_a_backdated_memo_still_borrows(enabled, monkeypatch):
+    # The window is anchored on the MEMO, not on the upload: a 2016 RAW exported and posted in 2026
+    # onto a memo dated 2016 is exactly what the memo says it is.
+    allowed, _ = enabled
+    old = datetime(2016, 7, 2, 15, 0, tzinfo=UTC)
+    aid, jid = _seed(
+        allowed,
+        filename="_AR51234.png",
+        created_at=MAY_POST,
+        captured_at=MAY_POST,
+        memo_created_at=old + timedelta(days=1),
+    )
+    _spy(monkeypatch, [[_cand(datetime_original=old)]])
+
+    asyncio.run(_process(jid))
+
+    row = _row(aid)
+    assert row["sibling_outcome"] == "unique"
+    assert row["capture_instant"] == old
+    assert row["capture_source"] == "sibling"
 
 
 def test_an_owner_outside_the_fence_makes_no_request_and_gets_none(enabled, monkeypatch):

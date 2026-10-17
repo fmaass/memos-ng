@@ -190,6 +190,21 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.3.3
+
+- The sibling lookup no longer takes a file name's counter for an identity. Phone and camera
+  counters repeat across bodies and years, so a RAW whose stem matched could be another frame
+  entirely. A candidate is now refused when it was shot more than a day after the export it would
+  date already existed, or more than 90 days before the memo the photo was posted on; refused
+  candidates neither win nor make the election ambiguous, and when none are left nothing is
+  borrowed. A memo dated back to an old shoot moves that window with it.
+- PNG and JPEG files whose EXIF carries no date are now dated from the `DateTimeOriginal` in
+  their XMP packet, as Lightroom's PNG exports write it, with `capture_source` `xmp`. EXIF still
+  wins when it has a date, and such a file is never handed a borrowed date.
+- `backfill_sibling_metadata --audit` is a read-only report: it re-judges every date already
+  borrowed under the new rule, lists the rows it would have refused, and lists the borrowed rows
+  whose own file now dates them. It writes and enqueues nothing and refuses `--execute`.
+
 ### v2.3.2
 
 - Reading memo data now always takes a credential: an anonymous or bad-token request to the compat
