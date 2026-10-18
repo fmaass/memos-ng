@@ -36,7 +36,7 @@ from app.models import (
     User,
     Visibility,
 )
-from app.services import asset_urls, poster, printready, reclaim, storage, variants
+from app.services import asset_urls, camera, poster, printready, reclaim, storage, variants
 from app.services import attachment_tags as tag_svc
 from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
@@ -196,6 +196,39 @@ def has_print(att: Attachment) -> bool:
     return att.print_path is not None or bool(att.renditions)
 
 
+# MEMNG-865. Every value was validated by the reader (app/services/camera.py) before it was stored.
+class CameraOut(BaseModel):
+    """The camera that took the picture, as the original's own EXIF recorded it. A field the file
+    did not carry, or carried in a form that is not a usable value, is null."""
+
+    make: str | None
+    model: str | None
+    lensModel: str | None
+    fNumber: float | None
+    exposureTimeS: float | None
+    focalLengthMm: float | None
+    exposureBiasEv: float | None
+    iso: int | None
+
+
+def camera_out(att: Attachment) -> CameraOut | None:
+    """The detail's `camera`, served ONLY when the ledger says the read found one: a row the reader
+    never visited, or settled as 'none' / 'unreadable' / 'not-image', has no camera to show,
+    whatever its columns hold."""
+    if att.camera_source != camera.SOURCE_EXIF:
+        return None
+    return CameraOut(
+        make=att.camera_make,
+        model=att.camera_model,
+        lensModel=att.lens_model,
+        fNumber=att.f_number,
+        exposureTimeS=att.exposure_time_s,
+        focalLengthMm=att.focal_length_mm,
+        exposureBiasEv=att.exposure_bias_ev,
+        iso=att.iso,
+    )
+
+
 class AttachmentMeta(BaseModel):
     uid: str
     mime: str
@@ -256,6 +289,8 @@ class AttachmentMeta(BaseModel):
     # Who uploaded THIS picture: its own owner's display name, else their subject; null when the
     # row has no owner. Never the memo's owner, never the requester, never an email.
     addedBy: str | None
+    # MEMNG-865: the camera EXIF, null unless `camera_source == 'exif'` (see `camera_out`).
+    camera: CameraOut | None
 
 
 class AttachmentListItem(BaseModel):
@@ -662,6 +697,7 @@ async def attachment_meta(
         longitude=att.longitude,
         locationSource=att.location_source,
         addedBy=added_by,
+        camera=camera_out(att),
     )
 
 

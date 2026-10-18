@@ -1185,6 +1185,7 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "longitude",
             "locationSource",
             "addedBy",
+            "camera",  # MEMNG-865: additive, the camera EXIF, null unless camera_source == 'exif'
         }
         # and a PAT caller is served the identical field set, not a reduced projection
         pat = client.post("/api/pats", json={"name": "slideshow-shape"}).json()["token"]

@@ -1566,6 +1566,29 @@ export interface components {
             addedBy: string | null;
             /** Blurhash */
             blurhash: string | null;
+            /**
+             * CameraOut
+             * @description The camera that took the picture, as the original's own EXIF recorded it. A field the file
+             *     did not carry, or carried in a form that is not a usable value, is null.
+             */
+            camera: {
+                /** Exposurebiasev */
+                exposureBiasEv: number | null;
+                /** Exposuretimes */
+                exposureTimeS: number | null;
+                /** Fnumber */
+                fNumber: number | null;
+                /** Focallengthmm */
+                focalLengthMm: number | null;
+                /** Iso */
+                iso: number | null;
+                /** Lensmodel */
+                lensModel: string | null;
+                /** Make */
+                make: string | null;
+                /** Model */
+                model: string | null;
+            } | null;
             /** Capture Civil */
             capture_civil: string | null;
             /**
@@ -1741,6 +1764,29 @@ export interface components {
         Body_upload_print_api_attachments__uid__print_post: {
             /** File */
             file: string;
+        };
+        /**
+         * CameraOut
+         * @description The camera that took the picture, as the original's own EXIF recorded it. A field the file
+         *     did not carry, or carried in a form that is not a usable value, is null.
+         */
+        CameraOut: {
+            /** Exposurebiasev */
+            exposureBiasEv: number | null;
+            /** Exposuretimes */
+            exposureTimeS: number | null;
+            /** Fnumber */
+            fNumber: number | null;
+            /** Focallengthmm */
+            focalLengthMm: number | null;
+            /** Iso */
+            iso: number | null;
+            /** Lensmodel */
+            lensModel: string | null;
+            /** Make */
+            make: string | null;
+            /** Model */
+            model: string | null;
         };
         /**
          * CaptureOut

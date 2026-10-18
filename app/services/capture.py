@@ -385,6 +385,21 @@ def heif_exif_from(f: BinaryIO) -> bytes | None:
     return _heif_exif_payload(raw)
 
 
+def heif_declares_exif(f: BinaryIO) -> bool:
+    """Whether a HEIF's item table names an Exif item describing the PRIMARY image.
+
+    `heif_exif_from` answering None and libheif handing over no Exif together still do not say
+    the file has none: both drop an Exif item whose block holds no payload. A reader that must
+    tell "no EXIF" from "EXIF it could not read" asks this — the same header walk, the same
+    `cdsc` rule, and False for anything it cannot walk.
+    """
+    meta = _heif_meta_from(f)
+    if meta is None:
+        return False
+    children = _heif_children(meta)
+    return children is not None and _heif_exif_item(meta, children) is not None
+
+
 def _heif_meta_from(f: BinaryIO) -> bytes | None:
     """The `meta` box's body, found by SEEKING over every other top-level box.
 

@@ -248,6 +248,82 @@
               "null"
             ]
           },
+          "camera": {
+            "description": "The camera that took the picture, as the original's own EXIF recorded it. A field the file\ndid not carry, or carried in a form that is not a usable value, is null.",
+            "properties": {
+              "exposureBiasEv": {
+                "title": "Exposurebiasev",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "exposureTimeS": {
+                "title": "Exposuretimes",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "fNumber": {
+                "title": "Fnumber",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "focalLengthMm": {
+                "title": "Focallengthmm",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "iso": {
+                "title": "Iso",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lensModel": {
+                "title": "Lensmodel",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "make": {
+                "title": "Make",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "model": {
+                "title": "Model",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "make",
+              "model",
+              "lensModel",
+              "fNumber",
+              "exposureTimeS",
+              "focalLengthMm",
+              "exposureBiasEv",
+              "iso"
+            ],
+            "title": "CameraOut",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "capture_civil": {
             "title": "Capture Civil",
             "type": [
@@ -440,7 +516,8 @@
           "latitude",
           "longitude",
           "locationSource",
-          "addedBy"
+          "addedBy",
+          "camera"
         ],
         "title": "AttachmentMeta",
         "type": "object"
@@ -746,6 +823,79 @@
           "file"
         ],
         "title": "Body_upload_print_api_attachments__uid__print_post",
+        "type": "object"
+      },
+      "CameraOut": {
+        "description": "The camera that took the picture, as the original's own EXIF recorded it. A field the file\ndid not carry, or carried in a form that is not a usable value, is null.",
+        "properties": {
+          "exposureBiasEv": {
+            "title": "Exposurebiasev",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "exposureTimeS": {
+            "title": "Exposuretimes",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fNumber": {
+            "title": "Fnumber",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "focalLengthMm": {
+            "title": "Focallengthmm",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "iso": {
+            "title": "Iso",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "lensModel": {
+            "title": "Lensmodel",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "make": {
+            "title": "Make",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "title": "Model",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "make",
+          "model",
+          "lensModel",
+          "fNumber",
+          "exposureTimeS",
+          "focalLengthMm",
+          "exposureBiasEv",
+          "iso"
+        ],
+        "title": "CameraOut",
         "type": "object"
       },
       "CaptureOut": {

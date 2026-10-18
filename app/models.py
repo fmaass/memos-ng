@@ -291,6 +291,20 @@ class Attachment(Base):
     # (`--include-ambiguous`). An img-manager that could not be asked is NOT an outcome — it stays
     # NULL and the job retries.
     sibling_outcome: Mapped[str | None] = mapped_column(String(16))
+    # The CAMERA the file says took it (MEMNG-865), read from its own EXIF at upload completion and
+    # by the one-off backfill (app/services/camera.py, which validates every value before it gets
+    # here). `camera_source` is the resume ledger: NULL = never visited, 'exif' = at least one field
+    # read, 'none' = read and nothing usable, 'unreadable' = the read failed (retryable),
+    # 'not-image' = classified by mime and never read. Served on the detail only when 'exif'.
+    camera_make: Mapped[str | None] = mapped_column(Text)
+    camera_model: Mapped[str | None] = mapped_column(Text)
+    lens_model: Mapped[str | None] = mapped_column(Text)
+    f_number: Mapped[float | None] = mapped_column(Double)
+    exposure_time_s: Mapped[float | None] = mapped_column(Double)
+    focal_length_mm: Mapped[float | None] = mapped_column(Double)
+    exposure_bias_ev: Mapped[float | None] = mapped_column(Double)
+    iso: Mapped[int | None] = mapped_column(Integer)
+    camera_source: Mapped[str | None] = mapped_column(String(16))
     # 0-based place in this memo's attachment order, written at finalize from the order the client
     # declared (`upload_uids`). NULL on every row that predates the column, and on an attachment
     # that belongs to no memo.

@@ -32,7 +32,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import asset_paths, capture, location, poster, storage
+from app.services import asset_paths, camera, capture, location, poster, storage
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -47,6 +47,9 @@ def _data_root() -> Path:
 # so the budget is generous by an order of magnitude and exists for the pathological file, not the
 # ordinary one. A timeout is a settled answer of "no date", never a stuck `pending`.
 CAPTURE_READ_TIMEOUT_S = 5.0
+# The camera read's own deadline, the same number in its own scope: one slow read never eats
+# another's budget (MEMNG-865).
+CAMERA_READ_TIMEOUT_S = CAPTURE_READ_TIMEOUT_S
 
 
 # Bounded read granularity for receiving a request body. Chosen well under the 5 MiB client chunk
@@ -946,6 +949,30 @@ async def _read_location(dest: Path, mime: str) -> tuple[float | None, float | N
     return found.latitude, found.longitude, found.source
 
 
+async def _read_camera(dest: Path, mime: str) -> tuple[camera.CameraInfo | None, str]:
+    """This attachment's camera EXIF, read from its FINAL path, and its `camera_source` value.
+
+    The `_read_location` shape, beside it: one header read in a worker thread under its own
+    deadline. A non-image is classified `'not-image'` without a read. A timeout or any exception
+    settles as `'unreadable'` (retried by `backfill_camera.py --retry-unreadable`) and never fails
+    the upload — a stored photo with no camera row beats a refused one. Every value the reader
+    returns is already validated for the database (app/services/camera.py).
+    """
+    if not camera.is_image(mime):
+        return None, camera.SOURCE_NOT_IMAGE
+    try:
+        with fail_after(CAMERA_READ_TIMEOUT_S):
+            found = await to_thread.run_sync(camera.read_camera, dest, mime, abandon_on_cancel=True)
+    except TimeoutError:
+        logger.warning("camera.read_timeout", mime=mime)
+        return None, camera.SOURCE_UNREADABLE
+    except Exception as exc:  # noqa: BLE001 — a metadata read must never fail an upload
+        logger.warning("camera.read_failed", mime=mime, error=type(exc).__name__)
+        return None, camera.SOURCE_UNREADABLE
+    source = camera.source_of(mime, found)
+    return (found if isinstance(found, camera.CameraInfo) else None), source
+
+
 def _wants_sibling_lookup(attachment: Attachment) -> bool:
     """Whether img-manager should be asked for this new attachment's missing date or location
     (MEMNG-796): the feature is on, the owner's library is the one img-manager indexes, it is an
@@ -1443,6 +1470,7 @@ async def finalize(
 
     is_video = mime.startswith("video/")
     latitude, longitude, location_source = await _read_location(dest, mime)
+    camera_found, camera_source = await _read_camera(dest, mime)
     attachment = Attachment(
         uid=secrets.token_urlsafe(16),
         owner_id=owner_id,
@@ -1461,6 +1489,8 @@ async def finalize(
         latitude=latitude,
         longitude=longitude,
         location_source=location_source,
+        **camera.columns(camera_found),
+        camera_source=camera_source,
         status=AttachmentStatus.pending if is_video else AttachmentStatus.processing,
         storage_path=str(dest),
         # width/height/duration are filled by the worker fast lane (T2.2 pyvips/ffprobe).
