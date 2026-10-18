@@ -190,6 +190,21 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.4.0
+
+- A picture can now carry its own tags, `favorites` for example, separate from the tags of the memo
+  it is on. `PUT` and `DELETE /api/attachments/{uid}/tags/{name}` set and clear one on the
+  caller's own picture, both idempotent; `GET /api/attachments/picture-tags` lists every picture
+  tag with the number of visible media carrying it, and `?pictureTag=` filters the attachment
+  list to media that itself carries that tag. A memo's tags never match a picture tag.
+- The attachment detail now returns the file name, the location with its source, and who added
+  the picture.
+- Uploads now read the camera EXIF of a picture: make, model, lens, aperture, exposure time, focal
+  length, exposure bias and ISO, returned as `camera` on the attachment detail. A one-off,
+  resumable `backfill_camera` script reads the same fields from pictures uploaded before; it is
+  a dry run unless given `--execute`.
+- Two migrations: picture tags, and the camera columns.
+
 ### v2.3.3
 
 - The sibling lookup no longer takes a file name's counter for an identity. Phone and camera
