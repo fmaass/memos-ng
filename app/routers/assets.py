@@ -242,6 +242,20 @@ class AttachmentMeta(BaseModel):
     # transcode is published.
     webReady: bool
     posterUrl: str
+    # The Info sheet's File and Where rows (MEMNG-864). A deliberate, scoped disclosure: this route
+    # answers only the viewers `_viewable` admits — the owner, or anyone who can see the memo, the
+    # same audience the map's markers reach through `visible_clause` — so the coordinate reaches no
+    # one who could not already find this picture on the map. The list and AttachmentRef ride on
+    # every page a viewer scrolls and stay coordinate-free (tests/test_location_privacy.py).
+    filename: str | None
+    latitude: float | None
+    longitude: float | None
+    # Where the reading came from, as stored: 'exif' / 'quicktime', or 'none' / 'unreadable' / null
+    # when there is no coordinate to show (app/models.py Attachment.location_source).
+    locationSource: str | None
+    # Who uploaded THIS picture: its own owner's display name, else their subject; null when the
+    # row has no owner. Never the memo's owner, never the requester, never an email.
+    addedBy: str | None
 
 
 class AttachmentListItem(BaseModel):
@@ -610,6 +624,15 @@ async def attachment_meta(
     # affordable here in a way it would not be on AttachmentRef, which rides on every item of every
     # feed page.
     has_poster = await poster.has_poster(att.uid) if att.mime.startswith("video/") else False
+    # One query for the uploader's name, only once `_viewable` has admitted the caller, and only
+    # the two columns the field is built from — the email column is never loaded.
+    added_by: str | None = None
+    if att.owner_id is not None:
+        owner = (
+            await db.execute(select(User.display_name, User.subject).where(User.id == att.owner_id))
+        ).one_or_none()
+        if owner is not None:
+            added_by = owner.display_name or owner.subject
     return AttachmentMeta(
         uid=att.uid,
         mime=att.mime,
@@ -634,6 +657,11 @@ async def attachment_meta(
         printUrl=f"{base}/print",
         **asset_urls.signed_tier_urls(att.uid, user.id, now=time.time()),
         webReady=att.uid in await web_ready_uids([att]),
+        filename=att.filename,
+        latitude=att.latitude,
+        longitude=att.longitude,
+        locationSource=att.location_source,
+        addedBy=added_by,
     )
 
 

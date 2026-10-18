@@ -234,6 +234,13 @@
       },
       "AttachmentMeta": {
         "properties": {
+          "addedBy": {
+            "title": "Addedby",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "blurhash": {
             "title": "Blurhash",
             "type": [
@@ -282,6 +289,13 @@
               "null"
             ]
           },
+          "filename": {
+            "title": "Filename",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "hasLegacyPrint": {
             "title": "Haslegacyprint",
             "type": "boolean"
@@ -298,6 +312,27 @@
             "title": "Height",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "latitude": {
+            "title": "Latitude",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "locationSource": {
+            "title": "Locationsource",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "longitude": {
+            "title": "Longitude",
+            "type": [
+              "number",
               "null"
             ]
           },
@@ -400,7 +435,12 @@
           "previewUrl",
           "webUrl",
           "webReady",
-          "posterUrl"
+          "posterUrl",
+          "filename",
+          "latitude",
+          "longitude",
+          "locationSource",
+          "addedBy"
         ],
         "title": "AttachmentMeta",
         "type": "object"

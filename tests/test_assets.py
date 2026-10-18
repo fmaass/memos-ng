@@ -477,6 +477,77 @@ def test_private_memo_media_stays_404_for_other_user(logged_in_client, monkeypat
         _rm("sharer2", mid)
 
 
+def _set_user(subject, display_name, email):
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text("UPDATE users SET display_name=:d, email=:e WHERE subject=:s"),
+            {"d": display_name, "e": email, "s": subject},
+        )
+    eng.dispose()
+
+
+def test_attachment_meta_added_by_is_the_attachment_owners_name(logged_in_client):
+    # MEMNG-864: `addedBy` names who uploaded THIS picture — its own owner, never the memo's owner
+    # and never the requester — by display name, else by subject. Email is never served.
+    client, _ = logged_in_client
+    _mk_user("adder")
+    _mk_user("adder-memo")
+    mid, aid = _seed_memo_with_attachment("ab-memo", "ab-att", "adder", "PUBLIC")
+    try:
+        _set_user("adder-memo", "Memo Owner", "memo@example.test")
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:  # the memo is someone else's: only the picture is adder's
+            c.execute(
+                text(
+                    "UPDATE memos SET owner_id=(SELECT id FROM users WHERE subject=:s) WHERE id=:m"
+                ),
+                {"s": "adder-memo", "m": mid},
+            )
+        eng.dispose()
+
+        body = client.get("/api/attachments/ab-att").json()
+        assert body["addedBy"] == "adder"  # no display name → the subject
+        assert body["filename"] == "x.jpg"
+        assert body["mine"] is False
+
+        _set_user("adder", "", None)  # an empty display name is no name: still the subject
+        assert client.get("/api/attachments/ab-att").json()["addedBy"] == "adder"
+
+        _set_user("adder", "Ada Adder", "ada@example.test")
+        r = client.get("/api/attachments/ab-att")
+        assert r.json()["addedBy"] == "Ada Adder"  # the display name wins once it is set
+        assert "example.test" not in r.text  # neither owner's email, anywhere in the body
+    finally:
+        _cleanup(aid)
+        _rm_memos(mid)
+        _rm("adder")
+        _rm("adder-memo")
+
+
+def test_attachment_meta_added_by_is_null_for_an_ownerless_row(logged_in_client):
+    # An attachment whose owner is gone (owner_id NULL) but that hangs on a memo the caller can
+    # see is still served — with no uploader to name, not an error and not the memo's owner.
+    client, _ = logged_in_client
+    _mk_user("orphaner")
+    mid, aid = _seed_memo_with_attachment("ol-memo", "ol-att", "orphaner", "PUBLIC")
+    try:
+        _set_user("orphaner", "Memo Keeper", None)
+        eng = create_engine(SYNC_URL)
+        with eng.begin() as c:
+            c.execute(text("UPDATE attachments SET owner_id=NULL WHERE id=:a"), {"a": aid})
+        eng.dispose()
+        r = client.get("/api/attachments/ol-att")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "addedBy" in body and body["addedBy"] is None
+        assert body["mine"] is False
+        assert body["filename"] == "x.jpg"
+    finally:
+        _cleanup(aid)
+        _rm("orphaner", mid)
+
+
 def test_list_attachments_includes_shared_excludes_private(logged_in_client):
     # The library shows the household-viewable set: own + media on non-PRIVATE memos; another
     # user's PRIVATE-memo media and orphans stay out.
@@ -535,6 +606,11 @@ def test_upload_print_master_then_serve_and_flag(logged_in_client, monkeypatch, 
             files={"file": ("p.tif", b"PRINTMASTERBYTES", "image/tiff")},
         )
         assert r.status_code == 200 and r.json()["hasPrint"] is True
+        # The print route answers with the same AttachmentMeta as the detail (MEMNG-864 fields
+        # included), built by the one handler — not a projection that drops them.
+        meta = r.json()
+        assert (meta["filename"], meta["addedBy"]) == ("x.jpg", "T")
+        assert (meta["latitude"], meta["longitude"], meta["locationSource"]) == (None, None, None)
         served = client.get("/api/attachments/pr-img/print")
         assert served.status_code == 200 and served.content == b"PRINTMASTERBYTES"
     finally:
@@ -1102,6 +1178,13 @@ def test_attachment_meta_response_fields_unchanged(logged_in_client):
             "webUrl",
             "webReady",  # added deliberately: whether webUrl has a file behind it
             "posterUrl",
+            # MEMNG-864: additive, the Info sheet's File and Where rows — the detail alone, never
+            # the list or AttachmentRef
+            "filename",
+            "latitude",
+            "longitude",
+            "locationSource",
+            "addedBy",
         }
         # and a PAT caller is served the identical field set, not a reduced projection
         pat = client.post("/api/pats", json={"name": "slideshow-shape"}).json()["token"]

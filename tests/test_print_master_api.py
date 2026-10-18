@@ -117,6 +117,8 @@ def test_attach_writes_a_rendition_row_and_serves_it(logged_in_client, monkeypat
         assert meta["hasLegacyPrint"] is False  # the legacy print_path column stays untouched
         assert [x["variant_key"] for x in meta["renditions"]] == ["print"]
         assert meta["renditions"][0]["size"] == len(master)
+        # same AttachmentMeta as the detail route, MEMNG-864 fields included
+        assert (meta["filename"], meta["addedBy"]) == ("_AR9 - screen.png", "T")
 
         # The row really exists (not just a response shape) and names a file that holds the bytes.
         rows = _rendition_rows(att["uid"])

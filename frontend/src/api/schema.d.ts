@@ -1562,6 +1562,8 @@ export interface components {
         };
         /** AttachmentMeta */
         AttachmentMeta: {
+            /** Addedby */
+            addedBy: string | null;
             /** Blurhash */
             blurhash: string | null;
             /** Capture Civil */
@@ -1582,6 +1584,8 @@ export interface components {
             downloadUrl: string;
             /** Duration */
             duration: number | null;
+            /** Filename */
+            filename: string | null;
             /** Haslegacyprint */
             hasLegacyPrint: boolean;
             /** Hasposter */
@@ -1590,6 +1594,12 @@ export interface components {
             hasPrint: boolean;
             /** Height */
             height: number | null;
+            /** Latitude */
+            latitude: number | null;
+            /** Locationsource */
+            locationSource: string | null;
+            /** Longitude */
+            longitude: number | null;
             /** Mime */
             mime: string;
             /** Mine */

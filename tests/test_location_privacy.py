@@ -289,17 +289,116 @@ def test_no_other_api_body_and_no_log_line_carries_a_coordinate(
             s in json.dumps([{"event": "probe", "latitude": 12.5}]) for s in LEAKED_SPELLINGS
         )
 
-        for body in (
-            client.get("/api/memos").text,
-            client.get(f"/api/attachments/{attachment_uid}").text,
-        ):
+        # The single-attachment detail is deliberately NOT in this loop: it carries the location
+        # (MEMNG-864, the Info sheet's Where row) to exactly the viewers `_viewable` admits, which
+        # the positive test below pins. The feed and the library list ride on every page a viewer
+        # scrolls and stay coordinate-free.
+        listed = client.get("/api/attachments")
+        assert listed.status_code == 200, listed.text
+        assert attachment_uid in listed.text  # the located row IS in the list this loop reads
+        for body in (client.get("/api/memos").text, listed.text):
+            assert attachment_uid in body
             assert "latitude" not in body
             assert "longitude" not in body
             assert "location_source" not in body
+            assert "locationSource" not in body
             for spelling in LEAKED_SPELLINGS:
                 assert spelling not in body
     finally:
         _cleanup()
+
+
+def _seed_located_memo(owner_subject: str, visibility: str, memo_uid: str, att_uid: str) -> None:
+    """Another user's memo carrying one located attachment, written straight to the row: the
+    viewer cases need an owner other than the logged-in client, which the upload route cannot
+    produce."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": owner_subject})
+        oid = c.execute(
+            text("INSERT INTO users (subject, role) VALUES (:s,'user') RETURNING id"),
+            {"s": owner_subject},
+        ).scalar_one()
+        mid = c.execute(
+            text(
+                "INSERT INTO memos (uid, owner_id, content, visibility, pinned, created_at, "
+                "updated_at) VALUES (:u,:o,'m',CAST(:v AS visibility),false,now(),now()) "
+                "RETURNING id"
+            ),
+            {"u": memo_uid, "o": oid, "v": visibility},
+        ).scalar_one()
+        c.execute(
+            text(
+                "INSERT INTO attachments (uid, owner_id, memo_id, filename, mime, size, status, "
+                "storage_path, latitude, longitude, location_source) VALUES (:u,:o,:m,"
+                "'harbour.jpg','image/jpeg',1,CAST('ready' AS attachment_status),'/x',"
+                "-33.5,151.25,'exif')"
+            ),
+            {"u": att_uid, "o": oid, "m": mid},
+        )
+    eng.dispose()
+
+
+def _drop_user(subject: str) -> None:
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text("DELETE FROM memos WHERE owner_id IN (SELECT id FROM users WHERE subject=:s)"),
+            {"s": subject},
+        )
+        c.execute(text("DELETE FROM users WHERE subject=:s"), {"s": subject})
+    eng.dispose()
+
+
+def test_the_attachment_detail_carries_the_location_to_its_viewers_only(
+    logged_in_client, monkeypatch, tmp_path
+):
+    # The deliberate, scoped disclosure (MEMNG-864): GET /api/attachments/{uid} serves the stored
+    # coordinate to the owner and to a household viewer of a non-private memo — the audience the
+    # map's `visible_clause` already reaches — and stays 404 for everyone else.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        # Owner: read from the file through the real upload + create routes.
+        payload = (BINARIES / "jpeg-north-east.jpg").read_bytes()
+        upload_uid = _upload(client, "geo.jpg", "image/jpeg", payload)
+        created = client.post(
+            "/api/memos",
+            json={"visibility": "PRIVATE", "content": "by the sea", "upload_uids": [upload_uid]},
+        )
+        assert created.status_code == 201, created.text
+        own_uid = created.json()["attachments"][0]["uid"]
+        own = client.get(f"/api/attachments/{own_uid}")
+        assert own.status_code == 200, own.text
+        body = own.json()
+        assert (body["latitude"], body["longitude"], body["locationSource"]) == (
+            12.5,
+            45.25,
+            "exif",
+        )
+        assert body["filename"] == "geo.jpg"
+
+        # Household viewer of another user's PROTECTED memo.
+        _seed_located_memo("loc-sharer", "PROTECTED", "loc-shared-memo", "loc-shared-att")
+        shared = client.get("/api/attachments/loc-shared-att")
+        assert shared.status_code == 200, shared.text
+        body = shared.json()
+        assert (body["latitude"], body["longitude"], body["locationSource"]) == (
+            -33.5,
+            151.25,
+            "exif",
+        )
+        assert body["filename"] == "harbour.jpg"
+
+        # Non-viewer: another user's PRIVATE memo — the same 404 as an unknown uid, no body.
+        _seed_located_memo("loc-hider", "PRIVATE", "loc-hidden-memo", "loc-hidden-att")
+        hidden = client.get("/api/attachments/loc-hidden-att")
+        assert hidden.status_code == 404, hidden.text
+        assert "151.25" not in hidden.text and "latitude" not in hidden.text
+    finally:
+        _cleanup()
+        _drop_user("loc-sharer")
+        _drop_user("loc-hider")
 
 
 def test_the_uploads_table_gained_no_location_column(db_engine):
