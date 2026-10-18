@@ -19,6 +19,7 @@ export function marker(over: Partial<MapMarker> = {}): MapMarker {
     hasPrint: false,
     hasLegacyPrint: false,
     renditions: [],
+    tags: [],
     capture_civil: null,
     capture_instant: null,
     capture_source: null,

@@ -157,6 +157,9 @@ class AttachmentRef(BaseModel):
     hasPrint: bool  # has a print master of any kind (legacy print_path OR a rendition)
     hasLegacyPrint: bool  # has the legacy single print_path → the /print download button applies
     renditions: list[RenditionItem]
+    tags: list[str] = Field(
+        default=[], description="The picture's own tags, sorted by name; never its memo's tags."
+    )
     # This attachment's place in the memo's saved order, 0-based; null on a row written before the
     # order was persisted (MEMNG-262). The list is ALREADY sorted by it — the field is carried so a
     # client can tell a saved order from an incidental one.
@@ -547,6 +550,7 @@ def _att_ref(att: Attachment, user_id: int, web_ready: AbstractSet[str]) -> Atta
         hasPrint=has_print(att),
         hasLegacyPrint=att.print_path is not None,
         renditions=rendition_items(att),
+        tags=list(att.picture_tag_names),
         position=att.position,
         **signed_tier_urls(att.uid, user_id, now=now),
         webReady=att.uid in web_ready,

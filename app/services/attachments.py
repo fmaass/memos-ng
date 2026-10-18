@@ -23,6 +23,7 @@ from app.models import (
     Tag,
     User,
     Visibility,
+    attachment_tags,
     memo_tags,
 )
 from app.services.memos import visible_clause
@@ -73,6 +74,20 @@ def tagged_clause(tag_name: str) -> ColumnElement[bool]:
     )
 
 
+def picture_tagged_clause(tag_name: str) -> ColumnElement[bool]:
+    """The attachment ITSELF carries the picture tag named exactly `tag_name` (MEMNG-863) — never
+    its memo's tags, which `tagged_clause` reads, so the two namespaces never admit each other's
+    rows. An EXISTS, so a picture is one row however it matches; correlated to `attachments`
+    alone, so an orphan matches like any other picture. ADDED under `library_visible`."""
+    return exists().where(
+        and_(
+            attachment_tags.c.attachment_id == Attachment.id,
+            attachment_tags.c.tag_id == Tag.id,
+            Tag.name == tag_name,
+        )
+    )
+
+
 def memo_tag_names_expr() -> ColumnElement[Sequence[str]]:
     """The tag names of the outer-joined Memo, sorted by name — the order `MemoOut.tags` uses.
     A correlated ARRAY(subquery) rides on the row the library SELECT already produces, so a page
@@ -94,6 +109,7 @@ def library_filters(
     *,
     mine: bool = False,
     visibility: Visibility | None = None,
+    picture_tag: str | None = None,
 ) -> list[ColumnElement[bool]]:
     """`library_visible` and whatever NARROWS it — never a substitute for it, so no combination
     of these reaches a row the caller could not already see (MEMNG-785).
@@ -112,6 +128,8 @@ def library_filters(
         conds.append(by_kind)
     if tag is not None:
         conds.append(tagged_clause(tag))
+    if picture_tag is not None:
+        conds.append(picture_tagged_clause(picture_tag))
     return conds
 
 
@@ -269,6 +287,7 @@ async def library_buckets(
     *,
     mine: bool = False,
     visibility: Visibility | None = None,
+    picture_tag: str | None = None,
 ) -> list[tuple[str, int, str, str, list[str]]]:
     """(key, count, cover uid, cover mime, tags) per calendar bucket of `tz`, newest first. The
     cover is the bucket's newest row by (taken_at, id) among the rows the filters ADMITTED — it is
@@ -296,7 +315,11 @@ async def library_buckets(
         )
         .select_from(Attachment)
         .outerjoin(Memo, Memo.id == Attachment.memo_id)
-        .where(*library_filters(user, kind, tag, mine=mine, visibility=visibility))
+        .where(
+            *library_filters(
+                user, kind, tag, mine=mine, visibility=visibility, picture_tag=picture_tag
+            )
+        )
         .cte("library_rows")
     )
     ranked = select(
@@ -357,6 +380,34 @@ async def library_tag_counts(
         .join(Memo, Memo.id == Attachment.memo_id)
         .join(memo_tags, memo_tags.c.memo_id == Memo.id)
         .join(Tag, Tag.id == memo_tags.c.tag_id)
+        .where(*library_filters(user, kind, None, mine=mine, visibility=visibility))
+        .group_by(Tag.name)
+        .order_by(count.desc(), Tag.name.asc())
+    )
+    return [(name, n) for name, n in (await db.execute(stmt)).all()]
+
+
+async def library_picture_tag_counts(
+    db: AsyncSession,
+    user: User,
+    kind: str | None,
+    *,
+    mine: bool = False,
+    visibility: Visibility | None = None,
+) -> list[tuple[str, int]]:
+    """Each PICTURE tag (MEMNG-863) with the number of library items carrying it that `user` may
+    see — memo tags never count here. The population is the listing's own: `attachments` OUTER
+    joined to `memos` under the same `library_filters`, so an owner's tagged orphan counts and no
+    readiness condition applies, and a tag's count is the length of `?pictureTag=` under the same
+    `type`, `mine` and `visibility`. The pair is the primary key, so a picture counts once per tag.
+    A tag on no visible picture is absent. Most items first, then by name."""
+    count = func.count(Attachment.id)
+    stmt = (
+        select(Tag.name, count)
+        .select_from(Attachment)
+        .outerjoin(Memo, Memo.id == Attachment.memo_id)
+        .join(attachment_tags, attachment_tags.c.attachment_id == Attachment.id)
+        .join(Tag, Tag.id == attachment_tags.c.tag_id)
         .where(*library_filters(user, kind, None, mine=mine, visibility=visibility))
         .group_by(Tag.name)
         .order_by(count.desc(), Tag.name.asc())

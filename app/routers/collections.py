@@ -7,20 +7,19 @@ may see that attachment, and an attachment the caller may not see is referenced 
 exclusion) exactly as if it did not exist — `_viewable`'s 404, one answer for both.
 """
 
-import re
 from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import ColumnElement, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
-from app.api_types import Rfc3339Datetime
+from app.api_types import Rfc3339Datetime, TagName
 from app.database import get_session
 from app.models import Attachment, Collection, Memo, User, Visibility
 from app.routers.assets import (
@@ -65,26 +64,7 @@ _NOT_FOUND: dict[int | str, dict[str, Any]] = {
 }
 
 
-def _tag_name(value: str) -> str:
-    if re.fullmatch(r"\w+", value) is None:
-        raise ValueError("a tag is a name as a memo's #tag carries it, without the #")
-    return value
-
-
-# A tag is the NAME a memo's `#tag` stores — letters, digits and `_`, case kept, no `#` — and is
-# matched exactly. It is refused rather than normalised: a stripped `#` or a lowered case would
-# make the stored record differ from what the client sent, and a value no memo can carry would
-# silently match nothing.
-CollectionTag = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=255,
-        description="A tag name exactly as memos carry it, without the hash sign: letters, "
-        "digits and underscores. Matched exactly, case included.",
-    ),
-    AfterValidator(_tag_name),
-]
+CollectionTag = TagName
 Title = Annotated[str, Field(min_length=1, max_length=255)]
 SpanBound = Annotated[
     AwareDatetime,

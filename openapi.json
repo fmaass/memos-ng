@@ -124,6 +124,15 @@
             "title": "Orphan",
             "type": "boolean"
           },
+          "pictureTags": {
+            "default": [],
+            "description": "The picture's own tags, sorted by name; never its memo's tags.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Picturetags",
+            "type": "array"
+          },
           "posterUrl": {
             "title": "Posterurl",
             "type": "string"
@@ -332,6 +341,15 @@
           },
           "status": {
             "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "tags": {
+            "default": [],
+            "description": "The picture's own tags, sorted by name; never its memo's tags.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
           },
           "thumbnailUrl": {
             "title": "Thumbnailurl",
@@ -585,6 +603,15 @@
           },
           "status": {
             "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "tags": {
+            "default": [],
+            "description": "The picture's own tags, sorted by name; never its memo's tags.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
           },
           "thumbnailUrl": {
             "title": "Thumbnailurl",
@@ -882,6 +909,15 @@
               "orphan": {
                 "title": "Orphan",
                 "type": "boolean"
+              },
+              "pictureTags": {
+                "default": [],
+                "description": "The picture's own tags, sorted by name; never its memo's tags.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Picturetags",
+                "type": "array"
               },
               "posterUrl": {
                 "title": "Posterurl",
@@ -2270,6 +2306,15 @@
           },
           "status": {
             "$ref": "#/components/schemas/AttachmentStatus"
+          },
+          "tags": {
+            "default": [],
+            "description": "The picture's own tags, sorted by name; never its memo's tags.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
           },
           "taken_at": {
             "format": "date-time",
@@ -4148,7 +4193,7 @@
     },
     "/api/attachments": {
       "get": {
-        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\nEach item names the tags of its memo, by name; an orphan's are empty.\n?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps\nonly media on a memo of that visibility, so no orphan. Both only narrow what the caller may\nalready see. Each item names its memo's visibility, null for an orphan.\n?bucket=<key> opens a taken-order walk at a day, month or year \u2014 a `key` exactly as the\nbuckets of `tz` (an IANA zone, default Europe/Zurich) name it \u2014 so the first item is that\nbucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the\nnext item beyond it. A key the buckets could not name, an unknown zone or a bucket under an\nupload order is a 422.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
+        "description": "The household media library the user can see, newest first: their own attachments\n(including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video\nfilters by mime prefix; `orphan` flags media not attached to any memo, and `memoUid` names the\nmemo it does hang on. Another user's PRIVATE or orphan media is excluded \u2014 the same visibility\nrule the memo surfaces apply. ?order=asc walks the same library oldest-first.\n?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>\nkeeps only media whose memo carries exactly that tag \u2014 an unknown tag is an empty page.\nEach item names the tags of its memo, by name; an orphan's are empty.\n?pictureTag=<name> keeps only media that itself carries exactly that picture tag, orphans\nincluded; a memo's tags never match it. Each item names its own picture tags too.\n?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps\nonly media on a memo of that visibility, so no orphan. Both only narrow what the caller may\nalready see. Each item names its memo's visibility, null for an orphan.\n?bucket=<key> opens a taken-order walk at a day, month or year \u2014 a `key` exactly as the\nbuckets of `tz` (an IANA zone, default Europe/Zurich) name it \u2014 so the first item is that\nbucket's newest under taken_desc, its oldest under taken_asc; an empty bucket opens at the\nnext item beyond it. A key the buckets could not name, an unknown zone or a bucket under an\nupload order is a 422.\n\nPaged by keyset, like the memo feed: when more rows follow, the response carries an\n`X-Next-Cursor` header; resend it as `?cursor=` \u2014 with the same filters, which the cursor does\nnot carry \u2014 for the page after. The body is a plain array on every page, cursor or not.",
         "operationId": "list_attachments_api_attachments_get",
         "parameters": [
           {
@@ -4252,6 +4297,18 @@
             "schema": {
               "$ref": "#/components/schemas/Visibility"
             }
+          },
+          {
+            "in": "query",
+            "name": "pictureTag",
+            "required": false,
+            "schema": {
+              "title": "Picturetag",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -4307,7 +4364,7 @@
     },
     "/api/attachments/buckets": {
       "get": {
-        "description": "The library the list shows \u2014 same visibility, same `type`, `tag`, `mine` and `visibility`\nfilters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail \u2014\nfor a video its poster frame, the one picture a video has \u2014 and the tags of the memos its\nitems hang on, the tag on the most items first, then by name.",
+        "description": "The library the list shows \u2014 same visibility, same `type`, `tag`, `mine`, `visibility`\nand `pictureTag` filters \u2014 counted per\ncalendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest\nfirst. Each bucket names its newest item as the cover, with that item's signed thumbnail \u2014\nfor a video its poster frame, the one picture a video has \u2014 and the tags of the memos its\nitems hang on, the tag on the most items first, then by name.",
         "operationId": "attachment_buckets_api_attachments_buckets_get",
         "parameters": [
           {
@@ -4375,6 +4432,18 @@
             "schema": {
               "$ref": "#/components/schemas/Visibility"
             }
+          },
+          {
+            "in": "query",
+            "name": "pictureTag",
+            "required": false,
+            "schema": {
+              "title": "Picturetag",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -4415,6 +4484,85 @@
           }
         ],
         "summary": "Attachment Buckets",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/api/attachments/picture-tags": {
+      "get": {
+        "description": "Every picture tag on media the user can see, with the number of such media under the same\n`type`, `mine` and `visibility` filters the list applies \u2014 so a tag's count is the length of\nthe list under `?pictureTag=` and those filters. Memo tags are not counted here. Most items\nfirst, then by name; a tag on no visible media is absent.",
+        "operationId": "attachment_picture_tags_api_attachments_picture_tags_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "title": "Type",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "mine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Mine",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Visibility"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AttachmentTagCount"
+                  },
+                  "title": "Response Attachment Picture Tags Api Attachments Picture Tags Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Attachment Picture Tags",
         "tags": [
           "assets"
         ]
@@ -4891,6 +5039,128 @@
           }
         ],
         "summary": "Attach Rendition",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/api/attachments/{uid}/tags/{name}": {
+      "delete": {
+        "description": "Take the picture tag `name` off the caller's own picture. Idempotent: a tag it does not\ncarry stays absent and answers 204.",
+        "operationId": "remove_picture_tag_api_attachments__uid__tags__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "description": "A tag name exactly as memos carry it, without the hash sign: letters, digits and underscores. Matched exactly, case included.",
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such attachment, or the caller does not own it."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove Picture Tag",
+        "tags": [
+          "assets"
+        ]
+      },
+      "put": {
+        "description": "Tag the caller's own picture with `name`. Idempotent: tagging it again changes nothing and\nanswers 204 again. A picture tag is the picture's own and never its memo's.",
+        "operationId": "add_picture_tag_api_attachments__uid__tags__name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "description": "A tag name exactly as memos carry it, without the hash sign: letters, digits and underscores. Matched exactly, case included.",
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such attachment, or the caller does not own it."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add Picture Tag",
         "tags": [
           "assets"
         ]

@@ -28,10 +28,11 @@ USE `Rfc3339Datetime` for every datetime field of every model an `/api/*` route 
 a bare `datetime` reintroduces the split, and tests/test_datetime_shape.py fails when one appears.
 """
 
+import re
 from datetime import UTC, datetime
 from typing import Annotated
 
-from pydantic import PlainSerializer, WithJsonSchema
+from pydantic import AfterValidator, Field, PlainSerializer, WithJsonSchema
 
 
 def to_rfc3339(value: datetime) -> str:
@@ -68,4 +69,28 @@ Rfc3339Datetime = Annotated[
     # client reads for a response body. Without this, swift-openapi-generator emits `String` where
     # the client wants `Date`. The validation schema (request bodies) is unaffected either way.
     WithJsonSchema({"type": "string", "format": "date-time"}, mode="serialization"),
+]
+
+
+def tag_name(value: str) -> str:
+    """`value` unchanged when it is a tag name as a memo's `#tag` carries it, else ValueError."""
+    if re.fullmatch(r"\w+", value) is None:
+        raise ValueError("a tag is a name as a memo's #tag carries it, without the #")
+    return value
+
+
+# A tag is the NAME a memo's `#tag` stores — letters, digits and `_`, case kept, no `#` — and is
+# matched exactly. It is refused rather than normalised: a stripped `#` or a lowered case would
+# make the stored record differ from what the client sent, and a value no memo can carry would
+# silently match nothing. ONE definition for a collection's tag and a picture tag (MEMNG-863),
+# here rather than in either router because the collections router imports the assets one.
+TagName = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=255,
+        description="A tag name exactly as memos carry it, without the hash sign: letters, "
+        "digits and underscores. Matched exactly, case included.",
+    ),
+    AfterValidator(tag_name),
 ]

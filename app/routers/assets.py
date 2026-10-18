@@ -15,13 +15,14 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
-from app.api_types import Rfc3339Datetime
+from app.api_types import Rfc3339Datetime, TagName
 from app.config import settings
 from app.database import async_session, get_session
 from app.models import (
@@ -36,6 +37,7 @@ from app.models import (
     Visibility,
 )
 from app.services import asset_urls, poster, printready, reclaim, storage, variants
+from app.services import attachment_tags as tag_svc
 from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
 from app.services.attachments import (
@@ -46,6 +48,7 @@ from app.services.attachments import (
     library_buckets,
     library_filters,
     library_page_statement,
+    library_picture_tag_counts,
     library_tag_counts,
     parse_bucket_key,
 )
@@ -226,6 +229,9 @@ class AttachmentMeta(BaseModel):
     # is what makes it assertable straight after a create, before the worker has run at all.
     hasPoster: bool
     renditions: list[RenditionItem]
+    tags: list[str] = Field(
+        default=[], description="The picture's own tags, sorted by name; never its memo's tags."
+    )
     downloadUrl: str
     printUrl: str
     thumbnailUrl: str
@@ -258,6 +264,9 @@ class AttachmentListItem(BaseModel):
     # The tags of the memo this hangs on, sorted by name like MemoOut.tags; empty for an orphan
     # and for an untagged memo. MEMNG-651, additive.
     tags: list[str]
+    pictureTags: list[str] = Field(
+        default=[], description="The picture's own tags, sorted by name; never its memo's tags."
+    )
     # The visibility of the memo this hangs on; null for an orphan, which has none. MEMNG-785,
     # additive.
     visibility: Visibility | None
@@ -302,6 +311,7 @@ def _list_item(
         takenAt=taken_at,
         filename=att.filename,
         tags=tags,
+        pictureTags=list(att.picture_tag_names),
         visibility=visibility,
         **asset_urls.signed_tier_urls(att.uid, user_id, now=time.time()),
         webReady=att.uid in web_ready,
@@ -400,6 +410,7 @@ async def list_attachments(
     # SkipJsonSchema like the memo listing's own `visibility`: a query string cannot carry a JSON
     # null, so absent is the only way it arrives unset.
     visibility: Visibility | SkipJsonSchema[None] = None,
+    pictureTag: str | None = None,
 ) -> list[AttachmentListItem]:
     """The household media library the user can see, newest first: their own attachments
     (including orphans) PLUS media on any memo visible to them (non-PRIVATE). ?type=image|video
@@ -409,6 +420,8 @@ async def list_attachments(
     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
     Each item names the tags of its memo, by name; an orphan's are empty.
+    ?pictureTag=<name> keeps only media that itself carries exactly that picture tag, orphans
+    included; a memo's tags never match it. Each item names its own picture tags too.
     ?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps
     only media on a memo of that visibility, so no orphan. Both only narrow what the caller may
     already see. Each item names its memo's visibility, null for an orphan.
@@ -431,7 +444,9 @@ async def list_attachments(
         opened = parse_bucket_key(bucket)
         if opened is None:
             raise HTTPException(status_code=422, detail="bucket is not a bucket key")
-    filters = library_filters(user, type, tag, mine=mine, visibility=visibility)
+    filters = library_filters(
+        user, type, tag, mine=mine, visibility=visibility, picture_tag=pictureTag
+    )
     if opened is not None:
         # Beside the cursor, not instead of it: a continuation's cursor already lies beyond the
         # bucket's start, so resending the bucket with it changes nothing.
@@ -501,8 +516,9 @@ def _known_zones() -> frozenset[str]:
     return frozenset(available_timezones())
 
 
-# Both literal routes are registered BEFORE `/attachments/{uid}` below: FastAPI matches in
-# registration order, and `{uid}` would otherwise answer `buckets` and `tags` as attachment uids.
+# The literal routes are registered BEFORE `/attachments/{uid}` below: FastAPI matches in
+# registration order, and `{uid}` would otherwise answer `buckets`, `tags` and `picture-tags` as
+# attachment uids.
 @router.get("/attachments/buckets", response_model=list[AttachmentBucket])
 async def attachment_buckets(
     user: Annotated[User, Depends(auth.require_user)],
@@ -513,9 +529,10 @@ async def attachment_buckets(
     tag: str | None = None,
     mine: bool = False,
     visibility: Visibility | SkipJsonSchema[None] = None,
+    pictureTag: str | None = None,
 ) -> list[AttachmentBucket]:
-    """The library the list shows — same visibility, same `type`, `tag`, `mine` and `visibility`
-    filters — counted per
+    """The library the list shows — same visibility, same `type`, `tag`, `mine`, `visibility`
+    and `pictureTag` filters — counted per
     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
     for a video its poster frame, the one picture a video has — and the tags of the memos its
@@ -532,7 +549,7 @@ async def attachment_buckets(
             tags=tags,
         )
         for key, count, uid, mime, tags in await library_buckets(
-            db, user, size, tz, type, tag, mine=mine, visibility=visibility
+            db, user, size, tz, type, tag, mine=mine, visibility=visibility, picture_tag=pictureTag
         )
     ]
 
@@ -552,6 +569,26 @@ async def attachment_tags(
     return [
         AttachmentTagCount(name=name, count=count)
         for name, count in await library_tag_counts(
+            db, user, type, mine=mine, visibility=visibility
+        )
+    ]
+
+
+@router.get("/attachments/picture-tags", response_model=list[AttachmentTagCount])
+async def attachment_picture_tags(
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+    type: str | None = None,
+    mine: bool = False,
+    visibility: Visibility | SkipJsonSchema[None] = None,
+) -> list[AttachmentTagCount]:
+    """Every picture tag on media the user can see, with the number of such media under the same
+    `type`, `mine` and `visibility` filters the list applies — so a tag's count is the length of
+    the list under `?pictureTag=` and those filters. Memo tags are not counted here. Most items
+    first, then by name; a tag on no visible media is absent."""
+    return [
+        AttachmentTagCount(name=name, count=count)
+        for name, count in await library_picture_tag_counts(
             db, user, type, mine=mine, visibility=visibility
         )
     ]
@@ -592,6 +629,7 @@ async def attachment_meta(
         hasLegacyPrint=att.print_path is not None,
         hasPoster=has_poster,
         renditions=rendition_items(att),
+        tags=list(att.picture_tag_names),
         downloadUrl=f"{base}/original",
         printUrl=f"{base}/print",
         **asset_urls.signed_tier_urls(att.uid, user.id, now=time.time()),
@@ -858,6 +896,59 @@ def _unlink_all(paths: list[Path]) -> None:
             p.unlink(missing_ok=True)
         except OSError:
             pass  # best-effort; the DB row is already gone
+
+
+# Postgres' foreign_key_violation: the picture-tag insert names an attachment that was deleted after
+# this request looked it up.
+_FK_VIOLATION = "23503"
+
+_TAG_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {"description": "No such attachment, or the caller does not own it."},
+}
+
+
+async def _owned(db: AsyncSession, user: User, uid: str) -> Attachment:
+    """The caller's own attachment by uid; anyone else's, visible or not, is the same 404 as an
+    unknown uid, so a write never tells a member which uids exist."""
+    att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
+    if att is None or att.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return att
+
+
+@router.put("/attachments/{uid}/tags/{name}", status_code=204, responses=_TAG_WRITE_RESPONSES)
+async def add_picture_tag(
+    uid: str,
+    name: TagName,
+    user: Annotated[User, Depends(auth.require_pat_or_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Tag the caller's own picture with `name`. Idempotent: tagging it again changes nothing and
+    answers 204 again. A picture tag is the picture's own and never its memo's."""
+    att = await _owned(db, user, uid)
+    try:
+        await tag_svc.add(db, att, name)
+        await db.commit()
+    except IntegrityError as exc:
+        # Only a vanished attachment is the caller's 404; any other integrity failure is not.
+        if getattr(exc.orig, "sqlstate", None) != _FK_VIOLATION:
+            raise
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="Attachment not found") from exc
+
+
+@router.delete("/attachments/{uid}/tags/{name}", status_code=204, responses=_TAG_WRITE_RESPONSES)
+async def remove_picture_tag(
+    uid: str,
+    name: TagName,
+    user: Annotated[User, Depends(auth.require_pat_or_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Take the picture tag `name` off the caller's own picture. Idempotent: a tag it does not
+    carry stays absent and answers 204."""
+    att = await _owned(db, user, uid)
+    await tag_svc.remove(db, att, name)
+    await db.commit()
 
 
 @router.delete("/attachments/{uid}", status_code=204)

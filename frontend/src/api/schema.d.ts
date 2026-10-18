@@ -288,6 +288,8 @@ export interface paths {
          *     ?order=taken_desc|taken_asc walks it by `takenAt` (ties broken by upload order); ?tag=<name>
          *     keeps only media whose memo carries exactly that tag — an unknown tag is an empty page.
          *     Each item names the tags of its memo, by name; an orphan's are empty.
+         *     ?pictureTag=<name> keeps only media that itself carries exactly that picture tag, orphans
+         *     included; a memo's tags never match it. Each item names its own picture tags too.
          *     ?mine=true keeps only the caller's own attachments, orphans included; ?visibility=<V> keeps
          *     only media on a memo of that visibility, so no orphan. Both only narrow what the caller may
          *     already see. Each item names its memo's visibility, null for an orphan.
@@ -319,14 +321,37 @@ export interface paths {
         };
         /**
          * Attachment Buckets
-         * @description The library the list shows — same visibility, same `type`, `tag`, `mine` and `visibility`
-         *     filters — counted per
+         * @description The library the list shows — same visibility, same `type`, `tag`, `mine`, `visibility`
+         *     and `pictureTag` filters — counted per
          *     calendar day, month or year of `takenAt` in `tz` (an IANA zone, default Europe/Zurich), newest
          *     first. Each bucket names its newest item as the cover, with that item's signed thumbnail —
          *     for a video its poster frame, the one picture a video has — and the tags of the memos its
          *     items hang on, the tag on the most items first, then by name.
          */
         get: operations["attachment_buckets_api_attachments_buckets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/picture-tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Attachment Picture Tags
+         * @description Every picture tag on media the user can see, with the number of such media under the same
+         *     `type`, `mine` and `visibility` filters the list applies — so a tag's count is the length of
+         *     the list under `?pictureTag=` and those filters. Memo tags are not counted here. Most items
+         *     first, then by name; a tag on no visible media is absent.
+         */
+        get: operations["attachment_picture_tags_api_attachments_picture_tags_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -453,6 +478,32 @@ export interface paths {
          */
         post: operations["attach_rendition_api_attachments__uid__renditions_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/{uid}/tags/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Add Picture Tag
+         * @description Tag the caller's own picture with `name`. Idempotent: tagging it again changes nothing and
+         *     answers 204 again. A picture tag is the picture's own and never its memo's.
+         */
+        put: operations["add_picture_tag_api_attachments__uid__tags__name__put"];
+        post?: never;
+        /**
+         * Remove Picture Tag
+         * @description Take the picture tag `name` off the caller's own picture. Idempotent: a tag it does not
+         *     carry stays absent and answers 204.
+         */
+        delete: operations["remove_picture_tag_api_attachments__uid__tags__name__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1471,6 +1522,12 @@ export interface components {
             mine: boolean;
             /** Orphan */
             orphan: boolean;
+            /**
+             * Picturetags
+             * @description The picture's own tags, sorted by name; never its memo's tags.
+             * @default []
+             */
+            pictureTags: string[];
             /** Posterurl */
             posterUrl: string;
             /** Previewurl */
@@ -1550,6 +1607,12 @@ export interface components {
             /** Size */
             size: number;
             status: components["schemas"]["AttachmentStatus"];
+            /**
+             * Tags
+             * @description The picture's own tags, sorted by name; never its memo's tags.
+             * @default []
+             */
+            tags: string[];
             /** Thumbnailurl */
             thumbnailUrl: string;
             /** Uid */
@@ -1635,6 +1698,12 @@ export interface components {
             /** Sha256 */
             sha256: string | null;
             status: components["schemas"]["AttachmentStatus"];
+            /**
+             * Tags
+             * @description The picture's own tags, sorted by name; never its memo's tags.
+             * @default []
+             */
+            tags: string[];
             /** Thumbnailurl */
             thumbnailUrl: string;
             /** Uid */
@@ -1764,6 +1833,12 @@ export interface components {
                 mine: boolean;
                 /** Orphan */
                 orphan: boolean;
+                /**
+                 * Picturetags
+                 * @description The picture's own tags, sorted by name; never its memo's tags.
+                 * @default []
+                 */
+                pictureTags: string[];
                 /** Posterurl */
                 posterUrl: string;
                 /** Previewurl */
@@ -2460,6 +2535,12 @@ export interface components {
             /** Sha256 */
             sha256: string | null;
             status: components["schemas"]["AttachmentStatus"];
+            /**
+             * Tags
+             * @description The picture's own tags, sorted by name; never its memo's tags.
+             * @default []
+             */
+            tags: string[];
             /**
              * Taken At
              * Format: date-time
@@ -3443,6 +3524,7 @@ export interface operations {
                 tz?: string;
                 mine?: boolean;
                 visibility?: components["schemas"]["Visibility"];
+                pictureTag?: string | null;
             };
             header?: never;
             path?: never;
@@ -3482,6 +3564,7 @@ export interface operations {
                 tag?: string | null;
                 mine?: boolean;
                 visibility?: components["schemas"]["Visibility"];
+                pictureTag?: string | null;
             };
             header?: never;
             path?: never;
@@ -3496,6 +3579,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AttachmentBucket"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    attachment_picture_tags_api_attachments_picture_tags_get: {
+        parameters: {
+            query?: {
+                type?: string | null;
+                mine?: boolean;
+                visibility?: components["schemas"]["Visibility"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentTagCount"][];
                 };
             };
             /** @description Validation Error */
@@ -3761,6 +3878,82 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AttachmentMeta"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    add_picture_tag_api_attachments__uid__tags__name__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such attachment, or the caller does not own it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    remove_picture_tag_api_attachments__uid__tags__name__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such attachment, or the caller does not own it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

@@ -53,6 +53,7 @@ function imageAtt(uid: string, dims: { width: number | null; height: number | nu
     hasPrint: false,
     hasLegacyPrint: false,
     position: null,
+    tags: [] as string[],
     // widened, not narrowed to null: a spec that gives a photo a real capture read spreads it
     // over this shape, which `null` alone would type as accepting nothing else
     capture_instant: null as string | null,

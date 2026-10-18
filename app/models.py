@@ -1,5 +1,7 @@
 import enum
+from collections.abc import Sequence
 from datetime import date, datetime, time
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
@@ -19,9 +21,11 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     func,
+    select,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship, validates
 
 from app.database import Base
 
@@ -78,6 +82,19 @@ memo_tags = Table(
     Base.metadata,
     Column("memo_id", ForeignKey("memos.id", ondelete="CASCADE"), primary_key=True),
     Column("tag_id", ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
+)
+
+# Tags on the PICTURE itself (MEMNG-863), in their own namespace: a memo's `#favorites` is a
+# `memo_tags` row and never one of these, so neither surface can change the other's membership.
+# The name row is shared with memo tags (`tags`), the relation is not. The primary key leads with
+# `attachment_id`, which serves the per-picture read; `tag_id` gets its own index for the per-tag
+# filter and count.
+attachment_tags = Table(
+    "attachment_tags",
+    Base.metadata,
+    Column("attachment_id", ForeignKey("attachments.id", ondelete="CASCADE"), primary_key=True),
+    Column("tag_id", ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
+    Index("ix_attachment_tags_tag_id", "tag_id"),
 )
 
 
@@ -300,6 +317,16 @@ class Attachment(Base):
     renditions: Mapped[list["AttachmentRendition"]] = relationship(
         lazy="selectin", cascade="all, delete-orphan", order_by="AttachmentRendition.id"
     )
+    # The picture's own tags (MEMNG-863). `raise`: no serializer reads this relationship — they read
+    # `picture_tag_names` below — so a lazy load from a sync serializer, which in this async app is
+    # a MissingGreenlet, fails loudly at the first test instead of silently costing a statement per
+    # row. `passive_deletes`: the foreign keys cascade, so deleting an attachment never loads it.
+    tags: Mapped[list["Tag"]] = relationship(
+        secondary=attachment_tags, lazy="raise", passive_deletes=True
+    )
+    if TYPE_CHECKING:
+        # Mapped below the class; see `Attachment.picture_tag_names` there.
+        picture_tag_names: Mapped[Sequence[str]]
 
     __table_args__ = (
         # Half a coordinate is not a location: a row with one column set would put a marker at an
@@ -314,6 +341,25 @@ class Attachment(Base):
             name="ck_attachments_location_range",
         ),
     )
+
+
+# The picture's tag names (MEMNG-863), sorted, `{}` when it has none: a correlated ARRAY(subquery)
+# loaded with the row itself, so every surface that already loads attachments — the library page,
+# the memo feed's `selectin`, the map's markers, a single attachment — carries them at no extra
+# statement. Read-only; writes go through app/services/attachment_tags.py. Assigned AFTER the class
+# on purpose: a column_property declared in the body renders FIRST in every attachment SELECT,
+# which would change the text of every existing statement over the table, its lock statements
+# included; assigned here it renders after the table's own columns.
+Attachment.picture_tag_names = column_property(
+    func.array(
+        select(Tag.name)
+        .join(attachment_tags, attachment_tags.c.tag_id == Tag.id)
+        .where(attachment_tags.c.attachment_id == Attachment.id)
+        .order_by(Tag.name.asc())
+        .scalar_subquery(),
+        type_=ARRAY(Text),
+    )
+)
 
 
 class AttachmentRendition(Base):
