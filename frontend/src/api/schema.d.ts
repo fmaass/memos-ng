@@ -493,15 +493,17 @@ export interface paths {
         get?: never;
         /**
          * Add Picture Tag
-         * @description Tag the caller's own picture with `name`. Idempotent: tagging it again changes nothing and
+         * @description Tag a picture with `name`. `favorites` may be set by any member who can view the picture;
+         *     every other tag only on the caller's own. Idempotent: tagging it again changes nothing and
          *     answers 204 again. A picture tag is the picture's own and never its memo's.
          */
         put: operations["add_picture_tag_api_attachments__uid__tags__name__put"];
         post?: never;
         /**
          * Remove Picture Tag
-         * @description Take the picture tag `name` off the caller's own picture. Idempotent: a tag it does not
-         *     carry stays absent and answers 204.
+         * @description Take the picture tag `name` off a picture. `favorites` may be cleared by any member who can
+         *     view the picture, whoever set it; every other tag only from the caller's own. Idempotent: a
+         *     tag it does not carry stays absent and answers 204.
          */
         delete: operations["remove_picture_tag_api_attachments__uid__tags__name__delete"];
         options?: never;
@@ -3966,7 +3968,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description No such attachment, or the caller does not own it. */
+            /** @description No such attachment, or one the caller may not tag: for `favorites`, one the caller cannot view; for any other tag, one the caller does not own. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -4004,7 +4006,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description No such attachment, or the caller does not own it. */
+            /** @description No such attachment, or one the caller may not tag: for `favorites`, one the caller cannot view; for any other tag, one the caller does not own. */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -967,8 +967,15 @@ def _unlink_all(paths: list[Path]) -> None:
 _FK_VIOLATION = "23503"
 
 _TAG_WRITE_RESPONSES: dict[int | str, dict[str, Any]] = {
-    404: {"description": "No such attachment, or the caller does not own it."},
+    404: {
+        "description": "No such attachment, or one the caller may not tag: for `favorites`, one "
+        "the caller cannot view; for any other tag, one the caller does not own."
+    },
 }
+
+# The heart. memos-ng is a family app, so the owner ruled (2026-10-21) that any member who can see
+# a picture may set and clear it; every other picture tag stays the uploader's alone.
+FAVORITES_TAG = "favorites"
 
 
 async def _owned(db: AsyncSession, user: User, uid: str) -> Attachment:
@@ -980,6 +987,15 @@ async def _owned(db: AsyncSession, user: User, uid: str) -> Attachment:
     return att
 
 
+async def _taggable(db: AsyncSession, user: User, uid: str, name: str) -> Attachment:
+    """The attachment `user` may write the picture tag `name` on: any picture they can view for
+    the heart, only their own for every other name. Either refusal is `_viewable`'s or `_owned`'s
+    404, the same answer as an unknown uid."""
+    if name == FAVORITES_TAG:
+        return await _viewable(db, user, uid)
+    return await _owned(db, user, uid)
+
+
 @router.put("/attachments/{uid}/tags/{name}", status_code=204, responses=_TAG_WRITE_RESPONSES)
 async def add_picture_tag(
     uid: str,
@@ -987,9 +1003,10 @@ async def add_picture_tag(
     user: Annotated[User, Depends(auth.require_pat_or_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Tag the caller's own picture with `name`. Idempotent: tagging it again changes nothing and
+    """Tag a picture with `name`. `favorites` may be set by any member who can view the picture;
+    every other tag only on the caller's own. Idempotent: tagging it again changes nothing and
     answers 204 again. A picture tag is the picture's own and never its memo's."""
-    att = await _owned(db, user, uid)
+    att = await _taggable(db, user, uid, name)
     try:
         await tag_svc.add(db, att, name)
         await db.commit()
@@ -1008,9 +1025,10 @@ async def remove_picture_tag(
     user: Annotated[User, Depends(auth.require_pat_or_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Take the picture tag `name` off the caller's own picture. Idempotent: a tag it does not
-    carry stays absent and answers 204."""
-    att = await _owned(db, user, uid)
+    """Take the picture tag `name` off a picture. `favorites` may be cleared by any member who can
+    view the picture, whoever set it; every other tag only from the caller's own. Idempotent: a
+    tag it does not carry stays absent and answers 204."""
+    att = await _taggable(db, user, uid, name)
     await tag_svc.remove(db, att, name)
     await db.commit()
 

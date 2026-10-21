@@ -1,7 +1,8 @@
 """Picture tags (MEMNG-863): a tag on the attachment itself, in its own namespace.
 
 A picture tag is set and cleared by its owner (`PUT`/`DELETE /api/attachments/{uid}/tags/{name}`,
-both 204 with no body, both idempotent) and read back on the attachment's own payloads. It is NOT
+both 204 with no body, both idempotent) — except the heart, `favorites`, which any member who can
+view the picture sets and clears — and read back on the attachment's own payloads. It is NOT
 a memo tag: `?pictureTag=` and `GET /api/attachments/picture-tags` read only picture tags, while
 `?tag=`, `GET /api/attachments/tags` and a collection's tag arm keep reading only the memo's, so a
 memo hashtag `#favorites` puts nothing in Favorites and a picture tag moves no trip.
@@ -14,8 +15,11 @@ import asyncio
 from typing import Any
 
 import pytest
+from app import auth
+from app.main import app
 from app.routers import assets as assets_router
 from app.services import attachment_tags as tag_svc
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import IntegrityError
 
 from tests import test_collections_api as coll_api
@@ -124,21 +128,113 @@ def test_removing_one_tag_leaves_the_others_and_other_pictures_alone(lib):
     assert _rows() == [("pt-x", "keep"), ("pt-y", FAV)]
 
 
-def test_a_non_owner_cannot_tag_or_untag_even_a_picture_they_can_see(two):
-    a_client, me, b_client, other = two
-    _att("pt-pub", me, _memo("pt-pub-m", me, visibility="PUBLIC"))
-    _att("pt-b-orph", other)
-    assert b_client.get("/api/attachments/pt-pub").status_code == 200  # B can see it
-    assert _tag(b_client, "pt-pub").status_code == 404
-    assert _tag(a_client, "pt-pub").status_code == 204
-    assert _untag(b_client, "pt-pub").status_code == 404
-    assert _rows() == [("pt-pub", FAV)]
-    # Another member's uid the caller cannot even see, and a uid nobody has.
-    assert _tag(a_client, "pt-b-orph").status_code == 404
-    assert _untag(a_client, "pt-b-orph").status_code == 404
-    assert _tag(a_client, "no-such-uid").status_code == 404
-    assert _untag(a_client, "no-such-uid").status_code == 404
-    assert _rows() == [("pt-pub", FAV)]
+def test_any_viewer_hearts_and_unhearts_another_members_picture(two):
+    """The heart is the household's, not the uploader's: B sets and clears it on A's picture."""
+    a_client, me, b_client, _ = two
+    _att("fam-pub", me, _memo("fam-pub-m", me, visibility="PUBLIC"))
+    _att("fam-prot", me, _memo("fam-prot-m", me, visibility="PROTECTED"))
+    for uid in ("fam-pub", "fam-prot"):
+        r = _tag(b_client, uid)
+        assert r.status_code == 204, r.text
+        assert r.content == b""
+    assert _rows() == [("fam-prot", FAV), ("fam-pub", FAV)]
+    assert _meta_tags(a_client, "fam-pub") == [FAV]
+    assert _meta_tags(b_client, "fam-pub") == [FAV]
+    # B clears B's own heart, and A's heart is just as clearable by B.
+    assert _untag(b_client, "fam-pub").status_code == 204
+    assert _rows() == [("fam-prot", FAV)]
+    assert _tag(a_client, "fam-pub").status_code == 204
+    r = _untag(b_client, "fam-pub")
+    assert r.status_code == 204, r.text
+    assert r.content == b""
+    assert _meta_tags(a_client, "fam-pub") == []
+    assert _rows() == [("fam-prot", FAV)]
+
+
+def test_a_heart_on_a_picture_the_caller_cannot_view_is_404_and_writes_nothing(two):
+    """`_viewable`'s 404: another member's PRIVATE picture, their orphan and an unknown uid answer
+    alike, so a write never tells a member which uids exist."""
+    a_client, me, b_client, _ = two
+    _att("fam-priv", me, _memo("fam-priv-m", me, visibility="PRIVATE"))
+    _att("fam-orph", me)
+    for uid in ("fam-priv", "fam-orph"):
+        assert _tag(a_client, uid).status_code == 204  # the owner can (the positive control)
+        assert b_client.get(f"/api/attachments/{uid}").status_code == 404  # B cannot see it
+    for uid in ("fam-priv", "fam-orph", "no-such-uid"):
+        assert _tag(b_client, uid).status_code == 404
+        assert _untag(b_client, uid).status_code == 404
+    assert _rows() == [("fam-orph", FAV), ("fam-priv", FAV)]
+
+
+@pytest.mark.parametrize("name", ["keep", "Favorites", "favorites_2"])
+def test_every_other_tag_name_stays_owner_only(two, name):
+    """Only the heart is family-wide; the match is exact, so a near name is just another tag."""
+    a_client, me, b_client, _ = two
+    _att("fam-own", me, _memo("fam-own-m", me, visibility="PUBLIC"))
+    assert b_client.get("/api/attachments/fam-own").status_code == 200  # B can see it
+    assert _tag(b_client, "fam-own", name).status_code == 404
+    assert _rows() == []
+    assert _tag(a_client, "fam-own", name).status_code == 204
+    assert _untag(b_client, "fam-own", name).status_code == 404
+    assert _rows() == [("fam-own", name)]
+
+
+def test_a_heart_set_by_one_member_lists_for_every_viewer(two):
+    """The Favorites card's reads — `?pictureTag=favorites` and the picture-tag counts — show B's
+    heart on A's picture to A and to B alike."""
+    a_client, me, b_client, _ = two
+    _att("fam-list", me, _memo("fam-list-m", me, visibility="PUBLIC"))
+    _att("fam-plain", me, _memo("fam-plain-m", me, visibility="PUBLIC"))
+    assert _tag(b_client, "fam-list").status_code == 204
+    for client in (a_client, b_client):
+        assert _listed(client, f"pictureTag={FAV}") == {"fam-list"}
+        assert _picture_counts(client) == [{"name": FAV, "count": 1}]
+    assert _listed(a_client, f"pictureTag={FAV}&mine=true") == {"fam-list"}
+    assert _listed(b_client, f"pictureTag={FAV}&mine=true") == set()
+
+
+async def test_two_members_hearting_one_picture_at_once_leave_one_row(two, monkeypatch):
+    """A and B, each by its own token, held past the lookup until both have looked up: the pair's
+    primary key makes them one row, and neither request errors."""
+    a_client, me, b_client, _ = two
+    _att("fam-race", me, _memo("fam-race-m", me, visibility="PUBLIC"))
+    tokens = []
+    for client in (a_client, b_client):
+        created = client.post("/api/pats", json={"name": "device"})
+        assert created.status_code == 201, created.text
+        tokens.append(created.json()["token"])
+    real = tag_svc.add
+    both_looked_up = asyncio.Barrier(2)
+    entered: list[int] = []
+
+    async def held(db, att, name):
+        entered.append(1)
+        async with asyncio.timeout(10):
+            await both_looked_up.wait()
+        return await real(db, att, name)
+
+    monkeypatch.setattr(tag_svc, "add", held)
+    path = f"/api/attachments/fam-race/tags/{FAV}"
+    transport = ASGITransport(app=app)
+    async with (
+        AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers={"Authorization": f"Bearer {tokens[0]}"},
+        ) as a_bearer,
+        AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers={"Authorization": f"Bearer {tokens[1]}"},
+        ) as b_bearer,
+    ):
+        try:
+            results = await asyncio.gather(a_bearer.put(path), b_bearer.put(path))
+        finally:
+            await auth.drain_pat_stamp_tasks()
+    assert [r.status_code for r in results] == [204, 204], [r.text for r in results]
+    assert len(entered) == 2  # both really overlapped past the lookup
+    assert _rows() == [("fam-race", FAV)]
 
 
 @pytest.mark.parametrize(
@@ -438,3 +534,12 @@ def test_the_write_routes_are_registered_ahead_of_the_uid_catch_alls():
     """`/attachments/picture-tags` must not be answered as the uid `picture-tags`."""
     paths = [getattr(r, "path", "") for r in assets_router.router.routes]
     assert paths.index("/api/attachments/picture-tags") < paths.index("/api/attachments/{uid}")
+
+
+def test_the_published_404_names_the_heart_as_a_viewer_write():
+    """The OpenAPI text a client is generated from must not still say the heart is owner-only."""
+    paths = app.openapi()["paths"]["/api/attachments/{uid}/tags/{name}"]
+    for method in ("put", "delete"):
+        text = paths[method]["responses"]["404"]["description"]
+        assert "for `favorites`, one the caller cannot view" in text, text
+        assert "favorites" in paths[method]["description"]

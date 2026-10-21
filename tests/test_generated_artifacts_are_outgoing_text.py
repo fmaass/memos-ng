@@ -62,6 +62,7 @@ ALLOWED_TOKENS = {
     "<memo-uid>.md": "a file-name shape inside the export archive",
     "media/<memo-uid>/": "a directory shape inside the export archive",
     "print-4096": "the permanent default rendition profile, a value `profile` takes",
+    "favorites": "the one picture tag any viewer may write, a value the tag write's `name` takes",
     "4:2:2": "chroma subsampling the mail profile deliberately does NOT offer, named to say so",
     '{"empty": true}': "a literal request body, quoted as the client must send it",
     "{video upload_uid: poster upload_uid}": "a literal body shape, quoted as the client sends it",
