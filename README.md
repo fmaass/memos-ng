@@ -190,6 +190,15 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.5.0
+
+- Tag, month and year collections can carry a chosen cover picture. `GET /api/collection-covers`
+  lists every chosen cover as `{kind, key, attachmentUid}`, limited to pictures the reader can see.
+  `PUT /api/collection-covers/{kind}/{key}` with `{"attachmentUid"}` sets one: any signed-in member
+  may choose any picture they can see, and covers are household-wide. `DELETE` on the same path
+  clears it (204). A bad kind or key answers 422; an unknown or unviewable picture answers 404.
+- Migration `a584468dae25` adds the `collection_covers` table (additive only).
+
 ### v2.4.1
 
 - Favorites are family-wide. Anyone signed in who can see a picture may now set and clear its
