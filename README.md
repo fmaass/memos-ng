@@ -190,6 +190,13 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.4.1
+
+- Favorites are family-wide. Anyone signed in who can see a picture may now set and clear its
+  `favorites` heart through `PUT` and `DELETE /api/attachments/{uid}/tags/favorites`. Every other
+  picture tag name stays owner-only, and a picture the caller cannot see still answers 404.
+- No migration.
+
 ### v2.4.0
 
 - A picture can now carry its own tags, `favorites` for example, separate from the tags of the memo
