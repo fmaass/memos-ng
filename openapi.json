@@ -941,6 +941,51 @@
         "title": "CaptureOut",
         "type": "object"
       },
+      "CollectionCoverOut": {
+        "properties": {
+          "attachmentUid": {
+            "description": "The cover picture.",
+            "title": "Attachmentuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031).",
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "tag",
+              "month",
+              "year"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "key",
+          "attachmentUid"
+        ],
+        "title": "CollectionCoverOut",
+        "type": "object"
+      },
+      "CollectionCoverSet": {
+        "properties": {
+          "attachmentUid": {
+            "description": "A picture the caller may see; any member's, not only theirs.",
+            "minLength": 1,
+            "title": "Attachmentuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachmentUid"
+        ],
+        "title": "CollectionCoverSet",
+        "type": "object"
+      },
       "CollectionCreate": {
         "properties": {
           "coverAttachmentUid": {
@@ -5737,6 +5782,244 @@
         "summary": "Whoami",
         "tags": [
           "auth"
+        ]
+      }
+    },
+    "/api/collection-covers": {
+      "get": {
+        "description": "Every chosen cover of a tag, month or year collection whose picture the caller may see,\nordered by kind then key. A cover whose picture was deleted, or that the caller may not see,\nis simply absent \u2014 the client shows its default cover for that collection.",
+        "operationId": "list_collection_covers_api_collection_covers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CollectionCoverOut"
+                  },
+                  "title": "Response List Collection Covers Api Collection Covers Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Collection Covers",
+        "tags": [
+          "collection-covers"
+        ]
+      }
+    },
+    "/api/collection-covers/{kind}/{key}": {
+      "delete": {
+        "description": "Clear the chosen cover of one tag, month or year collection, so every client shows its default again. Idempotent: clearing a cover that is not set answers 204 too. An unknown kind, or a key that is not a tag name, a month or a year as that kind needs it, answers 422 and changes nothing.",
+        "operationId": "clear_collection_cover_api_collection_covers__kind___key__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tag",
+                "month",
+                "year"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031).",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "description": "The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031).",
+              "title": "Key",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Clear Collection Cover",
+        "tags": [
+          "collection-covers"
+        ]
+      },
+      "put": {
+        "description": "Choose the cover of one tag, month or year collection for the whole household, replacing any earlier choice; the last write wins. Any signed-in member may choose any picture they can see. An unknown kind, or a key that is not a tag name, a month or a year as that kind needs it, answers 422 and changes nothing. A picture that does not exist or that the caller may not see answers 404 and changes nothing.",
+        "operationId": "set_collection_cover_api_collection_covers__kind___key__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tag",
+                "month",
+                "year"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031).",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "description": "The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031).",
+              "title": "Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CollectionCoverSet"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CollectionCoverOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The attachment does not exist or is not visible to the caller \u2014 one answer for both. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Set Collection Cover",
+        "tags": [
+          "collection-covers"
         ]
       }
     },

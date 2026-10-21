@@ -24,7 +24,7 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
 | F | `frame_share_jobs` | `frame_share_jobs.id` |
 | E | `export_settings` | singleton |
 | D | digest settings / runs | singleton |
-| C | `collections` (+ `collection_exclusions`) | `collections.id` — after A, never before; one row when taken explicitly (`update_collection`), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |
+| C | `collections` (+ `collection_exclusions`, `collection_covers`) | `collections.id`; `collection_covers` by `(kind, key)` — after A, never before; one row when taken explicitly (`update_collection`, `collection_covers.set_cover`), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |
 
 Within a class, acquire **ascending by canonical key, in ONE statement per class per
 transaction**.
@@ -125,7 +125,11 @@ INSERT of a private row, which is not an acquisition (R8).
   `collections.update_collection` (and `create_collection`, which holds no C row) takes FOR KEY
   SHARE on the cover attachment's row (`collections._hold_cover`) BEFORE its one FOR UPDATE on
   the collection row, and nothing else; a cover deleted before it could be held is `CoverGone`,
-  never a foreign-key violation at flush. F is acquired only after A and the frame worker reads
+  never a foreign-key violation at flush. `collection_covers.set_cover` (MEMNG-853, the chosen
+  cover of a tag, month or year collection) takes the same `_hold_cover` FOR KEY SHARE and then
+  writes its ONE `collection_covers` row by upsert; `clear_cover` deletes one such row and takes
+  no A. An attachment delete reaches every cover row naming it through ON DELETE CASCADE, after A,
+  so the edge is again **A < C**. F is acquired only after A and the frame worker reads
   A/M unlocked, so F sits last and never inverts.
   **The one M–C operation (MEMNG-785):** `POST /api/collections/{uid}/attachments`
   (`routers.collections._include_from_memo`) runs one transaction per memo: `lock_memo_for_write`

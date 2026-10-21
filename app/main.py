@@ -92,6 +92,7 @@ from app.routers import admin_digest as admin_digest_router  # noqa: E402
 from app.routers import admin_export as admin_export_router  # noqa: E402
 from app.routers import assets as assets_router  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
+from app.routers import collection_covers as collection_covers_router  # noqa: E402
 from app.routers import collections as collections_router  # noqa: E402
 from app.routers import compat as compat_router  # noqa: E402
 from app.routers import export as export_router  # noqa: E402
@@ -117,6 +118,7 @@ app.router.routes.extend(export_router.router.routes)
 app.router.routes.extend(uploads_router.router.routes)
 app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(collections_router.router.routes)
+app.router.routes.extend(collection_covers_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
 app.router.routes.extend(members_router.router.routes)

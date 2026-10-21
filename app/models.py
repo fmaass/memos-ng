@@ -470,6 +470,34 @@ class CollectionExclusion(Base):
     )
 
 
+class CollectionCover(Base):
+    """The chosen cover of one DERIVED collection (MEMNG-853): a tag, a month or a year, which —
+    unlike a stored `Collection` — has no row of its own to carry `cover_attachment_id`. Keyed by
+    `(kind, key)` and shared by the household, so two members choosing one key race onto ONE row
+    and the later write wins. The cover goes with its attachment (CASCADE): a deleted picture
+    leaves no dangling choice, and the client falls back to its default cover. The CHECKs are
+    the key's shape per kind, behind the router's 422 as the last line; a tag's is only "not
+    empty", because Postgres' `\\w` under a C ctype is ASCII-only and would refuse a tag name
+    Python's `\\w` (`api_types.tag_name`) accepts, turning a valid request into a 500."""
+
+    __tablename__ = "collection_covers"
+    __table_args__ = (
+        CheckConstraint("kind IN ('tag', 'month', 'year')", name="ck_collection_covers_kind"),
+        CheckConstraint(
+            "(kind = 'tag' AND key <> '') "
+            "OR (kind = 'month' AND key ~ '^[0-9]{4}-(0[1-9]|1[0-2])$') "
+            "OR (kind = 'year' AND key ~ '^[0-9]{4}$')",
+            name="ck_collection_covers_key",
+        ),
+    )
+
+    kind: Mapped[str] = mapped_column(String(8), primary_key=True)
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    attachment_id: Mapped[int] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), index=True
+    )
+
+
 class Upload(Base):
     __tablename__ = "uploads"
 

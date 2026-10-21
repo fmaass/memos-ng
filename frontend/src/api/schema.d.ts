@@ -732,6 +732,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/collection-covers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Collection Covers
+         * @description Every chosen cover of a tag, month or year collection whose picture the caller may see,
+         *     ordered by kind then key. A cover whose picture was deleted, or that the caller may not see,
+         *     is simply absent — the client shows its default cover for that collection.
+         */
+        get: operations["list_collection_covers_api_collection_covers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/collection-covers/{kind}/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set Collection Cover
+         * @description Choose the cover of one tag, month or year collection for the whole household, replacing any earlier choice; the last write wins. Any signed-in member may choose any picture they can see. An unknown kind, or a key that is not a tag name, a month or a year as that kind needs it, answers 422 and changes nothing. A picture that does not exist or that the caller may not see answers 404 and changes nothing.
+         */
+        put: operations["set_collection_cover_api_collection_covers__kind___key__put"];
+        post?: never;
+        /**
+         * Clear Collection Cover
+         * @description Clear the chosen cover of one tag, month or year collection, so every client shows its default again. Idempotent: clearing a cover that is not set answers 204 too. An unknown kind, or a key that is not a tag name, a month or a year as that kind needs it, answers 422 and changes nothing.
+         */
+        delete: operations["clear_collection_cover_api_collection_covers__kind___key__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/collections": {
         parameters: {
             query?: never;
@@ -1813,6 +1859,32 @@ export interface components {
              * @enum {string}
              */
             state: "pending" | "done";
+        };
+        /** CollectionCoverOut */
+        CollectionCoverOut: {
+            /**
+             * Attachmentuid
+             * @description The cover picture.
+             */
+            attachmentUid: string;
+            /**
+             * Key
+             * @description The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031).
+             */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "tag" | "month" | "year";
+        };
+        /** CollectionCoverSet */
+        CollectionCoverSet: {
+            /**
+             * Attachmentuid
+             * @description A picture the caller may see; any member's, not only theirs.
+             */
+            attachmentUid: string;
         };
         /** CollectionCreate */
         CollectionCreate: {
@@ -4263,6 +4335,141 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UserOut"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    list_collection_covers_api_collection_covers_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionCoverOut"][];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    set_collection_cover_api_collection_covers__kind___key__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "tag" | "month" | "year";
+                /** @description The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031). */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CollectionCoverSet"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CollectionCoverOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The attachment does not exist or is not visible to the caller — one answer for both. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    clear_collection_cover_api_collection_covers__kind___key__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "tag" | "month" | "year";
+                /** @description The collection's key: a tag name exactly as memos carry it (letters, digits and underscores, without the hash sign), a month as four-digit year, hyphen and two-digit month (2031-03), or a year as four digits (2031). */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
             503: components["responses"]["DatabaseBusy"];
