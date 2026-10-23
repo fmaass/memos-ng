@@ -8,11 +8,11 @@ exclusion) exactly as if it did not exist — `_viewable`'s 404, one answer for 
 """
 
 from collections.abc import Sequence
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import ColumnElement, select
 from sqlalchemy.exc import IntegrityError
@@ -71,6 +71,7 @@ SpanBound = Annotated[
     Field(description="An instant with its UTC offset; a value without one is refused."),
 ]
 Zone = Annotated[str, Field(description="The IANA zone the span was picked in; display only.")]
+CollectionKind = Literal["trip", "album"]
 
 
 def _no_default(schema: dict[str, Any]) -> None:
@@ -80,6 +81,11 @@ def _no_default(schema: dict[str, Any]) -> None:
 class CollectionOut(BaseModel):
     uid: str
     title: str
+    kind: CollectionKind = Field(
+        description="`trip`: its members are its tag's and its span's pictures, minus its "
+        "exclusions. `album`: no tag and no span; its members are the pictures added to it one by "
+        "one. Fixed when the collection is created."
+    )
     tag: str | None
     spanStart: Rfc3339Datetime | None
     spanEnd: Rfc3339Datetime | None
@@ -96,6 +102,11 @@ class CollectionOut(BaseModel):
 
 class CollectionCreate(BaseModel):
     title: Title
+    kind: CollectionKind = Field(
+        default="trip",
+        description="`trip` needs a tag, a span, or both; `album` takes neither. It cannot be "
+        "changed later.",
+    )
     tag: CollectionTag | None = None
     spanStart: SpanBound | None = None
     spanEnd: SpanBound | None = None
@@ -121,6 +132,14 @@ class CollectionPatch(BaseModel):
     tz: Zone | None = None
     coverAttachmentUid: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _kind_is_fixed(cls, data: Any) -> Any:
+        # `kind` is not a field here, and an ignored extra would read as accepted: refuse it.
+        if isinstance(data, dict) and "kind" in data:
+            raise ValueError("kind cannot be changed")
+        return data
+
 
 # The wire's names for the service's fields; `coverAttachmentUid` is resolved separately.
 _FIELDS = {
@@ -141,6 +160,23 @@ def _invalid(exc: coll_svc.CollectionInvalid) -> HTTPException:
 
 def _collection_gone() -> HTTPException:
     return HTTPException(status_code=404, detail="Collection not found")
+
+
+def _refuse_album(collection: Collection) -> None:
+    """Exclusions carve pictures out of a trip's derived members; an album has nothing derived to
+    carve, and a picture leaves it by its member row."""
+    if collection.kind == "album":
+        raise HTTPException(status_code=409, detail="albumHasNoExclusions")
+
+
+_EXCLUSION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_NOT_FOUND,
+    409: {
+        "description": "The collection is an album, which has no exclusions "
+        '(detail "albumHasNoExclusions"). Nothing was changed.',
+        "content": _DETAIL,
+    },
+}
 
 
 async def _collection(db: AsyncSession, uid: str) -> Collection:
@@ -184,6 +220,7 @@ async def _render(
                 spanStart=c.span_start,
                 spanEnd=c.span_end,
                 tz=c.tz,
+                kind=cast(CollectionKind, c.kind),
                 cover=covers.get(c.cover_attachment_id)
                 if c.cover_attachment_id is not None
                 else None,
@@ -200,10 +237,12 @@ async def _render(
 async def list_collections(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    kind: CollectionKind | SkipJsonSchema[None] = None,
 ) -> list[CollectionOut]:
-    """Every collection of the household, the latest span first and span-less ones last, each
-    with the caller's member count and cover."""
-    return await _render(db, user, await coll_svc.list_collections(db))
+    """Every collection of the household, each with the caller's member count and cover: the
+    trips first, the latest span first and span-less ones last, then the albums, the most recently
+    changed first. `kind` narrows the list to trips or to albums."""
+    return await _render(db, user, await coll_svc.list_collections(db, kind))
 
 
 @router.post("/collections", response_model=CollectionOut, status_code=201, responses=_NOT_FOUND)
@@ -212,8 +251,9 @@ async def create_collection(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> CollectionOut:
-    """Store a collection: it needs a tag, or both span bounds, or all three. A cover the caller
-    may not see is a 404. With `idempotencyKey`, a replay answers 201 with the stored record."""
+    """Store a collection. A trip needs a tag, or both span bounds, or all three; an album takes
+    neither. A cover the caller may not see is a 404. With `idempotencyKey`, a replay answers 201
+    with the stored record."""
     user_id = user.id
     if body.idempotencyKey is not None:
         # The replay FIRST, before the cover is resolved: a retry whose response was lost may name
@@ -238,6 +278,7 @@ async def create_collection(
             db,
             user,
             title=body.title,
+            kind=body.kind,
             tag=body.tag,
             span_start=body.spanStart,
             span_end=body.spanEnd,
@@ -271,8 +312,9 @@ async def update_collection(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> CollectionOut:
     """Change the named fields: an absent field stays, null clears it (`title` excepted). The
-    resulting record must still be a valid collection (422 otherwise, nothing changed). Any member
-    may edit any collection; the last write wins. A cover the caller may not see is a 404."""
+    resulting record must still be a valid collection (422 otherwise, nothing changed): an album
+    takes no tag and no span, and `kind` cannot be sent. Any member may edit any collection; the
+    last write wins. A cover the caller may not see is a 404."""
     collection = await _collection(db, uid)
     sent = body.model_dump(exclude_unset=True)
     changes: dict[str, object] = {_FIELDS[k]: v for k, v in sent.items() if k in _FIELDS}
@@ -304,16 +346,21 @@ async def delete_collection(
     await db.commit()
 
 
-@router.put("/collections/{uid}/exclusions/{attachment_uid}", status_code=204, responses=_NOT_FOUND)
+@router.put(
+    "/collections/{uid}/exclusions/{attachment_uid}",
+    status_code=204,
+    responses=_EXCLUSION_RESPONSES,
+)
 async def exclude_attachment(
     uid: str,
     attachment_uid: str,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Take one attachment out of this collection's members. Idempotent: excluding it again
-    changes nothing and answers 204 again."""
+    """Take one attachment out of this trip's members. Idempotent: excluding it again changes
+    nothing and answers 204 again. An album answers 409."""
     collection = await _collection(db, uid)
+    _refuse_album(collection)
     attachment = await _viewable(db, user, attachment_uid)
     try:
         await coll_svc.exclude(db, collection, attachment)
@@ -327,7 +374,9 @@ async def exclude_attachment(
 
 
 @router.delete(
-    "/collections/{uid}/exclusions/{attachment_uid}", status_code=204, responses=_NOT_FOUND
+    "/collections/{uid}/exclusions/{attachment_uid}",
+    status_code=204,
+    responses=_EXCLUSION_RESPONSES,
 )
 async def include_attachment(
     uid: str,
@@ -335,8 +384,10 @@ async def include_attachment(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
-    """Put an excluded attachment back. Idempotent: one that is not excluded stays a member."""
+    """Put an excluded attachment back. Idempotent: one that is not excluded stays a member. An
+    album answers 409."""
     collection = await _collection(db, uid)
+    _refuse_album(collection)
     attachment = await _viewable(db, user, attachment_uid)
     await coll_svc.include(db, collection, attachment)
     await db.commit()
@@ -401,7 +452,7 @@ async def list_members(
     return await library_page(db, user, response, filters, order, limit, cursor)
 
 
-InclusionOutcome = Literal["added", "alreadyMember", "notOwner", "orphan", "error"]
+InclusionOutcome = Literal["added", "alreadyMember", "notOwner", "notVisible", "orphan", "error"]
 
 
 class CollectionInclusion(BaseModel):
@@ -415,12 +466,15 @@ class CollectionInclusion(BaseModel):
 class InclusionResult(BaseModel):
     attachmentUid: str
     outcome: InclusionOutcome = Field(
-        description="`added`: it is a member now — its memo carries the trip's tag and its "
-        "exclusion, if any, is gone. `alreadyMember`: it was one; nothing was written. "
-        "`notOwner`: it hangs on another member's memo, or it does not exist or is not visible "
-        "to the caller — one answer for all three; nothing was written. `orphan`: it hangs on no "
-        "memo, so no tag can make it a member. `error`: its memo's edit failed and was rolled "
-        "back; the other memos' answers stand."
+        description="`added`: it is a member now — in a trip, its memo carries the trip's tag "
+        "and its exclusion, if any, is gone; in an album, it was added to the album. "
+        "`alreadyMember`: it was one; nothing was written. `notOwner` (trips only): it hangs on "
+        "another member's memo, or it does not exist or is not visible to the caller — one answer "
+        "for all three; nothing was written. `notVisible` (albums only): it does not exist or is "
+        "not visible to the caller — one answer for both; nothing was written. `orphan`: it hangs "
+        "on no memo or is detached, so it cannot be a member. `error`: its write failed and was "
+        "rolled back — in a trip its memo's edit, in an album that one picture; the other answers "
+        "stand."
     )
 
 
@@ -434,8 +488,8 @@ _INCLUSION_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_UNAUTHORIZED,
     404: {"description": "No such collection. Nothing was changed.", "content": _DETAIL},
     409: {
-        "description": "The collection has no tag, so no memo can be tagged into it. Nothing "
-        "was changed.",
+        "description": "The collection is a trip with no tag, so no memo can be tagged into it. "
+        "Nothing was changed.",
         "content": _DETAIL,
     },
 }
@@ -503,6 +557,47 @@ async def _include_from_memo(
     return out
 
 
+async def _add_to_album(
+    db: AsyncSession, user: User, collection_id: int, wanted: list[str]
+) -> CollectionInclusionOut:
+    """The album half of the batch add. The read is bounded by the library's visibility, so a
+    picture that does not exist and one the caller may not see are the same `notVisible`. Each
+    remaining picture is its own transaction, in id order: one that fails is rolled back and
+    answers `error`, and the pictures before and after it keep their answers."""
+    user_id = user.id
+    outcomes: dict[str, InclusionOutcome] = dict.fromkeys(wanted, "notVisible")
+    seen = (
+        await db.execute(
+            select(Attachment.id, Attachment.uid, Attachment.memo_id, Attachment.detached_at)
+            .outerjoin(Memo, Memo.id == Attachment.memo_id)
+            .where(Attachment.uid.in_(wanted), library_visible(user))
+        )
+    ).all()
+    to_add: list[tuple[int, str]] = []
+    for att_id, att_uid, memo_id, detached_at in seen:
+        if memo_id is None or detached_at is not None:
+            outcomes[att_uid] = "orphan"
+        else:
+            to_add.append((att_id, att_uid))
+    await db.rollback()  # end the read's transaction; each picture opens its own
+    for att_id, att_uid in sorted(to_add):
+        try:
+            outcome: InclusionOutcome = await coll_svc.add_member(
+                db, collection_id, att_id, added_by=user_id
+            )
+            await db.commit()
+        except Exception:
+            # Reported per uid, never swallowed: this picture's write is rolled back and answers
+            # `error`, while the pictures already committed keep their answers.
+            await db.rollback()
+            logger.exception("collection.album_add.failed", attachment_id=att_id)
+            outcome = "error"
+        outcomes[att_uid] = outcome
+    return CollectionInclusionOut(
+        results=[InclusionResult(attachmentUid=u, outcome=outcomes[u]) for u in wanted]
+    )
+
+
 @router.post(
     "/collections/{uid}/attachments",
     response_model=CollectionInclusionOut,
@@ -514,12 +609,21 @@ async def include_attachments(
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> CollectionInclusionOut:
-    """Make pictures members of this trip by tagging their memos with the trip's tag: the tag is
-    appended to each memo's text once (its other tags kept), and each named picture's exclusion
-    is cleared. Tagging a memo admits its other pictures too; their own exclusions stay. Only the
-    caller's own memos are edited, one transaction per memo, and each uid gets its own answer.
-    A collection without a tag is a 409."""
+    """Make pictures members of this collection; each uid gets its own answer.
+
+    A trip: each picture's memo is tagged with the trip's tag — appended to the memo's text once,
+    its other tags kept — and each named picture's exclusion is cleared. Tagging a memo admits its
+    other pictures too; their own exclusions stay. Only the caller's own memos are edited, one
+    transaction per memo. A trip without a tag is a 409.
+
+    An album: each named picture is added on its own, and nothing else — not its memo, not the
+    memo's other pictures. Any picture the caller can see may be added, one transaction per
+    picture."""
     collection = await _collection(db, uid)
+    if collection.kind == "album":
+        return await _add_to_album(
+            db, user, collection.id, list(dict.fromkeys(body.attachmentUids))
+        )
     if collection.tag is None:
         raise HTTPException(status_code=409, detail="This collection has no tag to add")
     # Plain values and one built clause: a memo transaction that rolls back expires every loaded
@@ -561,3 +665,49 @@ async def include_attachments(
     return CollectionInclusionOut(
         results=[InclusionResult(attachmentUid=u, outcome=outcomes[u]) for u in wanted]
     )
+
+
+_MEMBER_DELETE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_UNAUTHORIZED,
+    404: {"description": "No such collection. Nothing was changed.", "content": _DETAIL},
+    409: {
+        "description": "The collection is a trip, whose members come from its tag and span "
+        '(detail "tripHasNoMemberRows"); exclude the picture instead. Nothing was changed.',
+        "content": _DETAIL,
+    },
+}
+
+
+@router.delete(
+    "/collections/{uid}/members/{attachment_uid}",
+    status_code=204,
+    responses=_MEMBER_DELETE_RESPONSES,
+)
+async def remove_member(
+    uid: str,
+    attachment_uid: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Take one picture out of this album. Idempotent: a picture that is not in the album — or
+    that does not exist, or that the caller may not see — changes nothing and answers 204 too. A
+    trip answers 409."""
+    collection = await _collection(db, uid)
+    if collection.kind != "album":
+        raise HTTPException(status_code=409, detail="tripHasNoMemberRows")
+    collection_id = collection.id
+    found = (
+        await db.execute(
+            select(Attachment.id)
+            .outerjoin(Memo, Memo.id == Attachment.memo_id)
+            .where(Attachment.uid == attachment_uid, library_visible(user))
+        )
+    ).scalar_one_or_none()
+    if found is None:
+        return
+    try:
+        await coll_svc.remove_member(db, collection_id, found)
+    except coll_svc.CollectionGone as exc:
+        await db.rollback()
+        raise _collection_gone() from exc
+    await db.commit()

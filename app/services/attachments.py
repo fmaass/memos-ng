@@ -19,6 +19,7 @@ from app.models import (
     Attachment,
     Collection,
     CollectionExclusion,
+    CollectionMember,
     Memo,
     Tag,
     User,
@@ -149,7 +150,18 @@ def collection_member_clause(collection: Collection) -> ColumnElement[bool]:
     over `attachments` OUTER JOINED to `memos`, exactly as `GET /api/attachments` builds its query,
     so the correlated `Memo` columns resolve against that join and nothing a member sees can differ
     from what the library shows the same caller.
+
+    An ALBUM (MEMNG-802) has no tag and no span: its one arm is its own `collection_members` row,
+    and exclusions do not apply to it — a picture leaves an album by losing that row. The memo and
+    detachment terms stay OUTSIDE the kind switch, so a detached album member leaves the listing
+    exactly as a trip's does.
     """
+    if collection.kind == "album":
+        held = exists().where(
+            CollectionMember.collection_id == collection.id,
+            CollectionMember.attachment_id == Attachment.id,
+        )
+        return and_(Attachment.memo_id.is_not(None), Attachment.detached_at.is_(None), held)
     arms: list[ColumnElement[bool]] = []
     if collection.tag is not None:
         arms.append(tagged_clause(collection.tag))

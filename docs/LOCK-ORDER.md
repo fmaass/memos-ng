@@ -24,7 +24,7 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
 | F | `frame_share_jobs` | `frame_share_jobs.id` |
 | E | `export_settings` | singleton |
 | D | digest settings / runs | singleton |
-| C | `collections` (+ `collection_exclusions`, `collection_covers`) | `collections.id`; `collection_covers` by `(kind, key)` — after A, never before; one row when taken explicitly (`update_collection`, `collection_covers.set_cover`), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |
+| C | `collections` (+ `collection_exclusions`, `collection_members`, `collection_covers`) | `collections.id`; `collection_covers` by `(kind, key)` — after A, never before; one row when taken explicitly (`update_collection`, `collection_covers.set_cover`, `add_member` / `remove_member`), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |
 
 Within a class, acquire **ascending by canonical key, in ONE statement per class per
 transaction**.
@@ -129,7 +129,14 @@ INSERT of a private row, which is not an acquisition (R8).
   cover of a tag, month or year collection) takes the same `_hold_cover` FOR KEY SHARE and then
   writes its ONE `collection_covers` row by upsert; `clear_cover` deletes one such row and takes
   no A. An attachment delete reaches every cover row naming it through ON DELETE CASCADE, after A,
-  so the edge is again **A < C**. F is acquired only after A and the frame worker reads
+  so the edge is again **A < C**. An album's member writes (MEMNG-802) take the same shape:
+  `collections.add_member` and `collections.remove_member` each take FOR KEY SHARE on the ONE
+  picture's row (`_hold_member_attachment`, A) FIRST, then FOR NO KEY UPDATE on the ONE album row
+  (`_lock_album`, C), then insert or delete the `collection_members` row and write the album's
+  `updated_at` under that lock — one picture per transaction, so each class is still one row,
+  and **A < C** again. Holding A first is what keeps an attachment delete (A FOR UPDATE, then the
+  cover SET NULL and the member CASCADE, in either order) from meeting a member write in reverse.
+  F is acquired only after A and the frame worker reads
   A/M unlocked, so F sits last and never inverts.
   **The one M–C operation (MEMNG-785):** `POST /api/collections/{uid}/attachments`
   (`routers.collections._include_from_memo`) runs one transaction per memo: `lock_memo_for_write`

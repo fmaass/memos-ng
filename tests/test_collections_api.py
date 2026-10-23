@@ -46,8 +46,8 @@ INSIDE = "2031-03-05T12:00:00Z"
 OUTSIDE = "2031-06-01T12:00:00Z"
 TAG = "c746t"
 
-# The eight operations MEMNG-746 added and the inclusion MEMNG-785 adds, and nothing else under
-# the prefix.
+# The eight operations MEMNG-746 added, the inclusion MEMNG-785 adds and the album member removal
+# MEMNG-802 adds, and nothing else under the prefix.
 OPERATIONS = {
     ("get", "/api/collections"),
     ("post", "/api/collections"),
@@ -58,6 +58,7 @@ OPERATIONS = {
     ("delete", "/api/collections/{uid}/exclusions/{attachment_uid}"),
     ("get", "/api/collections/{uid}/attachments"),
     ("post", "/api/collections/{uid}/attachments"),
+    ("delete", "/api/collections/{uid}/members/{attachment_uid}"),
 }
 
 
@@ -204,6 +205,7 @@ def test_crud_round_trip_answers_every_field(lib):
     assert set(made) == {
         "uid",
         "title",
+        "kind",
         "tag",
         "spanStart",
         "spanEnd",
@@ -315,6 +317,7 @@ def test_anonymous_is_401_on_every_route(lib):
         ("DELETE", f"/api/collections/{uid}/exclusions/anon-a", None),
         ("GET", f"/api/collections/{uid}/attachments", None),
         ("POST", f"/api/collections/{uid}/attachments", {"attachmentUids": ["anon-a"]}),
+        ("DELETE", f"/api/collections/{uid}/members/anon-a", None),
     ]
     assert {(m.lower(), p.replace(uid, "{uid}").replace("anon-a", "{attachment_uid}"))
             for m, p, _ in calls} == OPERATIONS  # fmt: skip
@@ -907,7 +910,7 @@ def _document(routes: list[Any]) -> dict[str, Any]:
     return schema
 
 
-def test_openapi_names_exactly_the_nine_collection_operations():
+def test_openapi_names_exactly_the_ten_collection_operations():
     paths = app.openapi()["paths"]
     found = {
         (method, path)

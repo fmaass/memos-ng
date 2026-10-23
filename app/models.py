@@ -408,20 +408,28 @@ COLLECTION_CREATE_KEY_CONSTRAINT = "uq_collections_creator_idempotency_key"
 
 
 class Collection(Base):
-    """A trip: a household-shared record of which attachments belong together (MEMNG-746).
+    """A trip or an album: a household-shared record of which attachments belong together
+    (MEMNG-746, albums MEMNG-802).
 
-    Membership is DERIVED, never stored — the media whose memo carries `tag` OR whose library date
-    lies inside `[span_start, span_end]`, minus the exclusion rows
-    (`app/services/attachments.collection_member_clause`). Every signed-in member may read and edit
-    every collection, so `created_by` records who made it and grants nothing; it outlives its
-    creator (SET NULL), as a household object should. The three CHECKs are the record's shape: a
-    source must exist, a span is whole or absent, and it is not reversed. `tz` is the civil zone the
+    A TRIP's membership is DERIVED, never stored — the media whose memo carries `tag` OR whose
+    library date lies inside `[span_start, span_end]`, minus the exclusion rows. An ALBUM has no tag
+    and no span; its members are the `collection_members` rows, picked one by one
+    (`app/services/attachments.collection_member_clause` switches on `kind`). Every signed-in
+    member may read and edit every collection, so `created_by` records who made it and grants
+    nothing; it outlives its creator (SET NULL), as a household object should. The CHECKs are the
+    record's shape: a known kind, a trip has a source and an album has none, a span is whole or
+    absent, and it is not reversed. `tz` is the civil zone the
     client picked the bounds in, for display only — the bounds are instants and never move with it.
     """
 
     __tablename__ = "collections"
     __table_args__ = (
-        CheckConstraint("tag IS NOT NULL OR span_start IS NOT NULL", name="ck_collections_source"),
+        CheckConstraint("kind IN ('trip', 'album')", name="ck_collections_kind"),
+        CheckConstraint(
+            "(kind = 'trip' AND (tag IS NOT NULL OR span_start IS NOT NULL)) "
+            "OR (kind = 'album' AND tag IS NULL AND span_start IS NULL AND span_end IS NULL)",
+            name="ck_collections_source",
+        ),
         CheckConstraint(
             "(span_start IS NULL) = (span_end IS NULL)", name="ck_collections_span_pair"
         ),
@@ -438,6 +446,8 @@ class Collection(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(255))
+    # Fixed at create: `trip` or `album` (ck_collections_kind); never edited.
+    kind: Mapped[str] = mapped_column(String(8), server_default="trip")
     tag: Mapped[str | None] = mapped_column(String(255))
     span_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     span_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -468,6 +478,24 @@ class CollectionExclusion(Base):
     attachment_id: Mapped[int] = mapped_column(
         ForeignKey("attachments.id", ondelete="CASCADE"), primary_key=True, index=True
     )
+
+
+class CollectionMember(Base):
+    """One picture an album holds (MEMNG-802). A row, keyed by the pair, so two concurrent adds of
+    the same picture are one row and either side's deletion takes it along. It survives the
+    picture's detachment — the membership clause's `detached_at` term hides it — and goes only with
+    the attachment row or the album. `added_by` records who added it and grants nothing."""
+
+    __tablename__ = "collection_members"
+
+    collection_id: Mapped[int] = mapped_column(
+        ForeignKey("collections.id", ondelete="CASCADE"), primary_key=True
+    )
+    attachment_id: Mapped[int] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    added_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
 
 class CollectionCover(Base):

@@ -190,6 +190,26 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.6.0
+
+- Albums: a collection can now be an album — a title and pictures picked one by one, with no tag
+  and no span. `POST /api/collections` takes `kind` (`trip`, the default, or `album`); an album with
+  a tag or a span answers 422. Every collection carries `kind`, and `GET /api/collections?kind=`
+  narrows the list; the list shows the trips as before, then the albums, the most recently changed
+  first. `kind` cannot be changed: sending it in a `PATCH` answers 422, as does a tag or a span on
+  an album; a title or cover change succeeds.
+- `POST /api/collections/{uid}/attachments` adds pictures to an album one by one — only the named
+  picture, never its memo's other pictures, and without editing any memo. Anyone signed in may add
+  any picture they can see. Each uid answers `added`, `alreadyMember`, `notVisible` (it does not
+  exist or the caller cannot see it), `orphan` (no memo, or detached) or `error` (that one write
+  failed; the others stand). Trips answer exactly as before.
+- `DELETE /api/collections/{uid}/members/{attachment_uid}` takes one picture out of an album (204,
+  idempotent). On a trip it answers 409 `tripHasNoMemberRows`; the exclusion routes answer 409
+  `albumHasNoExclusions` on an album. Adding or removing a picture moves the album's `updatedAt`.
+- Migration `294410e70c5f` adds `collections.kind` (default `trip`, so existing collections become
+  trips without a rewrite), rewrites the source check per kind, and adds the `collection_members`
+  table (additive only).
+
 ### v2.5.0
 
 - Tag, month and year collections can carry a chosen cover picture. `GET /api/collection-covers`

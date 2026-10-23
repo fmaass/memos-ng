@@ -13,20 +13,27 @@ bad record is a `CollectionInvalid`, never an IntegrityError from the CHECKs tha
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import cast
+from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Attachment, Collection, CollectionExclusion, Memo, User
+from app.models import Attachment, Collection, CollectionExclusion, CollectionMember, Memo, User
 from app.services.attachments import collection_member_clause, library_filters
 from app.services.memos import gen_uid
 
 # What `update_collection` may change. `uid`, `created_by`, the key and the timestamps are the
 # record's identity and history, not its content.
 EDITABLE_FIELDS = frozenset({"title", "tag", "span_start", "span_end", "tz", "cover_attachment_id"})
+
+# A collection's kind is fixed at create. A trip's members are derived from its tag and span; an
+# album's are its `collection_members` rows (MEMNG-802).
+KINDS = ("trip", "album")
+
+# What an album add did with one picture; the router adds `notVisible` and `error`.
+MemberAdd = Literal["added", "alreadyMember", "orphan"]
 
 # A keyed create that loses the race reads the winner back. The winner can only be gone if it was
 # deleted between the conflict and the read, so a second pass inserts afresh; a third would mean
@@ -35,14 +42,20 @@ _CREATE_ATTEMPTS = 3
 
 
 class CollectionInvalid(ValueError):
-    """The record would break the collection's shape: no tag and no span, half a span, a reversed
-    span, a bound without an offset, an empty tag, or a `tz` that is no IANA zone. The router
+    """The record would break the collection's shape: a trip with no tag and no span, an album with
+    either, an unknown kind, half a span, a reversed span, a bound without an offset, an empty tag,
+    or a `tz` that is no IANA zone. The router
     answers it with 422; the database's CHECKs stay behind it as the last line."""
 
 
 class CollectionGone(LookupError):
     """The collection was deleted between the caller loading it and this write; the router
     answers it as it answers an unknown uid."""
+
+
+class MemberAttachmentGone(LookupError):
+    """The picture an album add names was deleted between the route's read and this write; the
+    router answers that one picture `error` and the others stand."""
 
 
 class CoverGone(LookupError):
@@ -68,6 +81,7 @@ async def _hold_cover(db: AsyncSession, cover_attachment_id: int | None) -> None
 
 def _validate(
     *,
+    kind: str,
     tag: str | None,
     span_start: datetime | None,
     span_end: datetime | None,
@@ -80,7 +94,14 @@ def _validate(
             raise CollectionInvalid("a span bound must carry a UTC offset")
     if (span_start is None) != (span_end is None):
         raise CollectionInvalid("a span needs both bounds")
-    if tag is None and span_start is None:
+    if kind not in KINDS:
+        raise CollectionInvalid("kind is neither trip nor album")
+    if kind == "album":
+        if tag is not None:
+            raise CollectionInvalid("an album has no tag")
+        if span_start is not None or span_end is not None:
+            raise CollectionInvalid("an album has no span")
+    elif tag is None and span_start is None:
         raise CollectionInvalid("a collection needs a tag, a span, or both")
     if span_start is not None and span_end is not None and span_end < span_start:
         raise CollectionInvalid("the span ends before it starts")
@@ -105,6 +126,7 @@ async def create_collection(
     user: User,
     *,
     title: str,
+    kind: str = "trip",
     tag: str | None = None,
     span_start: datetime | None = None,
     span_end: datetime | None = None,
@@ -126,7 +148,7 @@ async def create_collection(
         existing = await get_by_idempotency_key(db, user.id, idempotency_key)
         if existing is not None:
             return existing, False
-    _validate(tag=tag, span_start=span_start, span_end=span_end, tz=tz)
+    _validate(kind=kind, tag=tag, span_start=span_start, span_end=span_end, tz=tz)
     try:
         await _hold_cover(db, cover_attachment_id)
     except CoverGone:
@@ -140,6 +162,7 @@ async def create_collection(
     values = {
         "uid": gen_uid(),
         "title": title,
+        "kind": kind,
         "tag": tag,
         "span_start": span_start,
         "span_end": span_end,
@@ -181,14 +204,30 @@ async def get_collection(db: AsyncSession, uid: str) -> Collection | None:
     return (await db.execute(select(Collection).where(Collection.uid == uid))).scalar_one_or_none()
 
 
-async def list_collections(db: AsyncSession) -> list[Collection]:
-    """Every collection (a household object), the latest span first and span-less ones last."""
-    stmt = select(Collection).order_by(
-        Collection.span_start.desc().nulls_last(),
-        Collection.created_at.desc(),
-        Collection.id.desc(),
-    )
-    return list((await db.execute(stmt)).scalars().all())
+async def list_collections(db: AsyncSession, kind: str | None = None) -> list[Collection]:
+    """Every collection (a household object), or only those of `kind`: the trips first, the latest
+    span first and span-less ones last, then the albums, the most recently changed first — an album
+    has no date, and adding or removing a picture counts as a change."""
+    out: list[Collection] = []
+    if kind in (None, "trip"):
+        trips = (
+            select(Collection)
+            .where(Collection.kind == "trip")
+            .order_by(
+                Collection.span_start.desc().nulls_last(),
+                Collection.created_at.desc(),
+                Collection.id.desc(),
+            )
+        )
+        out.extend((await db.execute(trips)).scalars().all())
+    if kind in (None, "album"):
+        albums = (
+            select(Collection)
+            .where(Collection.kind == "album")
+            .order_by(Collection.updated_at.desc(), Collection.id.desc())
+        )
+        out.extend((await db.execute(albums)).scalars().all())
+    return out
 
 
 async def update_collection(
@@ -226,6 +265,7 @@ async def update_collection(
         return changes[name] if name in changes else getattr(collection, name)
 
     _validate(
+        kind=collection.kind,
         tag=cast(str | None, after("tag")),
         span_start=cast(datetime | None, after("span_start")),
         span_end=cast(datetime | None, after("span_end")),
@@ -239,7 +279,8 @@ async def update_collection(
 
 
 async def delete_collection(db: AsyncSession, collection: Collection) -> None:
-    """Remove the record; its exclusion rows go with it by the FK's ON DELETE CASCADE."""
+    """Remove the record; its exclusion and member rows go with it by the FKs' ON DELETE
+    CASCADE."""
     await db.delete(collection)
     await db.flush()
 
@@ -287,3 +328,91 @@ async def member_count(db: AsyncSession, collection: Collection, user: User) -> 
         .where(*library_filters(user, None, None), collection_member_clause(collection))
     )
     return (await db.execute(stmt)).scalar_one()
+
+
+async def _hold_member_attachment(
+    db: AsyncSession, attachment_id: int
+) -> tuple[int | None, datetime | None] | None:
+    """FOR KEY SHARE on the picture's row, BEFORE any collection row (A < C, docs/LOCK-ORDER.md):
+    held, it cannot be deleted under this write, so the member row's FK has nothing to wait on.
+    Returns its `(memo_id, detached_at)` as the lock read them, or None when it is gone."""
+    held = await db.execute(
+        select(Attachment.memo_id, Attachment.detached_at)
+        .where(Attachment.id == attachment_id)
+        .with_for_update(read=True, key_share=True)
+        .execution_options(populate_existing=True)
+    )
+    row = held.one_or_none()
+    return None if row is None else (row[0], row[1])
+
+
+async def _lock_album(db: AsyncSession, collection_id: int) -> None:
+    """FOR NO KEY UPDATE on the album row, after the picture's KEY SHARE: two writes to one album's
+    members take turns here, and the row's `updated_at` is then written under a lock already held.
+    A collection deleted meanwhile raises `CollectionGone`."""
+    locked = await db.execute(
+        select(Collection.id).where(Collection.id == collection_id).with_for_update(key_share=True)
+    )
+    if locked.scalar_one_or_none() is None:
+        raise CollectionGone(collection_id)
+
+
+async def _touch(db: AsyncSession, collection_id: int) -> None:
+    """A member row is a child: writing it does not move the album's `updated_at` on its own, and
+    the list orders albums by it."""
+    await db.execute(
+        update(Collection).where(Collection.id == collection_id).values(updated_at=func.now())
+    )
+
+
+async def add_member(
+    db: AsyncSession, collection_id: int, attachment_id: int, added_by: int | None = None
+) -> MemberAdd:
+    """Put one picture into one album, inside the caller's transaction, which commits it.
+
+    The picture is held (A) and re-judged under that hold — one that lost its memo or was detached
+    since the route's read is `orphan` — then the album row is locked (C) and the pair inserted.
+    An existing pair, including one a concurrent add just committed, is `alreadyMember` and writes
+    nothing. A picture deleted meanwhile raises `MemberAttachmentGone`; an album deleted meanwhile
+    `CollectionGone`."""
+    held = await _hold_member_attachment(db, attachment_id)
+    if held is None:
+        raise MemberAttachmentGone(attachment_id)
+    memo_id, detached_at = held
+    if memo_id is None or detached_at is not None:
+        return "orphan"
+    await _lock_album(db, collection_id)
+    inserted = await db.execute(
+        pg_insert(CollectionMember)
+        .values(collection_id=collection_id, attachment_id=attachment_id, added_by=added_by)
+        .on_conflict_do_nothing(
+            index_elements=[CollectionMember.collection_id, CollectionMember.attachment_id]
+        )
+        .returning(CollectionMember.attachment_id)
+    )
+    if inserted.scalar_one_or_none() is None:
+        return "alreadyMember"
+    await _touch(db, collection_id)
+    return "added"
+
+
+async def remove_member(db: AsyncSession, collection_id: int, attachment_id: int) -> bool:
+    """Take one picture out of one album; True when a row was removed. Idempotent: a pair that is
+    not there removes nothing and moves nothing. The same order as `add_member` — the picture,
+    then the album row, then the member row — so the two never wait on each other in reverse, nor
+    on an attachment delete, which takes the picture first and the album's rows after it."""
+    if await _hold_member_attachment(db, attachment_id) is None:
+        return False  # the picture is gone, and its member rows went with it
+    await _lock_album(db, collection_id)
+    removed = await db.execute(
+        delete(CollectionMember)
+        .where(
+            CollectionMember.collection_id == collection_id,
+            CollectionMember.attachment_id == attachment_id,
+        )
+        .returning(CollectionMember.attachment_id)
+    )
+    if removed.scalar_one_or_none() is None:
+        return False
+    await _touch(db, collection_id)
+    return True

@@ -1006,6 +1006,16 @@
               "null"
             ]
           },
+          "kind": {
+            "default": "trip",
+            "description": "`trip` needs a tag, a span, or both; `album` takes neither. It cannot be changed later.",
+            "enum": [
+              "trip",
+              "album"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
           "spanEnd": {
             "description": "An instant with its UTC offset; a value without one is refused.",
             "format": "date-time",
@@ -1269,6 +1279,15 @@
               "null"
             ]
           },
+          "kind": {
+            "description": "`trip`: its members are its tag's and its span's pictures, minus its exclusions. `album`: no tag and no span; its members are the pictures added to it one by one. Fixed when the collection is created.",
+            "enum": [
+              "trip",
+              "album"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
           "memberCount": {
             "description": "How many members the CALLER can see.",
             "title": "Membercount",
@@ -1321,6 +1340,7 @@
         "required": [
           "uid",
           "title",
+          "kind",
           "tag",
           "spanStart",
           "spanEnd",
@@ -2267,11 +2287,12 @@
             "type": "string"
           },
           "outcome": {
-            "description": "`added`: it is a member now \u2014 its memo carries the trip's tag and its exclusion, if any, is gone. `alreadyMember`: it was one; nothing was written. `notOwner`: it hangs on another member's memo, or it does not exist or is not visible to the caller \u2014 one answer for all three; nothing was written. `orphan`: it hangs on no memo, so no tag can make it a member. `error`: its memo's edit failed and was rolled back; the other memos' answers stand.",
+            "description": "`added`: it is a member now \u2014 in a trip, its memo carries the trip's tag and its exclusion, if any, is gone; in an album, it was added to the album. `alreadyMember`: it was one; nothing was written. `notOwner` (trips only): it hangs on another member's memo, or it does not exist or is not visible to the caller \u2014 one answer for all three; nothing was written. `notVisible` (albums only): it does not exist or is not visible to the caller \u2014 one answer for both; nothing was written. `orphan`: it hangs on no memo or is detached, so it cannot be a member. `error`: its write failed and was rolled back \u2014 in a trip its memo's edit, in an album that one picture; the other answers stand.",
             "enum": [
               "added",
               "alreadyMember",
               "notOwner",
+              "notVisible",
               "orphan",
               "error"
             ],
@@ -6025,8 +6046,23 @@
     },
     "/api/collections": {
       "get": {
-        "description": "Every collection of the household, the latest span first and span-less ones last, each\nwith the caller's member count and cover.",
+        "description": "Every collection of the household, each with the caller's member count and cover: the\ntrips first, the latest span first and span-less ones last, then the albums, the most recently\nchanged first. `kind` narrows the list to trips or to albums.",
         "operationId": "list_collections_api_collections_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "enum": [
+                "trip",
+                "album"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -6057,6 +6093,16 @@
             },
             "description": "No valid session cookie or bearer token."
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
           "503": {
             "$ref": "#/components/responses/DatabaseBusy"
           }
@@ -6075,7 +6121,7 @@
         ]
       },
       "post": {
-        "description": "Store a collection: it needs a tag, or both span bounds, or all three. A cover the caller\nmay not see is a 404. With `idempotencyKey`, a replay answers 201 with the stored record.",
+        "description": "Store a collection. A trip needs a tag, or both span bounds, or all three; an album takes\nneither. A cover the caller may not see is a 404. With `idempotencyKey`, a replay answers 201\nwith the stored record.",
         "operationId": "create_collection_api_collections_post",
         "requestBody": {
           "content": {
@@ -6315,7 +6361,7 @@
         ]
       },
       "patch": {
-        "description": "Change the named fields: an absent field stays, null clears it (`title` excepted). The\nresulting record must still be a valid collection (422 otherwise, nothing changed). Any member\nmay edit any collection; the last write wins. A cover the caller may not see is a 404.",
+        "description": "Change the named fields: an absent field stays, null clears it (`title` excepted). The\nresulting record must still be a valid collection (422 otherwise, nothing changed): an album\ntakes no tag and no span, and `kind` cannot be sent. Any member may edit any collection; the\nlast write wins. A cover the caller may not see is a 404.",
         "operationId": "update_collection_api_collections__uid__patch",
         "parameters": [
           {
@@ -6591,7 +6637,7 @@
         ]
       },
       "post": {
-        "description": "Make pictures members of this trip by tagging their memos with the trip's tag: the tag is\nappended to each memo's text once (its other tags kept), and each named picture's exclusion\nis cleared. Tagging a memo admits its other pictures too; their own exclusions stay. Only the\ncaller's own memos are edited, one transaction per memo, and each uid gets its own answer.\nA collection without a tag is a 409.",
+        "description": "Make pictures members of this collection; each uid gets its own answer.\n\nA trip: each picture's memo is tagged with the trip's tag \u2014 appended to the memo's text once,\nits other tags kept \u2014 and each named picture's exclusion is cleared. Tagging a memo admits its\nother pictures too; their own exclusions stay. Only the caller's own memos are edited, one\ntransaction per memo. A trip without a tag is a 409.\n\nAn album: each named picture is added on its own, and nothing else \u2014 not its memo, not the\nmemo's other pictures. Any picture the caller can see may be added, one transaction per\npicture.",
         "operationId": "include_attachments_api_collections__uid__attachments_post",
         "parameters": [
           {
@@ -6668,7 +6714,7 @@
                 }
               }
             },
-            "description": "The collection has no tag, so no memo can be tagged into it. Nothing was changed."
+            "description": "The collection is a trip with no tag, so no memo can be tagged into it. Nothing was changed."
           },
           "422": {
             "content": {
@@ -6700,7 +6746,7 @@
     },
     "/api/collections/{uid}/exclusions/{attachment_uid}": {
       "delete": {
-        "description": "Put an excluded attachment back. Idempotent: one that is not excluded stays a member.",
+        "description": "Put an excluded attachment back. Idempotent: one that is not excluded stays a member. An\nalbum answers 409.",
         "operationId": "include_attachment_api_collections__uid__exclusions__attachment_uid__delete",
         "parameters": [
           {
@@ -6756,6 +6802,21 @@
             },
             "description": "No such collection, or the attachment it names does not exist or is not visible to the caller \u2014 one answer for all three. Nothing was changed."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The collection is an album, which has no exclusions (detail \"albumHasNoExclusions\"). Nothing was changed."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -6784,7 +6845,7 @@
         ]
       },
       "put": {
-        "description": "Take one attachment out of this collection's members. Idempotent: excluding it again\nchanges nothing and answers 204 again.",
+        "description": "Take one attachment out of this trip's members. Idempotent: excluding it again changes\nnothing and answers 204 again. An album answers 409.",
         "operationId": "exclude_attachment_api_collections__uid__exclusions__attachment_uid__put",
         "parameters": [
           {
@@ -6840,6 +6901,21 @@
             },
             "description": "No such collection, or the attachment it names does not exist or is not visible to the caller \u2014 one answer for all three. Nothing was changed."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The collection is an album, which has no exclusions (detail \"albumHasNoExclusions\"). Nothing was changed."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -6863,6 +6939,107 @@
           }
         ],
         "summary": "Exclude Attachment",
+        "tags": [
+          "collections"
+        ]
+      }
+    },
+    "/api/collections/{uid}/members/{attachment_uid}": {
+      "delete": {
+        "description": "Take one picture out of this album. Idempotent: a picture that is not in the album \u2014 or\nthat does not exist, or that the caller may not see \u2014 changes nothing and answers 204 too. A\ntrip answers 409.",
+        "operationId": "remove_member_api_collections__uid__members__attachment_uid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "attachment_uid",
+            "required": true,
+            "schema": {
+              "title": "Attachment Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such collection. Nothing was changed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The collection is a trip, whose members come from its tag and span (detail \"tripHasNoMemberRows\"); exclude the picture instead. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove Member",
         "tags": [
           "collections"
         ]
