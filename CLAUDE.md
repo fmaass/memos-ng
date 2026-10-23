@@ -217,7 +217,7 @@ met until its tests exist and pass.
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
-- Release records (book level): **4409** (v2.5.0, 2026-10-21, collection covers, MEMNG-853), **4407** (v2.4.1, 2026-10-21, family-wide favorites, MEMNG-888), **4294** (v2.3.1, 2026-10-13, consensus sibling election, MEMNG-797), **4290** (v2.3.0, 2026-10-13, sibling metadata; img-manager counterpart v0.22.0 is page 4291 in book 2597), **4089** (v2.0.0, 2026-09-26), **3872** (v1.7.3, 2026-09-20), **3856** (v1.7.2, 2026-09-19), **3846** (v1.7.1, 2026-09-18), **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
+- Release records (book level): **4447** (v2.6.0, 2026-10-23, albums, MEMNG-802), **4409** (v2.5.0, 2026-10-21, collection covers, MEMNG-853), **4407** (v2.4.1, 2026-10-21, family-wide favorites, MEMNG-888), **4294** (v2.3.1, 2026-10-13, consensus sibling election, MEMNG-797), **4290** (v2.3.0, 2026-10-13, sibling metadata; img-manager counterpart v0.22.0 is page 4291 in book 2597), **4089** (v2.0.0, 2026-09-26), **3872** (v1.7.3, 2026-09-20), **3856** (v1.7.2, 2026-09-19), **3846** (v1.7.1, 2026-09-18), **3837** (v1.7.0, 2026-09-18); earlier ones are 3043, 3049 and 3051.
 - ADRs (chapter 2690): ADR-0009 **1661**, ADR-0010 **1692**, ADR-0011 **1881**, ADR-0012 **1882**,
   ADR-0013 **2316**, ADR-0014 **2584**, ADR-0015 **3152** (native client; PAT bearer; HTTPS
   callback brokered by the BFF), ADR-0016 **3209** (universal links skipped — the custom scheme is
