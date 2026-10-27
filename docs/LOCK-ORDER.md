@@ -13,6 +13,10 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
                                             CASCADE; never with U/R/F, E or D — R11)
     M  <  C                                (the inclusion route only: M first, then the
                                             requested exclusion rows — R11)
+    C  <  P                                (the collection delete only: its ONE C row FOR
+                                            UPDATE, then that collection's live P rows
+                                            ascending in one statement; every other P holder
+                                            holds one P row and nothing else — trip pass P1)
 
 | | Table | Canonical key |
 |---|---|---|
@@ -25,6 +29,7 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
 | E | `export_settings` | singleton |
 | D | digest settings / runs | singleton |
 | C | `collections` (+ `collection_exclusions`, `collection_members`, `collection_covers`) | `collections.id`; `collection_covers` by `(kind, key)` — after A, never before; one row when taken explicitly (`update_collection`, `collection_covers.set_cover`, `add_member` / `remove_member`), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |
+| P | `passes` (+ `pass_devices`, `pass_events`, `pass_sync_state`) | `passes.id` — ONE row, FOR UPDATE, by `passes._lock_pass`; every pass change (edit, revoke, device revoke) takes it before writing the pass, its devices, its events or its sync row, and the transaction holds nothing of another class. The moderation verbs never hold it: they read the pass, end that transaction, and then write exclusions / member rows / reclaims exactly as the collection and attachment-delete paths do. `collections.delete_collection` is the one path that co-holds: the collection row FOR UPDATE (which also blocks an issue racing it — the issue's insert takes KEY SHARE on that row), then `passes.revoke_collection_passes` takes that collection's live passes ascending in ONE statement, revokes each, and the delete's SET NULL touches the same rows again. So the only order the two meet in is C → P, and nothing holding P reaches for C |
 
 Within a class, acquire **ascending by canonical key, in ONE statement per class per
 transaction**.

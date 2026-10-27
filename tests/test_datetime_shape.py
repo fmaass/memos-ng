@@ -297,6 +297,14 @@ EXPECTED_DATETIME_FIELDS = {
     ("PatOut", "created_at"),
     ("PatOut", "expires_at"),
     ("PatOut", "last_used"),
+    ("ContributionOut", "createdAt"),
+    ("PassDeviceOut", "firstSeen"),
+    ("PassDeviceOut", "lastSeen"),
+    ("PassDeviceOut", "revokedAt"),
+    ("PassOut", "createdAt"),
+    ("PassOut", "expiresAt"),
+    ("PassOut", "revokedAt"),
+    ("PassOut", "updatedAt"),
 }
 
 

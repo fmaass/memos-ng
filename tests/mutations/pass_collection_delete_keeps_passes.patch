@@ -1,0 +1,12 @@
+diff --git a/app/services/collections.py b/app/services/collections.py
+index 4b8c0aa..5ee8f07 100644
+--- a/app/services/collections.py
++++ b/app/services/collections.py
+@@ -288,7 +288,6 @@ async def delete_collection(
+     from app.services import passes as passes_svc  # passes builds on this module
+ 
+     await db.execute(select(Collection.id).where(Collection.id == collection.id).with_for_update())
+-    await passes_svc.revoke_collection_passes(db, collection.id, actor)
+     await db.delete(collection)
+     await db.flush()
+ 

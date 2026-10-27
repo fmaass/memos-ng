@@ -910,6 +910,19 @@ def _document(routes: list[Any]) -> dict[str, Any]:
     return schema
 
 
+# The trip-pass routes nested under a collection (trip pass P1). They belong to
+# `app.routers.passes`, not to this module, and are inventoried here only so the prefix stays
+# closed: anything else under `/api/collections` is still a failure.
+NESTED_PASS_OPERATIONS = {
+    ("post", "/api/collections/{uid}/passes"),
+    ("get", "/api/collections/{uid}/passes"),
+}
+
+
+def _pass_route(route: Any) -> bool:
+    return isinstance(route, APIRoute) and route.endpoint.__module__ == "app.routers.passes"
+
+
 def test_openapi_names_exactly_the_ten_collection_operations():
     paths = app.openapi()["paths"]
     found = {
@@ -918,12 +931,14 @@ def test_openapi_names_exactly_the_ten_collection_operations():
         if path.startswith("/api/collections")
         for method in item
     }
-    assert found == OPERATIONS
+    assert found == OPERATIONS | NESTED_PASS_OPERATIONS
+    nested_pass_paths = {path for _, path in NESTED_PASS_OPERATIONS}
     assert all(
-        _collection_route(r)
+        _pass_route(r) if r.path in nested_pass_paths else _collection_route(r)
         for r in app.routes
         if getattr(r, "path", "").startswith("/api/collections")
     )
+    assert any(_pass_route(r) for r in app.routes)  # control: the nested routes are served
     member_read = paths["/api/collections/{uid}/attachments"]["get"]
     assert "X-Next-Cursor" in member_read["responses"]["200"]["headers"]
     params = {p["name"]: p for p in member_read["parameters"]}

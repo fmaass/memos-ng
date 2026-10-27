@@ -1,0 +1,13 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index 83888c3..6866676 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -288,7 +288,7 @@ async def _revoke_locked(
+         .values(revoked_at=now, revoked_version=locked.version)
+     )
+     await _event(db, locked, "revoked", actor=actor, detail=detail)
+-    await _request_push(db, locked.id, urgent=True)
++    await _request_push(db, locked.id, urgent=False)
+ 
+ 
+ async def revoke_collection_passes(db: AsyncSession, collection_id: int, actor: User | None) -> int:

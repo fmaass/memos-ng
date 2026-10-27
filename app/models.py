@@ -168,6 +168,17 @@ class Memo(Base):
     # Client-supplied retry token (MEMNG-110). NULL for every memo posted without one — the column
     # records what the client called this create, and nothing else reads it.
     idempotency_key: Mapped[str | None] = mapped_column(String(64))
+    # The trip pass a guest batch came in through (trip pass P1), NULL for every member memo. SET
+    # NULL: deleting a pass record must not delete what it brought in.
+    pass_id: Mapped[int | None] = mapped_column(
+        # use_alter: memos -> passes -> collections -> attachments -> memos is a cycle, and the
+        # metadata's table sort needs one edge it may leave out.
+        ForeignKey("passes.id", ondelete="SET NULL", use_alter=True, name="fk_memos_pass_id"),
+        index=True,
+    )
+    # A guest's caption, kept OUT of `content` on purpose: `content` is what `parse_tags` reads, and
+    # guest text must never choose a tag (app/services/passes.create_guest_memo).
+    guest_caption: Mapped[str | None] = mapped_column(Text)
 
     # selectin so async serialization can read tags/owner without a lazy-load error
     tags: Mapped[list["Tag"]] = relationship(
@@ -305,6 +316,18 @@ class Attachment(Base):
     exposure_bias_ev: Mapped[float | None] = mapped_column(Double)
     iso: Mapped[int | None] = mapped_column(Integer)
     camera_source: Mapped[str | None] = mapped_column(String(16))
+    # Who brought this picture in through a trip pass (trip pass P1); NULL for a member's upload.
+    # The name is copied, not joined, so "from Anna" survives the device record's deletion.
+    contributed_by_device_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "pass_devices.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_attachments_contributed_by_device_id",
+        ),
+        index=True,
+    )
+    contributor_name: Mapped[str | None] = mapped_column(String(64))
     # 0-based place in this memo's attachment order, written at finalize from the order the client
     # declared (`upload_uids`). NULL on every row that predates the column, and on an attachment
     # that belongs to no memo.
@@ -560,6 +583,208 @@ class Upload(Base):
     capture_source: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+PASS_SCOPES = ("contribute", "contribute_view")
+PASS_DEVICE_PLATFORMS = ("web", "clip", "app")
+PASS_EVENT_KINDS = (
+    "issued",
+    "updated",
+    "revoked",
+    "device_revoked",
+    "redeemed",
+    "named",
+    "upload_started",
+    "upload_finalized",
+    "refused",
+    "hidden",
+    "unhidden",
+    "removed",
+)
+INGEST_BATCH_STATES = ("open", "complete", "acked", "quarantined")
+
+
+def _in(column: str, values: Sequence[str]) -> str:
+    return f"{column} IN ({', '.join(repr(v) for v in values)})"
+
+
+class Pass(Base):
+    """A trip pass: a secret that lets guests put pictures into ONE collection (trip pass P1).
+
+    Home is the authority for it. Only the sha256 of the secret is stored. `version` is the pass's
+    epoch: every change raises it, the push to the ingest host carries it, and a revoke is one
+    terminal transition stamped with the version that performed it (`revoked_version`). The
+    collection link is SET NULL rather than CASCADE so that deleting a trip leaves the revoked
+    record a push still has to deliver; a pass without a collection is dead."""
+
+    __tablename__ = "passes"
+    __table_args__ = (
+        CheckConstraint(_in("scope", PASS_SCOPES), name="ck_passes_scope"),
+        CheckConstraint("max_devices > 0", name="ck_passes_max_devices"),
+        CheckConstraint("version > 0", name="ck_passes_version"),
+        CheckConstraint(
+            "(revoked_at IS NULL) = (revoked_version IS NULL)", name="ck_passes_revoked_pair"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    collection_id: Mapped[int | None] = mapped_column(
+        ForeignKey("collections.id", ondelete="SET NULL"), index=True
+    )
+    secret_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    label: Mapped[str] = mapped_column(String(255))
+    scope: Mapped[str] = mapped_column(String(16), server_default="contribute")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    max_devices: Mapped[int] = mapped_column(Integer, server_default="30")
+    byte_cap: Mapped[int] = mapped_column(BigInteger, server_default=str(50 * 1024**3))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    version: Mapped[int] = mapped_column(Integer, server_default="1")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_version: Mapped[int | None] = mapped_column(Integer)
+    revoked_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PassDevice(Base):
+    """One guest device enrolled on a pass. Enrollment happens on the ingest host; home holds a
+    mirror refreshed by the pull, keyed by the ingest host's device id (`uid`). A home revocation
+    is sticky: `revoked_version` is the pass version that performed it, and a pull never clears
+    it."""
+
+    __tablename__ = "pass_devices"
+    __table_args__ = (
+        CheckConstraint(_in("platform", PASS_DEVICE_PLATFORMS), name="ck_pass_devices_platform"),
+        CheckConstraint(
+            "(revoked_at IS NULL) = (revoked_version IS NULL)", name="ck_pass_devices_revoked_pair"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    pass_id: Mapped[int] = mapped_column(ForeignKey("passes.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str | None] = mapped_column(String(128), unique=True)
+    display_name: Mapped[str] = mapped_column(String(64))
+    platform: Mapped[str] = mapped_column(String(8))
+    user_agent: Mapped[str | None] = mapped_column(String(512))
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    uploads_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    bytes_total: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_version: Mapped[int | None] = mapped_column(Integer)
+
+
+class PassEvent(Base):
+    """The pass's audit trail: one row per transition, with the pass version it produced. A guest's
+    address is stored only as a hash."""
+
+    __tablename__ = "pass_events"
+    __table_args__ = (CheckConstraint(_in("kind", PASS_EVENT_KINDS), name="ck_pass_events_kind"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    pass_id: Mapped[int] = mapped_column(ForeignKey("passes.id", ondelete="CASCADE"), index=True)
+    device_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pass_devices.id", ondelete="SET NULL")
+    )
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    kind: Mapped[str] = mapped_column(String(24))
+    version: Mapped[int | None] = mapped_column(Integer)
+    ip_hash: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GuestUpload(Base):
+    """A guest's upload session on the ingest host. Its own table, so `uploads` and its owner rule
+    stay exactly as they are; the byte columns carry the SAME names as `uploads`' so the offset
+    helpers can serve both."""
+
+    __tablename__ = "guest_uploads"
+
+    upload_uid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    pass_device_id: Mapped[int] = mapped_column(
+        ForeignKey("pass_devices.id", ondelete="CASCADE"), index=True
+    )
+    filename: Mapped[str] = mapped_column(String(512))
+    mime: Mapped[str] = mapped_column(String(255))
+    declared_size: Mapped[int] = mapped_column(BigInteger)
+    bytes_received: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    client_mtime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class IngestBatch(Base):
+    """One guest completion: on the ingest host the batch of received files, at home the record
+    of its import (`memo_id` once filed). `uid` is the ingest host's batch id, which is also the
+    home memo's idempotency key."""
+
+    __tablename__ = "ingest_batches"
+    __table_args__ = (
+        CheckConstraint(_in("state", INGEST_BATCH_STATES), name="ck_ingest_batches_state"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    pass_id: Mapped[int] = mapped_column(ForeignKey("passes.id", ondelete="CASCADE"), index=True)
+    pass_device_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pass_devices.id", ondelete="SET NULL")
+    )
+    caption: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(16), server_default="open", index=True)
+    file_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    byte_total: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    memo_id: Mapped[int | None] = mapped_column(ForeignKey("memos.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class IngestBlob(Base):
+    """One file of an ingest batch, named by its content hash."""
+
+    __tablename__ = "ingest_blobs"
+    __table_args__ = (UniqueConstraint("batch_id", "sha256", name="uq_ingest_blobs_batch_sha256"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("ingest_batches.id", ondelete="CASCADE"), index=True
+    )
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    mime: Mapped[str] = mapped_column(String(255))
+    filename: Mapped[str] = mapped_column(String(512))
+    last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    storage_path: Mapped[str | None] = mapped_column(String(1024))
+    attachment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("attachments.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PassSyncState(Base):
+    """What the ingest host has acknowledged of one pass, and whether a push is owed. A revoke sets
+    `push_urgent` so the next sync tick pushes at once; the push is retried until the ingest host
+    acks a version at least `passes.version`."""
+
+    __tablename__ = "pass_sync_state"
+
+    pass_id: Mapped[int] = mapped_column(
+        ForeignKey("passes.id", ondelete="CASCADE"), primary_key=True
+    )
+    acked_version: Mapped[int] = mapped_column(Integer, server_default="0")
+    push_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    push_urgent: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    last_push_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_pull_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class MediaJob(Base):

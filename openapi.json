@@ -1409,6 +1409,78 @@
         "title": "CollectionPatch",
         "type": "object"
       },
+      "ContributionOut": {
+        "properties": {
+          "attachmentUid": {
+            "title": "Attachmentuid",
+            "type": "string"
+          },
+          "caption": {
+            "title": "Caption",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "contributorName": {
+            "title": "Contributorname",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "deviceUid": {
+            "title": "Deviceuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hidden": {
+            "description": "Hidden from the pass's collection (excluded, or not a member).",
+            "title": "Hidden",
+            "type": "boolean"
+          },
+          "memoUid": {
+            "title": "Memouid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachmentUid",
+          "memoUid",
+          "contributorName",
+          "deviceUid",
+          "caption",
+          "hidden",
+          "createdAt"
+        ],
+        "title": "ContributionOut",
+        "type": "object"
+      },
+      "ContributionSelection": {
+        "properties": {
+          "attachmentUids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Attachmentuids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "attachmentUids"
+        ],
+        "title": "ContributionSelection",
+        "type": "object"
+      },
       "CreateRacedDetail": {
         "description": "Why a keyed create could not be resolved: concurrent writes raced it and the memo they\nraced for was deleted before it could be read back. Retrying with the same key is safe \u2014 that\nis what the key is for \u2014 which is why this is a 5xx the client may repeat and not a 4xx\ntelling it to stop.",
         "properties": {
@@ -2947,6 +3019,47 @@
         "title": "MemoPatch",
         "type": "object"
       },
+      "ModerationOut": {
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/ModerationResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "ModerationOut",
+        "type": "object"
+      },
+      "ModerationResult": {
+        "properties": {
+          "attachmentUid": {
+            "title": "Attachmentuid",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "hidden",
+              "unhidden",
+              "removed",
+              "notContribution",
+              "error"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachmentUid",
+          "outcome"
+        ],
+        "title": "ModerationResult",
+        "type": "object"
+      },
       "NativeExchangeIn": {
         "properties": {
           "code": {
@@ -3043,6 +3156,328 @@
           "name"
         ],
         "title": "NativeTokenRename",
+        "type": "object"
+      },
+      "PassCreate": {
+        "properties": {
+          "expiresAt": {
+            "description": "An instant with its UTC offset, in the future. Default: the trip's span end plus 14 days, else 30 days from now.",
+            "format": "date-time",
+            "title": "Expiresat",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "maxDevices": {
+            "default": 30,
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Maxdevices",
+            "type": "integer"
+          },
+          "notes": {
+            "maxLength": 2000,
+            "title": "Notes",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": "contribute",
+            "enum": [
+              "contribute",
+              "contribute_view"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "PassCreate",
+        "type": "object"
+      },
+      "PassDeviceOut": {
+        "properties": {
+          "bytesTotal": {
+            "title": "Bytestotal",
+            "type": "integer"
+          },
+          "displayName": {
+            "title": "Displayname",
+            "type": "string"
+          },
+          "firstSeen": {
+            "format": "date-time",
+            "title": "Firstseen",
+            "type": "string"
+          },
+          "lastSeen": {
+            "format": "date-time",
+            "title": "Lastseen",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "platform": {
+            "enum": [
+              "web",
+              "clip",
+              "app"
+            ],
+            "title": "Platform",
+            "type": "string"
+          },
+          "revoked": {
+            "title": "Revoked",
+            "type": "boolean"
+          },
+          "revokedAt": {
+            "format": "date-time",
+            "title": "Revokedat",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revokedVersion": {
+            "title": "Revokedversion",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "uploadsCount": {
+            "title": "Uploadscount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "displayName",
+          "platform",
+          "firstSeen",
+          "lastSeen",
+          "uploadsCount",
+          "bytesTotal",
+          "revoked",
+          "revokedAt",
+          "revokedVersion"
+        ],
+        "title": "PassDeviceOut",
+        "type": "object"
+      },
+      "PassIssued": {
+        "properties": {
+          "pass": {
+            "$ref": "#/components/schemas/PassOut"
+          },
+          "qrSvg": {
+            "description": "The URL as a standalone SVG QR code.",
+            "title": "Qrsvg",
+            "type": "string"
+          },
+          "secret": {
+            "description": "Shown once; only its sha256 is stored.",
+            "title": "Secret",
+            "type": "string"
+          },
+          "url": {
+            "description": "The guest URL the QR code encodes.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pass",
+          "secret",
+          "url",
+          "qrSvg"
+        ],
+        "title": "PassIssued",
+        "type": "object"
+      },
+      "PassOut": {
+        "properties": {
+          "collectionUid": {
+            "description": "Null once the collection is deleted.",
+            "title": "Collectionuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "createdBy": {
+            "description": "Who issued it; null once that member is gone.",
+            "title": "Createdby",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deviceCount": {
+            "title": "Devicecount",
+            "type": "integer"
+          },
+          "expiresAt": {
+            "format": "date-time",
+            "title": "Expiresat",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "maxDevices": {
+            "title": "Maxdevices",
+            "type": "integer"
+          },
+          "notes": {
+            "title": "Notes",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revokedAt": {
+            "format": "date-time",
+            "title": "Revokedat",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revokedVersion": {
+            "description": "The version the revocation produced.",
+            "title": "Revokedversion",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "description": "`contribute`: guests add pictures. `contribute_view`: they may also see the trip (not served by any route yet).",
+            "enum": [
+              "contribute",
+              "contribute_view"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "state": {
+            "description": "`revoked` is terminal; a pass whose collection is gone reads as revoked.",
+            "enum": [
+              "active",
+              "expired",
+              "revoked"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "title": "Updatedat",
+            "type": "string"
+          },
+          "version": {
+            "description": "The pass's epoch: raised by every change, the revocation included.",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "uid",
+          "collectionUid",
+          "label",
+          "scope",
+          "state",
+          "expiresAt",
+          "maxDevices",
+          "notes",
+          "version",
+          "revokedAt",
+          "revokedVersion",
+          "deviceCount",
+          "createdBy",
+          "createdAt",
+          "updatedAt"
+        ],
+        "title": "PassOut",
+        "type": "object"
+      },
+      "PassPatch": {
+        "properties": {
+          "expiresAt": {
+            "format": "date-time",
+            "title": "Expiresat",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Label",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxDevices": {
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Maxdevices",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "notes": {
+            "maxLength": 2000,
+            "title": "Notes",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "enum": [
+              "contribute",
+              "contribute_view",
+              null
+            ],
+            "title": "Scope",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "PassPatch",
         "type": "object"
       },
       "PatCreate": {
@@ -7045,6 +7480,201 @@
         ]
       }
     },
+    "/api/collections/{uid}/passes": {
+      "get": {
+        "description": "Every pass of this collection, revoked ones included, the newest first.",
+        "operationId": "list_passes_api_collections__uid__passes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PassOut"
+                  },
+                  "title": "Response List Passes Api Collections  Uid  Passes Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such collection."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Passes",
+        "tags": [
+          "passes"
+        ]
+      },
+      "post": {
+        "description": "Issue a guest pass for this collection. The response carries the secret, its URL and the\nURL as a QR code; no later read returns the secret again.",
+        "operationId": "issue_pass_api_collections__uid__passes_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PassCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassIssued"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such collection. Nothing was stored."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The collection is a trip without a tag (detail \"trip_has_no_tag\"): a guest picture taken outside the span joins the trip only by its tag. Nothing was stored."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Issue Pass",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
     "/api/events": {
       "get": {
         "operationId": "events_api_events_get",
@@ -8299,6 +8929,875 @@
         "summary": "Unpin Memo",
         "tags": [
           "memos"
+        ]
+      }
+    },
+    "/api/passes/{uid}": {
+      "delete": {
+        "description": "Revoke the pass and every device on it, and push that to the guest door at once. Terminal:\nthe answer carries `revokedVersion`, and a second revoke is 410.",
+        "operationId": "revoke_pass_api_passes__uid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The pass is revoked (detail \"pass_revoked\"), which is terminal. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Revoke Pass",
+        "tags": [
+          "passes"
+        ]
+      },
+      "get": {
+        "description": "One pass. A revoked one answers 410; the collection's list still shows it.",
+        "operationId": "get_pass_api_passes__uid__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The pass is revoked (detail \"pass_revoked\"), which is terminal. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Get Pass",
+        "tags": [
+          "passes"
+        ]
+      },
+      "patch": {
+        "description": "Change the named fields; an absent field stays. Any change raises `version` by one; a body\nthat changes nothing keeps it. Only `notes` may be cleared with null.",
+        "operationId": "update_pass_api_passes__uid__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PassPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The pass is revoked (detail \"pass_revoked\"), which is terminal. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Update Pass",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
+    "/api/passes/{uid}/contributions": {
+      "get": {
+        "description": "Every picture that came in through this pass, the newest first, with who brought it and\nwhether it is hidden. Readable after a revoke.",
+        "operationId": "list_contributions_api_passes__uid__contributions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ContributionOut"
+                  },
+                  "title": "Response List Contributions Api Passes  Uid  Contributions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Contributions",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
+    "/api/passes/{uid}/contributions/hide": {
+      "post": {
+        "description": "Hide pictures that came in through this pass from its collection: an exclusion for a trip,\nthe member row taken away for an album. A uid that is not this pass's is `notContribution`.",
+        "operationId": "hide_contributions_api_passes__uid__contributions_hide_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContributionSelection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModerationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Hide Contributions",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
+    "/api/passes/{uid}/contributions/remove": {
+      "post": {
+        "description": "Delete pictures that came in through this pass \u2014 the original and every derived file \u2014 one\nat a time. `error` means that picture's files could not be removed and nothing of it was.",
+        "operationId": "remove_contributions_api_passes__uid__contributions_remove_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContributionSelection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModerationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove Contributions",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
+    "/api/passes/{uid}/contributions/unhide": {
+      "post": {
+        "description": "Undo `hide`.",
+        "operationId": "unhide_contributions_api_passes__uid__contributions_unhide_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContributionSelection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModerationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Unhide Contributions",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
+    "/api/passes/{uid}/devices": {
+      "get": {
+        "description": "The guest devices enrolled on this pass, revoked ones included, the earliest first.",
+        "operationId": "list_devices_api_passes__uid__devices_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PassDeviceOut"
+                  },
+                  "title": "Response List Devices Api Passes  Uid  Devices Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Devices",
+        "tags": [
+          "passes"
+        ]
+      }
+    },
+    "/api/passes/{uid}/devices/{device_uid}": {
+      "delete": {
+        "description": "Revoke one device; the others keep working. Raises the pass's `version` and pushes at\nonce.",
+        "operationId": "revoke_device_api_passes__uid__devices__device_uid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "device_uid",
+            "required": true,
+            "schema": {
+              "title": "Device Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassDeviceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No valid session cookie or bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such pass. Nothing was changed."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The pass is revoked (detail \"pass_revoked\") or this device already is (detail \"device_revoked\"). Nothing was changed."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Revoke Device",
+        "tags": [
+          "passes"
         ]
       }
     },

@@ -5,6 +5,7 @@ app/routers/assets.py	upload_print	refresh
 app/scripts/import_digest_state.py	run_import	for_update
 app/services/collections.py	_hold_cover	for_update
 app/services/collections.py	update_collection	for_update
+app/services/collections.py	delete_collection	for_update
 app/services/collections.py	_hold_member_attachment	for_update
 app/services/collections.py	_lock_album	for_update
 app/services/digest/domain.py	settings_row	for_update
@@ -16,6 +17,8 @@ app/services/memos.py	lock_memo_for_write	for_update
 app/services/memos.py	link_attachments	for_update
 app/services/memos.py	get_by_idempotency_key	for_update
 app/services/memos.py	get_memo_by_edit_key	for_update
+app/services/passes.py	_lock_pass	for_update
+app/services/passes.py	revoke_collection_passes	for_update
 app/services/reclaim.py	reclaim_attachment	for_update
 app/services/reclaim.py	reclaim_attachment	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update

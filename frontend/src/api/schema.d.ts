@@ -923,6 +923,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/collections/{uid}/passes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Passes
+         * @description Every pass of this collection, revoked ones included, the newest first.
+         */
+        get: operations["list_passes_api_collections__uid__passes_get"];
+        put?: never;
+        /**
+         * Issue Pass
+         * @description Issue a guest pass for this collection. The response carries the secret, its URL and the
+         *     URL as a QR code; no later read returns the secret again.
+         */
+        post: operations["issue_pass_api_collections__uid__passes_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/events": {
         parameters: {
             query?: never;
@@ -1249,6 +1274,160 @@ export interface paths {
         /** Unpin Memo */
         post: operations["unpin_memo_api_memos__uid__unpin_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/passes/{uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Pass
+         * @description One pass. A revoked one answers 410; the collection's list still shows it.
+         */
+        get: operations["get_pass_api_passes__uid__get"];
+        put?: never;
+        post?: never;
+        /**
+         * Revoke Pass
+         * @description Revoke the pass and every device on it, and push that to the guest door at once. Terminal:
+         *     the answer carries `revokedVersion`, and a second revoke is 410.
+         */
+        delete: operations["revoke_pass_api_passes__uid__delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Update Pass
+         * @description Change the named fields; an absent field stays. Any change raises `version` by one; a body
+         *     that changes nothing keeps it. Only `notes` may be cleared with null.
+         */
+        patch: operations["update_pass_api_passes__uid__patch"];
+        trace?: never;
+    };
+    "/api/passes/{uid}/contributions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Contributions
+         * @description Every picture that came in through this pass, the newest first, with who brought it and
+         *     whether it is hidden. Readable after a revoke.
+         */
+        get: operations["list_contributions_api_passes__uid__contributions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/passes/{uid}/contributions/hide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Hide Contributions
+         * @description Hide pictures that came in through this pass from its collection: an exclusion for a trip,
+         *     the member row taken away for an album. A uid that is not this pass's is `notContribution`.
+         */
+        post: operations["hide_contributions_api_passes__uid__contributions_hide_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/passes/{uid}/contributions/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove Contributions
+         * @description Delete pictures that came in through this pass — the original and every derived file — one
+         *     at a time. `error` means that picture's files could not be removed and nothing of it was.
+         */
+        post: operations["remove_contributions_api_passes__uid__contributions_remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/passes/{uid}/contributions/unhide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Unhide Contributions
+         * @description Undo `hide`.
+         */
+        post: operations["unhide_contributions_api_passes__uid__contributions_unhide_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/passes/{uid}/devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Devices
+         * @description The guest devices enrolled on this pass, revoked ones included, the earliest first.
+         */
+        get: operations["list_devices_api_passes__uid__devices_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/passes/{uid}/devices/{device_uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke Device
+         * @description Revoke one device; the others keep working. Raises the pass's `version` and pushes at
+         *     once.
+         */
+        delete: operations["revoke_device_api_passes__uid__devices__device_uid__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2113,6 +2292,34 @@ export interface components {
              */
             tz?: string | null;
         };
+        /** ContributionOut */
+        ContributionOut: {
+            /** Attachmentuid */
+            attachmentUid: string;
+            /** Caption */
+            caption: string | null;
+            /** Contributorname */
+            contributorName: string | null;
+            /**
+             * Createdat
+             * Format: date-time
+             */
+            createdAt: string;
+            /** Deviceuid */
+            deviceUid: string | null;
+            /**
+             * Hidden
+             * @description Hidden from the pass's collection (excluded, or not a member).
+             */
+            hidden: boolean;
+            /** Memouid */
+            memoUid: string;
+        };
+        /** ContributionSelection */
+        ContributionSelection: {
+            /** Attachmentuids */
+            attachmentUids: string[];
+        };
         /**
          * CreateRacedDetail
          * @description Why a keyed create could not be resolved: concurrent writes raced it and the memo they
@@ -2881,6 +3088,21 @@ export interface components {
             upload_uids?: string[] | null;
             visibility?: components["schemas"]["Visibility"];
         };
+        /** ModerationOut */
+        ModerationOut: {
+            /** Results */
+            results: components["schemas"]["ModerationResult"][];
+        };
+        /** ModerationResult */
+        ModerationResult: {
+            /** Attachmentuid */
+            attachmentUid: string;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "hidden" | "unhidden" | "removed" | "notContribution" | "error";
+        };
         /** NativeExchangeIn */
         NativeExchangeIn: {
             /** Code */
@@ -2931,6 +3153,168 @@ export interface components {
         NativeTokenRename: {
             /** Name */
             name: string;
+        };
+        /** PassCreate */
+        PassCreate: {
+            /**
+             * Expiresat
+             * Format: date-time
+             * @description An instant with its UTC offset, in the future. Default: the trip's span end plus 14 days, else 30 days from now.
+             */
+            expiresAt?: string | null;
+            /** Label */
+            label: string;
+            /**
+             * Maxdevices
+             * @default 30
+             */
+            maxDevices: number;
+            /** Notes */
+            notes?: string | null;
+            /**
+             * Scope
+             * @default contribute
+             * @enum {string}
+             */
+            scope: "contribute" | "contribute_view";
+        };
+        /** PassDeviceOut */
+        PassDeviceOut: {
+            /** Bytestotal */
+            bytesTotal: number;
+            /** Displayname */
+            displayName: string;
+            /**
+             * Firstseen
+             * Format: date-time
+             */
+            firstSeen: string;
+            /**
+             * Lastseen
+             * Format: date-time
+             */
+            lastSeen: string | null;
+            /**
+             * Platform
+             * @enum {string}
+             */
+            platform: "web" | "clip" | "app";
+            /** Revoked */
+            revoked: boolean;
+            /**
+             * Revokedat
+             * Format: date-time
+             */
+            revokedAt: string | null;
+            /** Revokedversion */
+            revokedVersion: number | null;
+            /** Uid */
+            uid: string;
+            /** Uploadscount */
+            uploadsCount: number;
+        };
+        /** PassIssued */
+        PassIssued: {
+            pass: components["schemas"]["PassOut"];
+            /**
+             * Qrsvg
+             * @description The URL as a standalone SVG QR code.
+             */
+            qrSvg: string;
+            /**
+             * Secret
+             * @description Shown once; only its sha256 is stored.
+             */
+            secret: string;
+            /**
+             * Url
+             * @description The guest URL the QR code encodes.
+             */
+            url: string;
+        };
+        /** PassOut */
+        PassOut: {
+            /**
+             * Collectionuid
+             * @description Null once the collection is deleted.
+             */
+            collectionUid: string | null;
+            /**
+             * Createdat
+             * Format: date-time
+             */
+            createdAt: string;
+            /**
+             * Createdby
+             * @description Who issued it; null once that member is gone.
+             */
+            createdBy: string | null;
+            /** Devicecount */
+            deviceCount: number;
+            /**
+             * Expiresat
+             * Format: date-time
+             */
+            expiresAt: string;
+            /** Label */
+            label: string;
+            /** Maxdevices */
+            maxDevices: number;
+            /** Notes */
+            notes: string | null;
+            /**
+             * Revokedat
+             * Format: date-time
+             */
+            revokedAt: string | null;
+            /**
+             * Revokedversion
+             * @description The version the revocation produced.
+             */
+            revokedVersion: number | null;
+            /**
+             * Scope
+             * @description `contribute`: guests add pictures. `contribute_view`: they may also see the trip (not served by any route yet).
+             * @enum {string}
+             */
+            scope: "contribute" | "contribute_view";
+            /**
+             * State
+             * @description `revoked` is terminal; a pass whose collection is gone reads as revoked.
+             * @enum {string}
+             */
+            state: "active" | "expired" | "revoked";
+            /** Uid */
+            uid: string;
+            /**
+             * Updatedat
+             * Format: date-time
+             */
+            updatedAt: string;
+            /**
+             * Version
+             * @description The pass's epoch: raised by every change, the revocation included.
+             */
+            version: number;
+        };
+        /** PassPatch */
+        PassPatch: {
+            /**
+             * Expiresat
+             * Format: date-time
+             */
+            expiresAt?: string | null;
+            /** Label */
+            label?: string | null;
+            /** Maxdevices */
+            maxDevices?: number | null;
+            /** Notes */
+            notes?: string | null;
+            /**
+             * Scope
+             * @enum {string|null}
+             */
+            scope?: "contribute" | "contribute_view" | null;
         };
         /** PatCreate */
         PatCreate: {
@@ -5108,6 +5492,129 @@ export interface operations {
             503: components["responses"]["DatabaseBusy"];
         };
     };
+    list_passes_api_collections__uid__passes_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassOut"][];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    issue_pass_api_collections__uid__passes_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PassCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassIssued"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such collection. Nothing was stored. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The collection is a trip without a tag (detail "trip_has_no_tag"): a guest picture taken outside the span joins the trip only by its tag. Nothing was stored. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
     events_api_events_get: {
         parameters: {
             query?: never;
@@ -5713,6 +6220,553 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    get_pass_api_passes__uid__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The pass is revoked (detail "pass_revoked"), which is terminal. Nothing was changed. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    revoke_pass_api_passes__uid__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The pass is revoked (detail "pass_revoked"), which is terminal. Nothing was changed. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    update_pass_api_passes__uid__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PassPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The pass is revoked (detail "pass_revoked"), which is terminal. Nothing was changed. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    list_contributions_api_passes__uid__contributions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContributionOut"][];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    hide_contributions_api_passes__uid__contributions_hide_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContributionSelection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    remove_contributions_api_passes__uid__contributions_remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContributionSelection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    unhide_contributions_api_passes__uid__contributions_unhide_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContributionSelection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    list_devices_api_passes__uid__devices_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassDeviceOut"][];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    revoke_device_api_passes__uid__devices__device_uid__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+                device_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassDeviceOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The pass is revoked (detail "pass_revoked") or this device already is (detail "device_revoked"). Nothing was changed. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
                 };
             };
             /** @description Validation Error */

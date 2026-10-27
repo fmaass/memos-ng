@@ -1,0 +1,12 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index 83888c3..5574989 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -232,7 +232,6 @@ async def _lock_pass(db: AsyncSession, pass_id: int) -> Pass:
+         await db.execute(
+             select(Pass)
+             .where(Pass.id == pass_id)
+-            .with_for_update()
+             .execution_options(populate_existing=True)
+         )
+     ).scalar_one_or_none()

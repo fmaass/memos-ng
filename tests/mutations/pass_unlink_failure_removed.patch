@@ -1,0 +1,13 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index 83888c3..62c1e09 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -464,7 +464,7 @@ async def moderate(
+             elif result.outcome == "vanished":  # a concurrent delete took it first
+                 outcomes[uid] = "notContribution"
+             else:  # its files could not be removed, so the row was kept (reclaim's rule)
+-                outcomes[uid] = "error"
++                outcomes[uid] = "removed"
+     elif collection_id is None:
+         pass  # the collection is gone: nothing to hide the pictures from
+     elif kind == "album":

@@ -1,0 +1,12 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index c6f1937..131ee07 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -94,6 +94,7 @@ def door_origin() -> str:
+     or relative value would print `/p/<secret>` into the answer and the QR code — a pass nobody can
+     use, with its secret already shown — so issuance asks this BEFORE anything is written."""
+     raw = settings.TRIP_PASS_BASE_URL
++    return raw.rstrip("/")
+     try:
+         parts = urlsplit(raw)
+         _ = parts.port  # a non-numeric or out-of-range port raises only when it is read

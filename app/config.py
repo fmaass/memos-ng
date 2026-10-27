@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     UPLOAD_EXPIRY_HOURS: int = 24
     MAX_UPLOAD_MIB: int = 1024  # prod parity (system_setting MAX_UPLOAD_SIZE_MIB)
 
+    # Trip passes (trip pass P1): the guest door's public origin, which the pass URL and its QR
+    # code name. Guests never reach this host; the door is a separate installation.
+    TRIP_PASS_BASE_URL: str = "https://trip.discomarder.live"
+
     # Slow-lane transcode + thermal guard (T2.3): defer the H.264 transcode while the CPU package
     # is above THERMAL_MAX_C.
     #

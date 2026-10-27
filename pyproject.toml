@@ -48,6 +48,9 @@ dependencies = [
     # CalVer too, and unbounded for a second reason: a ceiling would hold back zone data from the
     # turn of the year onward — the moment the data exists to correct a zone.
     "tzdata>=2024.2",
+    # The trip pass QR code (app/services/passes.py): a maintained, pure-Python encoder with no
+    # native dependency, so the slim image needs nothing new.
+    "segno>=1.6,<2",
 ]
 
 [dependency-groups]

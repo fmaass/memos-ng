@@ -1,0 +1,13 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index 83888c3..681daf0 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -427,7 +427,7 @@ async def _contribution_ids(db: AsyncSession, p: Pass, uids: Sequence[str]) -> d
+     rows = await db.execute(
+         select(Attachment.uid, Attachment.id)
+         .join(Memo, Memo.id == Attachment.memo_id)
+-        .where(Attachment.uid.in_(uids), Memo.pass_id == p.id, Attachment.detached_at.is_(None))
++        .where(Attachment.uid.in_(uids), Memo.pass_id.is_not(None), Attachment.detached_at.is_(None))
+     )
+     return {uid: aid for uid, aid in rows.all()}
+ 

@@ -342,7 +342,7 @@ async def delete_collection(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
     """Delete a collection and its exclusions. The media and the memos are untouched."""
-    await coll_svc.delete_collection(db, await _collection(db, uid))
+    await coll_svc.delete_collection(db, await _collection(db, uid), user)
     await db.commit()
 
 

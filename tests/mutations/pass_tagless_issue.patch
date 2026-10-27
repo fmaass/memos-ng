@@ -1,0 +1,12 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index 83888c3..ee46485 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -187,7 +187,6 @@ async def issue_pass(
+     return value. A trip whose tag would not survive `parse_tags` raises `TripHasNoTag` before
+     anything is written: a guest picture taken outside the span joins the trip only by its tag."""
+     door_origin()
+-    guest_memo_content(collection)
+     now = datetime.now(UTC)
+     secret = secrets.token_urlsafe(32)
+     p = Pass(

@@ -1,0 +1,13 @@
+diff --git a/app/services/passes.py b/app/services/passes.py
+index 83888c3..b5c1949 100644
+--- a/app/services/passes.py
++++ b/app/services/passes.py
+@@ -541,7 +541,7 @@ async def create_guest_memo(
+     memo = await memos_svc.create_memo(
+         db,
+         owner,
+-        content=content,
++        content=f"{content} {caption or ''} {contributor_name or ''}",
+         visibility=Visibility.PROTECTED,
+         idempotency_key=idempotency_key,
+         finalize=finalize,

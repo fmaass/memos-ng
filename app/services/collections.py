@@ -278,9 +278,17 @@ async def update_collection(
     return collection
 
 
-async def delete_collection(db: AsyncSession, collection: Collection) -> None:
+async def delete_collection(
+    db: AsyncSession, collection: Collection, actor: User | None = None
+) -> None:
     """Remove the record; its exclusion and member rows go with it by the FKs' ON DELETE
-    CASCADE."""
+    CASCADE. Its trip passes are revoked first, as versioned revocations owing an urgent push
+    (`passes.revoke_collection_passes`), under the collection row's lock; their contributions
+    stay."""
+    from app.services import passes as passes_svc  # passes builds on this module
+
+    await db.execute(select(Collection.id).where(Collection.id == collection.id).with_for_update())
+    await passes_svc.revoke_collection_passes(db, collection.id, actor)
     await db.delete(collection)
     await db.flush()
 
