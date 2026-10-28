@@ -55,6 +55,7 @@ function mountSettings() {
       plugins: [PrimeVue, ConfirmationService, ToastService],
       stubs: {
         PatManager: { template: '<div data-test="pat-manager" />' },
+        TripPassesPanel: { template: '<div data-test="trip-passes-panel" />' },
         DigestPanel: { template: '<div data-test="digest-panel-stub" />' },
         ExportPanel: { template: '<div data-test="export-panel-stub" />' },
       },
@@ -114,7 +115,14 @@ describe('SettingsView', () => {
     // before the tabs existed. Access tokens is PatManager, so the stub carries a marker.
     expect(at('profile')).toBeLessThan(at('preferences'))
     expect(at('preferences')).toBeLessThan(at('pat-manager'))
-    expect(at('pat-manager')).toBeLessThan(at('push-unsupported'))
+    expect(at('pat-manager')).toBeLessThan(at('trip-passes-panel'))
+    expect(at('trip-passes-panel')).toBeLessThan(at('push-unsupported'))
+  })
+
+  it('gives a member who is not an admin the guest-pass panel too (family-wide)', () => {
+    session.value = { ...MEMBER }
+    const wrapper = mountSettings()
+    expect(wrapper.find('[data-test="trip-passes-panel"]').exists()).toBe(true)
   })
 
   it('gives an admin all three tabs, General first and Export last', () => {

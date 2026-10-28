@@ -13,6 +13,7 @@ import { useRoute, useRouter } from 'vue-router'
 import DigestPanel from '@/components/DigestPanel.vue'
 import ExportPanel from '@/components/ExportPanel.vue'
 import PatManager from '@/components/PatManager.vue'
+import TripPassesPanel from '@/components/TripPassesPanel.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { usePushSubscription } from '@/composables/usePushSubscription'
 import { useSession } from '@/composables/useSession'
@@ -198,6 +199,8 @@ function setTheme(value: string) {
             </div>
 
             <PatManager />
+
+            <TripPassesPanel />
 
             <div>
               <h2 class="text-lg font-medium">Notifications</h2>
