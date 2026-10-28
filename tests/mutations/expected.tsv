@@ -38,3 +38,12 @@ tests/mutations/pass_unlink_failure_removed.patch	pass_unlink_failure_removed	te
 tests/mutations/pass_secret_plaintext.patch	pass_secret_plaintext	test_issue_shows_the_secret_once_and_stores_only_its_sha256		tests/test_passes_api.py
 tests/mutations/pass_collection_delete_keeps_passes.patch	pass_collection_delete_keeps_passes	test_deleting_the_collection_revokes_its_live_passes_as_one_versioned_transition		tests/test_passes_api.py
 tests/mutations/pass_door_unchecked.patch	pass_door_unchecked	test_issue_refuses_a_base_url_that_is_not_an_https_origin[] test_issue_refuses_a_base_url_that_is_not_an_https_origin[http://trip.example] test_issue_refuses_a_base_url_that_is_not_an_https_origin[trip.example] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://trip.example/p] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://trip.example?x=1] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://user@trip.example] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://:secret@trip.example] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://trip.example:abc] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://trip.example:99999] test_issue_refuses_a_base_url_that_is_not_an_https_origin[https://[broken]		tests/test_passes_api.py
+# The ingest door serves its allowlist and nothing else (trip pass P2): handing it the home-interface
+# routes turns the exact runtime walk for the ingest role and the union probe red.
+tests/mutations/ingest_role_allowlist.patch	ingest_role_allowlist	test_each_ingest_role_serves_exactly_its_allowlist[ingest] test_the_union_of_every_roles_paths_is_refused_outside_each_allowlist		tests/test_ingest_roles.py
+# An unset INGEST_SERVICE_TOKEN must admit nobody: without the fail-closed guard an empty bearer
+# compares equal to the empty token.
+tests/mutations/ingest_service_token_unset.patch	ingest_service_token_unset	test_an_unset_service_token_admits_nobody_not_even_an_empty_bearer		tests/test_ingest_roles.py
+# Overlapping completions of the same uploads join under the device lock: without the re-check
+# there, the second one finds its uploads consumed and answers 409 instead of the shared receipt.
+tests/mutations/ingest_completion_join.patch	ingest_completion_join	test_overlapping_completions_of_the_same_uploads_join_into_one_batch		tests/test_ingest_guest.py

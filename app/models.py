@@ -24,6 +24,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy import Sequence as SqlSequence
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship, validates
 
@@ -648,6 +649,9 @@ class Pass(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # The ingest host's automatic suspension (too many refused redemptions in an hour). Its own
+    # column, apart from home's version/revocation sequence, which a push never touches it through.
+    suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PassDevice(Base):
@@ -677,6 +681,10 @@ class PassDevice(Base):
     bytes_total: Mapped[int] = mapped_column(BigInteger, server_default="0")
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_version: Mapped[int | None] = mapped_column(Integer)
+    # The ingest host's change cursor for `GET /ingest/devices?since=`, from `ingest_change_seq`.
+    # Unique: the pull pages by a strict `> since`, so two rows sharing a value could be split
+    # across a page boundary and the second one never served.
+    change_seq: Mapped[int | None] = mapped_column(BigInteger, index=True, unique=True)
 
 
 class PassEvent(Base):
@@ -745,6 +753,10 @@ class IngestBatch(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # What a completion was asked for (device + its upload set), so a replay or an overlapping
+    # completion of the same uploads finds THIS batch and answers its receipt.
+    completion_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    change_seq: Mapped[int | None] = mapped_column(BigInteger, index=True, unique=True)
 
 
 class IngestBlob(Base):
@@ -767,6 +779,22 @@ class IngestBlob(Base):
         ForeignKey("attachments.id", ondelete="SET NULL")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IngestRefusal(Base):
+    """Refused redemptions per hashed client address and hour, on the ingest host. An unknown
+    secret has no pass to hang a `pass_events` row on, so the count lives here."""
+
+    __tablename__ = "ingest_refusals"
+
+    ip_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    refusals: Mapped[int] = mapped_column(Integer, server_default="0")
+
+
+# Hands out the ingest host's change cursors (devices and batches). A value is drawn under one
+# transaction-scoped advisory lock just before commit, so cursor order is commit order.
+INGEST_CHANGE_SEQ = SqlSequence("ingest_change_seq", metadata=Base.metadata)
 
 
 class PassSyncState(Base):

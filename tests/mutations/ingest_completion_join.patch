@@ -1,0 +1,16 @@
+diff --git a/app/ingest/guest.py b/app/ingest/guest.py
+index c78b6de..e96f008 100644
+--- a/app/ingest/guest.py
++++ b/app/ingest/guest.py
+@@ -684,11 +684,6 @@ async def complete(
+         guest = await _refence(db, guest, device_for_update=True)
+     except GuestRefused as exc:
+         raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+-    # The join point of record: under the device lock, the completion this one queued behind has
+-    # committed or rolled back, and its batch is visible here.
+-    existing = await _batch_by_key(db, key, guest.device.id)
+-    if existing is not None:
+-        return await _receipt(db, existing)
+     uids = sorted(set(body.upload_uids))
+     rows = list(
+         (

@@ -1,4 +1,14 @@
 path	enclosing def	mode
+app/ingest/guest.py	_lock_pass	for_update
+app/ingest/guest.py	_lock_device	for_update
+app/ingest/guest.py	redeem	for_update
+app/ingest/guest.py	append.relock	for_update
+app/ingest/guest.py	complete	for_update
+app/ingest/service_api.py	apply_pass_state	for_update
+app/ingest/service_api.py	push_device_revocations	for_update
+app/ingest/service_api.py	push_device_revocations	for_update
+app/ingest/service_api.py	_transition	for_update
+app/ingest/service_api.py	purge	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	upload_print	refresh
@@ -25,7 +35,7 @@ app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/sibling.py	_write_result	for_update
 app/services/sibling.py	_write_result	for_update
-app/services/uploads.py	append_stream	for_update
+app/services/uploads.py	append_stream.relock	for_update
 app/services/uploads.py	ensure_capture	for_update
 app/services/uploads.py	_lock_attachments	for_update
 app/services/uploads.py	finalize_pending	for_update

@@ -25,6 +25,7 @@ from app.models import (
     Attachment,
     AttachmentRendition,
     AttachmentStatus,
+    GuestUpload,
     JobKind,
     JobLane,
     JobState,
@@ -576,34 +577,14 @@ async def append_stream(
     until the caller COMMITS, which is when this append's bytes and offset actually become visible
     to another request; an in-process lock released at function exit would still let the next
     append read a pre-commit offset and write over these bytes."""
-    # Offset precedence outranks the size ceiling: a body that cannot land whatever its size gets
-    # the protocol's answer without being consumed at all — a gap is a 409 to re-sync from, and a
-    # replay is a no-op. This is an EARLY EXIT on the request's own snapshot, not the decision of
-    # record; the authoritative gap/replay/match call is re-taken under the row lock below against
-    # the refreshed offset.
-    if offset > upload.bytes_received:
-        raise ValueError("offset gap")
-    if offset < upload.bytes_received:
-        if strict_offset:
-            raise ValueError("offset mismatch")
-        return Appended(upload)
-    spool = _spool_path(upload.upload_uid)
-    try:
-        # Receive-time bound: no single body may exceed the session's whole ceiling, so an oversize
-        # upload is refused mid-stream. Where it LANDS is not yet known — that needs the offset the
-        # merge settles on, so the offset-relative check is the one under the lock below.
-        spooled = await spool_stream(
-            stream, spool, start=0, ceiling=size_ceiling(upload), keep_cut=True
-        )
-        received = spooled.received
-        if spooled.cut and received == 0:
-            return Appended(upload)
+
+    async def relock() -> Upload | None:
         # `scalar_one_or_none`, not `scalar_one`: waiting on this lock is exactly when the row can
         # disappear — the writer this append queued behind may have been a finalize, which consumes
         # the session and deletes it. A lock acquisition may lose its row, and losing it is an
         # ordinary answer, not a 500 (MEMNG-278; the protocol's R6a, the same contract
         # `ensure_capture` and `reclaim_attachment` already honour).
-        locked = (
+        return (
             await db.execute(
                 select(Upload)
                 .where(Upload.upload_uid == upload.upload_uid)
@@ -611,31 +592,98 @@ async def append_stream(
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+
+    async def completed(row: Upload) -> Upload:
+        # The upload just COMPLETED — the one moment its bytes are all here and nothing has
+        # consumed them yet. The capture read happens here, inside the same row lock and the same
+        # transaction as the offset that completed it, so it can neither run twice nor be visible
+        # without the bytes it describes (MEMNG-262). This transaction already holds the row, so
+        # the read cannot come back empty; the `or` keeps the type honest.
+        return await ensure_capture(db, row) or row
+
+    appended = await append_offset_stream(
+        db,
+        upload,
+        offset,
+        stream,
+        part=part_path(upload.upload_uid),
+        spool=_spool_path(upload.upload_uid),
+        body_ceiling=size_ceiling(upload),
+        ceiling=size_ceiling,
+        relock=relock,
+        on_complete=completed,
+        strict_offset=strict_offset,
+    )
+    return None if appended is None else Appended(appended.row, appended.kept_from_cut)
+
+
+@dataclass(frozen=True)
+class OffsetAppend[R: (Upload, GuestUpload)]:
+    row: R
+    kept_from_cut: int = 0
+
+
+async def append_offset_stream[R: (Upload, GuestUpload)](
+    db: AsyncSession,
+    row: R,
+    offset: int,
+    stream: AsyncIterable[bytes],
+    *,
+    part: Path,
+    spool: Path,
+    body_ceiling: int,
+    ceiling: Callable[[R], int],
+    relock: Callable[[], Awaitable[R | None]],
+    on_complete: Callable[[R], Awaitable[R]] | None = None,
+    strict_offset: bool = False,
+) -> OffsetAppend[R] | None:
+    """The principal-agnostic byte half of an append over an `uploads` or a `guest_uploads` row
+    (`append_stream` is the member wrapper; the ingest door's guest append is the other caller).
+    The caller supplies what differs: where the
+    part and the private spool live, the bound on this one body (`body_ceiling`) and on the whole
+    session (`ceiling`), and `relock`, which re-reads the session row FOR UPDATE after the body has
+    streamed — None when it is gone — and is where a caller re-checks its authorization, so a
+    credential revoked while the body was in flight lands no bytes. The decision of record
+    (gap/replay/match) is taken after `relock`, against the refreshed offset."""
+    # Offset precedence outranks the size ceiling: a body that cannot land whatever its size gets
+    # the protocol's answer without being consumed at all — a gap is a 409 to re-sync from, and a
+    # replay is a no-op. This is an EARLY EXIT on the request's own snapshot, not the decision of
+    # record; the authoritative gap/replay/match call is re-taken under the row lock below against
+    # the refreshed offset.
+    if offset > row.bytes_received:
+        raise ValueError("offset gap")
+    if offset < row.bytes_received:
+        if strict_offset:
+            raise ValueError("offset mismatch")
+        return OffsetAppend(row)
+    try:
+        # Receive-time bound: no single body may exceed `body_ceiling`, so an oversize body is
+        # refused mid-stream. Where it LANDS is not yet known — that needs the offset the merge
+        # settles on, so the offset-relative check is the one under the lock below.
+        spooled = await spool_stream(stream, spool, start=0, ceiling=body_ceiling, keep_cut=True)
+        received = spooled.received
+        if spooled.cut and received == 0:
+            return OffsetAppend(row)
+        locked = await relock()
         if locked is None:
             return None
-        upload = locked
-        if offset > upload.bytes_received:
+        row = locked
+        if offset > row.bytes_received:
             raise ValueError("offset gap")
-        if offset == upload.bytes_received:
-            if offset + received > size_ceiling(upload):
+        if offset == row.bytes_received:
+            if offset + received > ceiling(row):
                 raise UploadTooLarge(offset + received)
-            await to_thread.run_sync(_concat_sync, spool, part_path(upload.upload_uid), offset)
-            upload.bytes_received = offset + received
+            await to_thread.run_sync(_concat_sync, spool, part, offset)
+            row.bytes_received = offset + received
             await db.flush()
             kept_from_cut = received if spooled.cut else 0
-            if upload.bytes_received >= upload.declared_size:
-                # The upload just COMPLETED — the one moment its bytes are all here and nothing
-                # has consumed them yet. The capture read happens here, inside the same row lock
-                # and the same transaction as the offset that completed it, so it can neither run
-                # twice nor be visible without the bytes it describes (MEMNG-262).
-                # This transaction already holds the row, so the read cannot come back empty;
-                # the walrus keeps the type honest without inventing a branch that cannot run.
-                upload = await ensure_capture(db, upload) or upload
-            return Appended(upload, kept_from_cut)
+            if row.bytes_received >= row.declared_size and on_complete is not None:
+                row = await on_complete(row)
+            return OffsetAppend(row, kept_from_cut)
         # offset < bytes_received → a concurrent append already covered this range
         if strict_offset:
             raise ValueError("offset mismatch")
-        return Appended(upload)
+        return OffsetAppend(row)
     finally:
         await to_thread.run_sync(_unlink_sync, spool)
 

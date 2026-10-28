@@ -1,0 +1,13 @@
+diff --git a/app/ingest/service_api.py b/app/ingest/service_api.py
+index 71cc0aa..1144898 100644
+--- a/app/ingest/service_api.py
++++ b/app/ingest/service_api.py
+@@ -32,8 +32,6 @@ logger = structlog.get_logger(__name__)
+ 
+ def service_token_ok(header: str) -> bool:
+     expected = settings.INGEST_SERVICE_TOKEN
+-    if not expected:
+-        return False  # fail closed: no configured token admits nobody
+     scheme, _, presented = header.partition(" ")
+     if scheme.lower() != "bearer":
+         return False

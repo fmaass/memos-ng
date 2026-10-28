@@ -22,7 +22,8 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.routing import BaseRoute
 from starlette.types import Receive, Scope, Send
 
-from app import auth
+# `_role_guard` first: it refuses an ingest role before any member module loads.
+from app import _role_guard, auth  # noqa: F401
 from app.config import settings
 from app.csrf import OriginCsrfMiddleware
 from app.database import async_session

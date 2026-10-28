@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,6 +17,10 @@ class Settings(BaseSettings):
 
     # Runtime
     ENV: str = "development"
+    # Which installation this process is (trip pass P2). `home` is the household app, the default.
+    # `ingest` is the guest door on the public VPS and `ingest-home` the interface home pulls from
+    # there; both serve their own app (app/ingest) and never import a member router.
+    APP_ROLE: Literal["home", "ingest", "ingest-home"] = "home"
 
     # Database (async + sync DSN for Alembic). Provided by the stack .env in prod.
     DATABASE_URL: str = "postgresql+asyncpg://memosng:memosng@localhost:5433/memosng"
@@ -117,6 +122,28 @@ class Settings(BaseSettings):
     # Trip passes (trip pass P1): the guest door's public origin, which the pass URL and its QR
     # code name. Guests never reach this host; the door is a separate installation.
     TRIP_PASS_BASE_URL: str = "https://trip.discomarder.live"
+
+    # The ingest installation (trip pass P2; only read by the two ingest roles). The service token
+    # authenticates home on the `ingest-home` interface: at least 64 random bytes, generated with
+    # `python -c "import secrets; print(secrets.token_urlsafe(64))"` (86 characters) and kept in the
+    # stack's secret env, never in a file of this repo.
+    INGEST_SERVICE_TOKEN: str = Field(default="", repr=False)
+    INGEST_DATA_ROOT: str = "/srv/trip-ingest"
+    # Refuse new guest upload sessions (507) once the volume would keep less than this free.
+    INGEST_MIN_FREE_BYTES: int = 20 * 1024**3
+    # Every guest PATCH body is bounded, a resumed tail included (plan decision 8: the Cloudflare
+    # request-body limit is taken as applying to the tunnel).
+    INGEST_PATCH_MAX_BYTES: int = 64 * 1024 * 1024
+    INGEST_RETENTION_DAYS: int = 7
+    INGEST_PURGE_INTERVAL_S: int = 3600
+    INGEST_REDEEM_PER_MINUTE: int = 5
+    INGEST_REFUSALS_PER_HOUR: int = 50
+    # `CF-Connecting-IP` names the client only when cloudflared is the one peer that can reach the
+    # process, which is the `ingest` deploy and no other; startup refuses it in any other role.
+    INGEST_TRUST_CF_CONNECTING_IP: bool = False
+    INGEST_IP_HASH_SALT: str = Field(default="", repr=False)
+    GUEST_BODIES_PER_DEVICE: int = 2
+    GUEST_BODIES_PER_PROCESS: int = 12
 
     # Slow-lane transcode + thermal guard (T2.3): defer the H.264 transcode while the CPU package
     # is above THERMAL_MAX_C.
@@ -302,6 +329,8 @@ class Settings(BaseSettings):
     # same-image `up -d --force-recreate` — never a bare env edit.
     APPLE_TEAM_ID: str | None = None
     IOS_BUNDLE_ID: str = "live.discomarder.memosng"
+    # The App Clip the ingest door's association file names for `/p/*` (trip pass P2).
+    IOS_CLIP_BUNDLE_ID: str = "live.discomarder.memosng.Clip"
     # Which AASA sections to emit. `webcredentials` is what the callback interception needs;
     # `applinks` is kept switchable because which one ASWebAuthenticationSession's HTTPS callback
     # actually requires is an OPEN question answered in Phase 4 against Apple's docs.
@@ -331,6 +360,14 @@ class Settings(BaseSettings):
         signatures + decryptable BFF tokens). Called from the app lifespan at startup — NOT at
         import — so pure imports and tests stay side-effect-free. A dedicated ASSET_URL_SECRET does
         not exempt this: SESSION_SECRET still encrypts session tokens."""
+        if self.APP_ROLE != "home":
+            self._validate_ingest_role()
+            return
+        if self.INGEST_SERVICE_TOKEN or self.INGEST_TRUST_CF_CONNECTING_IP:
+            raise RuntimeError(
+                "INGEST_SERVICE_TOKEN and INGEST_TRUST_CF_CONNECTING_IP belong to the ingest "
+                "roles; the home role refuses them"
+            )
         if self.is_production and self.SESSION_SECRET == _DEV_SESSION_SECRET:
             raise RuntimeError(
                 "SESSION_SECRET is the built-in dev default in production — set a unique value "
@@ -357,6 +394,51 @@ class Settings(BaseSettings):
                 "IMGMANAGER_URL, IMGMANAGER_TOKEN and SIBLING_OWNER_IDS are set together or not "
                 f"at all — missing: {missing}"
             )
+
+    def _validate_ingest_role(self) -> None:
+        """The public door holds nothing of the household: a member-side setting given to either
+        ingest role is refused, whatever its value, so a copied home env cannot start there."""
+        given = self.model_fields_set
+        present = sorted(name for name in MEMBER_SETTINGS if name in given and getattr(self, name))
+        if present:
+            raise RuntimeError(
+                f"APP_ROLE={self.APP_ROLE} refuses member-side settings: {', '.join(present)}"
+            )
+        if self.APP_ROLE == "ingest":
+            if self.INGEST_SERVICE_TOKEN:
+                raise RuntimeError("APP_ROLE=ingest refuses INGEST_SERVICE_TOKEN (ingest-home's)")
+            return
+        if len(self.INGEST_SERVICE_TOKEN) < INGEST_TOKEN_MIN_CHARS:
+            raise RuntimeError(
+                "APP_ROLE=ingest-home needs INGEST_SERVICE_TOKEN of at least 64 random bytes "
+                f"({INGEST_TOKEN_MIN_CHARS} characters of secrets.token_urlsafe(64))"
+            )
+        if self.INGEST_TRUST_CF_CONNECTING_IP:
+            raise RuntimeError("APP_ROLE=ingest-home refuses INGEST_TRUST_CF_CONNECTING_IP")
+
+
+# Settings only the household installation may hold. An ingest role refuses each of them when it is
+# set at all (`model_fields_set`), so a default that merely exists is not mistaken for one given.
+MEMBER_SETTINGS = (
+    "SESSION_SECRET",
+    "OIDC_CLIENT_SECRET",
+    "ASSET_URL_SECRET",
+    "ASSET_URL_SECRET_PREV",
+    "VAPID_PUBLIC_KEY",
+    "VAPID_PRIVATE_KEY",
+    "IMGMANAGER_URL",
+    "IMGMANAGER_TOKEN",
+    "SIBLING_OWNER_IDS",
+    "SMTP_USERNAME",
+    "SMTP_PASSWORD",
+    "FRAME_API_URL",
+    "FRAME_API_TOKEN",
+    "DROPBOX_APP_KEY",
+    "DROPBOX_APP_SECRET",
+    "DROPBOX_REFRESH_TOKEN",
+)
+# len(secrets.token_urlsafe(64)): 64 bytes in unpadded base64url.
+INGEST_TOKEN_MIN_CHARS = 86
 
 
 @lru_cache
