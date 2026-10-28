@@ -44,7 +44,7 @@ from app.models import (
 )
 from app.services import collections as coll_svc
 from app.services import memos as memos_svc
-from app.services import reclaim
+from app.services import reclaim, storage
 
 DEFAULT_MAX_DEVICES = 30
 SPAN_GRACE = timedelta(days=14)
@@ -530,6 +530,7 @@ async def create_guest_memo(
     idempotency_key: str,
     device: PassDevice | None = None,
     finalize: Callable[[Memo], Awaitable[Sequence[str]]] | None = None,
+    moved_out: list[storage.TrackedMove] | None = None,
 ) -> Memo:
     """The ONE place a guest batch becomes a home memo. Owner, visibility, tag and destination
     come from the pass's home rows only: the issuer owns it, it is PROTECTED, and its `content` is
@@ -550,6 +551,9 @@ async def create_guest_memo(
         visibility=Visibility.PROTECTED,
         idempotency_key=idempotency_key,
         finalize=finalize,
+        # The final placement into the memo folder is a move like finalize's own, and a filing
+        # that rolls back has to be able to walk it back too.
+        moved_out=moved_out,
     )
     memo.pass_id = p.id
     memo.guest_caption = caption or None

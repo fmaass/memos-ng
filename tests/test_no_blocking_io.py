@@ -146,6 +146,9 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         # distinguish from `Path.open`; the real files in that module are opened and read off-loop.
         ("app/services/export.py", "_media_entry", "open"): 1,
         ("app/services/export.py", "_manifest_entry", "open"): 1,
+        # Worker only: a rolled-back trip filing walks its files back to staging inline, for the
+        # same reason as the memo router's `_restore_moved` — a cancellation may be unwinding.
+        ("app/services/trip_ingest.py", "_file_part", "_restore"): 1,
     }
 )
 

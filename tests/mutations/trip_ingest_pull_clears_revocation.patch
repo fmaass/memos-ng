@@ -1,0 +1,12 @@
+diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
+--- a/app/services/trip_ingest.py
++++ b/app/services/trip_ingest.py
+@@ -562,6 +562,8 @@
+     # The ingest host's activity figures only. `revoked_*` are home's and a pull never touches
+     # them, so a device the ingest host still shows live cannot clear a home revocation.
+     existing.display_name = d["display_name"]
++    existing.revoked_at = None
++    existing.revoked_version = None
+     existing.platform = d["platform"]
+     existing.last_seen = d["last_seen"]
+     existing.uploads_count = d["uploads_count"]

@@ -47,3 +47,17 @@ tests/mutations/ingest_service_token_unset.patch	ingest_service_token_unset	test
 # Overlapping completions of the same uploads join under the device lock: without the re-check
 # there, the second one finds its uploads consumed and answers 409 instead of the shared receipt.
 tests/mutations/ingest_completion_join.patch	ingest_completion_join	test_overlapping_completions_of_the_same_uploads_join_into_one_batch		tests/test_ingest_guest.py
+# A filing re-checks its batch is still open under the row lock: without it two racing filings of
+# one batch both create a memo (the second through the idempotency replay) and both report filed.
+tests/mutations/trip_ingest_refile.patch	trip_ingest_refile	test_two_filings_of_one_batch_racing_make_one_memo test_two_filings_racing_over_a_batch_of_parts_file_each_part_once test_two_filings_racing_over_a_cut_variant_group_file_each_file_once		tests/test_trip_ingest_puller.py
+# Only a FILED batch is acked: acking whatever settle finds would ack the batches home refused,
+# and the ingest host would purge bytes nobody filed.
+tests/mutations/trip_ingest_ack_quarantined.patch	trip_ingest_ack_quarantined	test_a_compressed_file_is_refused_before_it_is_inflated test_a_device_of_another_pass_is_a_mismatch_and_quarantined test_a_hostile_manifest_is_quarantined_never_acked[dotdot_device] test_a_hostile_manifest_is_quarantined_never_acked[dotdot_filename] test_a_hostile_manifest_is_quarantined_never_acked[mime_disagrees] test_a_hostile_manifest_is_quarantined_never_acked[non_hex_sha] test_a_hostile_manifest_is_quarantined_never_acked[oversize] test_a_hostile_manifest_is_quarantined_never_acked[streams_past_its_size] test_a_hostile_value_is_never_echoed_into_errors_or_logs test_a_quarantine_the_link_dropped_is_retried_until_it_lands test_bytes_that_do_not_hash_to_their_name_are_quarantined test_quarantine_and_cursors_page_across_more_than_one_page		tests/test_trip_ingest_puller.py
+# The device feed carries the ingest host's activity figures only: a pull that copied its
+# revoked_* back over home's would clear a revocation the ingest host has not applied yet.
+tests/mutations/trip_ingest_pull_clears_revocation.patch	trip_ingest_pull_clears_revocation	test_a_pull_never_clears_a_home_revocation test_a_revocation_made_while_the_link_is_down_lands_on_reconnect_and_batches_drain		tests/test_trip_ingest_puller.py
+# A cut download resumes where the partial file ends; without the Range header it starts over.
+tests/mutations/trip_ingest_no_range.patch	trip_ingest_no_range	test_a_cut_download_resumes_by_range		tests/test_trip_ingest_puller.py
+# create_guest_memo forwards moved_out so a rolled-back filing can put its originals back in
+# staging; dropped, the files stay in the memo folder of a memo that never committed.
+tests/mutations/pass_guest_memo_moved_out_dropped.patch	pass_guest_memo_moved_out_dropped	test_a_filing_that_rolls_back_walks_every_file_back_to_staging		tests/test_trip_ingest_puller.py

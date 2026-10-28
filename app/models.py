@@ -15,6 +15,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Table,
     Text,
@@ -685,6 +686,9 @@ class PassDevice(Base):
     # Unique: the pull pages by a strict `> since`, so two rows sharing a value could be split
     # across a page boundary and the second one never served.
     change_seq: Mapped[int | None] = mapped_column(BigInteger, index=True, unique=True)
+    # Home only: the revocation version the ingest host has confirmed it applied. A revocation is
+    # owed while this is below `revoked_version`, and pushed again every sync tick until it is not.
+    revocation_acked_version: Mapped[int | None] = mapped_column(Integer)
 
 
 class PassEvent(Base):
@@ -775,6 +779,9 @@ class IngestBlob(Base):
     filename: Mapped[str] = mapped_column(String(512))
     last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     storage_path: Mapped[str | None] = mapped_column(String(1024))
+    # Home's puller only: when this file was filed into a memo. A large batch is filed in parts,
+    # one transaction each, so the next tick resumes after the last committed part.
+    filed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attachment_id: Mapped[int | None] = mapped_column(
         ForeignKey("attachments.id", ondelete="SET NULL")
     )
@@ -812,6 +819,21 @@ class PassSyncState(Base):
     push_urgent: Mapped[bool] = mapped_column(Boolean, server_default="false")
     last_push_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_pull_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class TripIngestCursor(Base):
+    """Home only, one row: how far the puller has read the ingest host's two change feeds. A
+    cursor moves in the same transaction as the ledger rows of the page it read, so a crash can
+    re-read a page but never skip one."""
+
+    __tablename__ = "trip_ingest_cursor"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_trip_ingest_cursor_single_row"),)
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    devices_since: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    batches_since: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
 
 

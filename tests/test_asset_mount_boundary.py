@@ -46,6 +46,10 @@ DISPOSITIONS = {
     ("services/media.py", "_atomic_save"): "sibling tmp — thumbs/mobile/printready encode",
     ("services/media.py", "process_video_poster"): "sibling tmp — poster.poster_tmp_path",
     ("services/media.py", "process_slow"): "sibling tmp — the web mp4 beside its own destination",
+    ("services/trip_ingest.py", "_replace_sync"): "uploads only — a staged trip download "
+    "(data/uploads/trip-ingest) into its upload part",
+    ("services/trip_ingest.py", "_restore"): "uploads only — an upload part back to trip-ingest "
+    "staging; the originals go back through storage.restore",
     ("routers/assets.py", "_save_print_sync"): "data/print, not assets — a spooled print master",
     ("scripts/backfill_hdr_posters.py", "publish"): "sibling tmp — poster.poster_tmp_path, the "
     "same in-flight name process_video_poster renames from; the backup it takes first is a COPY "

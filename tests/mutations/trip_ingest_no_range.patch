@@ -1,0 +1,12 @@
+diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
+--- a/app/services/trip_ingest.py
++++ b/app/services/trip_ingest.py
+@@ -808,8 +808,6 @@
+     if have == blob.size_bytes:
+         return hasher.hexdigest()  # every byte came from an earlier attempt
+     headers = {"Accept-Encoding": "identity"}
+-    if have:
+-        headers["Range"] = f"bytes={have}-"
+     url = f"/ingest/blobs/{blob.sha256}"
+     try:
+         async with client.stream("GET", url, headers=headers) as r:

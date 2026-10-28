@@ -44,7 +44,7 @@ from app.models import (
     JobState,
     MediaJob,
 )
-from app.services import frame_share, media, push, reclaim, reconcile
+from app.services import frame_share, media, push, reclaim, reconcile, trip_ingest
 from app.services.digest import gate as digest_gate
 from app.services.digest import runner as digest_runner
 from app.services.uploads import reap_expired_committed
@@ -129,7 +129,18 @@ HOUSEKEEPING_BOUNDS: dict[str, int] = {
     # a slow remote is exactly the unbounded case. Missing a sweep costs a cycle of retention
     # lateness; missing a heartbeat costs the container.
     "digest_sweep": 240,
+    # One trip-ingest tick (trip pass P3a): pushes, two feed pulls, then downloads and filings
+    # until its own budget (this bound less a margin) runs out. Small on purpose — every piece of
+    # work it does is committed as it goes and a cut download resumes by Range on the next tick,
+    # so a big batch simply drains over several ticks. The total above had 15 s of room left
+    # under half the bar; the plan's pivot for a tick that keeps reaching this is a lane of its
+    # own, not a larger number here.
+    "trip_ingest_sync": 14,
 }
+# The trip-ingest tick's cadence and the share of its bound it spends on work, leaving the rest
+# for the settle round that follows the budget running out.
+TRIP_INGEST_INTERVAL_SECONDS = 60
+TRIP_INGEST_TICK_BUDGET_SECONDS = 10.0
 # Under half the healthcheck bar, and asserted in the tests so a later edit cannot quietly exceed
 # it. It is a deliberate OVER-estimate of any real gap: no single stamp-to-stamp gap contains every
 # step (the startup pair runs before the loop, the hourly block only on the reap cadence, and the
@@ -1498,6 +1509,7 @@ async def run() -> None:
                 job_watermark,
             )
         last_reap = 0.0
+        last_trip_sync = 0.0
         # Which classes have already had their exit reported with the cause attached. A local,
         # because it belongs to this supervisor's run and must not outlive it.
         reported_exits: set[JobClass] = set()
@@ -1534,6 +1546,19 @@ async def run() -> None:
                 elif await _bounded("digest_is_due", digest_is_due(), False):
                     if spawn_digest():
                         logger.info("digest_run_spawned", trigger="scheduled")
+            # Inline and awaited, so one tick runs at a time in this process; the tick's own
+            # advisory lock covers any second worker. Disabled (an instant no-op) until home is
+            # configured with the ingest host's URL and token file.
+            if (
+                trip_ingest.enabled()
+                and time.time() - last_trip_sync > TRIP_INGEST_INTERVAL_SECONDS
+            ):
+                await _bounded(
+                    "trip_ingest_sync",
+                    trip_ingest.run_sync_safe(budget_s=TRIP_INGEST_TICK_BUDGET_SECONDS),
+                    "timeout",
+                )
+                last_trip_sync = time.time()
             if time.time() - last_reap > REAP_INTERVAL_SECONDS:
                 # The whole hourly block is bounded step by step. Every one of these is idempotent
                 # and runs again next hour, so a step cut short costs a cycle of lateness — which

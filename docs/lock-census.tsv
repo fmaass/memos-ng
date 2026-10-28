@@ -35,6 +35,13 @@ app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update
 app/services/sibling.py	_write_result	for_update
 app/services/sibling.py	_write_result	for_update
+app/services/trip_ingest.py	_lock_passes	for_update
+app/services/trip_ingest.py	push_device_revocations	refresh
+app/services/trip_ingest.py	_mirror_device	for_update
+app/services/trip_ingest.py	_file_part	for_update
+app/services/trip_ingest.py	_ack	refresh
+app/services/trip_ingest.py	_quarantine	refresh
+app/services/trip_ingest.py	_refuse_open	refresh
 app/services/uploads.py	append_stream.relock	for_update
 app/services/uploads.py	ensure_capture	for_update
 app/services/uploads.py	_lock_attachments	for_update

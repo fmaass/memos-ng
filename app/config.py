@@ -142,6 +142,13 @@ class Settings(BaseSettings):
     # process, which is the `ingest` deploy and no other; startup refuses it in any other role.
     INGEST_TRUST_CF_CONNECTING_IP: bool = False
     INGEST_IP_HASH_SALT: str = Field(default="", repr=False)
+    # Home's puller (trip pass P3a): where home reaches the ingest host's home interface (through
+    # its port forward) and the FILE holding the service token — a file, so the token never sits in
+    # home's environment, and a distinct name, because home refuses `INGEST_SERVICE_TOKEN` itself.
+    # The puller is off while either is empty.
+    TRIP_INGEST_URL: str = ""
+    TRIP_INGEST_TOKEN_FILE: str = Field(default="", repr=False)
+    TRIP_INGEST_TIMEOUT_S: float = 30.0
     GUEST_BODIES_PER_DEVICE: int = 2
     GUEST_BODIES_PER_PROCESS: int = 12
 

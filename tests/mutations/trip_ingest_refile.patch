@@ -1,0 +1,12 @@
+diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
+--- a/app/services/trip_ingest.py
++++ b/app/services/trip_ingest.py
+@@ -968,7 +968,7 @@
+                     .execution_options(populate_existing=True)
+                 )
+             ).scalar_one_or_none()
+-            if batch is None or batch.state != "open":
++            if batch is None:
+                 return None
+             uid = batch.uid
+             p, collection = await _filing_target(db, batch)

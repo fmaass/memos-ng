@@ -1,0 +1,12 @@
+diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
+--- a/app/services/trip_ingest.py
++++ b/app/services/trip_ingest.py
+@@ -1132,7 +1132,7 @@
+             )
+         ).all()
+     for batch_id, uid, state in owed:
+-        if state == "complete":
++        if True:
+             await _ack(client, batch_id, uid)
+         else:
+             await _quarantine(client, batch_id, uid)

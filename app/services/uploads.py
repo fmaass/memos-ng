@@ -3,7 +3,7 @@ import os
 import secrets
 import shutil
 import uuid
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -1097,6 +1097,13 @@ async def finalize_pending(
     resolved_out: dict[str, str] | None = None,
     named_attachment_ids: Sequence[int] | None = None,
     after_acquisition: Callable[[], Awaitable[None]] | None = None,
+    # False: never hand back an existing unlinked attachment for identical bytes. A trip guest's
+    # batch mints its own rows, so it cannot take over a row the owner has (or the renditions,
+    # placement and provenance that row carries) and drop the incoming bytes.
+    adopt_unlinked: bool = True,
+    # upload uid -> sha256 the caller already verified on these exact part files, so a large
+    # batch is not read twice inside the transaction. Uids it does not name are hashed here.
+    known_digests: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Finalize-on-post: turn each fully-received pending upload into the owner's attachment and
     return their uids. A missing/expired or incomplete upload raises UploadsUnlinkable naming every
@@ -1243,7 +1250,8 @@ async def finalize_pending(
         if settled is None:  # cannot happen under the lock above; answered as an unknown uid would
             raise UploadsUnlinkable([upload.upload_uid], [])
         locked.uploads[settled.upload_uid] = settled
-        locked.digests[settled.upload_uid] = await to_thread.run_sync(
+        known = known_digests.get(settled.upload_uid) if known_digests is not None else None
+        locked.digests[settled.upload_uid] = known or await to_thread.run_sync(
             _sha256_sync, part_path(settled.upload_uid)
         )
 
@@ -1264,7 +1272,7 @@ async def finalize_pending(
         )
         .scalars()
         .all()
-        if locked.digests
+        if locked.digests and adopt_unlinked
         else []
     ):
         if att.sha256 is not None:
@@ -1506,7 +1514,9 @@ async def finalize(
     # Stage in originals/_unfiled/ — the memo (and so the per-memo folder) doesn't exist yet; the
     # master is atomically moved into originals/YYYY/MM/<memo-folder>/ on link_attachments.
     dest_dir = storage.unfiled_dir(_data_root())
-    dest = dest_dir / f"{uuid.uuid4().hex}_{Path(upload.filename).name}"
+    # The name sanitized and byte-capped as final placement names it: a long but legal client name
+    # plus this 33-character prefix would otherwise pass NAME_MAX and fail the move.
+    dest = dest_dir / f"{uuid.uuid4().hex}_{storage.sanitize_name(upload.filename)}"
     # Recorded BEFORE the move, not after it: a request cancelled during the await used to let the
     # rename land with the bookkeeping skipped, stranding an original in _unfiled/ that no rollback
     # could find (MEMNG-145). Only a genuinely-moved file is tracked — the dedup return above
