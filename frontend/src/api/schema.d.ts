@@ -5629,7 +5629,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description The collection is a trip without a tag (detail "trip_has_no_tag"): a guest picture taken outside the span joins the trip only by its tag. Nothing was stored. */
+            /** @description The collection is a trip whose tag a memo cannot carry as "#tag" (detail "trip_has_no_tag"; only a legacy tag can be one): a guest picture taken outside the span joins the trip only by its tag. Nothing was stored. A trip WITHOUT a tag is not refused: it is given its title lower-cased with everything but letters and digits removed ("Cyprus 2026" becomes cyprus2026, or trip plus the first eight letters and digits of its uid when that leaves nothing), in the same transaction as the pass, and memos already carrying that tag join the trip. */
             409: {
                 headers: {
                     [name: string]: unknown;

@@ -144,19 +144,108 @@ def test_two_issues_mint_two_secrets(lib):
     assert a["secret"] != b["secret"] and a["pass"]["uid"] != b["pass"]["uid"]
 
 
-def test_issue_on_a_tagless_trip_is_409_and_stores_nothing(lib):
+def _titled_trip(client, title: str) -> str:
+    r = client.post(
+        "/api/collections",
+        json={"title": title, "kind": "trip", "spanStart": START, "spanEnd": END},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["uid"]
+
+
+def _stored_tag(coll_uid: str) -> str | None:
+    return _sql("SELECT tag FROM collections WHERE uid = :u", {"u": coll_uid})[0][0]
+
+
+def test_issue_on_a_dates_only_trip_gives_it_the_squashed_title_as_tag(lib):
     client, _ = lib
-    coll = _trip(client, tag=None, span=True)
+    coll = _titled_trip(client, "Cyprus 2026")
+    assert _stored_tag(coll) is None
+    r = _issue(client, coll)
+    assert r.status_code == 201, r.text
+    assert _stored_tag(coll) == "cyprus2026"
+    assert client.get(f"/api/collections/{coll}").json()["tag"] == "cyprus2026"
+    listed = {c["uid"]: c["tag"] for c in client.get("/api/collections").json()}
+    assert listed[coll] == "cyprus2026"
+    (span,) = _sql("SELECT span_start IS NOT NULL FROM collections WHERE uid = :u", {"u": coll})
+    assert span[0] is True  # the span stays; the tag is added beside it
+
+
+def test_the_derived_tag_deliberately_pulls_in_memos_already_carrying_it(lib):
+    """The owner's rule: a trip named "Cyprus 2026" holds the #cyprus2026 memos — reuse is the
+    point, so there is no uniqueness check and no suffix."""
+    client, me = lib
+    coll = _titled_trip(client, "Cyprus 2026")
+    _att("cy-old", me, _memo("cy-old-m", me, tags=("cyprus2026",)))  # outside the span
+    assert client.get(f"/api/collections/{coll}").json()["memberCount"] == 0
+    assert _issue(client, coll).status_code == 201
+    assert _stored_tag(coll) == "cyprus2026"
+    assert client.get(f"/api/collections/{coll}").json()["memberCount"] == 1
+
+
+def test_issue_never_replaces_an_existing_tag(lib):
+    client, _ = lib
+    coll = _trip(client, tag="Keep_Me", span=True)
+    assert _issue(client, coll).status_code == 201
+    assert _stored_tag(coll) == "Keep_Me"
+
+
+def test_issue_on_a_trip_whose_legacy_tag_fails_parse_tags_is_409_and_keeps_it(lib):
+    client, _ = lib
+    coll = _trip(client, span=True)
+    _sql("UPDATE collections SET tag = 'has-dash' WHERE uid = :u", {"u": coll})
     r = _issue(client, coll)
     assert r.status_code == 409, r.text
     assert r.json()["detail"] == "trip_has_no_tag"
+    assert _stored_tag(coll) == "has-dash"
     assert _sql("SELECT count(*) FROM passes")[0][0] == 0
+
+
+@pytest.mark.parametrize("title", ["!!! ---", "🏖️ 🌊", "   "])
+def test_a_title_that_squashes_to_nothing_falls_back_to_trip_and_the_uid(lib, title):
+    client, _ = lib
+    coll = _titled_trip(client, title)
+    assert _issue(client, coll).status_code == 201, title
+    want = "trip" + "".join(ch for ch in coll if ch.isascii() and ch.isalnum())[:8].lower()
+    assert _stored_tag(coll) == want
+    from app.services.memos import parse_tags
+
+    assert parse_tags(f"#{want}") == [want]
+
+
+def test_a_trip_deleted_before_the_lock_is_404_and_stores_nothing(lib, monkeypatch):
+    from app.services import passes as pass_svc
+
+    client, _ = lib
+    coll = _titled_trip(client, "Gone")
+
+    async def deleted_meanwhile():
+        _sql("DELETE FROM collections WHERE uid = :u", {"u": coll})
+
+    monkeypatch.setattr(pass_svc, "_before_pass_lock", deleted_meanwhile)
+    r = _issue(client, coll)
+    assert r.status_code == 404, r.text
+    assert _sql("SELECT count(*) FROM passes")[0][0] == 0
+
+
+def test_the_squash_keeps_non_ascii_letters_parse_tags_reads():
+    from app.services import passes as pass_svc
+
+    assert pass_svc.derive_trip_tag("Zürich – Bern '26", "abcdefghij") == "zürichbern26"
+    assert pass_svc.derive_trip_tag("Cyprus_2026", "abcdefghij") == "cyprus2026"
+    assert pass_svc.derive_trip_tag("…", "a-b_c1234567") == "tripabc12345"
+    # "İ".lower() is "i" plus a combining dot, which is no letter and goes.
+    assert pass_svc.derive_trip_tag("İstanbul", "abcdefghij") == "istanbul"
+    assert pass_svc.derive_trip_tag("", "AbC-dEf_GhIj") == "tripabcdefgh"
+    assert pass_svc.derive_trip_tag("x" * 300, "abcdefghij") == "x" * 255  # the column's bound
 
 
 def test_issue_on_an_album_needs_no_tag(lib):
     client, _ = lib
-    r = _issue(client, _album(client))
+    album = _album(client)
+    r = _issue(client, album)
     assert r.status_code == 201, r.text
+    assert _stored_tag(album) is None  # an album is never given a tag
 
 
 def test_issue_on_an_unknown_collection_is_404(lib):
@@ -399,6 +488,64 @@ async def test_a_patch_racing_a_revoke_cannot_resurrect_the_pass(lib, pat_client
         assert row[1] == "r"  # the edit came second and changed nothing
     else:
         assert codes == [200, 200] and row[1] == "late"  # the edit came first; revoke still won
+
+
+async def test_two_issues_racing_on_an_untagged_trip_both_succeed_with_one_tag(
+    lib, pat_client, monkeypatch
+):
+    from app.services import passes as pass_svc
+
+    bearer, _, _ = pat_client
+    made = await bearer.post(
+        "/api/collections",
+        json={"title": "Cyprus 2026", "kind": "trip", "spanStart": START, "spanEnd": END},
+    )
+    coll = made.json()["uid"]
+    both = asyncio.Barrier(2)
+
+    async def held():
+        async with asyncio.timeout(10):
+            await both.wait()
+
+    monkeypatch.setattr(pass_svc, "_before_pass_lock", held)
+    results = await asyncio.gather(
+        bearer.post(f"/api/collections/{coll}/passes", json={"label": "a"}),
+        bearer.post(f"/api/collections/{coll}/passes", json={"label": "b"}),
+    )
+    assert [r.status_code for r in results] == [201, 201], [r.text for r in results]
+    assert _stored_tag(coll) == "cyprus2026"
+    assert _sql("SELECT count(*) FROM passes")[0][0] == 2
+
+
+async def test_an_issue_waits_on_the_trip_row_and_keeps_a_tag_committed_meanwhile(lib, pat_client):
+    """Another transaction holds the trip row and gives it a tag. Issuance must WAIT on the row and
+    then read the committed tag — never write its derived one over it. Without the lock it read the
+    tag as NULL before the holder committed, waits only at its own UPDATE, and overwrites."""
+    from sqlalchemy import text
+
+    bearer, _, _ = pat_client
+    made = await bearer.post(
+        "/api/collections",
+        json={"title": "Cyprus 2026", "kind": "trip", "spanStart": START, "spanEnd": END},
+    )
+    coll = made.json()["uid"]
+    async with async_session() as holder:
+        await holder.execute(
+            text("SELECT id FROM collections WHERE uid = :u FOR UPDATE"), {"u": coll}
+        )
+        holder_pid = (await holder.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+        request = asyncio.ensure_future(
+            bearer.post(f"/api/collections/{coll}/passes", json={"label": "r"})
+        )
+        await _wait_until_blocked_by(holder_pid)
+        assert not request.done()
+        await holder.execute(
+            text("UPDATE collections SET tag = 'chosen_by_hand' WHERE uid = :u"), {"u": coll}
+        )
+        await holder.commit()
+    r = await asyncio.wait_for(request, 10)
+    assert r.status_code == 201, r.text
+    assert _stored_tag(coll) == "chosen_by_hand"  # "cyprus2026" = it overwrote the committed tag
 
 
 def test_deleting_the_collection_revokes_its_live_passes_as_one_versioned_transition(lib):

@@ -235,9 +235,13 @@ def _device_out(d: PassDevice) -> PassDeviceOut:
         **_UNAUTHORIZED,
         404: {"description": "No such collection. Nothing was stored.", "content": _DETAIL},
         409: {
-            "description": 'The collection is a trip without a tag (detail "trip_has_no_tag"): a '
-            "guest picture taken outside the span joins the trip only by its tag. Nothing was "
-            "stored.",
+            "description": 'The collection is a trip whose tag a memo cannot carry as "#tag" '
+            '(detail "trip_has_no_tag"; only a legacy tag can be one): a guest picture taken '
+            "outside the span joins the trip only by its tag. Nothing was stored. A trip WITHOUT "
+            "a tag is not refused: it is given its title lower-cased with everything but letters "
+            'and digits removed ("Cyprus 2026" becomes cyprus2026, or trip plus the first eight '
+            "letters and digits of its uid when that leaves nothing), in the same transaction as "
+            "the pass, and memos already carrying that tag join the trip.",
             "content": _DETAIL,
         },
     },
@@ -267,6 +271,8 @@ async def issue_pass(
         url = pass_svc.pass_url(secret)
     except pass_svc.TripHasNoTag as exc:
         raise HTTPException(status_code=409, detail="trip_has_no_tag") from exc
+    except coll_svc.CollectionGone as exc:
+        raise HTTPException(status_code=404, detail="Collection not found") from exc
     except pass_svc.DoorNotConfigured as exc:
         # The schema's 503 ({detail}) already stands on every operation (app.main); this one is an
         # operator fault, named so whoever reads the log or the answer knows which setting to fix.

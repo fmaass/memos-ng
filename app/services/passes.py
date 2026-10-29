@@ -73,6 +73,48 @@ async def _before_pass_lock() -> None:
     requests must both be able to stand so the lock — not the read — is shown to decide."""
 
 
+TRIP_TAG_MAX = 255  # collections.tag is String(255)
+_UID_FALLBACK_LEN = 8
+
+
+def derive_trip_tag(title: str, uid: str) -> str:
+    """The tag a trip created from dates alone is given at its first pass (MEMNG-1057, the owner's
+    rule): the title lower-cased with every character that is not a letter or digit removed —
+    "Cyprus 2026" is `cyprus2026`. No uniqueness check and no suffix, on purpose: memos already
+    carrying that tag join the trip (membership is the tag OR the span), which is what a trip named
+    Cyprus 2026 is for. Lower-casing comes first because it can itself produce a non-letter (the
+    combining dot of "İ"). A title that leaves nothing, or nothing `parse_tags` reads back whole,
+    falls back to `trip` and the uid's first eight letters and digits."""
+    squashed = "".join(ch for ch in title.lower() if ch.isalnum())[:TRIP_TAG_MAX]
+    if squashed and memos_svc.parse_tags(f"#{squashed}") == [squashed]:
+        return squashed
+    uid_part = "".join(ch for ch in uid if ch.isascii() and ch.isalnum())[:_UID_FALLBACK_LEN]
+    return f"trip{uid_part.lower()}"
+
+
+async def _tag_trip_if_untagged(db: AsyncSession, collection: Collection) -> Collection:
+    """FOR UPDATE on the trip row and re-read it, then give it `derive_trip_tag` when — AS IT IS
+    NOW — it has no tag. Under the lock, two overlapping issuances take turns and the second sees
+    the first's tag, and a tag another writer committed meanwhile is kept rather than overwritten.
+    An existing tag is never replaced, even one `parse_tags` cannot read (`guest_memo_content`
+    refuses that one). The CHECKs hold: a trip with a tag needs nothing else."""
+    await _before_pass_lock()
+    locked = (
+        await db.execute(
+            select(Collection)
+            .where(Collection.id == collection.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked is None:
+        raise coll_svc.CollectionGone(collection.id)
+    if locked.tag is None:
+        locked.tag = derive_trip_tag(locked.title, locked.uid)
+        await db.flush()
+    return locked
+
+
 def guest_memo_content(collection: Collection) -> str:
     """The ENTIRE `content` of a memo a guest batch becomes: `#<tag>` for a trip, empty for an album
     (whose membership is its member rows). Built from the home row only; raises `TripHasNoTag`
@@ -189,9 +231,13 @@ async def issue_pass(
     notes: str | None = None,
 ) -> tuple[Pass, str]:
     """Issue a pass on `collection`; returns `(row, secret)`. The secret exists only in this
-    return value. A trip whose tag would not survive `parse_tags` raises `TripHasNoTag` before
-    anything is written: a guest picture taken outside the span joins the trip only by its tag."""
+    return value. A guest picture taken outside the span joins a trip only by its tag, so a trip
+    without one is given one here, in this transaction (`_tag_trip_if_untagged`); a trip whose
+    existing tag would not survive `parse_tags` raises `TripHasNoTag` before anything is written.
+    A vanished collection raises `CollectionGone`."""
     door_origin()
+    if collection.kind == "trip":
+        collection = await _tag_trip_if_untagged(db, collection)
     guest_memo_content(collection)
     now = datetime.now(UTC)
     secret = secrets.token_urlsafe(32)
