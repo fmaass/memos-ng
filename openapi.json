@@ -2889,6 +2889,13 @@
             "title": "Created At",
             "type": "string"
           },
+          "idempotency_key": {
+            "title": "Idempotency Key",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mine": {
             "title": "Mine",
             "type": "boolean"

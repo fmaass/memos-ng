@@ -197,6 +197,9 @@ class MemoOut(BaseModel):
     attachments: list[AttachmentRef] = []
     reactions: list[ReactionSummary] = []
     total_size: int = 0
+    # The key the memo was created under (MEMNG-1036), so an outbox whose create got no answer can
+    # find it on the timeline. It is the owner's private retry token: null for every other reader.
+    idempotency_key: str | None = None
 
 
 # Bounded and opaque: the shape gate only has to bound what the unique index stores and reject
@@ -570,10 +573,11 @@ def _reactions(memo: Memo, user_id: int) -> list[ReactionSummary]:
 
 
 def _out(memo: Memo, user_id: int, web_ready: AbstractSet[str]) -> MemoOut:
+    mine = memo.owner_id == user_id
     return MemoOut(
         uid=memo.uid,
         owner=memo.owner.subject,
-        mine=memo.owner_id == user_id,
+        mine=mine,
         content=memo.content,
         visibility=memo.visibility,
         pinned=memo.pinned,
@@ -586,6 +590,7 @@ def _out(memo: Memo, user_id: int, web_ready: AbstractSet[str]) -> MemoOut:
         # Summed over the same loaded rows `attachments` is built from, so the two never disagree
         # and no extra query is spent.
         total_size=sum(a.size for a in memo.attachments),
+        idempotency_key=memo.idempotency_key if mine else None,
     )
 
 

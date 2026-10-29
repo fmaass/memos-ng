@@ -3051,6 +3051,8 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Idempotency Key */
+            idempotency_key?: string | null;
             /** Mine */
             mine: boolean;
             /** Owner */
