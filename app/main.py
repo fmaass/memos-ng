@@ -29,7 +29,7 @@ from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
 from app.logging_privacy import configure_logging
 from app.security_headers import CSP
-from app.services import management_grant, reclaim
+from app.services import management_grant, reclaim, trip_ingest_metrics
 from app.services.cursors import InvalidCursor
 from app.services.digest import metrics as digest_metrics
 from app.version import API_MAJOR, __version__
@@ -143,6 +143,9 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_sch
 # at all). Registration is guarded because this module is re-imported by the test suite's app
 # fixtures, and prometheus_client refuses a duplicate collector by raising.
 digest_metrics.register_once(REGISTRY)
+# The trip pass puller's gauges, beside them on the same registry. Unlike the digest's, this
+# collector reads the database on every scrape (bounded; see its module docstring for why).
+trip_ingest_metrics.register_once(REGISTRY)
 
 
 SECURITY_SCHEMES = {
