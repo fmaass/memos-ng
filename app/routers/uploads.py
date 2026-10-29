@@ -1,3 +1,4 @@
+import time
 from typing import Annotated, Any, Literal
 
 import structlog
@@ -12,6 +13,7 @@ from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import get_session
 from app.models import AttachmentStatus, Upload, User
+from app.services import upload_metrics
 from app.services import uploads as svc
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
@@ -50,10 +52,11 @@ class BodyAdmission:
         # No lock: every request runs on the one event loop, and nothing between the check and the
         # increment awaits, so no other request can interleave there.
         held = self.per_user.get(user_id, 0)
-        if (
-            held >= settings.UPLOAD_BODIES_PER_USER
-            or self.total >= settings.UPLOAD_BODIES_PER_PROCESS
-        ):
+        if held >= settings.UPLOAD_BODIES_PER_USER:
+            upload_metrics.count_rejection("user")
+            return False
+        if self.total >= settings.UPLOAD_BODIES_PER_PROCESS:
+            upload_metrics.count_rejection("process")
             return False
         self.per_user[user_id] = held + 1
         self.total += 1
@@ -161,6 +164,7 @@ async def start_upload(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> UploadOut:
     if body.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
+        upload_metrics.count_size_rejection()
         raise HTTPException(
             status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
         )
@@ -262,10 +266,12 @@ async def append_chunk(
             detail="Too many uploads in progress; retry later",
             headers={"Retry-After": str(settings.UPLOAD_RETRY_AFTER_SECONDS)},
         )
+    started = time.monotonic()
     try:
         try:
             appended = await svc.append_stream(db, upload, upload_offset, request.stream())
         except svc.UploadTooLarge as exc:
+            upload_metrics.count_size_rejection()
             cap = settings.MAX_UPLOAD_MIB * 1024 * 1024
             detail = (
                 f"Upload exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
@@ -283,8 +289,11 @@ async def append_chunk(
             raise HTTPException(status_code=404, detail="Upload not found")
         upload = appended.upload
         await db.commit()
+        # After the commit, so bytes a 413 or a rollback discarded are never counted.
+        upload_metrics.count_bytes(getattr(request.state, "auth_kind", "session"), appended.merged)
     finally:
         body_admission.release(user.id)
+        upload_metrics.UPLOAD_PATCH_SECONDS.observe(time.monotonic() - started)
     if appended.kept_from_cut:
         # The client is gone and never reads this answer; the route still returns a valid
         # UploadOut, because FastAPI validates every return against `response_model`.

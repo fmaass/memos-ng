@@ -36,7 +36,16 @@ from app.models import (
     User,
     Visibility,
 )
-from app.services import asset_urls, camera, poster, printready, reclaim, storage, variants
+from app.services import (
+    asset_urls,
+    camera,
+    poster,
+    printready,
+    reclaim,
+    storage,
+    upload_metrics,
+    variants,
+)
 from app.services import attachment_tags as tag_svc
 from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
@@ -1317,4 +1326,7 @@ async def events(request: Request) -> StreamingResponse:
     async def meta(uids: list[str]) -> dict[str, dict]:
         return await _ready_meta(user_id, uids)
 
-    return StreamingResponse(media_event_stream(snap, meta), media_type="text/event-stream")
+    return StreamingResponse(
+        upload_metrics.events_subscriber(media_event_stream(snap, meta)),
+        media_type="text/event-stream",
+    )

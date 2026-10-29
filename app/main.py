@@ -29,7 +29,13 @@ from app.csrf import OriginCsrfMiddleware
 from app.database import async_session
 from app.logging_privacy import configure_logging
 from app.security_headers import CSP
-from app.services import management_grant, reclaim, trip_ingest_metrics
+from app.services import (
+    management_grant,
+    reclaim,
+    trip_ingest_metrics,
+    upload_metrics,
+    upload_queue_metrics,
+)
 from app.services.cursors import InvalidCursor
 from app.services.digest import metrics as digest_metrics
 from app.version import API_MAJOR, __version__
@@ -146,6 +152,10 @@ digest_metrics.register_once(REGISTRY)
 # The trip pass puller's gauges, beside them on the same registry. Unlike the digest's, this
 # collector reads the database on every scrape (bounded; see its module docstring for why).
 trip_ingest_metrics.register_once(REGISTRY)
+# Uploads and the event stream (MEMNG-962): in-process instruments where the app is the one that
+# sees the event, and a per-scrape read of the tables for what the worker decides.
+upload_metrics.register_once(REGISTRY)
+upload_queue_metrics.register_once(REGISTRY)
 
 
 SECURITY_SCHEMES = {

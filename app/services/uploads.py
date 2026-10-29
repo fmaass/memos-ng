@@ -33,7 +33,7 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import asset_paths, camera, capture, location, poster, storage
+from app.services import asset_paths, camera, capture, location, poster, storage, upload_metrics
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -546,6 +546,9 @@ class Appended:
 
     upload: Upload
     kept_from_cut: int = 0
+    # Bytes this append merged into the part file: 0 for a replay, including one a concurrent
+    # append covered while this body streamed — the offset alone cannot tell those apart.
+    merged: int = 0
 
 
 async def append_stream(
@@ -614,13 +617,16 @@ async def append_stream(
         on_complete=completed,
         strict_offset=strict_offset,
     )
-    return None if appended is None else Appended(appended.row, appended.kept_from_cut)
+    if appended is None:
+        return None
+    return Appended(appended.row, appended.kept_from_cut, appended.merged)
 
 
 @dataclass(frozen=True)
 class OffsetAppend[R: (Upload, GuestUpload)]:
     row: R
     kept_from_cut: int = 0
+    merged: int = 0
 
 
 async def append_offset_stream[R: (Upload, GuestUpload)](
@@ -679,7 +685,7 @@ async def append_offset_stream[R: (Upload, GuestUpload)](
             kept_from_cut = received if spooled.cut else 0
             if row.bytes_received >= row.declared_size and on_complete is not None:
                 row = await on_complete(row)
-            return OffsetAppend(row, kept_from_cut)
+            return OffsetAppend(row, kept_from_cut, received)
         # offset < bytes_received → a concurrent append already covered this range
         if strict_offset:
             raise ValueError("offset mismatch")
@@ -883,6 +889,7 @@ async def attach_video_poster(
     )
     poster_copies_out.append(record)  # before the copy, never after — see above
     await to_thread.run_sync(record.publish)
+    upload_metrics.count_session_end(db, "completed")
     await db.delete(upload)
     await db.flush()
     return dest
@@ -1505,6 +1512,7 @@ async def finalize(
         # a memo is not something a sweep of detached rows may still take.
         existing.detached_at = None
         await _consume(part, consumed_out)
+        upload_metrics.count_session_end(db, "deduped")
         await db.delete(upload)
         await db.flush()
         return existing
@@ -1580,6 +1588,7 @@ async def finalize(
                 state=JobState.queued,
             )
         )
+    upload_metrics.count_session_end(db, "completed")
     await db.delete(upload)
     await db.flush()
     return attachment
@@ -1614,6 +1623,7 @@ async def finalize_rendition(
     ).scalar_one_or_none()
     if existing is not None:  # write-once — a re-dump of the same key changes nothing
         await _consume(part, consumed_out)
+        upload_metrics.count_session_end(db, "deduped")
         await db.delete(upload)
         await db.flush()
         return None
@@ -1646,6 +1656,7 @@ async def finalize_rendition(
             await db.flush()
     except IntegrityError:  # lost a concurrent race for this (attachment, variant_key) → no-op
         await _consume(part, consumed_out)
+        upload_metrics.count_session_end(db, "deduped")
         await db.delete(upload)
         await db.flush()
         return None
@@ -1654,6 +1665,7 @@ async def finalize_rendition(
     if moved_out is not None:
         moved_out.append(track)
     await to_thread.run_sync(_tracked_move_into_sync, track, dest)
+    upload_metrics.count_session_end(db, "completed")
     await db.delete(upload)
     await db.flush()
     return rendition
@@ -1734,6 +1746,7 @@ async def attach_print_master(
         rendition.storage_path = str(dest)
         if existing is None:
             db.add(rendition)
+        upload_metrics.count_session_end(db, "completed")
         await db.delete(upload)
         await db.flush()
     except BaseException:
@@ -1805,6 +1818,7 @@ async def bind_print_to_sibling(
     attachment.print_path = str(path)
     attachment.print_mime = mime
     attachment.print_size = actual
+    upload_metrics.count_session_end(db, "completed")
     await db.delete(upload)
     await db.flush()
     return True
