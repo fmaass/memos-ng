@@ -90,6 +90,19 @@ class UploadOut(BaseModel):
     )
 
 
+class UploadLimitsOut(BaseModel):
+    max_bytes: int = Field(
+        description="The largest `size` POST /api/uploads accepts; anything larger is answered 413."
+    )
+    wifi_recommended_above_bytes: int = Field(
+        description="Advisory: above this size a client should wait for Wi-Fi by default. The "
+        "server enforces nothing at it."
+    )
+    bodies_per_user: int = Field(
+        description="Upload bodies one user may stream at once; one more PATCH is answered 429."
+    )
+
+
 class AttachmentOut(BaseModel):
     uid: str
     filename: str
@@ -164,6 +177,17 @@ async def start_upload(
         upload_uid=upload.upload_uid,
         chunk_size=settings.UPLOAD_CHUNK_SIZE,
         bytes_received=upload.bytes_received,
+    )
+
+
+# Declared before every `/{upload_uid}` route: Starlette matches in declaration order, so a
+# parametric single-segment route declared first would read `limits` as an upload uid.
+@router.get("/limits", response_model=UploadLimitsOut)
+async def upload_limits(_: Annotated[User, Depends(auth.require_user)]) -> UploadLimitsOut:
+    return UploadLimitsOut(
+        max_bytes=settings.MAX_UPLOAD_MIB * 1024 * 1024,
+        wifi_recommended_above_bytes=settings.UPLOAD_WIFI_RECOMMENDED_MIB * 1024 * 1024,
+        bodies_per_user=settings.UPLOAD_BODIES_PER_USER,
     )
 
 

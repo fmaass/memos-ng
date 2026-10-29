@@ -1575,6 +1575,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/uploads/limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Upload Limits */
+        get: operations["upload_limits_api_uploads_limits_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/uploads/{upload_uid}": {
         parameters: {
             query?: never;
@@ -3564,6 +3581,24 @@ export interface components {
             mime: string;
             /** Size */
             size: number;
+        };
+        /** UploadLimitsOut */
+        UploadLimitsOut: {
+            /**
+             * Bodies Per User
+             * @description Upload bodies one user may stream at once; one more PATCH is answered 429.
+             */
+            bodies_per_user: number;
+            /**
+             * Max Bytes
+             * @description The largest `size` POST /api/uploads accepts; anything larger is answered 413.
+             */
+            max_bytes: number;
+            /**
+             * Wifi Recommended Above Bytes
+             * @description Advisory: above this size a client should wait for Wi-Fi by default. The server enforces nothing at it.
+             */
+            wifi_recommended_above_bytes: number;
         };
         /** UploadOut */
         UploadOut: {
@@ -7079,6 +7114,27 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    upload_limits_api_uploads_limits_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadLimitsOut"];
                 };
             };
             503: components["responses"]["DatabaseBusy"];

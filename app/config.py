@@ -118,6 +118,10 @@ class Settings(BaseSettings):
     UPLOAD_CHUNK_SIZE: int = 5 * 1024 * 1024  # 5 MiB
     UPLOAD_EXPIRY_HOURS: int = 24
     MAX_UPLOAD_MIB: int = 1024  # prod parity (system_setting MAX_UPLOAD_SIZE_MIB)
+    # Published by GET /api/uploads/limits as the size above which the iOS client waits for Wi-Fi
+    # by default. 200 is plan 4494's default mobile-data policy ("only under 200 MB"); MiB, like
+    # MAX_UPLOAD_MIB, so both limits share one unit. Advisory: the server enforces nothing at it.
+    UPLOAD_WIFI_RECOMMENDED_MIB: int = 200
 
     # Trip passes (trip pass P1): the guest door's public origin, which the pass URL and its QR
     # code name. Guests never reach this host; the door is a separate installation.

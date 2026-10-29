@@ -4069,6 +4069,32 @@
         "title": "UploadCreate",
         "type": "object"
       },
+      "UploadLimitsOut": {
+        "properties": {
+          "bodies_per_user": {
+            "description": "Upload bodies one user may stream at once; one more PATCH is answered 429.",
+            "title": "Bodies Per User",
+            "type": "integer"
+          },
+          "max_bytes": {
+            "description": "The largest `size` POST /api/uploads accepts; anything larger is answered 413.",
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "wifi_recommended_above_bytes": {
+            "description": "Advisory: above this size a client should wait for Wi-Fi by default. The server enforces nothing at it.",
+            "title": "Wifi Recommended Above Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_bytes",
+          "wifi_recommended_above_bytes",
+          "bodies_per_user"
+        ],
+        "title": "UploadLimitsOut",
+        "type": "object"
+      },
       "UploadOut": {
         "properties": {
           "bytes_received": {
@@ -10247,6 +10273,38 @@
           }
         ],
         "summary": "Start Upload",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/api/uploads/limits": {
+      "get": {
+        "operationId": "upload_limits_api_uploads_limits_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadLimitsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Upload Limits",
         "tags": [
           "uploads"
         ]

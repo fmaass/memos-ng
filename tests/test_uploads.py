@@ -1701,3 +1701,51 @@ async def test_create_upload_stores_the_sent_millisecond_exactly(
         )
     ).scalar_one()
     assert reread.client_mtime == stored
+
+
+def test_upload_limits_follow_the_settings(logged_in_client, monkeypatch):
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 7)
+    monkeypatch.setattr(settings, "UPLOAD_WIFI_RECOMMENDED_MIB", 3)
+    monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_USER", 5)
+    r = client.get("/api/uploads/limits")
+    assert r.status_code == 200
+    assert r.json() == {
+        "max_bytes": 7 * 1024 * 1024,
+        "wifi_recommended_above_bytes": 3 * 1024 * 1024,
+        "bodies_per_user": 5,
+    }
+
+
+def test_upload_limits_max_bytes_is_the_largest_size_a_session_accepts(
+    logged_in_client, monkeypatch
+):
+    # The client marks a file too large from this number alone, so it must sit exactly on the
+    # boundary start_upload enforces — one byte either way strands a file or wastes an upload.
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 1)
+    max_bytes = client.get("/api/uploads/limits").json()["max_bytes"]
+    try:
+        at = client.post(
+            "/api/uploads", json={"filename": "a.mov", "mime": "video/mp4", "size": max_bytes}
+        )
+        assert at.status_code == 201
+        over = client.post(
+            "/api/uploads", json={"filename": "b.mov", "mime": "video/mp4", "size": max_bytes + 1}
+        )
+        assert over.status_code == 413
+    finally:
+        _cleanup()
+
+
+def test_upload_limits_require_auth(client):
+    assert client.get("/api/uploads/limits").status_code == 401
+
+
+def test_upload_limits_route_precedes_every_upload_uid_route():
+    # Starlette matches in declaration order, so a single-segment `/{upload_uid}` route declared
+    # first would take `limits` as an upload uid.
+    paths = [getattr(route, "path", None) for route in app.routes]
+    limits = paths.index("/api/uploads/limits")
+    parametric = [i for i, p in enumerate(paths) if p and p.startswith("/api/uploads/{upload_uid}")]
+    assert parametric and all(limits < i for i in parametric)
