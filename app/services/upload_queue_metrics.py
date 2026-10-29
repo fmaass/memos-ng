@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import async_session
 from app.models import JobLane, JobState, MediaJob, Upload
+from app.services.trip_ingest_metrics import descriptors_of
 
 logger = structlog.get_logger(__name__)
 
@@ -179,9 +180,16 @@ def families_from(state: QueueState) -> list[Metric]:
     return [sessions, queued, seconds]
 
 
+_DESCRIBE_STATE = QueueState(sessions_open=0, queued={}, finished=())
+
+
 class UploadQueueCollector:
     """Synchronous, as prometheus_client requires; the read runs on the app's event loop, as
     `trip_ingest_metrics.GuestSyncCollector` explains."""
+
+    def describe(self):
+        # Keeps `register()` from calling `collect()` outside a loop; see GuestSyncCollector.
+        return descriptors_of(families_from(_DESCRIBE_STATE))
 
     def collect(self):
         try:

@@ -174,10 +174,31 @@ def families_from(state: GuestSyncState, now: datetime) -> list[Metric]:
     return out
 
 
+def descriptors_of(families: list[Metric]) -> list[Metric]:
+    """The families' name, help and type without their samples, for a collector's `describe()`."""
+    return [Metric(f.name, f.documentation, f.type, f.unit) for f in families]
+
+
+# Every field set, so that the age family a scrape omits before the first sync is described too.
+_DESCRIBE_AT = datetime(1970, 1, 1, tzinfo=UTC)
+_DESCRIBE_STATE = GuestSyncState(
+    last_sync_at=_DESCRIBE_AT,
+    required=False,
+    oldest_open_at=_DESCRIBE_AT,
+    blobs_pending=0,
+    quarantined=0,
+)
+
+
 class GuestSyncCollector:
     """Synchronous, as prometheus_client requires. The instrumentator's `/metrics` handler is a
     plain `def`, so Starlette runs it in an AnyIO worker thread; the read is handed back to the
     app's event loop, where the pooled async engine lives."""
+
+    def describe(self):
+        # Without it an auto-describing registry calls `collect()` at `register()`, at import time
+        # where `from_thread.run` has no loop. Derived from `families_from` so the two cannot drift.
+        return descriptors_of(families_from(_DESCRIBE_STATE, _DESCRIBE_AT))
 
     def collect(self):
         try:
