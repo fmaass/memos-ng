@@ -190,6 +190,71 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.8.0
+
+- Trip passes: a guest pass lets people without an account add pictures to a collection.
+  `POST /api/collections/{uid}/passes` issues one (201) with a `label`, a `scope` (`contribute`,
+  the default, or `contribute_view`, which no route serves yet), `expiresAt` (default: the trip's
+  span end plus 14 days, else 30 days from now), `maxDevices` (1–200, default 30) and `notes`. The
+  answer carries the secret, the guest URL and that URL as an SVG QR code, once; only the secret's
+  sha256 is stored. A trip without a tag answers 409 `trip_has_no_tag`; a `TRIP_PASS_BASE_URL`
+  that is not an absolute https origin answers 503 and issues nothing.
+- Every signed-in member manages every pass, as with collections. `GET
+  /api/collections/{uid}/passes` lists a collection's passes, revoked ones included; `GET`, `PATCH`
+  and `DELETE /api/passes/{uid}` read, edit and revoke one. A change raises the pass's `version`.
+  A revocation is terminal and revokes every device on the pass; reading, editing or revoking it
+  again answers 410 `pass_revoked`. Deleting a collection revokes its passes first; their
+  contributions stay.
+- `GET /api/passes/{uid}/devices` lists the guest devices on a pass; `DELETE
+  /api/passes/{uid}/devices/{device_uid}` revokes one (410 `device_revoked` if it already is).
+  `GET /api/passes/{uid}/contributions` lists every picture that came in through a pass with its
+  contributor name, device, caption and whether it is hidden, also after a revoke.
+  `POST /api/passes/{uid}/contributions/hide`, `/unhide` and `/remove` take up to 500
+  `attachmentUids` and answer per uid `hidden`, `unhidden`, `removed`, `notContribution` or
+  `error`. Hiding excludes a picture from a trip or takes it out of an album; `remove` deletes the
+  original and every derived file.
+- Web: Settings > General has a "Guest passes" section listing the trips. Each opens a sheet that
+  issues a pass (label, scope, expiry, device limit), shows its QR code and link once, lists the
+  passes with their devices, and revokes a pass or a single device.
+- The guest side is a separate installation from the same image, picked by `APP_ROLE`: `home`
+  (the default, the household app), `ingest` or `ingest-home`. Both ingest roles serve
+  `app.ingest.asgi:app`, which loads no member route, OpenAPI document or SPA; `app.main` refuses
+  an ingest role, `app.ingest.asgi` refuses `home`, and the media worker refuses an ingest role.
+- `ingest` is the guest door: `GET /p/{secret}` (a static page), the
+  `/.well-known/apple-app-site-association` file for `/p/*` (404 without `APPLE_TEAM_ID`),
+  `POST /api/pass/redeem` (enrolls a device and returns its `trip_dev_…` token; 404 for an unknown
+  secret, 410 for a pass no longer open, 429 past the rate, address or device limit),
+  `GET /api/guest/me`, resumable uploads through `POST /api/guest/uploads` and `HEAD` / `PATCH
+  /api/guest/uploads/{upload_uid}` with `Upload-Offset`, `POST /api/guest/memos` to complete a
+  batch (a replayed completion answers the same receipt) and `GET /api/guest/batches`. A new
+  upload answers 507 past the pass's byte cap or the `INGEST_MIN_FREE_BYTES` floor. A pass with
+  more than `INGEST_REFUSALS_PER_HOUR` refused redemptions within an hour is suspended there.
+- `ingest-home` is the interface home pulls from, under `/ingest/`, for one bearer token,
+  `INGEST_SERVICE_TOKEN` (at least 86 characters, `secrets.token_urlsafe(64)`); without one it
+  refuses every request. It takes pass state and device revocations, pages devices and batches,
+  serves files by sha256 with Range, and takes acks and quarantines. Every
+  `INGEST_PURGE_INTERVAL_S` it deletes batches acknowledged more than `INGEST_RETENTION_DAYS` (7)
+  ago and expired upload sessions; unacknowledged and quarantined batches are kept.
+- Home's media worker runs a puller every 60 s once `TRIP_INGEST_URL` and
+  `TRIP_INGEST_TOKEN_FILE` are set, and is off otherwise. It pushes pass changes and revocations,
+  pulls devices and batches, and downloads each file, resuming by Range. A file is filed only once
+  it hashes to its manifest sha256 and is the type its name claims; a batch that fails this is
+  quarantined, and a transport failure is retried on the next tick. A filed batch becomes a
+  protected memo owned by the pass's issuer (several memos for a large one), carrying the trip's
+  tag or added to the album. A guest's name and caption are kept in their own fields and never
+  become memo text or tags.
+- Operators: the ingest roles serve without proxy headers or an access log, and the entrypoint
+  reads `INGEST_SERVICE_TOKEN_FILE` and `DATABASE_PASSWORD_FILE` (with `DATABASE_HOST`,
+  `DATABASE_NAME`, `DATABASE_USER`) when set. `ingest` migrates by default and `ingest-home` does
+  not; `RUN_MIGRATIONS` overrides either. An ingest role refuses to start with a member-side
+  secret set (`SESSION_SECRET`, `OIDC_CLIENT_SECRET` and the like); home refuses
+  `INGEST_SERVICE_TOKEN` and `INGEST_TRUST_CF_CONNECTING_IP`. New dependency: `segno`, a
+  pure-Python QR encoder.
+- Migrations `79cdd613ea6b` (passes, devices, events, guest uploads, ingest batches and files,
+  sync state; nullable contributor columns on `attachments` and pass columns on `memos`),
+  `a7d2c41e9b03` (pass suspension, change cursors, completion key, refusal counter) and
+  `c3e8b5a1d2f4` (puller cursor, revocation ack, filed-at stamp) — all additive only.
+
 ### v2.6.0
 
 - Albums: a collection can now be an album — a title and pictures picked one by one, with no tag
