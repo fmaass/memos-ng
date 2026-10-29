@@ -190,6 +190,29 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.9.0
+
+- `GET /api/uploads/limits` tells a client the upload limits before it starts: `max_bytes` (the
+  `MAX_UPLOAD_MIB` cap, the same threshold the 413 enforces), `wifi_recommended_above_bytes` (new
+  setting `UPLOAD_WIFI_RECOMMENDED_MIB`, default 200; advisory, the server enforces nothing at it)
+  and `bodies_per_user`. Settings are read per request.
+- Upload and media metrics on the internal `/metrics`: `memosng_upload_bytes_total{principal}`,
+  `memosng_upload_sessions_total{result}` (`completed`, `deduped`, `rejected_size`),
+  `memosng_upload_patch_seconds`, `memosng_upload_admission_rejections_total{scope}` and
+  `memosng_events_subscribers` are counted in process; `memosng_upload_sessions_open`,
+  `memosng_media_jobs_queued{lane}` and `memosng_media_job_seconds{lane,kind}` are read from the
+  tables on each scrape.
+- Trip pass guest-sync gauges on the same `/metrics`: `guest_sync_snapshot_age_seconds`,
+  `guest_sync_required`, `guest_pull_lag_seconds`, `guest_blobs_pending` and
+  `guest_batches_quarantined`, read from the database with one bounded statement per scrape. A
+  failed or slow read publishes no guest family at all, so an absence alert fires instead of a
+  healthy-looking zero.
+- Trip pass guest page: a separate guest build (`frontend/vite.guest.config.ts`) that the ingest
+  role serves at `/p/<secret>` and `/guest-assets/<name>`. It hashes and uploads a guest's
+  originals through the ingest door. New setting `INGEST_GUEST_APP_URL` (an https App Store or
+  TestFlight link, offered on the landing; empty hides it). The home app answers 404 on both
+  prefixes, so a pass link never opens the member app.
+
 ### v2.8.0
 
 - Trip passes: a guest pass lets people without an account add pictures to a collection.
