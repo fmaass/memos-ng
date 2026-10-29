@@ -1,0 +1,43 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1d1d1f;
+  --muted: #6e6e73;
+  --accent: #4f46e5;
+  --line: #e5e5ea;
+  --error: #b42318;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --fg: #f5f5f7;
+    --muted: #a1a1a6;
+    --accent: #818cf8;
+    --line: #2c2c2e;
+    --error: #f97066;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+.guest { max-width: 34rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+h1 { font-size: 1.6rem; margin: 0 0 1rem; }
+.muted { color: var(--muted); }
+.small { font-size: 0.875rem; }
+.error { color: var(--error); }
+.notice { border-left: 3px solid var(--accent); padding-left: 0.75rem; }
+.summary { font-weight: 600; }
+label { display: block; margin-bottom: 0.5rem; }
+input:not([type='file']) { width: 100%; font: inherit; padding: 0.6rem; border: 1px solid var(--line); border-radius: 0.5rem; background: transparent; color: inherit; margin-bottom: 0.75rem; }
+.button { display: block; width: 100%; text-align: center; font: inherit; padding: 0.75rem; margin: 0.5rem 0; border-radius: 0.6rem; border: 1px solid var(--line); background: transparent; color: inherit; text-decoration: none; cursor: pointer; }
+.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.button.small { display: inline-block; width: auto; padding: 0.25rem 0.75rem; margin: 0; }
+.button:disabled { opacity: 0.5; }
+.picker input { display: none; }
+.files { list-style: none; padding: 0; margin: 1rem 0; }
+.files li { display: grid; grid-template-columns: 3rem 1fr; grid-template-rows: auto auto; column-gap: 0.75rem; padding: 0.5rem 0; border-bottom: 1px solid var(--line); align-items: center; }
+.files img, .files .placeholder { grid-row: span 2; width: 3rem; height: 3rem; object-fit: cover; border-radius: 0.4rem; background: var(--line); }
+.files .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files .state { color: var(--muted); font-size: 0.875rem; }
+.files progress { grid-column: 2; width: 100%; }
+.files li.received .state { color: var(--accent); }
+.files li.failed .state, .files li.damaged .state, .files li.unsupported .state { color: var(--error); }

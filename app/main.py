@@ -621,6 +621,8 @@ ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 # against a round-trip the client pays anyway, and not worth hand-rolling validator comparison
 # into the highest-fan-out route in the app.
 SHELL_CACHE_CONTROL = "no-cache"
+# Served by the ingest role only (app/ingest/guest.py); the home catch-all refuses them.
+GUEST_PATH_PREFIXES = ("p/", "guest-assets/")
 
 
 class HashedAssetFiles(StaticFiles):
@@ -690,6 +692,10 @@ def mount_spa(target: FastAPI, frontend_dir: Path) -> None:
 
     @target.get("/{path:path}", include_in_schema=False)
     async def serve_spa(path: str):
+        # A pass link and the guest page's files belong to the ingest door alone: the shell must
+        # not answer them (it would hand a pass URL to the member app) and neither may the tree.
+        if path == "guest-assets" or path.startswith(GUEST_PATH_PREFIXES):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
         # Highest-fan-out route in the app (every non-/api URL), and its resolve()+is_file()
         # hit the bind-mounted volume — off the event loop.
         return FileResponse(

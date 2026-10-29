@@ -499,15 +499,7 @@ async def test_an_incomplete_upload_cannot_be_completed(door, home_iface):  # no
     assert (await complete(door, token, [uid])).status_code == 409
 
 
-# --- the page and the association file -----------------------------------------------------------
-
-
-async def test_the_pass_page_is_self_contained_and_refers_nothing(door, ingest_env):  # noqa: F811
-    r = await door.get("/p/some-secret-value")
-    assert r.status_code == 200 and r.headers["referrer-policy"] == "no-referrer"
-    assert "default-src 'none'" in r.headers["content-security-policy"]
-    assert "some-secret-value" not in r.text
-    assert "<script" not in r.text and "http" not in r.text.replace("http-equiv", "")
+# --- the association file (the page itself: tests/test_ingest_guest_page.py) ----------------------
 
 
 async def test_the_association_file_names_the_app_and_the_clip_for_pass_links(

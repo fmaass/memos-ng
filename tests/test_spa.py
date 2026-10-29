@@ -308,3 +308,39 @@ def test_compression_never_leaves_the_assets_mount(client, spa_app, spa_client):
         assert "content-encoding" not in response.headers, f"{path} came back compressed"
 
     assert len(client.get("/openapi.json").content) > 2000
+
+
+# --- the guest page belongs to the door alone (trip pass P4) ------------------------------------
+
+GUEST_DOCUMENT = '<!doctype html><div id="guest"></div>'
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/p/some-secret-value",
+        "/p/joined",
+        "/p/a/b",
+        "/guest-assets/guest-abcd1234.js",
+        "/guest-assets/",
+        "/guest-assets",
+    ],
+)
+def test_the_home_shell_never_answers_the_guest_paths(spa_dist, spa_client, path):
+    # The guest build sits beside dist in the image; home must neither serve it nor answer a pass
+    # link with its own shell, which would hand the secret-bearing URL to the member app.
+    guest = spa_dist.parent / "dist-guest"
+    (guest / "guest-assets").mkdir(parents=True)
+    (guest / "guest.html").write_text(GUEST_DOCUMENT)
+    (guest / "guest-assets" / "guest-abcd1234.js").write_text("guest()")
+    response = spa_client.get(path)
+    assert response.status_code == 404
+    assert SHELL_HTML not in response.text and GUEST_DOCUMENT not in response.text
+    assert "guest()" not in response.text
+
+
+def test_the_guest_path_refusal_is_narrow(spa_client):
+    # control: neighbours of the refused prefixes still get the shell
+    for path in ("/p", "/places", "/pictures/1", "/guest", "/guest-assetsx"):
+        response = spa_client.get(path)
+        assert response.status_code == 200 and response.text == SHELL_HTML, path

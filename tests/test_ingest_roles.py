@@ -37,6 +37,7 @@ GUEST_ALLOWLIST = {
     ("GET", "/health"),
     ("GET", "/.well-known/apple-app-site-association"),
     ("GET", "/p/{secret}"),
+    ("GET", "/guest-assets/{name}"),
     ("POST", "/api/pass/redeem"),
     ("GET", "/api/guest/me"),
     ("POST", "/api/guest/uploads"),
@@ -88,7 +89,9 @@ def test_each_ingest_role_serves_exactly_its_allowlist(role):
 def test_the_home_role_serves_no_guest_or_ingest_route():
     home = route_set(home_app)
     guestish = {
-        (m, p) for m, p in home if p.startswith(("/api/guest", "/api/pass/", "/ingest", "/p/"))
+        (m, p)
+        for m, p in home
+        if p.startswith(("/api/guest", "/api/pass/", "/ingest", "/p/", "/guest-assets"))
     }
     assert guestish == set()
     # control: the walk sees what home does serve, hidden routes included

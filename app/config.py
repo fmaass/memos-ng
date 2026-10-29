@@ -146,6 +146,9 @@ class Settings(BaseSettings):
     # process, which is the `ingest` deploy and no other; startup refuses it in any other role.
     INGEST_TRUST_CF_CONNECTING_IP: bool = False
     INGEST_IP_HASH_SALT: str = Field(default="", repr=False)
+    # Where an iPhone guest installs the app from (an App Store or TestFlight address), offered on
+    # the guest page's landing. Empty hides that action; anything but https is treated as empty.
+    INGEST_GUEST_APP_URL: str = ""
     # Home's puller (trip pass P3a): where home reaches the ingest host's home interface (through
     # its port forward) and the FILE holding the service token — a file, so the token never sits in
     # home's environment, and a distinct name, because home refuses `INGEST_SERVICE_TOKEN` itself.

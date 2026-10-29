@@ -9,6 +9,8 @@ COPY frontend/ .
 ARG APP_VERSION=dev
 ENV VITE_APP_VERSION=$APP_VERSION
 RUN npm run build
+# The Trip Pass guest page: its own entry and output, served by the ingest role only.
+RUN npx vite build --config vite.guest.config.ts
 
 # --- Backend runtime (uv-managed, Python 3.13) ---
 FROM python:3.13-slim
@@ -35,6 +37,7 @@ RUN python -m pip uninstall -y pip setuptools
 
 COPY . .
 COPY --from=frontend /build/dist /app/frontend/dist
+COPY --from=frontend /build/dist-guest /app/frontend/dist-guest
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 ARG APP_VERSION=dev
 ENV APP_VERSION=$APP_VERSION

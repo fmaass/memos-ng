@@ -7,16 +7,19 @@ upload session, so the redeem, create, append and completion paths never wait on
 cycle.
 """
 
+import html
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -131,33 +134,89 @@ def _limits() -> dict[str, int]:
 
 # --- the page and the association file ---------------------------------------------------------
 
-PASS_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
-<title>Trip Pass</title>
-<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;
-line-height:1.5;color:#1d1d1f;background:#fff}@media(prefers-color-scheme:dark){body{
-color:#f5f5f7;background:#000}}</style></head>
-<body><h1>Trip Pass</h1>
-<p>This link adds your pictures to a shared trip. Open it on your iPhone to continue in the app.</p>
-</body></html>
-"""
+# The separate guest build (frontend/vite.guest.config.ts): one document and its hashed files.
+# It exists only in the image; read per request so a fixture tree can stand in for it.
+GUEST_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist-guest"
+GUEST_DOCUMENT = "guest.html"
+GUEST_ASSET_DIR = "guest-assets"
+# The build's own output names: flat, hashed, and only the two types the page loads. Anything
+# else — a dotfile, the document itself, a file beside it — is a 404 before the disk is asked.
+GUEST_ASSET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*\.(js|css)$")
+GUEST_ASSET_TYPES = {"js": "text/javascript; charset=utf-8", "css": "text/css; charset=utf-8"}
+GUEST_ASSET_CACHE = "public, max-age=31536000, immutable"
+# Placeholders in the built document the door fills in, so the page needs no request (and no
+# credential) to know them: where the app is installed from, and what the picker accepts.
+APP_URL_PLACEHOLDER = "__MEMOS_APP_URL__"
+ACCEPT_PLACEHOLDER = "__MEMOS_ACCEPT__"
 
+GUEST_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+    "worker-src 'self'; img-src 'self' blob:; media-src blob:; manifest-src 'none'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
 PAGE_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
-    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": GUEST_CSP,
 }
 
 
+def guest_app_url() -> str:
+    """The configured app link, or "" — and "" for anything but an absolute https address, so a
+    mistyped setting hides the action rather than offering a guest some other scheme."""
+    url = settings.INGEST_GUEST_APP_URL.strip()
+    parts = urlsplit(url)
+    return url if parts.scheme == "https" and parts.netloc else ""
+
+
+def render_guest_document(template: str) -> str:
+    accept = ",".join(f".{ext}" for ext in core.ALLOWED_EXTENSIONS)
+    return template.replace(APP_URL_PLACEHOLDER, html.escape(guest_app_url(), quote=True)).replace(
+        ACCEPT_PLACEHOLDER, html.escape(accept, quote=True)
+    )
+
+
+def _read_guest_document_sync(root: Path) -> str | None:
+    try:
+        return (root / GUEST_DOCUMENT).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def _guest_asset_sync(root: Path, name: str) -> Path | None:
+    path = root / GUEST_ASSET_DIR / name
+    return path if path.is_file() else None
+
+
 @router.get("/p/{secret}", response_class=HTMLResponse)
-async def pass_page(secret: str) -> HTMLResponse:
-    # The secret stays in the path the client already holds; the page neither echoes nor checks
-    # it, so it never reaches a response or a lookup from here.
+async def pass_page(secret: str) -> Response:
+    # One document for every pass and for `/p/joined`: the secret stays in the path the client
+    # already holds, and the page neither echoes nor checks it, so it never reaches a response or
+    # a lookup from here.
     del secret
-    return HTMLResponse(PASS_PAGE, headers=PAGE_HEADERS)
+    template = await to_thread.run_sync(_read_guest_document_sync, GUEST_DIST)
+    if template is None:
+        return PlainTextResponse(
+            "The guest page is not built", status_code=503, headers=PAGE_HEADERS
+        )
+    return HTMLResponse(render_guest_document(template), headers=PAGE_HEADERS)
+
+
+@router.get("/guest-assets/{name}")
+async def guest_asset(name: str) -> Response:
+    match = GUEST_ASSET_NAME.match(name)
+    if match is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    path = await to_thread.run_sync(_guest_asset_sync, GUEST_DIST, name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    # The policy rides the assets too: a worker script runs under the policy of its own response.
+    return FileResponse(
+        path,
+        media_type=GUEST_ASSET_TYPES[match.group(1)],
+        headers={**PAGE_HEADERS, "Cache-Control": GUEST_ASSET_CACHE},
+    )
 
 
 @router.get("/.well-known/apple-app-site-association")

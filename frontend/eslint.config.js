@@ -5,7 +5,7 @@ import pluginVue from 'eslint-plugin-vue'
 // <script lang="ts"> blocks in SFCs are parsed as TypeScript (not espree, which
 // chokes on `interface`/type annotations).
 export default defineConfigWithVueTs(
-  { ignores: ['dist/**', 'src/api/schema.d.ts', 'node_modules/**'] },
+  { ignores: ['dist/**', 'dist-guest/**', 'src/api/schema.d.ts', 'node_modules/**'] },
   pluginVue.configs['flat/essential'],
   vueTsConfigs.recommended,
 )

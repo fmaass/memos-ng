@@ -15,10 +15,15 @@ __pycache__/
 # node / vite
 node_modules/
 frontend/dist/
+frontend/dist-guest/
 *.log
 # composite tsc build emits these next to the source
 frontend/vite.config.js
 frontend/vite.config.d.ts
+frontend/vite.guest.config.js
+frontend/vite.guest.config.d.ts
+frontend/vite-plugins/*.js
+frontend/vite-plugins/*.d.ts
 *.tsbuildinfo
 
 # data / media (never commit family media)

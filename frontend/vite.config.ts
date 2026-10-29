@@ -1,7 +1,7 @@
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 
 // Dev proxy target. Default 8000 (prod convention); override on hosts where 8000
 // is taken — e.g. Merkur: VITE_API_PROXY=http://localhost:8011.
@@ -96,6 +96,9 @@ export default defineConfig({
     environment: 'happy-dom',
     globals: true,
     setupFiles: ['./src/test-setup.ts'],
+    // `vue-tsc -b` emits vite-plugins/*.js beside their sources (tsconfig.node.json); a compiled
+    // spec there is a second, possibly stale, copy of the real one.
+    exclude: [...configDefaults.exclude, 'vite-plugins/**/*.js'],
     server: {
       // The PWA plugin's registration helper is a test SUBJECT (it is what reloads the page on
       // its own), so it has to go through vitest's transform — externalised it would import the
