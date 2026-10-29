@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -12,6 +13,7 @@ from app.routers.assets import (
     _user_snapshot,
     media_event_stream,
 )
+from app.services import event_stream
 from app.services import uploads as up_svc
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -250,6 +252,28 @@ def _stream_states(states):
     return snap
 
 
+async def _resynced_frames(snap, meta, resyncs: int) -> list[str]:
+    """The data frames the stream sends for its opening snapshot plus `resyncs` resends — the path
+    a listener reconnect takes, and the one place a finished upload is inferred from an absence."""
+    hub = event_stream.EventHub("unused", event_stream.fetch_status_frames)  # never started
+    hub.loop = asyncio.get_running_loop()
+    gen = media_event_stream(hub, 1, snap, meta, keepalive=0.05)
+    try:
+        assert await anext(gen) == f"retry: {event_stream.RETRY_MS}\n\n"
+        for _ in range(resyncs):
+            hub.resync_all()
+        frames = []
+        while (frame := await anext(gen)) != ": keepalive\n\n":
+            frames.append(frame)
+        return frames
+    finally:
+        await gen.aclose()
+
+
+def _data(frame: str) -> dict:
+    return json.loads(frame.partition("data: ")[2])
+
+
 async def test_sse_stream_emits_progress_then_ready():
     snap = _stream_states(
         [
@@ -262,10 +286,10 @@ async def test_sse_stream_emits_progress_then_ready():
     async def meta(uids):
         return {"a": {"width": 1200, "height": 900, "blurhash": "LKO2"}}
 
-    events = [e async for e in media_event_stream(snap, meta, interval=0)]
+    events = await _resynced_frames(snap, meta, resyncs=2)
 
     assert any('"progress_pct": 40' in e for e in events)
-    ready = [json.loads(e.removeprefix("data: ")) for e in events if '"status": "ready"' in e]
+    ready = [_data(e) for e in events if '"status": "ready"' in e]
     # The terminal event carries the metadata the worker just wrote: a client that only patched
     # `status` would leave the attachment at NULL dims until the next refetch.
     assert ready == [
@@ -288,9 +312,9 @@ async def test_sse_ready_event_is_still_emitted_without_metadata():
     async def meta(uids):
         return {}
 
-    events = [e async for e in media_event_stream(snap, meta, interval=0)]
+    events = await _resynced_frames(snap, meta, resyncs=1)
 
-    assert json.loads(events[-1].removeprefix("data: ")) == {
+    assert _data(events[-1]) == {
         "uid": "b",
         "status": "ready",
         "progress_pct": 100,

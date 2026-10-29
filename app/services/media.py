@@ -36,7 +36,14 @@ from app.models import (
     MediaJob,
     MediaJobProgress,
 )
-from app.services import blurhash_pure, export_settings, poster, printready, sibling
+from app.services import (
+    blurhash_pure,
+    event_stream,
+    export_settings,
+    poster,
+    printready,
+    sibling,
+)
 
 pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
@@ -1381,6 +1388,7 @@ async def publish_progress(job_id: int, pct: int) -> None:
                     set_={"progress_pct": pct, "updated_at": func.now()},
                 )
             )
+            await event_stream.notify_attachment_status_for_job(db, job_id)
             await db.commit()
     except Exception as exc:  # telemetry must never break the work it describes
         logger.warning("job_progress_publish_failed", job_id=job_id, error=str(exc))
@@ -1558,6 +1566,7 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
     _stamp_mtime(dest, attachment)  # blocking-ok: one utime, same no-yield window as the rename
     job.progress_pct = 100
     attachment.status = AttachmentStatus.ready
+    await event_stream.notify_attachment_status(db, attachment.uid, attachment.owner_id)
     await db.flush()
 
 
@@ -1764,6 +1773,7 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
             attachment.height = meta.get("height")
             attachment.blurhash = meta.get("blurhash")
             attachment.status = AttachmentStatus.ready
+            await event_stream.notify_attachment_status(db, attachment.uid, attachment.owner_id)
             await db.flush()
         return
 
@@ -1781,6 +1791,7 @@ async def process_job(db: AsyncSession, job: MediaJob) -> None:
     attachment.blurhash = meta.get("blurhash")
     # Image is complete after the fast lane; video still needs the slow-lane transcode.
     attachment.status = AttachmentStatus.processing if is_video else AttachmentStatus.ready
+    await event_stream.notify_attachment_status(db, attachment.uid, attachment.owner_id)
     if is_video:
         # Enqueue the transcode only now that the fast lane (poster, dims, duration) is done,
         # which guarantees fast→slow ordering regardless of how many workers run.

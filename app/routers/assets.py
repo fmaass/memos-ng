@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime
 from functools import cache
@@ -28,9 +28,6 @@ from app.database import async_session, get_session
 from app.models import (
     Attachment,
     AttachmentStatus,
-    JobState,
-    MediaJob,
-    MediaJobProgress,
     Memo,
     Upload,
     User,
@@ -39,6 +36,7 @@ from app.models import (
 from app.services import (
     asset_urls,
     camera,
+    event_stream,
     poster,
     printready,
     reclaim,
@@ -1207,40 +1205,55 @@ async def upload_print(
     return await attachment_meta(uid, user, db)
 
 
-# --- SSE media status channel (poll-based; LISTEN/NOTIFY is a future enhancement) ---
+# --- SSE media status channel (LISTEN/NOTIFY through event_stream's hub, MEMNG-964) ---
+
+# Bounds one response's life when set; None in production, where the client decides when to go.
+# The endpoint tests set it, because an in-process test transport buffers a response to its end.
+STREAM_LIFETIME_SECONDS: float | None = None
 
 
-def sse_event(payload: dict) -> str:
-    return f"data: {json.dumps(payload)}\n\n"
+def sse_event(payload: dict, event_id: str) -> str:
+    # `event: message` is the spec's default name, written out: shipped iOS builds drop every
+    # other type and the web client listens on onmessage only, so the media-status frames keep
+    # it, and new kinds take new names that those clients then ignore.
+    return f"id: {event_id}\nevent: message\ndata: {json.dumps(payload)}\n\n"
 
 
 async def media_event_stream(
+    hub: event_stream.EventHub,
+    user_id: int,
     snapshot: Callable[[], Awaitable[list[dict]]],
     ready_meta: Callable[[list[str]], Awaitable[dict[str, dict]]],
     *,
-    interval: float = 1.5,
-) -> AsyncIterator[str]:
-    """Yield SSE events as the user's attachments change; close when nothing is in-flight.
-    `snapshot()` returns {uid,status,progress_pct} for the user's NON-ready attachments
-    (uploading/pending/processing/failed). When a watched uid drops out of the snapshot it
-    has become 'ready' → emit a synthetic ready event, carrying the metadata `ready_meta()`
-    reads back for it. Unit-tested with both callables injected."""
-    seen: dict[str, tuple] = {}
+    last_event_id: str | None = None,
+    keepalive: float = event_stream.KEEPALIVE_SECONDS,
+    lifetime: float | None = None,
+) -> AsyncGenerator[str]:
+    """Yield SSE frames for `user_id`'s attachments until the client goes away.
+
+    A fresh connect, or an id the hub cannot replay from, starts with the snapshot: `snapshot()`
+    returns {uid,status,progress_pct} for the user's NON-ready attachments. The same snapshot is
+    resent when the hub says frames may have been lost; a uid that was in flight before and has
+    dropped out of it finished meanwhile, so it is announced ready with the metadata `ready_meta()`
+    reads back for it. Unit-tested with both callables bound to a real owner.
+    """
+    sub = hub.subscribe(user_id, last_event_id)
     watching: set[str] = set()
-    while True:
+
+    def track(payload: dict) -> None:
+        if payload["status"] == "ready":
+            watching.discard(payload["uid"])
+        else:
+            watching.add(payload["uid"])
+
+    async def resend() -> AsyncIterator[str]:
+        at = hub.event_id(hub.head)
         rows = await snapshot()
-        present: set[str] = set()
-        in_flight = False
+        present = {row["uid"] for row in rows}
         for row in rows:
-            present.add(row["uid"])
-            watching.add(row["uid"])
-            cur = (row["status"], row["progress_pct"])
-            if seen.get(row["uid"]) != cur:
-                seen[row["uid"]] = cur
-                yield sse_event(row)
-            if row["status"] in ("uploading", "pending", "processing"):
-                in_flight = True
-        finished = sorted(watching - present)  # dropped from non-ready → it finished
+            track(row)
+            yield sse_event(row, at)
+        finished = sorted(watching - present)
         if finished:
             # The ready event is synthesised from an ABSENCE, so the row that now carries the
             # worker's width/height/blurhash is not in hand — it is read back here. Without it the
@@ -1248,17 +1261,51 @@ async def media_event_stream(
             # fallback box, with no srcset, until something refetches the feed.
             meta = await ready_meta(finished)
             for uid in finished:
-                yield sse_event(
-                    {"uid": uid, "status": "ready", "progress_pct": 100, **meta.get(uid, {})}
-                )
-                watching.discard(uid)
-        if not in_flight:
-            break
-        await asyncio.sleep(interval)
+                payload = {"uid": uid, "status": "ready", "progress_pct": 100, **meta.get(uid, {})}
+                track(payload)
+                yield sse_event(payload, at)
+
+    deadline = None if lifetime is None else asyncio.get_running_loop().time() + lifetime
+    try:
+        # Read before the first byte goes out, so the state a client is told it has is the state
+        # at the moment it connected, not whenever it gets round to reading.
+        if sub.replay is None:
+            opening = [frame async for frame in resend()]
+        else:
+            opening = []
+            for frame in sub.replay:
+                track(frame.payload)
+                opening.append(sse_event(frame.payload, hub.event_id(frame.seq)))
+        yield f"retry: {event_stream.RETRY_MS}\n\n"
+        for frame in opening:
+            yield frame
+        while True:
+            wait = keepalive
+            if deadline is not None:
+                wait = min(wait, deadline - asyncio.get_running_loop().time())
+                if wait <= 0:
+                    return
+            try:
+                async with asyncio.timeout(wait):
+                    item = await sub.queue.get()
+            except TimeoutError:
+                # An idle response must still move bytes, or a proxy's idle timeout cuts it.
+                yield ": keepalive\n\n"
+                continue
+            if isinstance(item, event_stream.Close):
+                return
+            if isinstance(item, event_stream.Resync):
+                async for frame in resend():
+                    yield frame
+                continue
+            track(item.payload)
+            yield sse_event(item.payload, hub.event_id(item.seq))
+    finally:
+        hub.unsubscribe(sub)
 
 
 async def _user_snapshot(user_id: int) -> list[dict]:
-    """{uid,status,progress_pct} for this user's non-ready attachments — the stream's poll.
+    """{uid,status,progress_pct} for this user's non-ready attachments — the stream's snapshot.
 
     progress_pct is ONE job's own percentage: the least-advanced job of that attachment that has
     not finished. It used to be max() across every job of the attachment, which reported a
@@ -1270,21 +1317,11 @@ async def _user_snapshot(user_id: int) -> list[dict]:
     A running job's live percentage comes from media_job_progress, because the worker's own
     media_jobs row is locked and unreadable-through until the job commits (see MediaJobProgress).
     The job row's stored progress_pct is the fallback for a job with no sample yet (a queued one,
-    at 0).
+    at 0). The live frames read the same subquery (event_stream.fetch_status_frames), so a frame
+    and a snapshot row never disagree about the same moment.
     """
     async with async_session() as db:
-        active = (
-            select(
-                MediaJob.attachment_id.label("attachment_id"),
-                func.min(func.coalesce(MediaJobProgress.progress_pct, MediaJob.progress_pct)).label(
-                    "pct"
-                ),
-            )
-            .join(MediaJobProgress, MediaJobProgress.job_id == MediaJob.id, isouter=True)
-            .where(MediaJob.state.notin_((JobState.done, JobState.failed)))
-            .group_by(MediaJob.attachment_id)
-            .subquery()
-        )
+        active = event_stream.active_progress_subquery()
         stmt = (
             select(Attachment.uid, Attachment.status, func.coalesce(active.c.pct, 0))
             .join(active, active.c.attachment_id == Attachment.id, isouter=True)
@@ -1314,11 +1351,15 @@ async def _ready_meta(user_id: int, uids: list[str]) -> dict[str, dict]:
 @router.get("/events")
 async def events(request: Request) -> StreamingResponse:
     # Authenticate in a short-lived session and release it before the stream opens — otherwise the
-    # SSE connection would pin a pool connection for its whole lifetime. Each poll inside
-    # media_event_stream opens its own short session (_user_snapshot), so the stream holds none.
+    # SSE connection would pin a pool connection for its whole lifetime. The snapshot reads open
+    # their own short sessions and live frames come from the hub's listener, which is outside the
+    # pool, so the stream holds none.
     async with async_session() as db:
         user = await auth.require_user(request, db)
     user_id = user.id
+    hub = await event_stream.get_hub()
+    # Bounded: past it the stream opens anyway, and the hub's resync on connect covers the gap.
+    await hub.wait_connected(event_stream.HEALTH_TIMEOUT)
 
     async def snap() -> list[dict]:
         return await _user_snapshot(user_id)
@@ -1326,7 +1367,15 @@ async def events(request: Request) -> StreamingResponse:
     async def meta(uids: list[str]) -> dict[str, dict]:
         return await _ready_meta(user_id, uids)
 
+    stream = media_event_stream(
+        hub,
+        user_id,
+        snap,
+        meta,
+        last_event_id=request.headers.get("last-event-id"),
+        lifetime=STREAM_LIFETIME_SECONDS,
+    )
     return StreamingResponse(
-        upload_metrics.events_subscriber(media_event_stream(snap, meta)),
+        upload_metrics.events_subscriber(stream),
         media_type="text/event-stream",
     )

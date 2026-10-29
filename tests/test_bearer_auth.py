@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from app import auth
 from app.config import settings
 from app.main import app
+from app.routers import assets as assets_router
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine, text
@@ -118,17 +119,19 @@ async def test_bearer_reads_an_export_route(pat_client):
     assert "photos" in manifest.json()
 
 
-async def test_bearer_opens_the_sse_stream_and_gets_a_real_frame(pat_client):
+async def test_bearer_opens_the_sse_stream_and_gets_a_real_frame(pat_client, monkeypatch):
     """`/api/events` calls `auth.require_user` itself rather than declaring it as a dependency —
     this pins that the bearer reaches that call site too, and that the stream really emits."""
     bearer, subject, _ = pat_client
+    # The stream never ends on its own and the in-process transport returns only a finished body.
+    monkeypatch.setattr(assets_router, "STREAM_LIFETIME_SECONDS", 0.5)
     aid = _seed_attachment("att-bearer-sse", subject, status="failed")
     try:
         stream = await bearer.get("/api/events")
         assert stream.status_code == 200
         assert stream.headers["content-type"].startswith("text/event-stream")
-        frame = stream.text.split("\n\n")[0]
-        assert json.loads(frame.removeprefix("data: "))["uid"] == "att-bearer-sse"
+        frame = next(f for f in stream.text.split("\n\n") if "data: " in f)
+        assert json.loads(frame.partition("data: ")[2])["uid"] == "att-bearer-sse"
     finally:
         _drop_attachment(aid)
 

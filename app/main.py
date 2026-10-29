@@ -30,6 +30,7 @@ from app.database import async_session
 from app.logging_privacy import configure_logging
 from app.security_headers import CSP
 from app.services import (
+    event_stream,
     management_grant,
     reclaim,
     trip_ingest_metrics,
@@ -73,6 +74,9 @@ async def lifespan(app: FastAPI):
     logger.info("app_started", data_root=str(data_root), version=__version__)
     yield
     digest_refresher.cancel()
+    # The listener's socket and tasks belong to this loop; leaving them for the loop's teardown
+    # logs a cancelled-task error per shutdown instead of a clean close.
+    await event_stream.shutdown_hub()
     # PAT last_used stamps run as background tasks (MEMNG-81), so shutdown can catch one in
     # flight. Give it a bounded moment to land; anything slower is cancelled deliberately here
     # rather than being torn down mid-write by the loop with the engine already going away.

@@ -110,6 +110,8 @@ markers = [
     # then patches nothing, so the case runs on the real clock — which is only ever right for one
     # that reads no clock at all, since a pinned case with no application read fails by name.
     "real_clock: run this case against the real clock, not the pinned one",
+    # Skipped unless MEMNG964_LOAD=1: minutes of commits, not a unit check.
+    "load: a load test, skipped by the default run",
 ]
 
 [build-system]

@@ -33,7 +33,16 @@ from app.models import (
     Memo,
     Upload,
 )
-from app.services import asset_paths, camera, capture, location, poster, storage, upload_metrics
+from app.services import (
+    asset_paths,
+    camera,
+    capture,
+    event_stream,
+    location,
+    poster,
+    storage,
+    upload_metrics,
+)
 from app.services.variants import ParsedName, parse_variant
 
 logger = structlog.get_logger(__name__)
@@ -1563,6 +1572,7 @@ async def finalize(
     )
     db.add(attachment)
     await db.flush()
+    await event_stream.notify_attachment_status(db, attachment.uid, owner_id)
     if locked is not None:
         # A row this transaction just inserted is invisible to every other one, so it carries no
         # lock order (R8) — but it IS a dedup target for the rest of the batch, exactly as it was

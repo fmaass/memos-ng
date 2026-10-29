@@ -28,7 +28,7 @@ from app import worker
 from app.config import settings
 from app.database import async_session
 from app.routers.assets import _ready_meta, _user_snapshot, media_event_stream
-from app.services import media
+from app.services import event_stream, media
 from PIL import Image
 from sqlalchemy import create_engine, text
 from structlog.testing import capture_logs
@@ -180,10 +180,38 @@ def _cleanup(subject: str | None = None, *aids: int) -> None:
     eng.dispose()
 
 
+async def _events_until_ready(owner: int, uid: str):
+    """The data frames /api/events sends `owner` until `uid` is announced ready, through a real
+    hub: the worker's own transactions emit the NOTIFYs, the hub reads each row back."""
+    hub = event_stream.EventHub(event_stream._listener_dsn(), event_stream.fetch_status_frames)
+    await hub.start()
+    assert await hub.wait_connected(10)
+
+    async def snap() -> list[dict]:
+        return await _user_snapshot(owner)
+
+    async def meta(uids: list[str]) -> dict[str, dict]:
+        return await _ready_meta(owner, uids)
+
+    stream = media_event_stream(hub, owner, snap, meta)
+    try:
+        async for chunk in stream:
+            if "data: " not in chunk:
+                continue
+            event = json.loads(chunk.partition("data: ")[2])
+            yield event
+            if event["uid"] == uid and event["status"] == "ready":
+                return
+    finally:
+        await stream.aclose()
+        await hub.stop()
+
+
 async def test_sse_reports_real_progress_from_committed_worker_transitions(monkeypatch, tmp_path):
     """End to end, against the real worker: /api/events' stream must show the transcode moving.
 
-    The SSE layer polls _user_snapshot from its own session while worker.run_once processes the job.
+    The SSE layer hears the worker's NOTIFYs and reads each row back while worker.run_once
+    processes the job.
     Before MEMNG-36 the percentages existed only inside the worker's own transaction, so every
     event carried the value the row had when the job was claimed — the client watched a
     frozen number until the job finished. The mid-run assertions here (a percentage strictly
@@ -211,19 +239,15 @@ async def test_sse_reports_real_progress_from_committed_worker_transitions(monke
         async with async_session() as db:
             return await worker.run_once(db)
 
-    async def snap() -> list[dict]:
-        return await _user_snapshot(owner)
-
-    async def meta(uids: list[str]) -> dict[str, dict]:
-        return await _ready_meta(owner, uids)
-
     try:
-        job = asyncio.create_task(drain())
         events: list[dict] = []
         job_rows: list[tuple[str, int]] = []
+        stream = _events_until_ready(owner, uid)
+        job: asyncio.Task[str] | None = None
         async with asyncio.timeout(90):  # a stuck stream must fail the test, not hang the suite
-            async for chunk in media_event_stream(snap, meta, interval=0.05):
-                event = json.loads(chunk.removeprefix("data: "))
+            async for event in stream:
+                if job is None:
+                    job = asyncio.create_task(drain())  # the snapshot is in: the stream listens
                 events.append(event)
                 if 0 < event["progress_pct"] < 100 and not job.done():
                     # Read the job row from a THIRD session at the moment the stream reports
@@ -232,7 +256,7 @@ async def test_sse_reports_real_progress_from_committed_worker_transitions(monke
                     # media_job_progress table, so the number the stream just reported cannot
                     # have come from the job row.
                     job_rows.append(_read_job(jid))
-        assert await job == "processed"
+        assert job is not None and await job == "processed"
 
         moving = [e["progress_pct"] for e in events if 0 < e["progress_pct"] < 100]
         assert moving, f"stream never reported progress between 0 and 100: {events}"
@@ -285,19 +309,15 @@ async def test_the_reported_percentage_never_goes_backwards(monkeypatch, tmp_pat
         async with async_session() as db:
             return await worker.run_once(db)
 
-    async def snap() -> list[dict]:
-        return await _user_snapshot(owner)
-
-    async def meta(uids: list[str]) -> dict[str, dict]:
-        return await _ready_meta(owner, uids)
-
     try:
-        job = asyncio.create_task(drain())
         events: list[dict] = []
+        job: asyncio.Task[str] | None = None
         async with asyncio.timeout(90):
-            async for chunk in media_event_stream(snap, meta, interval=0.05):
-                events.append(json.loads(chunk.removeprefix("data: ")))
-        assert await job == "processed"
+            async for event in _events_until_ready(owner, uid):
+                if job is None:
+                    job = asyncio.create_task(drain())  # the snapshot is in: the stream listens
+                events.append(event)
+        assert job is not None and await job == "processed"
 
         seen = [(e["status"], e["progress_pct"]) for e in events]
         pcts = [e["progress_pct"] for e in events]

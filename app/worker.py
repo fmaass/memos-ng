@@ -44,7 +44,7 @@ from app.models import (
     JobState,
     MediaJob,
 )
-from app.services import frame_share, media, push, reclaim, reconcile, trip_ingest
+from app.services import event_stream, frame_share, media, push, reclaim, reconcile, trip_ingest
 from app.services.digest import gate as digest_gate
 from app.services.digest import runner as digest_runner
 from app.services.uploads import reap_expired_committed
@@ -435,6 +435,7 @@ async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
     ).scalar_one_or_none()
     if att is not None:
         att.status = AttachmentStatus.failed  # terminal + UI-visible, never a silent drop
+        await event_stream.notify_attachment_status(db, att.uid, att.owner_id)
 
 
 async def _notify_terminal(db: AsyncSession, attachment_id: int) -> None:

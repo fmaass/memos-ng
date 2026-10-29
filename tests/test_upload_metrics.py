@@ -275,9 +275,11 @@ def test_events_subscribers_counts_a_live_stream_and_lets_it_go(logged_in_client
 
     async def snapshot(user_id: int) -> list[dict]:
         seen.append(_sample("memosng_events_subscribers"))
-        return []  # nothing in flight: the stream closes after its first poll
+        return []
 
     monkeypatch.setattr(assets_router, "_user_snapshot", snapshot)
+    # The stream never ends on its own and the test client returns only a finished body.
+    monkeypatch.setattr(assets_router, "STREAM_LIFETIME_SECONDS", 0.2)
     before = _sample("memosng_events_subscribers")
     r = client.get("/api/events")
     assert r.status_code == 200
