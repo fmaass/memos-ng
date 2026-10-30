@@ -14,7 +14,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from anyio import to_thread
@@ -54,6 +54,85 @@ class GuestRefused(Exception):
 
 NOT_A_GUEST = GuestRefused(401, "Not a valid guest credential")
 PASS_ENDED = GuestRefused(410, "This pass is no longer open")
+
+
+# --- the published contract ----------------------------------------------------------------------
+# The door serves no schema; scripts/gen-openapi.py renders these declarations into the committed
+# openapi-guest.json, the only contract a native guest client is generated from (MEMNG-1011).
+# They change the document only — every status below is one a handler here already raises.
+
+
+class GuestError(BaseModel):
+    """The body of every refusal the door sends: FastAPI's rendering of an HTTPException."""
+
+    detail: str
+
+
+GUEST_SECURITY_SCHEMES: dict[str, dict[str, str]] = {
+    "guestBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": GUEST_TOKEN_PREFIX.rstrip("_"),
+        "description": f"The device token POST /api/pass/redeem answers once (`{GUEST_TOKEN_PREFIX}"
+        "…`). Nothing else authenticates here: a member token, a session cookie or the service "
+        "token is refused exactly like no credential at all.",
+    }
+}
+# Read off each route's dependency by app.main.attach_route_security, as the home schema is.
+GUEST_DEPENDENCY_SECURITY = {"require_guest": [{"guestBearer": []}]}
+
+# What each refusal status means on this door, across every route that sends it.
+REFUSALS: dict[int, str] = {
+    401: "No guest credential, or one that names no device or a revoked device.",
+    404: "No such pass (redeem), or no such upload session on this device.",
+    409: "Append: the Upload-Offset is not where the session stands — re-sync with HEAD. "
+    "Completion: an upload is unknown, already completed, or not fully received.",
+    410: "The pass has ended: expired, revoked or suspended.",
+    413: "The file is larger than the upload limit, or one append body is larger than "
+    "max_patch_bytes or than what the upload still owes.",
+    415: "The file name is not an accepted picture or video type, or the bytes are not the type "
+    "the name says.",
+    429: "Redeem: too many attempts from this address, or the pass has no room for another "
+    "device. Append: too many bodies streaming at once; nothing was read or stored. Resend "
+    "after Retry-After seconds.",
+    507: "No room: the pass's byte cap, or the door's free-space floor.",
+}
+AUTHED = (401, 410)
+
+
+def _retry_after_header() -> dict[str, Any]:
+    return {
+        "Retry-After": {
+            "description": "Seconds to wait before sending the request again.",
+            "schema": {"type": "integer"},
+        }
+    }
+
+
+def _upload_offset_header() -> dict[str, Any]:
+    """A fresh dict per call: FastAPI merges `openapi_extra` into the operation by reference, so a
+    shared constant would leave two operations aliasing the same node in the document."""
+    return {
+        "Upload-Offset": {
+            "description": "Bytes the door now holds for this upload session — the offset the "
+            "next append must start at.",
+            "schema": {"type": "integer"},
+        }
+    }
+
+
+def refusals(*statuses: int, body: bool = True) -> dict[int | str, dict[str, Any]]:
+    """`responses=` entries for the refusals a route sends, from the one vocabulary above. A HEAD
+    route passes body=False: its answer carries no body to describe."""
+    declared: dict[int | str, dict[str, Any]] = {}
+    for status in statuses:
+        entry: dict[str, Any] = {"description": REFUSALS[status]}
+        if body:
+            entry["model"] = GuestError
+        if status == 429:
+            entry["headers"] = _retry_after_header()
+        declared[status] = entry
+    return declared
 
 
 @dataclass
@@ -122,6 +201,16 @@ async def _refence(db: AsyncSession, guest: Guest, *, device_for_update: bool) -
     _check(device, p)
     assert device is not None and p is not None
     return Guest(device=device, pass_=p)
+
+
+class GuestLimits(BaseModel):
+    """The limits a guest client sizes its files and its appends by."""
+
+    # The keys, in the order, the plain dict below has always put on the wire: the web guest
+    # client reads them by these names, and tests pin the bytes.
+    max_file_bytes: int
+    chunk_size: int
+    max_patch_bytes: int
 
 
 def _limits() -> dict[str, int]:
@@ -261,7 +350,7 @@ class RedeemOut(BaseModel):
     device_token: str
     device_id: str
     pass_: PassOut = Field(alias="pass", serialization_alias="pass")
-    limits: dict[str, int]
+    limits: GuestLimits
 
 
 def _hour(now: datetime) -> datetime:
@@ -328,7 +417,13 @@ async def _refuse(
     return HTTPException(status_code=status, detail=detail, headers=headers)
 
 
-@router.post("/api/pass/redeem", response_model=RedeemOut, status_code=201)
+@router.post(
+    "/api/pass/redeem",
+    response_model=RedeemOut,
+    status_code=201,
+    operation_id="guestRedeem",
+    responses=refusals(404, 410, 429),
+)
 async def redeem(
     body: RedeemIn,
     request: Request,
@@ -402,12 +497,14 @@ class MeOut(BaseModel):
     display_name: str
     platform: str
     pass_: PassOut = Field(alias="pass", serialization_alias="pass")
-    limits: dict[str, int]
+    limits: GuestLimits
     uploads_count: int
     bytes_total: int
 
 
-@router.get("/api/guest/me", response_model=MeOut)
+@router.get(
+    "/api/guest/me", response_model=MeOut, operation_id="guestMe", responses=refusals(*AUTHED)
+)
 async def me(guest: Annotated[Guest, Depends(require_guest)]) -> MeOut:
     d, p = guest.device, guest.pass_
     return MeOut.model_validate(
@@ -491,7 +588,20 @@ async def _outstanding_bytes(db: AsyncSession) -> int:
     return int(owed)
 
 
-@router.post("/api/guest/uploads", response_model=GuestUploadOut, status_code=201)
+@router.post(
+    "/api/guest/uploads",
+    response_model=GuestUploadOut,
+    status_code=201,
+    operation_id="guestCreateUpload",
+    responses={
+        200: {
+            "model": GuestUploadOut,
+            "description": "Already received: this pass holds a file with the declared sha256, so "
+            "no session is opened and no byte needs sending.",
+        },
+        **refusals(*AUTHED, 413, 415, 507),
+    },
+)
 async def create_upload(
     body: GuestUploadIn,
     response: Response,
@@ -568,7 +678,13 @@ async def _own_upload(db: AsyncSession, guest: Guest, upload_uid: str) -> GuestU
     return row
 
 
-@router.head("/api/guest/uploads/{upload_uid}", response_class=Response)
+@router.head(
+    "/api/guest/uploads/{upload_uid}",
+    response_class=Response,
+    operation_id="guestUploadOffset",
+    responses=refusals(*AUTHED, 404, body=False),
+    openapi_extra={"responses": {"200": {"headers": _upload_offset_header()}}},
+)
 async def upload_offset(
     upload_uid: str,
     guest: Annotated[Guest, Depends(require_guest)],
@@ -586,7 +702,25 @@ def _spool_path(upload_uid: str) -> Path:
     return core.ingest_root() / "parts" / f"{upload_uid}.{secrets.token_urlsafe(8)}.spool"
 
 
-@router.patch("/api/guest/uploads/{upload_uid}", response_model=GuestUploadOut)
+@router.patch(
+    "/api/guest/uploads/{upload_uid}",
+    response_model=GuestUploadOut,
+    operation_id="guestAppendUpload",
+    responses=refusals(*AUTHED, 404, 409, 413, 429, 507),
+    # The handler streams the raw body and checks no Content-Type; this is the type the door's
+    # own web client sends (frontend/src/guest/api.ts).
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/offset+octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                }
+            },
+        },
+        "responses": {"200": {"headers": _upload_offset_header()}},
+    },
+)
 async def append(
     upload_uid: str,
     request: Request,
@@ -741,7 +875,30 @@ async def _discard(db: AsyncSession, row: GuestUpload) -> None:
     await to_thread.run_sync(_unlink_all_sync, [core.part_path(row.upload_uid)])
 
 
-@router.post("/api/guest/memos", response_model=Receipt)
+@router.post(
+    "/api/guest/memos",
+    response_model=Receipt,
+    operation_id="guestComplete",
+    responses={
+        **refusals(*AUTHED, 409, 415),
+        # Declaring 422 replaces FastAPI's own, and this route sends both bodies: a request that
+        # fails validation, and a file whose bytes do not match its declared sha256.
+        422: {
+            "description": "The request failed validation (HTTPValidationError), or a file "
+            "arrived damaged: its bytes do not match the sha256 it was created with (GuestError).",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/HTTPValidationError"},
+                            {"$ref": "#/components/schemas/GuestError"},
+                        ]
+                    }
+                }
+            },
+        },
+    },
+)
 async def complete(
     body: CompleteIn,
     guest: Annotated[Guest, Depends(require_guest)],
@@ -863,7 +1020,12 @@ async def complete(
     return await _receipt(db, batch)
 
 
-@router.get("/api/guest/batches", response_model=list[Receipt])
+@router.get(
+    "/api/guest/batches",
+    response_model=list[Receipt],
+    operation_id="guestBatches",
+    responses=refusals(*AUTHED),
+)
 async def batches(
     guest: Annotated[Guest, Depends(require_guest)],
     db: Annotated[AsyncSession, Depends(get_session)],

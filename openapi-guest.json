@@ -1,0 +1,987 @@
+{
+  "components": {
+    "schemas": {
+      "CompleteIn": {
+        "properties": {
+          "caption": {
+            "maxLength": 2000,
+            "title": "Caption",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "upload_uids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Upload Uids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "upload_uids"
+        ],
+        "title": "CompleteIn",
+        "type": "object"
+      },
+      "GuestError": {
+        "description": "The body of every refusal the door sends: FastAPI's rendering of an HTTPException.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "GuestError",
+        "type": "object"
+      },
+      "GuestLimits": {
+        "description": "The limits a guest client sizes its files and its appends by.",
+        "properties": {
+          "chunk_size": {
+            "title": "Chunk Size",
+            "type": "integer"
+          },
+          "max_file_bytes": {
+            "title": "Max File Bytes",
+            "type": "integer"
+          },
+          "max_patch_bytes": {
+            "title": "Max Patch Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_file_bytes",
+          "chunk_size",
+          "max_patch_bytes"
+        ],
+        "title": "GuestLimits",
+        "type": "object"
+      },
+      "GuestUploadIn": {
+        "properties": {
+          "filename": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Filename",
+            "type": "string"
+          },
+          "last_modified": {
+            "title": "Last Modified",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mime": {
+            "default": "",
+            "maxLength": 255,
+            "title": "Mime",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "title": "Sha256",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size": {
+            "minimum": 1.0,
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filename",
+          "size"
+        ],
+        "title": "GuestUploadIn",
+        "type": "object"
+      },
+      "GuestUploadOut": {
+        "properties": {
+          "already_received": {
+            "default": false,
+            "title": "Already Received",
+            "type": "boolean"
+          },
+          "bytes_received": {
+            "default": 0,
+            "title": "Bytes Received",
+            "type": "integer"
+          },
+          "chunk_size": {
+            "default": 0,
+            "title": "Chunk Size",
+            "type": "integer"
+          },
+          "max_patch_bytes": {
+            "default": 0,
+            "title": "Max Patch Bytes",
+            "type": "integer"
+          },
+          "upload_uid": {
+            "title": "Upload Uid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "GuestUploadOut",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "MeOut": {
+        "properties": {
+          "bytes_total": {
+            "title": "Bytes Total",
+            "type": "integer"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/GuestLimits"
+          },
+          "pass": {
+            "$ref": "#/components/schemas/PassOut"
+          },
+          "platform": {
+            "title": "Platform",
+            "type": "string"
+          },
+          "uploads_count": {
+            "title": "Uploads Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device_id",
+          "display_name",
+          "platform",
+          "pass",
+          "limits",
+          "uploads_count",
+          "bytes_total"
+        ],
+        "title": "MeOut",
+        "type": "object"
+      },
+      "PassOut": {
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "scope": {
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "scope",
+          "expires_at"
+        ],
+        "title": "PassOut",
+        "type": "object"
+      },
+      "Receipt": {
+        "properties": {
+          "batch_id": {
+            "title": "Batch Id",
+            "type": "string"
+          },
+          "byte_total": {
+            "title": "Byte Total",
+            "type": "integer"
+          },
+          "caption": {
+            "title": "Caption",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_count": {
+            "title": "File Count",
+            "type": "integer"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/ReceiptFile"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "received",
+              "held"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "batch_id",
+          "status",
+          "file_count",
+          "byte_total",
+          "caption",
+          "completed_at",
+          "files"
+        ],
+        "title": "Receipt",
+        "type": "object"
+      },
+      "ReceiptFile": {
+        "properties": {
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filename",
+          "sha256",
+          "size"
+        ],
+        "title": "ReceiptFile",
+        "type": "object"
+      },
+      "RedeemIn": {
+        "properties": {
+          "device_hint": {
+            "maxLength": 512,
+            "title": "Device Hint",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "platform": {
+            "enum": [
+              "web",
+              "clip",
+              "app"
+            ],
+            "title": "Platform",
+            "type": "string"
+          },
+          "secret": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret",
+          "display_name",
+          "platform"
+        ],
+        "title": "RedeemIn",
+        "type": "object"
+      },
+      "RedeemOut": {
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "device_token": {
+            "title": "Device Token",
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/GuestLimits"
+          },
+          "pass": {
+            "$ref": "#/components/schemas/PassOut"
+          }
+        },
+        "required": [
+          "device_token",
+          "device_id",
+          "pass",
+          "limits"
+        ],
+        "title": "RedeemOut",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "guestBearer": {
+        "bearerFormat": "trip_dev",
+        "description": "The device token POST /api/pass/redeem answers once (`trip_dev_\u2026`). Nothing else authenticates here: a member token, a session cookie or the service token is refused exactly like no credential at all.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "memos-ng ingest",
+    "version": "dev"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/guest/batches": {
+      "get": {
+        "operationId": "guestBatches",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Receipt"
+                  },
+                  "title": "Response Guestbatches",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Batches"
+      }
+    },
+    "/api/guest/me": {
+      "get": {
+        "operationId": "guestMe",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Me"
+      }
+    },
+    "/api/guest/memos": {
+      "post": {
+        "description": "Finish a batch. Overlapping or replayed completions of the same uploads JOIN: the device\nrow lock makes them take turns, and the one that comes second finds the batch the first made\n(by its completion key) and answers that batch's receipt \u2014 one batch, one answer.",
+        "operationId": "guestComplete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Receipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "Append: the Upload-Offset is not where the session stands \u2014 re-sync with HEAD. Completion: an upload is unknown, already completed, or not fully received."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The file name is not an accepted picture or video type, or the bytes are not the type the name says."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/GuestError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "The request failed validation (HTTPValidationError), or a file arrived damaged: its bytes do not match the sha256 it was created with (GuestError)."
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Complete"
+      }
+    },
+    "/api/guest/uploads": {
+      "post": {
+        "operationId": "guestCreateUpload",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GuestUploadIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestUploadOut"
+                }
+              }
+            },
+            "description": "Already received: this pass holds a file with the declared sha256, so no session is opened and no byte needs sending."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestUploadOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The file name is not an accepted picture or video type, or the bytes are not the type the name says."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No room: the pass's byte cap, or the door's free-space floor."
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Create Upload"
+      }
+    },
+    "/api/guest/uploads/{upload_uid}": {
+      "head": {
+        "operationId": "guestUploadOffset",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "headers": {
+              "Upload-Offset": {
+                "description": "Bytes the door now holds for this upload session \u2014 the offset the next append must start at.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "404": {
+            "description": "No such pass (redeem), or no such upload session on this device."
+          },
+          "410": {
+            "description": "The pass has ended: expired, revoked or suspended."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Upload Offset"
+      },
+      "patch": {
+        "operationId": "guestAppendUpload",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Upload-Offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Upload-Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/offset+octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestUploadOut"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "Upload-Offset": {
+                "description": "Bytes the door now holds for this upload session \u2014 the offset the next append must start at.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No such pass (redeem), or no such upload session on this device."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "Append: the Upload-Offset is not where the session stands \u2014 re-sync with HEAD. Completion: an upload is unknown, already completed, or not fully received."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "Redeem: too many attempts from this address, or the pass has no room for another device. Append: too many bodies streaming at once; nothing was read or stored. Resend after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before sending the request again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No room: the pass's byte cap, or the door's free-space floor."
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Append"
+      }
+    },
+    "/api/pass/redeem": {
+      "post": {
+        "operationId": "guestRedeem",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedeemIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedeemOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No such pass (redeem), or no such upload session on this device."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "Redeem: too many attempts from this address, or the pass has no room for another device. Append: too many bodies streaming at once; nothing was read or stored. Resend after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before sending the request again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Redeem"
+      }
+    }
+  }
+}

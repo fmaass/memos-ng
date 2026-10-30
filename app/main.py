@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -249,14 +249,19 @@ PUBLIC_OPERATIONS: set[tuple[str, str]] = {
 }
 
 
-def route_security(route: APIRoute) -> list[dict[str, list[str]]] | None:
+def route_security(
+    route: APIRoute,
+    dependency_security: Mapping[str, list[dict[str, list[str]]]] = DEPENDENCY_SECURITY,
+) -> list[dict[str, list[str]]] | None:
     """The credentials this route accepts, or None when it takes none.
 
     Read off the route's auth dependency rather than declared alongside it, so the published
-    contract cannot drift from what the route enforces (MEMNG-111).
+    contract cannot drift from what the route enforces (MEMNG-111). `dependency_security` is the
+    member map unless a caller describes another app — the guest door's snapshot passes its own
+    (scripts/gen-openapi.py), so both documents derive security the same way.
     """
     for dependency in route.dependant.dependencies:
-        derived = DEPENDENCY_SECURITY.get(getattr(dependency.call, "__name__", ""))
+        derived = dependency_security.get(getattr(dependency.call, "__name__", ""))
         if derived is not None:
             return derived
     for method in route.methods or ():
@@ -266,11 +271,15 @@ def route_security(route: APIRoute) -> list[dict[str, list[str]]] | None:
     return None
 
 
-def attach_route_security(schema: dict[str, Any], routes: Sequence[BaseRoute]) -> None:
+def attach_route_security(
+    schema: dict[str, Any],
+    routes: Sequence[BaseRoute],
+    dependency_security: Mapping[str, list[dict[str, list[str]]]] = DEPENDENCY_SECURITY,
+) -> None:
     for route in routes:
         if not isinstance(route, APIRoute) or not route.include_in_schema:
             continue
-        security = route_security(route)
+        security = route_security(route, dependency_security)
         if security is None:
             continue
         operations = schema["paths"].get(route.path_format, {})

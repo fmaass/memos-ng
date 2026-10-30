@@ -611,3 +611,98 @@ async def test_a_completion_takes_its_blob_locks_in_hash_order(door, home_iface,
         assert free is False
         await holder.commit()
     assert (await task).status_code == 200
+
+
+# --- the declared contract, provoked (openapi-guest.json, MEMNG-1011) ---------------------------
+# tests/test_openapi_guest.py maps every refusal the guest document declares to the test here that
+# makes the route send it; these are the ones no behaviour test above already provoked.
+
+
+async def test_every_authed_guest_route_is_410_once_its_pass_has_ended(door, home_iface):  # noqa: F811
+    _, secret = await seeded_pass(home_iface)
+    token = (await redeem(door, secret))["device_token"]
+    uid = await upload(door, token, JPEG)
+    assert (await door.get("/api/guest/me", headers=bearer(token))).status_code == 200  # control
+    _sql("UPDATE passes SET expires_at = now() - interval '1 minute'")
+    auth = bearer(token)
+    answers = {
+        "me": await door.get("/api/guest/me", headers=auth),
+        "create": await door.post(
+            "/api/guest/uploads", json={"filename": "b.jpg", "size": 10}, headers=auth
+        ),
+        "offset": await door.head(f"/api/guest/uploads/{uid}", headers=auth),
+        "append": await door.patch(
+            f"/api/guest/uploads/{uid}", content=b"x", headers={**auth, "Upload-Offset": "0"}
+        ),
+        "complete": await complete(door, token, [uid]),
+        "batches": await door.get("/api/guest/batches", headers=auth),
+    }
+    assert {name: r.status_code for name, r in answers.items()} == dict.fromkeys(answers, 410)
+    assert answers["me"].json() == {"detail": "This pass is no longer open"}
+    assert answers["offset"].content == b""  # a HEAD answer has no body to describe
+
+
+async def test_a_declared_size_over_the_upload_limit_is_413_at_create(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "MAX_UPLOAD_MIB", 1)
+    _, secret = await seeded_pass(home_iface)
+    token = (await redeem(door, secret))["device_token"]
+    over = {"filename": "big.jpg", "size": 1024 * 1024 + 1}
+    r = await door.post("/api/guest/uploads", json=over, headers=bearer(token))
+    assert r.status_code == 413 and r.json() == {"detail": "File exceeds the 1 MiB limit"}
+    at = {"filename": "big.jpg", "size": 1024 * 1024}
+    assert (
+        await door.post("/api/guest/uploads", json=at, headers=bearer(token))
+    ).status_code == 201
+
+
+async def test_every_429_tells_the_client_when_to_retry(door, home_iface, monkeypatch):  # noqa: F811
+    _, secret = await seeded_pass(home_iface, max_devices=1)
+    token = (await redeem(door, secret))["device_token"]
+    body = {"secret": secret, "display_name": "x", "platform": "web"}
+    r = await door.post("/api/pass/redeem", json=body)
+    assert r.status_code == 429 and r.headers["Retry-After"] == "60"
+    assert r.json() == {"detail": "This pass has no room for another device"}
+
+    # The append's admission is held for real: this device's only body slot is taken first.
+    monkeypatch.setattr(settings, "GUEST_BODIES_PER_DEVICE", 1)
+    r = await door.post(
+        "/api/guest/uploads", json={"filename": "a.jpg", "size": len(JPEG)}, headers=bearer(token)
+    )
+    uid = r.json()["upload_uid"]
+    device_id = _sql("SELECT id FROM pass_devices")[0][0]
+    assert core.body_admission.admit(device_id)
+    try:
+        r = await door.patch(
+            f"/api/guest/uploads/{uid}",
+            content=JPEG,
+            headers={**bearer(token), "Upload-Offset": "0"},
+        )
+    finally:
+        core.body_admission.release(device_id)
+    assert r.status_code == 429
+    assert r.headers["Retry-After"] == str(settings.UPLOAD_RETRY_AFTER_SECONDS)
+    r = await door.patch(
+        f"/api/guest/uploads/{uid}", content=JPEG, headers={**bearer(token), "Upload-Offset": "0"}
+    )
+    assert r.status_code == 200 and r.headers["Upload-Offset"] == str(len(JPEG))  # control
+
+
+async def test_the_limits_keep_their_wire_bytes(door, home_iface):  # noqa: F811
+    """`limits` became a named model for the contract; what a client reads must not have moved by a
+    byte — the same keys, in the same order, compact, on both answers that carry it."""
+    wire = (
+        f'"limits":{{"max_file_bytes":{settings.MAX_UPLOAD_MIB * 1024 * 1024},'
+        f'"chunk_size":{settings.UPLOAD_CHUNK_SIZE},'
+        f'"max_patch_bytes":{settings.INGEST_PATCH_MAX_BYTES}}}'
+    ).encode()
+    _, secret = await seeded_pass(home_iface)
+    r = await door.post(
+        "/api/pass/redeem", json={"secret": secret, "display_name": "x", "platform": "web"}
+    )
+    assert r.status_code == 201 and wire in r.content
+    me = await door.get("/api/guest/me", headers=bearer(r.json()["device_token"]))
+    assert me.status_code == 200 and wire in me.content
