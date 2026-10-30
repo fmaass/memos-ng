@@ -898,6 +898,41 @@
         "title": "CameraOut",
         "type": "object"
       },
+      "CaptureGrantOut": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "expires_at",
+          "token"
+        ],
+        "title": "CaptureGrantOut",
+        "type": "object"
+      },
       "CaptureOut": {
         "description": "What the server read out of an upload's own metadata, and whether it has read it yet.\n\n`pending` means the read has not happened (the bytes are still arriving, or nothing has asked\nyet); `done` is a SETTLED answer even when all three values are null \u2014 a file with no capture\ndate is an answer, not a reason for a composer to keep waiting.",
         "properties": {
@@ -4282,7 +4317,7 @@
     "securitySchemes": {
       "bearerAuth": {
         "bearerFormat": "memos_pat",
-        "description": "A personal access token (`memos_pat_\u2026`). Accepted on every /api/* route except /api/pats/*, which takes a browser session or a management grant and never a token, and POST /api/auth/native/exchange, which is anonymous by construction \u2014 it is how a device obtains a token in the first place, so requiring one would be circular.",
+        "description": "A personal access token (`memos_pat_\u2026`). Accepted on every /api/* route except /api/pats/*, which takes a browser session or a management grant and never a token, and POST /api/auth/native/exchange, which is anonymous by construction \u2014 it is how a device obtains a token in the first place, so requiring one would be circular. An upload-only capture grant (minted by POST /api/tokens/capture-grant) travels in the same header and is accepted ONLY on POST /api/uploads and on PATCH and HEAD /api/uploads/{upload_uid}; every other route answers it 401.",
         "scheme": "bearer",
         "type": "http"
       },
@@ -10230,6 +10265,80 @@
         "summary": "List Tags",
         "tags": [
           "memos"
+        ]
+      }
+    },
+    "/api/tokens/capture-grant": {
+      "post": {
+        "description": "Mint the presenting device token's capture grant: upload-only, 24 h, acts as its owner.\n\nEach mint ROTATES: the grant this token minted before is revoked in the same transaction, so a\ndevice holds one live grant however often it foregrounds, and concurrent mints leave exactly\none live (the last to commit). The grant expires after 24 hours or with its token, whichever\nis first, and is revoked with its token \u2014 by logout, renewal or Manage Tokens.",
+        "operationId": "mint_capture_grant_api_tokens_capture_grant_post",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaptureGrantOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Mint Capture Grant",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
+    "/api/tokens/capture-grant/{grant_id}": {
+      "delete": {
+        "description": "Revoke the capture grant the presenting device token minted, and only that.\n\n404 for any other id: an ordinary token, or a grant another device minted, is not this route's\nto touch \u2014 token management proper is `/api/pats`.",
+        "operationId": "revoke_capture_grant_api_tokens_capture_grant__grant_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "title": "Grant Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke Capture Grant",
+        "tags": [
+          "tokens"
         ]
       }
     },

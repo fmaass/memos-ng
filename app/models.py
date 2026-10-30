@@ -985,6 +985,13 @@ class Pat(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # NULL = never expires, which is what every token minted before this column existed is.
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set only on an upload-only capture grant (MEMNG-938): the full token that minted it. A grant
+    # dies with that token (the cascade) and there is at most one per token (the unique index), so
+    # rotation on each mint is a property of the table, not of whoever writes it. NULL on every
+    # ordinary token, which is what every row before this column existed is.
+    parent_pat_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pats.id", ondelete="CASCADE"), unique=True, index=True
+    )
 
 
 class NativeAuthCode(Base):

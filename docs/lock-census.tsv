@@ -27,9 +27,10 @@ app/services/memos.py	lock_memo_for_write	for_update
 app/services/memos.py	link_attachments	for_update
 app/services/memos.py	get_by_idempotency_key	for_update
 app/services/memos.py	get_memo_by_edit_key	for_update
+app/services/passes.py	_tag_trip_if_untagged	for_update
 app/services/passes.py	_lock_pass	for_update
 app/services/passes.py	revoke_collection_passes	for_update
-app/services/passes.py	_tag_trip_if_untagged	for_update
+app/services/pats.py	mint_capture_grant	for_update
 app/services/reclaim.py	reclaim_attachment	for_update
 app/services/reclaim.py	reclaim_attachment	for_update
 app/services/reclaim.py	reclaim_attachment_sync	for_update

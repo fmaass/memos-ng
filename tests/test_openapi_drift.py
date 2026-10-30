@@ -459,6 +459,9 @@ NATIVE_SELF_SERVICE = {
     ("post", "/api/auth/native/logout"),
     ("get", "/api/auth/native/token"),
     ("patch", "/api/auth/native/token"),
+    # The presenting token's own upload-only capture grant (MEMNG-938): mint and revoke.
+    ("post", "/api/tokens/capture-grant"),
+    ("delete", "/api/tokens/capture-grant/{grant_id}"),
 }
 
 

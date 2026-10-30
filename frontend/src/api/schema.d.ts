@@ -1558,6 +1558,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tokens/capture-grant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint Capture Grant
+         * @description Mint the presenting device token's capture grant: upload-only, 24 h, acts as its owner.
+         *
+         *     Each mint ROTATES: the grant this token minted before is revoked in the same transaction, so a
+         *     device holds one live grant however often it foregrounds, and concurrent mints leave exactly
+         *     one live (the last to commit). The grant expires after 24 hours or with its token, whichever
+         *     is first, and is revoked with its token — by logout, renewal or Manage Tokens.
+         */
+        post: operations["mint_capture_grant_api_tokens_capture_grant_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tokens/capture-grant/{grant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke Capture Grant
+         * @description Revoke the capture grant the presenting device token minted, and only that.
+         *
+         *     404 for any other id: an ordinary token, or a grant another device minted, is not this route's
+         *     to touch — token management proper is `/api/pats`.
+         */
+        delete: operations["revoke_capture_grant_api_tokens_capture_grant__grant_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/uploads": {
         parameters: {
             query?: never;
@@ -2062,6 +2110,25 @@ export interface components {
             make: string | null;
             /** Model */
             model: string | null;
+        };
+        /** CaptureGrantOut */
+        CaptureGrantOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+            /** Token */
+            token: string;
         };
         /**
          * CaptureOut
@@ -7082,6 +7149,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TagCount"][];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    mint_capture_grant_api_tokens_capture_grant_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureGrantOut"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    revoke_capture_grant_api_tokens_capture_grant__grant_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                grant_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
             503: components["responses"]["DatabaseBusy"];

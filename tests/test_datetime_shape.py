@@ -270,6 +270,8 @@ EXPECTED_DATETIME_FIELDS = {
     ("AttachmentOut", "capture_instant"),
     ("AttachmentOut", "captured_at"),
     ("AttachmentRef", "capture_instant"),
+    ("CaptureGrantOut", "created_at"),
+    ("CaptureGrantOut", "expires_at"),
     ("CaptureOut", "capture_instant"),
     ("CollectionOut", "createdAt"),
     ("CollectionOut", "spanEnd"),

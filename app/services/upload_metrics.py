@@ -18,8 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 # The auth path that admitted the request (`request.state.auth_kind`): a PAT is the iOS app, a
-# session the web SPA. Two values, never a user: the panel asks "are bytes arriving", not whose.
-Principal = Literal["pat", "session"]
+# session the web SPA, a capture grant the iOS share extension (MEMNG-938). Never a user: the panel
+# asks "are bytes arriving", not whose.
+Principal = Literal["pat", "session", "capture_grant"]
 # Which cap refused: one account's bodies or the whole process's.
 AdmissionScope = Literal["user", "process"]
 # How a consumed session ended. `rejected_size` is the third value this process publishes (see

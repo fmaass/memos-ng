@@ -337,6 +337,10 @@ class Settings(BaseSettings):
     # short enough that a stolen grant is worth about as much as a stolen live browser session —
     # which is precisely the blast radius this design accepts. A device PAT can never become one.
     MANAGE_GRANT_TTL_S: int = 600
+    # Seconds an upload-only capture grant stays usable (MEMNG-938). The app re-mints one on every
+    # foreground, so a day covers a phone that shares between opens without leaving a credential in
+    # the shared app-group container that outlives a lost day by much.
+    CAPTURE_GRANT_TTL_S: int = 24 * 3600
     # Apple associated-domains identity. While APPLE_TEAM_ID is unset (no Developer Program
     # membership yet) the AASA route 404s, which is the correct answer for a domain that claims
     # no app. Settings are read ONCE at process start, so enabling this is an env change plus a

@@ -160,7 +160,8 @@ async def _get_upload(db: AsyncSession, upload_uid: str, owner_id: int) -> Uploa
 @router.post("", response_model=UploadOut, status_code=201)
 async def start_upload(
     body: UploadCreate,
-    user: Annotated[User, Depends(auth.require_user)],
+    # Also an upload-only capture grant (MEMNG-938); nothing else in this router takes one.
+    user: Annotated[User, Depends(auth.require_upload_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> UploadOut:
     if body.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
@@ -247,7 +248,8 @@ async def append_chunk(
     upload_uid: str,
     request: Request,
     response: Response,
-    user: Annotated[User, Depends(auth.require_user)],
+    # Also an upload-only capture grant (MEMNG-938); nothing else in this router takes one.
+    user: Annotated[User, Depends(auth.require_upload_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
 ) -> UploadOut:
@@ -324,7 +326,8 @@ async def append_chunk(
 )
 async def upload_offset(
     upload_uid: str,
-    user: Annotated[User, Depends(auth.require_user)],
+    # Also an upload-only capture grant (MEMNG-938); nothing else in this router takes one.
+    user: Annotated[User, Depends(auth.require_upload_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> Response:
     upload = await _get_upload(db, upload_uid, user.id)

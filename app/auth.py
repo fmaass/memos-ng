@@ -13,6 +13,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.config import settings
 from app.database import async_session, get_session
@@ -306,6 +307,19 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+# An upload-only capture grant (MEMNG-938) is a `pats` row with a `parent_pat_id`, presented as a
+# Bearer like the token that minted it — the share extension's upload requests are built the same
+# way the app's are. Two things keep it from ever acting as that token, each on its own sufficient:
+# it is stored under a DOMAIN-SEPARATED hash, so no lookup that hashes like a PAT can find it (an
+# old process after a rollback included), and `authenticate_pat` refuses any row that has a parent.
+CAPTURE_GRANT_PREFIX = "memos_cap_"
+_CAPTURE_GRANT_DOMAIN = b"memos-ng capture grant\x00"
+
+
+def hash_capture_grant(grant: str) -> str:
+    return hashlib.sha256(_CAPTURE_GRANT_DOMAIN + grant.encode()).hexdigest()
+
+
 # In-process record of when each PAT's last_used stamp was last claimed (monotonic seconds), the
 # PAT-side twin of _last_seen_claimed above. Same reason: claimed synchronously BEFORE the write so
 # a concurrent burst on one PAT (a satellite pulling a gallery's derived tiers) has exactly one
@@ -429,7 +443,11 @@ async def authenticate_pat(db: AsyncSession, token: str) -> User | None:
     """Return the owning user for a valid, unexpired PAT, else None. Schedules the last_used stamp
     (at most once per throttle window) as a background task; the request never waits for it."""
     pat = (
-        await db.execute(select(Pat).where(Pat.hashed_token == hash_token(token)))
+        await db.execute(
+            # A capture grant is never a token, whatever its hash: it is refused here by what the
+            # row IS, so every bearer route inherits the refusal from this one place.
+            select(Pat).where(Pat.hashed_token == hash_token(token), Pat.parent_pat_id.is_(None))
+        )
     ).scalar_one_or_none()
     if pat is None:
         return None
@@ -484,6 +502,60 @@ async def require_pat_or_user(request: Request, db: AsyncSession = Depends(get_s
     dependency name they were reviewed under. Now that every route accepts a bearer it carries no
     meaning of its own; the call sites collapse onto require_user in a later cleanup."""
     return await require_user(request, db)
+
+
+async def authenticate_capture_grant(db: AsyncSession, grant: str) -> User | None:
+    """The user a live capture grant uploads for — None for an unknown, expired or orphaned one.
+
+    Judged against its PARENT at use time, not only at mint: the grant is live only while the
+    token that minted it still exists and has not expired. The cascade removes a revoked parent's
+    grant, and this join is what makes that true even for a parent that merely ran out of time.
+    """
+    parent = aliased(Pat)
+    now = datetime.now(UTC)
+    row = (
+        await db.execute(
+            select(Pat.id, Pat.user_id, Pat.last_used)
+            .join(parent, parent.id == Pat.parent_pat_id)
+            .where(
+                Pat.hashed_token == hash_capture_grant(grant),
+                Pat.parent_pat_id.is_not(None),
+                Pat.expires_at > now,
+                parent.parent_pat_id.is_(None),
+                parent.user_id == Pat.user_id,
+                or_(parent.expires_at.is_(None), parent.expires_at > now),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    user = (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()
+    # Display-only, like a token's: Manage Tokens shows when the phone last uploaded through it.
+    try:
+        schedule_pat_last_used_stamp(row.id, row.last_used)
+    except Exception:
+        logger.warning("pat_last_used_stamp_failed", exc_info=True)
+    return user
+
+
+async def require_upload_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
+    """`require_user`, widened by exactly one credential: an upload-only capture grant.
+
+    Declared ONLY on the three upload-protocol operations a share extension needs — open a session
+    (POST /api/uploads), append bytes (PATCH /api/uploads/{uid}) and read the offset (HEAD) — so a
+    grant reaches those and nothing else; every other route takes `require_user`, whose PAT lookup
+    refuses a grant row. Dispatch is on the prefix, so a token is looked up exactly as before and a
+    grant is never tried as a token or the other way round; a grant that does not authenticate is a
+    401 with no fallback to the cookie (Decision 6).
+    """
+    credential = bearer_credential(request)
+    if credential is None or not credential.startswith(CAPTURE_GRANT_PREFIX):
+        return await require_user(request, db)
+    user = await authenticate_capture_grant(db, credential)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired capture grant")
+    request.state.auth_kind = "capture_grant"
+    return user
 
 
 # --- simple per-IP fixed-window rate limit for login/callback ---

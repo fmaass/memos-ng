@@ -103,6 +103,7 @@ from app.routers import admin_digest as admin_digest_router  # noqa: E402
 from app.routers import admin_export as admin_export_router  # noqa: E402
 from app.routers import assets as assets_router  # noqa: E402
 from app.routers import auth as auth_router  # noqa: E402
+from app.routers import capture_grants as capture_grants_router  # noqa: E402
 from app.routers import collection_covers as collection_covers_router  # noqa: E402
 from app.routers import collections as collections_router  # noqa: E402
 from app.routers import compat as compat_router  # noqa: E402
@@ -126,6 +127,7 @@ from app.routers import uploads as uploads_router  # noqa: E402
 app.router.routes.extend(auth_router.router.routes)
 app.router.routes.extend(memos_router.router.routes)
 app.router.routes.extend(pats_router.router.routes)
+app.router.routes.extend(capture_grants_router.router.routes)
 app.router.routes.extend(export_router.router.routes)
 app.router.routes.extend(uploads_router.router.routes)
 app.router.routes.extend(assets_router.router.routes)
@@ -170,7 +172,10 @@ SECURITY_SCHEMES = {
         "description": "A personal access token (`memos_pat_…`). Accepted on every /api/* route "
         "except /api/pats/*, which takes a browser session or a management grant and never a "
         "token, and POST /api/auth/native/exchange, which is anonymous by construction — it is how "
-        "a device obtains a token in the first place, so requiring one would be circular.",
+        "a device obtains a token in the first place, so requiring one would be circular. An "
+        "upload-only capture grant (minted by POST /api/tokens/capture-grant) "
+        "travels in the same header and is accepted ONLY on POST /api/uploads and on PATCH and "
+        "HEAD /api/uploads/{upload_uid}; every other route answers it 401.",
     },
     "sessionCookie": {
         "type": "apiKey",
@@ -210,6 +215,8 @@ DEPENDENCY_SECURITY: dict[str, list[dict[str, list[str]]]] = {
     "presenting_token_hash": BEARER_SECURITY,
     "require_user": USER_SECURITY,
     "require_pat_or_user": USER_SECURITY,
+    # The bearer arm also admits an upload-only capture grant (`memos_cap_…`), on these routes only.
+    "require_upload_user": USER_SECURITY,
     "require_session_user": SESSION_SECURITY,
     "require_admin": SESSION_SECURITY,
     "require_session_or_grant": SESSION_OR_GRANT_SECURITY,
