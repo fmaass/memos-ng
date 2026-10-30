@@ -190,6 +190,28 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.11.0
+
+- Upload-only capture grants, the server half of sharing into memos from the iOS share sheet.
+  `POST /api/tokens/capture-grant`, presented with a device's own personal access token, mints a
+  `memos_cap_…` credential that acts as that token's owner on exactly three operations: opening an
+  upload (`POST /api/uploads`), appending bytes (`PATCH /api/uploads/{upload_uid}`) and reading the
+  offset (`HEAD /api/uploads/{upload_uid}`). Every other route answers it 401, and a grant that does
+  not authenticate is a 401 with no fallback to the session cookie. A session cookie cannot mint one.
+- A grant lives for 24 hours (`CAPTURE_GRANT_TTL_S`) or until its token expires, whichever comes
+  first, and is checked against that token on every use. Each token holds at most one grant: a new
+  mint retires the previous one in the same transaction, and concurrent mints leave exactly one
+  live. Revoking the token (Manage Tokens, native logout or renewal) revokes its grant with it, and
+  `DELETE /api/tokens/capture-grant/{grant_id}` revokes it alone, answering 404 for anything the
+  presenting token did not mint. Grants are listed in Manage Tokens as "Capture grant, phone".
+- A grant is stored under its own domain-separated hash and refused by the token lookup whatever
+  its hash, so it can never act as a personal access token, an older build after a rollback
+  included. Bytes appended with a grant are counted in `memosng_upload_bytes` under
+  `principal="capture_grant"`.
+- Migration `f9af5db6b98c` (expand-only) adds the nullable `pats.parent_pat_id` with a unique
+  index and a self-referencing foreign key that cascades on delete; every existing token reads
+  NULL. Its downgrade deletes the grant rows before dropping the column.
+
 ### v2.10.0
 
 - `GET /api/events` is now a live stream instead of a poll that closed once nothing was in
