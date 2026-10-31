@@ -78,12 +78,18 @@ async def test_shared_bytes_go_only_with_the_last_batch_naming_them(door, home_i
     blob = _blob(ingest_env, JPEG)
     _set(first, acked_at=NOW - timedelta(days=8), state="acked")
     _set(second, acked_at=NOW - timedelta(days=6), state="acked")
-    assert await service_api.purge(now=NOW) == {"batches": 1, "sessions": 0, "files": 0}
+    assert await service_api.purge(now=NOW) == {
+        "batches": 1,
+        "sessions": 0,
+        "files": 0,
+        "strays": 0,
+    }
     assert blob.read_bytes() == JPEG  # `second` still names the hash
     assert await service_api.purge(now=NOW + timedelta(days=2)) == {
         "batches": 1,
         "sessions": 0,
         "files": 1,
+        "strays": 0,
     }
     assert not blob.exists()
     assert _uids() == set()

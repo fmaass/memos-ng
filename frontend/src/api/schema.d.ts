@@ -1433,6 +1433,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/passes/{uid}/unsuspend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Unsuspend Pass
+         * @description Lift the guest door's automatic suspension (too many refused redemptions) and push that at
+         *     once. Raises `version`; the door clears a suspension it held before this version and keeps
+         *     one it sets later. Home does not see the suspension itself, so this answers the same whether
+         *     or not one stood.
+         */
+        post: operations["unsuspend_pass_api_passes__uid__unsuspend_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/pats": {
         parameters: {
             query?: never;
@@ -6863,6 +6886,71 @@ export interface operations {
                 };
             };
             /** @description The pass is revoked (detail "pass_revoked") or this device already is (detail "device_revoked"). Nothing was changed. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    unsuspend_pass_api_passes__uid__unsuspend_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PassOut"];
+                };
+            };
+            /** @description No valid session cookie or bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description No such pass. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
+            /** @description The pass is revoked (detail "pass_revoked"), which is terminal. Nothing was changed. */
             410: {
                 headers: {
                     [name: string]: unknown;

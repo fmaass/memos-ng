@@ -14,7 +14,9 @@ import pytest
 from app.config import settings
 from app.database import async_session
 from app.ingest import core
+from app.ingest.factory import create_app
 from app.models import PassDevice
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 
 from tests.ingest_support import (
@@ -162,6 +164,38 @@ async def test_a_pass_with_more_than_the_hourly_refusals_is_suspended(
     assert out[0]["applied"] is True and out[0]["suspended_at"] is not None
 
 
+async def test_a_lifted_pass_counts_only_the_refusals_after_the_lift(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "INGEST_REFUSALS_PER_HOUR", 3)
+    monkeypatch.setattr(settings, "INGEST_TRUST_CF_CONNECTING_IP", True)
+    uid, secret = await seeded_pass(home_iface, max_devices=1)
+    token = (await redeem(door, secret, **{"CF-Connecting-IP": "192.0.2.1"}))["device_token"]
+    body = {"secret": secret, "display_name": "x", "platform": "web"}
+
+    async def refused(first: int, n: int) -> None:
+        for i in range(first, first + n):  # each from its own address, the pass full
+            r = await door.post(
+                "/api/pass/redeem", json=body, headers={"CF-Connecting-IP": f"192.0.2.{i}"}
+            )
+            assert r.status_code == 429
+
+    await refused(10, 4)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
+    out = await push(
+        home_iface, pass_state(uid, secret, version=2, max_devices=1, unsuspend_version=2)
+    )
+    assert out[0]["suspended_at"] is None
+    assert (await door.get("/api/guest/me", headers=bearer(token))).status_code == 200
+    # The four refusals of the last hour were the suspension's; the lift starts the count over.
+    await refused(20, 3)
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)]
+    await refused(30, 1)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
+
+
 async def test_an_address_past_the_hourly_refusals_is_shut_out_before_any_lookup(
     door,  # noqa: F811
     home_iface,  # noqa: F811
@@ -182,6 +216,37 @@ async def test_an_address_past_the_hourly_refusals_is_shut_out_before_any_lookup
 
 
 # --- upload sessions ---------------------------------------------------------------------------
+
+
+LAST_MS = 253_402_300_799_999  # 9999-12-31T23:59:59.999Z, the last instant a datetime holds
+FIRST_MS = -62_135_596_800_000  # 0001-01-01T00:00:00Z
+
+
+@pytest.mark.parametrize("ms", [LAST_MS + 1, 10**20, FIRST_MS - 1])
+async def test_a_last_modified_no_datetime_holds_is_422_and_leaves_no_part_file(
+    home_iface,  # noqa: F811
+    ingest_env,  # noqa: F811
+    ms,
+):
+    # Answers, not raises: a crash in the door must show here as the 500 a guest would get.
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app("ingest"), raise_app_exceptions=False),
+        base_url="http://door",
+    ) as answering:
+        _, secret = await seeded_pass(home_iface)
+        token = (await redeem(answering, secret))["device_token"]
+        body = {"filename": "a.jpg", "size": 5, "last_modified": ms}
+        r = await answering.post("/api/guest/uploads", json=body, headers=bearer(token))
+        assert r.status_code == 422, r.text
+        assert sorted(ingest_env.rglob("*.part")) == []
+        assert _sql("SELECT count(*) FROM guest_uploads") == [(0,)]
+        # Control: each edge itself is a time, and is kept.
+        for edge in (LAST_MS, FIRST_MS):
+            body["last_modified"] = edge
+            r = await answering.post("/api/guest/uploads", json=body, headers=bearer(token))
+            assert r.status_code == 201, r.text
+        assert len(sorted(ingest_env.rglob("*.part"))) == 2
+        assert _sql("SELECT count(*) FROM guest_uploads WHERE client_mtime IS NOT NULL") == [(2,)]
 
 
 async def test_upload_in_three_patches_with_a_resume_then_complete(door, home_iface, ingest_env):  # noqa: F811

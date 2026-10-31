@@ -350,6 +350,7 @@ def test_every_route_refuses_an_anonymous_caller(lib):
         ("get", f"/api/passes/{p}", None),
         ("patch", f"/api/passes/{p}", {"label": "x"}),
         ("delete", f"/api/passes/{p}", None),
+        ("post", f"/api/passes/{p}/unsuspend", None),
         ("get", f"/api/passes/{p}/devices", None),
         ("delete", f"/api/passes/{p}/devices/dev1", None),
         ("get", f"/api/passes/{p}/contributions", None),
@@ -427,6 +428,35 @@ def test_revoke_marks_an_immediate_push_pending(lib):
     assert [tuple(k) for k in kinds] == [("issued", 1), ("revoked", 2)]
 
 
+def test_unsuspend_raises_the_version_records_the_lift_and_owes_an_immediate_push(lib):
+    client, _ = lib
+    p = _issue(client, _trip(client)).json()["pass"]["uid"]
+    _sql(
+        "UPDATE pass_sync_state SET push_requested_at = NULL "
+        "WHERE pass_id = (SELECT id FROM passes WHERE uid = :u)",
+        {"u": p},
+    )
+    assert [tuple(r) for r in _sync_row(p)] == [(False, False, 0)]  # control
+    r = client.post(f"/api/passes/{p}/unsuspend")
+    assert r.status_code == 200, r.text
+    assert r.json()["version"] == 2 and r.json()["state"] == "active"
+    assert [tuple(r) for r in _sync_row(p)] == [(True, True, 0)]
+    events = _sql(
+        "SELECT kind, version, detail FROM pass_events "
+        "WHERE pass_id=(SELECT id FROM passes WHERE uid=:u) ORDER BY id",
+        {"u": p},
+    )
+    assert [tuple(e) for e in events] == [("issued", 1, None), ("updated", 2, "unsuspend")]
+
+
+def test_unsuspend_of_a_revoked_pass_is_410_and_changes_nothing(lib):
+    client, _ = lib
+    p = _issue(client, _trip(client)).json()["pass"]["uid"]
+    client.delete(f"/api/passes/{p}")
+    assert client.post(f"/api/passes/{p}/unsuspend").status_code == 410
+    assert _sql("SELECT version FROM passes WHERE uid = :u", {"u": p}) == [(2,)]
+
+
 def test_revoke_cascades_to_every_device(lib):
     client, _ = lib
     p = _issue(client, _trip(client)).json()["pass"]["uid"]
@@ -442,6 +472,7 @@ def test_an_unknown_pass_is_404(lib):
     assert client.get("/api/passes/nope").status_code == 404
     assert client.patch("/api/passes/nope", json={"label": "x"}).status_code == 404
     assert client.delete("/api/passes/nope").status_code == 404
+    assert client.post("/api/passes/nope/unsuspend").status_code == 404
     assert client.get("/api/passes/nope/devices").status_code == 404
     assert client.get("/api/passes/nope/contributions").status_code == 404
 
@@ -948,6 +979,7 @@ PASS_OPERATIONS = {
     ("get", "/api/passes/{uid}"),
     ("patch", "/api/passes/{uid}"),
     ("delete", "/api/passes/{uid}"),
+    ("post", "/api/passes/{uid}/unsuspend"),
     ("get", "/api/passes/{uid}/devices"),
     ("delete", "/api/passes/{uid}/devices/{device_uid}"),
     ("get", "/api/passes/{uid}/contributions"),
@@ -975,6 +1007,7 @@ def test_openapi_names_exactly_the_pass_operations_all_member_authenticated():
         ("get", "/api/passes/{uid}"),
         ("patch", "/api/passes/{uid}"),
         ("delete", "/api/passes/{uid}"),
+        ("post", "/api/passes/{uid}/unsuspend"),
         ("delete", "/api/passes/{uid}/devices/{device_uid}"),
     ):
         assert "410" in paths[path][method]["responses"], (method, path)

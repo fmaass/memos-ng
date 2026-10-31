@@ -316,6 +316,40 @@ async def update_pass(db: AsyncSession, p: Pass, actor: User, changes: dict[str,
     return locked
 
 
+# The PassEvent detail of an owner's lift; the push carries the newest one's version.
+UNSUSPEND = "unsuspend"
+
+
+async def unsuspend_pass(db: AsyncSession, p: Pass, actor: User) -> Pass:
+    """Lift the ingest host's automatic suspension. Home never holds the suspension itself (the
+    ingest host sets it), so the lift is the owner's word, versioned like any change and owing an
+    IMMEDIATE push: the ingest host clears a suspension it held before this version and keeps
+    one set after it. A revoked pass refuses (`PassRevoked`)."""
+    locked = await _lock_pass(db, p.id)
+    locked.version += 1
+    await _event(db, locked, "updated", actor=actor, detail=UNSUSPEND)
+    await _request_push(db, locked.id, urgent=True)
+    await db.flush()
+    await db.refresh(locked)
+    return locked
+
+
+async def unsuspend_versions(db: AsyncSession, pass_ids: Sequence[int]) -> dict[int, int]:
+    """The version of each pass's newest lift, for the passes that have one."""
+    if not pass_ids:
+        return {}
+    rows = await db.execute(
+        select(PassEvent.pass_id, func.max(PassEvent.version))
+        .where(
+            PassEvent.pass_id.in_(pass_ids),
+            PassEvent.kind == "updated",
+            PassEvent.detail == UNSUSPEND,
+        )
+        .group_by(PassEvent.pass_id)
+    )
+    return {pass_id: version for pass_id, version in rows.tuples() if version is not None}
+
+
 async def revoke_pass(db: AsyncSession, p: Pass, actor: User) -> Pass:
     """The terminal transition: stamp the revocation with the version that performs it, revoke
     every device with it, and owe an IMMEDIATE push. A second revoke is refused (`PassRevoked`)."""

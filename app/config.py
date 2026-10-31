@@ -158,6 +158,12 @@ class Settings(BaseSettings):
     TRIP_INGEST_TIMEOUT_S: float = 30.0
     GUEST_BODIES_PER_DEVICE: int = 2
     GUEST_BODIES_PER_PROCESS: int = 12
+    # File-count caps on the guest door (MEMNG-1027). The pass cap is the moonshot's 2 000 new
+    # files in any 24 hours; the device cap bounds what one enrolled phone can send in all, so a
+    # single leaked device token cannot spend the whole pass. 1 000 is half a day of the pass cap
+    # and far above what one guest shoots on one trip.
+    INGEST_PASS_FILES_PER_DAY: int = 2000
+    GUEST_FILES_PER_DEVICE: int = 1000
 
     # Slow-lane transcode + thermal guard (T2.3): defer the H.264 transcode while the CPU package
     # is above THERMAL_MAX_C.

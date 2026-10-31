@@ -385,6 +385,18 @@ async def record_refusal(
         PassEvent(pass_id=p.id, kind="refused", version=p.version, ip_hash=address, detail=reason)
     )
     await db.flush()
+    # The refusals that suspended a pass the owner has since lifted are spent: counted again, the
+    # next one would suspend it straight back.
+    lifted = (
+        await db.execute(
+            select(func.max(PassEvent.at)).where(
+                PassEvent.pass_id == p.id,
+                PassEvent.kind == "updated",
+                PassEvent.detail == core.LIFTED,
+            )
+        )
+    ).scalar_one()
+    since = now - timedelta(hours=1) if lifted is None else max(now - timedelta(hours=1), lifted)
     refused = (
         await db.execute(
             select(func.count())
@@ -392,7 +404,7 @@ async def record_refusal(
             .where(
                 PassEvent.pass_id == p.id,
                 PassEvent.kind == "refused",
-                PassEvent.at > now - timedelta(hours=1),
+                PassEvent.at > since,
             )
         )
     ).scalar_one()
@@ -527,7 +539,9 @@ class GuestUploadIn(BaseModel):
     filename: str = Field(min_length=1, max_length=512)
     mime: str = Field(default="", max_length=255)
     size: int = Field(ge=1)
-    last_modified: int | None = None
+    # Milliseconds since 1970 that a datetime can hold (years 1 to 9999 UTC): one past either edge
+    # overflowed the conversion into a 500.
+    last_modified: int | None = Field(default=None, ge=-62_135_596_800_000, le=253_402_300_799_999)
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
 
 
@@ -557,6 +571,37 @@ async def _already_received(db: AsyncSession, pass_id: int, sha256: str) -> bool
             .limit(1)
         )
     ).scalar_one_or_none() is not None
+
+
+# A file cap frees up as the day's window slides or an unfinished session expires; an hour is the
+# coarse retry that suits both without the client polling a cap that will not move for a while.
+FILE_CAP_RETRY_AFTER_S = 3600
+
+
+async def _files_today(db: AsyncSession, pass_id: int) -> int:
+    """Upload sessions this pass opened in the last 24 hours, read from its own audit trail."""
+    return (
+        await db.execute(
+            select(func.count())
+            .select_from(PassEvent)
+            .where(
+                PassEvent.pass_id == pass_id,
+                PassEvent.kind == "upload_started",
+                PassEvent.at > func.now() - timedelta(hours=24),
+            )
+        )
+    ).scalar_one()
+
+
+async def _open_sessions(db: AsyncSession, device_id: int) -> int:
+    """The device's sessions not yet filed; filed ones are already in `uploads_count`."""
+    return (
+        await db.execute(
+            select(func.count())
+            .select_from(GuestUpload)
+            .where(GuestUpload.pass_device_id == device_id)
+        )
+    ).scalar_one()
 
 
 async def _pass_bytes(db: AsyncSession, pass_id: int) -> int:
@@ -599,7 +644,7 @@ async def _outstanding_bytes(db: AsyncSession) -> int:
             "description": "Already received: this pass holds a file with the declared sha256, so "
             "no session is opened and no byte needs sending.",
         },
-        **refusals(*AUTHED, 413, 415, 507),
+        **refusals(*AUTHED, 413, 415, 429, 507),
     },
 )
 async def create_upload(
@@ -628,6 +673,22 @@ async def create_upload(
     assert p is not None and device is not None
     if await _pass_bytes(db, p.id) + body.size > p.byte_cap:
         raise HTTPException(status_code=507, detail="This pass has no room for more pictures")
+    # Counted under the same pass lock as the bytes, so two creates cannot both take the last
+    # slot. A file is counted when its session opens: one refused here sent no byte.
+    if await _files_today(db, p.id) >= settings.INGEST_PASS_FILES_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail="This pass has taken all the pictures it can today",
+            headers={"Retry-After": str(FILE_CAP_RETRY_AFTER_S)},
+        )
+    if device.uploads_count + await _open_sessions(db, device.id) >= (
+        settings.GUEST_FILES_PER_DEVICE
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="This device has sent all it can",
+            headers={"Retry-After": str(FILE_CAP_RETRY_AFTER_S)},
+        )
     # The floor protects a root disk other services share. Every open session still owes the
     # volume what it has not sent yet, so that is spoken for; the reservation lock makes two
     # creates on different passes count each other.
@@ -636,7 +697,6 @@ async def create_upload(
     if free - await _outstanding_bytes(db) - body.size < settings.INGEST_MIN_FREE_BYTES:
         raise HTTPException(status_code=507, detail="The door is full; try again later")
     uid = secrets.token_urlsafe(24)
-    await to_thread.run_sync(_part_create_sync, core.part_path(uid))
     mtime = (
         upload_bytes.EPOCH + timedelta(milliseconds=body.last_modified)
         if body.last_modified
@@ -656,6 +716,11 @@ async def create_upload(
         )
     )
     db.add(PassEvent(pass_id=p.id, device_id=device.id, kind="upload_started", version=p.version))
+    await db.flush()
+    # The part file last, after everything that can raise short of the commit: made first, a
+    # failure left a part with no row to find it by. A failed commit still leaves one, which the
+    # purge's stray sweep removes once it is older than the upload horizon.
+    await to_thread.run_sync(_part_create_sync, core.part_path(uid))
     await db.commit()
     return GuestUploadOut(
         upload_uid=uid,

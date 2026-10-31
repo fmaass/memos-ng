@@ -380,6 +380,29 @@ async def revoke_pass(
     return (await _render(db, [revoked]))[0]
 
 
+@router.post("/passes/{uid}/unsuspend", response_model=PassOut, responses=_REVOKED)
+async def unsuspend_pass(
+    uid: str,
+    user: Annotated[User, Depends(auth.require_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> PassOut:
+    """Lift the guest door's automatic suspension (too many refused redemptions) and push that at
+    once. Raises `version`; the door clears a suspension it held before this version and keeps
+    one it sets later. Home does not see the suspension itself, so this answers the same whether
+    or not one stood."""
+    p = await _live_pass(db, uid)
+    try:
+        lifted = await pass_svc.unsuspend_pass(db, p, user)
+    except pass_svc.PassRevoked as exc:
+        await db.rollback()
+        raise _revoked() from exc
+    except pass_svc.PassGone as exc:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="Pass not found") from exc
+    await db.commit()
+    return (await _render(db, [lifted]))[0]
+
+
 @router.get("/passes/{uid}/devices", response_model=list[PassDeviceOut], responses=_NO_PASS)
 async def list_devices(
     uid: str,

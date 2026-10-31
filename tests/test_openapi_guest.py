@@ -176,6 +176,8 @@ PROVOKED = {
     ("POST", "/api/guest/uploads", 415): _G
     + "test_a_name_outside_the_allowlist_is_415_at_create[0]",
     ("POST", "/api/guest/uploads", 507): _G + "test_the_pass_byte_cap_and_the_volume_floor_are_507",
+    ("POST", "/api/guest/uploads", 429): "tests/test_ingest_guest_caps.py::"
+    + "test_the_pass_files_per_day_cap_admits_one_below_and_refuses_at_the_limit",
     ("HEAD", _UPLOAD, 401): _FOREIGN_401,
     ("HEAD", _UPLOAD, 404): _G + "test_another_devices_session_answers_as_unknown",
     ("HEAD", _UPLOAD, 410): _ENDED_410,
@@ -311,7 +313,7 @@ def test_every_429_declares_retry_after_and_every_offset_answer_declares_upload_
     limited = [
         op["responses"]["429"] for *_, op in _each_operation(document) if "429" in op["responses"]
     ]
-    assert len(limited) == 2  # redeem and append
+    assert len(limited) == 3  # redeem, create (file caps) and append
     for response in limited:
         assert response["headers"]["Retry-After"]["schema"] == integer
     upload = document["paths"][_UPLOAD]

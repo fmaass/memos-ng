@@ -3,7 +3,9 @@ blob download and retention. Driven over ASGI with the real service token."""
 
 import asyncio
 import hashlib
+import os
 import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -48,6 +50,58 @@ async def test_a_pushed_pass_is_an_ingest_projection_with_no_home_references(hom
         "SELECT collection_id, created_by, revoked_by, version FROM passes WHERE uid=:u", {"u": uid}
     )
     assert rows == [(None, None, None, 1)]
+
+
+def _suspend(uid: str) -> None:
+    _sql("UPDATE passes SET suspended_at = now() WHERE uid = :u", {"u": uid})
+
+
+async def test_a_pushed_lift_clears_a_suspension_standing_before_it(home_iface):  # noqa: F811
+    uid, secret = "p-lift", "s" * 43
+    await push(home_iface, pass_state(uid, secret))
+    _suspend(uid)
+    out = await push(home_iface, pass_state(uid, secret, version=2, label="edited"))
+    assert out[0]["applied"] is True and out[0]["suspended_at"] is not None  # an edit lifts nothing
+    out = await push(home_iface, pass_state(uid, secret, version=3, unsuspend_version=3))
+    assert out[0] == {"uid": uid, "version": 3, "applied": True, "suspended_at": None}
+    assert _sql(
+        "SELECT version FROM pass_events WHERE detail = 'unsuspended' "
+        "AND pass_id = (SELECT id FROM passes WHERE uid = :u)",
+        {"u": uid},
+    ) == [(3,)]
+
+
+async def test_a_stale_push_never_undoes_a_newer_state(home_iface):  # noqa: F811
+    uid, secret = "p-stale", "s" * 43
+    await push(home_iface, pass_state(uid, secret))
+    _suspend(uid)
+    out = await push(home_iface, pass_state(uid, secret, version=2, unsuspend_version=2))
+    assert out[0]["suspended_at"] is None
+    _suspend(uid)  # suspended again after the lift
+    # The lift delivered twice, and a push older than it, arriving now: neither lands.
+    for state in (
+        pass_state(uid, secret, version=2, unsuspend_version=2),
+        pass_state(uid, secret, version=1, label="older"),
+    ):
+        out = await push(home_iface, state)
+        assert out[0]["applied"] is False and out[0]["suspended_at"] is not None
+    assert _sql("SELECT version, label FROM passes WHERE uid = :u", {"u": uid}) == [
+        (2, "Sardinia friends")
+    ]
+
+
+async def test_a_suspension_after_the_lift_survives_pushes_carrying_that_lift(home_iface):  # noqa: F811
+    uid, secret = "p-again", "s" * 43
+    await push(home_iface, pass_state(uid, secret))
+    _suspend(uid)
+    await push(home_iface, pass_state(uid, secret, version=2, unsuspend_version=2))
+    _suspend(uid)
+    # Every later push carries the newest lift; the ingest host already holds it.
+    out = await push(home_iface, pass_state(uid, secret, version=3, unsuspend_version=2))
+    assert out[0]["applied"] is True and out[0]["suspended_at"] is not None
+    # Only a new lift (a version above what the host holds) clears it again.
+    out = await push(home_iface, pass_state(uid, secret, version=4, unsuspend_version=4))
+    assert out[0]["applied"] is True and out[0]["suspended_at"] is None
 
 
 async def test_a_push_lands_only_when_its_version_is_higher(home_iface):  # noqa: F811
@@ -252,7 +306,7 @@ async def test_purge_keeps_bytes_another_batch_still_names_and_never_touches_una
     _age(twin, 6)
     assert (await service_api.purge())["batches"] == 0  # inside the window
     _age(twin, 8)
-    assert (await service_api.purge()) == {"batches": 1, "sessions": 0, "files": 1}
+    assert (await service_api.purge()) == {"batches": 1, "sessions": 0, "files": 1, "strays": 0}
     assert not blob.exists()
     assert _sql("SELECT uid FROM ingest_batches") == [(held,)]  # quarantined: never purged
 
@@ -276,6 +330,56 @@ async def test_purge_reaps_expired_upload_sessions_and_their_parts(door, home_if
     assert (await service_api.purge())["sessions"] == 1
     assert not (ingest_env / "parts" / f"{uid}.part").exists()
     assert (ingest_env / "parts" / f"{keep}.part").exists()
+
+
+def _aged(path, hours: float):
+    if not path.exists():
+        path.write_bytes(b"x")
+    stamp = time.time() - hours * 3600
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+async def test_purge_sweeps_stray_parts_and_spools_but_never_a_live_session_or_a_blob(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    ingest_env,  # noqa: F811
+):
+    """A killed process leaves spools, and a part can outlive its row; those go once older than the
+    upload horizon. A live session's files stay however old they look (a stalled upload), a file
+    younger than the horizon stays (a create commits its row after making the part), and the
+    finalized blobs are another directory the sweep never reads."""
+    _, secret = await seeded_pass(home_iface)
+    token = (await redeem(door, secret))["device_token"]
+
+    async def opened(name: str) -> str:
+        r = await door.post(
+            "/api/guest/uploads", json={"filename": name, "size": 5}, headers=bearer(token)
+        )
+        return r.json()["upload_uid"]
+
+    parts = ingest_env / "parts"
+    live = await opened("live.jpg")
+    gone = await opened("gone.jpg")
+    _sql(
+        "UPDATE guest_uploads SET expires_at = now() - interval '1 minute' WHERE upload_uid = :u",
+        {"u": gone},
+    )
+    live_part = _aged(parts / f"{live}.part", 48)
+    live_spool = _aged(parts / f"{live}.tok.spool", 48)
+    gone_spool = _aged(parts / f"{gone}.tok.spool", 0)  # its row expired: the horizon is the row's
+    stray_part = _aged(parts / "orphan.part", 25)
+    stray_spool = _aged(parts / "orphan.tok.spool", 25)
+    fresh_part = _aged(parts / "creating.part", 1)
+    await _batch(door, home_iface, JPEG)
+    sha = hashlib.sha256(JPEG).hexdigest()
+    blob = _aged(ingest_env / "blobs" / sha[:2] / sha, 48)  # finalized, named by an unacked batch
+    result = await service_api.purge()
+    assert result["sessions"] == 1 and result["strays"] == 3
+    assert live_part.exists() and live_spool.exists() and fresh_part.exists()
+    assert not gone_spool.exists() and not (parts / f"{gone}.part").exists()
+    assert not stray_part.exists() and not stray_spool.exists()
+    assert blob.read_bytes() == JPEG
 
 
 @pytest.mark.parametrize("path", ["/ingest/passes", "/ingest/device-revocations"])

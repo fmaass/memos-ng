@@ -74,6 +74,8 @@
             "type": "string"
           },
           "last_modified": {
+            "maximum": 253402300799999.0,
+            "minimum": -62135596800000.0,
             "title": "Last Modified",
             "type": [
               "integer",
@@ -684,6 +686,24 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "Redeem: too many attempts from this address, or the pass has no room for another device. Append: too many bodies streaming at once; nothing was read or stored. Resend after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before sending the request again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "507": {
             "content": {

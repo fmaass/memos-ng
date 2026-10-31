@@ -39,7 +39,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from tests.ingest_support import HEIC, JPEG, SERVICE_TOKEN, complete, redeem, upload
+from tests.ingest_support import HEIC, JPEG, SERVICE_TOKEN, bearer, complete, redeem, upload
 from tests.test_attachments_taken import _sql
 
 TAG = "tp3trip"
@@ -543,6 +543,44 @@ async def _revoke(trip: Trip, owner_id: int) -> None:
         assert p is not None and owner is not None
         await passes_svc.revoke_pass(db, p, owner)
         await db.commit()
+
+
+async def test_an_owner_lift_is_pushed_applied_on_the_ingest_host_and_acked(world):
+    trip = await _trip(world)
+    token = await _guest(world, trip)
+    _sql("UPDATE pluto.passes SET suspended_at = now()")
+    assert (await world.door.get("/api/guest/me", headers=bearer(token))).status_code == 410
+    async with async_session() as db:
+        p = await passes_svc.get_pass(db, trip.pass_uid)
+        owner = await db.get(User, world.owner_id)
+        assert p is not None and owner is not None
+        await passes_svc.unsuspend_pass(db, p, owner)
+        await db.commit()
+    assert _sql("SELECT push_urgent FROM pass_sync_state") == [(True,)]
+    assert await _tick(world) == "ok"
+    assert _sql("SELECT suspended_at IS NULL, version FROM pluto.passes") == [(True, 2)]
+    assert _sql("SELECT acked_version, push_urgent FROM pass_sync_state") == [(2, False)]
+    assert (await world.door.get("/api/guest/me", headers=bearer(token))).status_code == 200
+    # Suspended again after the lift, then an ordinary edit: its push carries the same lift, and
+    # the ingest host, already holding it, keeps the new suspension.
+    _sql("UPDATE pluto.passes SET suspended_at = now()")
+    async with async_session() as db:
+        p = await passes_svc.get_pass(db, trip.pass_uid)
+        owner = await db.get(User, world.owner_id)
+        assert p is not None and owner is not None
+        await passes_svc.update_pass(db, p, owner, {"label": "renamed"})
+        await db.commit()
+    assert await _tick(world) == "ok"
+    assert _sql("SELECT suspended_at IS NOT NULL, version, label FROM pluto.passes") == [
+        (True, 3, "renamed")
+    ]
+    lifts = [
+        state.get("unsuspend_version")
+        for request in world.wire.requests
+        if request.method == "PUT" and request.url.path == "/ingest/passes"
+        for state in json.loads(request.content)["passes"]
+    ]
+    assert lifts == [None, 2, 2]
 
 
 async def test_a_revocation_made_while_the_link_is_down_lands_on_reconnect_and_batches_drain(

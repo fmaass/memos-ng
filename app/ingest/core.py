@@ -61,6 +61,10 @@ def ip_hash(ip: str) -> str:
 
 PassState = Literal["active", "expired", "revoked", "suspended"]
 
+# The PassEvent detail this host records when a pushed lift clears its suspension; the refusal
+# count that suspends a pass starts again from the newest one.
+LIFTED = "unsuspended"
+
 
 def pass_state(p: Pass, now: datetime | None = None) -> PassState:
     """The ingest projection's own reading: a pushed pass has no home collection here, so a null

@@ -394,7 +394,7 @@ async def _note_pass_error(db: AsyncSession, pass_id: int, message: str) -> None
 # --- step 1: push pass state --------------------------------------------------------------------
 
 
-def _pass_state(p: Pass) -> dict[str, object]:
+def _pass_state(p: Pass, unsuspend_version: int | None) -> dict[str, object]:
     return {
         "uid": p.uid,
         "secret_hash": p.secret_hash,
@@ -406,6 +406,7 @@ def _pass_state(p: Pass) -> dict[str, object]:
         "version": p.version,
         "revoked_at": p.revoked_at.isoformat() if p.revoked_at else None,
         "revoked_version": p.revoked_version,
+        "unsuspend_version": unsuspend_version,
     }
 
 
@@ -429,7 +430,8 @@ async def push_passes(client: httpx.AsyncClient) -> int:
             ).scalars()
         )
         pushed = {p.uid: (p.id, p.version) for p in owed}
-        body = {"passes": [_pass_state(p) for p in owed]}
+        lifts = await passes_svc.unsuspend_versions(db, [p.id for p in owed])
+        body = {"passes": [_pass_state(p, lifts.get(p.id)) for p in owed]}
     if not owed:
         return 0
     r = await _call(client, "PUT", "/ingest/passes", json=body)

@@ -64,6 +64,10 @@ class PassStateIn(BaseModel):
     version: int = Field(gt=0)
     revoked_at: datetime | None = None
     revoked_version: int | None = None
+    unsuspend_version: int | None = Field(
+        default=None,
+        description="The version of the owner's newest lift of a suspension, if there was one.",
+    )
 
 
 class PassPushIn(BaseModel):
@@ -107,13 +111,20 @@ async def apply_pass_state(db: AsyncSession, state: PassStateIn) -> PassPushResu
         )
     ).scalar_one()
     applied = inserted is not None
-    if not applied and state.version > p.version:
+    held = p.version
+    if not applied and state.version > held:
         if p.revoked_at is not None:
             # A revocation is terminal: a later version without one cannot reopen the pass.
             values = {k: v for k, v in values.items() if k not in ("revoked_at", "revoked_version")}
         for name, value in values.items():
             setattr(p, name, value)
         applied = True
+        # A lift clears only a suspension this host held before the lift's version arrived: once
+        # held, every later push carries the same lift, and a suspension set since stands.
+        lift = state.unsuspend_version
+        if p.suspended_at is not None and lift is not None and held < lift <= state.version:
+            p.suspended_at = None
+            db.add(PassEvent(pass_id=p.id, kind="updated", version=lift, detail=core.LIFTED))
     if applied:
         db.add(PassEvent(pass_id=p.id, kind="updated", version=p.version, detail="pushed"))
     await db.flush()
@@ -400,6 +411,31 @@ def _unlink_sync(path) -> None:
     path.unlink(missing_ok=True)
 
 
+def _sweep_parts_sync(live: frozenset[str], expired: frozenset[str], horizon: float) -> int:
+    """Unlink what lies in parts/ and belongs to no live upload session: a spool a killed append
+    left behind, a part whose row is gone. The OWNING SESSION decides first — a live session's
+    files stay however old they look, since a stalled append may still write them. A file of a
+    session this sweep just expired goes now: its row's expires_at was its horizon. Any other file
+    goes once it is older than the upload horizon: a create makes the part before its row
+    commits, so a young file may simply not be visible yet. `<uid>.part` and
+    `<uid>.<token>.spool` both start with the uid, and token_urlsafe has no dot. Finalized blobs
+    live in blobs/, which this never reads."""
+    parts = core.ingest_root() / "parts"
+    if not parts.is_dir():
+        return 0
+    swept = 0
+    for path in parts.iterdir():
+        try:
+            uid = path.name.split(".", 1)[0]
+            if uid in live or (uid not in expired and path.stat().st_mtime >= horizon):
+                continue
+            path.unlink()
+            swept += 1
+        except OSError:  # vanished under us: its own request or completion just removed it
+            continue
+    return swept
+
+
 async def purge(now: datetime | None = None) -> dict[str, int]:
     """Delete what home has acknowledged for longer than the retention window, and expired upload
     sessions. Unacknowledged and quarantined batches are never touched. A file goes only when no
@@ -450,6 +486,11 @@ async def purge(now: datetime | None = None) -> dict[str, int]:
         await db.commit()
     for uid in expired:
         await to_thread.run_sync(_unlink_sync, core.part_path(uid))
+    # Read after the expired rows are gone, so their leftovers (a spool) count as no one's.
+    async with async_session() as db:
+        live = frozenset((await db.execute(select(GuestUpload.upload_uid))).scalars())
+    horizon = (at - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS)).timestamp()
+    strays = await to_thread.run_sync(_sweep_parts_sync, live, frozenset(expired), horizon)
     removed = 0
     for sha in sorted(hashes):
         async with async_session() as db:
@@ -467,6 +508,11 @@ async def purge(now: datetime | None = None) -> dict[str, int]:
             await db.commit()
         if cancelled is not None:
             raise cancelled
-    result = {"batches": len(doomed), "sessions": len(expired), "files": removed}
+    result = {
+        "batches": len(doomed),
+        "sessions": len(expired),
+        "files": removed,
+        "strays": strays,
+    }
     logger.info("ingest.purge", **result)
     return result
