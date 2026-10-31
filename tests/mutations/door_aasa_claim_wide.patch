@@ -1,0 +1,18 @@
+diff --git a/app/ingest/guest.py b/app/ingest/guest.py
+index 5dc7733..247e496 100644
+--- a/app/ingest/guest.py
++++ b/app/ingest/guest.py
+@@ -332,12 +332,7 @@ async def association() -> JSONResponse:
+                         # the door serves under `/p/` that is not a pass: the guest page moves
+                         # there once a pass is redeemed, and a reload of it belongs in the browser.
+                         # A real secret is `token_urlsafe(32)`, 43 characters, so never "joined".
+-                        "components": [
+-                            {"/": "/p/", "exclude": True},
+-                            {"/": "/p/*/*", "exclude": True},
+-                            {"/": "/p/joined", "exclude": True},
+-                            {"/": "/p/*"},
+-                        ],
++                        "components": [{"/": "/p/*"}],
+                     }
+                 ]
+             },

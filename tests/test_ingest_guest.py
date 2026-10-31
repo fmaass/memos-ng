@@ -8,6 +8,7 @@ parked behind them.
 
 import asyncio
 import hashlib
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -576,9 +577,74 @@ async def test_the_association_file_names_the_app_and_the_clip_for_pass_links(
     monkeypatch.setattr(settings, "APPLE_TEAM_ID", "TEAM123")
     doc = (await door.get("/.well-known/apple-app-site-association")).json()
     assert doc["applinks"]["details"][0]["appIDs"] == [f"TEAM123.{settings.IOS_BUNDLE_ID}"]
-    assert doc["applinks"]["details"][0]["components"] == [{"/": "/p/*"}]
+    # Excludes first: Apple takes the first component that matches.
+    assert doc["applinks"]["details"][0]["components"] == [
+        {"/": "/p/", "exclude": True},
+        {"/": "/p/*/*", "exclude": True},
+        {"/": "/p/joined", "exclude": True},
+        {"/": "/p/*"},
+    ]
     assert doc["appclips"]["apps"] == [f"TEAM123.{settings.IOS_CLIP_BUNDLE_ID}"]
     assert "webcredentials" not in doc
+
+
+def _apple_opens_app(components: list[dict], path: str) -> bool:
+    """Apple's documented matching of an applinks `components` list against a URL path: the
+    components are tried in order and the first whose `/` pattern matches the whole path decides
+    (`exclude: true` hands the URL to the browser); no match leaves it with the browser. In a
+    pattern `*` matches any run of characters, the empty run and `/` included, and `?` matches
+    exactly one character."""
+    for component in components:
+        pattern = "".join(
+            ".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in component["/"]
+        )
+        if re.fullmatch(pattern, path, flags=re.DOTALL):
+            return not component.get("exclude", False)
+    return False
+
+
+def _check_the_yardstick() -> None:
+    # The yardstick itself, against the semantics it claims: `*` spans `/` and the empty run,
+    # `?` is exactly one character, and the first matching component wins. Checked inside the
+    # served-document test below rather than as a test of its own, so every assertion here guards
+    # a verdict that test reaches about the route's real answer.
+    assert _apple_opens_app([{"/": "/p/*"}], "/p/a/b")
+    assert _apple_opens_app([{"/": "/p/*"}], "/p/")
+    assert _apple_opens_app([{"/": "/p/?"}], "/p/a")
+    assert not _apple_opens_app([{"/": "/p/?"}], "/p/ab")
+    assert not _apple_opens_app([{"/": "/p/?"}], "/p/")
+    assert not _apple_opens_app([{"/": "/p/*", "exclude": True}, {"/": "/p/*"}], "/p/a")
+    assert _apple_opens_app([{"/": "/p/*"}, {"/": "/p/*", "exclude": True}], "/p/a")
+    assert not _apple_opens_app([], "/p/a")
+    # Every other character is literal: a `.` in a pattern is not a regex wildcard.
+    assert _apple_opens_app([{"/": "/a.b"}], "/a.b")
+    assert not _apple_opens_app([{"/": "/a.b"}], "/axb")
+
+
+@pytest.mark.parametrize(
+    ("path", "opens_app"),
+    [
+        ("/p/abc", True),  # a real pass link
+        ("/p/", False),  # the empty secret
+        ("/p/x/extra", False),  # a second segment
+        ("/p/x/", False),  # a trailing slash: `/p/*/*` with an empty last segment
+        ("/p/joined", False),  # the guest page after a redeem, not a pass
+        ("/", False),
+        ("/other", False),
+    ],
+)
+async def test_only_a_single_segment_pass_path_opens_the_app(
+    door,  # noqa: F811
+    ingest_env,  # noqa: F811
+    monkeypatch,
+    path,
+    opens_app,
+):
+    monkeypatch.setattr(settings, "APPLE_TEAM_ID", "TEAM123")
+    doc = (await door.get("/.well-known/apple-app-site-association")).json()
+    components = doc["applinks"]["details"][0]["components"]
+    _check_the_yardstick()
+    assert _apple_opens_app(components, path) is opens_app
 
 
 # --- the volume floor, at create and at every body ---------------------------------------------

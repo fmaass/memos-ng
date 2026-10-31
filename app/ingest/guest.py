@@ -321,7 +321,23 @@ async def association() -> JSONResponse:
                 "details": [
                     {
                         "appIDs": [f"{team}.{settings.IOS_BUNDLE_ID}"],
-                        "components": [{"/": "/p/*"}],
+                        # Only a single-segment pass path `/p/<secret>` opens the app. Apple tries
+                        # the components in order and the first match wins, and its `*` matches
+                        # any run of characters, the empty one and `/` included. So `/p/*` alone
+                        # would also claim `/p/` (empty secret) and `/p/x/extra`; the app opens on
+                        # those and refuses them, where the browser would show the landing page.
+                        # The excludes come first: `/p/` for the empty secret, `/p/*/*` for any
+                        # second segment, which also covers the trailing slash `/p/x/` (its last
+                        # `*` matches the empty run). `/p/joined` is the one single-segment path
+                        # the door serves under `/p/` that is not a pass: the guest page moves
+                        # there once a pass is redeemed, and a reload of it belongs in the browser.
+                        # A real secret is `token_urlsafe(32)`, 43 characters, so never "joined".
+                        "components": [
+                            {"/": "/p/", "exclude": True},
+                            {"/": "/p/*/*", "exclude": True},
+                            {"/": "/p/joined", "exclude": True},
+                            {"/": "/p/*"},
+                        ],
                     }
                 ]
             },

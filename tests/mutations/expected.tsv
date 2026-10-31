@@ -61,3 +61,7 @@ tests/mutations/trip_ingest_no_range.patch	trip_ingest_no_range	test_a_cut_downl
 # create_guest_memo forwards moved_out so a rolled-back filing can put its originals back in
 # staging; dropped, the files stay in the memo folder of a memo that never committed.
 tests/mutations/pass_guest_memo_moved_out_dropped.patch	pass_guest_memo_moved_out_dropped	test_a_filing_that_rolls_back_walks_every_file_back_to_staging		tests/test_trip_ingest_puller.py
+# The door's association file narrowed to single-segment pass paths (MEMNG-1085): back on the
+# bare `/p/*` claim the app opens on the empty secret, a second segment, a trailing slash and the
+# post-redeem /p/joined page.
+tests/mutations/door_aasa_claim_wide.patch	door_aasa_claim_wide	test_the_association_file_names_the_app_and_the_clip_for_pass_links test_only_a_single_segment_pass_path_opens_the_app[/p/-False] test_only_a_single_segment_pass_path_opens_the_app[/p/x/extra-False] test_only_a_single_segment_pass_path_opens_the_app[/p/x/-False] test_only_a_single_segment_pass_path_opens_the_app[/p/joined-False]		tests/test_ingest_guest.py
