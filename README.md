@@ -190,6 +190,69 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.12.0
+
+- File caps on the guest door. `POST /api/guest/uploads` answers 429 with `Retry-After: 3600`
+  once a pass has opened 2 000 upload sessions in the last 24 hours (`INGEST_PASS_FILES_PER_DAY`)
+  or a device has sent 1 000 files in all, its unfinished sessions included
+  (`GUEST_FILES_PER_DEVICE`), so one leaked device token cannot spend a whole pass. The pass count
+  is taken under the same pass lock as its bytes, so two creates cannot take the same last slot,
+  and a refused file has sent no byte. Its `last_modified` is now bounded to the years 1 to 9999,
+  where a value past either edge used to be a 500.
+- `POST /api/passes/{uid}/unsuspend` lifts the guest door's automatic suspension of a pass (too
+  many refused redemptions) and pushes it to the ingest host at once. The lift raises the pass's
+  version: the door clears a suspension it held before that version, keeps one it sets later, and
+  counts refusals afresh from the lift, so the next one does not suspend the pass straight back.
+  It answers the same whether or not a suspension stood, and 410 for a revoked pass.
+- A pass issued without an expiry now lasts until the later of the trip's end and now, plus 14
+  days, so a pass for a trip that ended long ago is no longer expired the moment it is issued.
+  In the pass manager, a pass someone else revoked meanwhile also drops its QR code from the
+  sheet.
+- The guest page in a browser that will not store the device credential durably (a private
+  window, for one) keeps it for that tab, under a digest of the pass link, and leaves the link in
+  the address bar: reloading it resumes the same device instead of redeeming another one against
+  the pass's device limit. The link itself is never stored. A set whose confirmation retries ran
+  out is shown as failed, with a Retry, instead of staying "Sent, confirming".
+- A guest batch filed in several parts now lands in one memo with its caption once: every later
+  part is appended to the memo the first part made, and starts a memo of its own only if the
+  owner deleted that one. An album's members are written before the memo is tied to its pass,
+  which removes a lock cycle with a collection being deleted at the same moment.
+- The trip ingest puller judges what the ingest host sends before the database does. A device
+  figure, timestamp or text the home columns cannot hold (a count past its integer column, a year
+  outside 1 to 9999, a NUL) is refused or quarantined on its own instead of aborting the whole
+  page on every tick, and a page whose next cursor is out of range is refused as malformed. A
+  file whose length or hash disagrees with its manifest gets one fresh download and is then
+  quarantined, so the batches behind it keep moving. A filing interrupted inside its commit reads
+  back whether it committed before it moves any file back, and a tick cut off by the worker's
+  time bound records `cancelled: the tick ran past its bound` as its last error.
+- An upload append (`PATCH /api/uploads/{upload_uid}`, and the guest door's
+  `PATCH /api/guest/uploads/{upload_uid}`) cancelled mid-write now waits for its write to finish
+  before it lets go of the upload, and records no new offset, so a retry at the same offset
+  overwrites those bytes rather than writing beside them.
+- Creating an upload, on either side, makes its part file last, so a create that fails before its
+  commit no longer leaves a part file behind. The guest door's purge also removes files under
+  `parts/` that belong to no live upload session: an expired session's at once, any other once it
+  is older than `UPLOAD_EXPIRY_HOURS`, counted as `strays` in its `ingest.purge` log line.
+- The guest door's `/.well-known/apple-app-site-association` now claims only a single-segment
+  pass path `/p/<secret>` for the app. `/p/`, any path with a second segment (a trailing slash
+  included) and `/p/joined` are excluded and stay in the browser.
+- An upload body that goes silent is ended by the server. Each wait for the next chunk of
+  `PATCH /api/uploads/{upload_uid}` is bounded by `UPLOAD_BODY_IDLE_SECONDS` (30 s); a stalled
+  body is treated exactly as a disconnect, its bytes so far kept and its upload slot released,
+  instead of holding that slot until the proxy's read timeout and answering every retry with 429
+  meanwhile. The bound is per wait, so a slow body that keeps moving is never cut, and the answer
+  is the usual 200 with the offset the next PATCH starts at.
+- `/metrics` counts terminal media job failures by why they failed:
+  `memosng_media_jobs_failed_total{lane,reason}`, with `lane` one of `transcode` and `light` and
+  `reason` one of `decode_error`, `source_missing`, `storage_error`, `ffmpeg_failed`, `timeout`,
+  `out_of_memory`, `sibling_unavailable`, `stale_claim` and `other`, every pair published.
+  `memosng_upload_sessions_total` now carries `result="expired"` too, for the sessions the worker
+  reaps. The worker keeps both as durable tallies in the database that the app's scrape reads,
+  bumped in the transaction that does the work, and a tally that cannot be written is logged and
+  never costs the job or the session.
+- Migration `85d081a451a1` (expand-only) adds two new tables for those tallies,
+  `media_job_failure_tallies` and `upload_session_tallies`. No existing table or row is touched.
+
 ### v2.11.0
 
 - Upload-only capture grants, the server half of sharing into memos from the iOS share sheet.
