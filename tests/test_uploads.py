@@ -1349,6 +1349,17 @@ async def _patch_cut_short(token, uid, offset, pieces, content_length):
     connection drops mid-body: each piece as a `more_body` request message, then `http.disconnect`
     for every later receive (uvicorn `httptools_impl.py` `receive`, :571-572). httpx's ASGI
     transport cannot say this — it has no way to end a body except by finishing it."""
+    queue = [{"type": "http.request", "body": p, "more_body": True} for p in pieces]
+
+    async def receive():
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    return await _asgi_patch(token, uid, offset, content_length, receive)
+
+
+async def _asgi_patch(token, uid, offset, content_length, receive):
+    """PATCH through the COMPLETE app with the caller's own ASGI `receive`, so a test can say what
+    httpx cannot: a body that drops, stalls, or trickles."""
     import json
 
     headers = [
@@ -1373,11 +1384,7 @@ async def _patch_cut_short(token, uid, offset, pieces, content_length):
         "client": ("127.0.0.1", 50000),
         "root_path": "",
     }
-    queue = [{"type": "http.request", "body": p, "more_body": True} for p in pieces]
     sent = []
-
-    async def receive():
-        return queue.pop(0) if queue else {"type": "http.disconnect"}
 
     async def send(message):
         sent.append(message)
@@ -1749,3 +1756,286 @@ def test_upload_limits_route_precedes_every_upload_uid_route():
     limits = paths.index("/api/uploads/limits")
     parametric = [i for i, p in enumerate(paths) if p and p.startswith("/api/uploads/{upload_uid}")]
     assert parametric and all(limits < i for i in parametric)
+
+
+# --- MEMNG-934: an idle body gives its admission slot back -----------------------------------
+# A body that stops sending holds its request, and with it one of the account's body-admission
+# permits, until something ends it. Without a server-side bound that something is Traefik's 300 s
+# read timeout, and three dead bodies answer every retry from the account 429 for five minutes.
+# These probes run with a 0.5 s bound; `tests/mutations/body_idle_unbounded.patch` removes it.
+
+_IDLE = 0.5
+# How long past the bound a stalled PATCH may take to end: generous for a loaded test host, and
+# still far below anything an unbounded body would ever reach.
+_IDLE_MARGIN = 2.0
+
+
+def _stalling_receive(pieces):
+    """ASGI `receive` for a client that sends `pieces` and then goes silent on an open
+    connection: no more bytes, and no `http.disconnect` either — exactly what a dead mobile radio
+    looks like from the server until a read timeout fires."""
+    queue = [{"type": "http.request", "body": p, "more_body": True} for p in pieces]
+
+    async def receive():
+        if queue:
+            return queue.pop(0)
+        await asyncio.Event().wait()  # never set
+        raise AssertionError("unreachable")
+
+    return receive
+
+
+async def _within_the_bound(task):
+    """Wait for a stalled PATCH for at most the bound plus the margin; answer the elapsed time.
+    A task still running then is the defect itself, and is cancelled by the caller's cleanup."""
+    started = asyncio.get_running_loop().time()
+    done, _ = await asyncio.wait({task}, timeout=_IDLE + _IDLE_MARGIN)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert task in done, f"a stalled PATCH still held its request {elapsed:.1f}s after it went idle"
+    return elapsed
+
+
+async def _settle(task):
+    if task is not None and not task.done():
+        task.cancel()
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _start_bearer(bearer, content, name="idle.bin"):
+    start = await bearer.post(
+        "/api/uploads",
+        json={"filename": name, "mime": "application/octet-stream", "size": len(content)},
+    )
+    assert start.status_code == 201, start.text
+    return start.json()["upload_uid"]
+
+
+async def test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot(
+    pat_client, monkeypatch, tmp_path
+):
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
+    # One permit per account, so a permit the stalled body kept would answer the next PATCH 429.
+    monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_USER", 1)
+    content = os.urandom(10_000)
+    uid = await _start_bearer(bearer, content)
+    stalled = None
+    try:
+        stalled = asyncio.create_task(
+            _asgi_patch(
+                token, uid, 0, len(content), _stalling_receive([content[:2500], content[2500:4000]])
+            )
+        )
+        # Not vacuous: while the stalled body holds the account's one permit, a retry is refused.
+        await asyncio.sleep(_IDLE / 5)
+        early = await bearer.patch(
+            f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"}
+        )
+        assert early.status_code == 429
+
+        elapsed = await _within_the_bound(stalled)
+        assert elapsed >= _IDLE * 0.5  # ended by the bound, not by something earlier
+        # The answer of the existing cut path: 200 with the offset the bytes reached.
+        status, out = stalled.result()
+        assert (status, out["bytes_received"]) == (200, 4000)
+
+        retry = await bearer.patch(
+            f"/api/uploads/{uid}", content=content[4000:], headers={"Upload-Offset": "4000"}
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["bytes_received"] == len(content)
+    finally:
+        await _settle(stalled)
+        _cleanup()
+
+
+async def test_bytes_before_an_idle_stall_are_kept_and_the_resume_completes(
+    pat_client, monkeypatch, tmp_path
+):
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
+    content = b"\x89PNG\r\n\x1a\n" + os.urandom(12_000)
+    start = await bearer.post(
+        "/api/uploads", json={"filename": "idle.png", "mime": "image/png", "size": len(content)}
+    )
+    uid = start.json()["upload_uid"]
+    stalled = None
+    try:
+        stalled = asyncio.create_task(
+            _asgi_patch(token, uid, 0, len(content), _stalling_receive([content[:5000]]))
+        )
+        await _within_the_bound(stalled)
+        head = await bearer.head(f"/api/uploads/{uid}")
+        assert head.headers["Upload-Offset"] == "5000"
+        assert _upload_row(uid) == (5000, "pending")
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+
+        rest = await bearer.patch(
+            f"/api/uploads/{uid}", content=content[5000:], headers={"Upload-Offset": "5000"}
+        )
+        assert rest.status_code == 200 and rest.json()["bytes_received"] == len(content)
+        assert _upload_row(uid) == (len(content), "done")
+        memo = await bearer.post(
+            "/api/memos",
+            json={
+                "content": "resumed after a stall",
+                "visibility": "PRIVATE",
+                "upload_uids": [uid],
+            },
+        )
+        assert memo.status_code in (200, 201), memo.text
+        [att] = memo.json()["attachments"]
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            digest = c.execute(
+                text("SELECT sha256 FROM attachments WHERE uid = :u"), {"u": att["uid"]}
+            ).scalar_one()
+        eng.dispose()
+        assert digest == hashlib.sha256(content).hexdigest()
+    finally:
+        await _settle(stalled)
+        _cleanup()
+
+
+async def test_a_slow_body_that_keeps_moving_is_not_cut(pat_client, monkeypatch, tmp_path):
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
+    content = os.urandom(10_000)
+    uid = await _start_bearer(bearer, content, "slow.bin")
+    pieces = [content[i : i + 2000] for i in range(0, len(content), 2000)]
+    queue = [
+        {"type": "http.request", "body": p, "more_body": i < len(pieces) - 1}
+        for i, p in enumerate(pieces)
+    ]
+
+    async def trickle():
+        # Every gap is well inside the bound; together they are three times it.
+        await asyncio.sleep(_IDLE * 0.6)
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    try:
+        started = asyncio.get_running_loop().time()
+        status, out = await _asgi_patch(token, uid, 0, len(content), trickle)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert elapsed > _IDLE * 2  # the body as a whole outlasted the bound
+        assert (status, out["bytes_received"]) == (200, len(content))
+        assert _upload_row(uid) == (len(content), "done")
+        assert svc.part_path(uid).read_bytes() == content
+    finally:
+        _cleanup()
+
+
+async def test_a_body_idle_from_its_first_byte_changes_nothing_and_frees_its_slot(
+    pat_client, monkeypatch, tmp_path
+):
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
+    monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_USER", 1)
+    content = os.urandom(3_000)
+    uid = await _start_bearer(bearer, content, "silent.bin")
+    stalled = None
+    try:
+        stalled = asyncio.create_task(
+            _asgi_patch(token, uid, 0, len(content), _stalling_receive([]))
+        )
+        await _within_the_bound(stalled)
+        status, out = stalled.result()
+        assert (status, out["bytes_received"]) == (200, 0)
+        assert _upload_row(uid) == (0, "pending")
+        whole = await bearer.patch(
+            f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"}
+        )
+        assert whole.status_code == 200 and whole.json()["bytes_received"] == len(content)
+    finally:
+        await _settle(stalled)
+        _cleanup()
+
+
+async def test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_nothing(
+    pat_client, monkeypatch, tmp_path
+):
+    # The client gives up on the stalled request and resends the whole body on a new connection
+    # while the old one is still open: two permits, two writers at offset 0. The retry completes
+    # first; the stalled body's cut then finds its range already covered and merges nothing.
+    bearer, _, token = pat_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
+    monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_USER", 2)
+    content = os.urandom(10_000)
+    uid = await _start_bearer(bearer, content, "race.bin")
+    stale = os.urandom(4000)  # different bytes, so a cut that DID land would corrupt the file
+    stalled = None
+    try:
+        stalled = asyncio.create_task(
+            _asgi_patch(token, uid, 0, len(content), _stalling_receive([stale]))
+        )
+        await asyncio.sleep(_IDLE / 5)
+        retry = await bearer.patch(
+            f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"}
+        )
+        assert retry.status_code == 200 and retry.json()["bytes_received"] == len(content)
+        await _within_the_bound(stalled)
+        status, out = stalled.result()
+        assert (status, out["bytes_received"]) == (200, len(content))
+        assert svc.part_path(uid).read_bytes() == content
+        assert list((tmp_path / "uploads").glob("*.spool")) == []
+    finally:
+        await _settle(stalled)
+        _cleanup()
+
+
+async def _then_silent(*chunks):
+    for chunk in chunks:
+        yield chunk
+    await asyncio.Event().wait()  # never set
+
+
+async def test_idle_bounded_passes_a_whole_body_through_unchanged():
+    got = [c async for c in svc.idle_bounded(_chunks([b"ab", b"", b"cd"]), _IDLE)]
+    assert got == [b"ab", b"", b"cd"]
+
+
+async def test_idle_bounded_cuts_the_first_wait_that_outlasts_the_bound():
+    got = []
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(svc.BodyIdle) as cut:
+        async for chunk in svc.idle_bounded(_then_silent(b"ab", b"cd"), _IDLE):
+            got.append(chunk)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert got == [b"ab", b"cd"]
+    assert _IDLE * 0.5 <= elapsed < _IDLE + _IDLE_MARGIN
+    # The disconnect path is what keeps a cut body's bytes; the cut must be one it recognises.
+    from starlette.requests import ClientDisconnect
+
+    assert isinstance(cut.value, ClientDisconnect)
+
+
+async def test_idle_bounded_lets_every_other_outcome_of_a_wait_through_unchanged():
+    # Only the bound's own expiry is a cut. The stream's own errors — a real disconnect, an I/O
+    # error, even a TimeoutError of its own — and a cancellation from outside keep their identity,
+    # so none of them is quietly turned into "keep the bytes and answer 200".
+    for raised in (OSError("socket"), TimeoutError("stream's own")):
+
+        async def failing(exc=raised):
+            yield b"ab"
+            raise exc
+
+        with pytest.raises(type(raised)) as seen:
+            async for _ in svc.idle_bounded(failing(), 10):
+                pass
+        assert not isinstance(seen.value, svc.BodyIdle)
+
+    async def consume():
+        async for _ in svc.idle_bounded(_then_silent(b"ab"), 10):
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

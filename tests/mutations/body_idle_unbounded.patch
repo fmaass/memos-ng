@@ -1,0 +1,22 @@
+Remove the idle bound on an upload body: the PATCH route hands the raw request stream to the append
+again, so a body that stops sending holds its request, and the account's admission permit, until
+something outside the app ends it (MEMNG-934).
+
+The probes that must turn red are the four that stall a body on an open connection: the
+admission-slot probe (the stalled PATCH must end within the bound and the next PATCH be admitted),
+the kept-bytes probe (HEAD and the resume can only be read once the stall has ended), the
+first-byte probe (a body silent from the start must end too) and the overtaking-retry probe (the
+stalled body must end for its cut to be judged). The slow-body probe must stay green — it never
+stalls — and so must the `idle_bounded` unit tests, which call the wrapper directly.
+
+--- a/app/routers/uploads.py
++++ b/app/routers/uploads.py
+@@ -278,7 +278,7 @@
+             # answer is already the contract's "offset the next PATCH must start at", which is
+             # all a client still listening needs to resume; a new status would be a schema change
+             # every generated client must learn, for no different action on its side.
+-            body = svc.idle_bounded(request.stream(), settings.UPLOAD_BODY_IDLE_SECONDS)
++            body = request.stream()
+             appended = await svc.append_stream(db, upload, upload_offset, body)
+         except svc.UploadTooLarge as exc:
+             upload_metrics.count_size_rejection()

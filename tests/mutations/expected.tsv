@@ -21,7 +21,7 @@ tests/mutations/claim_flush.patch	claim_flush	test_failure_record_commit_error_l
 # The disconnect branch discards what arrived: the disconnect probe, the race probe (its answer
 # is the stale snapshot the early return hands back) and the spool unit test turn red; the
 # zero-byte probe stays green because a cut with nothing in it was already a no-op.
-tests/mutations/partial_commit_discard.patch	partial_commit_discard	test_bytes_before_a_disconnect_are_kept_and_the_resume_completes test_a_cut_body_whose_offset_a_concurrent_append_moved_is_discarded test_spool_stream_keeps_a_cut_body_only_for_a_caller_that_asked		tests/test_uploads.py
+tests/mutations/partial_commit_discard.patch	partial_commit_discard	test_bytes_before_a_disconnect_are_kept_and_the_resume_completes test_a_cut_body_whose_offset_a_concurrent_append_moved_is_discarded test_spool_stream_keeps_a_cut_body_only_for_a_caller_that_asked test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot test_bytes_before_an_idle_stall_are_kept_and_the_resume_completes test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_nothing		tests/test_uploads.py
 # A borrowed capture date is written only when the file said NOTHING: dropping the capture_civil
 # half of the guard lets img-manager overwrite an offset-less EXIF date and its provenance.
 tests/mutations/sibling_civil_guard.patch	sibling_civil_guard	test_a_civil_only_capture_is_never_overwritten_while_a_missing_location_is_filled		tests/test_sibling_job.py
@@ -65,3 +65,7 @@ tests/mutations/pass_guest_memo_moved_out_dropped.patch	pass_guest_memo_moved_ou
 # bare `/p/*` claim the app opens on the empty secret, a second segment, a trailing slash and the
 # post-redeem /p/joined page.
 tests/mutations/door_aasa_claim_wide.patch	door_aasa_claim_wide	test_the_association_file_names_the_app_and_the_clip_for_pass_links test_only_a_single_segment_pass_path_opens_the_app[/p/-False] test_only_a_single_segment_pass_path_opens_the_app[/p/x/extra-False] test_only_a_single_segment_pass_path_opens_the_app[/p/x/-False] test_only_a_single_segment_pass_path_opens_the_app[/p/joined-False]		tests/test_ingest_guest.py
+# An upload body that stops sending must end at the idle bound and give its admission permit back
+# (MEMNG-934). Without the bound every probe that stalls a body on an open connection waits out its
+# margin with the PATCH still running.
+tests/mutations/body_idle_unbounded.patch	body_idle_unbounded	test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot test_bytes_before_an_idle_stall_are_kept_and_the_resume_completes test_a_body_idle_from_its_first_byte_changes_nothing_and_frees_its_slot test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_nothing		tests/test_uploads.py

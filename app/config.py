@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     UPLOAD_BODIES_PER_USER: int = 3
     UPLOAD_BODIES_PER_PROCESS: int = 6
     UPLOAD_RETRY_AFTER_SECONDS: int = 2
+    # The longest an upload body may go without sending its next chunk before the PATCH is ended
+    # server-side (MEMNG-934). Without it a stalled body holds its permit above until Traefik's
+    # 300 s read timeout, and three dead bodies answer every retry from the account 429 for five
+    # minutes. The bytes that arrived before the stall are kept exactly as a disconnect keeps them.
+    # Per wait, not per body: a slow body that keeps moving is never cut.
+    UPLOAD_BODY_IDLE_SECONDS: float = 30.0
 
     # Derived media tiers are immutable (uid-keyed) — let browsers cache them hard so re-renders
     # of the feed/gallery don't re-request every image (1 year, immutable).

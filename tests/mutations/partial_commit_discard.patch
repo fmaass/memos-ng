@@ -8,6 +8,10 @@ that arrived), the race probe (its answer must carry the offset the concurrent a
 which this early return never re-reads), and the spool unit test (a caller that asked to keep a cut
 body must get it). The zero-byte probe must stay green: a cut with nothing in it was already a no-op.
 
+An idle body is cut through the same branch (MEMNG-934), so the three idle-bound probes that read
+what the cut kept turn red with it — the admission-slot, kept-bytes and overtaking-retry probes —
+while the idle-from-the-first-byte probe, a zero-byte cut, stays green like the disconnect one.
+
 --- a/app/services/uploads.py
 +++ b/app/services/uploads.py
 @@ -507,7 +507,8 @@

@@ -15,7 +15,7 @@ from typing import BinaryIO, Literal
 
 import puremagic
 import structlog
-from anyio import fail_after, to_thread
+from anyio import fail_after, move_on_after, to_thread
 from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -510,6 +510,33 @@ async def create_upload(
     # year 9999 (OverflowError) left a part file with no row to find it by, once per attempt.
     await to_thread.run_sync(_create_part_sync, part_path(upload_uid))
     return upload
+
+
+class BodyIdle(ClientDisconnect):
+    """The request body sent nothing for longer than the idle bound (MEMNG-934). A
+    `ClientDisconnect` on purpose: from the server's side a body that stopped sending is a body the
+    client cut, so `spool_stream(keep_cut=True)` keeps what arrived and the append merges it exactly
+    as it merges a disconnect — one path, not a second one beside it."""
+
+
+async def idle_bounded(stream: AsyncIterable[bytes], seconds: float) -> AsyncIterator[bytes]:
+    """Yield `stream`'s chunks, bounding each wait for the NEXT one by `seconds`; a wait that
+    outlasts it raises BodyIdle. The bound is per wait, never on the body as a whole, so a slow
+    body that keeps moving is not cut; and only the wait is timed, not this request's own work on
+    the chunk it already has. Any other outcome of the wait — the stream's own exception, or a
+    cancellation from outside — propagates unchanged: only the bound's own expiry becomes a cut."""
+    chunks = aiter(stream)
+    while True:
+        chunk = b""
+        with move_on_after(seconds) as wait:
+            try:
+                chunk = await anext(chunks)
+            except StopAsyncIteration:
+                return
+        if wait.cancelled_caught:
+            logger.info("upload.body_idle", idle_seconds=seconds)
+            raise BodyIdle()
+        yield chunk
 
 
 @dataclass(frozen=True)

@@ -271,7 +271,15 @@ async def append_chunk(
     started = time.monotonic()
     try:
         try:
-            appended = await svc.append_stream(db, upload, upload_offset, request.stream())
+            # Each wait for the next body chunk is bounded (MEMNG-934): a body that goes silent
+            # ends here as a cut, its bytes kept by the disconnect path and its permit released
+            # by the `finally` below, instead of holding both until Traefik's read timeout. The
+            # answer is the cut path's own — 200 with the offset the bytes reached — because that
+            # answer is already the contract's "offset the next PATCH must start at", which is
+            # all a client still listening needs to resume; a new status would be a schema change
+            # every generated client must learn, for no different action on its side.
+            body = svc.idle_bounded(request.stream(), settings.UPLOAD_BODY_IDLE_SECONDS)
+            appended = await svc.append_stream(db, upload, upload_offset, body)
         except svc.UploadTooLarge as exc:
             upload_metrics.count_size_rejection()
             cap = settings.MAX_UPLOAD_MIB * 1024 * 1024
