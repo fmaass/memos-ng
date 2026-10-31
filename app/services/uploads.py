@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import hashlib
 import os
 import secrets
@@ -243,6 +245,30 @@ class LockedMedia:
     uploads: dict[str, Upload]
     digests: dict[str, str]
     candidates: dict[str, Attachment]
+
+
+async def finish_off_the_loop[T](
+    fn: Callable[..., T], *args: object
+) -> tuple[T, asyncio.CancelledError | None]:
+    """Run a file operation in a worker thread and come back only once that thread has RETURNED.
+
+    A worker thread cannot be cancelled. A cancellation of the caller (shutdown cancelling the
+    sweeper, a request torn down) would otherwise unwind the transaction AROUND the thread, and
+    with it the lock that thread's file operation is serialized by, while the thread still
+    writes, links or unlinks. So each cancellation is remembered and the same future awaited again
+    under a shield until it is done; the caller re-raises it once nothing it holds can outlive the
+    thread. The future is a plain executor future, not a task, so a teardown cancelling every task
+    leaves it alone. Same reasoning as `app.services.reclaim._unlink_off_the_loop`. It lives here,
+    in the upload seam both roles import, because the append needs it and `app.ingest.core`
+    imports this module (it re-exports the helper for the ingest roles).
+    """
+    thread = asyncio.get_running_loop().run_in_executor(None, functools.partial(fn, *args))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(thread), cancellation
+        except asyncio.CancelledError as exc:
+            cancellation = exc
 
 
 # Blocking disk I/O runs off the event loop (anyio.to_thread) so large chunk writes /
@@ -688,7 +714,15 @@ async def append_offset_stream[R: (Upload, GuestUpload)](
         if offset == row.bytes_received:
             if offset + received > ceiling(row):
                 raise UploadTooLarge(offset + received)
-            await to_thread.run_sync(_concat_sync, spool, part, offset)
+            # The row lock serializes writers to this part file, and it lasts only as long as the
+            # caller's transaction. A cancellation taken mid-write would unwind that transaction
+            # while the thread still writes, and a retry at the same offset would then write
+            # beside it (MEMNG-1028). So the append outlives a cancellation until its thread has
+            # returned, and only then raises it, before the offset is recorded: the bytes it wrote
+            # are past the committed end, which the next append at this offset overwrites.
+            _, cancelled = await finish_off_the_loop(_concat_sync, spool, part, offset)
+            if cancelled is not None:
+                raise cancelled
             row.bytes_received = offset + received
             await db.flush()
             kept_from_cut = received if spooled.cut else 0

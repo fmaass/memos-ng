@@ -1,13 +1,10 @@
 """Shared pieces of the two ingest roles: storage layout, pass state, hashing, cursors, sniffing."""
 
-import asyncio
-import functools
 import hashlib
 import hmac
 import shutil
 import time
 from collections import deque
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -19,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import INGEST_CHANGE_SEQ, Pass, PassDevice
 from app.services.uploads import detect_heif_mime
+from app.services.uploads import finish_off_the_loop as finish_off_the_loop  # re-export
 
 
 def ingest_root() -> Path:
@@ -92,29 +90,6 @@ async def next_change_seq(db: AsyncSession) -> int:
     """Draw a change cursor. Call it LAST in a transaction, right before its commit."""
     await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _CHANGE_LOCK_KEY})
     return (await db.execute(select(func.nextval(INGEST_CHANGE_SEQ.name)))).scalar_one()
-
-
-async def finish_off_the_loop[T](
-    fn: Callable[..., T], *args: object
-) -> tuple[T, asyncio.CancelledError | None]:
-    """Run a file operation in a worker thread and come back only once that thread has RETURNED.
-
-    A worker thread cannot be cancelled. A cancellation of the caller (shutdown cancelling the
-    sweeper, a request torn down) would otherwise unwind the transaction AROUND the thread, and
-    with it the hash lock that thread's file operation is serialized by, while the thread still
-    links or unlinks. So each cancellation is remembered and the same future awaited again under
-    a shield until it is done; the caller re-raises it after its commit or rollback. The future
-    is a plain executor future, not a task, so a teardown cancelling every task leaves it alone.
-    Same reasoning as `app.services.reclaim._unlink_off_the_loop`, kept separate because the
-    ingest roles import no member service.
-    """
-    thread = asyncio.get_running_loop().run_in_executor(None, functools.partial(fn, *args))
-    cancellation: asyncio.CancelledError | None = None
-    while True:
-        try:
-            return await asyncio.shield(thread), cancellation
-        except asyncio.CancelledError as exc:
-            cancellation = exc
 
 
 async def lock_disk_reservation(db: AsyncSession) -> None:
