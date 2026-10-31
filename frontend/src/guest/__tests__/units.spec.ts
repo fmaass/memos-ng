@@ -151,6 +151,176 @@ describe('session', () => {
   })
 })
 
+describe('session when the browser refuses to keep the credential', () => {
+  const limits = { max_file_bytes: 1, chunk_size: 1, max_patch_bytes: 1 }
+  // A door that knows two devices: d1 on pass "Old" (already stored) and the one each redeem mints.
+  function door() {
+    const wire: string[] = []
+    let minted = 0
+    const devices = new Map<string, { id: string; pass: string }>([['trip_dev_a', { id: 'd1', pass: 'Old' }]])
+    const api = createGuestApi(async (url, init) => {
+      wire.push(url)
+      if (url === '/api/pass/redeem') {
+        const secret = (JSON.parse(init.body as string) as { secret: string }).secret
+        const token = `trip_dev_new${++minted}`
+        devices.set(token, { id: `d-new${minted}`, pass: secret })
+        return new Response(JSON.stringify({ device_token: token, device_id: `d-new${minted}`, pass: { label: secret, scope: 'contribute', expires_at: '' }, limits }), { status: 201 })
+      }
+      const token = new Headers(init.headers).get('Authorization')?.replace('Bearer ', '') ?? ''
+      const device = devices.get(token)
+      if (url === '/api/guest/me' && device) {
+        return new Response(JSON.stringify({ device_id: device.id, display_name: 'Anna', platform: 'web', pass: { label: device.pass, scope: 'contribute', expires_at: '' }, limits, uploads_count: 0, bytes_total: 0 }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ detail: 'Not a valid guest credential' }), { status: 401 })
+    })
+    return { api, wire }
+  }
+  // One page load: the stores are rebuilt from the same browser storage, as a reload does.
+  function page(d: ReturnType<typeof door>, path: string, local: Storage, tab: Storage) {
+    let current = path
+    const credentials = new CredentialStore(local, tab)
+    const session = new GuestSession(d.api, credentials, { path: () => current, replace: (p) => void (current = p) }, false)
+    return { session, path: () => current }
+  }
+
+  it('joining a second pass on a refusing browser restores that pass link, never /p/joined', async () => {
+    const local = memoryStorage()
+    local.setItem(CREDENTIAL_KEY, JSON.stringify({ token: 'trip_dev_a', deviceId: 'd1' }))
+    local.setItem = () => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+    }
+    const tab = memoryStorage()
+    const d = door()
+    const first = page(d, '/p/second', local, tab)
+    await first.session.boot()
+    expect(first.session.deviceId).toBe('d1')
+    expect(first.session.otherSecret).toBe('second')
+    expect(first.path()).toBe(JOINED_PATH)
+
+    first.session.joinOther()
+    await first.session.redeem('Anna')
+    expect(first.session.phase).toBe('ready')
+    expect(first.session.deviceId).toBe('d-new1')
+    expect(first.session.durable).toBe(false)
+    expect(first.path()).toBe('/p/second') // the just-joined pass, not /p/joined
+
+    const reloaded = page(d, first.path(), local, tab)
+    await reloaded.session.boot()
+    expect(reloaded.session.phase).toBe('ready')
+    expect(reloaded.session.deviceId).toBe('d-new1') // the pass just joined, not the stored one
+    expect(reloaded.session.pass?.label).toBe('second')
+    expect(reloaded.path()).not.toBe(JOINED_PATH)
+  })
+
+  it('a reload of the kept pass link resumes the same device instead of redeeming a new one', async () => {
+    const local = refusingStorage()
+    const tab = memoryStorage()
+    const d = door()
+    const first = page(d, '/p/s3cret', local, tab)
+    await first.session.boot()
+    await first.session.redeem('Anna')
+    expect(first.session.durable).toBe(false)
+    expect(first.path()).toBe('/p/s3cret')
+
+    const reloaded = page(d, first.path(), local, tab)
+    await reloaded.session.boot()
+    expect(reloaded.session.phase).toBe('ready')
+    expect(reloaded.session.deviceId).toBe('d-new1')
+    expect(reloaded.session.otherSecret).toBeNull() // the same pass: not offered as another one
+    expect(reloaded.session.durable).toBe(false) // still says a closed tab cannot resume
+    expect(reloaded.path()).toBe('/p/s3cret')
+    await reloaded.session.redeem('Anna') // a stray Join after the reload redeems nothing
+    expect(d.wire.filter((u) => u === '/api/pass/redeem')).toHaveLength(1)
+  })
+
+  it('when no storage keeps the new credential, the older pass is never resumed on /p/joined', async () => {
+    const local = memoryStorage()
+    local.setItem(CREDENTIAL_KEY, JSON.stringify({ token: 'trip_dev_a', deviceId: 'd1' }))
+    local.setItem = () => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+    }
+    const tab = refusingStorage()
+    const d = door()
+    const first = page(d, '/p/second', local, tab)
+    await first.session.boot()
+    first.session.joinOther()
+    await first.session.redeem('Anna')
+    expect(first.path()).toBe('/p/second')
+
+    const reloaded = page(d, first.path(), local, tab)
+    await reloaded.session.boot()
+    expect(reloaded.session.deviceId).toBeNull() // not d1 on the old pass
+    expect(reloaded.session.phase).toBe('name') // the kept link asks to join again
+    expect(reloaded.path()).toBe('/p/second')
+  })
+
+  it('a restored pass link carries a secret with reserved characters intact', async () => {
+    const local = memoryStorage()
+    local.setItem(CREDENTIAL_KEY, JSON.stringify({ token: 'trip_dev_a', deviceId: 'd1' }))
+    local.setItem = () => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+    }
+    const tab = memoryStorage()
+    const d = door()
+    const first = page(d, '/p/se%2Fc%2Bond%23x', local, tab)
+    await first.session.boot()
+    first.session.joinOther()
+    await first.session.redeem('Anna')
+    expect(secretFromPath(first.path())).toBe('se/c+ond#x')
+    const reloaded = page(d, first.path(), local, tab)
+    await reloaded.session.boot()
+    expect(reloaded.session.deviceId).toBe('d-new1')
+    expect(reloaded.session.otherSecret).toBeNull()
+  })
+
+  it('a write another tab overtook drops only the credential this one replaced, never the other tab\'s', () => {
+    const local = memoryStorage()
+    local.setItem(CREDENTIAL_KEY, JSON.stringify({ token: 'trip_dev_a', deviceId: 'd1' }))
+    const store = new CredentialStore(local, memoryStorage())
+    const write = local.setItem.bind(local)
+    local.setItem = (k, v) => {
+      write(k, v)
+      write(k, JSON.stringify({ token: 'trip_dev_other_tab', deviceId: 'd7' })) // the other tab lands last
+    }
+    expect(store.set('trip_dev_b', 'd2', 's3cret').durable).toBe(false)
+    expect(local.getItem(CREDENTIAL_KEY)).toContain('trip_dev_other_tab')
+  })
+
+  it('a later durable write supersedes the tab copy', () => {
+    const local = memoryStorage()
+    const tab = memoryStorage()
+    const refusing = new CredentialStore(refusingStorage(), tab)
+    refusing.set('trip_dev_tab', 'd1', 's3cret')
+    const store = new CredentialStore(local, tab)
+    expect(store.get()?.token).toBe('trip_dev_tab')
+    expect(store.set('trip_dev_kept', 'd2', 's3cret').durable).toBe(true)
+    expect(new CredentialStore(local, tab).get()).toMatchObject({ token: 'trip_dev_kept', durable: true })
+  })
+
+  it('a refusal clears the tab copy too, so a reload does not boot a dead credential', () => {
+    const tab = memoryStorage()
+    const store = new CredentialStore(refusingStorage(), tab)
+    const mine = store.set('trip_dev_a', 'd1', 's3cret')
+    expect(new CredentialStore(refusingStorage(), tab).get()?.token).toBe('trip_dev_a')
+    expect(store.clearIfCurrent(mine)).toBe(true)
+    expect(new CredentialStore(refusingStorage(), tab).get()).toBeNull()
+  })
+
+  it('a different pass link opened in the same tab is offered, not taken for the kept one', async () => {
+    const local = refusingStorage()
+    const tab = memoryStorage()
+    const d = door()
+    const first = page(d, '/p/s3cret', local, tab)
+    await first.session.boot()
+    await first.session.redeem('Anna')
+
+    const other = page(d, '/p/elsewhere', local, tab)
+    await other.session.boot()
+    expect(other.session.deviceId).toBe('d-new1')
+    expect(other.session.otherSecret).toBe('elsewhere')
+  })
+})
+
 describe('hasher', () => {
   it('a job answered twice is answered once, and the next job keeps its own answer', async () => {
     let worker!: WorkerLike & { posted: { id: number }[] }

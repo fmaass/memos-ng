@@ -95,6 +95,11 @@ export function useTripPasses(collectionUid: MaybeRefOrGetter<string>) {
     })
   }
 
+  /** The sheet must not keep offering a QR whose pass no longer works. */
+  function dropIssued(passUid: string) {
+    if (issued.value?.value.pass.uid === passUid) issued.value = null
+  }
+
   /** Revoke the pass and every device on it. Resolves true once the server says it is revoked. */
   function revokePass(passUid: string): Promise<boolean> {
     const forUid = uid.value
@@ -105,10 +110,13 @@ export function useTripPasses(collectionUid: MaybeRefOrGetter<string>) {
           params: { path: { uid: passUid } },
         })
         if (e) throw new PassError(response.status, detailOf(e))
-        // The sheet must not keep offering a QR whose pass no longer works.
-        if (issued.value?.value.pass.uid === passUid) issued.value = null
+        dropIssued(passUid)
         return true
       } catch (err) {
+        // Revoked by someone else meanwhile: the pass is just as dead as if this call had won.
+        if (err instanceof PassError && err.status === 410 && err.detail === 'pass_revoked') {
+          dropIssued(passUid)
+        }
         fail(forUid, err)
         return false
       } finally {

@@ -172,15 +172,32 @@ describe('TripPassManager', () => {
     expect(w.find('[data-test="device-row"][data-uid="d2"] [data-test="device-revoke"]').exists()).toBe(true)
   })
 
-  it('revokes the whole pass after a confirm and drops its live controls', async () => {
+  it('revokes one device, then the whole pass after a confirm, and both devices read back revoked', async () => {
     let pass = aPass()
+    let devices = [aDevice({ uid: 'd1', displayName: 'Oma' }), aDevice({ uid: 'd2', displayName: 'Opa' })]
+    const revokedAt = '2026-10-28T10:00:00Z'
     server.on('GET', LIST, () => ({ status: 200, body: [pass] }))
+    server.on('GET', '/api/passes/pass1/devices', () => ({ status: 200, body: devices }))
+    server.on('DELETE', '/api/passes/pass1/devices/d1', () => {
+      devices = devices.map((d) => (d.uid === 'd1' ? { ...d, revoked: true, revokedAt } : d))
+      return { status: 200, body: devices[0] }
+    })
     server.on('DELETE', '/api/passes/pass1', () => {
-      pass = { ...pass, state: 'revoked', revokedAt: '2026-10-28T10:00:00Z', version: 2, revokedVersion: 2 }
+      pass = { ...pass, state: 'revoked', revokedAt, version: 3, revokedVersion: 3 }
+      // The server cascades the revoke to every device still live on the pass.
+      devices = devices.map((d) => (d.revoked ? d : { ...d, revoked: true, revokedAt }))
       return { status: 200, body: pass }
     })
     const w = mountSheet()
     await flushPromises()
+    await w.find('[data-test="pass-devices-toggle"]').trigger('click')
+    await flushPromises()
+
+    await w.find('[data-test="device-revoke"][data-uid="d1"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="device-row"][data-uid="d1"]').text()).toContain('Revoked')
+    expect(w.find('[data-test="device-row"][data-uid="d2"]').text()).not.toContain('Revoked')
+
     await w.find('[data-test="pass-revoke"]').trigger('click')
     await flushPromises()
     // First click only arms the confirm; nothing is on the wire yet.
@@ -191,6 +208,56 @@ describe('TripPassManager', () => {
     const row = w.find('[data-test="pass-row"][data-uid="pass1"]')
     expect(row.find('[data-test="pass-state"]').text()).toBe('revoked')
     expect(row.find('[data-test="pass-revoke"]').exists()).toBe(false)
+    // The open device list is re-read, so neither device still offers a revoke of a dead pass.
+    for (const uid of ['d1', 'd2']) {
+      const device = w.find(`[data-test="device-row"][data-uid="${uid}"]`)
+      expect(device.text()).toContain('Revoked')
+      expect(device.find('[data-test="device-revoke"]').exists()).toBe(false)
+    }
+  })
+
+  it('a pass revoked elsewhere clears the just-issued QR when this sheet’s revoke reads 410', async () => {
+    const passes = [aPass({ uid: 'new', label: 'Guests' })]
+    server.on('GET', LIST, () => ({ status: 200, body: passes }))
+    server.on('POST', LIST, () => ({
+      status: 201,
+      body: { pass: passes[0], secret: 'S3cr3t', url: 'https://door.example/p/S3cr3t', qrSvg: SERVER_QR_SVG },
+    }))
+    server.on('DELETE', '/api/passes/new', { status: 410, body: { detail: 'pass_revoked' } })
+    const w = mountSheet()
+    await flushPromises()
+    await w.find('[data-test="pass-label"]').setValue('Guests')
+    await w.find('[data-test="pass-issue"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="pass-qr"] svg').exists()).toBe(true)
+
+    await w.find('[data-test="pass-row"][data-uid="new"] [data-test="pass-revoke"]').trigger('click')
+    await w.find('[data-test="pass-revoke-confirm"]').trigger('click')
+    await flushPromises()
+    expect(server.calls('DELETE', '/api/passes/new')).toHaveLength(1)
+    expect(w.find('[data-test="pass-error"]').text()).toContain('already revoked')
+    expect(w.find('[data-test="pass-qr"]').exists()).toBe(false)
+    expect(w.find('[data-test="pass-issued-url"]').exists()).toBe(false)
+  })
+
+  it('a revoke refused for another reason keeps the just-issued QR', async () => {
+    const passes = [aPass({ uid: 'new', label: 'Guests' })]
+    server.on('GET', LIST, () => ({ status: 200, body: passes }))
+    server.on('POST', LIST, () => ({
+      status: 201,
+      body: { pass: passes[0], secret: 'S3cr3t', url: 'https://door.example/p/S3cr3t', qrSvg: SERVER_QR_SVG },
+    }))
+    server.on('DELETE', '/api/passes/new', { status: 500, body: { detail: 'boom' } })
+    const w = mountSheet()
+    await flushPromises()
+    await w.find('[data-test="pass-label"]').setValue('Guests')
+    await w.find('[data-test="pass-issue"]').trigger('click')
+    await flushPromises()
+    await w.find('[data-test="pass-row"][data-uid="new"] [data-test="pass-revoke"]').trigger('click')
+    await w.find('[data-test="pass-revoke-confirm"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="pass-error"]').exists()).toBe(true)
+    expect(w.find('[data-test="pass-qr"] svg').exists()).toBe(true)
   })
 
   it('a revoke the server refuses as already revoked says so and re-reads the list', async () => {

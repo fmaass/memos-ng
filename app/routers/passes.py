@@ -96,8 +96,8 @@ class PassCreate(BaseModel):
     scope: PassScope = "contribute"
     expiresAt: Expiry | None = Field(
         default=None,
-        description="An instant with its UTC offset, in the future. Default: the trip's span end "
-        "plus 14 days, else 30 days from now.",
+        description="An instant with its UTC offset, in the future. Default: the later of the "
+        "trip's span end and now, plus 14 days; else 30 days from now.",
     )
     maxDevices: MaxDevices = pass_svc.DEFAULT_MAX_DEVICES
     notes: Notes | None = None

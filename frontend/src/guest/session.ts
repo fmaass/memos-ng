@@ -1,9 +1,11 @@
 import { GuestHttpError, type GuestApi, type Limits, type PassInfo } from './api'
-import type { Credential, CredentialStore } from './credential'
+import { linkDigest, type Credential, type CredentialStore } from './credential'
 
 // Redeem and boot. The pass secret is read from the path once, kept in memory only, and the path
 // is replaced by `/p/joined` only AFTER the device credential is stored. `/p/joined` boots from
-// the stored credential and never redeems the literal "joined".
+// the stored credential and never redeems the literal "joined". A credential the browser would
+// not store durably keeps the pass link in the address bar instead, and a reload of that same
+// link resumes the device this tab holds rather than redeeming another.
 
 export type Phase = 'boot' | 'landing' | 'name' | 'ready' | 'ended' | 'missing' | 'error'
 
@@ -52,11 +54,17 @@ export class GuestSession {
   async boot(): Promise<void> {
     const credential = this.credentials.get()
     if (credential) {
+      const kept = this.secret !== null && credential.link !== null && credential.link === linkDigest(this.secret)
       await this.loadMe(credential)
+      if (this.phase === 'ready') this.durable = credential.durable
       if (this.phase === 'ready' && this.secret) {
-        this.otherSecret = this.secret
-        this.secret = null
-        this.nav.replace(JOINED_PATH)
+        if (kept) {
+          this.secret = null // the link this tab kept for its own credential: not another pass
+        } else {
+          this.otherSecret = this.secret
+          this.secret = null
+          this.nav.replace(JOINED_PATH)
+        }
       }
       if (this.phase !== 'ready' && this.phase !== 'error' && this.secret) this.phase = this.ios ? 'landing' : 'name'
     } else if (this.secret) {
@@ -127,12 +135,14 @@ export class GuestSession {
     if (!secret || !displayName) return
     try {
       const out = await this.api.redeem(secret, displayName)
-      const credential = this.credentials.set(out.device_token, out.device_id) // durable FIRST
+      const credential = this.credentials.set(out.device_token, out.device_id, secret) // durable FIRST
       this.secret = null
       this.durable = credential.durable
       // Only a credential a reopened tab will find lets the secret leave the address bar;
-      // otherwise the pass link is the guest's only way back in.
+      // otherwise the pass link is the guest's only way back in — restored when a boot on
+      // another pass's credential had already moved the address bar to /p/joined.
       if (credential.durable) this.nav.replace(JOINED_PATH)
+      else if (secretFromPath(this.nav.path()) !== secret) this.nav.replace(`/p/${encodeURIComponent(secret)}`)
       this.pass = out.pass
       this.limits = out.limits
       this.deviceId = out.device_id

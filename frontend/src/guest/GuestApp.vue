@@ -11,7 +11,7 @@ import { GuestUploader, type UploadItem } from './uploader'
 const tick = ref(0)
 const bump = () => tick.value++
 const api = createGuestApi()
-const credentials = new CredentialStore(safeStorage())
+const credentials = new CredentialStore(safeStorage(() => window.localStorage), safeStorage(() => window.sessionStorage))
 const ios = isIOS(navigator.userAgent, navigator.maxTouchPoints ?? 0)
 const session = new GuestSession(
   api,
@@ -30,9 +30,9 @@ const lastReceipt = ref<Receipt | null>(null)
 const thumbs = new Map<number, string>()
 let wakeLock: { release(): Promise<void> } | null = null
 
-function safeStorage(): Storage | null {
+function safeStorage(open: () => Storage): Storage | null {
   try {
-    return window.localStorage
+    return open()
   } catch {
     return null
   }

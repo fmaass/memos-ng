@@ -19,7 +19,7 @@ export interface PassForm {
   label: string
   scope: PassScope
   /** A calendar day; the pass lasts to the END of it, local time. Null → the server's default
-   * (the trip's span end + 14 days, else 30 days from now). */
+   * (the later of the trip's span end and now, + 14 days; else 30 days from now). */
   expiresOn: Date | null
   maxDevices: number | null
 }

@@ -163,7 +163,7 @@ const day = (iso: string) => new Date(iso).toLocaleDateString()
             v-model="expiresOn"
             :min-date="minDay"
             show-button-bar
-            placeholder="Trip end + 14 days"
+            placeholder="Trip end (or today, if later) + 14 days"
             fluid
             data-test="pass-expiry"
           />

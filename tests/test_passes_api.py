@@ -14,6 +14,7 @@ prefix so nothing seeded elsewhere can match.
 import asyncio
 import hashlib
 import re
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.database import async_session
@@ -258,6 +259,42 @@ def test_issue_defaults_the_expiry_to_span_end_plus_14_days(lib):
     coll = _trip(client, span=True)
     p = _issue(client, coll).json()["pass"]
     assert p["expiresAt"] == "2031-03-24T23:59:59Z"
+
+
+def _iso(t: datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _past_trip(client, ended_days_ago: int) -> str:
+    end = datetime.now(UTC) - timedelta(days=ended_days_ago)
+    body = {"title": "Old trip", "kind": "trip", "tag": TAG}
+    body |= {"spanStart": _iso(end - timedelta(days=7)), "spanEnd": _iso(end)}
+    r = client.post("/api/collections", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()["uid"]
+
+
+def test_issue_on_a_trip_that_ended_30_days_ago_defaults_to_14_days_from_now(lib):
+    # Decided for MEMNG-1024: default to max(span end + 14 d, now + 14 d) rather than refuse.
+    client, _ = lib
+    coll = _past_trip(client, 30)
+    before = datetime.now(UTC)
+    r = _issue(client, coll)
+    assert r.status_code == 201, r.text
+    p = r.json()["pass"]
+    assert p["state"] == "active"
+    expires = datetime.fromisoformat(p["expiresAt"].replace("Z", "+00:00"))
+    assert before + timedelta(days=14) - timedelta(seconds=1) <= expires
+    assert expires <= datetime.now(UTC) + timedelta(days=14) + timedelta(seconds=1)
+
+
+def test_issue_on_a_past_trip_keeps_an_explicit_expiry(lib):
+    client, _ = lib
+    coll = _past_trip(client, 30)
+    explicit = _iso(datetime.now(UTC) + timedelta(days=3))
+    r = _issue(client, coll, expiresAt=explicit)
+    assert r.status_code == 201, r.text
+    assert r.json()["pass"]["expiresAt"] == explicit
 
 
 def test_issue_refuses_a_past_expiry_and_a_bad_scope(lib):

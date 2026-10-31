@@ -499,14 +499,23 @@ export class GuestUploader {
         await this.accept(receipt, pending, f)
         return
       }
+      // The budget is spent with the set still unsettled: hand it back to the guest as failed,
+      // with a Retry, rather than leave it "Sent, confirming" with nothing left to try it.
+      if (pending && pending.uploads.length && this.alive(f)) {
+        this.markSet(pending, 'failed', 'Not confirmed yet. Retry to send it again.')
+      }
     } finally {
       this.unsettled = new Set(pending?.uploads.map((u) => u.uid) ?? [])
     }
   }
 
-  private markSet(pending: PendingCompletion, state: ItemState): void {
+  private markSet(pending: PendingCompletion, state: ItemState, message: string | null = null): void {
     const uids = new Set(pending.uploads.map((u) => u.uid))
-    for (const i of this.items) if (i.uid && uids.has(i.uid)) i.state = state
+    for (const i of this.items) {
+      if (!i.uid || !uids.has(i.uid)) continue
+      i.state = state
+      if (message) i.message = message
+    }
   }
 
   /** Re-judges every upload of a refused completion BY UID: 200 = survivor, 404 = gone. The

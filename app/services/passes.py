@@ -177,7 +177,9 @@ def pass_state(p: Pass, now: datetime | None = None) -> Literal["active", "expir
 
 def default_expiry(collection: Collection, now: datetime) -> datetime:
     if collection.span_end is not None:
-        return collection.span_end + SPAN_GRACE
+        # An owner issuing a pass for a trip that ended long ago wants a pass that works, not one
+        # that is expired at birth (MEMNG-1024): the grace runs from now when that is later.
+        return max(collection.span_end, now) + SPAN_GRACE
     return now + SPANLESS_LIFETIME
 
 

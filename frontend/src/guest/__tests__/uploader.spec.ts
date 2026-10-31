@@ -386,6 +386,34 @@ describe('guest uploader', () => {
     expect(door.calls('HEAD', '/')).toEqual([])
   })
 
+  it('six completion rounds that settle nothing leave the set failed with a Retry that completes it', async () => {
+    const door = new FakeDoor()
+    const orig = door.fetch
+    let unreachable = true
+    door.fetch = async (input, init) => {
+      if (input === '/api/guest/memos' && unreachable) {
+        door.wire.push({ method: init.method ?? 'GET', path: input, token: null, status: 0, referrer: '' })
+        throw new TypeError('network connection was lost')
+      }
+      return orig(input, init)
+    }
+    const s = await setup(door)
+    s.uploader.add([fileOf(bytes(100, 31), 'a.jpg')])
+    await idle(s.uploader)
+    expect(door.calls('POST', '/api/guest/memos')).toHaveLength(6)
+    const [item] = s.uploader.items
+    expect(item.state).toBe('failed') // not left 'uploaded' ("Sent, confirming") with nothing to press
+    expect(item.message).toBeTruthy()
+    expect(s.receipts).toEqual([])
+
+    unreachable = false
+    s.uploader.retry(item)
+    await idle(s.uploader)
+    expect(item.state).toBe('received')
+    expect(s.receipts).toHaveLength(1)
+    expect(door.received).toEqual(new Set([sha(bytes(100, 31))]))
+  })
+
   it('persists the completion set before sending it, and a reload replays it first', async () => {
     const factory = new IDBFactory()
     const door = new FakeDoor()

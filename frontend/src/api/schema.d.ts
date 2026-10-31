@@ -3245,7 +3245,7 @@ export interface components {
             /**
              * Expiresat
              * Format: date-time
-             * @description An instant with its UTC offset, in the future. Default: the trip's span end plus 14 days, else 30 days from now.
+             * @description An instant with its UTC offset, in the future. Default: the later of the trip's span end and now, plus 14 days; else 30 days from now.
              */
             expiresAt?: string | null;
             /** Label */
