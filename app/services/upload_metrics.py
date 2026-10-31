@@ -9,13 +9,17 @@ Created unregistered and registered by `register_once`, like the other collector
 the test suite re-imports `app.main`, and prometheus_client refuses a duplicate by raising.
 """
 
-from collections.abc import AsyncIterator
+import functools
+from collections.abc import AsyncIterator, Callable
 from typing import Literal
 
+import structlog
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
+
+logger = structlog.get_logger(__name__)
 
 # The auth path that admitted the request (`request.state.auth_kind`): a PAT is the iOS app, a
 # session the web SPA, a capture grant the iOS share extension (MEMNG-938). Never a user: the panel
@@ -24,8 +28,8 @@ Principal = Literal["pat", "session", "capture_grant"]
 # Which cap refused: one account's bodies or the whole process's.
 AdmissionScope = Literal["user", "process"]
 # How a consumed session ended. `rejected_size` is the third value this process publishes (see
-# `count_size_rejection`); the plan's `expired` and `withdrawn` are not decided here (see
-# `count_session_end`).
+# `count_size_rejection`); `expired` is the worker's, read from its tally per scrape
+# (`upload_queue_metrics`), and `withdrawn` has no server path (see `count_session_end`).
 SessionEnd = Literal["completed", "deduped"]
 
 UPLOAD_BYTES = Counter(
@@ -34,9 +38,10 @@ UPLOAD_BYTES = Counter(
     ["principal"],
     registry=None,
 )
+SESSIONS_HELP = "Upload sessions ended, by result. Counted when the ending transaction commits."
 UPLOAD_SESSIONS = Counter(
     "memosng_upload_sessions",
-    "Upload sessions ended, by result. Counted when the ending transaction commits.",
+    SESSIONS_HELP,
     ["result"],
     registry=None,
 )
@@ -71,21 +76,40 @@ for _scope in ("user", "process"):
 _PENDING_KEY = "memosng_upload_session_results"
 
 
+def _never_raises[**P](record: Callable[P, None]) -> Callable[P, None]:
+    """Instrumentation never changes a request's outcome: these run on the 413, the 429, in the
+    PATCH's `finally` and inside a commit, where a raise would replace the answer (or report a
+    committed finalize as failed). A broken instrument is logged instead."""
+
+    @functools.wraps(record)
+    def guarded(*args: P.args, **kwargs: P.kwargs) -> None:
+        try:
+            record(*args, **kwargs)
+        except Exception:
+            logger.exception("upload_metrics.record_failed", record=record.__name__)
+
+    return guarded
+
+
+@_never_raises
 def count_bytes(principal: str, received: int) -> None:
     if received > 0:
         UPLOAD_BYTES.labels(principal=principal).inc(received)
 
 
+@_never_raises
 def count_rejection(scope: AdmissionScope) -> None:
     ADMISSION_REJECTIONS.labels(scope=scope).inc()
 
 
+@_never_raises
 def count_size_rejection() -> None:
     """A size refusal ends nothing in the database (the create is never written, the PATCH rolls
     back), so there is no commit to wait for: it is counted when it is answered."""
     UPLOAD_SESSIONS.labels(result="rejected_size").inc()
 
 
+@_never_raises
 def count_session_end(db: AsyncSession, result: SessionEnd) -> None:
     """Record a session's end, to be counted only if the transaction that deletes its row commits.
 
@@ -93,21 +117,36 @@ def count_session_end(db: AsyncSession, result: SessionEnd) -> None:
     here it would be counted twice. Called at every site that consumes an `uploads` row, which is
     every caller of the finalize family — the standalone route, the memo create, a trip filing.
 
-    `expired` is not counted: the reaper runs in the worker, which serves no `/metrics`, and the row
-    it deletes is the only record there was. `withdrawn` has no server path (no route deletes a
-    session on request).
+    `expired` is not counted here: the reaper runs in the worker, which serves no `/metrics`, so it
+    bumps a tally row in its own transaction (`tallies.count_upload_sessions`) that the scrape
+    reads. `withdrawn` has no server path (no route deletes a session on request).
     """
     db.sync_session.info.setdefault(_PENDING_KEY, []).append(result)
 
 
+@_never_raises
+def observe_patch_seconds(seconds: float) -> None:
+    UPLOAD_PATCH_SECONDS.observe(seconds)
+
+
+# Both hooks also fire for a SAVEPOINT (released or rolled back inside the transaction), which is
+# neither the commit that ends the session nor the rollback that keeps it: only the outermost
+# transaction's end decides. A root commit or rollback with a savepoint still open fires once for
+# the savepoint and once more, un-nested, for the root.
 @event.listens_for(Session, "after_commit")
+@_never_raises
 def _count_committed(session: Session) -> None:
+    if session.in_nested_transaction():
+        return
     for result in session.info.pop(_PENDING_KEY, ()):
         UPLOAD_SESSIONS.labels(result=result).inc()
 
 
 @event.listens_for(Session, "after_rollback")
+@_never_raises
 def _drop_rolled_back(session: Session) -> None:
+    if session.in_nested_transaction():
+        return
     session.info.pop(_PENDING_KEY, None)
 
 
@@ -136,9 +175,10 @@ _registered: bool = False
 def register_once(registry: CollectorRegistry) -> bool:
     global _registered
     if not _registered:
+        # UPLOAD_SESSIONS is not registered here: `upload_queue_metrics` publishes it, merged
+        # with the `expired` result the worker tallies in the database (MEMNG-1046).
         for metric in (
             UPLOAD_BYTES,
-            UPLOAD_SESSIONS,
             UPLOAD_PATCH_SECONDS,
             ADMISSION_REJECTIONS,
             EVENTS_SUBSCRIBERS,

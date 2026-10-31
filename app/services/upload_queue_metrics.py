@@ -16,6 +16,12 @@ recoverable: the claim's own timestamp is overwritten by the done write, and kee
 a column. It is a GAUGE histogram over the jobs that finished in the last `FINISHED_WINDOW`, not a
 counter histogram over the table, because rows leave `media_jobs` when their attachment is
 deleted, and a cumulative bucket that shrinks is a counter reset Prometheus would misread.
+
+The two counters the worker keeps (MEMNG-1046) are read from its durable tallies for the same
+reason (`app/services/tallies.py`): `memosng_media_jobs_failed_total{lane,reason}`, every pair
+published, and the `expired` result of `memosng_upload_sessions_total`. That family's other results
+are counted in this process (`upload_metrics.UPLOAD_SESSIONS`), so this collector publishes the
+whole family, merged: a read that fails drops `expired` and keeps the in-process results.
 """
 
 from dataclasses import dataclass
@@ -24,14 +30,29 @@ from datetime import timedelta
 import structlog
 from anyio import fail_after, from_thread
 from prometheus_client import CollectorRegistry
-from prometheus_client.core import GaugeHistogramMetricFamily, GaugeMetricFamily
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeHistogramMetricFamily,
+    GaugeMetricFamily,
+)
 from prometheus_client.metrics_core import Metric
+from prometheus_client.samples import Sample
 from sqlalchemy import JSON, func, select
 from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import async_session
-from app.models import JobLane, JobState, MediaJob, Upload
+from app.models import (
+    MEDIA_JOB_CLASSES,
+    FailureReason,
+    JobLane,
+    JobState,
+    MediaJob,
+    MediaJobFailureTally,
+    Upload,
+    UploadSessionTally,
+)
+from app.services import upload_metrics
 from app.services.trip_ingest_metrics import descriptors_of
 
 logger = structlog.get_logger(__name__)
@@ -39,6 +60,8 @@ logger = structlog.get_logger(__name__)
 SESSIONS_OPEN = "memosng_upload_sessions_open"
 JOBS_QUEUED = "memosng_media_jobs_queued"
 JOB_SECONDS = "memosng_media_job_seconds"
+JOBS_FAILED = "memosng_media_jobs_failed"
+SESSIONS = "memosng_upload_sessions"
 
 # Long enough that a household's sparse uploads leave something to chart, short enough that a
 # worker falling behind shows within the hour rather than being averaged away.
@@ -66,6 +89,9 @@ class QueueState:
     sessions_open: int
     queued: dict[str, int]
     finished: tuple[FinishedJobs, ...]
+    sessions_expired: int
+    # (lane, reason) -> terminal failures, as the worker tallied them.
+    failed: dict[tuple[str, str], int]
 
 
 def _statement():
@@ -117,10 +143,31 @@ def _statement():
             type_=JSON,
         )
     ).scalar_subquery()
+    sessions_expired = func.coalesce(
+        select(UploadSessionTally.count)
+        .where(UploadSessionTally.result == "expired")
+        .scalar_subquery(),
+        0,
+    )
+    failed = select(
+        func.coalesce(
+            func.json_agg(
+                func.json_build_array(
+                    MediaJobFailureTally.lane,
+                    MediaJobFailureTally.reason,
+                    MediaJobFailureTally.count,
+                )
+            ),
+            func.json_build_array(),
+            type_=JSON,
+        )
+    ).scalar_subquery()
     return select(
         sessions_open.label("sessions_open"),
         queued.label("queued"),
         finished.label("finished"),
+        sessions_expired.label("sessions_expired"),
+        failed.label("failed"),
     )
 
 
@@ -144,6 +191,8 @@ async def read_state(
             )
             for lane, kind, n, s, buckets in row.finished
         ),
+        sessions_expired=int(row.sessions_expired),
+        failed={(str(lane), str(reason)): int(n) for lane, reason, n in row.failed},
     )
 
 
@@ -177,10 +226,31 @@ def families_from(state: QueueState) -> list[Metric]:
             buckets=[(bound, float(n)) for bound, n in zip(bounds, counts, strict=True)],
             gsum_value=jobs.seconds,
         )
-    return [sessions, queued, seconds]
+    failed = CounterMetricFamily(
+        JOBS_FAILED,
+        "Media jobs that failed terminally, by worker consumer and reason.",
+        labels=["lane", "reason"],
+    )
+    # Every pair, so a quiet hour reads 0 rather than no data; a pair only a newer worker writes
+    # is published as it was tallied.
+    pairs = {(lane, reason.value): 0 for lane in MEDIA_JOB_CLASSES for reason in FailureReason}
+    for (lane, reason), n in {**pairs, **state.failed}.items():
+        failed.add_metric([lane, reason], float(n))
+    return [sessions, queued, seconds, failed]
 
 
-_DESCRIBE_STATE = QueueState(sessions_open=0, queued={}, finished=())
+def sessions_family(expired: int | None) -> Metric:
+    """`memosng_upload_sessions` as this process counted it, plus the worker's `expired` when the
+    tally could be read (None: it could not, and a guessed zero would be a lie)."""
+    family = Metric(SESSIONS, upload_metrics.SESSIONS_HELP, "counter")
+    for metric in upload_metrics.UPLOAD_SESSIONS.collect():
+        family.samples.extend(metric.samples)
+    if expired is not None:
+        family.samples.append(Sample(f"{SESSIONS}_total", {"result": "expired"}, float(expired)))
+    return family
+
+
+_DESCRIBE_STATE = QueueState(sessions_open=0, queued={}, finished=(), sessions_expired=0, failed={})
 
 
 class UploadQueueCollector:
@@ -189,15 +259,17 @@ class UploadQueueCollector:
 
     def describe(self):
         # Keeps `register()` from calling `collect()` outside a loop; see GuestSyncCollector.
-        return descriptors_of(families_from(_DESCRIBE_STATE))
+        return descriptors_of([sessions_family(None), *families_from(_DESCRIBE_STATE)])
 
     def collect(self):
         try:
             state = from_thread.run(_read_bounded)
         except Exception:
             logger.exception("upload_queue.metrics_read_failed")
-            return
-        yield from families_from(state)
+            state = None
+        yield sessions_family(None if state is None else state.sessions_expired)
+        if state is not None:
+            yield from families_from(state)
 
 
 _registered: UploadQueueCollector | None = None

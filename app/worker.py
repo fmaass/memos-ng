@@ -19,6 +19,7 @@ import contextlib
 import os
 import signal
 import socket
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Literal
 
 import structlog
+from PIL import Image
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -37,6 +39,7 @@ from app.logging_privacy import configure_logging
 from app.models import (
     Attachment,
     AttachmentStatus,
+    FailureReason,
     FrameShareJob,
     FrameShareState,
     JobKind,
@@ -44,7 +47,17 @@ from app.models import (
     JobState,
     MediaJob,
 )
-from app.services import event_stream, frame_share, media, push, reclaim, reconcile, trip_ingest
+from app.services import (
+    event_stream,
+    frame_share,
+    media,
+    push,
+    reclaim,
+    reconcile,
+    sibling,
+    tallies,
+    trip_ingest,
+)
 from app.services.digest import gate as digest_gate
 from app.services.digest import runner as digest_runner
 from app.services.uploads import reap_expired_committed
@@ -419,6 +432,43 @@ def sanitize_error(text: str, limit: int = ERROR_TEXT_LIMIT) -> str:
     return cleaned.encode("utf-8", "backslashreplace").decode("utf-8")[:limit]
 
 
+def classify_failure(exc: BaseException) -> FailureReason:
+    """The bounded reason a media job failed with, read off the exception its attempt raised
+    (MEMNG-1046). Pure: the type decides, never the message.
+
+    Order matters where the types nest: Pillow's refusals are OSErrors, so they are read before the
+    filesystem ones, and a missing file before any other OS error. Pillow raises its own decode
+    failures ("image file is truncated", "broken data stream") as OSError with no errno, which is
+    what separates them from a refusal by the volume, which always carries one.
+    """
+    if isinstance(exc, MemoryError):
+        return FailureReason.out_of_memory
+    if isinstance(exc, media.TranscodeTimeout | subprocess.TimeoutExpired | TimeoutError):
+        return FailureReason.timeout
+    if isinstance(exc, media.TranscodeFailed | subprocess.CalledProcessError):
+        return FailureReason.ffmpeg_failed
+    if isinstance(exc, Image.UnidentifiedImageError | Image.DecompressionBombError | SyntaxError):
+        return FailureReason.decode_error
+    if isinstance(exc, media.SourceMissing | FileNotFoundError):
+        return FailureReason.source_missing
+    if isinstance(exc, OSError):
+        return FailureReason.decode_error if exc.errno is None else FailureReason.storage_error
+    if isinstance(exc, sibling.SiblingUnavailable):
+        return FailureReason.sibling_unavailable
+    return FailureReason.other
+
+
+async def _transcode_job_ids(db: AsyncSession, job_ids: list[int]) -> set[int]:
+    """Which of these jobs the `transcode` consumer owns — the claim's own predicate, so the
+    failure is published under the consumer that ran (or would run) it. Reads, locks nothing."""
+    if not job_ids:
+        return set()
+    rows = await db.execute(
+        select(MediaJob.id).where(MediaJob.id.in_(job_ids), _transcode_class_predicate())
+    )
+    return set(rows.scalars().all())
+
+
 async def _fail_attachment(db: AsyncSession, job: MediaJob) -> None:
     """Mark the photo failed when the work that PRODUCES it gives up — and only then.
 
@@ -505,17 +555,24 @@ async def _record_job_failure(
             return "deferred"
         job.attempts += 1
         job.error = error
+        reason = classify_failure(exc)
         if job.attempts >= settings.MEDIA_MAX_ATTEMPTS:
             job.state = JobState.failed
             await _fail_attachment(db, job)
-            logger.warning("media_job_failed_terminal", job_id=job_id, error=error)
+            lane: JobClass = "transcode" if await _transcode_job_ids(db, [job_id]) else "light"
+            await tallies.count_media_job_failures(db, lane, reason)
+            logger.warning(
+                "media_job_failed_terminal", job_id=job_id, lane=lane, reason=reason, error=error
+            )
             await db.commit()
             if job_kind == JobKind.derive:  # see run_once for why the push is kind-scoped
                 await _notify_terminal_safe(attachment_id)  # separate session, after commit
             return "processed"
         job.state = JobState.queued  # retry
         job.claimed_by = None
-        logger.warning("media_job_retry", job_id=job_id, attempts=job.attempts, error=error)
+        logger.warning(
+            "media_job_retry", job_id=job_id, attempts=job.attempts, reason=reason, error=error
+        )
         await db.commit()
         return "deferred"
     except Exception:
@@ -843,6 +900,9 @@ async def recover_stale_media_claims(db: AsyncSession, now: datetime | None = No
             .order_by(Attachment.id)
             .with_for_update()
         )
+    # The consumer each terminal job is published under (MEMNG-1046), read before the writes.
+    giving_up = [job.id for job in rows if job.attempts + 1 >= settings.MEDIA_MAX_ATTEMPTS]
+    transcode = await _transcode_job_ids(db, giving_up)
     for job in rows:
         job.attempts += 1
         job.claimed_by = None
@@ -856,6 +916,9 @@ async def recover_stale_media_claims(db: AsyncSession, now: datetime | None = No
             job.error = "recovered from stale claim (worker interrupted mid-job)"
             logger.warning("media_stale_claim_requeued", job_id=job.id, attempts=job.attempts)
     await db.flush()
+    stale = FailureReason.stale_claim
+    await tallies.count_media_job_failures(db, "transcode", stale, len(transcode))
+    await tallies.count_media_job_failures(db, "light", stale, len(giving_up) - len(transcode))
     return len(rows)
 
 

@@ -591,7 +591,7 @@ def process_printready(
     resolved = profile or printready.DEFAULT_PROFILE
     source = printready.source_path(attachment)
     if source is None:  # enqueue refuses these; a hand-made job must fail loudly, not silently
-        raise RuntimeError(f"attachment {attachment.id} has no source file for a print rendition")
+        raise SourceMissing(f"attachment {attachment.id} has no source file for a print rendition")
     dest = printready.printready_path(attachment.uid, resolved)
     with Image.open(source) as raw:
         img = ImageOps.exif_transpose(raw)  # orientation first — the same path the tiers use
@@ -1049,6 +1049,21 @@ def sanitize_poster_override(src: Path, dest: Path, tmp: Path) -> None:
 
 class ThermalDefer(Exception):
     """Raised to re-queue a slow job when the host is too hot (not a failure)."""
+
+
+# Named failures, so `worker.classify_failure` reads a type rather than a message. Each stays a
+# RuntimeError with the message it always had: callers and the stored `media_jobs.error` see no
+# change (MEMNG-1046).
+class TranscodeTimeout(RuntimeError):
+    """The slow-lane transcode reached SLOW_TRANSCODE_TIMEOUT_S."""
+
+
+class TranscodeFailed(RuntimeError):
+    """ffmpeg exited non-zero."""
+
+
+class SourceMissing(RuntimeError):
+    """The job has no source file to derive from."""
 
 
 # The package sensor is resolved BY NAME, never by hwmon index. /sys/class/hwmon/hwmonN is handed
@@ -1532,9 +1547,9 @@ async def process_slow(db: AsyncSession, job: MediaJob, attachment: Attachment) 
         # that visibly snapped from 100% back to 0% before turning ready. worker.run_once clears it
         # after the commit, and again at claim time for the attempt a kill left behind (MEMNG-36).
     if timed_out:
-        raise RuntimeError(f"slow-lane transcode timed out after {ceiling}s")
+        raise TranscodeTimeout(f"slow-lane transcode timed out after {ceiling}s")
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
+        raise TranscodeFailed(f"ffmpeg exited {proc.returncode}: {' | '.join(tail)[-300:]}")
 
     # The delete endpoint does not wait for this job, so the attachment may have gone away during
     # the transcode. Check under the row lock BEFORE publishing: past this point the tmp file

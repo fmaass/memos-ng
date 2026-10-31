@@ -1,6 +1,6 @@
 --- a/app/worker.py
 +++ b/app/worker.py
-@@ -373,30 +373,6 @@
+@@ -876,30 +876,6 @@
          .scalars()
          .all()
      )
@@ -28,6 +28,6 @@
 -            .order_by(Attachment.id)
 -            .with_for_update()
 -        )
-     for job in rows:
-         job.attempts += 1
-         job.claimed_by = None
+     # The consumer each terminal job is published under (MEMNG-1046), read before the writes.
+     giving_up = [job.id for job in rows if job.attempts + 1 >= settings.MEDIA_MAX_ATTEMPTS]
+     transcode = await _transcode_job_ids(db, giving_up)

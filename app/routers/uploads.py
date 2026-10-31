@@ -303,7 +303,7 @@ async def append_chunk(
         upload_metrics.count_bytes(getattr(request.state, "auth_kind", "session"), appended.merged)
     finally:
         body_admission.release(user.id)
-        upload_metrics.UPLOAD_PATCH_SECONDS.observe(time.monotonic() - started)
+        upload_metrics.observe_patch_seconds(time.monotonic() - started)
     if appended.kept_from_cut:
         # The client is gone and never reads this answer; the route still returns a valid
         # UploadOut, because FastAPI validates every return against `response_model`.

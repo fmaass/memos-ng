@@ -313,3 +313,71 @@ def test_every_family_is_on_the_one_metrics_endpoint(clean, client):
         assert not _absent(body, name), name
     assert um.register_once(REGISTRY) is um.register_once(REGISTRY)
     assert qm.register_once(REGISTRY) is qm.register_once(REGISTRY)
+
+
+class _Broken:
+    """An instrument whose every call raises — what a mislabelled or broken metric does."""
+
+    def __getattr__(self, name):
+        def _raise(*args, **kwargs):
+            raise RuntimeError(f"instrument {name} broke")
+
+        return _raise
+
+
+def test_a_broken_instrument_never_changes_a_request_outcome(clean, logged_in_client, monkeypatch):
+    """Instrumentation sits on the 413, 429 and PATCH paths (one of them in a `finally`); a metric
+    call that raises must be logged, never answered in place of the request's own outcome."""
+    client, _ = logged_in_client
+    uid = _start(client, 10)
+    for name in ("UPLOAD_BYTES", "UPLOAD_SESSIONS", "UPLOAD_PATCH_SECONDS", "ADMISSION_REJECTIONS"):
+        monkeypatch.setattr(um, name, _Broken())
+    too_big = client.post(
+        "/api/uploads",
+        json={
+            "filename": "huge.bin",
+            "mime": "application/octet-stream",
+            "size": settings.MAX_UPLOAD_MIB * 1024 * 1024 + 1,
+        },
+    )
+    assert too_big.status_code == 413
+    assert (
+        client.patch(
+            f"/api/uploads/{uid}", content=b"q" * 11, headers={"Upload-Offset": "0"}
+        ).status_code
+        == 413
+    )
+    ok = client.patch(f"/api/uploads/{uid}", content=b"q" * 10, headers={"Upload-Offset": "0"})
+    assert ok.is_success, ok.text
+    monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_PROCESS", 0)
+    assert (
+        client.patch(
+            f"/api/uploads/{uid}", content=b"q", headers={"Upload-Offset": "10"}
+        ).status_code
+        == 429
+    )
+    monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_PROCESS", 10)
+    assert client.post(f"/api/uploads/{uid}/finalize").status_code == 200
+
+
+async def test_a_savepoint_neither_counts_nor_drops_the_outer_result(db_engine):
+    """The result is the OUTER transaction's: a SAVEPOINT released inside it is not the commit,
+    and a SAVEPOINT rolled back inside it is not the rollback."""
+    from app.database import async_session
+    from sqlalchemy import text
+
+    before = _sample("memosng_upload_sessions_total", {"result": "completed"})
+    async with async_session() as db:
+        um.count_session_end(db, "completed")
+        async with db.begin_nested():
+            await db.execute(text("SELECT 1"))
+        await db.rollback()
+    assert _sample("memosng_upload_sessions_total", {"result": "completed"}) == before
+
+    async with async_session() as db:
+        um.count_session_end(db, "completed")
+        with pytest.raises(Exception, match="division by zero"):
+            async with db.begin_nested():
+                await db.execute(text("SELECT 1/0"))
+        await db.commit()
+    assert _sample("memosng_upload_sessions_total", {"result": "completed"}) == before + 1

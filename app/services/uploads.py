@@ -43,6 +43,7 @@ from app.services import (
     location,
     poster,
     storage,
+    tallies,
     upload_metrics,
 )
 from app.services.variants import ParsedName, parse_variant
@@ -1996,6 +1997,9 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
     for upload in rows:
         await db.delete(upload)
     await db.flush()
+    # Counted in THIS transaction (MEMNG-1046): the row just deleted was the only record of the
+    # session, and a sweep that rolls back un-counts what it un-deletes.
+    await tallies.count_upload_sessions(db, "expired", len(rows))
     # Whatever survived the deletion above IS the live set. Reading it as that complement rather
     # than re-deriving it from expires_at keeps a never-expiring row (NULL expires_at), which the
     # row sweep also never collects, on the spared side instead of orphaning its spool.

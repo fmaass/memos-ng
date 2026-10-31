@@ -305,7 +305,15 @@ def test_worker_marks_a_hung_transcode_failed(monkeypatch, tmp_path):
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_bytes(b"not really a video")
     aid, jid = _seed_slow_row(str(src))
+    tally = (
+        "SELECT coalesce(sum(count), 0) FROM media_job_failure_tallies "
+        "WHERE lane = 'transcode' AND reason = 'timeout'"
+    )
     try:
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            timeouts_before = c.execute(text(tally)).scalar_one()
+        eng.dispose()
 
         async def _go():
             async with async_session() as db:
@@ -325,6 +333,11 @@ def test_worker_marks_a_hung_transcode_failed(monkeypatch, tmp_path):
         assert state == "failed"
         assert error is not None and "slow-lane transcode timed out after 1s" in error
         assert status == "failed"  # terminal + UI-visible, never a silently stuck job
+        # ...and published as what it was: a transcode-consumer timeout (MEMNG-1046).
+        eng = create_engine(SYNC_URL)
+        with eng.connect() as c:
+            assert c.execute(text(tally)).scalar_one() - timeouts_before == 1
+        eng.dispose()
     finally:
         _cleanup(aid)
 

@@ -79,6 +79,37 @@ class JobKind(enum.StrEnum):
     sibling = "sibling"
 
 
+class FailureReason(enum.StrEnum):
+    """Why a media job failed terminally — the bounded `reason` label of
+    `memosng_media_jobs_failed_total` (MEMNG-1046). `worker.classify_failure` maps an exception
+    onto it; `stale_claim` is set by the stale-claim sweep, which has no exception to classify.
+
+    Stored as a plain string in `media_job_failure_tallies`, so a new value needs no migration.
+    """
+
+    # Pillow could not read the bytes: unidentified, truncated, malformed, or a decompression bomb.
+    decode_error = "decode_error"
+    # The original (or a print source) is not on disk.
+    source_missing = "source_missing"
+    # Any other OS-level refusal from the data volume: no space, permission, I/O error.
+    storage_error = "storage_error"
+    # ffmpeg or ffprobe exited non-zero.
+    ffmpeg_failed = "ffmpeg_failed"
+    # The transcode ceiling, or a subprocess timeout of the probe or poster extraction.
+    timeout = "timeout"
+    out_of_memory = "out_of_memory"
+    # img-manager could not be asked (a sibling job), until the attempts ran out.
+    sibling_unavailable = "sibling_unavailable"
+    # The worker died mid-job often enough that the stale-claim sweep gave up.
+    stale_claim = "stale_claim"
+    other = "other"
+
+
+# The worker's two consumers, the `lane` label of `memosng_media_jobs_failed_total`: the values of
+# `app.worker.JobClass`, restated here so the app's scrape need not import the worker.
+MEDIA_JOB_CLASSES: tuple[str, ...] = ("transcode", "light")
+
+
 memo_tags = Table(
     "memo_tags",
     Base.metadata,
@@ -888,6 +919,34 @@ class MediaJob(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class MediaJobFailureTally(Base):
+    """How many media jobs failed terminally, per consumer class and reason (MEMNG-1046).
+
+    A counter that survives the rows it counts: a failed `media_jobs` row leaves the table when its
+    attachment is deleted, so counting those rows per scrape would shrink, and a shrinking
+    `_total` is a counter reset Prometheus misreads. Bumped in the transaction that writes the
+    `failed` state; read by the app's `/metrics` scrape (the worker serves none).
+    """
+
+    __tablename__ = "media_job_failure_tallies"
+
+    lane: Mapped[str] = mapped_column(String(16), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(32), primary_key=True)
+    count: Mapped[int] = mapped_column(BigInteger, server_default="0")
+
+
+class UploadSessionTally(Base):
+    """How many upload sessions ended with a result only the WORKER sees (MEMNG-1046): `expired`,
+    bumped in the reaper's own transaction, because the row it deletes was the only record. Read by
+    the app's `/metrics` scrape as `memosng_upload_sessions_total{result="expired"}`.
+    """
+
+    __tablename__ = "upload_session_tallies"
+
+    result: Mapped[str] = mapped_column(String(32), primary_key=True)
+    count: Mapped[int] = mapped_column(BigInteger, server_default="0")
 
 
 class MediaJobProgress(Base):
