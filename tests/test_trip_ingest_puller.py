@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import json
 import random
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,7 +36,7 @@ from app.services import trip_ingest, variants
 from app.services import uploads as uploads_svc
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from tests.ingest_support import HEIC, JPEG, SERVICE_TOKEN, complete, redeem, upload
@@ -1176,3 +1177,387 @@ async def test_two_filings_racing_over_a_cut_variant_group_file_each_file_once(w
         (2,),
     ]
     _assert_prints_bind_only_beside_their_screen(len(shots))
+
+
+# --- the P3a final audit: cancellation windows and a hostile ingest host -------------------------
+
+
+async def _two_batches(w: World) -> tuple[str, str]:
+    """Two one-file batches of one guest, in feed order: the first is the one a test turns hostile,
+    the second must still file behind it."""
+    trip = await _trip(w)
+    token = await _guest(w, trip)
+    return await _send(w, token, (JPEG, "a.jpg")), await _send(w, token, (JPEG + b"\x01", "b.jpg"))
+
+
+def _json_answer(page: object) -> httpx.Response:
+    """A rewritten service answer as the wire delivers one: an unread body."""
+    body = json.dumps(page).encode()
+    return httpx.Response(200, headers={"content-type": "application/json"}, stream=_Body(body))
+
+
+def _no_upload_parts(w: World) -> bool:
+    return not list((w.home_root / "uploads").glob("*.part"))
+
+
+async def test_a_cancel_landing_after_the_filing_commit_keeps_the_committed_originals(
+    world, monkeypatch
+):
+    """PostgreSQL has committed the filing, but the cancellation lands before `commit()` returns.
+    The memo, its attachments and their filed marks are durable, so their originals must stay where
+    the rows say they are; walking them back to staging would lose them for good."""
+    trip = await _trip(world)
+    batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
+    real_memo, real_commit = passes_svc.create_guest_memo, AsyncSession.commit
+    armed: dict[str, asyncio.Task | None] = {"task": None}
+    parked = asyncio.Event()
+
+    async def create_guest_memo(*args, **kwargs):
+        memo = await real_memo(*args, **kwargs)
+        armed["task"] = asyncio.current_task()  # the next commit of this task is the filing's
+        return memo
+
+    async def commit(self):
+        await real_commit(self)
+        if armed["task"] is not None and armed["task"] is asyncio.current_task():
+            armed["task"] = None
+            parked.set()
+            await asyncio.Event().wait()  # committed on the server, not yet returned
+
+    monkeypatch.setattr(passes_svc, "create_guest_memo", create_guest_memo)
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    tick = asyncio.create_task(_tick(world))
+    await asyncio.wait_for(parked.wait(), 30)
+    tick.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tick
+    [(path, sha)] = _sql("SELECT storage_path, sha256 FROM attachments")
+    assert Path(path).read_bytes() == JPEG and sha == SHA_JPEG
+    assert _sql("SELECT count(*) FROM ingest_blobs WHERE filed_at IS NOT NULL") == [(1,)]
+    monkeypatch.setattr(passes_svc, "create_guest_memo", real_memo)
+    assert await _tick(world) == "ok"
+    assert len(_memos()) == 1 and Path(path).read_bytes() == JPEG
+    assert _home_batch(batch) == [("acked", True, True, False)]
+
+
+async def test_a_cancel_before_the_staging_rename_leaves_the_verified_file_intact(
+    world, monkeypatch
+):
+    """`create_upload` has made the upload's empty part file and the cancellation lands before the
+    verified file is renamed over it: the empty file must not be walked back over the verified
+    bytes, and no empty part file may be left behind."""
+    trip = await _trip(world)
+    batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
+    real = trip_ingest.to_thread
+    parked = asyncio.Event()
+
+    async def run_sync(func, *args, **kwargs):
+        if func is trip_ingest._replace_sync and args[1].parent.name == "uploads":
+            parked.set()
+            await asyncio.Event().wait()  # the rename into the upload has not run
+        return await real.run_sync(func, *args, **kwargs)
+
+    monkeypatch.setattr(trip_ingest, "to_thread", SimpleNamespace(run_sync=run_sync))
+    tick = asyncio.create_task(_tick(world))
+    await asyncio.wait_for(parked.wait(), 30)
+    tick.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tick
+    staged = trip_ingest.staging_dir(batch) / SHA_JPEG
+    assert staged.read_bytes() == JPEG
+    assert _no_upload_parts(world)
+    monkeypatch.setattr(trip_ingest, "to_thread", real)
+    world.wire.seen.clear()
+    assert await _tick(world) == "ok"
+    assert len(_memos()) == 1 and _home_batch(batch) == [("acked", True, True, False)]
+    assert not any(p.startswith("/ingest/blobs/") for _, p, _ in world.wire.seen)  # no re-download
+
+
+async def test_a_declared_size_one_byte_too_large_is_quarantined_and_the_queue_moves_on(world):
+    """Valid bytes that hash to their name, but a manifest size one byte larger: the complete
+    answer ends short. That is the manifest's fault, not the link's, so it is quarantined at once
+    instead of being resumed (416) and restarted on every tick with the batches behind it stuck."""
+    first, second = await _two_batches(world)
+    _sql(
+        "UPDATE pluto.ingest_blobs SET size_bytes = size_bytes + 1 WHERE sha256 = :s",
+        {"s": SHA_JPEG},
+    )
+    assert await _tick(world) == "ok"
+    assert _pluto_batch(first) == [("quarantined", False)]
+    assert _home_batch(first) == [("quarantined", False, False, True)]
+    assert _sql("SELECT detail LIKE '%declared size%' FROM pass_events WHERE kind = 'refused'") == [
+        (True,)
+    ]
+    assert _home_batch(second) == [("acked", True, True, False)]
+    assert not trip_ingest.staging_dir(first).exists()
+
+
+HOSTILE_ENTRY = {
+    "device_id_list": ("device_id", []),
+    "pass_uid_list": ("pass_uid", []),
+    "device_id_nul": ("device_id", "dev\x00ice"),
+    "pass_uid_nul": ("pass_uid", "pa\x00ss"),
+    "caption_nul": ("caption", "be\x00ach"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(HOSTILE_ENTRY))
+async def test_a_malformed_feed_entry_is_quarantined_and_the_rest_of_its_page_files(world, case):
+    field, value = HOSTILE_ENTRY[case]
+    first, second = await _two_batches(world)
+
+    async def poisoned(request, response):
+        if request.url.path != "/ingest/batches":
+            return response
+        page = json.loads(await response.aread())
+        for entry in page["batches"]:
+            if entry["batch_id"] == first:
+                entry[field] = value
+        return _json_answer(page)
+
+    world.wire.rewrite = poisoned
+    assert await _tick(world) == "ok"
+    assert _pluto_batch(first) == [("quarantined", False)]
+    assert _home_batch(first) in ([], [("quarantined", False, False, True)])
+    assert _home_batch(second) == [("acked", True, True, False)]
+    assert len(_memos()) == 1
+
+
+HOSTILE_DEVICE = {
+    "display_name_nul": ("display_name", "An\x00na"),
+    "uploads_count_past_int32": ("uploads_count", 2**31),
+    "bytes_total_past_int64": ("bytes_total", 2**63),
+    "last_seen_past_year_9999_in_utc": ("last_seen", "9999-12-31T23:00:00-05:00"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(HOSTILE_DEVICE))
+async def test_a_device_field_the_columns_cannot_hold_is_refused_not_a_page_abort(world, case):
+    """Each value passed `_valid_device` and failed only in PostgreSQL, aborting the page's
+    transaction and every page after it. The device is refused instead (so its batch is refused
+    as one of an unknown device) and the other guest's batch files."""
+    field, value = HOSTILE_DEVICE[case]
+    trip = await _trip(world)
+    first = await _send(world, await _guest(world, trip, "Anna"), (JPEG, "a.jpg"))
+    second = await _send(world, await _guest(world, trip, "Bea"), (JPEG + b"\x01", "b.jpg"))
+
+    async def poisoned(request, response):
+        if request.url.path != "/ingest/devices":
+            return response
+        page = json.loads(await response.aread())
+        for entry in page["devices"]:
+            if entry["display_name"] == "Anna":
+                entry[field] = value
+        return _json_answer(page)
+
+    world.wire.rewrite = poisoned
+    assert await _tick(world) == "ok"
+    assert _sql("SELECT display_name FROM pass_devices") == [("Bea",)]
+    assert _home_batch(first) == [("quarantined", False, False, True)]
+    assert _home_batch(second) == [("acked", True, True, False)]
+
+
+async def test_a_last_modified_at_the_end_of_year_9999_files_and_leaves_no_part_file(world):
+    """`9999-12-31T23:59:59.999999Z` is a valid timestamp, but the float conversion rounded it
+    into year 10000: `create_upload` raised after it had made the part file, on every tick."""
+    first, second = await _two_batches(world)
+    _sql(
+        "UPDATE pluto.ingest_blobs SET last_modified = '9999-12-31T23:59:59.999999Z' "
+        "WHERE sha256 = :s",
+        {"s": SHA_JPEG},
+    )
+    assert await _tick(world) == "ok"
+    assert _home_batch(first) == [("acked", True, True, False)]
+    assert _home_batch(second) == [("acked", True, True, False)]
+    assert _no_upload_parts(world)
+    assert _sql("SELECT count(*) FROM pass_sync_state WHERE last_error IS NOT NULL") == [(0,)]
+
+
+@pytest.mark.parametrize(
+    "field", ["last_modified", "completed_at"], ids=["last_modified", "completed_at"]
+)
+def test_a_timestamp_past_year_9999_in_utc_is_hostile(field):
+    blob = {"sha256": SHA_JPEG, "size": len(JPEG), "mime": "image/jpeg", "filename": "a.jpg"}
+    raw = {"batch_id": "b1", "pass_uid": "p1", "device_id": "d1", "blobs": [blob]}
+    late = "9999-12-31T23:00:00-05:00"  # 10000-01-01T04:00Z: no datetime holds it
+    if field == "last_modified":
+        blob["last_modified"] = late
+    else:
+        raw["completed_at"] = late
+    with pytest.raises(trip_ingest.Hostile):
+        trip_ingest.validate_batch(raw)
+
+
+async def test_create_upload_makes_no_part_file_when_it_raises(world):
+    async with async_session() as db:
+        with pytest.raises(OverflowError):
+            await uploads_svc.create_upload(
+                db,
+                owner_id=world.owner_id,
+                filename="a.jpg",
+                mime="image/jpeg",
+                size=10,
+                last_modified=2**62,  # no datetime is that many milliseconds past 1970
+            )
+        await db.rollback()
+    assert _no_upload_parts(world)
+
+
+def _device(**over) -> dict:
+    raw = {
+        "device_id": "d1",
+        "pass_uid": "p1",
+        "display_name": "Anna",
+        "platform": "web",
+        "uploads_count": 0,
+        "bytes_total": 0,
+        "first_seen": "2031-03-01T10:00:00Z",
+        "last_seen": None,
+    }
+    return raw | over
+
+
+def test_a_device_count_at_its_column_maximum_is_kept_and_one_past_is_refused():
+    top32, top64 = trip_ingest.INT32_MAX, trip_ingest.INT64_MAX
+    assert (top32, top64) == (2_147_483_647, 9_223_372_036_854_775_807)
+    kept = trip_ingest._valid_device(_device(uploads_count=top32, bytes_total=top64))
+    assert kept is not None and (kept["uploads_count"], kept["bytes_total"]) == (top32, top64)
+    assert trip_ingest._valid_device(_device(uploads_count=top32 + 1)) is None
+    assert trip_ingest._valid_device(_device(bytes_total=top64 + 1)) is None
+    assert trip_ingest._valid_device(_device(uploads_count=-1)) is None
+
+
+def test_a_name_spelling_out_a_backslash_escape_is_text_not_a_nul():
+    kept = trip_ingest._valid_device(_device(display_name="An\\x00na"))
+    assert kept is not None and kept["display_name"] == "An\\x00na"
+    assert trip_ingest._valid_device(_device(display_name="An\x00na")) is None
+    assert trip_ingest._valid_device(_device(display_name="An\ud800na")) is None
+
+
+async def test_create_upload_still_makes_the_part_file_it_hands_out(world):
+    async with async_session() as db:
+        up = await uploads_svc.create_upload(
+            db, owner_id=world.owner_id, filename="a.jpg", mime="image/jpeg", size=10
+        )
+        await db.rollback()
+    assert uploads_svc.part_path(up.upload_uid).read_bytes() == b""
+
+
+async def test_a_cancelled_download_keeps_the_tick_lock_until_its_write_returns(world, monkeypatch):
+    """A worker thread cannot be cancelled. A cancellation landing while it appends to a staging
+    file must not unwind the tick (and release its advisory lock) around it: the next tick would
+    then write the same partial file while this thread still does."""
+    trip = await _trip(world)
+    batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
+    real = trip_ingest._append_hashed_sync
+    entered, release = threading.Event(), threading.Event()
+
+    def parked(*args):
+        entered.set()
+        release.wait(30)
+        real(*args)
+
+    monkeypatch.setattr(trip_ingest, "_append_hashed_sync", parked)
+    tick = asyncio.create_task(_tick(world))
+    assert await asyncio.to_thread(entered.wait, 30)
+    tick.cancel()
+    try:
+        done, _ = await asyncio.wait({tick}, timeout=1)
+        assert not done, "the cancelled tick returned while its writer thread was still running"
+        free = _sql("SELECT pg_try_advisory_xact_lock(:k)", {"k": trip_ingest.SYNC_LOCK_KEY})
+        assert free == [(False,)]
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await tick
+    partial = trip_ingest.staging_dir(batch) / f"{SHA_JPEG}.part"
+    assert partial.read_bytes() == JPEG  # the write the thread was in landed whole
+
+
+# --- security gate p1: zoneless timestamps, cursor range, hashed answer ids ---------------------
+
+YEAR_ONE = {
+    "naive": ("0001-01-01T00:00:00", datetime(1, 1, 1, tzinfo=UTC)),
+    "utc": ("0001-01-01T00:00:00Z", datetime(1, 1, 1, tzinfo=UTC)),
+    "east_of_utc": ("0001-01-01T00:00:00+01:00", None),  # year 0 in UTC: refused
+}
+
+
+@pytest.mark.parametrize("edge", sorted(YEAR_ONE))
+@pytest.mark.parametrize("field", ["first_seen", "completed_at", "last_modified"])
+def test_a_year_one_timestamp_is_read_as_utc_or_refused_never_an_escaping_error(field, edge):
+    value, expected = YEAR_ONE[edge]
+    if field == "first_seen":
+        kept = trip_ingest._valid_device(_device(first_seen=value))
+        assert (kept["first_seen"] if kept else None) == expected
+        return
+    blob = {"sha256": SHA_JPEG, "size": len(JPEG), "mime": "image/jpeg", "filename": "a.jpg"}
+    raw = {"batch_id": "b1", "pass_uid": "p1", "device_id": "d1", "blobs": [blob]}
+    (blob if field == "last_modified" else raw)[field] = value
+    if expected is None:
+        with pytest.raises(trip_ingest.Hostile):
+            trip_ingest.validate_batch(raw)
+        return
+    batch = trip_ingest.validate_batch(raw)
+    got = batch.blobs[0].last_modified if field == "last_modified" else batch.completed_at
+    assert got == expected and got.tzinfo is not None
+
+
+async def test_a_zoneless_year_one_first_seen_does_not_stall_the_device_feed(world):
+    trip = await _trip(world)
+    batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
+
+    async def year_one(request, response):
+        if request.url.path != "/ingest/devices":
+            return response
+        page = json.loads(await response.aread())
+        for entry in page["devices"]:
+            entry["first_seen"] = "0001-01-01"
+        return _json_answer(page)
+
+    world.wire.rewrite = year_one
+    assert await _tick(world) == "ok"
+    assert _home_batch(batch) == [("acked", True, True, False)]
+
+
+@pytest.mark.parametrize("feed", ["devices", "batches"])
+async def test_a_cursor_past_bigint_is_a_malformed_page_and_bigint_max_is_kept(world, feed):
+    trip = await _trip(world)
+    await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
+    nxt = {"value": 2**63}
+
+    async def far(request, response):
+        if request.url.path != f"/ingest/{feed}":
+            return response
+        page = json.loads(await response.aread())
+        if page[feed]:
+            page["next"] = nxt["value"]
+        return _json_answer(page)
+
+    world.wire.rewrite = far
+    column = f"{feed}_since"
+    assert await _tick(world) == "link_down"
+    assert _sql(f"SELECT {column} FROM trip_ingest_cursor") == [(0,)]
+    nxt["value"] = 2**63 - 1
+    assert await _tick(world) == "ok"
+    assert _sql(f"SELECT {column} FROM trip_ingest_cursor") == [(2**63 - 1,)]
+
+
+@pytest.mark.parametrize("push", ["passes", "device-revocations"])
+async def test_an_unhashable_id_in_a_push_answer_is_ignored_not_a_tick_error(world, push):
+    trip = await _trip(world)
+    await _guest(world, trip)
+    assert await _tick(world) == "ok"  # the device is mirrored, the pass acknowledged
+    _sql("UPDATE pass_devices SET revoked_at = now(), revoked_version = 1")
+    _sql("UPDATE pass_sync_state SET acked_version = 0")
+
+    async def unhashable(request, response):
+        if request.url.path != f"/ingest/{push}":
+            return response
+        await response.aread()
+        if push == "passes":
+            return _json_answer([{"uid": [], "version": 1}])
+        return _json_answer({"applied": [{"device_id": []}], "unknown": []})
+
+    world.wire.rewrite = unhashable
+    assert await _tick(world) == "ok"

@@ -148,7 +148,8 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         ("app/services/export.py", "_manifest_entry", "open"): 1,
         # Worker only: a rolled-back trip filing walks its files back to staging inline, for the
         # same reason as the memo router's `_restore_moved` — a cancellation may be unwinding.
-        ("app/services/trip_ingest.py", "_file_part", "_restore"): 1,
+        # Twice: the rolled-back filing, and the interrupted COMMIT read back as not committed.
+        ("app/services/trip_ingest.py", "_file_part", "_restore"): 2,
     }
 )
 

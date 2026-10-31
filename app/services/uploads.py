@@ -490,8 +490,6 @@ async def create_upload(
     every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
     another user out of these bytes."""
     upload_uid = secrets.token_urlsafe(24)
-    part = part_path(upload_uid)
-    await to_thread.run_sync(_create_part_sync, part)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
     # millisecond than the one sent once the seconds pass 2**32, and this value is kept exactly
     # as the client sent it.
@@ -508,6 +506,9 @@ async def create_upload(
     )
     db.add(upload)
     await db.flush()
+    # The part file last, after everything that can raise: made first, a `last_modified` past
+    # year 9999 (OverflowError) left a part file with no row to find it by, once per attempt.
+    await to_thread.run_sync(_create_part_sync, part_path(upload_uid))
     return upload
 
 

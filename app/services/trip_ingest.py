@@ -26,6 +26,7 @@ received is filed even when its pass or device was revoked later. A home revocat
 pulled device never clears it — and is pushed every tick until the ingest host reports it applied.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -34,9 +35,9 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeGuard
 from urllib.parse import quote
@@ -78,6 +79,10 @@ CAPTION_MAX = 2000
 # the ingest host accepted is one home can file — placement sanitizes and byte-caps it.
 FILENAME_MAX = 512
 DISPLAY_NAME_MAX = 64
+# The mirror's count columns (`pass_devices.uploads_count` INTEGER, `bytes_total` BIGINT): a value
+# past them fails only inside PostgreSQL, aborting the whole page's transaction.
+INT32_MAX = 2**31 - 1
+INT64_MAX = 2**63 - 1
 # Every service-API answer is read into memory up to this many bytes and no further. A page of
 # BATCH_PAGE batches at the manifest caps (2000 files, 512-character names) stays well inside it.
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -229,13 +234,46 @@ def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _a_cursor(value: object) -> TypeGuard[int]:
+    """A feed's `next`: it is committed into a BIGINT cursor column, where a larger value would
+    abort the page's transaction on every tick."""
+    return _is_int(value) and 0 <= value <= INT64_MAX
+
+
+def _an_id(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and ID.fullmatch(value) is not None
+
+
+def _ids_of(entries: list, field: str) -> set[str]:
+    return {e[field] for e in entries if isinstance(e, dict) and _an_id(e.get(field))}
+
+
 def _datetime_or_none(value: object, what: str) -> datetime | None:
+    """A timestamp a `timestamptz` column and the millisecond arithmetic downstream can hold: a
+    value whose instant lies past year 9999 in UTC parses, then fails at the INSERT (aborting the
+    page) or in the filing's conversion (on every tick)."""
     if value is None:
         return None
     try:
-        return _DATETIME.validate_python(value)
-    except ValidationError:
+        parsed = _DATETIME.validate_python(value)
+        if parsed.tzinfo is None:
+            # A zoneless value is read as UTC, as `_epoch_ms` reads one, never as this host's
+            # local time: `astimezone` on a naive year-1 value fails (year 0) in any zone.
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (ValidationError, ValueError, OverflowError):
         raise Hostile(f"{what} is not a timestamp") from None
+
+
+def _text_ok(value: str) -> bool:
+    """Text PostgreSQL will store: no NUL, and no lone surrogate (JSON can escape one)."""
+    if "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _filename_ok(name: object) -> bool:
@@ -284,7 +322,9 @@ def validate_batch(raw: dict) -> BatchIn:
         raise Hostile("the pass id is malformed")
     if not isinstance(device_id, str) or not ID.fullmatch(device_id):
         raise Hostile("the device id is malformed or missing")
-    if caption is not None and (not isinstance(caption, str) or len(caption) > CAPTION_MAX):
+    if caption is not None and (
+        not isinstance(caption, str) or len(caption) > CAPTION_MAX or not _text_ok(caption)
+    ):
         raise Hostile("the caption is not text of at most 2000 characters")
     blobs_raw = raw.get("blobs")
     if not isinstance(blobs_raw, list) or not 0 < len(blobs_raw) <= MAX_BATCH_FILES:
@@ -402,7 +442,12 @@ async def push_passes(client: httpx.AsyncClient) -> int:
     async with async_session() as db:
         await _lock_passes(db, set(pushed))
         for item in answer:
-            if not isinstance(item, dict) or item.get("uid") not in pushed:
+            # The id is checked as text before the lookup hashes it (a list is unhashable).
+            if (
+                not isinstance(item, dict)
+                or not _an_id(item.get("uid"))
+                or item["uid"] not in pushed
+            ):
                 continue
             held = item.get("version")
             pass_id, version = pushed[item["uid"]]
@@ -485,7 +530,7 @@ async def push_device_revocations(client: httpx.AsyncClient) -> int:
             if not isinstance(record, dict):
                 continue
             uid = record.get("device_id")
-            if uid not in owed:
+            if not _an_id(uid) or uid not in owed:
                 continue
             device_id, pass_uid, version, _ = owed[uid]
             # The confirmation must name the record home sent: same pass, at least its version.
@@ -515,17 +560,21 @@ def _valid_device(raw: object) -> dict | None:
         return None
     if not (isinstance(pass_uid, str) and ID.fullmatch(pass_uid)):
         return None
-    if not (isinstance(name, str) and 0 < len(name) <= DISPLAY_NAME_MAX):
+    if not (isinstance(name, str) and 0 < len(name) <= DISPLAY_NAME_MAX and _text_ok(name)):
         return None
     if raw.get("platform") not in PASS_DEVICE_PLATFORMS:
         return None
     counts = (raw.get("uploads_count"), raw.get("bytes_total"))
-    if not all(_is_int(c) and c >= 0 for c in counts):
+    if not all(
+        _is_int(c) and 0 <= c <= top for c, top in zip(counts, (INT32_MAX, INT64_MAX), strict=True)
+    ):
         return None
     try:
-        first_seen = _DATETIME.validate_python(raw.get("first_seen"))
+        first_seen = _datetime_or_none(raw.get("first_seen"), "first_seen")
         last_seen = _datetime_or_none(raw.get("last_seen"), "last_seen")
-    except (ValidationError, Hostile):
+    except Hostile:
+        return None
+    if first_seen is None:
         return None
     return {
         "uid": uid,
@@ -587,7 +636,7 @@ async def pull_devices(client: httpx.AsyncClient) -> int:
         page = _json(r)
         devices = page.get("devices") if isinstance(page, dict) else None
         nxt = page.get("next") if isinstance(page, dict) else None
-        if not isinstance(devices, list) or not _is_int(nxt) or nxt < since:
+        if not isinstance(devices, list) or not _a_cursor(nxt) or nxt < since:
             raise LinkDown("GET /ingest/devices: malformed page")
         if not devices:
             return seen
@@ -646,7 +695,7 @@ async def _record_batch(
     except Hostile as exc:
         p = None
         pass_uid = raw.get("pass_uid")
-        if isinstance(pass_uid, str):
+        if _an_id(pass_uid):
             p = await _home_pass(db, pass_uid)
         if p is None:
             # No home pass to hang a ledger row on: quarantined NOW, inside the transaction that
@@ -721,15 +770,17 @@ async def pull_batches(client: httpx.AsyncClient, errors: list[str]) -> int:
         page = _json(r)
         batches = page.get("batches") if isinstance(page, dict) else None
         nxt = page.get("next") if isinstance(page, dict) else None
-        if not isinstance(batches, list) or not _is_int(nxt) or nxt < since:
+        if not isinstance(batches, list) or not _a_cursor(nxt) or nxt < since:
             raise LinkDown("GET /ingest/batches: malformed page")
         if not batches:
             return seen
         # A batch whose device the mirror does not hold yet: the device feed is drained again
         # BEFORE this page's transaction, because the ingest host commits a batch and its device's
         # cursor together, so a drain started now serves every device this page names.
-        named = {b.get("device_id") for b in batches if isinstance(b, dict)}
-        named = {d for d in named if isinstance(d, str)}
+        # Only well-formed ids are hashed or sent to PostgreSQL: a list is unhashable and a NUL
+        # is refused by the database, either one aborting the page before any entry is judged.
+        # The entry itself is judged (and quarantined) by `_record_batch`.
+        named = _ids_of(batches, "device_id")
         async with async_session() as db:
             mirrored = set(
                 (await db.execute(select(PassDevice.uid).where(PassDevice.uid.in_(named))))
@@ -738,10 +789,9 @@ async def pull_batches(client: httpx.AsyncClient, errors: list[str]) -> int:
             )
         if named - mirrored:
             await pull_devices(client)
-        page_passes = {b.get("pass_uid") for b in batches if isinstance(b, dict)}
         async with async_session() as db:
             # A refusal writes its pass's sync row and event, so the page takes its passes first.
-            await _lock_passes(db, {u for u in page_passes if isinstance(u, str)})
+            await _lock_passes(db, _ids_of(batches, "pass_uid"))
             for raw in batches:
                 await _record_batch(db, client, raw, errors)
             (await _cursor(db)).batches_since = nxt
@@ -799,6 +849,16 @@ def _partial_path(batch_uid: str, sha: str) -> Path:
     return staging_dir(batch_uid) / f"{sha}.part"
 
 
+async def _staging_write(fn: Callable[..., object], *args: object) -> None:
+    """A staging file write, append, truncate, unlink or rename, waited out to its end. A worker
+    thread cannot be cancelled: unwound around it, the tick would release its advisory lock while
+    the thread still writes, and the next tick would write the same partial file beside it. The
+    cancellation is raised once the thread has returned."""
+    _, cancelled = await uploads_svc.finish_off_the_loop(fn, *args)
+    if cancelled is not None:
+        raise cancelled
+
+
 async def _fetch(client: httpx.AsyncClient, blob: IngestBlob, dest: Path, deadline: float) -> str:
     """Stream one file into `dest`, continuing from what an earlier attempt left there (Range),
     and answer the sha256 of the whole file, hashed as it arrives. The running count aborts the
@@ -807,7 +867,7 @@ async def _fetch(client: httpx.AsyncClient, blob: IngestBlob, dest: Path, deadli
     in one piece than the declared size before any count saw them."""
     have = await to_thread.run_sync(_size_sync, dest)
     if have > blob.size_bytes:
-        await to_thread.run_sync(_unlink_sync, dest)
+        await _staging_write(_unlink_sync, dest)
         have = 0
     hasher = await to_thread.run_sync(_hasher_sync, dest) if have else hashlib.sha256()
     if have == blob.size_bytes:
@@ -823,7 +883,7 @@ async def _fetch(client: httpx.AsyncClient, blob: IngestBlob, dest: Path, deadli
             if r.status_code == 404:
                 raise Hostile(f"{blob.sha256}: the ingest host has no such file")
             if r.status_code == 416:
-                await to_thread.run_sync(_unlink_sync, dest)
+                await _staging_write(_unlink_sync, dest)
                 raise LinkDown(f"GET {url}: range refused, restarting")
             if r.status_code not in (200, 206):
                 raise LinkDown(f"GET {url}: HTTP {r.status_code}")
@@ -842,14 +902,14 @@ async def _fetch(client: httpx.AsyncClient, blob: IngestBlob, dest: Path, deadli
                     continue
                 offset += len(chunk)
                 if offset > blob.size_bytes:
-                    await to_thread.run_sync(_unlink_sync, dest)
+                    await _staging_write(_unlink_sync, dest)
                     raise Hostile(f"{blob.sha256}: the file streams past its declared size")
-                await to_thread.run_sync(_append_hashed_sync, dest, chunk, truncate, hasher)
+                await _staging_write(_append_hashed_sync, dest, chunk, truncate, hasher)
                 truncate = False
                 if time.monotonic() >= deadline:
                     raise OutOfTime
             if truncate:  # an empty body to a whole-file request
-                await to_thread.run_sync(_append_sync, dest, b"", True)
+                await _staging_write(_append_sync, dest, b"", True)
     except httpx.HTTPError as exc:
         raise LinkDown(f"GET {url}: {type(exc).__name__}") from None
     return hasher.hexdigest()
@@ -873,18 +933,23 @@ async def download(
         for attempt in (1, 2):
             have = await to_thread.run_sync(_size_sync, dest)
             digest = await _fetch(client, blob, dest, deadline)
-            if await to_thread.run_sync(_size_sync, dest) != blob.size_bytes:
-                raise LinkDown(f"{blob.sha256}: the stream ended short")
-            if digest == blob.sha256:
+            short = await to_thread.run_sync(_size_sync, dest) != blob.size_bytes
+            if not short and digest == blob.sha256:
                 break
-            await to_thread.run_sync(_unlink_sync, dest)
-            # One fresh download after a resumed one went wrong; a whole download that does not
-            # hash to its name is the manifest's fault.
+            await _staging_write(_unlink_sync, dest)
+            # `_fetch` returned, so the answer ended by its own framing (a cut link raises
+            # LinkDown there): those are all the bytes the ingest host will send. A length or a
+            # hash that disagrees with the manifest is then the manifest's fault, never the
+            # link's; retried, a short one would be resumed into a 416 and restarted on every
+            # tick, with every batch behind it stuck. One fresh download after a resumed one went
+            # wrong, then the batch is quarantined.
             if not have or attempt == 2:
+                if short:
+                    raise Hostile(f"{blob.sha256}: the file ends before its declared size")
                 raise Hostile(f"{blob.sha256}: the bytes do not hash to their name")
         if await to_thread.run_sync(ingest_core.sniff_matches, dest, blob.filename) != blob.mime:
             raise Hostile(f"{blob.sha256}: the bytes are not the type the name claims")
-        await to_thread.run_sync(_replace_sync, dest, verified)
+        await _staging_write(_replace_sync, dest, verified)
 
 
 # --- step 6: file -------------------------------------------------------------------------------
@@ -909,10 +974,49 @@ def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -
             logger.error("trip_ingest.restore_failed", src=move.src, dest=unrestored)
     for staged, part in parts:
         try:
-            if part.exists():
+            if staged.exists():
+                # The rename into the upload never ran (a cancellation or a failure before it):
+                # the verified bytes are still staged and the part file is the empty placeholder
+                # `create_upload` made, which must not be moved over them.
+                part.unlink(missing_ok=True)
+            elif part.exists():
                 os.replace(part, staged)
         except OSError as exc:
             logger.error("trip_ingest.restore_failed", src=str(part), error=type(exc).__name__)
+
+
+def _epoch_ms(value: datetime) -> int:
+    """Milliseconds since 1970, in integer arithmetic: `timestamp() * 1000` failed on the last
+    instants of year 9999 (the value lands in year 10000), on every tick. The driver hands such an
+    instant back without its zone; a `timestamptz` value is a UTC instant either way."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return (value - uploads_svc.EPOCH) // timedelta(milliseconds=1)
+
+
+async def _filing_committed(batch_id: int, blob_ids: list[int]) -> bool | None:
+    """Whether a filing whose COMMIT was interrupted committed after all; None when that cannot be
+    learned. PostgreSQL may have committed before the interruption reached `commit()`, and then
+    the memo's rows point at the placed originals. Taking the batch row's lock waits until the
+    interrupted transaction has ended either way, so the filed marks read here are its outcome."""
+    try:
+        async with async_session() as db:
+            await db.execute(text("SET LOCAL lock_timeout = '30s'"))
+            await db.execute(
+                select(IngestBatch.id).where(IngestBatch.id == batch_id).with_for_update()
+            )
+            filed = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(IngestBlob)
+                    .where(IngestBlob.id.in_(blob_ids), IngestBlob.filed_at.is_not(None))
+                )
+            ).scalar_one()
+            await db.rollback()
+            return filed > 0
+    except Exception:
+        logger.exception("trip_ingest.commit_outcome_unknown", batch_id=batch_id)
+        return None
 
 
 async def _filing_target(db: AsyncSession, batch: IngestBatch) -> tuple[Pass, Any]:
@@ -978,118 +1082,141 @@ async def _file_part(batch_id: int) -> bool | None:
     moved: list[storage.TrackedMove] = []
     parts: list[tuple[Path, Path]] = []
     consumed: list[str] = []
-    committed = False
-    async with async_session() as db:
-        try:
-            batch = (
-                await db.execute(
-                    select(IngestBatch)
-                    .where(IngestBatch.id == batch_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalar_one_or_none()
-            if batch is None or batch.state != "open":
-                return None
-            uid = batch.uid
-            p, collection = await _filing_target(db, batch)
-            assert p.created_by is not None
-            owner_id = p.created_by
-            blobs = list(
-                (
+    filing: list[int] = []
+    committed = commit_sent = False
+    try:
+        async with async_session() as db:
+            try:
+                batch = (
                     await db.execute(
-                        select(IngestBlob)
-                        .where(IngestBlob.batch_id == batch.id)
-                        .order_by(IngestBlob.id)
+                        select(IngestBatch)
+                        .where(IngestBatch.id == batch_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
                     )
-                ).scalars()
-            )
-            pending = [b for b in blobs if b.filed_at is None]
-            part = _filing_parts(pending)[0] if pending else []
-            # The first part keeps the batch's own key, so a batch of one part is keyed exactly as
-            # a whole batch; a later part is keyed by the file it starts with.
-            key = idempotency_key(uid if len(pending) == len(blobs) else f"{uid}/{part[0].sha256}")
-            upload_for: dict[str, IngestBlob] = {}
-            for blob in part:
-                up = await uploads_svc.create_upload(
-                    db,
-                    owner_id=owner_id,
-                    filename=blob.filename,
-                    mime=blob.mime,
-                    size=blob.size_bytes,
-                    last_modified=(
-                        int(blob.last_modified.timestamp() * 1000) if blob.last_modified else None
-                    ),
+                ).scalar_one_or_none()
+                if batch is None or batch.state != "open":
+                    return None
+                uid = batch.uid
+                p, collection = await _filing_target(db, batch)
+                assert p.created_by is not None
+                owner_id = p.created_by
+                blobs = list(
+                    (
+                        await db.execute(
+                            select(IngestBlob)
+                            .where(IngestBlob.batch_id == batch.id)
+                            .order_by(IngestBlob.id)
+                        )
+                    ).scalars()
                 )
-                staged = _verified_path(uid, blob.sha256)
-                target = uploads_svc.part_path(up.upload_uid)
-                parts.append((staged, target))
-                await to_thread.run_sync(_replace_sync, staged, target)
-                # The completion state a member's last chunk leaves: every byte received, its hash
-                # known. The capture read happens in finalize's `ensure_capture`.
-                up.bytes_received = blob.size_bytes
-                up.sha256 = blob.sha256
-                upload_for[up.upload_uid] = blob
-            await db.flush()
-            device = (
-                await db.get(PassDevice, batch.pass_device_id)
-                if batch.pass_device_id is not None
-                else None
-            )
-            resolved: dict[str, str] = {}
-            positions: dict[str, int] = {}
-            order = list(upload_for)
+                pending = [b for b in blobs if b.filed_at is None]
+                part = _filing_parts(pending)[0] if pending else []
+                # The first part keeps the batch's own key, so a batch of one part is keyed
+                # exactly as a whole batch; a later part is keyed by the file it starts with.
+                key = idempotency_key(
+                    uid if len(pending) == len(blobs) else f"{uid}/{part[0].sha256}"
+                )
+                upload_for: dict[str, IngestBlob] = {}
+                for blob in part:
+                    up = await uploads_svc.create_upload(
+                        db,
+                        owner_id=owner_id,
+                        filename=blob.filename,
+                        mime=blob.mime,
+                        size=blob.size_bytes,
+                        last_modified=(
+                            _epoch_ms(blob.last_modified) if blob.last_modified else None
+                        ),
+                    )
+                    staged = _verified_path(uid, blob.sha256)
+                    target = uploads_svc.part_path(up.upload_uid)
+                    parts.append((staged, target))
+                    await to_thread.run_sync(_replace_sync, staged, target)
+                    # The completion state a member's last chunk leaves: every byte received, its
+                    # hash known. The capture read happens in finalize's `ensure_capture`.
+                    up.bytes_received = blob.size_bytes
+                    up.sha256 = blob.sha256
+                    upload_for[up.upload_uid] = blob
+                await db.flush()
+                device = (
+                    await db.get(PassDevice, batch.pass_device_id)
+                    if batch.pass_device_id is not None
+                    else None
+                )
+                resolved: dict[str, str] = {}
+                positions: dict[str, int] = {}
+                order = list(upload_for)
 
-            async def finalize(memo) -> list[str]:
-                done = await uploads_svc.finalize_pending(
+                async def finalize(memo) -> list[str]:
+                    done = await uploads_svc.finalize_pending(
+                        db,
+                        order,
+                        owner_id,
+                        moved_out=moved,
+                        consumed_out=consumed,
+                        positions_out=positions,
+                        resolved_out=resolved,
+                        # Fresh rows always: a guest's bytes never take over an attachment the owner
+                        # already has, its renditions or its placement (the gate's finding 4).
+                        adopt_unlinked=False,
+                        # Hashed by `download` from these very files, which only home has touched.
+                        known_digests={u: b.sha256 for u, b in upload_for.items()},
+                    )
+                    return sorted(done, key=lambda u: positions.get(u, len(done)))
+
+                memo = await passes_svc.create_guest_memo(
                     db,
-                    order,
-                    owner_id,
+                    p,
+                    caption=batch.caption,
+                    contributor_name=device.display_name if device is not None else None,
+                    idempotency_key=key,
+                    device=device,
+                    finalize=finalize,
                     moved_out=moved,
-                    consumed_out=consumed,
-                    positions_out=positions,
-                    resolved_out=resolved,
-                    # Fresh rows always: a guest's bytes never take over an attachment the owner
-                    # already has, its renditions or its placement (the gate's finding 4).
-                    adopt_unlinked=False,
-                    # Hashed by `download` from these very files, which only home has touched.
-                    known_digests={u: b.sha256 for u, b in upload_for.items()},
                 )
-                return sorted(done, key=lambda u: positions.get(u, len(done)))
-
-            memo = await passes_svc.create_guest_memo(
-                db,
-                p,
-                caption=batch.caption,
-                contributor_name=device.display_name if device is not None else None,
-                idempotency_key=key,
-                device=device,
-                finalize=finalize,
-                moved_out=moved,
-            )
-            by_uid = {a.uid: a for a in memo.attachments}
-            now = datetime.now(UTC)
-            for up_uid, blob in upload_for.items():
-                att = by_uid.get(resolved.get(up_uid, ""))
-                blob.attachment_id = att.id if att is not None else None
-                blob.filed_at = now
-            if collection.kind == "album":
-                # An album's membership is its member rows, not a tag (`guest_memo_content`).
-                for att in sorted(memo.attachments, key=lambda a: a.id):
-                    await coll_svc.add_member(db, collection.id, att.id, added_by=owner_id)
-            if batch.memo_id is None:
-                batch.memo_id = memo.id
-            complete = len(part) == len(pending)
-            if complete:
-                batch.state = "complete"
-            await db.commit()
-            committed = True
-        except BaseException:
-            if not committed:
-                # blocking-ok: a cancellation may be unwinding through here, and an await could be
-                # interrupted before the files are back (the memo router restores inline too).
-                _restore(moved, parts)
-            raise
+                by_uid = {a.uid: a for a in memo.attachments}
+                now = datetime.now(UTC)
+                for up_uid, blob in upload_for.items():
+                    att = by_uid.get(resolved.get(up_uid, ""))
+                    blob.attachment_id = att.id if att is not None else None
+                    blob.filed_at = now
+                if collection.kind == "album":
+                    # An album's membership is its member rows, not a tag (`guest_memo_content`).
+                    for att in sorted(memo.attachments, key=lambda a: a.id):
+                        await coll_svc.add_member(db, collection.id, att.id, added_by=owner_id)
+                if batch.memo_id is None:
+                    batch.memo_id = memo.id
+                complete = len(part) == len(pending)
+                if complete:
+                    batch.state = "complete"
+                filing = [b.id for b in part]
+                commit_sent = True
+                await db.commit()
+                committed = True
+            except BaseException:
+                if not commit_sent:
+                    # blocking-ok: a cancellation may be unwinding through here, and an await
+                    # could be interrupted before the files are back (the memo router restores
+                    # inline too).
+                    _restore(moved, parts)
+                raise
+    except BaseException:
+        if commit_sent and not committed:
+            # Interrupted inside COMMIT: undoing the placement is right only if PostgreSQL did not
+            # commit, so the outcome is read back first (its session has closed by now, so the
+            # interrupted transaction is over or ending). Shielded, because a cancellation is
+            # what usually lands here; interrupted again or unreadable, the files stay where they
+            # are: committed, they are where the rows say; not, the batch is still open and
+            # unacked, so the next tick downloads them again.
+            outcome = asyncio.ensure_future(_filing_committed(batch_id, filing))
+            try:
+                committed_after_all = await asyncio.shield(outcome)
+            except BaseException:
+                committed_after_all = None
+            if committed_after_all is False:
+                _restore(moved, parts)  # blocking-ok: as above
+        raise
     if consumed:
         await to_thread.run_sync(uploads_svc.reap_consumed_sync, consumed)
     if complete:
