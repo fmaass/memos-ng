@@ -16,7 +16,7 @@ host, which enrolls guest devices. Three rules hold everywhere in this module:
 
 import io
 import secrets
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -603,6 +603,27 @@ async def moderate(
 # --- the guest memo boundary -----------------------------------------------------------------
 
 
+async def _file_into_album(
+    db: AsyncSession, collection: Collection, attachment_ids: Sequence[int], owner_id: int
+) -> None:
+    """An album's membership is its member rows, not a tag (`guest_memo_content`). Written BEFORE
+    the memo is linked to its pass: the link's foreign keys take KEY SHARE on the pass and its
+    device, and the collection delete holds the album row and then asks for the pass, so a filing
+    that held the pass while it asked for the album row closed a cycle (docs/LOCK-ORDER.md,
+    C < P)."""
+    if collection.kind != "album":
+        return
+    for attachment_id in sorted(attachment_ids):
+        await coll_svc.add_member(db, collection.id, attachment_id, added_by=owner_id)
+
+
+def _credit(attachments: Iterable[Attachment], name: str | None, device: PassDevice | None) -> None:
+    name = name[:CONTRIBUTOR_NAME_MAX] if name else None
+    for att in attachments:
+        att.contributor_name = name
+        att.contributed_by_device_id = device.id if device is not None else None
+
+
 async def create_guest_memo(
     db: AsyncSession,
     p: Pass,
@@ -618,7 +639,8 @@ async def create_guest_memo(
     come from the pass's home rows only: the issuer owns it, it is PROTECTED, and its `content` is
     exactly `guest_memo_content` — so a guest's caption or name, whatever hashtags they carry,
     never reaches `parse_tags`. The caption is kept in `memos.guest_caption`, the name on each
-    attachment's `contributor_name`. An album's member rows are the importer's to write."""
+    attachment's `contributor_name`. An album's member rows are written here too, before the
+    memo is linked to its pass (`_file_into_album`)."""
     collection = await pass_collection(db, p)
     if collection is None:
         raise PassGone(p.uid)
@@ -637,11 +659,49 @@ async def create_guest_memo(
         # that rolls back has to be able to walk it back too.
         moved_out=moved_out,
     )
+    await _file_into_album(db, collection, [a.id for a in memo.attachments], owner.id)
     memo.pass_id = p.id
     memo.guest_caption = caption or None
-    name = contributor_name[:CONTRIBUTOR_NAME_MAX] if contributor_name else None
-    for att in memo.attachments:
-        att.contributor_name = name
-        att.contributed_by_device_id = device.id if device is not None else None
+    _credit(memo.attachments, contributor_name, device)
     await db.flush()
     return memo
+
+
+async def append_guest_files(
+    db: AsyncSession,
+    p: Pass,
+    memo_id: int,
+    *,
+    contributor_name: str | None,
+    device: PassDevice | None = None,
+    finalize: Callable[[Memo, Sequence[int]], Awaitable[Sequence[str]]],
+    moved_out: list[storage.TrackedMove] | None = None,
+) -> Memo | None:
+    """A later part of a guest batch, filed into the memo its first part made, so one batch is
+    one memo with its caption once. The memo row is locked first, as every memo edit does
+    (`memos.lock_memo_for_write`); `finalize` gets it and the ids of the attachments it already
+    carries, which its one ascending attachment acquisition must cover because the append re-locks
+    them to number after them. None when that memo is gone or is not this pass's guest memo (the
+    owner deleted it): the caller files the part as a memo of its own."""
+    collection = await pass_collection(db, p)
+    if collection is None:
+        raise PassGone(p.uid)
+    memo = await db.get(Memo, memo_id)
+    if memo is None:
+        return None
+    locked = await memos_svc.lock_memo_for_write(db, memo)
+    if locked is None or locked.pass_id != p.id or locked.owner_id != p.created_by:
+        return None
+    before = set(
+        (await db.execute(select(Attachment.id).where(Attachment.memo_id == locked.id))).scalars()
+    )
+    finalized = list(await finalize(locked, sorted(before)))
+    await memos_svc.link_attachments(
+        db, locked.owner_id, locked, finalized, moved_out=moved_out, vouched=set(finalized)
+    )
+    await db.refresh(locked)
+    added = [a for a in locked.attachments if a.id not in before]
+    await _file_into_album(db, collection, [a.id for a in added], locked.owner_id)
+    _credit(added, contributor_name, device)
+    await db.flush()
+    return locked

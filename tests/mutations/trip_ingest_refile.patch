@@ -9,4 +9,4 @@ diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
 +                if batch is None:
                      return None
                  uid = batch.uid
-                 p, collection = await _filing_target(db, batch)
+                 p, _collection = await _filing_target(db, batch)

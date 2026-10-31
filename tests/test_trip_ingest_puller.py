@@ -910,11 +910,60 @@ async def test_a_batch_too_large_for_one_tick_files_in_parts_across_ticks(world,
         f"/ingest/blobs/{hashlib.sha256(d).hexdigest()}" for d, _ in files
     )
     assert sorted(sniffed) == sorted(n for _, n in files)  # each file verified exactly once
-    assert len(_memos()) == 3  # parts of 2, 2 and 1 files
+    assert len(_memos()) == 1  # parts of 2, 2 and 1 files, all in the first part's memo
     assert _sql("SELECT count(*) FROM ingest_blobs WHERE filed_at IS NULL") == [(0,)]
-    assert _sql("SELECT count(DISTINCT memo_id) FROM attachments") == [(3,)]
+    assert _sql("SELECT count(DISTINCT memo_id), count(*) FROM attachments") == [(1, 5)]
     assert _home_batch(batch) == [("acked", True, True, False)]
     assert _pluto_batch(batch) == [("acked", True)]
+
+
+async def test_a_batch_of_more_than_one_part_is_one_memo_across_a_cancelled_tick(
+    world, monkeypatch
+):
+    """More files than one part holds, and the tick cancelled (the worker's housekeeping bound)
+    inside the second part, after its files were placed: one memo, every file on it, in the
+    manifest's order, the caption once."""
+    trip = await _trip(world)
+    count = trip_ingest.FILE_PART_FILES + 5
+    files = [(JPEG + i.to_bytes(2, "big"), f"p{i:02}.jpg") for i in range(count)]
+    batch = await _send(world, await _guest(world, trip), *files, caption="all of them")
+    park = asyncio.Event()
+    cancelled = [False]
+
+    def parking(name: str) -> None:
+        real = getattr(passes_svc, name, None)
+        if real is None:
+            return
+
+        async def parked(*args, **kwargs):
+            # A later part, its files placed; once the tick is cancelled, every part files.
+            if not cancelled[0] and _sql("SELECT count(*) FROM memos") != [(0,)]:
+                park.set()
+                await asyncio.Event().wait()  # until the tick is cancelled
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(passes_svc, name, parked)
+
+    parking("create_guest_memo")
+    parking("append_guest_files")
+    tick = asyncio.ensure_future(_tick(world))
+    await asyncio.wait_for(park.wait(), timeout=60)
+    tick.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tick
+    assert _home_batch(batch) == [("open", True, False, False)]
+    cancelled[0] = True
+    assert await _tick(world) == "ok"
+    [(memo_id, _vis, _owner, _pass, caption, _content)] = _memos()
+    assert caption == "all of them"
+    rows = _sql(
+        "SELECT a.memo_id, a.filename FROM attachments a ORDER BY a.position NULLS LAST, a.id"
+    )
+    assert [m for m, _ in rows] == [memo_id] * count
+    assert sorted(n for _, n in rows) == [n for _, n in files]
+    assert _sql("SELECT count(*) FROM ingest_blobs WHERE filed_at IS NULL") == [(0,)]
+    assert _home_batch(batch) == [("acked", True, True, False)]
+    assert _no_upload_parts(world)
 
 
 async def test_a_part_left_unfiled_keeps_the_batch_open_and_unacked(world, monkeypatch):
@@ -1008,7 +1057,7 @@ async def test_two_filings_racing_over_a_batch_of_parts_file_each_part_once(worl
         trip_ingest.file_batch(batch_id), trip_ingest.file_batch(batch_id), return_exceptions=True
     )
     assert sorted(results, key=repr) == [False, True], results
-    assert len(_memos()) == 3
+    assert len(_memos()) == 1  # three parts, one memo
     assert _sql("SELECT count(*), count(DISTINCT attachment_id) FROM ingest_blobs") == [(3, 3)]
 
 
@@ -1175,7 +1224,7 @@ async def test_an_oversized_variant_group_cancelled_mid_part_still_completes(
     assert _sql(
         "SELECT count(*) FROM ingest_blobs WHERE filed_at IS NULL OR attachment_id IS NULL"
     ) == [(0,)]
-    assert len(_memos()) == len(parts) == 3
+    assert len(parts) == 3 and len(_memos()) == 1
     # Each file filed once: a visible picture, or a print bound to the screen of its part.
     _assert_prints_bind_only_beside_their_screen(len(shots))
     gets = [p for _, p, _ in world.wire.seen if p.startswith("/ingest/blobs/")]
@@ -1208,7 +1257,7 @@ async def test_two_filings_racing_over_a_cut_variant_group_file_each_file_once(w
         trip_ingest.file_batch(batch_id), trip_ingest.file_batch(batch_id), return_exceptions=True
     )
     assert sorted(results, key=repr) == [False, True], results
-    assert len(_memos()) == 3  # parts of 2, 2 and 1 files
+    assert len(_memos()) == 1  # parts of 2, 2 and 1 files, one memo
     assert _sql("SELECT count(*) FROM ingest_blobs GROUP BY filed_at ORDER BY 1") == [
         (1,),
         (2,),
@@ -1599,3 +1648,24 @@ async def test_an_unhashable_id_in_a_push_answer_is_ignored_not_a_tick_error(wor
 
     world.wire.rewrite = unhashable
     assert await _tick(world) == "ok"
+
+
+async def test_a_tick_cancelled_by_its_bound_records_why_in_last_error(world, monkeypatch):
+    """The worker's housekeeping bound cancels a tick that runs past it: the cancellation still
+    ends the tick, and the cursor row says why (MEMNG-1045 item 3)."""
+    entered = asyncio.Event()
+
+    async def stuck(client) -> int:
+        entered.set()
+        await asyncio.Event().wait()
+        return 0
+
+    monkeypatch.setattr(trip_ingest, "push_passes", stuck)
+    tick = asyncio.ensure_future(_tick(world))
+    await asyncio.wait_for(entered.wait(), timeout=30)
+    tick.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tick
+    assert _sql("SELECT last_error, last_sync_at FROM trip_ingest_cursor") == [
+        (trip_ingest.TICK_CANCELLED, None)
+    ]

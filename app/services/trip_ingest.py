@@ -63,7 +63,6 @@ from app.models import (
     PassSyncState,
     TripIngestCursor,
 )
-from app.services import collections as coll_svc
 from app.services import passes as passes_svc
 from app.services import storage, variants
 from app.services import uploads as uploads_svc
@@ -1077,8 +1076,9 @@ def _filing_parts(blobs: Sequence[IngestBlob]) -> list[list[IngestBlob]]:
 
 
 async def _file_part(batch_id: int) -> bool | None:
-    """File the next part of a downloaded batch as one guest memo, in one transaction with the
-    ledger marks that say it is filed. None: the batch is not `open` (filed, quarantined — the
+    """File the next part of a downloaded batch into its guest memo (the first part makes it,
+    every later part is appended to it), in one transaction with the ledger marks that say it is
+    filed. None: the batch is not `open` (filed, quarantined — the
     replay is resolved here, before anything is inserted); True: this part completed the batch;
     False: parts remain for the next call."""
     moved: list[storage.TrackedMove] = []
@@ -1100,7 +1100,7 @@ async def _file_part(batch_id: int) -> bool | None:
                 if batch is None or batch.state != "open":
                     return None
                 uid = batch.uid
-                p, collection = await _filing_target(db, batch)
+                p, _collection = await _filing_target(db, batch)
                 assert p.created_by is not None
                 owner_id = p.created_by
                 blobs = list(
@@ -1150,7 +1150,7 @@ async def _file_part(batch_id: int) -> bool | None:
                 positions: dict[str, int] = {}
                 order = list(upload_for)
 
-                async def finalize(memo) -> list[str]:
+                async def finalize(memo, carried: Sequence[int] = ()) -> list[str]:
                     done = await uploads_svc.finalize_pending(
                         db,
                         order,
@@ -1159,6 +1159,9 @@ async def _file_part(batch_id: int) -> bool | None:
                         consumed_out=consumed,
                         positions_out=positions,
                         resolved_out=resolved,
+                        # The memo's attachments from earlier parts: the append re-locks them, so
+                        # pass 0's one ascending acquisition has to hold them already.
+                        named_attachment_ids=carried,
                         # Fresh rows always: a guest's bytes never take over an attachment the owner
                         # already has, its renditions or its placement (the gate's finding 4).
                         adopt_unlinked=False,
@@ -1167,28 +1170,41 @@ async def _file_part(batch_id: int) -> bool | None:
                     )
                     return sorted(done, key=lambda u: positions.get(u, len(done)))
 
-                memo = await passes_svc.create_guest_memo(
-                    db,
-                    p,
-                    caption=batch.caption,
-                    contributor_name=device.display_name if device is not None else None,
-                    idempotency_key=key,
-                    device=device,
-                    finalize=finalize,
-                    moved_out=moved,
+                name = device.display_name if device is not None else None
+                # A later part goes into the memo the first part made: one batch, one memo, its
+                # caption once (the MEMNG-1014 chaos AC). Only when the owner deleted that memo
+                # meanwhile does a part start a memo of its own.
+                memo = (
+                    await passes_svc.append_guest_files(
+                        db,
+                        p,
+                        batch.memo_id,
+                        contributor_name=name,
+                        device=device,
+                        finalize=finalize,
+                        moved_out=moved,
+                    )
+                    if batch.memo_id is not None
+                    else None
                 )
+                if memo is None:
+                    memo = await passes_svc.create_guest_memo(
+                        db,
+                        p,
+                        caption=batch.caption,
+                        contributor_name=name,
+                        idempotency_key=key,
+                        device=device,
+                        finalize=finalize,
+                        moved_out=moved,
+                    )
                 by_uid = {a.uid: a for a in memo.attachments}
                 now = datetime.now(UTC)
                 for up_uid, blob in upload_for.items():
                     att = by_uid.get(resolved.get(up_uid, ""))
                     blob.attachment_id = att.id if att is not None else None
                     blob.filed_at = now
-                if collection.kind == "album":
-                    # An album's membership is its member rows, not a tag (`guest_memo_content`).
-                    for att in sorted(memo.attachments, key=lambda a: a.id):
-                        await coll_svc.add_member(db, collection.id, att.id, added_by=owner_id)
-                if batch.memo_id is None:
-                    batch.memo_id = memo.id
+                batch.memo_id = memo.id
                 complete = len(part) == len(pending)
                 if complete:
                     batch.state = "complete"
@@ -1402,6 +1418,9 @@ async def sync_once(client: httpx.AsyncClient, budget_s: float) -> TickResult:
     return TickResult("ok", filed, tuple(errors))
 
 
+TICK_CANCELLED = "cancelled: the tick ran past its bound"
+
+
 async def _record_tick(*, synced: bool, error: str | None) -> None:
     async with async_session() as db:
         cur = await _cursor(db)
@@ -1439,6 +1458,12 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
                         await http.aclose()
                 await _record_tick(synced=True, error="; ".join(result.errors) or None)
                 return result.status
+    except asyncio.CancelledError:
+        # The worker's housekeeping bound (`worker._bounded`) cancelled the tick. The snapshot's
+        # age still says the sync is stale, but without this the reason was lost (MEMNG-1045).
+        # Shielded: the cancellation that brought the tick here must not also cancel the record.
+        await asyncio.shield(asyncio.ensure_future(_record_tick_safe(TICK_CANCELLED)))
+        raise
     except LinkDown as exc:
         logger.warning("trip_ingest.link_down", error=str(exc))
         await _record_tick_safe(f"link: {exc}")

@@ -1,11 +1,11 @@
 diff --git a/app/services/passes.py b/app/services/passes.py
 --- a/app/services/passes.py
 +++ b/app/services/passes.py
-@@ -553,7 +553,6 @@
+@@ -623,7 +623,6 @@
          finalize=finalize,
          # The final placement into the memo folder is a move like finalize's own, and a filing
          # that rolls back has to be able to walk it back too.
 -        moved_out=moved_out,
      )
+     await _file_into_album(db, collection, [a.id for a in memo.attachments], owner.id)
      memo.pass_id = p.id
-     memo.guest_caption = caption or None
