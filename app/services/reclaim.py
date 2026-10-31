@@ -45,6 +45,15 @@ the length of a transcode — it does not, since MEMNG-90 commits the claim befo
 the worker is inside, and this sweep has no reason to wait for it: the row it skips belongs to a
 run that will find the attachment gone and discard itself (MEMNG-41).
 
+Step 4 skips any path ANOTHER attachment row still names (MEMNG-959, `_named_elsewhere`). A path is
+what two rows could share — identical bytes in two memos are two names of one inode (a staging
+hit's hard link), each row holding its own, so that case never trips it; the check is the guard
+for two rows pointed at one file, where unlinking for the first would take the second's picture.
+A skipped path is not leaked: a row still names it, and the last row to go unlinks it. Two
+reclaims of such a pair are serialised on a transaction-scoped advisory lock per path, taken after
+the row lock — otherwise each would see the other's row still there, both would keep the file,
+and both rows would go.
+
 Holding the attachment lock from step 2 to the commit is what closes the late-publish window: a
 worker republishing a tier takes that same lock inside `guard_publish`, so it either finishes
 before step 3 (and its file is in the set collected there) or waits until after step 6 (and finds
@@ -63,13 +72,13 @@ from typing import Literal
 
 import structlog
 from anyio import to_thread
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select, union
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app.database import async_session
-from app.models import Attachment, MediaJob
+from app.models import Attachment, AttachmentRendition, MediaJob
 from app.services import printready
 from app.services.asset_paths import all_asset_paths
 
@@ -155,6 +164,67 @@ def unlink_paths(paths: list[Path]) -> list[str]:
         except OSError:
             failed.append(str(path))
     return failed
+
+
+def _named_paths(att: Attachment) -> list[str]:
+    """The files this row NAMES in a column — the only paths another row could also name. Every
+    derived tier is keyed by the row's own uid, so no other row can hold one of those."""
+    named = {path for path in (att.storage_path, att.print_path) if path}
+    named.update(rendition.storage_path for rendition in att.renditions)
+    return sorted(named)
+
+
+def _path_lock_stmt(path: str):
+    """The per-path advisory lock two reclaims of a shared file serialise on (released at commit or
+    rollback). Taken in sorted path order, after the row lock; nothing else takes it."""
+    return select(func.pg_advisory_xact_lock(func.hashtextextended(f"reclaim-path:{path}", 0)))
+
+
+def _named_elsewhere_stmt(att_id: int, named: list[str]):
+    """Which of `named` some OTHER attachment row — or another row's rendition — still names."""
+    return union(
+        select(Attachment.storage_path).where(
+            Attachment.id != att_id, Attachment.storage_path.in_(named)
+        ),
+        select(Attachment.print_path).where(
+            Attachment.id != att_id, Attachment.print_path.in_(named)
+        ),
+        select(AttachmentRendition.storage_path).where(
+            AttachmentRendition.attachment_id != att_id, AttachmentRendition.storage_path.in_(named)
+        ),
+    )
+
+
+async def _named_elsewhere(db: AsyncSession, att: Attachment) -> frozenset[str]:
+    """The reference count (MEMNG-959): this row's named paths that another row still uses, which
+    this reclaim must leave on disk. Asked under the per-path locks, so a concurrent reclaim of the
+    other row has either committed its delete (and is not counted) or waits for this one."""
+    named = _named_paths(att)
+    if not named:
+        return frozenset()
+    for path in named:
+        await db.execute(_path_lock_stmt(path))
+    rows = await db.execute(_named_elsewhere_stmt(att.id, named))
+    return frozenset(path for (path,) in rows if path)
+
+
+def _named_elsewhere_sync(session: Session, att: Attachment) -> frozenset[str]:
+    """`_named_elsewhere` for the maintenance script's synchronous reclaim."""
+    named = _named_paths(att)
+    if not named:
+        return frozenset()
+    for path in named:
+        session.execute(_path_lock_stmt(path))
+    rows = session.execute(_named_elsewhere_stmt(att.id, named))
+    return frozenset(path for (path,) in rows if path)
+
+
+def _unshared(paths: list[Path], shared: frozenset[str], att: Attachment) -> list[Path]:
+    if shared:
+        logger.info(
+            "reclaim.shared_path_kept", attachment_id=att.id, uid=att.uid, paths=sorted(shared)
+        )
+    return [path for path in paths if str(path) not in shared]
 
 
 def _has_leaked_path(att: Attachment) -> bool:
@@ -319,7 +389,9 @@ async def reclaim_attachment(
             "reclaim.profile_scan_failed", attachment_id=attachment_id, uid=uid, error=str(exc)
         )
         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
-    paths = all_asset_paths(att) + profile_assets
+    # 4. …minus whatever another row still names: that file is the other row's, not garbage.
+    shared = await _named_elsewhere(db, att)
+    paths = _unshared(all_asset_paths(att) + profile_assets, shared, att)
     failed, cancellation = await _unlink_off_the_loop(remove, paths)
     if failed:
         # FAIL CLOSED. Deleting the row now would leave these files with nothing naming them — the
@@ -522,7 +594,8 @@ def reclaim_attachment_sync(
             "reclaim.profile_scan_failed", attachment_id=attachment_id, uid=uid, error=str(exc)
         )
         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
-    paths = all_asset_paths(att) + profile_assets
+    shared = _named_elsewhere_sync(session, att)  # the reference count — see reclaim_attachment
+    paths = _unshared(all_asset_paths(att) + profile_assets, shared, att)
     failed = remove(paths)
     if failed:
         session.rollback()  # fail closed — see reclaim_attachment

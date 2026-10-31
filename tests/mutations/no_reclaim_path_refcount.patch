@@ -1,0 +1,20 @@
+Drop reclaim's reference check: unlink every path the row names, whether or not another row names
+it too (MEMNG-959).
+
+Two memo rows pointed at ONE original then lose it on the first delete — the second memo's picture
+is gone while its row still promises it. The probes that must turn red are the two delete orders of
+the `same-path` shape. The `staged` shape stays green on purpose: a staging hit gives each row its
+own hard-linked name, which no reference count is needed to protect, and that is the property the
+staged cases pin.
+
+--- a/app/services/reclaim.py
++++ b/app/services/reclaim.py
+@@ -390,7 +390,7 @@
+         )
+         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
+     # 4. …minus whatever another row still names: that file is the other row's, not garbage.
+-    shared = await _named_elsewhere(db, att)
++    shared: frozenset[str] = frozenset()
+     paths = _unshared(all_asset_paths(att) + profile_assets, shared, att)
+     failed, cancellation = await _unlink_off_the_loop(remove, paths)
+     if failed:

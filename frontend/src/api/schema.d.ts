@@ -3671,6 +3671,11 @@ export interface components {
             last_modified?: number | null;
             /** Mime */
             mime: string;
+            /**
+             * Sha256
+             * @description Optional SHA-256 of the file's bytes, lowercase hex. When the caller already owns an attachment with this digest and `size`, the session is created complete (`bytes_received` equals `size`) and the client goes straight to finalize; otherwise it is an ordinary session. Only the caller's own attachments are ever matched.
+             */
+            sha256?: string | null;
             /** Size */
             size: number;
         };

@@ -51,6 +51,10 @@ publication manufactures a new cycle; they change together or not at all.
 `sibling._write_result` (MEMNG-796) acquires in the same order — its own job row, then its
 attachment, each `FOR UPDATE` — and `tests/test_sibling_job.py` races it against
 `reclaim_attachment` on two connections (the attachment-first order there is a 40P01).
+After its attachment row, a reclaim takes one transaction-scoped advisory lock per path the row
+names (`reclaim._named_elsewhere`, MEMNG-959), in sorted path order, LAST — nothing else takes
+them, and the holder asks for no row after them — so two reclaims of rows naming one file queue on
+the path instead of each keeping it for the other.
 
 `uploads.upload_uid` is a text PK and text ordering is collation-dependent. The rule is therefore
 that every path uses the identical `ORDER BY Upload.upload_uid` clause against the one database —

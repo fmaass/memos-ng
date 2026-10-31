@@ -13,7 +13,7 @@ from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import get_session
 from app.models import AttachmentStatus, Upload, User
-from app.services import upload_metrics
+from app.services import storage, upload_metrics
 from app.services import uploads as svc
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
@@ -79,6 +79,14 @@ class UploadCreate(BaseModel):
     mime: str
     size: int
     last_modified: int | None = None  # client File.lastModified, epoch ms
+    sha256: str | None = Field(
+        default=None,
+        pattern="^[0-9a-f]{64}$",
+        description="Optional SHA-256 of the file's bytes, lowercase hex. When the caller already "
+        "owns an attachment with this digest and `size`, the session is created complete "
+        "(`bytes_received` equals `size`) and the client goes straight to finalize; otherwise it "
+        "is an ordinary session. Only the caller's own attachments are ever matched.",
+    )
 
 
 class UploadOut(BaseModel):
@@ -176,6 +184,7 @@ async def start_upload(
         mime=body.mime,
         size=body.size,
         last_modified=body.last_modified,
+        sha256=body.sha256,
     )
     await db.commit()
     return UploadOut(
@@ -375,6 +384,18 @@ async def upload_capture(
     )
 
 
+def _restore_moves_sync(moves: list[storage.TrackedMove]) -> None:
+    """Walk back what a failed finalize placed on disk, last placement first (worker thread).
+
+    Each restore arbitrates with its own placement under the record's lock, so this is safe while
+    a copy or move thread is still running. A restore that fails is logged and left in place: a
+    file in the wrong directory can still be recovered by hand, an unlinked one cannot."""
+    for move in reversed(moves):
+        unrestored = move.restore()
+        if unrestored is not None:
+            logger.error("uploads.finalize.restore_failed", src=move.src, dest=unrestored)
+
+
 @router.post("/{upload_uid}/finalize", response_model=AttachmentOut)
 async def finalize_upload(
     upload_uid: str,
@@ -387,15 +408,34 @@ async def finalize_upload(
     # finalize would destroy the client's only copy if this commit then failed, leaving a restored
     # upload row promising bytes that are gone (MEMNG-142).
     consumed: list[str] = []
+    # What finalize placed on disk before the commit — the original's move and, for a staging hit,
+    # the derived tiers it copied from the twin (MEMNG-959) — walked back if the write does not
+    # land, so a copied tier never outlives the rolled-back row under a uid nothing names.
+    moved: list[storage.TrackedMove] = []
     try:
-        attachment = await svc.finalize(db, upload, owner_id=user.id, consumed_out=consumed)
-    except svc.UploadsUnlinkable:
-        # The session was consumed by another finalize while this one waited for its row. Same
-        # answer as an unknown uid — because that is what it now is.
-        raise HTTPException(status_code=404, detail="Upload not found") from None
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-    await db.commit()
+        try:
+            attachment = await svc.finalize(
+                db, upload, owner_id=user.id, moved_out=moved, consumed_out=consumed
+            )
+        except svc.UploadsUnlinkable:
+            # The session was consumed by another finalize while this one waited for its row.
+            # Same answer as an unknown uid — because that is what it now is.
+            raise HTTPException(status_code=404, detail="Upload not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        await db.commit()
+    except BaseException:
+        # Off the loop: every restore is a rename or an unlink on the data volume, and a copy's
+        # restore may first wait out that copy's lock. `finish_off_the_loop` runs the whole
+        # walk-back in one worker thread and awaits it under a shield until it has RETURNED,
+        # remembering any cancellation that arrives meanwhile — so the request never unwinds with
+        # files half walked back, and the cancellation is still delivered once the walk-back is
+        # over.
+        if moved:
+            _, cancelled = await svc.finish_off_the_loop(_restore_moves_sync, moved)
+            if cancelled is not None:
+                raise cancelled from None
+        raise
     if consumed:
         await to_thread.run_sync(svc.reap_consumed_sync, consumed)
     return AttachmentOut(

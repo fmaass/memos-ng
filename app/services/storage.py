@@ -99,6 +99,31 @@ class TrackedMove:
             return None
 
 
+@dataclass
+class TrackedCopy(TrackedMove):
+    """A file COPIED into place before the write commits, walked back by removing the copy.
+
+    The same arbitration as a move and kept in the same list, so every caller that already undoes
+    its moves on a failed write undoes these too without knowing the difference: `perform` copies
+    under the lock and records `dest`; `restore` takes the lock, marks the copy abandoned and
+    unlinks what it placed. `src` is never touched — it belongs to another attachment (MEMNG-959:
+    the derived tiers a staging hit reuses from its twin).
+    """
+
+    def restore(self) -> str | None:
+        with self._lock:
+            self._abandoned = True
+            dest = self.dest
+            if dest is None:
+                return None
+            try:
+                Path(dest).unlink(missing_ok=True)
+            except OSError:
+                return dest
+            self.dest = None
+            return None
+
+
 def _truncate_bytes(name: str, limit: int) -> str:
     """Cap `name` to `limit` ENCODED bytes (filesystem component limits are byte-based, ~255),
     never splitting a multibyte char. Keeps the extension when possible so the name stays usable."""

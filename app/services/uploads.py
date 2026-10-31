@@ -486,10 +486,20 @@ async def create_upload(
     mime: str,
     size: int,
     last_modified: int | None = None,
+    sha256: str | None = None,
 ) -> Upload:
     """Open an upload session BOUND to `owner_id`. The uid is unguessable but is not a capability:
     every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
-    another user out of these bytes."""
+    another user out of these bytes.
+
+    `sha256` (MEMNG-959) is the client's claim about the bytes it is about to send. When this owner
+    already has an attachment with that digest AND that size, the part file is made a HARD LINK to
+    its original and the session is born complete (`bytes_received == size`): nothing needs to
+    travel. Absent, unmatched, or the link refused (EXDEV, EPERM, the original missing) — the
+    ordinary empty part, exactly as without it. The claim is trusted no further than this owner's
+    own rows: a guessed digest can only re-attach bytes the caller already owns, and finalize
+    re-hashes the part as it always has, so a row is never stamped with a digest its bytes lack.
+    """
     upload_uid = secrets.token_urlsafe(24)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
     # millisecond than the one sent once the seconds pass 2**32, and this value is kept exactly
@@ -509,7 +519,12 @@ async def create_upload(
     await db.flush()
     # The part file last, after everything that can raise: made first, a `last_modified` past
     # year 9999 (OverflowError) left a part file with no row to find it by, once per attempt.
-    await to_thread.run_sync(_create_part_sync, part_path(upload_uid))
+    part = part_path(upload_uid)
+    if sha256 is not None and await _link_staged_twin(db, owner_id, sha256, size, part):
+        upload.bytes_received = size
+        await db.flush()
+        return upload
+    await to_thread.run_sync(_create_part_sync, part)
     return upload
 
 
@@ -538,6 +553,68 @@ async def idle_bounded(stream: AsyncIterable[bytes], seconds: float) -> AsyncIte
             logger.info("upload.body_idle", idle_seconds=seconds)
             raise BodyIdle()
         yield chunk
+
+
+# How many of the owner's same-digest rows a staging match tries before giving up: identical bytes
+# in several memos is ordinary, and any one original is the same bytes, but a pathological pile of
+# rows whose files are all gone must not turn one POST into an unbounded walk over the share.
+STAGING_CANDIDATES = 3
+
+
+def _link_part_sync(original: Path, part: Path, size: int) -> bool:
+    """Make `part` a second NAME for `original` and confirm it holds `size` bytes, in one hop.
+
+    A hard link, never a copy: the session costs no bytes, and no write ever reaches it — a session
+    born complete refuses any body past its size and treats one below it as a replay (see
+    `append_offset_stream`), so the shared inode is read-only by construction. Answers False on any
+    OSError (EXDEV across filesystems, EPERM, the original gone) and on a size that disagrees with
+    the row, removing a link it made in that case; the caller then opens the ordinary empty part.
+
+    A link it made and cannot take back RAISES instead. The ordinary path would `touch` that name
+    and record `bytes_received = 0`, and the first PATCH at offset 0 would then write straight into
+    the original's inode — so a request that fails here is the only safe outcome.
+    """
+    try:
+        part.parent.mkdir(parents=True, exist_ok=True)
+        os.link(original, part)
+    except OSError:
+        return False
+    try:
+        if part.stat().st_size == size:
+            return True
+    except OSError:
+        pass
+    part.unlink(missing_ok=True)  # raises if it cannot: see above
+    return False
+
+
+async def _link_staged_twin(
+    db: AsyncSession, owner_id: int, sha256: str, size: int, part: Path
+) -> bool:
+    """Back a new session's part file with an original this OWNER already holds — see
+    `create_upload`. Only `owner_id`'s rows are candidates, matched on digest AND size."""
+    originals = (
+        (
+            await db.execute(
+                select(Attachment.storage_path)
+                .where(
+                    Attachment.owner_id == owner_id,
+                    Attachment.sha256 == sha256,
+                    Attachment.size == size,
+                    Attachment.storage_path.is_not(None),
+                )
+                .order_by(Attachment.id)
+                .limit(STAGING_CANDIDATES)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for original in originals:
+        assert original is not None  # filtered above
+        if await to_thread.run_sync(_link_part_sync, Path(original), part, size):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1490,7 @@ async def finalize_pending(
             owner_id,
             moved_out,
             dedup=poster_upload is None,
+            reuse_linked=adopt_unlinked,
             consumed_out=consumed_out,
             locked=locked,
         )
@@ -1484,6 +1562,175 @@ async def finalize_pending(
     return out
 
 
+# The derived tiers a staging hit takes over from its twin (MEMNG-959), and the ones that must be
+# there for the twin to count as derived at all — what the worker publishes before it calls a row
+# `ready`. Anything else in the list is copied when present and otherwise left to be produced on
+# demand, exactly as it is for the twin.
+REUSED_TIERS = ("thumb", "mobile", "web", "poster", "printready")
+REQUIRED_TIERS = {"image": ("thumb", "mobile"), "video": ("poster", "web")}
+
+
+def _first_same_file_sync(part: Path, originals: list[str]) -> int | None:
+    """The index of the first original `part` is a second name of (same device and inode), or None.
+
+    This is how finalize recognises a staging hit without recording one: only `create_upload`'s
+    hard link makes a part file share an inode with an original. An ordinary upload never does,
+    so it can never take this path — and a false negative merely derives afresh."""
+    for index, original in enumerate(originals):
+        try:
+            if os.path.samefile(part, original):
+                return index
+        except OSError:
+            continue
+    return None
+
+
+def _tier_pairs(twin_uid: str, uid: str, kind: str) -> list[tuple[Path, Path]] | None:
+    """(twin's file, this uid's file) for every reusable tier file the twin HAS — its
+    format-negotiated variants included — or None when a required tier is missing."""
+    pairs: list[tuple[Path, Path]] = []
+    for tier in REUSED_TIERS:
+        src = asset_paths.derived_tier_path(twin_uid, tier)
+        dst = asset_paths.derived_tier_path(uid, tier)
+        assert src is not None and dst is not None  # every name above is a known tier
+        if not src[0].is_file():
+            if tier in REQUIRED_TIERS[kind]:
+                return None
+            continue
+        pairs.append((src[0], dst[0]))
+        for src_variant, dst_variant in zip(
+            asset_paths.variant_paths(src[0]), asset_paths.variant_paths(dst[0]), strict=True
+        ):
+            if src_variant.is_file():
+                pairs.append((src_variant, dst_variant))
+    return pairs
+
+
+def _tracked_copy_sync(track: storage.TrackedCopy, dest: Path) -> Path:
+    """`_copy_into_sync` under the copy's own arbitration — a temp in the destination directory,
+    fsynced, then a within-device rename, so a reader never sees half a tier."""
+
+    def copy(src: Path) -> Path:
+        _copy_into_sync(src, dest, dest.with_name(dest.name + ".tmp"))
+        return dest
+
+    return track.perform(copy)
+
+
+async def _reuse_twin_tiers(
+    db: AsyncSession,
+    owner_id: int,
+    digest: str,
+    size: int,
+    part: Path,
+    uid: str,
+    moved_out: list[storage.TrackedMove],
+) -> Attachment | None:
+    """Finalize by link (MEMNG-959): when `part` is a staging hit — a hard link to an original of
+    one of this owner's `ready` attachments with these bytes — give `uid` its OWN COPY of every
+    derived tier that twin has and return the twin, whose dims and blurhash the caller copies.
+    None means derive as usual.
+
+    THE SHARING MODEL, chosen for reclaim: the new row gets its own original NAME (the hard link,
+    moved into place like any upload) and its own COPIES of the derived tiers. Nothing is shared
+    by PATH, so reclaiming either row unlinks only names that row alone holds and never takes a
+    file the other still serves; the last name of the original goes with the last row. Sharing the
+    tier files themselves is not even expressible — they are keyed by uid
+    (`asset_paths.derived_tier_path`) — and copying costs the cache volume a few hundred KB per
+    photo, a transcode's size per video. `reclaim` still checks for another row naming a path
+    before unlinking it, as a guard for the shape this never produces.
+
+    The twin is READ, not locked: the batch acquires nothing after its pass 0 (MEMNG-267 R3). A
+    reclaim racing this copy can only make a tier vanish mid-way; the copies already made stay
+    tracked in `moved_out` under this uid, and the caller derives afresh, which overwrites them.
+    """
+    twins = (
+        (
+            await db.execute(
+                select(Attachment)
+                .where(
+                    Attachment.owner_id == owner_id,
+                    Attachment.sha256 == digest,
+                    Attachment.size == size,
+                    Attachment.status == AttachmentStatus.ready,
+                    Attachment.storage_path.is_not(None),
+                )
+                .order_by(Attachment.id)
+                .limit(STAGING_CANDIDATES)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not twins:
+        return None
+    originals = [twin.storage_path or "" for twin in twins]
+    index = await to_thread.run_sync(_first_same_file_sync, part, originals)
+    if index is None:
+        return None
+    twin = twins[index]
+    kind = "video" if twin.mime.startswith("video/") else "image"
+    pairs = await to_thread.run_sync(_tier_pairs, twin.uid, uid, kind)
+    if pairs is None:
+        return None
+    for src, dst in pairs:
+        track = storage.TrackedCopy(src=str(src))
+        moved_out.append(track)  # before the copy, never after — see storage.TrackedMove
+        try:
+            await to_thread.run_sync(_tracked_copy_sync, track, dst)
+        except OSError as exc:
+            logger.warning("uploads.twin_tier_copy_failed", uid=uid, path=str(src), error=str(exc))
+            return None
+    return twin
+
+
+def _attachment_from_twin(
+    twin: Attachment,
+    upload: Upload,
+    uid: str,
+    owner_id: int,
+    size: int,
+    digest: str,
+    dest: Path,
+    now: datetime,
+) -> Attachment:
+    """The new row of a finalize by link: its own uid, name and original path, and — because the
+    bytes are the twin's to the last one — every column the worker and the metadata reads derived
+    from those bytes, copied rather than read again. The capture time keeps this upload's own
+    precedence (the file's date, else this client's modification time, else now)."""
+    return Attachment(
+        uid=uid,
+        owner_id=owner_id,
+        filename=upload.filename,
+        mime=twin.mime,
+        size=size,
+        sha256=digest,
+        width=twin.width,
+        height=twin.height,
+        duration=twin.duration,
+        blurhash=twin.blurhash,
+        captured_at=twin.capture_instant or upload.capture_instant or upload.client_mtime or now,
+        capture_instant=twin.capture_instant,
+        capture_civil=twin.capture_civil,
+        capture_source=twin.capture_source,
+        latitude=twin.latitude,
+        longitude=twin.longitude,
+        location_source=twin.location_source,
+        sibling_outcome=twin.sibling_outcome,
+        camera_make=twin.camera_make,
+        camera_model=twin.camera_model,
+        lens_model=twin.lens_model,
+        f_number=twin.f_number,
+        exposure_time_s=twin.exposure_time_s,
+        focal_length_mm=twin.focal_length_mm,
+        exposure_bias_ev=twin.exposure_bias_ev,
+        iso=twin.iso,
+        camera_source=twin.camera_source,
+        status=AttachmentStatus.ready,
+        storage_path=str(dest),
+    )
+
+
 async def finalize(
     db: AsyncSession,
     upload: Upload,
@@ -1493,6 +1740,7 @@ async def finalize(
     dedup: bool = True,
     consumed_out: list[str] | None = None,
     locked: LockedMedia | None = None,
+    reuse_linked: bool = True,
 ) -> Attachment:
     """Turn one fully-received upload into this owner's attachment (or, by dedup, hand back the
     unlinked one that already holds these bytes).
@@ -1509,6 +1757,12 @@ async def finalize(
 
     `consumed_out` collects the part files this call CONSUMED without moving — see
     `finalize_pending` for why the caller has to unlink them after its commit rather than here.
+
+    A STAGING HIT (MEMNG-959: a part file `create_upload` hard-linked to one of this owner's
+    originals) that is not handed an unlinked twin above mints a NEW row that reuses its linked
+    twin's derived tiers, dims and blurhash with no media job (`_reuse_twin_tiers`). It needs
+    `moved_out` to track the tier copies, and `dedup` and `reuse_linked` both true; without them,
+    or with no `ready` twin to copy from, the staged bytes finalize as any upload does.
     """
     # Under the upload's row lock BEFORE anything is copied off it. The append that completes an
     # upload writes its capture read in the same transaction as the last chunk, so a finalize that
@@ -1589,7 +1843,15 @@ async def finalize(
         await db.flush()
         return existing
 
-    mime = await to_thread.run_sync(_sniff_mime, part, upload.mime)
+    uid = secrets.token_urlsafe(16)
+    twin = (
+        await _reuse_twin_tiers(db, owner_id, digest, actual, part, uid, moved_out)
+        if dedup and reuse_linked and moved_out is not None
+        else None
+    )
+    mime = (
+        twin.mime if twin is not None else await to_thread.run_sync(_sniff_mime, part, upload.mime)
+    )
     now = datetime.now(UTC)
     # Stage in originals/_unfiled/ — the memo (and so the per-memo folder) doesn't exist yet; the
     # master is atomically moved into originals/YYYY/MM/<memo-folder>/ on link_attachments.
@@ -1607,10 +1869,23 @@ async def finalize(
     await to_thread.run_sync(_tracked_move_into_sync, track, dest)  # mkdir + os.replace in one hop
 
     is_video = mime.startswith("video/")
+    if twin is not None:
+        attachment = _attachment_from_twin(twin, upload, uid, owner_id, actual, digest, dest, now)
+        db.add(attachment)
+        await db.flush()
+        await event_stream.notify_attachment_status(db, attachment.uid, owner_id)
+        if locked is not None:
+            locked.candidates.setdefault(digest, attachment)  # see the minting branch below
+        # No media job of either kind: the tiers are in place, and the twin's sibling outcome and
+        # metadata columns came with it.
+        upload_metrics.count_session_end(db, "completed")
+        await db.delete(upload)
+        await db.flush()
+        return attachment
     latitude, longitude, location_source = await _read_location(dest, mime)
     camera_found, camera_source = await _read_camera(dest, mime)
     attachment = Attachment(
-        uid=secrets.token_urlsafe(16),
+        uid=uid,
         owner_id=owner_id,
         filename=upload.filename,
         mime=mime,
