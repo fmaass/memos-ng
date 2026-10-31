@@ -492,6 +492,68 @@ async def test_a_device_revoked_while_its_body_streams_lands_no_bytes(door, home
     assert (await complete(door, token, [uid])).status_code == 401
 
 
+async def test_a_revoked_device_is_shut_out_while_its_sibling_keeps_uploading(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    ingest_env,  # noqa: F811
+):
+    pass_uid, secret = await seeded_pass(home_iface)
+    anna = await redeem(door, secret, "Anna")
+    ben = await redeem(door, secret, "Ben")
+    sessions = {}
+    for out in (anna, ben):
+        r = await door.post(
+            "/api/guest/uploads",
+            json={"filename": "a.jpg", "size": len(JPEG)},
+            headers=bearer(out["device_token"]),
+        )
+        assert r.status_code == 201, r.text
+        sessions[out["device_id"]] = r.json()["upload_uid"]
+    revoked = await home_iface.put(
+        "/ingest/device-revocations",
+        json={
+            "revocations": [
+                {
+                    "device_id": anna["device_id"],
+                    "pass_uid": pass_uid,
+                    "version": 2,
+                    "revoked_at": datetime.now(UTC).isoformat(),
+                }
+            ]
+        },
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert [a["device_id"] for a in revoked.json()["applied"]] == [anna["device_id"]]
+    # The revoked device is refused before a byte lands.
+    r = await door.patch(
+        f"/api/guest/uploads/{sessions[anna['device_id']]}",
+        content=JPEG,
+        headers={**bearer(anna["device_token"]), "Upload-Offset": "0"},
+    )
+    assert r.status_code == 401
+    assert (ingest_env / "parts" / f"{sessions[anna['device_id']]}.part").read_bytes() == b""
+    # Its sibling on the same pass keeps uploading, and its bytes land.
+    ben_uid = sessions[ben["device_id"]]
+    r = await door.patch(
+        f"/api/guest/uploads/{ben_uid}",
+        content=JPEG,
+        headers={**bearer(ben["device_token"]), "Upload-Offset": "0"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["bytes_received"] == len(JPEG)
+    assert (ingest_env / "parts" / f"{ben_uid}.part").read_bytes() == JPEG
+    done = await complete(door, ben["device_token"], [ben_uid])
+    assert done.status_code == 200, done.text
+    sha = hashlib.sha256(JPEG).hexdigest()
+    assert (ingest_env / "blobs" / sha[:2] / sha).read_bytes() == JPEG
+    anna_uid = sessions[anna["device_id"]]
+    assert (await complete(door, anna["device_token"], [anna_uid])).status_code == 401
+    assert _sql(
+        "SELECT display_name, revoked_at IS NOT NULL, revoked_version "
+        "FROM pass_devices ORDER BY display_name"
+    ) == [("Anna", True, 2), ("Ben", False, None)]
+
+
 async def test_a_completion_fenced_by_a_revocation_files_nothing(door, home_iface):  # noqa: F811
     pass_uid, secret = await seeded_pass(home_iface)
     token = (await redeem(door, secret))["device_token"]

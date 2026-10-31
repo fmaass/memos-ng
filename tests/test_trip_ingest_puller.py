@@ -604,6 +604,42 @@ async def test_a_revocation_made_while_the_link_is_down_lands_on_reconnect_and_b
     assert len(_memos()) == 1 and _pluto_batch(batch) == [("acked", True)]
 
 
+async def test_one_device_revoked_at_home_lands_alone_on_the_ingest_host_in_one_tick(world):
+    trip = await _trip(world)
+    anna = await _guest(world, trip, "Anna")
+    ben = await _guest(world, trip, "Ben")
+    assert await trip_ingest.pull_devices(world.link) == 2  # home's mirror holds both devices
+    (anna_uid,) = _sql("SELECT uid FROM pass_devices WHERE display_name = 'Anna'")[0]
+    async with async_session() as db:
+        p = await passes_svc.get_pass(db, trip.pass_uid)
+        owner = await db.get(User, world.owner_id)
+        assert p is not None and owner is not None
+        assert await passes_svc.revoke_device(db, p, anna_uid, owner) is not None
+        await db.commit()
+    assert _sql("SELECT push_urgent FROM pass_sync_state") == [(True,)]
+    sent = len(world.wire.requests)
+    assert await _tick(world) == "ok"
+    pushed = [
+        [(r["device_id"], r["version"]) for r in json.loads(request.content)["revocations"]]
+        for request in world.wire.requests[sent:]
+        if request.method == "PUT" and request.url.path == "/ingest/device-revocations"
+    ]
+    assert pushed == [[(anna_uid, 2)]]
+    # The ingest host holds the one revocation; the sibling and the pass stay live.
+    assert _sql(
+        "SELECT display_name, revoked_at IS NOT NULL, revoked_version "
+        "FROM pluto.pass_devices ORDER BY display_name"
+    ) == [("Anna", True, 2), ("Ben", False, None)]
+    assert _sql("SELECT revoked_at IS NULL, version FROM pluto.passes") == [(True, 2)]
+    assert _sql(
+        "SELECT display_name, revoked_version, revocation_acked_version "
+        "FROM pass_devices ORDER BY display_name"
+    ) == [("Anna", 2, 2), ("Ben", None, None)]
+    assert _sql("SELECT acked_version, push_urgent FROM pass_sync_state") == [(2, False)]
+    assert (await world.door.get("/api/guest/me", headers=bearer(anna))).status_code == 401
+    assert (await world.door.get("/api/guest/me", headers=bearer(ben))).status_code == 200
+
+
 async def test_a_pull_never_clears_a_home_revocation(world):
     trip = await _trip(world)
     await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
