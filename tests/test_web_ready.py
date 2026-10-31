@@ -97,6 +97,15 @@ def test_memo_feed_attachment_refs_carry_web_ready(seeded):
     assert _flags(memo["attachments"]) == EXPECTED
 
 
+def test_memo_feed_attachment_refs_carry_status(seeded):
+    """The feed tells a mid-transcode attachment (`processing`) apart from the ready ones."""
+    body = seeded.get("/api/memos").json()
+    [memo] = [m for m in body["items"] if m["uid"] == "wr-memo"]
+    got = {i["uid"]: i["status"] for i in memo["attachments"] if i["uid"] in CASES}
+    assert got == {uid: case[1] for uid, case in CASES.items()}
+    assert got["wr-vid-transcoding"] == "processing"
+
+
 def test_single_memo_attachment_refs_carry_web_ready(seeded):
     memo = seeded.get("/api/memos/wr-memo").json()
     assert _flags(memo["attachments"]) == EXPECTED
