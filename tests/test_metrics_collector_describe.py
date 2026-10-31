@@ -47,6 +47,7 @@ def test_register_keeps_the_name_collision_check(make):
                 qm.JOB_SECONDS: "gaugehistogram",
                 qm.JOBS_FAILED: "counter",
                 qm.SESSIONS: "counter",
+                qm.ORPHANED: "gauge",
             },
             id="upload_queue",
         ),

@@ -66,20 +66,31 @@ import enum
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 import structlog
 from anyio import to_thread
-from sqlalchemy import Select, func, select, union
+from sqlalchemy import ColumnElement, Select, exists, func, select, union
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import async_session
-from app.models import Attachment, AttachmentRendition, MediaJob
-from app.services import printready
+from app.models import (
+    Attachment,
+    AttachmentRendition,
+    Collection,
+    CollectionCover,
+    CollectionMember,
+    DigestHostedMedia,
+    MediaJob,
+    Upload,
+    attachment_tags,
+)
+from app.services import printready, storage
 from app.services.asset_paths import all_asset_paths
 
 logger = structlog.get_logger(__name__)
@@ -91,6 +102,12 @@ logger = structlog.get_logger(__name__)
 # Not anchored: the stored path is absolute and its prefix is the deployment's DATA_ROOT.
 LEAKED_PATH_RE = r"originals/[0-9]{4}/[0-9]{2}/"
 _LEAKED_PATH = re.compile(LEAKED_PATH_RE)
+
+# A row a standalone finalize made (`POST /api/uploads/{uid}/finalize`) and no memo ever took
+# (MEMNG-968). Counted once it is a day old, reclaimed once it is three days old, both by its
+# `created_at` — the instant finalize inserted it (a twin-built row does not copy its twin's).
+NEVER_LINKED_COUNT_AFTER = timedelta(hours=24)
+NEVER_LINKED_RECLAIM_AFTER = timedelta(hours=72)
 
 
 class Revalidate(enum.StrEnum):
@@ -123,6 +140,12 @@ class Revalidate(enum.StrEnum):
     premise is both halves of that predicate, and its selection is the oldest thing anyone here
     acts on, so both are re-checked."""
 
+    NEVER_LINKED = "never_linked"
+    """The worker's never-linked sweep picked this row by `never_linked_clauses` and a creation
+    cutoff (MEMNG-968). Its premise is the WHOLE of that predicate — the `_unfiled/` discriminator,
+    every exclusion and the cutoff — so all of it is asked again under the row lock, in the same
+    SQL, against the cutoff the pass selected on. Without a cutoff it refuses (fail closed)."""
+
 
 Outcome = Literal["reclaimed", "vanished", "skipped_ineligible", "failed_unlink"]
 
@@ -133,6 +156,59 @@ class ReclaimResult:
 
     outcome: Outcome
     failed_paths: tuple[str, ...] = field(default=())
+
+
+def never_linked_clauses() -> list[ColumnElement[bool]]:
+    """What makes a row "finalized by an upload session and never linked" (MEMNG-968), as SQL —
+    the sweep's selection, the gauge's count and the NEVER_LINKED revalidation all read THIS list.
+
+    `memo_id IS NULL` alone is the wrong predicate: the 0.29.1 imports (flat `originals/`) and the
+    leftovers of old memo deletes (dated memo folders) carry it too and are household archive
+    media. The positive discriminator is `storage.is_unfiled`: only a standalone finalize leaves an
+    attachment's original DIRECTLY in `<DATA_ROOT>/originals/_unfiled/`, because `link_attachments`
+    moves it out the moment a memo takes it. Compared as a literal prefix plus "no further slash",
+    never as a LIKE pattern, whose `_` would match any character. `detached_at IS NULL` leaves a
+    detached row to the detached sweep, which judges it by its own clock.
+
+    Then what keeps a never-linked row: a same-owner upload session declaring the same bytes (it
+    may be about to stage onto or dedup into this row, MEMNG-959 — the finalized row's own session
+    is gone, finalize deletes it), and anything the owner did with the picture the library shows
+    them — an album, a cover, a picture tag, a print rendition, a digest's hosted copy.
+    """
+    prefix = str(storage.unfiled_dir(Path(settings.DATA_ROOT))) + "/"
+    return [
+        Attachment.memo_id.is_(None),
+        Attachment.detached_at.is_(None),
+        func.left(Attachment.storage_path, len(prefix)) == prefix,
+        func.strpos(func.substr(Attachment.storage_path, len(prefix) + 1), "/") == 0,
+        Attachment.print_path.is_(None),
+        ~exists().where(Upload.owner_id == Attachment.owner_id, Upload.sha256 == Attachment.sha256),
+        ~exists().where(CollectionMember.attachment_id == Attachment.id),
+        ~exists().where(CollectionCover.attachment_id == Attachment.id),
+        ~exists().where(Collection.cover_attachment_id == Attachment.id),
+        ~exists().where(attachment_tags.c.attachment_id == Attachment.id),
+        ~exists().where(AttachmentRendition.attachment_id == Attachment.id),
+        ~exists().where(DigestHostedMedia.attachment_id == Attachment.id),
+    ]
+
+
+async def _still_never_linked(db: AsyncSession, att_id: int, created_before: datetime) -> bool:
+    """NEVER_LINKED's revalidation: the same clauses, asked of this one row, under its lock.
+
+    Every exclusion table carries a foreign key to `attachments`, so an insert naming this row
+    takes a KEY SHARE lock on it: one already in flight makes our FOR UPDATE wait for its commit
+    (and this READ COMMITTED statement then sees it), and one that starts after waits for ours and
+    finds the row gone. The upload session is not a foreign key; one that opens after this check
+    stages a hard link of its own (MEMNG-959) or finalizes into a fresh row, so no bytes are lost.
+    """
+    found = await db.execute(
+        select(Attachment.id).where(
+            Attachment.id == att_id,
+            Attachment.created_at <= created_before,
+            *never_linked_clauses(),
+        )
+    )
+    return found.scalar_one_or_none() is not None
 
 
 def leaked_orphans_stmt() -> Select[tuple[Attachment]]:
@@ -237,6 +313,7 @@ def _ineligible(
     *,
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
+    created_before: datetime | None = None,
 ) -> str | None:
     """Why this row may no longer be reclaimed under `mode`, or None to go ahead.
 
@@ -263,6 +340,11 @@ def _ineligible(
         # of this mode that deletes a picture the user is still editing.
         if detached_before is None or att.detached_at is None or att.detached_at > detached_before:
             return "adopted_or_redetached"
+    if mode is Revalidate.NEVER_LINKED and created_before is None:
+        # Fail closed, as DETACHED does: "every never-linked row, whatever its age" would take a
+        # picture whose memo is still being composed. The rest of the premise is SQL — see
+        # `_still_never_linked`, which `reclaim_attachment` asks next.
+        return "no_cutoff"
     return None
 
 
@@ -310,6 +392,7 @@ async def reclaim_attachment(
     unlink: Callable[[list[Path]], list[str]] | None = None,
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
+    created_before: datetime | None = None,
 ) -> ReclaimResult:
     """Reclaim ONE attachment in its own transaction, in the order this module documents.
 
@@ -319,6 +402,7 @@ async def reclaim_attachment(
     `detached_at` and `detached_before` carry the caller's premise about WHEN this row was detached
     — the instant it detached it with, or the cutoff its pass selected on — so the revalidation
     under the lock can be about the same instant the decision was taken about (see `_ineligible`).
+    `created_before` is the never-linked sweep's cutoff, NEVER_LINKED's alone.
 
     `unlink` is the seam the crash-window tests inject at; production passes nothing. It is called
     OFF the event loop, in a worker thread this coroutine then waits out whatever happens to it
@@ -355,7 +439,20 @@ async def reclaim_attachment(
     if att is None:
         await db.commit()
         return ReclaimResult("vanished")
-    ineligible = _ineligible(att, mode, detached_at=detached_at, detached_before=detached_before)
+    ineligible = _ineligible(
+        att,
+        mode,
+        detached_at=detached_at,
+        detached_before=detached_before,
+        created_before=created_before,
+    )
+    if (
+        ineligible is None
+        and mode is Revalidate.NEVER_LINKED
+        and created_before is not None
+        and not await _still_never_linked(db, att.id, created_before)
+    ):
+        ineligible = "left_the_never_linked_predicate"
     if ineligible is not None:
         uid = att.uid  # read BEFORE the rollback: it expires every instance, and reading an
         # expired column would try to refresh it — blocking IO from a place the async session
@@ -444,6 +541,7 @@ async def reclaim_row(
     unlink: Callable[[list[Path]], list[str]] | None = None,
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
+    created_before: datetime | None = None,
 ) -> ReclaimResult:
     """ONE row's reclaim, session and all, as one inseparable unit — what every caller runs.
 
@@ -460,6 +558,7 @@ async def reclaim_row(
             unlink=unlink,
             detached_at=detached_at,
             detached_before=detached_before,
+            created_before=created_before,
         )
 
 
@@ -470,6 +569,7 @@ async def reclaim_row_shielded(
     unlink: Callable[[list[Path]], list[str]] | None = None,
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
+    created_before: datetime | None = None,
 ) -> ReclaimResult:
     """`reclaim_row` as a TASK of its own, awaited through a shield — how every caller calls it.
 
@@ -500,6 +600,7 @@ async def reclaim_row_shielded(
             unlink=unlink,
             detached_at=detached_at,
             detached_before=detached_before,
+            created_before=created_before,
         )
     )
     _pending.add(task)

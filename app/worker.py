@@ -981,7 +981,10 @@ async def run_commit_race_reconcile_safe() -> int:
 
 
 async def sweep_detached_attachments(
-    *, unlink: Callable[[list[Path]], list[str]] | None = None, now: datetime | None = None
+    *,
+    unlink: Callable[[list[Path]], list[str]] | None = None,
+    now: datetime | None = None,
+    deadline: float | None = None,
 ) -> int:
     """Reclaim the attachments that have been off their memo longer than the grace period.
 
@@ -1007,7 +1010,9 @@ async def sweep_detached_attachments(
     work runs off the event loop and keeps the row's lock until it ends.
 
     Returns the number of rows reclaimed. `unlink` is the seam the sweep's tests inject at; it is
-    called off the loop, so it must not touch one.
+    called off the loop, so it must not touch one. `deadline` is a `time.monotonic()` instant the
+    caller already started spending (the never-linked sweep shares this step's bound); without it
+    the pass starts its own.
     """
     cutoff = (now or datetime.now(UTC)) - timedelta(seconds=DETACH_GRACE_SECONDS)
     async with async_session() as db:
@@ -1027,7 +1032,8 @@ async def sweep_detached_attachments(
             .all()
         )
     reclaimed = 0
-    deadline = time.monotonic() + HOUSEKEEPING_BOUNDS["detached_attachment_sweep"]
+    if deadline is None:
+        deadline = time.monotonic() + HOUSEKEEPING_BOUNDS["detached_attachment_sweep"]
     for attachment_id in candidates:
         if time.monotonic() >= deadline:
             logger.info(
@@ -1050,9 +1056,67 @@ async def sweep_detached_attachments(
     return reclaimed
 
 
+async def sweep_unlinked_attachments(
+    *,
+    unlink: Callable[[list[Path]], list[str]] | None = None,
+    now: datetime | None = None,
+    deadline: float | None = None,
+) -> int:
+    """Reclaim the attachments a standalone finalize made and no memo took for three days.
+
+    MEMNG-968.
+
+    The selection is `reclaim.never_linked_clauses` and nothing of this function's own: an original
+    still directly in `originals/_unfiled/`, no memo, no detach instant, no same-owner session for
+    the same bytes, and nothing the owner did with the picture. `memo_id IS NULL` on its own would
+    also take the 0.29.1 imports and old memo-delete leftovers, which are archive media.
+
+    Shaped like `sweep_detached_attachments`, for the same reasons: the cutoff is computed ONCE and
+    carried into each reclaim (NEVER_LINKED re-asks the whole predicate under the row lock against
+    it), each row goes through the shared shielded unit, and the deadline is checked between rows.
+    Returns the number of rows reclaimed.
+    """
+    cutoff = (now or datetime.now(UTC)) - reclaim.NEVER_LINKED_RECLAIM_AFTER
+    async with async_session() as db:
+        candidates = list(
+            (
+                await db.execute(
+                    select(Attachment.id)
+                    .where(Attachment.created_at <= cutoff, *reclaim.never_linked_clauses())
+                    .order_by(Attachment.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    reclaimed = 0
+    if deadline is None:
+        deadline = time.monotonic() + HOUSEKEEPING_BOUNDS["detached_attachment_sweep"]
+    for attachment_id in candidates:
+        if time.monotonic() >= deadline:
+            logger.info(
+                "unlinked_attachments.sweep_deadline",
+                reclaimed=reclaimed,
+                candidates=len(candidates),
+            )
+            break
+        result = await reclaim.reclaim_row_shielded(
+            attachment_id, reclaim.Revalidate.NEVER_LINKED, unlink=unlink, created_before=cutoff
+        )
+        if result.outcome == "reclaimed":
+            reclaimed += 1
+    return reclaimed
+
+
 async def sweep_detached_attachments_safe() -> int:
-    """Reclaim detached attachments past their grace period, in sessions of its own with ALL errors
-    isolated — the same boundary guard the other periodic sweeps get. Returns rows reclaimed.
+    """Reclaim detached attachments past their grace period, then never-linked ones past theirs
+    (MEMNG-968), in sessions of their own with ALL errors isolated — the same boundary guard the
+    other periodic sweeps get. Returns rows reclaimed by both.
+
+    The two share the `detached_attachment_sweep` bound and one deadline rather than a bound each:
+    the housekeeping sum has no room left under half the healthcheck bar (see HOUSEKEEPING_BOUNDS),
+    and both are idempotent hourly passes whose cut-short backlog is simply next hour's work. Each
+    is guarded on its own, so an error in the first does not skip the second.
 
     The count is logged on every pass this returns from, zero and the caught-error path included: a
     pass that found nothing and a worker that never reached its hourly block are otherwise the same
@@ -1060,13 +1124,20 @@ async def sweep_detached_attachments_safe() -> int:
     the record. (A pass its bound cancels returns nothing and logs no count; `_bounded` announces
     that one by name as `worker_housekeeping_timeout`.)
     """
+    deadline = time.monotonic() + HOUSEKEEPING_BOUNDS["detached_attachment_sweep"]
     reclaimed = 0
     try:
-        reclaimed = await sweep_detached_attachments()
+        reclaimed = await sweep_detached_attachments(deadline=deadline)
     except Exception:
         logger.exception("detached_attachments.sweep_error")
     logger.info("detached_attachments_swept", count=reclaimed)
-    return reclaimed
+    never_linked = 0
+    try:
+        never_linked = await sweep_unlinked_attachments(deadline=deadline)
+    except Exception:
+        logger.exception("unlinked_attachments.sweep_error")
+    logger.info("unlinked_attachments_swept", count=never_linked)
+    return reclaimed + never_linked
 
 
 async def claim_frame_share_one(db: AsyncSession) -> FrameShareJob | None:

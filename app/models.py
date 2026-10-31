@@ -599,6 +599,10 @@ class Upload(Base):
     mime: Mapped[str] = mapped_column(String(255))
     declared_size: Mapped[int] = mapped_column(BigInteger)
     bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
+    # A digest of the session's bytes that something VERIFIED, never a bare client claim: a trip
+    # filing's blob, hashed by home on download, or a staging hit's (MEMNG-959), whose part file is
+    # a hard link to an original of the owner's row carrying that digest and size. The never-linked
+    # sweep reads it to hold that row while the session is open (MEMNG-968); finalize re-hashes.
     sha256: Mapped[str | None] = mapped_column(String(64))
     client_mtime: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)

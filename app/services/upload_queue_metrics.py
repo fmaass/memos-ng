@@ -44,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.database import async_session
 from app.models import (
     MEDIA_JOB_CLASSES,
+    Attachment,
     FailureReason,
     JobLane,
     JobState,
@@ -52,7 +53,7 @@ from app.models import (
     Upload,
     UploadSessionTally,
 )
-from app.services import upload_metrics
+from app.services import reclaim, upload_metrics
 from app.services.trip_ingest_metrics import descriptors_of
 
 logger = structlog.get_logger(__name__)
@@ -62,6 +63,14 @@ JOBS_QUEUED = "memosng_media_jobs_queued"
 JOB_SECONDS = "memosng_media_job_seconds"
 JOBS_FAILED = "memosng_media_jobs_failed"
 SESSIONS = "memosng_upload_sessions"
+# MEMNG-968 asked for `memosng_upload_sessions_total{result="orphaned"}`. A counter is the wrong
+# type for this: a never-linked row is a STANDING population, not an event, and the sweep that
+# ends it runs in the worker, which serves no metrics. Counted per scrape it would count the same
+# rows again every time; counted in the worker it would never be scraped. So it is a gauge read
+# from the table per scrape, like the others here: `counted` = every row of the population older
+# than a day (those past three days included, until the hourly sweep takes them), `reclaimable` =
+# the part of it older than three days.
+ORPHANED = "memosng_orphaned_attachments"
 
 # Long enough that a household's sparse uploads leave something to chart, short enough that a
 # worker falling behind shows within the hour rather than being averaged away.
@@ -92,6 +101,8 @@ class QueueState:
     sessions_expired: int
     # (lane, reason) -> terminal failures, as the worker tallied them.
     failed: dict[tuple[str, str], int]
+    orphaned_counted: int = 0
+    orphaned_reclaimable: int = 0
 
 
 def _statement():
@@ -162,12 +173,29 @@ def _statement():
             type_=JSON,
         )
     ).scalar_subquery()
+    never_linked = reclaim.never_linked_clauses()
+    orphaned_counted = (
+        select(func.count())
+        .select_from(Attachment)
+        .where(
+            Attachment.created_at <= func.now() - reclaim.NEVER_LINKED_COUNT_AFTER, *never_linked
+        )
+    ).scalar_subquery()
+    orphaned_reclaimable = (
+        select(func.count())
+        .select_from(Attachment)
+        .where(
+            Attachment.created_at <= func.now() - reclaim.NEVER_LINKED_RECLAIM_AFTER, *never_linked
+        )
+    ).scalar_subquery()
     return select(
         sessions_open.label("sessions_open"),
         queued.label("queued"),
         finished.label("finished"),
         sessions_expired.label("sessions_expired"),
         failed.label("failed"),
+        orphaned_counted.label("orphaned_counted"),
+        orphaned_reclaimable.label("orphaned_reclaimable"),
     )
 
 
@@ -193,6 +221,8 @@ async def read_state(
         ),
         sessions_expired=int(row.sessions_expired),
         failed={(str(lane), str(reason)): int(n) for lane, reason, n in row.failed},
+        orphaned_counted=int(row.orphaned_counted),
+        orphaned_reclaimable=int(row.orphaned_reclaimable),
     )
 
 
@@ -236,7 +266,15 @@ def families_from(state: QueueState) -> list[Metric]:
     pairs = {(lane, reason.value): 0 for lane in MEDIA_JOB_CLASSES for reason in FailureReason}
     for (lane, reason), n in {**pairs, **state.failed}.items():
         failed.add_metric([lane, reason], float(n))
-    return [sessions, queued, seconds, failed]
+    orphaned = GaugeMetricFamily(
+        ORPHANED,
+        "Attachments a standalone finalize made and no memo took, older than a day (counted) "
+        "and older than three days (reclaimable, taken by the worker's hourly sweep).",
+        labels=["state"],
+    )
+    orphaned.add_metric(["counted"], float(state.orphaned_counted))
+    orphaned.add_metric(["reclaimable"], float(state.orphaned_reclaimable))
+    return [sessions, queued, seconds, failed, orphaned]
 
 
 def sessions_family(expired: int | None) -> Metric:

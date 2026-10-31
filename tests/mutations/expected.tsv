@@ -70,3 +70,9 @@ tests/mutations/door_aasa_claim_wide.patch	door_aasa_claim_wide	test_the_associa
 # margin with the PATCH still running.
 tests/mutations/body_idle_unbounded.patch	body_idle_unbounded	test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot test_bytes_before_an_idle_stall_are_kept_and_the_resume_completes test_a_body_idle_from_its_first_byte_changes_nothing_and_frees_its_slot test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_nothing		tests/test_uploads.py
 tests/mutations/no_reclaim_path_refcount.patch	no_reclaim_path_refcount	test_two_memos_sharing_an_original_delete_in_either_order[same-path-first-then-second] test_two_memos_sharing_an_original_delete_in_either_order[same-path-second-then-first]		tests/test_upload_staging_dedupe.py
+# MEMNG-968: the never-linked sweep's _unfiled/ discriminator; dropped, migration-era (flat) and
+# memo-folder orphans and every look-alike path are counted and reclaimed.
+tests/mutations/no_never_linked_unfiled_discriminator.patch	no_never_linked_unfiled_discriminator	test_a_migration_or_memo_folder_orphan_is_never_touched[flat] test_a_migration_or_memo_folder_orphan_is_never_touched[memo] test_only_a_file_directly_in_unfiled_under_the_data_root_matches[below-unfiled] test_only_a_file_directly_in_unfiled_under_the_data_root_matches[like-underscore-wildcard] test_only_a_file_directly_in_unfiled_under_the_data_root_matches[unfiled-inside-a-flat-name] test_only_a_file_directly_in_unfiled_under_the_data_root_matches[unfiled-under-another-root]		tests/test_unlinked_sweep.py
+# MEMNG-968 r1: a staging hit records its checked digest on the session; dropped, the session
+# clause never holds a row a real POST /api/uploads session staged onto.
+tests/mutations/no_staging_digest_recorded.patch	no_staging_digest_recorded	test_a_session_opened_on_the_route_for_the_same_bytes_holds_the_row		tests/test_unlinked_sweep.py

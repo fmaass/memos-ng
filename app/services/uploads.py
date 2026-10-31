@@ -522,6 +522,11 @@ async def create_upload(
     part = part_path(upload_uid)
     if sha256 is not None and await _link_staged_twin(db, owner_id, sha256, size, part):
         upload.bytes_received = size
+        # Recorded only on a HIT: the part is now a hard link to an original of this owner's row
+        # with this digest and size, so the claim has been checked against stored bytes. It is what
+        # holds that row against the never-linked sweep while this session is open (MEMNG-968). A
+        # miss stores nothing — an unchecked claim must not read as a digest.
+        upload.sha256 = sha256
         await db.flush()
         return upload
     await to_thread.run_sync(_create_part_sync, part)

@@ -1,0 +1,18 @@
+Drop the never-linked sweep's positive discriminator: match every memo-less, never-detached row
+wherever its original sits, not only one directly in originals/_unfiled/ (MEMNG-968).
+
+The 0.29.1 imports (flat originals/) and old memo-delete leftovers (dated memo folders) then fall
+into the population and are counted and reclaimed: household archive media deleted. The probes
+that must turn red are the ones holding those rows, and the look-alike paths, untouched.
+
+--- a/app/services/reclaim.py
++++ b/app/services/reclaim.py
+@@ -179,8 +179,6 @@
+     return [
+         Attachment.memo_id.is_(None),
+         Attachment.detached_at.is_(None),
+-        func.left(Attachment.storage_path, len(prefix)) == prefix,
+-        func.strpos(func.substr(Attachment.storage_path, len(prefix) + 1), "/") == 0,
+         Attachment.print_path.is_(None),
+         ~exists().where(Upload.owner_id == Attachment.owner_id, Upload.sha256 == Attachment.sha256),
+         ~exists().where(CollectionMember.attachment_id == Attachment.id),
