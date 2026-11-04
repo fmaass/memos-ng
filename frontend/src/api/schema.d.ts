@@ -1139,6 +1139,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Me */
+        get: operations["get_me_api_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Me */
+        patch: operations["update_me_api_me_patch"];
+        trace?: never;
+    };
     "/api/members": {
         parameters: {
             query?: never;
@@ -3059,6 +3077,22 @@ export interface components {
         MapMarkerList: {
             /** Markers */
             markers: components["schemas"]["MapMarker"][];
+        };
+        /** MeOut */
+        MeOut: {
+            default_visibility: components["schemas"]["Visibility"];
+            /** Notify On Household Posts */
+            notify_on_household_posts: boolean;
+        };
+        /**
+         * MePatch
+         * @description Both optional: an absent field leaves the preference as it is; a JSON null is a 422.
+         */
+        MePatch: {
+            /** Default Visibility */
+            default_visibility?: components["schemas"]["Visibility"];
+            /** Notify On Household Posts */
+            notify_on_household_posts?: boolean;
         };
         /**
          * MemberOut
@@ -6002,6 +6036,61 @@ export interface operations {
                 };
             };
             503: components["responses"]["DatabaseBusyHead"];
+        };
+    };
+    get_me_api_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeOut"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    update_me_api_me_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MePatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     list_members_api_members_get: {

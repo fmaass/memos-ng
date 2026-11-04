@@ -146,6 +146,11 @@ class User(Base):
     default_visibility: Mapped[Visibility] = mapped_column(
         Enum(Visibility, name="visibility"), default=Visibility.PUBLIC
     )
+    # Opt-in (MEMNG-972): a push when another household member posts a memo. MEMNG-967 reads it to
+    # pick the recipients of a memo-live push; off unless the user turns it on.
+    notify_on_household_posts: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     theme: Mapped[str] = mapped_column(String(32), default="dark")
     # Retained (nullable, now UNUSED) after the SMTP frame-send path and per-user frame settings
     # were removed — #curated delivery is now a system-level album HTTP upload. Kept for one

@@ -2778,6 +2778,38 @@
         "title": "MapMarkerList",
         "type": "object"
       },
+      "MeOut": {
+        "properties": {
+          "default_visibility": {
+            "$ref": "#/components/schemas/Visibility"
+          },
+          "notify_on_household_posts": {
+            "title": "Notify On Household Posts",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "default_visibility",
+          "notify_on_household_posts"
+        ],
+        "title": "MeOut",
+        "type": "object"
+      },
+      "MePatch": {
+        "description": "Both optional: an absent field leaves the preference as it is; a JSON null is a 422.",
+        "properties": {
+          "default_visibility": {
+            "$ref": "#/components/schemas/Visibility",
+            "title": "Default Visibility"
+          },
+          "notify_on_household_posts": {
+            "title": "Notify On Household Posts",
+            "type": "boolean"
+          }
+        },
+        "title": "MePatch",
+        "type": "object"
+      },
       "MemberOut": {
         "description": "One household member, in the field shapes `/api/auth/user` already uses for the caller.\n\nA deliberate subset of `UserOut`: `email` and `role` are the account's own business and no\nclient needs them to draw a filter row, so they are not published about OTHER people here.\n`avatar` is whatever the settings feature stores \u2014 a `data:image/\u2026` URL (nothing else is\naccepted, capped at 256 KB) or, for an account carried over from old memos, the path string\nthat came with it \u2014 and null for a member who never set one. It is\npassed through verbatim rather than normalised, so the value a client renders for a member is\nthe same one `/api/auth/user` hands that member for themselves.",
         "properties": {
@@ -8329,6 +8361,88 @@
         "summary": "Serve Basemap Archive",
         "tags": [
           "map"
+        ]
+      }
+    },
+    "/api/me": {
+      "get": {
+        "operationId": "get_me_api_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Get Me",
+        "tags": [
+          "me"
+        ]
+      },
+      "patch": {
+        "operationId": "update_me_api_me_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MePatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Update Me",
+        "tags": [
+          "me"
         ]
       }
     },
