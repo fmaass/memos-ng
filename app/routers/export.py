@@ -124,6 +124,9 @@ async def _export_items(
             # Nothing gates on a count any more (the 413 is gone), and that COUNT was the single
             # most expensive part of the query — it scanned every visible memo, once per batch.
             with_total=False,
+            # An export is the whole record: the memos trip passes brought in go with it, unlike
+            # the home timeline that leaves them out (MEMNG-1164).
+            guest="include",
         )
         for memo in memos:
             yield _export_item(memo, include_media=include_media, tier=tier)

@@ -2851,6 +2851,16 @@ export interface components {
             print_long_edge: 0 | 4096 | 5000;
             print_metadata_policy: components["schemas"]["PrintMetadataPolicy"];
         };
+        /**
+         * GuestOut
+         * @description Who sent a guest memo in, and through which trip pass.
+         */
+        GuestOut: {
+            /** Contributor Name */
+            contributor_name: string | null;
+            /** Pass Uid */
+            pass_uid: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -3141,6 +3151,16 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /**
+             * GuestOut
+             * @description Who sent a guest memo in, and through which trip pass.
+             */
+            guest?: {
+                /** Contributor Name */
+                contributor_name: string | null;
+                /** Pass Uid */
+                pass_uid: string;
+            } | null;
             /** Idempotency Key */
             idempotency_key?: string | null;
             /** Mine */
@@ -6014,6 +6034,8 @@ export interface operations {
                 visibility?: components["schemas"]["Visibility"];
                 /** @description Filter to memos owned by the named household members (`subject`, as published by `GET /api/members`). Repeatable, and repeating it ORs: `?owner=alice&owner=bob` returns the union of what alice and bob wrote that the caller may see, never a memo of anyone else's, and never a memo of theirs the caller could not already see. Composes with every other filter (they still AND), and must be resent unchanged on each page — like every filter here, it is not carried inside `cursor`. A single `owner=alice` behaves exactly as it did before it was repeatable; omitting it filters by owner not at all. */
                 owner?: string[] | null;
+                /** @description Whether memos a trip pass brought in (those carrying `guest`) are listed. `exclude`, the default, leaves them out, so the home timeline shows what the household wrote; `include` returns them alongside every other memo. Composes with every other filter (they still AND), and must be resent unchanged on each page — it is not carried inside `cursor`. A guest memo whose pass record was deleted is a plain memo and is listed either way. */
+                guest?: "exclude" | "include";
                 q?: string | null;
                 include_archived?: boolean;
                 archived_only?: boolean;

@@ -2344,6 +2344,28 @@
         "title": "ExportSettingsPut",
         "type": "object"
       },
+      "GuestOut": {
+        "description": "Who sent a guest memo in, and through which trip pass.",
+        "properties": {
+          "contributor_name": {
+            "title": "Contributor Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pass_uid": {
+            "title": "Pass Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contributor_name",
+          "pass_uid"
+        ],
+        "title": "GuestOut",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -2923,6 +2945,31 @@
             "format": "date-time",
             "title": "Created At",
             "type": "string"
+          },
+          "guest": {
+            "description": "Who sent a guest memo in, and through which trip pass.",
+            "properties": {
+              "contributor_name": {
+                "title": "Contributor Name",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "pass_uid": {
+                "title": "Pass Uid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "contributor_name",
+              "pass_uid"
+            ],
+            "title": "GuestOut",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "idempotency_key": {
             "title": "Idempotency Key",
@@ -8390,6 +8437,22 @@
                 "array",
                 "null"
               ]
+            }
+          },
+          {
+            "description": "Whether memos a trip pass brought in (those carrying `guest`) are listed. `exclude`, the default, leaves them out, so the home timeline shows what the household wrote; `include` returns them alongside every other memo. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 it is not carried inside `cursor`. A guest memo whose pass record was deleted is a plain memo and is listed either way.",
+            "in": "query",
+            "name": "guest",
+            "required": false,
+            "schema": {
+              "default": "exclude",
+              "description": "Whether memos a trip pass brought in (those carrying `guest`) are listed. `exclude`, the default, leaves them out, so the home timeline shows what the household wrote; `include` returns them alongside every other memo. Composes with every other filter (they still AND), and must be resent unchanged on each page \u2014 it is not carried inside `cursor`. A guest memo whose pass record was deleted is a plain memo and is listed either way.",
+              "enum": [
+                "exclude",
+                "include"
+              ],
+              "title": "Guest",
+              "type": "string"
             }
           },
           {

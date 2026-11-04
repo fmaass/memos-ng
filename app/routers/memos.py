@@ -183,6 +183,17 @@ class ReactionSummary(BaseModel):
     reacted: bool  # did the requesting user react with this emoji
 
 
+# A guest batch is owned by the pass issuer, so `owner` alone would read as the issuer's own memo
+# (MEMNG-1164); this names who really sent it.
+class GuestOut(BaseModel):
+    """Who sent a guest memo in, and through which trip pass."""
+
+    # The guest's name as copied onto the memo's attachments (one memo = one batch = one
+    # contributor); null when the guest gave none or the memo carries no attachment.
+    contributor_name: str | None
+    pass_uid: str
+
+
 class MemoOut(BaseModel):
     uid: str
     owner: str
@@ -200,6 +211,9 @@ class MemoOut(BaseModel):
     # The key the memo was created under (MEMNG-1036), so an outbox whose create got no answer can
     # find it on the timeline. It is the owner's private retry token: null for every other reader.
     idempotency_key: str | None = None
+    # Set on a memo a trip pass brought in; null for every member memo, and for a guest memo whose
+    # pass record was deleted (`memos.pass_id` is SET NULL), which then reads as a plain memo.
+    guest: GuestOut | None = None
 
 
 # Bounded and opaque: the shape gate only has to bound what the unique index stores and reject
@@ -572,6 +586,15 @@ def _reactions(memo: Memo, user_id: int) -> list[ReactionSummary]:
     return [ReactionSummary(emoji=e, count=c, reacted=e in mine) for e, c in sorted(counts.items())]
 
 
+def _guest(memo: Memo) -> GuestOut | None:
+    # None for a member memo and once the pass record is gone: `pass_id` is SET NULL with it.
+    p = memo.guest_pass
+    if p is None:
+        return None
+    name = next((a.contributor_name for a in memo.attachments if a.contributor_name), None)
+    return GuestOut(contributor_name=name, pass_uid=p.uid)
+
+
 def _out(memo: Memo, user_id: int, web_ready: AbstractSet[str]) -> MemoOut:
     mine = memo.owner_id == user_id
     return MemoOut(
@@ -591,6 +614,7 @@ def _out(memo: Memo, user_id: int, web_ready: AbstractSet[str]) -> MemoOut:
         # and no extra query is spent.
         total_size=sum(a.size for a in memo.attachments),
         idempotency_key=memo.idempotency_key if mine else None,
+        guest=_guest(memo),
     )
 
 
@@ -625,6 +649,19 @@ async def list_memos(
             )
         ),
     ] = None,
+    guest: Annotated[
+        svc.GuestFilter,
+        Query(
+            description=(
+                "Whether memos a trip pass brought in (those carrying `guest`) are listed. "
+                "`exclude`, the default, leaves them out, so the home timeline shows what the "
+                "household wrote; `include` returns them alongside every other memo. Composes "
+                "with every other filter (they still AND), and must be resent unchanged on each "
+                "page — it is not carried inside `cursor`. A guest memo whose pass record was "
+                "deleted is a plain memo and is listed either way."
+            )
+        ),
+    ] = "exclude",
     q: str | None = None,
     include_archived: bool = False,
     archived_only: bool = False,
@@ -648,6 +685,7 @@ async def list_memos(
         cursor=cursor,
         limit=limit,
         with_total=with_total,
+        guest=guest,
     )
     ready = await web_ready_uids(a for m in items for a in m.attachments)
     return MemoList(

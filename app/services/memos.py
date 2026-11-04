@@ -4,6 +4,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import structlog
 from sqlalchemy import String, and_, cast, exists, func, or_, select
@@ -28,6 +29,11 @@ from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cu
 logger = structlog.get_logger(__name__)
 
 TAG_RE = re.compile(r"#(\w+)")
+
+# Whether `list_memos` returns guest memos — the ones a trip pass brought in (`pass_id IS NOT
+# NULL`, MEMNG-1164). The service answers everything by default so an internal walk (the export)
+# never silently loses them; the home timeline route is what defaults to "exclude".
+GuestFilter = Literal["exclude", "include"]
 
 
 def parse_tags(content: str) -> list[str]:
@@ -476,8 +482,11 @@ async def list_memos(
     cursor: str | None = None,
     limit: int = 20,
     with_total: bool = True,
+    guest: GuestFilter = "include",
 ) -> tuple[list[Memo], str | None, int | None]:
     conds = [visible_clause(user)]
+    if guest == "exclude":
+        conds.append(Memo.pass_id.is_(None))
     if archived_only:
         conds.append(Memo.archived_at.is_not(None))
     elif not include_archived:

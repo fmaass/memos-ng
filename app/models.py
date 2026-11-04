@@ -230,6 +230,10 @@ class Memo(Base):
     reactions: Mapped[list["Reaction"]] = relationship(
         lazy="selectin", cascade="all, delete-orphan"
     )
+    # The pass a guest memo came in through, read for `MemoOut.guest.pass_uid` (MEMNG-1164).
+    # selectin like the rest, so the async render never lazy-loads; a member memo's NULL `pass_id`
+    # costs no query. Read-only from this side: `pass_id` is what the guest boundary writes.
+    guest_pass: Mapped["Pass | None"] = relationship(lazy="selectin", viewonly=True)
 
 
 # Named, and named ONCE, because the router has to recognise this constraint by name at runtime:
