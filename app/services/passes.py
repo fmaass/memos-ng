@@ -23,7 +23,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 import segno
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -342,8 +342,10 @@ async def unsuspend_versions(db: AsyncSession, pass_ids: Sequence[int]) -> dict[
         select(PassEvent.pass_id, func.max(PassEvent.version))
         .where(
             PassEvent.pass_id.in_(pass_ids),
-            PassEvent.kind == "updated",
-            PassEvent.detail == UNSUSPEND,
+            or_(
+                PassEvent.kind == "unsuspend_requested",
+                and_(PassEvent.kind == "updated", PassEvent.detail == UNSUSPEND),
+            ),
         )
         .group_by(PassEvent.pass_id)
     )

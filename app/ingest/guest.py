@@ -21,7 +21,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -403,27 +403,32 @@ async def record_refusal(
     await db.flush()
     # The refusals that suspended a pass the owner has since lifted are spent: counted again, the
     # next one would suspend it straight back.
+    # Ordered by event id, not `at`: `at` is a transaction-start now(), so a refusal committed
+    # before the lift can carry a later stamp. Both writers assign the id holding the pass lock
+    # (MEMNG-1082).
     lifted = (
         await db.execute(
-            select(func.max(PassEvent.at)).where(
+            select(func.max(PassEvent.id)).where(
                 PassEvent.pass_id == p.id,
-                PassEvent.kind == "updated",
-                PassEvent.detail == core.LIFTED,
+                or_(
+                    PassEvent.kind == "unsuspended",
+                    and_(PassEvent.kind == "updated", PassEvent.detail == core.LIFTED),
+                ),
             )
         )
     ).scalar_one()
-    since = now - timedelta(hours=1) if lifted is None else max(now - timedelta(hours=1), lifted)
-    refused = (
-        await db.execute(
-            select(func.count())
-            .select_from(PassEvent)
-            .where(
-                PassEvent.pass_id == p.id,
-                PassEvent.kind == "refused",
-                PassEvent.at > since,
-            )
+    counted = (
+        select(func.count())
+        .select_from(PassEvent)
+        .where(
+            PassEvent.pass_id == p.id,
+            PassEvent.kind == "refused",
+            PassEvent.at > now - timedelta(hours=1),
         )
-    ).scalar_one()
+    )
+    if lifted is not None:
+        counted = counted.where(PassEvent.id > lifted)
+    refused = (await db.execute(counted)).scalar_one()
     if refused > settings.INGEST_REFUSALS_PER_HOUR and p.suspended_at is None:
         p.suspended_at = now
         db.add(

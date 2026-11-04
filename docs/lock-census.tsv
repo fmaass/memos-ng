@@ -12,6 +12,8 @@ app/ingest/service_api.py	purge	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	upload_print	refresh
+app/routers/trip_ingest.py	_resolve_batch	for_update
+app/routers/trip_ingest.py	resolve_unknown	for_update
 app/scripts/import_digest_state.py	run_import	for_update
 app/services/collections.py	_hold_cover	for_update
 app/services/collections.py	update_collection	for_update

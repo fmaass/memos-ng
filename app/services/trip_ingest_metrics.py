@@ -102,11 +102,23 @@ def _statement():
         .where(IngestBatch.state == "open", IngestBlob.filed_at.is_(None))
         .scalar_subquery()
         .label("blobs_pending"),
-        select(func.count())
-        .select_from(IngestBatch)
-        .where(IngestBatch.state == "quarantined")
-        .scalar_subquery()
-        .label("quarantined"),
+        # Resolved batches stay `quarantined` for settle; unknown-pass quarantines have no row, so
+        # the cursor's monotonic pair carries them (MEMNG-1045).
+        (
+            select(func.count())
+            .select_from(IngestBatch)
+            .where(IngestBatch.state == "quarantined", IngestBatch.resolved_at.is_(None))
+            .scalar_subquery()
+            + func.coalesce(
+                select(
+                    TripIngestCursor.quarantined_unknown_total
+                    - TripIngestCursor.quarantined_unknown_cleared
+                )
+                .limit(1)
+                .scalar_subquery(),
+                0,
+            )
+        ).label("quarantined"),
     )
 
 

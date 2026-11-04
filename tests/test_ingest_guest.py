@@ -899,3 +899,33 @@ async def test_the_limits_keep_their_wire_bytes(door, home_iface):  # noqa: F811
     assert r.status_code == 201 and wire in r.content
     me = await door.get("/api/guest/me", headers=bearer(r.json()["device_token"]))
     assert me.status_code == 200 and wire in me.content
+
+
+async def test_a_refusal_stamped_after_the_lift_but_committed_before_it_stays_spent(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1082 #1: `at` is a transaction-start now(), so it can invert against the lift. Order by
+    event id: the pre-lift refusals stay spent whatever they are stamped, and later ones count."""
+    monkeypatch.setattr(settings, "INGEST_REFUSALS_PER_HOUR", 3)
+    monkeypatch.setattr(settings, "INGEST_TRUST_CF_CONNECTING_IP", True)
+    uid, secret = await seeded_pass(home_iface, max_devices=1)
+    await redeem(door, secret, **{"CF-Connecting-IP": "192.0.2.1"})
+    body = {"secret": secret, "display_name": "x", "platform": "web"}
+
+    async def refused(first: int, n: int) -> None:
+        for i in range(first, first + n):
+            r = await door.post(
+                "/api/pass/redeem", json=body, headers={"CF-Connecting-IP": f"192.0.2.{i}"}
+            )
+            assert r.status_code == 429
+
+    await refused(10, 4)
+    await push(home_iface, pass_state(uid, secret, version=2, max_devices=1, unsuspend_version=2))
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)]
+    _sql("UPDATE pass_events SET at = now() + interval '1 minute' WHERE kind = 'refused'")
+    await refused(20, 3)
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)], "spent refusals counted"
+    await refused(30, 1)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]

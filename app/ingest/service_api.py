@@ -47,6 +47,28 @@ async def require_home(request: Request) -> None:
 
 router = APIRouter(prefix="/ingest", dependencies=[Depends(require_home)])
 
+SUSPENDED_VIEW_CAP = 500
+
+
+@router.get("/passes/suspended")
+async def suspended_passes(db: Annotated[AsyncSession, Depends(get_session)]) -> dict:
+    """The COMPLETE list of suspended passes, unpaginated, so home can read an absent uid as not
+    suspended. One past the cap is returned on purpose: home reads that as unknown."""
+    rows = await db.execute(
+        select(Pass.uid, Pass.suspended_at)
+        .where(Pass.suspended_at.is_not(None))
+        .order_by(Pass.id)
+        .limit(SUSPENDED_VIEW_CAP + 1)
+    )
+    return {
+        "passes": [
+            {"pass_uid": uid, "suspended_at": at.isoformat()}
+            for uid, at in rows.tuples()
+            if at is not None
+        ]
+    }
+
+
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -431,7 +453,8 @@ def _sweep_parts_sync(live: frozenset[str], expired: frozenset[str], horizon: fl
                 continue
             path.unlink()
             swept += 1
-        except OSError:  # vanished under us: its own request or completion just removed it
+        except OSError as exc:  # usually vanished under us; anything else must leave a trace
+            logger.warning("ingest.sweep_skipped", path=str(path), error=type(exc).__name__)
             continue
     return swept
 

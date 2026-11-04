@@ -668,6 +668,14 @@ async def _push_quarantine(client: httpx.AsyncClient, uid: str) -> bool:
     raise LinkDown(f"quarantine {uid}: HTTP {r.status_code}")
 
 
+async def _count_unknown_quarantine(batch_uid: str, pass_uid: object) -> None:
+    async with async_session() as db:
+        cur = await _cursor(db)
+        cur.quarantined_unknown_total += 1
+        await db.commit()
+    logger.warning("trip_ingest.quarantined_unknown", batch=batch_uid, pass_uid=str(pass_uid)[:64])
+
+
 async def _record_batch(
     db: AsyncSession, client: httpx.AsyncClient, raw: object, errors: list[str]
 ) -> None:
@@ -703,6 +711,11 @@ async def _record_batch(
         if p is None:
             # No home pass to hang a ledger row on: quarantined NOW, inside the transaction that
             # moves the cursor past it, so a link failure leaves the cursor where it was.
+            # Counted FIRST and on its own session: the page's transaction may yet roll back with
+            # the door already moved, and a replay returns early above, so it would never be
+            # counted. Over-counting a replay is accepted; the owner clears it. The page writes the
+            # cursor row only after this loop, so this cannot queue behind its own page.
+            await _count_unknown_quarantine(uid, raw.get("pass_uid"))
             await _push_quarantine(client, uid)
             logger.warning("trip_ingest.quarantined", batch=uid, reason=str(exc))
             errors.append(f"{uid}: {exc}")
@@ -972,7 +985,8 @@ def _replace_sync(src: Path, dest: Path) -> None:
 class _MoveJournal:
     """Commits each filing rename's (src, dest) BEFORE it happens, on a session of its own: the
     filing's transaction holds the batch row and will only commit if everything lands. No foreign
-    key on `ingest_moves.batch_id`, so these inserts do not queue behind that row (MEMNG-1037 #2)."""
+    key on `ingest_moves.batch_id`, so these inserts do not queue behind that row (MEMNG-1037 #2).
+    """
 
     def __init__(self, batch_id: int) -> None:
         self.batch_id = batch_id
@@ -1098,7 +1112,10 @@ async def reconcile_moves() -> None:
                 if outcome == "flag":
                     row.flagged_at = datetime.now(UTC)
                     logger.error(
-                        "trip_ingest.reconcile_both_present", move=row.id, src=row.src, dest=row.dest
+                        "trip_ingest.reconcile_both_present",
+                        move=row.id,
+                        src=row.src,
+                        dest=row.dest,
                     )
                 else:
                     await db.delete(row)
@@ -1588,6 +1605,45 @@ async def sync_once(client: httpx.AsyncClient, budget_s: float) -> TickResult:
     return TickResult("ok", filed, tuple(errors))
 
 
+SUSPENDED_VIEW_CAP = 500
+
+
+async def refresh_door_view(client: httpx.AsyncClient) -> None:
+    """Home's display-only view of which passes the door has suspended (MEMNG-1082 #3). The door is
+    untrusted and `require_home` authenticates home to it, not its answer, so this touches only the
+    two display columns. A valid 200 is a full snapshot; anything else leaves the view unknown and
+    `door_suspended_seen_at` where it was. Never raises: a failure must not stop ingestion."""
+    try:
+        answer = await _call(client, "GET", "/ingest/passes/suspended")
+        if answer.status_code != 200:
+            return
+        doc = _json(answer)
+        entries = doc.get("passes") if isinstance(doc, dict) else None
+        if not isinstance(entries, list) or len(entries) > SUSPENDED_VIEW_CAP:
+            return
+        now = datetime.now(UTC)
+        seen: dict[str, datetime] = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or not _an_id(entry.get("pass_uid")):
+                return
+            at = _datetime_or_none(entry.get("suspended_at"), "suspended_at")
+            if at is None:
+                return
+            seen[entry["pass_uid"]] = min(at, now)
+        async with async_session() as db:
+            rows = (await db.execute(select(Pass.uid, Pass.id).order_by(Pass.id))).tuples().all()
+            await _lock_passes(db, {uid for uid, _ in rows})
+            for uid, pass_id in rows:
+                values = {"door_suspended_at": seen.get(uid), "door_suspended_seen_at": now}
+                stmt = pg_insert(PassSyncState).values(pass_id=pass_id, **values)
+                await db.execute(
+                    stmt.on_conflict_do_update(index_elements=[PassSyncState.pass_id], set_=values)
+                )
+            await db.commit()
+    except Exception as exc:
+        logger.warning("trip_ingest.door_view_unknown", error=type(exc).__name__)
+
+
 TICK_CANCELLED = "cancelled: the tick ran past its bound"
 CANCEL_RECORD_DEADLINE_S = 2.0
 
@@ -1624,6 +1680,7 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
                     http = client
                 try:
                     result = await sync_once(http, budget_s)
+                    await refresh_door_view(http)
                 finally:
                     if own:
                         await http.aclose()

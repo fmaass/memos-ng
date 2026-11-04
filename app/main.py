@@ -116,6 +116,7 @@ from app.routers import passes as passes_router  # noqa: E402
 from app.routers import pats as pats_router  # noqa: E402
 from app.routers import push as push_router  # noqa: E402
 from app.routers import settings as settings_router  # noqa: E402
+from app.routers import trip_ingest as trip_ingest_router  # noqa: E402
 from app.routers import uploads as uploads_router  # noqa: E402
 
 # Add eagerly rather than include_router(): FastAPI 0.138's include_router defers to a
@@ -134,6 +135,7 @@ app.router.routes.extend(assets_router.router.routes)
 app.router.routes.extend(collections_router.router.routes)
 app.router.routes.extend(collection_covers_router.router.routes)
 app.router.routes.extend(passes_router.router.routes)
+app.router.routes.extend(trip_ingest_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
 app.router.routes.extend(members_router.router.routes)
