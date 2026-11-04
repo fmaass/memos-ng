@@ -27,8 +27,8 @@ from app.services import memos as memos_svc
 from app.services import passes as passes_svc
 from app.services import reclaim, trip_ingest
 from sqlalchemy import create_engine, select, text
-from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from tests import test_trip_ingest_puller as tp
 from tests.conftest import SYNC_URL
