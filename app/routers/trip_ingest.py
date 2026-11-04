@@ -90,8 +90,8 @@ async def resolve_unknown(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
     """`through` is the total the owner saw: anything since stays counted, so no ABA and no 409.
-    With no `through` this is the batch whose door-chosen uid is literally `unknown`, which this route
-    would otherwise make unresolvable and its alert unclearable."""
+    With no `through` this is the batch whose door-chosen uid is literally `unknown`, which this
+    route would otherwise make unresolvable and its alert unclearable."""
     if body.through is None:
         await _resolve_batch(db, "unknown", user)
         return

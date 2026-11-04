@@ -1629,6 +1629,62 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/trip-ingest/quarantine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Quarantine */
+        get: operations["list_quarantine_api_trip_ingest_quarantine_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/trip-ingest/quarantine/unknown/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve Unknown
+         * @description `through` is the total the owner saw: anything since stays counted, so no ABA and no 409.
+         *     With no `through` this is the batch whose door-chosen uid is literally `unknown`, which this
+         *     route would otherwise make unresolvable and its alert unclearable.
+         */
+        post: operations["resolve_unknown_api_trip_ingest_quarantine_unknown_resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/trip-ingest/quarantine/{batch_uid}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resolve Batch */
+        post: operations["resolve_batch_api_trip_ingest_quarantine__batch_uid__resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/uploads": {
         parameters: {
             query?: never;
@@ -3361,6 +3417,16 @@ export interface components {
             /** Devicecount */
             deviceCount: number;
             /**
+             * Doorsuspended
+             * @description What the door last said, display only; null when home does not know (an old door, a malformed answer, or a view older than the sync's stale window).
+             */
+            doorSuspended?: boolean | null;
+            /**
+             * Doorsuspendedat
+             * Format: date-time
+             */
+            doorSuspendedAt?: string | null;
+            /**
              * Expiresat
              * Format: date-time
              */
@@ -3570,6 +3636,37 @@ export interface components {
             /** P256Dh */
             p256dh: string;
         };
+        /** QuarantineOut */
+        QuarantineOut: {
+            /** Batches */
+            batches: components["schemas"]["QuarantinedBatchOut"][];
+            /**
+             * Unknownopen
+             * @description `unknownTotal` less what the owner cleared.
+             */
+            unknownOpen: number;
+            /**
+             * Unknowntotal
+             * @description Quarantines for a pass home never issued, ever.
+             */
+            unknownTotal: number;
+        };
+        /** QuarantinedBatchOut */
+        QuarantinedBatchOut: {
+            /** Bytetotal */
+            byteTotal: number;
+            /**
+             * Createdat
+             * Format: date-time
+             */
+            createdAt: string;
+            /** Filecount */
+            fileCount: number;
+            /** Passuid */
+            passUid: string;
+            /** Uid */
+            uid: string;
+        };
         /** ReactionIn */
         ReactionIn: {
             /** Emoji */
@@ -3662,6 +3759,14 @@ export interface components {
             count: number;
             /** Name */
             name: string;
+        };
+        /** UnknownResolveIn */
+        UnknownResolveIn: {
+            /**
+             * Through
+             * @description The `unknownTotal` the owner saw; later ones stay counted.
+             */
+            through?: number | null;
         };
         /** UploadCreate */
         UploadCreate: {
@@ -7269,6 +7374,89 @@ export interface operations {
             header?: never;
             path: {
                 grant_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    list_quarantine_api_trip_ingest_quarantine_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuarantineOut"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    resolve_unknown_api_trip_ingest_quarantine_unknown_resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnknownResolveIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    resolve_batch_api_trip_ingest_quarantine__batch_uid__resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                batch_uid: string;
             };
             cookie?: never;
         };

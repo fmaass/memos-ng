@@ -9,7 +9,7 @@ import Tag from 'primevue/tag'
 import { computed, ref } from 'vue'
 
 import TripPassDevices from '@/components/TripPassDevices.vue'
-import { useTripPasses } from '@/composables/useTripPasses'
+import { useTripPasses, useTripQuarantine } from '@/composables/useTripPasses'
 import {
   buildPassCreate,
   DEFAULT_MAX_DEVICES,
@@ -33,12 +33,14 @@ const {
   error,
   issue,
   revokePass,
+  unsuspendPass,
   revokeDevice,
   dismissIssued,
   issuing,
   revokingPass,
   revokingDevice,
 } = useTripPasses(() => props.collectionUid)
+const { quarantine, resolveBatch, clearUnknown } = useTripQuarantine()
 
 const label = ref('')
 const scope = ref<PassScope>('contribute')
@@ -218,6 +220,20 @@ const day = (iso: string) => new Date(iso).toLocaleDateString()
               </span>
             </span>
             <Tag :value="p.state" :severity="severity(p)" data-test="pass-state" />
+            <Tag
+              v-if="p.doorSuspended === true"
+              value="suspended"
+              severity="danger"
+              data-test="pass-suspended"
+            />
+            <Button
+              v-if="p.doorSuspended === true"
+              label="Unsuspend"
+              size="small"
+              severity="secondary"
+              data-test="pass-unsuspend"
+              @click="unsuspendPass(p.uid)"
+            />
           </div>
           <div class="flex flex-wrap items-center gap-2">
             <Button
@@ -267,5 +283,39 @@ const day = (iso: string) => new Date(iso).toLocaleDateString()
         </li>
       </ul>
     </div>
+    <section
+      v-if="quarantine.data.value && (quarantine.data.value.batches.length || quarantine.data.value.unknownOpen)"
+      class="flex flex-col gap-2"
+      data-test="quarantine"
+    >
+      <h3 class="text-sm font-semibold">Quarantined guest uploads</h3>
+      <p class="text-xs">
+        Marking one as seen files nothing and deletes nothing, and the guest's bytes stay on the door.
+      </p>
+      <div
+        v-for="b in quarantine.data.value.batches"
+        :key="b.uid"
+        class="flex items-center justify-between gap-2"
+      >
+        <span class="text-sm">{{ b.fileCount }} files from {{ day(b.createdAt) }}</span>
+        <Button
+          label="Mark seen"
+          size="small"
+          severity="secondary"
+          data-test="quarantine-resolve"
+          @click="resolveBatch(b.uid)"
+        />
+      </div>
+      <div v-if="quarantine.data.value.unknownOpen" class="flex items-center justify-between gap-2">
+        <span class="text-sm">{{ quarantine.data.value.unknownOpen }} from a pass I never issued</span>
+        <Button
+          label="Mark seen"
+          size="small"
+          severity="secondary"
+          data-test="quarantine-clear-unknown"
+          @click="clearUnknown(quarantine.data.value!.unknownTotal)"
+        />
+      </div>
+    </section>
   </div>
 </template>
