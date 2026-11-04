@@ -9,6 +9,7 @@ an existing (committed) master is never moved — so no GC, lock, or migration i
 
 import os
 import re
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -23,6 +24,14 @@ MAX_NAME_LEN = 200
 
 # The ` (n)` tail `_reserve` appends on a collision — n starts at 2, so ` (1)` is a literal name.
 _BUMPED = re.compile(r"^(?P<stem>.*) \((?:[2-9]|[1-9]\d+)\)$")
+
+
+def free_bytes(root: Path) -> int:
+    """Free bytes on the volume that holds `root` — the one probe of the disk floor, shared by the
+    guest door (`app.ingest`) and the household upload session (MEMNG-961). Blocking: call it
+    off the loop."""
+    root.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(root).free
 
 
 class MoveAbandoned(Exception):

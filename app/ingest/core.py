@@ -2,7 +2,6 @@
 
 import hashlib
 import hmac
-import shutil
 import time
 from collections import deque
 from datetime import UTC, datetime
@@ -15,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import INGEST_CHANGE_SEQ, Pass, PassDevice
+from app.services.storage import free_bytes as free_bytes  # re-export: the one disk probe
 from app.services.uploads import detect_heif_mime
 from app.services.uploads import finish_off_the_loop as finish_off_the_loop  # re-export
 
@@ -99,12 +99,6 @@ async def next_change_seq(db: AsyncSession) -> int:
 async def lock_disk_reservation(db: AsyncSession) -> None:
     """Serialize the volume-floor check and the session insert it admits, across all passes."""
     await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": DISK_RESERVATION_LOCK})
-
-
-def free_bytes(root: Path) -> int:
-    """Free bytes on the volume that holds `root` — the one probe of the disk floor."""
-    root.mkdir(parents=True, exist_ok=True)
-    return shutil.disk_usage(root).free
 
 
 async def lock_blob_hash(db: AsyncSession, sha256: str) -> None:

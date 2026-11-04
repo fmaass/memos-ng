@@ -165,7 +165,23 @@ async def _get_upload(db: AsyncSession, upload_uid: str, owner_id: int) -> Uploa
     return upload
 
 
-@router.post("", response_model=UploadOut, status_code=201)
+@router.post(
+    "",
+    response_model=UploadOut,
+    status_code=201,
+    responses={
+        507: {
+            "description": "The server's upload volume has less free space than the declared "
+            "size plus 10 %. Nothing was stored; `detail` says why. A session the server can "
+            "complete from bytes it already holds (a `sha256` match) is never refused for space.",
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"detail": {"type": "string"}}}
+                }
+            },
+        }
+    },
+)
 async def start_upload(
     body: UploadCreate,
     # Also an upload-only capture grant (MEMNG-938); nothing else in this router takes one.
@@ -177,15 +193,21 @@ async def start_upload(
         raise HTTPException(
             status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
         )
-    upload = await svc.create_upload(
-        db,
-        owner_id=user.id,
-        filename=body.filename,
-        mime=body.mime,
-        size=body.size,
-        last_modified=body.last_modified,
-        sha256=body.sha256,
-    )
+    try:
+        upload = await svc.create_upload(
+            db,
+            owner_id=user.id,
+            filename=body.filename,
+            mime=body.mime,
+            size=body.size,
+            last_modified=body.last_modified,
+            sha256=body.sha256,
+        )
+    except svc.InsufficientSpace as exc:
+        # The row create_upload flushed is rolled back here, never committed: a refusal leaves
+        # no session behind (and no part — the probe runs before the part is made).
+        await db.rollback()
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
     await db.commit()
     return UploadOut(
         upload_uid=upload.upload_uid,

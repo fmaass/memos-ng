@@ -184,7 +184,7 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | `WORKER_LANES` | `fast,slow` | which media lanes a worker drains (`fast` = thumbs/posters, `slow` = transcode) |
 | `THERMAL_ZONE` / `THERMAL_MAX_C` | empty (the `coretemp` `Package id 0` sensor, resolved by name) / `90` | defer media work while the CPU package is above the limit; a path in `THERMAL_ZONE` overrides the by-name lookup |
 | `SLOW_TRANSCODE_TIMEOUT_S` | `3600` | ceiling for one slow-lane transcode; on expiry the ffmpeg process tree is killed and the job fails visibly instead of holding the worker slot |
-| `MAX_UPLOAD_MIB` | `1024` | upload size cap |
+| `MAX_UPLOAD_MIB` | `4096` | upload size cap (413 above it); a session is also refused with 507 while the volume holding its part file has less free space than its size plus 10 % |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | empty (push disabled) | Web Push (VAPID) keypair |
 | Authelia OIDC | — | confidential BFF client; public `https://auth…` endpoints only |
 

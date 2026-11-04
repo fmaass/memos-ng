@@ -478,6 +478,26 @@ def _sniff_mime(path: Path, declared: str) -> str:
         return declared
 
 
+class InsufficientSpace(Exception):
+    """The volume that would hold a new session's part file cannot take its declared size plus
+    the head-room (MEMNG-961). Raised before the part exists; the caller must not commit the row
+    `create_upload` flushed, so a refusal leaves nothing behind."""
+
+    def __init__(self, size: int, free: int) -> None:
+        self.size = size
+        self.free = free
+        super().__init__(
+            f"Not enough free space on the server for this upload: it needs {size} bytes plus "
+            f"10 % head-room, and {free} bytes are free. Try again later."
+        )
+
+
+def has_room_for(size: int, free: int) -> bool:
+    """Whether `free` bytes hold `size` plus 10 % — `free >= size * 1.1`, in integers so a
+    multi-GiB size is compared exactly."""
+    return free * 10 >= size * 11
+
+
 async def create_upload(
     db: AsyncSession,
     *,
@@ -499,6 +519,10 @@ async def create_upload(
     ordinary empty part, exactly as without it. The claim is trusted no further than this owner's
     own rows: a guessed digest can only re-attach bytes the caller already owns, and finalize
     re-hashes the part as it always has, so a row is never stamped with a digest its bytes lack.
+
+    Disk admission (MEMNG-961): on the ordinary path — not on a hit, which sends no bytes — the
+    volume that will hold the part must have room for `size` plus 10 %, or InsufficientSpace is
+    raised before the part is created.
     """
     upload_uid = secrets.token_urlsafe(24)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
@@ -529,6 +553,9 @@ async def create_upload(
         upload.sha256 = sha256
         await db.flush()
         return upload
+    free = await to_thread.run_sync(storage.free_bytes, part.parent)
+    if not has_room_for(size, free):
+        raise InsufficientSpace(size, free)
     await to_thread.run_sync(_create_part_sync, part)
     return upload
 

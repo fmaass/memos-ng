@@ -123,7 +123,9 @@ class Settings(BaseSettings):
     # Resumable upload (T2.1).
     UPLOAD_CHUNK_SIZE: int = 5 * 1024 * 1024  # 5 MiB
     UPLOAD_EXPIRY_HOURS: int = 24
-    MAX_UPLOAD_MIB: int = 1024  # prod parity (system_setting MAX_UPLOAD_SIZE_MIB)
+    # 4 GiB (MEMNG-961): a long iPhone video. A session is also refused (507) when the volume that
+    # holds its part file has less free space than the declared size plus 10 %.
+    MAX_UPLOAD_MIB: int = 4096
     # Published by GET /api/uploads/limits as the size above which the iOS client waits for Wi-Fi
     # by default. 200 is plan 4494's default mobile-data policy ("only under 200 MB"); MiB, like
     # MAX_UPLOAD_MIB, so both limits share one unit. Advisory: the server enforces nothing at it.

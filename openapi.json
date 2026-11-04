@@ -10663,6 +10663,21 @@
           },
           "503": {
             "$ref": "#/components/responses/DatabaseBusy"
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The server's upload volume has less free space than the declared size plus 10 %. Nothing was stored; `detail` says why. A session the server can complete from bytes it already holds (a `sha256` match) is never refused for space."
           }
         },
         "security": [

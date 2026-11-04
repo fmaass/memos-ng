@@ -7441,6 +7441,17 @@ export interface operations {
                 };
             };
             503: components["responses"]["DatabaseBusy"];
+            /** @description The server's upload volume has less free space than the declared size plus 10 %. Nothing was stored; `detail` says why. A session the server can complete from bytes it already holds (a `sha256` match) is never refused for space. */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        detail?: string;
+                    };
+                };
+            };
         };
     };
     upload_limits_api_uploads_limits_get: {
