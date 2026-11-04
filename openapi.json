@@ -10568,7 +10568,7 @@
     },
     "/api/trip-ingest/quarantine/unknown/resolve": {
       "post": {
-        "description": "`through` is the total the owner saw: anything since stays counted, so no ABA and no 409.\nWith no `through` this is the batch whose door-chosen uid is literally `unknown`, which this\nroute would otherwise make unresolvable and its alert unclearable.",
+        "description": "`through` is the total the owner saw: anything since stays counted, so no ABA and no 409.\nWith no `through` this is the batch whose door-chosen uid is literally unknown, which this\nroute would otherwise make unresolvable and its alert unclearable.",
         "operationId": "resolve_unknown_api_trip_ingest_quarantine_unknown_resolve_post",
         "requestBody": {
           "content": {
