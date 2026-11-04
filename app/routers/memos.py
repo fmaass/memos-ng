@@ -1464,6 +1464,9 @@ async def delete_memo(
     # backwards, and exactly what a PATCH of the same memo (which holds M and then reaches for
     # those attachments) deadlocks against. Taking the memo lock at the head puts the delete on
     # the same M → A path as every edit, and it costs nothing: everything after it is downstream.
+    # H before M (docs/LOCK-ORDER.md, MEMNG-1037): the delete's SET NULL writes the trip ledger rows
+    # naming this memo, and a filing part holds such a row while it asks for M.
+    await svc.lock_referencing_batches(db, memo.id)
     locked = await svc.lock_memo_for_write(db, memo)
     if locked is None:
         # A concurrent delete of this memo committed while this one queued for the lock. It won:
