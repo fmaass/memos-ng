@@ -1,0 +1,16 @@
+diff --git a/app/ingest/guest.py b/app/ingest/guest.py
+index a1df634..a41384c 100644
+--- a/app/ingest/guest.py
++++ b/app/ingest/guest.py
+@@ -427,7 +427,10 @@ async def record_refusal(
+         )
+     )
+     if lifted is not None:
+-        counted = counted.where(PassEvent.id > lifted)
++        counted = counted.where(
++            PassEvent.at
++            > (await db.execute(select(PassEvent.at).where(PassEvent.id == lifted))).scalar_one()
++        )
+     refused = (await db.execute(counted)).scalar_one()
+     if refused > settings.INGEST_REFUSALS_PER_HOUR and p.suspended_at is None:
+         p.suspended_at = now
