@@ -195,7 +195,10 @@ All settings come from the environment (or a `.env` file). Key variables — see
 - File caps on the guest door. `POST /api/guest/uploads` answers 429 with `Retry-After: 3600`
   once a pass has opened 2 000 upload sessions in the last 24 hours (`INGEST_PASS_FILES_PER_DAY`)
   or a device has sent 1 000 files in all, its unfinished sessions included
-  (`GUEST_FILES_PER_DEVICE`), so one leaked device token cannot spend a whole pass. The pass count
+  (`GUEST_FILES_PER_DEVICE`), so one leaked device token cannot spend a whole pass. That cap is per
+  enrollment, not per physical phone: whoever holds the QR secret gets another 1 000-file allowance
+  per redemption while the pass has enrollment slots left, and the 2 000-a-day pass cap still holds
+  over all of them. The pass count
   is taken under the same pass lock as its bytes, so two creates cannot take the same last slot,
   and a refused file has sent no byte. Its `last_modified` is now bounded to the years 1 to 9999,
   where a value past either edge used to be a 500.
@@ -363,6 +366,9 @@ All settings come from the environment (or a `.env` file). Key variables — see
   batch (a replayed completion answers the same receipt) and `GET /api/guest/batches`. A new
   upload answers 507 past the pass's byte cap or the `INGEST_MIN_FREE_BYTES` floor. A pass with
   more than `INGEST_REFUSALS_PER_HOUR` refused redemptions within an hour is suspended there.
+  A suspension that arises between the owner's unsuspend and the door applying it is cleared by
+  that lift, on purpose: the owner asked for this pass to open, the door counts refusals afresh
+  from the lift, so a real attack suspends it again within the same limit, and the owner sees it.
 - `ingest-home` is the interface home pulls from, under `/ingest/`, for one bearer token,
   `INGEST_SERVICE_TOKEN` (at least 86 characters, `secrets.token_urlsafe(64)`); without one it
   refuses every request. It takes pass state and device revocations, pages devices and batches,

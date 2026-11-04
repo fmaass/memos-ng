@@ -2,6 +2,8 @@
 `INGEST_PASS_FILES_PER_DAY` new files in any 24 hours, and one device at most
 `GUEST_FILES_PER_DEVICE` files in all. Each answers 429 AT the limit and admits one below it."""
 
+import asyncio
+
 from app.config import settings
 
 from tests.ingest_support import (
@@ -65,3 +67,33 @@ async def test_the_device_file_cap_admits_one_below_and_refuses_at_the_limit(
     assert refused.headers["Retry-After"] == "3600"
     # The cap is the device's own: another device on the same pass is unaffected.
     assert (await _create(door, ben, 4)).status_code == 201
+
+
+async def test_concurrent_creates_take_exactly_the_files_the_pass_has_left(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1082 #6: the count and the insert are one decision under the pass lock, so creates from
+    two devices at once cannot both take the last slot."""
+    monkeypatch.setattr(settings, "INGEST_PASS_FILES_PER_DAY", 3)
+    monkeypatch.setattr(settings, "GUEST_FILES_PER_DEVICE", 100)
+    _, secret = await seeded_pass(home_iface)
+    anna = (await redeem(door, secret, "Anna"))["device_token"]
+    ben = (await redeem(door, secret, "Ben"))["device_token"]
+    answers = await asyncio.gather(*(_create(door, anna if n % 2 else ben, n) for n in range(8)))
+    assert sorted(r.status_code for r in answers) == [201] * 3 + [429] * 5
+    assert _sql("SELECT count(*) FROM guest_uploads") == [(3,)]
+
+
+async def test_concurrent_creates_take_exactly_the_files_the_device_has_left(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "GUEST_FILES_PER_DEVICE", 2)
+    _, secret = await seeded_pass(home_iface)
+    anna = (await redeem(door, secret, "Anna"))["device_token"]
+    answers = await asyncio.gather(*(_create(door, anna, n) for n in range(6)))
+    assert sorted(r.status_code for r in answers) == [201] * 2 + [429] * 4
+    assert _sql("SELECT count(*) FROM guest_uploads") == [(2,)]

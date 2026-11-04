@@ -12,6 +12,7 @@ from app.services import passes as passes_svc
 from app.services import trip_ingest, trip_ingest_metrics
 from fastapi import HTTPException
 from sqlalchemy import select
+from starlette.routing import Match
 
 from tests import test_trip_ingest_puller as tp
 from tests.ingest_support import JPEG
@@ -91,6 +92,29 @@ async def test_resolving_what_is_not_quarantined_is_a_404(world):
     with pytest.raises(HTTPException) as err:
         await _resolve("nope", await _owner(world))
     assert err.value.status_code == 404
+
+
+async def test_a_batch_the_door_named_unknown_resolves_as_a_batch_not_as_the_counter(world):
+    """The uid is door-chosen, and the literal route shadows `{batch_uid}` for this one name, so a
+    bare POST there is the batch; only a `through` is the counter. Unhandled, its alert never ends."""
+    owner = await _owner(world)
+    uid = await _quarantined(world)
+    tp._sql("UPDATE ingest_batches SET uid = 'unknown' WHERE uid = :u", {"u": uid})
+    tp._sql("UPDATE trip_ingest_cursor SET quarantined_unknown_total = 2")
+    assert await _gauge() == 3
+    path = "/api/trip-ingest/quarantine/unknown/resolve"
+    first = next(
+        r
+        for r in router.router.routes
+        if r.matches({"type": "http", "path": path, "method": "POST"})[0] == Match.FULL  # type: ignore[union-attr]
+    )
+    assert first.endpoint is router.resolve_unknown  # type: ignore[union-attr]
+    async with async_session() as db:
+        await router.resolve_unknown(router.UnknownResolveIn(through=2), owner, db)
+    assert await _gauge() == 1, "a through must clear only the counter"
+    async with async_session() as db:
+        await router.resolve_unknown(router.UnknownResolveIn(), owner, db)
+    assert await _gauge() == 0
 
 
 async def _bare_cursor() -> None:

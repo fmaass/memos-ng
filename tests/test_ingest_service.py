@@ -6,9 +6,11 @@ import hashlib
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
+import structlog
+from app.config import settings
 from app.database import async_session
 from app.ingest import guest as guest_module
 from app.ingest import service_api
@@ -557,3 +559,77 @@ async def test_a_bulk_push_locks_its_passes_in_uid_order(home_iface):  # noqa: F
         await holder.commit()
     out = await task
     assert [(r["uid"], r["applied"]) for r in out] == [("pass-b", True), ("pass-a", True)]
+
+
+async def test_a_sweep_beside_a_real_uncommitted_create_leaves_its_part(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    ingest_env,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1082 #6: a create makes its part and only then commits, so the sweep can meet a file
+    whose row it cannot see. The create here is genuinely open: its transaction holds the row."""
+    _, secret = await seeded_pass(home_iface)
+    token = (await redeem(door, secret))["device_token"]
+    made, release = threading.Event(), threading.Event()
+    real = guest_module._part_create_sync
+
+    def parked(path) -> None:
+        real(path)
+        made.set()
+        assert release.wait(30), "the test never released the create"
+
+    monkeypatch.setattr(guest_module, "_part_create_sync", parked)
+    create = asyncio.create_task(
+        door.post(
+            "/api/guest/uploads", json={"filename": "a.jpg", "size": 5}, headers=bearer(token)
+        )
+    )
+    try:
+        assert await asyncio.to_thread(made.wait, 30), "the create never reached its part"
+        assert _sql("SELECT count(*) FROM guest_uploads") == [(0,)], "the row is not uncommitted"
+        result = await asyncio.wait_for(service_api.purge(), timeout=30)
+        assert result["strays"] == 0
+        parts = list((ingest_env / "parts").iterdir())
+        assert len(parts) == 1
+    finally:
+        release.set()
+    answer = await create
+    assert answer.status_code == 201, answer.text
+    assert parts[0].name == f"{answer.json()['upload_uid']}.part" and parts[0].exists()
+
+
+async def test_a_file_exactly_at_the_upload_horizon_stays_and_a_second_older_goes(
+    ingest_env,  # noqa: F811
+):
+    """MEMNG-1082 #6: the 24 h limit is `older than`, so a file stamped on it is still young."""
+    at = datetime(2026, 11, 4, 12, 0, 0, tzinfo=UTC)
+    horizon = int((at - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS)).timestamp())
+    parts = ingest_env / "parts"
+    parts.mkdir(parents=True, exist_ok=True)
+    on_it, older = parts / "onit.part", parts / "older.part"
+    for path, stamp in ((on_it, horizon), (older, horizon - 1)):
+        path.write_bytes(b"x")
+        os.utime(path, (stamp, stamp))
+    result = await service_api.purge(at)
+    assert result["strays"] == 1
+    assert on_it.exists() and not older.exists()
+
+
+async def test_a_file_the_sweep_cannot_remove_leaves_a_trace_and_the_rest_still_go(
+    ingest_env,  # noqa: F811
+):
+    """MEMNG-1082 #6: a real OSError (unlinking a directory), not a stubbed one."""
+    parts = ingest_env / "parts"
+    parts.mkdir(parents=True, exist_ok=True)
+    stuck = parts / "stuck.part"
+    stuck.mkdir()
+    os.utime(stuck, (time.time() - 48 * 3600, time.time() - 48 * 3600))
+    stray = _aged(parts / "stray.part", 48)
+    with structlog.testing.capture_logs() as logs:
+        result = await service_api.purge()
+    assert result["strays"] == 1
+    assert stuck.exists() and not stray.exists()
+    skipped = [e for e in logs if e["event"] == "ingest.sweep_skipped"]
+    assert [e["path"] for e in skipped] == [str(stuck)]
+    assert skipped[0]["error"] in ("IsADirectoryError", "PermissionError")
