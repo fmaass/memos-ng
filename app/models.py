@@ -633,6 +633,10 @@ PASS_EVENT_KINDS = (
     "hidden",
     "unhidden",
     "removed",
+    # Readable since 2.13.0, written by nobody yet: 2.12.0 readers know only the legacy `updated` +
+    # detail form, so a writer flip waits for the train after this one (MEMNG-1082 #4).
+    "unsuspend_requested",
+    "unsuspended",
 )
 INGEST_BATCH_STATES = ("open", "complete", "acked", "quarantined")
 
@@ -788,6 +792,13 @@ class IngestBatch(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The pass version that admitted this batch, taken under the pass lock when home recorded it, so
+    # a refusal after a pass edit records the version the door acted on (MEMNG-1037 #3).
+    pass_version: Mapped[int | None] = mapped_column(Integer)
+    # The owner's acknowledgment, separate from transport settlement: `state` stays `quarantined`
+    # because settle selects undelivered quarantines by it (MEMNG-1045 #1).
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     # What a completion was asked for (device + its upload set), so a replay or an overlapping
     # completion of the same uploads finds THIS batch and answers its receipt.
     completion_key: Mapped[str | None] = mapped_column(String(64), unique=True)
@@ -850,6 +861,10 @@ class PassSyncState(Base):
     push_urgent: Mapped[bool] = mapped_column(Boolean, server_default="false")
     last_push_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_pull_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # What the door last said about a suspension (MEMNG-1082 #3): display only, the door is
+    # untrusted. `seen_at` is home's clock, advanced only by a complete valid snapshot.
+    door_suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    door_suspended_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -866,6 +881,36 @@ class TripIngestCursor(Base):
     batches_since: Mapped[int] = mapped_column(BigInteger, server_default="0")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+    # Quarantines for a pass home never issued: no ledger row can exist (`pass_id` NOT NULL), and a
+    # counter cannot be grown by a hostile door the way a row per uid could. Monotonic; the gauge
+    # adds total - cleared (MEMNG-1045 #2).
+    quarantined_unknown_total: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    quarantined_unknown_cleared: Mapped[int] = mapped_column(BigInteger, server_default="0")
+
+
+class IngestMove(Base):
+    """One filing rename, committed BEFORE it happens (MEMNG-1037 #2): a crash between placement and
+    the filing commit loses the in-memory move list, and this is what walks those files back. The
+    filing commit deletes the rows, so a surviving row means filing did not commit.
+
+    `batch_id` has NO foreign key on purpose: rows are committed from a second session while the
+    filing holds the batch row FOR UPDATE, and a child insert's FOR KEY SHARE on that parent would
+    make the filing block on itself."""
+
+    __tablename__ = "ingest_moves"
+    __table_args__ = (
+        CheckConstraint(_in("kind", ("part", "master")), name="ck_ingest_moves_kind"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(Integer, index=True)
+    src: Mapped[str] = mapped_column(Text)
+    dest: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(8))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Both files present and the destination not this row's placeholder: nothing is overwritten,
+    # the row stays as the evidence and is never walked again.
+    flagged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class MediaJob(Base):

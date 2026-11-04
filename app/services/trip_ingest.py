@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import time
 from collections.abc import Callable, Sequence
@@ -46,7 +47,7 @@ import httpx
 import structlog
 from anyio import to_thread
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +58,7 @@ from app.models import (
     PASS_DEVICE_PLATFORMS,
     IngestBatch,
     IngestBlob,
+    IngestMove,
     Pass,
     PassDevice,
     PassEvent,
@@ -727,6 +729,8 @@ async def _record_batch(
         uid=uid,
         pass_id=p.id,
         pass_device_id=device.id,
+        # Under the pass lock `pull_batches` holds: the version that admitted this batch.
+        pass_version=p.version,
         caption=batch.caption,
         state="open",
         file_count=len(batch.blobs),
@@ -965,6 +969,144 @@ def _replace_sync(src: Path, dest: Path) -> None:
     os.replace(src, dest)
 
 
+class _MoveJournal:
+    """Commits each filing rename's (src, dest) BEFORE it happens, on a session of its own: the
+    filing's transaction holds the batch row and will only commit if everything lands. No foreign
+    key on `ingest_moves.batch_id`, so these inserts do not queue behind that row (MEMNG-1037 #2)."""
+
+    def __init__(self, batch_id: int) -> None:
+        self.batch_id = batch_id
+
+    async def record_many(self, moves: Sequence[tuple[str, str]], kind: str) -> None:
+        async with async_session() as db:
+            db.add_all(
+                IngestMove(batch_id=self.batch_id, src=src, dest=dest, kind=kind)
+                for src, dest in moves
+            )
+            await db.commit()
+
+    async def record(self, src: str, dest: str, kind: str) -> int:
+        async with async_session() as db:
+            row = IngestMove(batch_id=self.batch_id, src=src, dest=dest, kind=kind)
+            db.add(row)
+            await db.flush()
+            row_id = row.id
+            await db.commit()
+            return row_id
+
+    async def forget(self, row_id: int) -> None:
+        async with async_session() as db:
+            await db.execute(delete(IngestMove).where(IngestMove.id == row_id))
+            await db.commit()
+
+
+class _JournaledMoves(list[storage.TrackedMove]):
+    """The filing's move list. Appending hands the move its journal, so the member paths that take
+    `moved_out` carry the seam without a parameter of their own, and no other caller gets it."""
+
+    def __init__(self, journal: _MoveJournal) -> None:
+        super().__init__()
+        self.journal = journal
+
+    def append(self, track: storage.TrackedMove) -> None:
+        track.journal = self.journal
+        super().append(track)
+
+
+def _is_reservation(dest: Path, row_id: int) -> bool:
+    token = storage.reservation_token(row_id)
+    if dest.stat().st_size != len(token):
+        return False
+    return dest.read_bytes() == token
+
+
+def _walk_back_sync(row_id: int, src_path: str, dest_path: str, kind: str) -> str:
+    """One journal row's reconciliation; `done` drops the row, `flag` keeps it. Never overwrites."""
+    src, dest = Path(src_path), Path(dest_path)
+    has_src, has_dest = src.exists(), dest.exists()
+    if has_dest and kind == "master" and _is_reservation(dest, row_id):
+        dest.unlink()  # this row's own placeholder: the rename never ran
+        return "done"
+    if has_src and has_dest:
+        # A part path is named by this row's 192-bit uid, so nobody else made it; empty, it is the
+        # placeholder `create_upload` leaves until the rename lands.
+        if kind == "part" and dest.stat().st_size == 0:
+            dest.unlink()
+            return "done"
+        return "flag"
+    if has_dest:
+        src.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(dest, src)
+        return "done"
+    if not has_src:
+        logger.warning("trip_ingest.reconcile_neither", move=row_id, src=src_path, dest=dest_path)
+    return "done"
+
+
+class ReconcileIncomplete(Exception):
+    """A journaled file would not move back. The tick stops before filing: the batch's bytes are
+    not where a retry expects them, and `GuestSyncStale` stays the loud signal."""
+
+
+async def reconcile_moves() -> None:
+    """Walk back whatever a crashed filing left, before anything is filed. For each batch with rows:
+    the batch row FIRST, which waits out a filing still running (the sync advisory lock is on
+    another connection, so losing that connection can release it while a filing runs on), THEN the
+    journal read fresh, walked in REVERSE order. Idempotent, and a no-op after an in-process walk
+    back."""
+    async with async_session() as db:
+        batch_ids = list(
+            (
+                await db.execute(
+                    select(IngestMove.batch_id)
+                    .where(IngestMove.flagged_at.is_(None))
+                    .distinct()
+                    .order_by(IngestMove.batch_id)
+                )
+            ).scalars()
+        )
+    failed = 0
+    for batch_id in batch_ids:
+        async with async_session() as db:
+            await db.execute(
+                select(IngestBatch.id).where(IngestBatch.id == batch_id).with_for_update()
+            )
+            rows = list(
+                (
+                    await db.execute(
+                        select(IngestMove)
+                        .where(IngestMove.batch_id == batch_id, IngestMove.flagged_at.is_(None))
+                        .order_by(IngestMove.id.desc())
+                    )
+                ).scalars()
+            )
+            for row in rows:
+                try:
+                    outcome = await to_thread.run_sync(
+                        _walk_back_sync, row.id, row.src, row.dest, row.kind
+                    )
+                except OSError as exc:
+                    failed += 1
+                    logger.error(
+                        "trip_ingest.reconcile_failed",
+                        move=row.id,
+                        src=row.src,
+                        dest=row.dest,
+                        error=type(exc).__name__,
+                    )
+                    continue
+                if outcome == "flag":
+                    row.flagged_at = datetime.now(UTC)
+                    logger.error(
+                        "trip_ingest.reconcile_both_present", move=row.id, src=row.src, dest=row.dest
+                    )
+                else:
+                    await db.delete(row)
+            await db.commit()
+    if failed:
+        raise ReconcileIncomplete(f"{failed} journaled moves would not walk back")
+
+
 def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -> None:
     """Walk a rolled-back filing's files back to the staging area, so the next tick finds them.
     Inline, not in a thread: this may run while a cancellation unwinds (see the memo router's
@@ -1081,7 +1223,8 @@ async def _file_part(batch_id: int) -> bool | None:
     filed. None: the batch is not `open` (filed, quarantined — the
     replay is resolved here, before anything is inserted); True: this part completed the batch;
     False: parts remain for the next call."""
-    moved: list[storage.TrackedMove] = []
+    journal = _MoveJournal(batch_id)
+    moved = _JournaledMoves(journal)
     parts: list[tuple[Path, Path]] = []
     consumed: list[str] = []
     filing: list[int] = []
@@ -1120,9 +1263,24 @@ async def _file_part(batch_id: int) -> bool | None:
                     uid if len(pending) == len(blobs) else f"{uid}/{part[0].sha256}"
                 )
                 upload_for: dict[str, IngestBlob] = {}
-                for blob in part:
+                # Journaled before the empty part files exist: a crash before this commit leaves
+                # nothing to find, and one after it leaves rows that say what to clean.
+                planned = [(secrets.token_urlsafe(24), blob) for blob in part]
+                if planned:
+                    await journal.record_many(
+                        [
+                            (
+                                str(_verified_path(uid, b.sha256)),
+                                str(uploads_svc.part_path(up_uid)),
+                            )
+                            for up_uid, b in planned
+                        ],
+                        "part",
+                    )
+                for up_uid, blob in planned:
                     up = await uploads_svc.create_upload(
                         db,
+                        upload_uid=up_uid,
                         owner_id=owner_id,
                         filename=blob.filename,
                         mime=blob.mime,
@@ -1209,6 +1367,13 @@ async def _file_part(batch_id: int) -> bool | None:
                 if complete:
                     batch.state = "complete"
                 filing = [b.id for b in part]
+                # In the filing's own transaction: a surviving row means this did not commit. A
+                # flagged row stays as the evidence of a conflict nothing resolved.
+                await db.execute(
+                    delete(IngestMove).where(
+                        IngestMove.batch_id == batch_id, IngestMove.flagged_at.is_(None)
+                    )
+                )
                 commit_sent = True
                 await db.commit()
                 committed = True
@@ -1315,7 +1480,11 @@ async def _refuse_open(batch_id: int, reason: str) -> None:
         if p is not None:
             db.add(
                 PassEvent(
-                    pass_id=p.id, kind="refused", version=p.version, detail=f"{batch.uid}: {reason}"
+                    pass_id=p.id,
+                    kind="refused",
+                    # The version that admitted the batch; an older row has none and keeps today's.
+                    version=batch.pass_version if batch.pass_version is not None else p.version,
+                    detail=f"{batch.uid}: {reason}",
                 )
             )
             await _note_pass_error(db, p.id, f"batch {batch.uid} quarantined: {reason}")
@@ -1407,6 +1576,7 @@ async def sync_once(client: httpx.AsyncClient, budget_s: float) -> TickResult:
     await pull_devices(client)
     await pull_batches(client, errors)
     await settle(client)
+    await reconcile_moves()
     try:
         filed = await file_open(client, deadline, errors)
     except OutOfTime:
@@ -1419,6 +1589,7 @@ async def sync_once(client: httpx.AsyncClient, budget_s: float) -> TickResult:
 
 
 TICK_CANCELLED = "cancelled: the tick ran past its bound"
+CANCEL_RECORD_DEADLINE_S = 2.0
 
 
 async def _record_tick(*, synced: bool, error: str | None) -> None:
@@ -1462,7 +1633,9 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
         # The worker's housekeeping bound (`worker._bounded`) cancelled the tick. The snapshot's
         # age still says the sync is stale, but without this the reason was lost (MEMNG-1045).
         # Shielded: the cancellation that brought the tick here must not also cancel the record.
-        await asyncio.shield(asyncio.ensure_future(_record_tick_safe(TICK_CANCELLED)))
+        # The deadline lives INSIDE the shielded task: a timeout around the shield would only stop
+        # this wait and leave the task queued on the row or the pool.
+        await asyncio.shield(asyncio.ensure_future(_record_cancelled()))
         raise
     except LinkDown as exc:
         logger.warning("trip_ingest.link_down", error=str(exc))
@@ -1472,6 +1645,18 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
         logger.exception("trip_ingest.error")
         await _record_tick_safe(f"{type(exc).__name__}: {exc}")
         return "error"
+
+
+async def _record_cancelled() -> None:
+    """The cancel path's record, ending on its own: pool acquire, statement and commit together get
+    CANCEL_RECORD_DEADLINE_S, well inside the worker's 14 s housekeeping bound."""
+    try:
+        async with asyncio.timeout(CANCEL_RECORD_DEADLINE_S):
+            await _record_tick(synced=False, error=TICK_CANCELLED)
+    except TimeoutError:
+        logger.error("trip_ingest.cancel_record_timed_out")
+    except Exception:
+        logger.exception("trip_ingest.record_failed")
 
 
 async def _record_tick_safe(error: str) -> None:

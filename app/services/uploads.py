@@ -338,6 +338,13 @@ def _move_into_sync(src: Path, dest: Path) -> None:
     os.replace(src, dest)
 
 
+async def _move_tracked(track: storage.TrackedMove, dest: Path) -> None:
+    """The tracked move, journaled first when the move list carries a journal (trip filing)."""
+    if track.journal is not None:
+        await track.journal.record(track.src, str(dest), "master")
+    await to_thread.run_sync(_tracked_move_into_sync, track, dest)
+
+
 def _tracked_move_into_sync(track: storage.TrackedMove, dest: Path) -> Path:
     """`_move_into_sync` under the move's own arbitration — see `storage.TrackedMove.perform`.
 
@@ -486,11 +493,13 @@ async def create_upload(
     mime: str,
     size: int,
     last_modified: int | None = None,
+    upload_uid: str | None = None,
 ) -> Upload:
     """Open an upload session BOUND to `owner_id`. The uid is unguessable but is not a capability:
     every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
-    another user out of these bytes."""
-    upload_uid = secrets.token_urlsafe(24)
+    another user out of these bytes. `upload_uid` is trip filing's: it journals the part path before
+    the empty part file exists (`trip_ingest._file_part`)."""
+    upload_uid = upload_uid or secrets.token_urlsafe(24)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
     # millisecond than the one sent once the seconds pass 2**32, and this value is kept exactly
     # as the client sent it.
@@ -1604,7 +1613,7 @@ async def finalize(
     track = storage.TrackedMove(src=str(part))
     if moved_out is not None:
         moved_out.append(track)
-    await to_thread.run_sync(_tracked_move_into_sync, track, dest)  # mkdir + os.replace in one hop
+    await _move_tracked(track, dest)  # mkdir + os.replace in one hop
 
     is_video = mime.startswith("video/")
     latitude, longitude, location_source = await _read_location(dest, mime)
@@ -1737,7 +1746,7 @@ async def finalize_rendition(
     track = storage.TrackedMove(src=str(part))  # recorded before the move — see finalize above
     if moved_out is not None:
         moved_out.append(track)
-    await to_thread.run_sync(_tracked_move_into_sync, track, dest)
+    await _move_tracked(track, dest)
     upload_metrics.count_session_end(db, "completed")
     await db.delete(upload)
     await db.flush()

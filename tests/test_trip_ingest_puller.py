@@ -45,6 +45,7 @@ from tests.test_attachments_taken import _sql
 TAG = "tp3trip"
 OWNER = "tp3_owner"
 HOME_TABLES = (
+    "ingest_moves",
     "trip_ingest_cursor",
     "pass_sync_state",
     "pass_events",
