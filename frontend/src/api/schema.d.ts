@@ -3642,7 +3642,7 @@ export interface components {
             batches: components["schemas"]["QuarantinedBatchOut"][];
             /**
              * Unknownopen
-             * @description `unknownTotal` less what the owner cleared.
+             * @description The total less what the owner cleared.
              */
             unknownOpen: number;
             /**

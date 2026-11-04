@@ -79,7 +79,7 @@ class PassOut(BaseModel):
         description="What the door last said, display only; null when home does not know "
         "(an old door, a malformed answer, or a view older than the sync's stale window).",
     )
-    doorSuspendedAt: datetime | None = None
+    doorSuspendedAt: Rfc3339Datetime | None = None
     expiresAt: Rfc3339Datetime
     maxDevices: int
     notes: str | None

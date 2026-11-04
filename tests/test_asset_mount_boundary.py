@@ -37,6 +37,9 @@ RENAME_CALLS = {"replace", "rename", "move"}
 # rename is within-device by construction whichever mount that directory is on.
 DISPOSITIONS = {
     ("services/storage.py", "restore"): "originals only — a memo folder or _unfiled back to a part",
+    ("services/storage.py", "move"): "originals only — a journaled _unfiled into a memo folder",
+    ("services/trip_ingest.py", "_walk_back_sync"): "uploads and originals only — a journaled "
+    "filing move walked back, each side on the data volume",
     ("services/storage.py", "_place_master_sync"): "originals only — _unfiled into a memo folder",
     ("services/storage.py", "_replace_master_sync"): "originals only — onto a print master "
     "already in its memo folder",

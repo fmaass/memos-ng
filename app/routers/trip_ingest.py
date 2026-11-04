@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
+from app.api_types import Rfc3339Datetime
 from app.database import get_session
 from app.models import IngestBatch, Pass, TripIngestCursor, User
 
@@ -22,13 +23,13 @@ class QuarantinedBatchOut(BaseModel):
     passUid: str
     fileCount: int
     byteTotal: int
-    createdAt: datetime
+    createdAt: Rfc3339Datetime
 
 
 class QuarantineOut(BaseModel):
     batches: list[QuarantinedBatchOut]
     unknownTotal: int = Field(description="Quarantines for a pass home never issued, ever.")
-    unknownOpen: int = Field(description="`unknownTotal` less what the owner cleared.")
+    unknownOpen: int = Field(description="The total less what the owner cleared.")
 
 
 class UnknownResolveIn(BaseModel):

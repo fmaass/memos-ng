@@ -304,6 +304,8 @@ EXPECTED_DATETIME_FIELDS = {
     ("PassDeviceOut", "lastSeen"),
     ("PassDeviceOut", "revokedAt"),
     ("PassOut", "createdAt"),
+    ("PassOut", "doorSuspendedAt"),
+    ("QuarantinedBatchOut", "createdAt"),
     ("PassOut", "expiresAt"),
     ("PassOut", "revokedAt"),
     ("PassOut", "updatedAt"),

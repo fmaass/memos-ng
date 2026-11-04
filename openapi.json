@@ -3862,7 +3862,7 @@
             "type": "array"
           },
           "unknownOpen": {
-            "description": "`unknownTotal` less what the owner cleared.",
+            "description": "The total less what the owner cleared.",
             "title": "Unknownopen",
             "type": "integer"
           },

@@ -49,6 +49,7 @@ GUEST_ALLOWLIST = {
 HOME_IFACE_ALLOWLIST = {
     ("GET", "/health"),
     ("PUT", "/ingest/passes"),
+    ("GET", "/ingest/passes/suspended"),
     ("PUT", "/ingest/device-revocations"),
     ("GET", "/ingest/devices"),
     ("GET", "/ingest/batches"),
