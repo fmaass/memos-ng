@@ -194,6 +194,27 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.14.0
+
+- Uploads can now be up to 4 GiB. `GET /api/uploads/limits` publishes the new limit, and creating a
+  session answers 507 with a reason when the volume cannot hold the file plus 10 %.
+- Optional dedupe at staging: `POST /api/uploads` takes an optional `sha256`. When it matches one of
+  the caller's own files, the session starts complete and costs no upload. No client sends it yet.
+- `POST /api/uploads/batch` opens several sessions in one request, and `DELETE /api/uploads/{uid}`
+  withdraws a session so it can no longer finalize.
+- `GET` and `PATCH /api/me` carry the default memo visibility and the opt-in for a push when a
+  household member's memo goes live. One push per memo, never for a private memo.
+- `/api/events` now reports upload progress and memo changes, and a reconnect replays more safely.
+  The web client keeps the stream open during an upload.
+- Guest memos stay out of `GET /api/memos` unless the request says `?guest=include`, and carry the
+  contributor's name.
+- `POST` and `DELETE /api/devices/live-activity-token` register a device's push-to-start token.
+- A sweep for finalized attachments no memo ever took is included and off by default
+  (`NEVER_LINKED_SWEEP_ENABLED`). The metric reports them either way.
+- Reclaim checks every path it removes against the other rows, and upload finalize, batch cleanup
+  and the hourly reap are more careful around commit failures.
+- HEIC decoding now uses the decode-only `pi-heif` instead of `pillow-heif`.
+
 ### v2.13.0
 
 - Quarantined guest uploads can now be marked as seen. `GET /api/trip-ingest/quarantine` lists the
