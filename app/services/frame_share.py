@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-import pillow_heif
+import pi_heif
 import structlog
 from anyio import to_thread
 from PIL import Image, ImageOps
@@ -26,7 +26,7 @@ from app.models import Attachment, FrameShareJob, FrameShareState, Memo, Tag, Us
 
 logger = structlog.get_logger(__name__)
 
-pillow_heif.register_heif_opener()  # decode HEIC/HEIF originals (also registered in services.media)
+pi_heif.register_heif_opener()  # decode HEIC/HEIF originals (also registered in services.media)
 
 # The tag that opts a memo's photos into frame sharing.
 CURATED_TAG = "curated"
@@ -147,7 +147,7 @@ def render_for_frame(original_path: str, photo_date: datetime | None = None) -> 
     normalized to 1 after ImageOps.exif_transpose bakes rotation into the pixels. DateTimeOriginal
     is backfilled from photo_date ONLY when the source lacks it (stored curated screen-PNGs have no
     EXIF, and Aura sorts chronologically by that tag — callers pass the memo's date, the intended
-    frame position). HEIC decodes via pillow-heif. Synchronous CPU work — call under
+    frame position). HEIC decodes via pi-heif. Synchronous CPU work — call under
     to_thread.run_sync."""
     with Image.open(original_path) as raw:
         img = ImageOps.exif_transpose(raw).convert("RGB")

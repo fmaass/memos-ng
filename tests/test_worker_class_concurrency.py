@@ -139,10 +139,13 @@ def _png(path: Path, size=(400, 300)) -> Path:
 
 
 def _heic(path: Path) -> Path:
-    """A REAL HEIF file (pillow-heif's opener is registered by app.services.media), so the
-    slow-lane image branch decodes what the deployed worker decodes."""
+    """A REAL HEIF file, encoded by the dev-only pillow-heif and decoded by the pi-heif opener
+    app.services.media registers, so the slow-lane image branch decodes what the deployed worker
+    decodes."""
+    import pillow_heif
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (400, 300), (30, 140, 90)).save(path, format="HEIF")
+    pillow_heif.from_pillow(Image.new("RGB", (400, 300), (30, 140, 90))).save(path)
     return path
 
 

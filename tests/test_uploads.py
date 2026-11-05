@@ -321,8 +321,7 @@ def _make_heic(path):
     import pillow_heif
     from PIL import Image
 
-    pillow_heif.register_heif_opener()
-    Image.new("RGB", (96, 72), (200, 120, 40)).save(str(path), format="HEIF")
+    pillow_heif.from_pillow(Image.new("RGB", (96, 72), (200, 120, 40))).save(str(path))
 
 
 def test_detect_heif_mime_per_category():

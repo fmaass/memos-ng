@@ -43,13 +43,13 @@ from dataclasses import astuple, dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-import pillow_heif
+import pi_heif
 import structlog
 from PIL import Image, PngImagePlugin, TiffImagePlugin, WebPImagePlugin
 
 from app.services import capture
 
-pillow_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
+pi_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
 
 logger = structlog.get_logger()
 

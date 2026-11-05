@@ -758,7 +758,6 @@ def _png_without_metadata() -> bytes:
 def _heic_with_date_and_gps() -> bytes:
     import pillow_heif
 
-    pillow_heif.register_heif_opener()
     exif = Image.Exif()
     ifd = exif.get_ifd(0x8769)
     ifd[0x9003] = "2025:05:06 07:08:09"
@@ -766,7 +765,7 @@ def _heic_with_date_and_gps() -> bytes:
     gps = exif.get_ifd(0x8825)
     gps[1], gps[2], gps[3], gps[4] = "N", (12.0, 30.0, 0.0), "E", (45.0, 15.0, 0.0)
     buf = io.BytesIO()
-    Image.new("RGB", (16, 16), "red").save(buf, format="HEIF", exif=exif.tobytes())
+    pillow_heif.from_pillow(Image.new("RGB", (16, 16), "red")).save(buf, exif=exif.tobytes())
     return buf.getvalue()
 
 

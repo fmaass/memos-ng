@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pillow_heif
+import pi_heif
 import structlog
 from anyio import to_thread
 from app.config import settings
@@ -51,13 +51,13 @@ from PIL import Image
 from sqlalchemy import Update, and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-pillow_heif.register_heif_opener()  # the same HEIC/HEIF opener the worker registers
+pi_heif.register_heif_opener()  # the same HEIC/HEIF opener the worker registers
 
 logger = structlog.get_logger(__name__)
 
 IMAGE_PREFIX = "image/"
 
-# The raster types Pillow (+pillow_heif) actually decodes in this deployment. ``process_job`` has no
+# The raster types Pillow (+pi_heif) actually decodes in this deployment. ``process_job`` has no
 # such predicate — it routes every non-video mime into image processing — and it is deliberately not
 # changed here, so the allowlist lives in this script alone. Anything else (image/svg+xml, unknown
 # subtypes) is left untouched and counted as skipped.

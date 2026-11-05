@@ -26,7 +26,9 @@ dependencies = [
     "cryptography>=44,<51",
     "puremagic>=1.28,<3",
     "pillow>=11,<13",
-    "pillow-heif>=0.18,<2",
+    # Decode-only sibling of pillow-heif: its wheel bundles libheif + libde265 and no x265 (GPLv2)
+    # encoder, so the shipped image carries no GPL library. The server only ever decodes HEIC.
+    "pi-heif>=0.18,<2",
     "pywebpush>=2.0,<3",
     # --- daily digest (MEMNG-234). memos-ng had no server-side Markdown renderer and no template
     # engine; the digest's mail body is the satellite's Jinja2 template rendering memo Markdown,
@@ -60,6 +62,10 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "httpx>=0.28",
+    # The HEIC encoder, for test and fixture generation only. Never a runtime dependency: the wheel
+    # bundles x265 (GPLv2). Tests encode with `pillow_heif.from_pillow` and never register its
+    # opener, so every decode under test goes through the runtime pi-heif opener.
+    "pillow-heif>=0.18,<2",
 ]
 
 [tool.ruff]

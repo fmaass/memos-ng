@@ -8,7 +8,7 @@ module different from the EXIF code already in `services/media.py`:
   no decode. A video is walked atom by atom with `seek`, so the `mdat` (the samples, i.e. the
   whole file for a 4K clip) is never read: only the `moov` box reaches memory, and only up to
   `MOOV_READ_CAP`. A HEIC is walked the same way (`heif_exif_from`), because opening one costs
-  the WHOLE file — pillow-heif parses the image payload to open it, and only the `meta` box and
+  the WHOLE file — pi-heif parses the image payload to open it, and only the `meta` box and
   the Exif item's own extent are wanted, capped by `HEIF_EXIF_READ_CAP`.
 * **A date-tag WHITELIST.** Exactly three EXIF tags and one QuickTime key are read — and, for a
   PNG or JPEG whose EXIF holds no date, `DateTimeOriginal` out of its XMP packet (MEMNG-844):
@@ -31,11 +31,11 @@ from pathlib import Path
 from typing import BinaryIO
 from xml.etree import ElementTree
 
-import pillow_heif
+import pi_heif
 import structlog
 from PIL import Image, PngImagePlugin, TiffImagePlugin
 
-pillow_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
+pi_heif.register_heif_opener()  # HEIC/HEIF primaries (also registered in services.media)
 
 logger = structlog.get_logger()
 
@@ -352,7 +352,7 @@ def png_exif_from(f: BinaryIO) -> bytes | None:
 def heif_exif_from(f: BinaryIO) -> bytes | None:
     """A HEIF/HEIC's Exif payload, found by walking its boxes and reading ONE extent — or None.
 
-    pillow-heif parses the WHOLE file to open it, image payload included, so asking Pillow for
+    pi-heif parses the WHOLE file to open it, image payload included, so asking Pillow for
     `im.info["exif"]` costs a 4 MB read for four kilobytes of metadata — over NFS that is what put
     the location backfill and the upload's 5 s read budget at the mercy of the mount. The box walk
     is the same trick `read_moov_from` plays on a video: every box but `meta` is SEEKED over,
@@ -666,7 +666,7 @@ def _heif_exif_payload(raw: bytes) -> bytes | None:
     """One Exif item's extent as the payload a parser takes, or None if it is not one.
 
     The extent is an ExifDataBlock: a 4-byte `exif_tiff_header_offset` and then the payload. The
-    four bytes are dropped rather than followed, because that is byte-for-byte what pillow-heif
+    four bytes are dropped rather than followed, because that is byte-for-byte what pi-heif
     hands over in `im.info["exif"]` — the whole point is that the two readers are interchangeable.
     A payload that is neither APP1-prefixed nor a TIFF header is refused: an offset read from a
     file that turned out not to be shaped as assumed must never be handed on as metadata.
@@ -703,7 +703,7 @@ def _read_image(path: Path, mime: str) -> CaptureResult:
     * JPEG — `im.info["exif"]` is the raw APP1 payload the plugin picked up while parsing the
       header.
     * HEIF / HEIC — the box walk above (`heif_exif_from`), because an OPEN costs the whole file
-      here: pillow-heif parses the image payload too. It reads the PRIMARY item's Exif, which is
+      here: pi-heif parses the image payload too. It reads the PRIMARY item's Exif, which is
       NOT necessarily the first one (`fixtures/auto-memo-date/heic-offset.heic` carries a
       different date on its first item on purpose). When the walk declines, the open is the
       fallback and answers exactly as it always did.

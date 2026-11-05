@@ -121,10 +121,9 @@ async def test_slow_lane_decodes_heic_image(adb, monkeypatch, tmp_path):
     from PIL import Image
 
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
-    pillow_heif.register_heif_opener()
     src = tmp_path / "originals" / "p.heic"
     src.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (120, 90), (40, 160, 90)).save(str(src), format="HEIF")
+    pillow_heif.from_pillow(Image.new("RGB", (120, 90), (40, 160, 90))).save(str(src))
 
     att = Attachment(
         uid="heic1",

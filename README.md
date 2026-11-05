@@ -31,7 +31,7 @@ into two containers from one image:** `memos-ng-app` (SPA + API + asset serving)
                     │ memos-ng-worker (command: worker)         │
                     │  • drains the media_jobs queue            │
                     │    (FOR UPDATE SKIP LOCKED)               │
-                    │  • Pillow/pillow-heif thumbs + posters    │
+                    │  • Pillow/pi-heif thumbs + posters        │
                     │  • ffmpeg H.264 transcode (slow lane)     │
                     │  • thermal-guarded (Saturn is heat-bound) │
                     └───────────────────────────────────────────┘

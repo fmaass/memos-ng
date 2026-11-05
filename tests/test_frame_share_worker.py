@@ -79,12 +79,9 @@ def test_render_normalizes_orientation(tmp_path):
 
 
 def test_render_heic_source_to_jpeg(tmp_path):
-    pytest.importorskip("pillow_heif")
+    pillow_heif = pytest.importorskip("pillow_heif")
     p = tmp_path / "o.heic"
-    try:
-        Image.new("RGB", (80, 50), (5, 5, 5)).save(p, format="HEIF")
-    except (OSError, KeyError):
-        pytest.skip("HEIF encoder unavailable in this pillow-heif build")
+    pillow_heif.from_pillow(Image.new("RGB", (80, 50), (5, 5, 5))).save(p)
     assert Image.open(io.BytesIO(fs.render_for_frame(str(p)))).format == "JPEG"
 
 

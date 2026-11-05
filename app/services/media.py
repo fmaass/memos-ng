@@ -15,7 +15,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
 
-import pillow_heif
+import pi_heif
 import structlog
 from anyio import to_thread
 from PIL import Image, ImageChops, ImageCms, ImageFile, ImageOps, ImageStat
@@ -45,7 +45,7 @@ from app.services import (
     sibling,
 )
 
-pillow_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
+pi_heif.register_heif_opener()  # lets PIL open HEIC/HEIF camera originals
 
 logger = structlog.get_logger(__name__)
 
@@ -351,7 +351,7 @@ def _stamp_mtime(path: Path, attachment: Attachment) -> None:
 
 
 def process_image(attachment: Attachment) -> dict:
-    """Derive thumb + mobile tiers + blurhash + dims via Pillow (+pillow-heif for HEIC).
+    """Derive thumb + mobile tiers + blurhash + dims via Pillow (+pi-heif for HEIC).
 
     pyvips would be faster but needs a system libvips; the bundled-libheif wheels are
     portable. The original is never modified (ADR-0008).
