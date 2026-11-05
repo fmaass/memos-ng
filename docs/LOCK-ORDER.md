@@ -209,11 +209,12 @@ files move.
   the identity-vs-orphan predicates, the per-attachment transaction boundary, and the absence of a
   media-job FK cascade (`reclaim._ineligible`, `reclaim.reclaim_attachment`,
   `asset_paths.all_asset_paths`; `models.MediaJob`).
-- **X7** Do **not** unlink consumed parts before commit, and do **not** discard committed media in
-  a cleanup path. Keep `consumed_out`, `TrackedMove`, poster-copy settlement and the
-  committed-state guards (`uploads.PosterCopy`, `storage.TrackedMove`, and the create/PATCH
-  routes' post-commit reaps). `tests/test_commit_race_reconcile.py` documents actual damage, not a
-  hypothetical.
+- **X7** Do **not** unlink consumed or expired parts before commit, and do **not** discard
+  committed media in a cleanup path. Keep `consumed_out`, `TrackedMove`, poster-copy settlement and
+  the committed-state guards (`uploads.PosterCopy`, `storage.TrackedMove`, the create/PATCH routes'
+  post-commit reaps, and the expiry sweep's `uploads.reap_expired_committed`, which unlinks a part
+  only after the deletion of its row committed). `tests/test_commit_race_reconcile.py` documents
+  actual damage, not a hypothetical.
 - **X8** Do **not** unify ingest and interactive replacement semantics. Ingest renditions are
   write-once; interactive renditions replace; a sibling print collision promotes rather than
   dropping a master (`uploads.finalize_rendition`, `assets.attach_rendition`,

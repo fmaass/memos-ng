@@ -436,14 +436,21 @@ def sanitize_error(text: str, limit: int = ERROR_TEXT_LIMIT) -> str:
     return cleaned.encode("utf-8", "backslashreplace").decode("utf-8")[:limit]
 
 
+def _names_an_executable(filename: object) -> bool:
+    # `filename` is whatever the raiser passed — a str, bytes, a PathLike or None; only a str can
+    # be a bare binary name, and an unhashable value must not turn the classifier into a raise.
+    return isinstance(filename, str) and filename in media.EXECUTABLES
+
+
 def classify_failure(exc: BaseException) -> FailureReason:
     """The bounded reason a media job failed with, read off the exception its attempt raised
-    (MEMNG-1046). Pure: the type decides, never the message.
+    (MEMNG-1046). Pure: the type and its attributes decide, never the message.
 
     Order matters where the types nest: Pillow's refusals are OSErrors, so they are read before the
-    filesystem ones, and a missing file before any other OS error. Pillow raises its own decode
-    failures ("image file is truncated", "broken data stream") as OSError with no errno, which is
-    what separates them from a refusal by the volume, which always carries one.
+    filesystem ones, and a missing file before any other OS error — unless the missing file is the
+    ffmpeg/ffprobe binary a spawn named (`filename`), which is no source of the job's. Pillow raises
+    its own decode failures ("image file is truncated", "broken data stream") as OSError with no
+    errno, which is what separates them from a refusal by the volume, which always carries one.
     """
     if isinstance(exc, MemoryError):
         return FailureReason.out_of_memory
@@ -453,6 +460,10 @@ def classify_failure(exc: BaseException) -> FailureReason:
         return FailureReason.ffmpeg_failed
     if isinstance(exc, Image.UnidentifiedImageError | Image.DecompressionBombError | SyntaxError):
         return FailureReason.decode_error
+    if isinstance(exc, FileNotFoundError) and _names_an_executable(exc.filename):
+        # The ffmpeg/ffprobe binary itself is gone, not the original: that is the image, and it
+        # is `other` — `ffmpeg_failed` says ffmpeg ran and exited non-zero (MEMNG-1162).
+        return FailureReason.other
     if isinstance(exc, media.SourceMissing | FileNotFoundError):
         return FailureReason.source_missing
     if isinstance(exc, OSError):

@@ -401,3 +401,86 @@ async def test_a_savepoint_neither_counts_nor_drops_the_outer_result(db_engine):
                 await db.execute(text("SELECT 1/0"))
         await db.commit()
     assert _sample("memosng_upload_sessions_total", {"result": "completed"}) == before + 1
+
+
+def _completed() -> float:
+    return _sample("memosng_upload_sessions_total", {"result": "completed"})
+
+
+async def test_a_result_inside_a_rolled_back_savepoint_is_not_counted_on_commit(db_engine):
+    """MEMNG-1162: the result belongs to the SAVEPOINT it was recorded in. Rolled back, that
+    savepoint takes the result with it, whatever the outer transaction then does."""
+    from app.database import async_session
+    from sqlalchemy import text
+
+    before = _completed()
+    async with async_session() as db:
+        await db.execute(text("SELECT 1"))
+        with pytest.raises(Exception, match="division by zero"):
+            async with db.begin_nested():
+                um.count_session_end(db, "completed")
+                await db.execute(text("SELECT 1/0"))
+        await db.commit()
+    assert _completed() == before
+
+    # An explicit ROLLBACK TO SAVEPOINT, not only the exception path.
+    async with async_session() as db:
+        savepoint = await db.begin_nested()
+        um.count_session_end(db, "completed")
+        await savepoint.rollback()
+        await db.commit()
+    assert _completed() == before
+
+
+async def test_a_released_savepoint_hands_its_result_to_the_outer_transaction(db_engine):
+    from app.database import async_session
+    from sqlalchemy import text
+
+    before = _completed()
+    async with async_session() as db:
+        async with db.begin_nested():
+            um.count_session_end(db, "completed")
+            await db.execute(text("SELECT 1"))
+        await db.commit()
+    assert _completed() == before + 1
+
+    # Released, then the ROOT rolls back: the result dies with the transaction it was handed to.
+    async with async_session() as db:
+        async with db.begin_nested():
+            um.count_session_end(db, "completed")
+        await db.rollback()
+    assert _completed() == before + 1
+
+    # Still open when the root commits: the commit releases it, and the result counts.
+    async with async_session() as db:
+        await db.begin_nested()
+        um.count_session_end(db, "completed")
+        await db.commit()
+    assert _completed() == before + 2
+
+
+async def test_a_savepoint_rolled_back_takes_the_results_its_released_children_handed_it(
+    db_engine,
+):
+    from app.database import async_session
+
+    before = _completed()
+    async with async_session() as db:
+        um.count_session_end(db, "completed")  # recorded at the root, before it: survives
+        outer = await db.begin_nested()
+        um.count_session_end(db, "completed")  # the outer savepoint's own result
+        async with db.begin_nested():
+            um.count_session_end(db, "completed")  # released into the outer savepoint
+        await outer.rollback()
+        um.count_session_end(db, "completed")  # recorded at the root, after it: survives
+        await db.commit()
+    assert _completed() == before + 2
+
+    # The rolled-back savepoint is ended while its child is still open: both go.
+    async with async_session() as db:
+        outer = await db.begin_nested()
+        await db.begin_nested()
+        um.count_session_end(db, "completed")
+        await outer.rollback()
+        await db.commit()
+    assert _completed() == before + 2

@@ -175,6 +175,63 @@ def test_the_typed_transcode_errors_stay_runtime_errors():
         assert issubclass(cls, RuntimeError)
 
 
+# A missing ffmpeg/ffprobe is a broken image, not a missing original (MEMNG-1162). The errors are
+# raised for real: a spawn on a PATH that holds neither binary, beside a source that IS on disk.
+
+
+@pytest.fixture
+def no_ffmpeg_on_path(monkeypatch, tmp_path):
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    source = tmp_path / "originals" / "clip.mov"
+    source.parent.mkdir()
+    source.write_bytes(b"\x00\x00\x00\x18ftypqt  " + b"\x00" * 64)
+    return source
+
+
+def test_a_missing_ffprobe_on_the_poster_lane_is_not_source_missing(no_ffmpeg_on_path):
+    from app.models import Attachment
+
+    clip = Attachment(uid="memng1162-clip", storage_path=str(no_ffmpeg_on_path))
+    with pytest.raises(FileNotFoundError) as raised:
+        media.process_video_poster(clip)
+    assert no_ffmpeg_on_path.exists()  # the original was there all along
+    assert worker.classify_failure(raised.value) is FailureReason.other
+
+
+def test_a_missing_ffmpeg_on_the_transcode_spawn_is_not_source_missing(no_ffmpeg_on_path):
+    cmd = media.slow_ffmpeg_cmd(
+        str(no_ffmpeg_on_path), str(no_ffmpeg_on_path.with_suffix(".mp4")), 1
+    )
+
+    async def _spawn():
+        await asyncio.create_subprocess_exec(*cmd)
+
+    with pytest.raises(FileNotFoundError) as raised:
+        asyncio.run(_spawn())
+    assert worker.classify_failure(raised.value) is FailureReason.other
+
+
+def test_a_missing_original_that_happens_to_be_named_ffmpeg_is_still_source_missing():
+    # The executable is matched by the spawn's bare name, never by a path that ends in one.
+    try:
+        Path("/nonexistent/memng-1162/ffmpeg").read_bytes()
+    except FileNotFoundError as exc:
+        assert worker.classify_failure(exc) is FailureReason.source_missing
+    else:
+        raise AssertionError("test setup: the missing file exists")
+
+
+def test_every_spawned_binary_is_one_the_classifier_knows():
+    commands = (
+        media.probe_cmd("/x.mov"),
+        media.poster_ffmpeg_cmd("/x.mov", "/x.jpg", 1.0),
+        media.slow_ffmpeg_cmd("/x.mov", "/x.mp4", 1),
+    )
+    assert {cmd[0] for cmd in commands} <= media.EXECUTABLES
+
+
 # --- the worker records the reason when it marks a job failed -----------------------------------
 
 

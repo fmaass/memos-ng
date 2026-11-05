@@ -53,7 +53,7 @@ app/services/uploads.py	finalize_pending	for_update
 app/services/uploads.py	finalize	for_update
 app/services/uploads.py	bind_print_to_sibling	refresh
 app/services/uploads.py	withdraw	for_update
-app/services/uploads.py	reap_expired	for_update
+app/services/uploads.py	_reap_expired_rows	for_update
 app/worker.py	claim_one	for_update
 app/worker.py	recover_stale_media_claims	for_update
 app/worker.py	recover_stale_media_claims	for_update

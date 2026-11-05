@@ -794,6 +794,13 @@ def select_video_stream(streams: list) -> dict:
     return {}
 
 
+# The binaries the job lanes spawn, by their BARE names, resolved on PATH. A spawn that cannot find
+# one raises FileNotFoundError whose `filename` is exactly that bare name, while a missing source
+# names the absolute path it was opened at — which is how worker.classify_failure tells a broken
+# image from a missing original without reading a message (MEMNG-1162).
+EXECUTABLES = frozenset({"ffmpeg", "ffprobe"})
+
+
 def probe_cmd(path: str) -> list[str]:
     """The ffprobe argv (sibling of poster_ffmpeg_cmd / slow_ffmpeg_cmd — a builder so the two
     choices encoded here stay unit-testable).

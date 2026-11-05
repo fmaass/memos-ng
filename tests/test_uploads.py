@@ -71,18 +71,10 @@ def _drop_user(subject):
 
 
 def _reap_expired_committed():
-    """Run the expiry reaper against the real DB from a sync test. Its own event loop is safe here:
-    the dev/test engine uses NullPool, so a fresh (loop-bound) connection is taken per checkout."""
-
-    async def _run():
-        from app.database import async_session
-
-        async with async_session() as s:
-            n = await svc.reap_expired(s)
-            await s.commit()
-            return n
-
-    return asyncio.run(_run())
+    """Run the worker's committing reap against the real DB from a sync test. Its own event loop is
+    safe here: the dev/test engine uses NullPool, so a fresh (loop-bound) connection is taken per
+    checkout."""
+    return asyncio.run(svc.reap_expired_committed())
 
 
 def _attachment_owners():
@@ -566,7 +558,11 @@ def test_uploads_require_auth(client):
     )
 
 
-async def test_reaper_deletes_expired_upload_and_part(adb, monkeypatch, tmp_path):
+async def test_the_session_scoped_reap_deletes_the_row_and_leaves_the_part(
+    adb, monkeypatch, tmp_path
+):
+    # The part may go only once the deletion commits (MEMNG-1162), and `adb` never commits: the
+    # part's removal is `reap_expired_committed`'s, pinned beside the worker wiring below.
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     part = svc.part_path("expired-uid")
     part.parent.mkdir(parents=True, exist_ok=True)
@@ -583,7 +579,10 @@ async def test_reaper_deletes_expired_upload_and_part(adb, monkeypatch, tmp_path
     )
     await adb.flush()
     n = await svc.reap_expired(adb)
-    assert n == 1 and not part.exists()
+    assert n == 1 and part.read_bytes() == b"orphan"
+    assert (
+        await adb.execute(select(Upload).where(Upload.upload_uid == "expired-uid"))
+    ).first() is None
 
 
 def test_upload_rejects_oversize(logged_in_client, monkeypatch):
@@ -1333,6 +1332,106 @@ def test_worker_loop_uses_the_committed_reap_entry():
     assert "reap_expired(db)" not in source
 
 
+def _expired_part(uid: str, payload: bytes):
+    """A COMMITTED expired session with a real part file under it."""
+    eng = create_engine(SYNC_URL)
+    with eng.begin() as c:
+        c.execute(
+            text(
+                "INSERT INTO uploads (upload_uid, filename, mime, declared_size, bytes_received, "
+                "expires_at) VALUES (:u, 'a.bin', 'application/octet-stream', :n, :n, "
+                "now() - interval '1 hour')"
+            ),
+            {"u": uid, "n": len(payload)},
+        )
+    eng.dispose()
+    part = svc.part_path(uid)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(payload)
+    return part
+
+
+def _upload_rows(uid: str) -> int:
+    eng = create_engine(SYNC_URL)
+    with eng.connect() as c:
+        n = c.execute(
+            text("SELECT count(*) FROM uploads WHERE upload_uid = :u"), {"u": uid}
+        ).scalar_one()
+    eng.dispose()
+    return n
+
+
+def test_a_reap_that_rolls_back_keeps_the_part_bytes(db_engine, monkeypatch, tmp_path):
+    # MEMNG-1162: the sweep used to unlink inside its transaction, so a reap that rolled back
+    # restored the row and lost its bytes. The row and the bytes now go together or not at all.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _cleanup()
+    payload = b"the only copy" * 64
+    part = _expired_part("rollback-reap-uid", payload)
+
+    async def _reap_then_roll_back() -> int:
+        from app.database import async_session
+
+        async with async_session() as db:
+            reaped = await svc.reap_expired(db)
+            await db.rollback()
+            return reaped
+
+    try:
+        assert asyncio.run(_reap_then_roll_back()) == 1
+        assert _upload_rows("rollback-reap-uid") == 1  # the row is back...
+        assert part.read_bytes() == payload  # ...and so are its bytes, every one of them
+    finally:
+        _cleanup()
+
+
+def test_the_committed_reap_unlinks_the_part_only_once_the_deletion_committed(
+    db_engine, monkeypatch, tmp_path
+):
+    from sqlalchemy.orm import Session
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _cleanup()
+    part = _expired_part("commit-reap-uid", b"expired bytes")
+    at_commit: list[bool] = []
+
+    def _seen_at_commit(session):
+        if not session.in_nested_transaction():
+            at_commit.append(part.exists())
+
+    event.listen(Session, "after_commit", _seen_at_commit)
+    try:
+        assert asyncio.run(svc.reap_expired_committed()) == 1
+    finally:
+        event.remove(Session, "after_commit", _seen_at_commit)
+        _cleanup()
+    assert at_commit == [True]  # still on disk when the deletion committed
+    assert not part.exists()  # gone once it had
+    assert _upload_rows("commit-reap-uid") == 0
+
+
+def test_a_part_that_will_not_unlink_after_the_commit_is_logged_not_raised(
+    db_engine, monkeypatch, tmp_path
+):
+    # Past the commit the session is gone for good: a part that refuses to go is a logged leak,
+    # never an error that reports a committed reap as failed.
+    from structlog.testing import capture_logs
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _cleanup()
+    part = svc.part_path("stuck-reap-uid")
+    _expired_part("stuck-reap-uid", b"x").unlink()
+    part.mkdir()  # unlink() of a directory refuses (EISDIR) — a stand-in for a refusing volume
+    try:
+        with capture_logs() as logs:
+            assert asyncio.run(svc.reap_expired_committed()) == 1
+        assert _upload_rows("stuck-reap-uid") == 0
+        assert any(e["event"] == "uploads.consumed_reap_failed" for e in logs)
+    finally:
+        part.rmdir()
+        _cleanup()
+
+
 def _upload_row(uid):
     eng = create_engine(SYNC_URL)
     with eng.connect() as c:
@@ -2039,3 +2138,25 @@ async def test_idle_bounded_lets_every_other_outcome_of_a_wait_through_unchanged
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def test_two_committed_reaps_racing_for_one_session_unlink_and_count_it_once(
+    db_engine, monkeypatch, tmp_path
+):
+    # The post-commit unlink takes its list from the set each sweep CLAIMED under the row lock, so
+    # the sweep that queued behind the other finds the row gone and has nothing to unlink or count.
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    _cleanup()
+    part = _expired_part("raced-reap-uid", b"once")
+
+    async def _race() -> list[int]:
+        return sorted(
+            await asyncio.gather(svc.reap_expired_committed(), svc.reap_expired_committed())
+        )
+
+    try:
+        assert asyncio.run(_race()) == [0, 1]
+        assert not part.exists()
+        assert _upload_rows("raced-reap-uid") == 0
+    finally:
+        _cleanup()

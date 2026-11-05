@@ -17,7 +17,7 @@ import structlog
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, SessionTransaction
 
 logger = structlog.get_logger(__name__)
 
@@ -124,8 +124,14 @@ def count_session_end(db: AsyncSession, result: SessionEnd) -> None:
     `expired` is not counted here: the reaper runs in the worker, which serves no `/metrics`, so it
     bumps a tally row in its own transaction (`tallies.count_upload_sessions`) that the scrape
     reads.
+
+    The result is filed under the SAVEPOINT it is recorded in, if any (MEMNG-1162): rolling that
+    savepoint back takes the result with it, while releasing it leaves the result to the
+    enclosing transaction, whose own end decides.
     """
-    db.sync_session.info.setdefault(_PENDING_KEY, []).append(result)
+    session = db.sync_session
+    owner = session.get_nested_transaction()
+    session.info.setdefault(_PENDING_KEY, []).append((owner, result))
 
 
 @_never_raises
@@ -133,25 +139,41 @@ def observe_patch_seconds(seconds: float) -> None:
     UPLOAD_PATCH_SECONDS.observe(seconds)
 
 
-# Both hooks also fire for a SAVEPOINT (released or rolled back inside the transaction), which is
-# neither the commit that ends the session nor the rollback that keeps it: only the outermost
-# transaction's end decides. A root commit or rollback with a savepoint still open fires once for
-# the savepoint and once more, un-nested, for the root.
+# Both hooks also fire for a SAVEPOINT (released or rolled back inside the transaction), and while
+# they run that savepoint is still the session's innermost nested transaction. A RELEASE decides
+# nothing: its results now ride on the enclosing transaction, which their owner's `parent` chain
+# already names, so nothing has to move. A ROLLBACK TO SAVEPOINT discards every result filed under
+# that savepoint or under one nested inside it — so a child released into it goes too. Only the
+# root's commit counts what is left; the root's rollback drops it all. A root commit or rollback
+# with a savepoint still open fires once for the savepoint and once more, un-nested, for the root.
 @event.listens_for(Session, "after_commit")
 @_never_raises
 def _count_committed(session: Session) -> None:
     if session.in_nested_transaction():
         return
-    for result in session.info.pop(_PENDING_KEY, ()):
+    for _owner, result in session.info.pop(_PENDING_KEY, ()):
         UPLOAD_SESSIONS.labels(result=result).inc()
 
 
 @event.listens_for(Session, "after_rollback")
 @_never_raises
 def _drop_rolled_back(session: Session) -> None:
-    if session.in_nested_transaction():
+    savepoint = session.get_nested_transaction()
+    if savepoint is None:
+        session.info.pop(_PENDING_KEY, None)
         return
-    session.info.pop(_PENDING_KEY, None)
+    pending = session.info.get(_PENDING_KEY)
+    if pending:
+        pending[:] = [(o, r) for o, r in pending if not _filed_under(o, savepoint)]
+
+
+def _filed_under(owner: SessionTransaction | None, savepoint: SessionTransaction) -> bool:
+    """Whether a result filed under `owner` (None: the root) lives inside `savepoint`."""
+    while owner is not None:
+        if owner is savepoint:
+            return True
+        owner = owner.parent
+    return False
 
 
 async def events_subscriber[T](stream: AsyncIterator[T]) -> AsyncIterator[T]:

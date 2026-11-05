@@ -2431,20 +2431,32 @@ async def withdraw(db: AsyncSession, upload_uid: str, owner_id: int) -> bool:
 
 
 async def reap_expired_committed(now: datetime | None = None) -> int:
-    """The worker's reap entry: a dedicated session that COMMITS the deletions. A flush alone
-    dies with the session, which is how expired rows resurrected every cycle — their part files
-    already unlinked — while the hourly log counted the same rows forever (MEMNG-37)."""
+    """The worker's reap entry: a dedicated session that COMMITS the deletions, and only then
+    unlinks the part files of the sessions it deleted. A flush alone dies with the session, which
+    is how expired rows resurrected every cycle — their part files already unlinked — while the
+    hourly log counted the same rows forever (MEMNG-37)."""
     async with async_session() as db:
-        reaped = await reap_expired(db)
+        reaped = await _reap_expired_rows(db, now)
         await db.commit()
-    return reaped
+    # Past the commit those rows are gone for good, so their bytes may go too — and a part that
+    # will not delete is logged and left, never raised over a reap that has already landed.
+    await to_thread.run_sync(reap_consumed_sync, [str(part_path(uid)) for uid in reaped])
+    return len(reaped)
 
 
 async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
-    """Delete abandoned uploads (past expires_at) + part files, and any spool file a killed process
-    orphaned mid-append. Returns the number of upload SESSIONS reaped — the size of the set it
-    actually claimed under the row lock, so a session another transaction consumed while this sweep
-    queued counts for nobody. Worker-wired in T2.2."""
+    """Delete abandoned uploads (past expires_at), and any spool file a killed process orphaned
+    mid-append, in the caller's transaction. Returns the number of upload SESSIONS reaped — the
+    size of the set it actually claimed under the row lock, so a session another transaction
+    consumed while this sweep queued counts for nobody.
+
+    It never touches a session's PART file (MEMNG-1162): those may go only once the deletion has
+    committed, which is `reap_expired_committed`'s job — the entry the worker runs."""
+    return len(await _reap_expired_rows(db, now))
+
+
+async def _reap_expired_rows(db: AsyncSession, now: datetime | None) -> list[str]:
+    """`reap_expired`'s body: the uids of the sessions whose rows it deleted (and flushed)."""
     now = now or datetime.now(UTC)
     # List the spool directory BEFORE reading which sessions are live. In that order every listed
     # file's session row was already committed when the read below ran, so a session opened while
@@ -2477,12 +2489,17 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
         .scalars()
         .all()
     )
-    # Every part file in ONE hop — an hourly sweep of a large backlog would otherwise be that many
-    # blocking unlinks in a row — and now INSIDE the window those locks fence. §2.5 permits it: an
-    # unlink under DATA_ROOT is bounded local file I/O of the same class as the finalize's own
-    # placements, not a third party, not a subprocess and not a client stream. The alternative
-    # (unlink after the caller's commit) would need a second commit boundary, which §2.5 rejects.
-    await to_thread.run_sync(unlink_many_sync, [part_path(u.upload_uid) for u in rows])
+    # No part file is unlinked here (MEMNG-1162). The sweep used to unlink them inside this window,
+    # under the locks, so a sweep that then rolled back — a refused statement, a dropped connection,
+    # a failed commit — restored rows whose only copy of the bytes was already gone. The caller
+    # unlinks once its commit has made the deletions final (`reap_expired_committed`), and leaving
+    # the window gives up nothing the locks protected: a finalize or append that wants one of these
+    # rows is queued behind its lock and finds it deleted once the commit lands, so it never
+    # reaches the part, and no later session can come to own the path, because a uid is a fresh
+    # random token. What is left is the gap between that commit and the unlink. A crash there
+    # leaves a part file no row names, and nothing collects it: this sweep finds parts only through
+    # their rows, and the spool sweep below reads spools. That leak is the chosen residual — bytes
+    # kept that nobody needs — over the old one, a live row whose bytes were gone.
     for upload in rows:
         await db.delete(upload)
     await db.flush()
@@ -2497,4 +2514,4 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
     live_uids = frozenset((await db.execute(select(Upload.upload_uid))).scalars().all())
     cutoff = (now - timedelta(hours=settings.UPLOAD_EXPIRY_HOURS)).timestamp()
     await to_thread.run_sync(_reap_spools_sync, spools, cutoff, live_uids)
-    return len(rows)
+    return [u.upload_uid for u in rows]
