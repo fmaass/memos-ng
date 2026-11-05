@@ -562,7 +562,7 @@ def _loop_watchdog(seconds: float):
 
 
 def _outcome_read_task() -> asyncio.Task:
-    (task,) = [t for t in asyncio.all_tasks() if "landed_upload_uids" in t.get_coro().__qualname__]
+    (task,) = [t for t in asyncio.all_tasks() if "commit_landed" in t.get_coro().__qualname__]
     return task
 
 

@@ -6,6 +6,7 @@ import secrets
 import shutil
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -272,6 +273,11 @@ async def finish_off_the_loop[T](
     leaves it alone. Same reasoning as `app.services.reclaim._unlink_off_the_loop`. It lives here,
     in the upload seam both roles import, because the append needs it and `app.ingest.core`
     imports this module (it re-exports the helper for the ingest roles).
+
+    The one exception is the future ITSELF cancelled (MEMNG-1192): awaiting a cancelled future
+    raises at once without yielding, so awaiting it again would spin the event loop, and it can no
+    longer say when its thread returns. That cancellation is raised — the caller's own, when one
+    arrived first — exactly as `commit_landed` gives up on a cancelled read.
     """
     thread = asyncio.get_running_loop().run_in_executor(None, functools.partial(fn, *args))
     cancellation: asyncio.CancelledError | None = None
@@ -279,6 +285,8 @@ async def finish_off_the_loop[T](
         try:
             return await asyncio.shield(thread), cancellation
         except asyncio.CancelledError as exc:
+            if thread.cancelled():
+                raise (cancellation or exc) from None
             cancellation = exc
 
 
@@ -606,8 +614,9 @@ async def create_upload(
     # The part file last, after everything that can raise: made first, a `last_modified` past
     # year 9999 (OverflowError) left a part file with no row to find it by, once per attempt.
     part = part_path(upload_uid)
-    # Registered before the hop, not after it: a cancellation reaching that hop is delivered only
-    # once the thread has made the file, and would skip anything placed after the await.
+    # Registered before the hop, not after it: both hops that can put a file at `part` run through
+    # `finish_off_the_loop`, so a cancellation reaching one is delivered only once its thread has
+    # returned — the file made, if it will ever be — and would skip anything placed after the await.
     if part_uids_out is not None:
         part_uids_out.append(upload_uid)
     if sha256 is not None and await _link_staged_twin(db, owner_id, sha256, size, part):
@@ -622,24 +631,37 @@ async def create_upload(
     free = await to_thread.run_sync(storage.free_bytes, part.parent)
     if not has_room_for(reserved + size, free):
         raise InsufficientSpace(size, max(free - reserved, 0))
-    await to_thread.run_sync(_create_part_sync, part)
+    _, cancelled = await finish_off_the_loop(_create_part_sync, part)
+    if cancelled is not None:
+        raise cancelled
     return upload
 
 
 # How long a request whose COMMIT raised waits to learn what landed (MEMNG-1182). Bounded because
 # the usual cause is the database going away, and an unbounded read would hold that request — under
-# a shield, past its own cancellation — for as long as the driver keeps trying to connect.
+# a shield, past its own cancellation — for as long as the driver keeps trying to connect. It also
+# bounds the wait for a transaction PostgreSQL still reports in progress (MEMNG-1192).
 COMMIT_OUTCOME_TIMEOUT_S = 5.0
+# Between two reads of a transaction's status while it is still in progress.
+COMMIT_OUTCOME_POLL_S = 0.05
 
 
-async def landed_upload_uids(
-    upload_uids: Sequence[str],
-) -> tuple[set[str] | None, asyncio.CancelledError | None]:
-    """Which of `upload_uids` have a committed row — how a caller whose COMMIT raised learns
-    whether it landed (MEMNG-1182). An exception out of the commit (a cancellation, the connection
-    dropped after PostgreSQL accepted it) proves nothing either way; a row read in a FRESH session
-    does. None when that read fails or times out: the outcome stays unknown, and the caller must
-    then treat every session as possibly committed.
+async def commit_landed(
+    xid: int, holder: AsyncSession
+) -> tuple[bool | None, asyncio.CancelledError | None]:
+    """Whether the transaction `xid` committed — how a caller whose COMMIT raised learns whether
+    it landed (MEMNG-1182, MEMNG-1192). An exception out of the commit (a cancellation, the
+    connection dropped) proves nothing either way, and neither does a row read: PostgreSQL may
+    still be processing that COMMIT, and a read run meanwhile finds no row of a transaction that
+    then commits. So the transaction's own status decides, read in a FRESH session and read again
+    while it is `in progress`: True for `committed`, False for `aborted`. None — the outcome
+    unknown, and the caller must treat every session as possibly committed — when that status
+    stays in progress past the bound, is NULL (too old to know), or cannot be read.
+
+    `holder`, the session whose COMMIT raised, is invalidated first: its connection may still hold
+    the transaction open — a cancellation that arrived before the COMMIT was sent — and would then
+    read `in progress` until the request ended. Closing the connection lets PostgreSQL end it: a
+    COMMIT it has already received completes, anything else aborts.
 
     The read runs in a task of its own, awaited under a shield until it is done — the caller is
     usually unwinding a cancellation, and a level-triggered cancel scope would cancel the read at
@@ -647,19 +669,32 @@ async def landed_upload_uids(
     `finish_off_the_loop` does, for the caller to re-raise once it has acted on the answer.
     """
 
-    async def read() -> set[str] | None:
+    async def read() -> bool | None:
         try:
             with fail_after(COMMIT_OUTCOME_TIMEOUT_S):
+                try:
+                    await holder.invalidate()
+                except Exception as exc:  # the status read below still decides
+                    logger.warning("uploads.commit_holder_not_closed", error=repr(exc)[:200])
                 async with async_session() as db:
-                    found = await db.execute(
-                        select(Upload.upload_uid).where(Upload.upload_uid.in_(list(upload_uids)))
-                    )
-                    return set(found.scalars().all())
+                    while True:
+                        status = (
+                            await db.execute(
+                                text("SELECT pg_xact_status(CAST(:xid AS xid8))"), {"xid": xid}
+                            )
+                        ).scalar_one_or_none()
+                        if status != "in progress":
+                            break
+                        await asyncio.sleep(COMMIT_OUTCOME_POLL_S)
         except Exception as exc:
-            logger.error(
-                "uploads.commit_outcome_unknown", sessions=len(upload_uids), error=repr(exc)[:200]
-            )
+            logger.error("uploads.commit_outcome_unknown", xid=xid, error=repr(exc)[:200])
             return None
+        if status == "committed":
+            return True
+        if status == "aborted":
+            return False
+        logger.error("uploads.commit_outcome_unknown", xid=xid, error=f"status {status!r}")
+        return None
 
     task = asyncio.create_task(read())
     cancellation: asyncio.CancelledError | None = None
@@ -673,15 +708,71 @@ async def landed_upload_uids(
                 # outcome is unknown. A cancellation of the caller in the same tick lands here
                 # too; `cancelling()` still counts it, and it is handed back.
                 logger.error(
-                    "uploads.commit_outcome_unknown",
-                    sessions=len(upload_uids),
-                    error="outcome read cancelled",
+                    "uploads.commit_outcome_unknown", xid=xid, error="outcome read cancelled"
                 )
                 current = asyncio.current_task()
                 if cancellation is None and current is not None and current.cancelling():
                     cancellation = exc
                 return None, cancellation
             cancellation = exc
+
+
+@dataclass
+class OpenedSessions:
+    """The upload sessions one request opens in ONE transaction of `db`, so that a failure removes
+    exactly the parts of sessions that did not commit. `part_uids` is handed to `create_upload` as
+    `part_uids_out`; `commit` ends the transaction. See `opening_sessions`."""
+
+    db: AsyncSession
+    part_uids: list[str] = dataclass_field(default_factory=list)
+    _xid: int | None = None
+
+    async def commit(self) -> None:
+        """COMMIT, having first read the transaction's id — after an exception out of the COMMIT
+        that id is the only way to ask PostgreSQL what happened. A failure of that read is a
+        failure before the COMMIT: it was never sent, and the transaction can only roll back."""
+        if self.part_uids:
+            self._xid = int(
+                (await self.db.execute(text("SELECT pg_current_xact_id()::text"))).scalar_one()
+            )
+        await self.db.commit()
+
+    async def discard(self) -> asyncio.CancelledError | None:
+        """Unlink the parts of the sessions that provably did not commit, in one hop off the loop
+        awaited to the end even if this request is being cancelled; return the cancellation that
+        arrived meanwhile, for the caller to re-raise. Before the COMMIT nothing is committed —
+        the session's close rolls every row back — so every part goes. After it, `commit_landed`
+        decides: committed keeps every part, aborted removes them all, and an outcome that cannot
+        be established removes nothing. A hit's part is a second name for its original: only the
+        name goes."""
+        cancelled: asyncio.CancelledError | None = None
+        if self._xid is None:
+            doomed = self.part_uids
+        else:
+            landed, cancelled = await commit_landed(self._xid, self.db)
+            doomed = self.part_uids if landed is False else []
+        if doomed:
+            parts = [part_path(u) for u in doomed]
+            _, cancelled_unlinking = await finish_off_the_loop(unlink_many_sync, parts)
+            cancelled = cancelled or cancelled_unlinking
+        return cancelled
+
+
+@asynccontextmanager
+async def opening_sessions(db: AsyncSession) -> AsyncIterator[OpenedSessions]:
+    """The part cleanup both upload creates share (MEMNG-1182, MEMNG-1192). The body creates its
+    sessions with `part_uids_out=opened.part_uids` and ends with `await opened.commit()`; any
+    exception out of it — before, in or after the COMMIT, a cancellation included — first removes
+    the parts of the sessions that did not commit (`OpenedSessions.discard`), then propagates. A
+    cancellation that arrived during that cleanup is raised in its place."""
+    opened = OpenedSessions(db)
+    try:
+        yield opened
+    except BaseException:
+        cancelled = await opened.discard()
+        if cancelled is not None:
+            raise cancelled from None
+        raise
 
 
 class BodyIdle(ClientDisconnect):
@@ -768,7 +859,12 @@ async def _link_staged_twin(
     )
     for original in originals:
         assert original is not None  # filtered above
-        if await to_thread.run_sync(_link_part_sync, Path(original), part, size):
+        # Awaited to the end, as `create_upload` documents: abandoned to a cancellation, the link
+        # would be made after the caller's cleanup had looked for it.
+        linked, cancelled = await finish_off_the_loop(_link_part_sync, Path(original), part, size)
+        if cancelled is not None:
+            raise cancelled
+        if linked:
             return True
     return False
 
