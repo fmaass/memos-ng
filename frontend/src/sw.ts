@@ -13,7 +13,7 @@ self.skipWaiting()
 clientsClaim()
 precacheAndRoute(self.__WB_MANIFEST)
 
-// Web Push receiver — the worker's send_to_user posts {uid,status,title}.
+// Web Push receiver — payloads come from the server notify seam (see notificationFor).
 self.addEventListener('push', (event: PushEvent) => {
   let payload: PushPayload = {}
   try {

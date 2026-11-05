@@ -217,6 +217,12 @@ class Memo(Base):
     # A guest's caption, kept OUT of `content` on purpose: `content` is what `parse_tags` reads, and
     # guest text must never choose a tag (app/services/passes.create_guest_memo).
     guest_caption: Mapped[str | None] = mapped_column(Text)
+    # When the "memo is live" push went out (MEMNG-967): the moment no attachment of this memo was
+    # still in flight. NULL until then. Claimed by ONE conditional UPDATE (services/memo_live), so
+    # two consumers finishing the memo's last two files cannot both announce it. Every memo that
+    # predates the column reads as announced (the migration's fast default), so a re-derive of an
+    # old memo's file never announces a memo the household saw years ago.
+    live_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # selectin so async serialization can read tags/owner without a lazy-load error
     tags: Mapped[list["Tag"]] = relationship(

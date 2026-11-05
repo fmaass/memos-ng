@@ -51,7 +51,11 @@ from app.services import (
     event_stream,
     frame_share,
     media,
-    push,
+    memo_live,
+    notify,
+    # Not called here any more (the notify seam reaches the sender), but `worker.push` is the handle
+    # every push test replaces `send_to_user` through — and it is the same module object.
+    push,  # noqa: F401
     reclaim,
     reconcile,
     sibling,
@@ -501,27 +505,51 @@ async def _notify_terminal(db: AsyncSession, attachment_id: int) -> None:
     ).scalar_one_or_none()
     if att is None or att.status not in (AttachmentStatus.ready, AttachmentStatus.failed):
         return
-    await push.send_to_user(
+    await notify.notify(
         db,
         att.owner_id,
-        {"uid": att.uid, "status": att.status.value, "title": att.filename},
+        notify.AttachmentTerminal(uid=att.uid, status=att.status.value, filename=att.filename),
     )
 
 
+async def _push_terminal(attachment_id: int) -> None:
+    async with async_session() as db:
+        await _notify_terminal(db, attachment_id)
+        await db.commit()
+
+
+async def _announce_memo_live(attachment_id: int) -> None:
+    """The memo-live push (MEMNG-967) for the memo this attachment belongs to, if this file was its
+    last one in flight. Runs after this job's `ready`/`failed` commit, which is what lets the claim
+    see it (services/memo_live)."""
+    async with async_session() as db:
+        memo_id = (
+            await db.execute(select(Attachment.memo_id).where(Attachment.id == attachment_id))
+        ).scalar_one_or_none()
+    if memo_id is not None:
+        await memo_live.announce_if_live(async_session, memo_id)
+
+
 async def _notify_terminal_safe(attachment_id: int) -> None:
-    """Best-effort push in its OWN session, AFTER the media job has committed.
+    """Best-effort pushes in their OWN sessions, AFTER the media job has committed.
 
     Decoupled deliberately: running push (and its 404/410 prune flush) inside the job's
     transaction means a push/flush error would poison that session and fail the *already
     finished* media job. Here the job is durable before we ever touch push, and any error
-    — including a poisoned session — is swallowed.
+    — including a poisoned session — is swallowed. The per-file push and the memo-live push are
+    swallowed SEPARATELY, so a failing per-file push does not cost the memo its one announcement.
     """
+    await _best_effort("push_notify_failed", _push_terminal, attachment_id)
+    await _best_effort("memo_live_notify_failed", _announce_memo_live, attachment_id)
+
+
+async def _best_effort(
+    event: str, step: Callable[[int], Awaitable[None]], attachment_id: int
+) -> None:
     try:
-        async with async_session() as db:
-            await _notify_terminal(db, attachment_id)
-            await db.commit()
+        await step(attachment_id)
     except Exception as exc:  # push is best-effort; the job is already committed
-        logger.warning("push_notify_failed", attachment_id=attachment_id, error=str(exc))
+        logger.warning(event, attachment_id=attachment_id, error=str(exc))
         if _stop_in_flight():
             # An error raised while a cancellation was unwinding this call REPLACES it — the
             # session's own exit is one await that can, closing a connection whose operation was

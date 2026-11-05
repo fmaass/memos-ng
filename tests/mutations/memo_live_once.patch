@@ -1,0 +1,13 @@
+--- a/app/services/memo_live.py
++++ b/app/services/memo_live.py
+@@ -47,7 +47,9 @@
+     in_flight = exists().where(Attachment.memo_id == Memo.id, Attachment.status.in_(IN_FLIGHT))
+     stmt = (
+         update(Memo)
+-        .where(Memo.id == memo_id, Memo.live_notified_at.is_(None), ~in_flight)
++        # MUTATION memo_live_once: the claim no longer waits for the stamp to be unset, so a second
++        # caller that sees the memo live announces it again. The race test must see two pushes.
++        .where(Memo.id == memo_id, ~in_flight)
+         .values(live_notified_at=func.now(), updated_at=Memo.updated_at)
+         .returning(Memo.id)
+         .execution_options(synchronize_session=False)

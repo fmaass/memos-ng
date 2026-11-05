@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 
 import structlog
 from anyio import to_thread
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import select
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import auth
 from app.api_types import Rfc3339Datetime
-from app.database import get_session
+from app.database import async_session, get_session
 from app.models import (
     CREATE_KEY_CONSTRAINT,
     EDIT_KEY_CONSTRAINT,
@@ -29,7 +29,7 @@ from app.models import (
 )
 from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
-from app.services import asset_paths, event_stream, reclaim, storage
+from app.services import asset_paths, event_stream, memo_live, reclaim, storage
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
 from app.services import uploads as uploads_svc
@@ -852,6 +852,7 @@ async def create_memo(
     body: MemoCreate,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    background: BackgroundTasks,
 ) -> MemoOut:
     # Read off the ORM user BEFORE any rollback below: rolling back expires every object in the
     # session, and a later `user.id` would then lazy-refresh — sync IO in an async context, which
@@ -986,6 +987,11 @@ async def create_memo(
             # cancellation cannot be delivered in that gap, so this flag can never be missing for
             # a memo that is stored.
             committed = True
+            # Only the attempt that STORED the memo schedules its announcement: a replay answers a
+            # memo another request stored (and scheduled), and it answers holding a FOR SHARE lock
+            # on that memo row until its session closes — which a claim queued behind its own
+            # request would wait on for ever.
+            _announce_after_response(background, memo.id)
             # AFTER the commit, and only then: each consumed poster's part file — and each part
             # a dedup hit consumed — is now bytes no row names, and nothing else will ever collect
             # it (the expiry reaper walks `uploads` rows, and those are gone). Best-effort by
@@ -1033,6 +1039,15 @@ async def create_memo(
         rollback=rollback_for_retry,
     )
     return await _render(memo, owner_id)
+
+
+def _announce_after_response(background: BackgroundTasks, memo_id: int) -> None:
+    """A memo whose files are all terminal the moment it is stored — no files at all, or only
+    attachments that were ready before it (a dedup hit, a back-compat `attachment_uids`) — is live
+    at create, and no worker completion will ever announce it (MEMNG-967). The claim and the push
+    run after the response, in their own sessions; a memo still waiting on a file claims nothing
+    here, and the worker announces it when its last file finishes."""
+    background.add_task(memo_live.announce_safely, async_session, memo_id)
 
 
 async def _require_owned(db: AsyncSession, user: User, uid: str) -> Memo:

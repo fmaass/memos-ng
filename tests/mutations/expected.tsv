@@ -76,3 +76,4 @@ tests/mutations/no_never_linked_unfiled_discriminator.patch	no_never_linked_unfi
 # MEMNG-968 r1: a staging hit records its checked digest on the session; dropped, the session
 # clause never holds a row a real POST /api/uploads session staged onto.
 tests/mutations/no_staging_digest_recorded.patch	no_staging_digest_recorded	test_a_session_opened_on_the_route_for_the_same_bytes_holds_the_row		tests/test_unlinked_sweep.py
+tests/mutations/memo_live_once.patch	memo_live_once	test_two_concurrent_last_completions_send_once test_an_already_announced_memo_is_never_announced_again		tests/test_memo_live_push.py
