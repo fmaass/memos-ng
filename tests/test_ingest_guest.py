@@ -14,11 +14,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.config import settings
 from app.database import async_session
-from app.ingest import core
+from app.ingest import core, guest, service_api
 from app.ingest.factory import create_app
 from app.models import PassDevice
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 
 from tests.ingest_support import (
     HEIC,
@@ -36,6 +37,7 @@ from tests.ingest_support import (
     upload,
 )
 from tests.test_attachments_taken import _sql
+from tests.test_lock_protocol_concurrency import Park
 
 
 async def _waiters(n: int, budget_s: float = 10.0) -> None:
@@ -899,3 +901,159 @@ async def test_the_limits_keep_their_wire_bytes(door, home_iface):  # noqa: F811
     assert r.status_code == 201 and wire in r.content
     me = await door.get("/api/guest/me", headers=bearer(r.json()["device_token"]))
     assert me.status_code == 200 and wire in me.content
+
+
+async def test_a_refusal_stamped_after_the_lift_but_committed_before_it_stays_spent(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1082 #1: `at` is a transaction-start now(), so it can invert against the lift. Order by
+    event id: the pre-lift refusals stay spent whatever they are stamped, and later ones count."""
+    monkeypatch.setattr(settings, "INGEST_REFUSALS_PER_HOUR", 3)
+    monkeypatch.setattr(settings, "INGEST_TRUST_CF_CONNECTING_IP", True)
+    uid, secret = await seeded_pass(home_iface, max_devices=1)
+    await redeem(door, secret, **{"CF-Connecting-IP": "192.0.2.1"})
+    body = {"secret": secret, "display_name": "x", "platform": "web"}
+
+    async def refused(first: int, n: int) -> None:
+        for i in range(first, first + n):
+            r = await door.post(
+                "/api/pass/redeem", json=body, headers={"CF-Connecting-IP": f"192.0.2.{i}"}
+            )
+            assert r.status_code == 429
+
+    await refused(10, 4)
+    await push(home_iface, pass_state(uid, secret, version=2, max_devices=1, unsuspend_version=2))
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)]
+    _sql("UPDATE pass_events SET at = now() + interval '1 minute' WHERE kind = 'refused'")
+    await refused(20, 3)
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)], "spent refusals counted"
+    await refused(30, 1)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
+
+
+async def _a_suspended_pass(door, home_iface, monkeypatch) -> tuple[str, str, dict]:  # noqa: F811
+    monkeypatch.setattr(settings, "INGEST_REFUSALS_PER_HOUR", 3)
+    monkeypatch.setattr(settings, "INGEST_TRUST_CF_CONNECTING_IP", True)
+    uid, secret = await seeded_pass(home_iface, max_devices=1)
+    await redeem(door, secret, **{"CF-Connecting-IP": "192.0.2.1"})
+    body = {"secret": secret, "display_name": "x", "platform": "web"}
+    for i in range(10, 14):
+        await door.post("/api/pass/redeem", json=body, headers={"CF-Connecting-IP": f"192.0.2.{i}"})
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
+    return uid, secret, body
+
+
+async def _refused(door, body, first: int, n: int) -> None:  # noqa: F811
+    for i in range(first, first + n):
+        r = await door.post(
+            "/api/pass/redeem", json=body, headers={"CF-Connecting-IP": f"192.0.2.{i}"}
+        )
+        assert r.status_code == 429, r.text
+
+
+async def test_a_refusal_holding_the_pass_lock_commits_before_the_lift_and_stays_spent(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1082 #1: parked with its event written and uncommitted, a refusal holds the pass row;
+    the lift beside it waits, so its event takes the later id and the refusal is spent."""
+    uid, secret, body = await _a_suspended_pass(door, home_iface, monkeypatch)
+    park, real = Park(), guest.record_refusal
+
+    async def parked(*args, **kwargs) -> None:
+        await real(*args, **kwargs)
+        if park.claim():
+            await park.hold()
+
+    monkeypatch.setattr(guest, "record_refusal", parked)
+    refusal = asyncio.create_task(
+        door.post("/api/pass/redeem", json=body, headers={"CF-Connecting-IP": "192.0.2.20"})
+    )
+    await asyncio.wait_for(park.entered.wait(), timeout=30)
+    lift = asyncio.create_task(
+        push(home_iface, pass_state(uid, secret, version=2, max_devices=1, unsuspend_version=2))
+    )
+    await _waiters(1)
+    assert not lift.done(), "the lift did not wait for the refusal's pass lock"
+    park.release.set()
+    await refusal
+    await lift
+    park.fired()
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)]
+    assert _sql(
+        "SELECT (SELECT max(id) FROM pass_events WHERE kind = 'refused')"
+        " < (SELECT max(id) FROM pass_events WHERE detail = :d)",
+        {"d": core.LIFTED},
+    ) == [(True,)]
+    await _refused(door, body, 30, 3)
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)], "a spent refusal counted"
+    await _refused(door, body, 40, 1)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
+
+
+async def test_a_refusal_waiting_on_the_lift_commits_after_it_and_counts(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1082 #1: the other order. The lift holds the pass row; the refusal queues behind it,
+    so its id is later and it counts toward the next suspension."""
+    uid, secret, body = await _a_suspended_pass(door, home_iface, monkeypatch)
+    park, real = Park(), service_api.apply_pass_state
+
+    async def parked(*args, **kwargs):
+        result = await real(*args, **kwargs)
+        if park.claim():
+            await park.hold()
+        return result
+
+    monkeypatch.setattr(service_api, "apply_pass_state", parked)
+    lift = asyncio.create_task(
+        push(home_iface, pass_state(uid, secret, version=2, max_devices=1, unsuspend_version=2))
+    )
+    await asyncio.wait_for(park.entered.wait(), timeout=30)
+    refusal = asyncio.create_task(
+        door.post("/api/pass/redeem", json=body, headers={"CF-Connecting-IP": "192.0.2.20"})
+    )
+    await _waiters(1)
+    assert not refusal.done(), "the refusal did not wait for the lift's pass lock"
+    park.release.set()
+    await lift
+    assert (await refusal).status_code == 429
+    park.fired()
+    await _refused(door, body, 30, 2)
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)]
+    await _refused(door, body, 40, 1)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)], "it did not count"
+
+
+async def test_a_create_that_fails_at_the_flush_leaves_no_part(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    ingest_env,  # noqa: F811
+):
+    """MEMNG-1082 #6: the part comes after everything that can raise short of the commit. Made
+    first, a failed flush leaves a part with no row to find it by. The refusal is the database's."""
+    _, secret = await seeded_pass(home_iface)
+    token = (await redeem(door, secret))["device_token"]
+    _sql(
+        "CREATE FUNCTION r213_refuse_upload() RETURNS trigger LANGUAGE plpgsql AS "
+        "$$ BEGIN RAISE EXCEPTION 'refused by the test'; END $$"
+    )
+    _sql(
+        "CREATE TRIGGER r213_refuse_upload BEFORE INSERT ON guest_uploads "
+        "FOR EACH ROW EXECUTE FUNCTION r213_refuse_upload()"
+    )
+    try:
+        with pytest.raises(DBAPIError, match="refused by the test"):
+            await door.post(
+                "/api/guest/uploads", json={"filename": "a.jpg", "size": 5}, headers=bearer(token)
+            )
+    finally:
+        _sql("DROP TRIGGER r213_refuse_upload ON guest_uploads")
+        _sql("DROP FUNCTION r213_refuse_upload()")
+    parts = ingest_env / "parts"
+    assert not parts.exists() or list(parts.iterdir()) == []

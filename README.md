@@ -190,12 +190,67 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.13.0
+
+- Quarantined guest uploads can now be marked as seen. `GET /api/trip-ingest/quarantine` lists the
+  batches nobody has resolved yet, plus a count of quarantines naming a pass this server never
+  issued, which have no batch row. `POST /api/trip-ingest/quarantine/{batch_uid}/resolve` marks a
+  batch, and `POST /api/trip-ingest/quarantine/unknown/resolve` with `{"through": <total>}` clears
+  that count up to the total the reader saw, so any that arrived since stay counted. The pass
+  manager shows both, each with a Mark seen button. Resolving files nothing, deletes nothing and
+  sends nothing to the door: the batch stays `quarantined`, a quarantine delivery still owed goes
+  out, and the guest's bytes stay on the door. `guest_batches_quarantined` now counts unresolved
+  batches plus the open count, so an alert on it above zero clears once everything has been seen.
+- The pass manager shows a pass the door has suspended, with an Unsuspend button on the existing
+  `POST /api/passes/{uid}/unsuspend`. After each sync, home reads the door's new
+  `GET /ingest/passes/suspended`, a complete list under home's bearer token, and pass answers carry
+  the result as `doorSuspended` and `doorSuspendedAt`. It is display only and changes no pass state,
+  because the door is not trusted to decide one. A failure there does not stop ingestion. An older
+  door's 404, a malformed answer or more than 500 suspended passes leave the last view in place,
+  and a view older than 15 minutes reads as `doorSuspended: null`, unknown, and shows nothing.
+- Trip filing keeps a crash journal. Each rename's source and destination is committed to the new
+  `ingest_moves` table before the rename happens, and the filing's commit deletes those rows, so a
+  row that survives means that filing never committed. Before this, a kill between placing a file
+  and the commit lost the list of moves and left the bytes orphaned. Each sync now walks surviving
+  rows back, newest first, before it files anything, and it overwrites nothing: when both ends of a
+  move exist and the destination is not that move's own placeholder, the row is flagged, an error
+  is logged and both files stay. A destination that a committed attachment or print rendition names
+  is never moved: the row is flagged, and that sync ends before any filing, as it does for a file
+  that will not move back. A filing that fails in process and restores every file deletes its own rows, so a name it
+  gave up is not read as its own later.
+- Deleting a memo takes the trip ledger rows naming it before it takes the memo's own lock, the
+  order a filing uses. A delete beside a running filing could deadlock, and Postgres aborted one of
+  the two with `40P01`.
+- Smaller hardening on the guest path. Refusals are ordered against a lift by event id under the
+  pass lock, so one stamped after a lift but committed before it stays spent. A batch records the
+  pass version that admitted it. The write recording a cancelled sync ends inside a
+  2 s deadline. A part the upload sweep cannot remove now leaves a log line and the rest still go.
+- One additive migration, `a13d0e5c7b21`, runs at boot on both databases. It adds the `ingest_moves`
+  table, `ingest_batches.pass_version`, `resolved_at` and `resolved_by`,
+  `trip_ingest_cursor.quarantined_unknown_total` and `quarantined_unknown_cleared`, and
+  `pass_sync_state.door_suspended_at` and `door_suspended_seen_at`. `ck_pass_events_kind` also
+  accepts `unsuspend_requested` and `unsuspended`, which nothing writes yet: lifts keep the form
+  2.12.0 reads, and readers here accept either.
+- Rolling back to 2.12.0 needs `ROLLBACK_MODE=1` on both services and keeps the schema
+  (`RELEASING.md`, "Rollback across a migration"). A resolved batch reads as quarantined again, so
+  `guest_batches_quarantined` counts it and the alert fires again until the roll-forward; its
+  `resolved_at` stays on the row and nothing is lost. The count of quarantines for an unissued pass
+  drops out of that gauge meanwhile, because 2.12.0 reads only batch rows. 2.12.0 ignores
+  `ingest_moves`, so a surviving journal row waits for the next forward deploy, whose first sync
+  walks it back. The exception is a row whose destination a committed attachment or print rendition
+  now names, which happens when 2.12.0 refiled the part under the same name: that file stays where
+  it is, the row is flagged and kept, and each such row ends one sync with an error before filing. Later syncs
+  walk the batch's other rows and file whatever the batch still owes.
+
 ### v2.12.0
 
 - File caps on the guest door. `POST /api/guest/uploads` answers 429 with `Retry-After: 3600`
   once a pass has opened 2 000 upload sessions in the last 24 hours (`INGEST_PASS_FILES_PER_DAY`)
   or a device has sent 1 000 files in all, its unfinished sessions included
-  (`GUEST_FILES_PER_DEVICE`), so one leaked device token cannot spend a whole pass. The pass count
+  (`GUEST_FILES_PER_DEVICE`), so one leaked device token cannot spend a whole pass. That cap is per
+  enrollment, not per physical phone: whoever holds the QR secret gets another 1 000-file allowance
+  per redemption while the pass has enrollment slots left, and the 2 000-a-day pass cap still holds
+  over all of them. The pass count
   is taken under the same pass lock as its bytes, so two creates cannot take the same last slot,
   and a refused file has sent no byte. Its `last_modified` is now bounded to the years 1 to 9999,
   where a value past either edge used to be a 500.
@@ -363,6 +418,9 @@ All settings come from the environment (or a `.env` file). Key variables — see
   batch (a replayed completion answers the same receipt) and `GET /api/guest/batches`. A new
   upload answers 507 past the pass's byte cap or the `INGEST_MIN_FREE_BYTES` floor. A pass with
   more than `INGEST_REFUSALS_PER_HOUR` refused redemptions within an hour is suspended there.
+  A suspension that arises between the owner's unsuspend and the door applying it is cleared by
+  that lift, on purpose: the owner asked for this pass to open, the door counts refusals afresh
+  from the lift, so a real attack suspends it again within the same limit, and the owner sees it.
 - `ingest-home` is the interface home pulls from, under `/ingest/`, for one bearer token,
   `INGEST_SERVICE_TOKEN` (at least 86 characters, `secrets.token_urlsafe(64)`); without one it
   refuses every request. It takes pass state and device revocations, pages devices and batches,

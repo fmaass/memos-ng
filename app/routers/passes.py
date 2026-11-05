@@ -9,7 +9,7 @@ A revoked pass is terminal. Reading, editing or revoking it again answers 410 `p
 changes nothing; its devices and contributions stay readable, because moderation outlives the pass.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import auth
 from app.api_types import Rfc3339Datetime
 from app.database import get_session
-from app.models import Collection, Pass, PassDevice, User
+from app.models import Collection, Pass, PassDevice, PassSyncState, User
 from app.services import collections as coll_svc
 from app.services import passes as pass_svc
 
@@ -59,6 +59,10 @@ def _future(value: Any) -> Any:
     return value
 
 
+# The `GuestSyncStale` window: an older view shows nothing rather than a false state.
+DOOR_VIEW_FRESH = timedelta(seconds=900)
+
+
 class PassOut(BaseModel):
     uid: str
     collectionUid: str | None = Field(description="Null once the collection is deleted.")
@@ -70,6 +74,12 @@ class PassOut(BaseModel):
     state: PassStateName = Field(
         description="`revoked` is terminal; a pass whose collection is gone reads as revoked."
     )
+    doorSuspended: bool | None = Field(
+        default=None,
+        description="What the door last said, display only; null when home does not know "
+        "(an old door, a malformed answer, or a view older than the sync's stale window).",
+    )
+    doorSuspendedAt: Rfc3339Datetime | None = None
     expiresAt: Rfc3339Datetime
     maxDevices: int
     notes: str | None
@@ -189,9 +199,23 @@ async def _render(db: AsyncSession, passes: list[Pass]) -> list[PassOut]:
         rows = await db.execute(select(User.id, User.subject).where(User.id.in_(user_ids)))
         subjects = {uid: subj for uid, subj in rows.all()}
     counts = await pass_svc.device_counts(db, [p.id for p in passes])
+    fresh_after = datetime.now(UTC) - DOOR_VIEW_FRESH
+    views = {
+        pass_id: at
+        for pass_id, at in (
+            await db.execute(
+                select(PassSyncState.pass_id, PassSyncState.door_suspended_at).where(
+                    PassSyncState.pass_id.in_([p.id for p in passes]),
+                    PassSyncState.door_suspended_seen_at > fresh_after,
+                )
+            )
+        ).tuples()
+    }
     return [
         PassOut(
             uid=p.uid,
+            doorSuspended=(views[p.id] is not None) if p.id in views else None,
+            doorSuspendedAt=views.get(p.id),
             collectionUid=colls.get(p.collection_id) if p.collection_id is not None else None,
             label=p.label,
             scope=cast(PassScope, p.scope),

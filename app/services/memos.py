@@ -15,6 +15,7 @@ from app.config import settings
 from app.models import (
     Attachment,
     AttachmentRendition,
+    IngestBatch,
     Memo,
     MemoEditKey,
     Pass,
@@ -243,6 +244,21 @@ async def _place_attachment_masters(
                 moved_out.append(track)
             new = await storage.place_master(Path(staged), dest_dir, r.filename, track)
             r.storage_path = str(new)
+
+
+async def lock_referencing_batches(db: AsyncSession, memo_id: int) -> None:
+    """Take the trip ledger rows naming this memo, ascending in one statement, before its M lock.
+
+    Deleting a memo writes them through ON DELETE SET NULL, and a later filing part holds its batch
+    row while it asks for the memo: left implicit, the delete is M → H against the filing's H → M, a
+    40P01 (`tests/test_trip_filing_lock_order.py`). The set cannot grow under the delete: a batch
+    names a memo only from the commit that made that memo."""
+    await db.execute(
+        select(IngestBatch.id)
+        .where(IngestBatch.memo_id == memo_id)
+        .order_by(IngestBatch.id)
+        .with_for_update()
+    )
 
 
 async def lock_memo_for_write(db: AsyncSession, memo: Memo) -> Memo | None:

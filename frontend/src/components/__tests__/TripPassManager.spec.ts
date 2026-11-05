@@ -117,6 +117,68 @@ describe('TripPassManager', () => {
     expect(server.calls('POST', LIST)).toHaveLength(1)
   })
 
+  it('shows a door suspension and offers Unsuspend, and hides both when unknown', async () => {
+    const passes = [
+      aPass({ uid: 'sus', doorSuspended: true }),
+      aPass({ uid: 'unk', doorSuspended: null }),
+      aPass({ uid: 'fine', doorSuspended: false }),
+    ]
+    server.on('GET', LIST, () => ({ status: 200, body: passes }))
+    server.on('POST', '/api/passes/sus/unsuspend', { status: 200, body: passes[0] })
+    const wrapper = mountSheet()
+    await flushPromises()
+    expect(wrapper.findAll('[data-test="pass-suspended"]')).toHaveLength(1)
+    const buttons = wrapper.findAll('[data-test="pass-unsuspend"]')
+    expect(buttons).toHaveLength(1)
+    const before = server.calls('GET', LIST).length
+    await buttons[0]!.trigger('click')
+    await flushPromises()
+    expect(server.calls('POST', '/api/passes/sus/unsuspend')).toHaveLength(1)
+    // The list on screen refetches: an invalidation under any other key would leave it stale.
+    expect(server.calls('GET', LIST).length).toBeGreaterThan(before)
+  })
+
+  it('says why an unsuspend failed', async () => {
+    const passes = [aPass({ uid: 'sus', doorSuspended: true })]
+    server.on('GET', LIST, () => ({ status: 200, body: passes }))
+    server.on('POST', '/api/passes/sus/unsuspend', { status: 502, body: {} })
+    const wrapper = mountSheet()
+    await flushPromises()
+    await wrapper.find('[data-test="pass-unsuspend"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-test="pass-error"]').text()).toContain('HTTP 502')
+  })
+
+  it('lists quarantined uploads, resolves them, and hides the section when none are left', async () => {
+    let batches = [
+      { uid: 'b1', passUid: 'p', fileCount: 2, byteTotal: 9, createdAt: '2026-11-04T10:00:00Z' },
+    ]
+    let open = 3
+    const quarantine = '/api/trip-ingest/quarantine'
+    server.on('GET', LIST, () => ({ status: 200, body: [] }))
+    server.on('GET', quarantine, () => ({
+      status: 200,
+      body: { batches, unknownTotal: 3, unknownOpen: open },
+    }))
+    server.on('POST', `${quarantine}/b1/resolve`, () => {
+      batches = []
+      return { status: 204, body: undefined }
+    })
+    server.on('POST', `${quarantine}/unknown/resolve`, () => {
+      open = 0
+      return { status: 204, body: undefined }
+    })
+    const wrapper = mountSheet()
+    await flushPromises()
+    expect(wrapper.find('[data-test="quarantine"]').exists()).toBe(true)
+    await wrapper.find('[data-test="quarantine-resolve"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('[data-test="quarantine-clear-unknown"]').trigger('click')
+    await flushPromises()
+    expect(server.calls('POST', `${quarantine}/unknown/resolve`)[0]!.body).toEqual({ through: 3 })
+    expect(wrapper.find('[data-test="quarantine"]').exists()).toBe(false)
+  })
+
   it('refuses an empty label without a request', async () => {
     server.on('GET', LIST, { status: 200, body: [] })
     const w = mountSheet()

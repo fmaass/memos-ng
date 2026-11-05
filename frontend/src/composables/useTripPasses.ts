@@ -100,6 +100,25 @@ export function useTripPasses(collectionUid: MaybeRefOrGetter<string>) {
     if (issued.value?.value.pass.uid === passUid) issued.value = null
   }
 
+  /** Ask the door to lift a suspension; the sheet learns the result from a later sync. */
+  function unsuspendPass(passUid: string): Promise<boolean> {
+    const forUid = uid.value
+    return joined(passKey(passUid), async () => {
+      error.value = null
+      try {
+        const { error: e, response } = await api.POST('/api/passes/{uid}/unsuspend', {
+          params: { path: { uid: passUid } },
+        })
+        if (e) throw new PassError(response.status, detailOf(e))
+        refresh(forUid)
+        return true
+      } catch (err) {
+        fail(forUid, err)
+        return false
+      }
+    })
+  }
+
   /** Revoke the pass and every device on it. Resolves true once the server says it is revoked. */
   function revokePass(passUid: string): Promise<boolean> {
     const forUid = uid.value
@@ -155,6 +174,7 @@ export function useTripPasses(collectionUid: MaybeRefOrGetter<string>) {
     error,
     issue,
     revokePass,
+    unsuspendPass,
     revokeDevice,
     dismissIssued,
     issuing: computed(() => isBusy(issueKey())),
@@ -177,4 +197,31 @@ export function usePassDevices(passUid: MaybeRefOrGetter<string>) {
       return data
     },
   })
+}
+
+/** Quarantined guest batches the owner has not looked at yet. Resolving files nothing, deletes
+ * nothing and sends nothing to the door. */
+export function useTripQuarantine() {
+  const api = useApi()
+  const queryClient = useQueryClient()
+  const quarantine = useQuery({
+    queryKey: ['trip-quarantine'],
+    queryFn: async () => {
+      const { data, error, response } = await api.GET('/api/trip-ingest/quarantine')
+      if (error || !data) throw new PassError(response.status, detailOf(error))
+      return data
+    },
+  })
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['trip-quarantine'] })
+  async function resolveBatch(batchUid: string): Promise<void> {
+    await api.POST('/api/trip-ingest/quarantine/{batch_uid}/resolve', {
+      params: { path: { batch_uid: batchUid } },
+    })
+    await refresh()
+  }
+  async function clearUnknown(through: number): Promise<void> {
+    await api.POST('/api/trip-ingest/quarantine/unknown/resolve', { body: { through } })
+    await refresh()
+  }
+  return { quarantine, resolveBatch, clearUnknown }
 }

@@ -16,6 +16,7 @@ from dataclasses import field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
+from typing import Protocol
 
 from anyio import to_thread
 
@@ -32,6 +33,25 @@ def free_bytes(root: Path) -> int:
     off the loop."""
     root.mkdir(parents=True, exist_ok=True)
     return shutil.disk_usage(root).free
+
+
+class MoveRecorder(Protocol):
+    """A durable record of a rename, committed BEFORE the rename happens. Only trip filing has one
+    (`trip_ingest._MoveJournal`, MEMNG-1037 #2); every other caller's move carries none and behaves
+    exactly as it always did."""
+
+    async def record(self, src: str, dest: str, kind: str) -> int: ...
+
+    async def forget(self, row_id: int) -> None: ...
+
+
+# What a journaled placement writes into its reservation: the row's own id, which is what lets a
+# later reconcile tell THIS row's placeholder from a real file or another writer's reservation.
+RESERVATION_PREFIX = b"memos-ng-ingest-move:"
+
+
+def reservation_token(row_id: int) -> bytes:
+    return RESERVATION_PREFIX + str(row_id).encode()
 
 
 class MoveAbandoned(Exception):
@@ -64,6 +84,7 @@ class TrackedMove:
 
     src: str
     dest: str | None = None
+    journal: MoveRecorder | None = None
     _lock: Lock = dataclass_field(default_factory=Lock, repr=False)
     _abandoned: bool = False
 
@@ -222,6 +243,60 @@ def _tracked_place_master_sync(track: TrackedMove, dest_dir: Path, name: str) ->
     return track.perform(lambda src: _place_master_sync(src, dest_dir, name))
 
 
+def _free_candidate(dest_dir: Path, name: str, attempt: int) -> tuple[Path, int]:
+    """The first name free right now from `attempt` on, the numbering `_reserve` uses. Creates
+    nothing, so a crash before the journal commit leaves nothing behind."""
+    stem, suffix = Path(name).stem, Path(name).suffix
+    while True:
+        candidate = dest_dir / (name if attempt == 1 else f"{stem} ({attempt}){suffix}")
+        if not candidate.exists():
+            return candidate, attempt
+        attempt += 1
+
+
+def _journaled_place_sync(track: TrackedMove, candidate: Path, token: bytes) -> Path:
+    """Reserve exactly the journaled name, marked as that row's own, then rename onto it. A lost
+    race raises FileExistsError with nothing moved; the caller re-journals under another name."""
+
+    def move(src: Path) -> Path:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, token)
+        finally:
+            os.close(fd)
+        _before_journaled_rename()
+        try:
+            os.replace(src, candidate)
+        except OSError:
+            candidate.unlink(missing_ok=True)
+            raise
+        return candidate
+
+    return track.perform(move)
+
+
+def _before_journaled_rename() -> None:
+    """A test seam: the reservation exists, the journal row is committed, the rename has not run."""
+
+
+async def _journaled_place(
+    track: TrackedMove, journal: MoveRecorder, src: Path, dest_dir: Path, name: str
+) -> Path:
+    clean = sanitize_name(name)
+    attempt = 1
+    while True:
+        candidate, attempt = await to_thread.run_sync(_free_candidate, dest_dir, clean, attempt)
+        row_id = await journal.record(str(src), str(candidate), "master")
+        try:
+            return await to_thread.run_sync(
+                _journaled_place_sync, track, candidate, reservation_token(row_id)
+            )
+        except FileExistsError:
+            await journal.forget(row_id)
+            attempt += 1
+
+
 async def place_master(
     src: Path, dest_dir: Path, name: str, track: TrackedMove | None = None
 ) -> Path:
@@ -232,6 +307,8 @@ async def place_master(
     into the worker thread, so a cancelled request cannot lose it (MEMNG-145)."""
     if track is None:
         return await to_thread.run_sync(_place_master_sync, src, dest_dir, name)
+    if track.journal is not None:
+        return await _journaled_place(track, track.journal, src, dest_dir, name)
     return await to_thread.run_sync(_tracked_place_master_sync, track, dest_dir, name)
 
 

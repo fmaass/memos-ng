@@ -115,7 +115,7 @@ sha256sum "$f" > "$f.sha256"
 # 2. the table of contents, read with the dev container's pg_restore (same major version)
 docker exec -i memos-ng-db-1 pg_restore -l < "$f" > "$f.toc"
 chmod 600 "$f.sha256" "$f.toc"
-grep -c 'TABLE DATA' "$f.toc"                   # one per table; 24 on 2026-09-18
+grep -c 'TABLE DATA' "$f.toc"                   # one per table; 40 on 2026-11-05
 ```
 
 A dump that was never restored is not a backup. Restore it into a throwaway database in the DEV
@@ -137,7 +137,7 @@ The same four numbers are read from production, read-only, through the estate's
 dump and the read. The step is done when the dump, its `.sha256` and its `.toc` exist with mode
 600, the `TABLE DATA` count equals the table count, and the restore probe matched.
 
-**Retention.** A dump is about 0.5 to 0.6 MB today. Every `~/backups/memosng-pre-<version>-<date>/`
+**Retention.** A dump was about 0.9 MB on 2026-11-05. Every `~/backups/memosng-pre-<version>-<date>/`
 directory is kept and nothing prunes them; revisit this when a dump passes 1 GB.
 
 **Rehearsed 2026-09-18** against production, read-only: 611,456 bytes, 24 `TABLE DATA` entries, and

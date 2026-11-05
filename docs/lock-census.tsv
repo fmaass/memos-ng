@@ -12,6 +12,8 @@ app/ingest/service_api.py	purge	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	attach_rendition	for_update
 app/routers/assets.py	upload_print	refresh
+app/routers/trip_ingest.py	_resolve_batch	for_update
+app/routers/trip_ingest.py	resolve_unknown	for_update
 app/scripts/import_digest_state.py	run_import	for_update
 app/services/collections.py	_hold_cover	for_update
 app/services/collections.py	update_collection	for_update
@@ -23,6 +25,7 @@ app/services/export_settings.py	settings_row	for_update
 app/services/frame_share.py	recover_stale_claimed	for_update
 app/services/media.py	attachment_still_exists	for_update
 app/services/media.py	guard_publish	for_update
+app/services/memos.py	lock_referencing_batches	for_update
 app/services/memos.py	lock_memo_for_write	for_update
 app/services/memos.py	link_attachments	for_update
 app/services/memos.py	get_by_idempotency_key	for_update
@@ -40,14 +43,15 @@ app/services/sibling.py	_write_result	for_update
 app/services/trip_ingest.py	_lock_passes	for_update
 app/services/trip_ingest.py	push_device_revocations	refresh
 app/services/trip_ingest.py	_mirror_device	for_update
+app/services/trip_ingest.py	reconcile_moves	for_update
 app/services/trip_ingest.py	_filing_committed	for_update
 app/services/trip_ingest.py	_file_part	for_update
 app/services/trip_ingest.py	_ack	refresh
 app/services/trip_ingest.py	_quarantine	refresh
 app/services/trip_ingest.py	_refuse_open	refresh
+app/services/uploads.py	finalize_committed	for_update
 app/services/uploads.py	append_stream.relock	for_update
 app/services/uploads.py	ensure_capture	for_update
-app/services/uploads.py	finalize_committed	for_update
 app/services/uploads.py	_lock_attachments	for_update
 app/services/uploads.py	finalize_pending	for_update
 app/services/uploads.py	finalize	for_update

@@ -3503,6 +3503,22 @@
             "title": "Devicecount",
             "type": "integer"
           },
+          "doorSuspended": {
+            "description": "What the door last said, display only; null when home does not know (an old door, a malformed answer, or a view older than the sync's stale window).",
+            "title": "Doorsuspended",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "doorSuspendedAt": {
+            "format": "date-time",
+            "title": "Doorsuspendedat",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "expiresAt": {
             "format": "date-time",
             "title": "Expiresat",
@@ -3959,6 +3975,68 @@
         "title": "PushKeys",
         "type": "object"
       },
+      "QuarantineOut": {
+        "properties": {
+          "batches": {
+            "items": {
+              "$ref": "#/components/schemas/QuarantinedBatchOut"
+            },
+            "title": "Batches",
+            "type": "array"
+          },
+          "unknownOpen": {
+            "description": "The total less what the owner cleared.",
+            "title": "Unknownopen",
+            "type": "integer"
+          },
+          "unknownTotal": {
+            "description": "Quarantines for a pass home never issued, ever.",
+            "title": "Unknowntotal",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "batches",
+          "unknownTotal",
+          "unknownOpen"
+        ],
+        "title": "QuarantineOut",
+        "type": "object"
+      },
+      "QuarantinedBatchOut": {
+        "properties": {
+          "byteTotal": {
+            "title": "Bytetotal",
+            "type": "integer"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "fileCount": {
+            "title": "Filecount",
+            "type": "integer"
+          },
+          "passUid": {
+            "title": "Passuid",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "passUid",
+          "fileCount",
+          "byteTotal",
+          "createdAt"
+        ],
+        "title": "QuarantinedBatchOut",
+        "type": "object"
+      },
       "ReactionIn": {
         "properties": {
           "emoji": {
@@ -4202,6 +4280,21 @@
           "count"
         ],
         "title": "TagCount",
+        "type": "object"
+      },
+      "UnknownResolveIn": {
+        "properties": {
+          "through": {
+            "description": "The `unknownTotal` the owner saw; later ones stay counted.",
+            "minimum": 0.0,
+            "title": "Through",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "UnknownResolveIn",
         "type": "object"
       },
       "UploadBatchCreate": {
@@ -10850,6 +10943,130 @@
         "summary": "Revoke Capture Grant",
         "tags": [
           "tokens"
+        ]
+      }
+    },
+    "/api/trip-ingest/quarantine": {
+      "get": {
+        "operationId": "list_quarantine_api_trip_ingest_quarantine_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuarantineOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Quarantine",
+        "tags": [
+          "trip-ingest"
+        ]
+      }
+    },
+    "/api/trip-ingest/quarantine/unknown/resolve": {
+      "post": {
+        "description": "`through` is the total the owner saw: anything since stays counted, so no ABA and no 409.\nWith no `through` this is the batch whose door-chosen uid is literally unknown, which this\nroute would otherwise make unresolvable and its alert unclearable.",
+        "operationId": "resolve_unknown_api_trip_ingest_quarantine_unknown_resolve_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnknownResolveIn",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Resolve Unknown",
+        "tags": [
+          "trip-ingest"
+        ]
+      }
+    },
+    "/api/trip-ingest/quarantine/{batch_uid}/resolve": {
+      "post": {
+        "operationId": "resolve_batch_api_trip_ingest_quarantine__batch_uid__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_uid",
+            "required": true,
+            "schema": {
+              "title": "Batch Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Resolve Batch",
+        "tags": [
+          "trip-ingest"
         ]
       }
     },

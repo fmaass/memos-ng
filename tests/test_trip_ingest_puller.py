@@ -45,6 +45,7 @@ from tests.test_attachments_taken import _sql
 TAG = "tp3trip"
 OWNER = "tp3_owner"
 HOME_TABLES = (
+    "ingest_moves",
     "trip_ingest_cursor",
     "pass_sync_state",
     "pass_events",
@@ -1368,19 +1369,20 @@ async def test_a_cancel_before_the_staging_rename_leaves_the_verified_file_intac
 ):
     """`create_upload` has made the upload's empty part file and the cancellation lands before the
     verified file is renamed over it: the empty file must not be walked back over the verified
-    bytes, and no empty part file may be left behind."""
+    bytes, its journal row must survive to say so, and the next tick must leave no empty part file
+    behind."""
     trip = await _trip(world)
     batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
-    real = trip_ingest.to_thread
+    real = trip_ingest.uploads_svc.create_upload
     parked = asyncio.Event()
 
-    async def run_sync(func, *args, **kwargs):
-        if func is trip_ingest._replace_sync and args[1].parent.name == "uploads":
-            parked.set()
-            await asyncio.Event().wait()  # the rename into the upload has not run
-        return await real.run_sync(func, *args, **kwargs)
+    async def create_upload(*args, **kwargs):
+        up = await real(*args, **kwargs)
+        parked.set()
+        await asyncio.Event().wait()  # the rename into the upload has not run
+        return up
 
-    monkeypatch.setattr(trip_ingest, "to_thread", SimpleNamespace(run_sync=run_sync))
+    monkeypatch.setattr(trip_ingest.uploads_svc, "create_upload", create_upload)
     tick = asyncio.create_task(_tick(world))
     await asyncio.wait_for(parked.wait(), 30)
     tick.cancel()
@@ -1388,10 +1390,13 @@ async def test_a_cancel_before_the_staging_rename_leaves_the_verified_file_intac
         await tick
     staged = trip_ingest.staging_dir(batch) / SHA_JPEG
     assert staged.read_bytes() == JPEG
-    assert _no_upload_parts(world)
-    monkeypatch.setattr(trip_ingest, "to_thread", real)
+    assert not _no_upload_parts(world), "the placeholder was not there to clean"
+    assert _sql("SELECT count(*) FROM ingest_moves") == [(1,)]
+    monkeypatch.setattr(trip_ingest.uploads_svc, "create_upload", real)
     world.wire.seen.clear()
     assert await _tick(world) == "ok"
+    assert _no_upload_parts(world)
+    assert _sql("SELECT count(*) FROM ingest_moves") == [(0,)]
     assert len(_memos()) == 1 and _home_batch(batch) == [("acked", True, True, False)]
     assert not any(p.startswith("/ingest/blobs/") for _, p, _ in world.wire.seen)  # no re-download
 

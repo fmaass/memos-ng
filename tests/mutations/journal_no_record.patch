@@ -1,0 +1,13 @@
+diff --git a/app/services/uploads.py b/app/services/uploads.py
+index 18c2ce4..497764e 100644
+--- a/app/services/uploads.py
++++ b/app/services/uploads.py
+@@ -340,8 +340,6 @@ def _move_into_sync(src: Path, dest: Path) -> None:
+ 
+ async def _move_tracked(track: storage.TrackedMove, dest: Path) -> None:
+     """The tracked move, journaled first when the move list carries a journal (trip filing)."""
+-    if track.journal is not None:
+-        await track.journal.record(track.src, str(dest), "master")
+     await to_thread.run_sync(_tracked_move_into_sync, track, dest)
+ 
+ 

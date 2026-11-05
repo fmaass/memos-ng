@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import time
 from collections.abc import Callable, Sequence
@@ -46,7 +47,7 @@ import httpx
 import structlog
 from anyio import to_thread
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,8 +56,11 @@ from app.database import async_session, engine
 from app.ingest import core as ingest_core
 from app.models import (
     PASS_DEVICE_PLATFORMS,
+    Attachment,
+    AttachmentRendition,
     IngestBatch,
     IngestBlob,
+    IngestMove,
     Pass,
     PassDevice,
     PassEvent,
@@ -666,6 +670,14 @@ async def _push_quarantine(client: httpx.AsyncClient, uid: str) -> bool:
     raise LinkDown(f"quarantine {uid}: HTTP {r.status_code}")
 
 
+async def _count_unknown_quarantine(batch_uid: str, pass_uid: object) -> None:
+    async with async_session() as db:
+        cur = await _cursor(db)
+        cur.quarantined_unknown_total += 1
+        await db.commit()
+    logger.warning("trip_ingest.quarantined_unknown", batch=batch_uid, pass_uid=str(pass_uid)[:64])
+
+
 async def _record_batch(
     db: AsyncSession, client: httpx.AsyncClient, raw: object, errors: list[str]
 ) -> None:
@@ -701,6 +713,11 @@ async def _record_batch(
         if p is None:
             # No home pass to hang a ledger row on: quarantined NOW, inside the transaction that
             # moves the cursor past it, so a link failure leaves the cursor where it was.
+            # Counted FIRST and on its own session: the page's transaction may yet roll back with
+            # the door already moved, and a replay returns early above, so it would never be
+            # counted. Over-counting a replay is accepted; the owner clears it. The page writes the
+            # cursor row only after this loop, so this cannot queue behind its own page.
+            await _count_unknown_quarantine(uid, raw.get("pass_uid"))
             await _push_quarantine(client, uid)
             logger.warning("trip_ingest.quarantined", batch=uid, reason=str(exc))
             errors.append(f"{uid}: {exc}")
@@ -727,6 +744,8 @@ async def _record_batch(
         uid=uid,
         pass_id=p.id,
         pass_device_id=device.id,
+        # Under the pass lock `pull_batches` holds: the version that admitted this batch.
+        pass_version=p.version,
         caption=batch.caption,
         state="open",
         file_count=len(batch.blobs),
@@ -965,13 +984,218 @@ def _replace_sync(src: Path, dest: Path) -> None:
     os.replace(src, dest)
 
 
-def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -> None:
+class _MoveJournal:
+    """Commits each filing rename's (src, dest) BEFORE it happens, on a session of its own: the
+    filing's transaction holds the batch row and will only commit if everything lands. No foreign
+    key on `ingest_moves.batch_id`, so these inserts do not queue behind that row (MEMNG-1037 #2).
+    """
+
+    def __init__(self, batch_id: int) -> None:
+        self.batch_id = batch_id
+        self.written: set[int] = set()
+
+    async def record_many(self, moves: Sequence[tuple[str, str]], kind: str) -> None:
+        async with async_session() as db:
+            rows = [
+                IngestMove(batch_id=self.batch_id, src=src, dest=dest, kind=kind)
+                for src, dest in moves
+            ]
+            db.add_all(rows)
+            await db.flush()
+            row_ids = [row.id for row in rows]
+            await db.commit()
+        self.written.update(row_ids)
+
+    async def record(self, src: str, dest: str, kind: str) -> int:
+        async with async_session() as db:
+            row = IngestMove(batch_id=self.batch_id, src=src, dest=dest, kind=kind)
+            db.add(row)
+            await db.flush()
+            row_id = row.id
+            await db.commit()
+        self.written.add(row_id)
+        return row_id
+
+    async def forget(self, row_id: int) -> None:
+        async with async_session() as db:
+            await db.execute(delete(IngestMove).where(IngestMove.id == row_id))
+            await db.commit()
+        self.written.discard(row_id)
+
+    async def drop_written(self) -> None:
+        """A fully restored filing's rows: left behind, they read a name its restore vacated as
+        theirs, and the next owner of that name loses the file. Runs after the filing's session has
+        closed, because a filing interrupted at its own delete still holds these rows until then.
+        Ends on its own, like the cancel record; rows it cannot drop stay for reconcile, whose
+        attachment check is what makes them harmless."""
+        try:
+            async with asyncio.timeout(CANCEL_RECORD_DEADLINE_S):
+                async with async_session() as db:
+                    await db.execute(
+                        delete(IngestMove).where(
+                            IngestMove.id.in_(self.written), IngestMove.flagged_at.is_(None)
+                        )
+                    )
+                    await db.commit()
+        except TimeoutError:
+            logger.error("trip_ingest.journal_drop_timed_out", batch=self.batch_id)
+        except Exception:
+            logger.exception("trip_ingest.journal_drop_failed", batch=self.batch_id)
+
+
+class _JournaledMoves(list[storage.TrackedMove]):
+    """The filing's move list. Appending hands the move its journal, so the member paths that take
+    `moved_out` carry the seam without a parameter of their own, and no other caller gets it."""
+
+    def __init__(self, journal: _MoveJournal) -> None:
+        super().__init__()
+        self.journal = journal
+
+    def append(self, track: storage.TrackedMove) -> None:
+        track.journal = self.journal
+        super().append(track)
+
+
+def _is_reservation(dest: Path, row_id: int) -> bool:
+    token = storage.reservation_token(row_id)
+    if dest.stat().st_size != len(token):
+        return False
+    return dest.read_bytes() == token
+
+
+def _walk_back_sync(row_id: int, src_path: str, dest_path: str, kind: str) -> str:
+    """One journal row's reconciliation; `done` drops the row, `flag` keeps it. Never overwrites."""
+    src, dest = Path(src_path), Path(dest_path)
+    has_src, has_dest = src.exists(), dest.exists()
+    if has_dest and kind == "master" and _is_reservation(dest, row_id):
+        dest.unlink()  # this row's own placeholder: the rename never ran
+        return "done"
+    if has_src and has_dest:
+        # A part path is named by this row's 192-bit uid, so nobody else made it; empty, it is the
+        # placeholder `create_upload` leaves until the rename lands.
+        if kind == "part" and dest.stat().st_size == 0:
+            dest.unlink()
+            return "done"
+        return "flag"
+    if has_dest:
+        src.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(dest, src)
+        return "done"
+    if not has_src:
+        logger.warning("trip_ingest.reconcile_neither", move=row_id, src=src_path, dest=dest_path)
+    return "done"
+
+
+class ReconcileIncomplete(Exception):
+    """A journaled file would not move back. The tick stops before filing: the batch's bytes are
+    not where a retry expects them, and `GuestSyncStale` stays the loud signal."""
+
+
+async def _attachment_names(db: AsyncSession, path: str) -> bool:
+    """Whether a committed row stores exactly this path: an attachment's display or print master, or
+    a rendition, which a filing journals and places in the memo folder under its own filename. Each
+    column holds the `str()` of the path `place_master` returned, as a journal row's dest does."""
+    for names in (
+        select(Attachment.id).where(
+            or_(Attachment.storage_path == path, Attachment.print_path == path)
+        ),
+        select(AttachmentRendition.id).where(AttachmentRendition.storage_path == path),
+    ):
+        if (await db.execute(names.limit(1))).first() is not None:
+            return True
+    return False
+
+
+async def reconcile_moves() -> None:
+    """Walk back whatever a crashed filing left, before anything is filed. For each batch with rows:
+    the batch row FIRST, which waits out a filing still running (the sync advisory lock is on
+    another connection, so losing that connection can release it while a filing runs on), THEN the
+    journal read fresh, walked in REVERSE order. Idempotent, and a no-op after an in-process walk
+    back."""
+    async with async_session() as db:
+        batch_ids = list(
+            (
+                await db.execute(
+                    select(IngestMove.batch_id)
+                    .where(IngestMove.flagged_at.is_(None))
+                    .distinct()
+                    .order_by(IngestMove.batch_id)
+                )
+            ).scalars()
+        )
+    failed = 0
+    for batch_id in batch_ids:
+        async with async_session() as db:
+            await db.execute(
+                select(IngestBatch.id).where(IngestBatch.id == batch_id).with_for_update()
+            )
+            rows = list(
+                (
+                    await db.execute(
+                        select(IngestMove)
+                        .where(IngestMove.batch_id == batch_id, IngestMove.flagged_at.is_(None))
+                        .order_by(IngestMove.id.desc())
+                    )
+                ).scalars()
+            )
+            for row in rows:
+                if row.kind == "master" and await _attachment_names(db, row.dest):
+                    # Not this row's file: the filing it journaled gave that name up, and somebody
+                    # committed it since (an owner upload, or an older build refiling the part).
+                    # The flag takes this row out of every later walk, so the stop lasts this pass:
+                    # the earlier hops are each right on their own, and the next tick walks them.
+                    row.flagged_at = datetime.now(UTC)
+                    failed += 1
+                    logger.error(
+                        "trip_ingest.reconcile_dest_committed",
+                        move=row.id,
+                        src=row.src,
+                        dest=row.dest,
+                    )
+                    break
+                try:
+                    # blocking-ok: anyio holds no native `task.cancel()` for a running thread, so
+                    # awaited, the rename can outlive this session and the batch lock it holds,
+                    # and land after a later reconcile and a refile. Only a crash leaves work here,
+                    # and a rename is short.
+                    outcome = _walk_back_sync(row.id, row.src, row.dest, row.kind)
+                except OSError as exc:
+                    failed += 1
+                    logger.error(
+                        "trip_ingest.reconcile_failed",
+                        move=row.id,
+                        src=row.src,
+                        dest=row.dest,
+                        error=type(exc).__name__,
+                    )
+                    # The earlier rows depend on this hop: walked now they read "neither present"
+                    # and go, and the retry finds the original with no journal.
+                    break
+                if outcome == "flag":
+                    row.flagged_at = datetime.now(UTC)
+                    logger.error(
+                        "trip_ingest.reconcile_both_present",
+                        move=row.id,
+                        src=row.src,
+                        dest=row.dest,
+                    )
+                else:
+                    await db.delete(row)
+            await db.commit()
+    if failed:
+        raise ReconcileIncomplete(f"{failed} journaled moves would not walk back")
+
+
+def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -> bool:
     """Walk a rolled-back filing's files back to the staging area, so the next tick finds them.
     Inline, not in a thread: this may run while a cancellation unwinds (see the memo router's
-    `_restore_moved`). A file that will not move is logged and left where it is."""
+    `_restore_moved`). A file that will not move is logged and left where it is, and the answer is
+    False: only True says the filing's journal rows have nothing left to describe."""
+    clean = True
     for move in reversed(moved):
         unrestored = move.restore()
         if unrestored is not None:
+            clean = False
             logger.error("trip_ingest.restore_failed", src=move.src, dest=unrestored)
     for staged, part in parts:
         try:
@@ -983,7 +1207,9 @@ def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -
             elif part.exists():
                 os.replace(part, staged)
         except OSError as exc:
+            clean = False
             logger.error("trip_ingest.restore_failed", src=str(part), error=type(exc).__name__)
+    return clean
 
 
 def _epoch_ms(value: datetime) -> int:
@@ -1081,11 +1307,12 @@ async def _file_part(batch_id: int) -> bool | None:
     filed. None: the batch is not `open` (filed, quarantined — the
     replay is resolved here, before anything is inserted); True: this part completed the batch;
     False: parts remain for the next call."""
-    moved: list[storage.TrackedMove] = []
+    journal = _MoveJournal(batch_id)
+    moved = _JournaledMoves(journal)
     parts: list[tuple[Path, Path]] = []
     consumed: list[str] = []
     filing: list[int] = []
-    committed = commit_sent = False
+    committed = commit_sent = restored = creating_part = False
     try:
         async with async_session() as db:
             try:
@@ -1120,9 +1347,28 @@ async def _file_part(batch_id: int) -> bool | None:
                     uid if len(pending) == len(blobs) else f"{uid}/{part[0].sha256}"
                 )
                 upload_for: dict[str, IngestBlob] = {}
-                for blob in part:
+                # Journaled before the empty part files exist: a crash before this commit leaves
+                # nothing to find, and one after it leaves rows that say what to clean.
+                planned = [(secrets.token_urlsafe(24), blob) for blob in part]
+                if planned:
+                    await journal.record_many(
+                        [
+                            (
+                                str(_verified_path(uid, b.sha256)),
+                                str(uploads_svc.part_path(up_uid)),
+                            )
+                            for up_uid, b in planned
+                        ],
+                        "part",
+                    )
+                for up_uid, blob in planned:
+                    # Interrupted in here, the empty part file exists or is still to land from the
+                    # thread a cancellation left running, and `parts` does not list it: only its
+                    # journal row can clean it, so a restore does not drop the rows then.
+                    creating_part = True
                     up = await uploads_svc.create_upload(
                         db,
+                        upload_uid=up_uid,
                         owner_id=owner_id,
                         filename=blob.filename,
                         mime=blob.mime,
@@ -1131,10 +1377,13 @@ async def _file_part(batch_id: int) -> bool | None:
                             _epoch_ms(blob.last_modified) if blob.last_modified else None
                         ),
                     )
+                    creating_part = False
                     staged = _verified_path(uid, blob.sha256)
                     target = uploads_svc.part_path(up.upload_uid)
                     parts.append((staged, target))
-                    await to_thread.run_sync(_replace_sync, staged, target)
+                    # blocking-ok: awaited, a cancellation leaves this rename running in its thread,
+                    # where it can land after `_restore` has dropped the only row that describes it.
+                    _replace_sync(staged, target)
                     # The completion state a member's last chunk leaves: every byte received, its
                     # hash known. The capture read happens in finalize's `ensure_capture`.
                     up.bytes_received = blob.size_bytes
@@ -1209,6 +1458,13 @@ async def _file_part(batch_id: int) -> bool | None:
                 if complete:
                     batch.state = "complete"
                 filing = [b.id for b in part]
+                # In the filing's own transaction: a surviving row means this did not commit. A
+                # flagged row stays as the evidence of a conflict nothing resolved.
+                await db.execute(
+                    delete(IngestMove).where(
+                        IngestMove.batch_id == batch_id, IngestMove.flagged_at.is_(None)
+                    )
+                )
                 commit_sent = True
                 await db.commit()
                 committed = True
@@ -1217,7 +1473,7 @@ async def _file_part(batch_id: int) -> bool | None:
                     # blocking-ok: a cancellation may be unwinding through here, and an await
                     # could be interrupted before the files are back (the memo router restores
                     # inline too).
-                    _restore(moved, parts)
+                    restored = _restore(moved, parts)
                 raise
     except BaseException:
         if commit_sent and not committed:
@@ -1233,7 +1489,10 @@ async def _file_part(batch_id: int) -> bool | None:
             except BaseException:
                 committed_after_all = None
             if committed_after_all is False:
-                _restore(moved, parts)  # blocking-ok: as above
+                restored = _restore(moved, parts)  # blocking-ok: as above
+        if restored and not creating_part and journal.written:
+            # Shielded with its deadline inside, like the cancel record (see `run_sync_safe`).
+            await asyncio.shield(asyncio.ensure_future(journal.drop_written()))
         raise
     if consumed:
         await to_thread.run_sync(uploads_svc.reap_consumed_sync, consumed)
@@ -1315,7 +1574,11 @@ async def _refuse_open(batch_id: int, reason: str) -> None:
         if p is not None:
             db.add(
                 PassEvent(
-                    pass_id=p.id, kind="refused", version=p.version, detail=f"{batch.uid}: {reason}"
+                    pass_id=p.id,
+                    kind="refused",
+                    # The version that admitted the batch; an older row has none and keeps today's.
+                    version=batch.pass_version if batch.pass_version is not None else p.version,
+                    detail=f"{batch.uid}: {reason}",
                 )
             )
             await _note_pass_error(db, p.id, f"batch {batch.uid} quarantined: {reason}")
@@ -1407,6 +1670,7 @@ async def sync_once(client: httpx.AsyncClient, budget_s: float) -> TickResult:
     await pull_devices(client)
     await pull_batches(client, errors)
     await settle(client)
+    await reconcile_moves()
     try:
         filed = await file_open(client, deadline, errors)
     except OutOfTime:
@@ -1418,7 +1682,47 @@ async def sync_once(client: httpx.AsyncClient, budget_s: float) -> TickResult:
     return TickResult("ok", filed, tuple(errors))
 
 
+SUSPENDED_VIEW_CAP = 500
+
+
+async def refresh_door_view(client: httpx.AsyncClient) -> None:
+    """Home's display-only view of which passes the door has suspended (MEMNG-1082 #3). The door is
+    untrusted and `require_home` authenticates home to it, not its answer, so this touches only the
+    two display columns. A valid 200 is a full snapshot; anything else leaves the view unknown and
+    `door_suspended_seen_at` where it was. Never raises: a failure must not stop ingestion."""
+    try:
+        answer = await _call(client, "GET", "/ingest/passes/suspended")
+        if answer.status_code != 200:
+            return
+        doc = _json(answer)
+        entries = doc.get("passes") if isinstance(doc, dict) else None
+        if not isinstance(entries, list) or len(entries) > SUSPENDED_VIEW_CAP:
+            return
+        now = datetime.now(UTC)
+        seen: dict[str, datetime] = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or not _an_id(entry.get("pass_uid")):
+                return
+            at = _datetime_or_none(entry.get("suspended_at"), "suspended_at")
+            if at is None:
+                return
+            seen[entry["pass_uid"]] = min(at, now)
+        async with async_session() as db:
+            rows = (await db.execute(select(Pass.uid, Pass.id).order_by(Pass.id))).tuples().all()
+            await _lock_passes(db, {uid for uid, _ in rows})
+            for uid, pass_id in rows:
+                values = {"door_suspended_at": seen.get(uid), "door_suspended_seen_at": now}
+                stmt = pg_insert(PassSyncState).values(pass_id=pass_id, **values)
+                await db.execute(
+                    stmt.on_conflict_do_update(index_elements=[PassSyncState.pass_id], set_=values)
+                )
+            await db.commit()
+    except Exception as exc:
+        logger.warning("trip_ingest.door_view_unknown", error=type(exc).__name__)
+
+
 TICK_CANCELLED = "cancelled: the tick ran past its bound"
+CANCEL_RECORD_DEADLINE_S = 2.0
 
 
 async def _record_tick(*, synced: bool, error: str | None) -> None:
@@ -1453,6 +1757,7 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
                     http = client
                 try:
                     result = await sync_once(http, budget_s)
+                    await refresh_door_view(http)
                 finally:
                     if own:
                         await http.aclose()
@@ -1462,7 +1767,9 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
         # The worker's housekeeping bound (`worker._bounded`) cancelled the tick. The snapshot's
         # age still says the sync is stale, but without this the reason was lost (MEMNG-1045).
         # Shielded: the cancellation that brought the tick here must not also cancel the record.
-        await asyncio.shield(asyncio.ensure_future(_record_tick_safe(TICK_CANCELLED)))
+        # The deadline lives INSIDE the shielded task: a timeout around the shield would only stop
+        # this wait and leave the task queued on the row or the pool.
+        await asyncio.shield(asyncio.ensure_future(_record_cancelled()))
         raise
     except LinkDown as exc:
         logger.warning("trip_ingest.link_down", error=str(exc))
@@ -1472,6 +1779,18 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
         logger.exception("trip_ingest.error")
         await _record_tick_safe(f"{type(exc).__name__}: {exc}")
         return "error"
+
+
+async def _record_cancelled() -> None:
+    """The cancel path's record, ending on its own: pool acquire, statement and commit together get
+    CANCEL_RECORD_DEADLINE_S, well inside the worker's 14 s housekeeping bound."""
+    try:
+        async with asyncio.timeout(CANCEL_RECORD_DEADLINE_S):
+            await _record_tick(synced=False, error=TICK_CANCELLED)
+    except TimeoutError:
+        logger.error("trip_ingest.cancel_record_timed_out")
+    except Exception:
+        logger.exception("trip_ingest.record_failed")
 
 
 async def _record_tick_safe(error: str) -> None:
