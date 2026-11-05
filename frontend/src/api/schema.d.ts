@@ -948,6 +948,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/devices/live-activity-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register Live Activity Token
+         * @description Register this device's push-to-start token for the signed-in member.
+         *
+         *     Idempotent: posting the same token again updates its one row. A token another member posted
+         *     moves to the caller, since the device has switched accounts.
+         */
+        post: operations["register_live_activity_token_api_devices_live_activity_token_post"];
+        /**
+         * Unregister Live Activity Token
+         * @description Remove this device's push-to-start token if the signed-in member holds it.
+         *
+         *     Always 204: a token that is unknown, already removed, or held by another member is left as it
+         *     is and answered the same way.
+         */
+        delete: operations["unregister_live_activity_token_api_devices_live_activity_token_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/events": {
         parameters: {
             query?: never;
@@ -2905,6 +2935,29 @@ export interface components {
              * @enum {string}
              */
             outcome: "added" | "alreadyMember" | "notOwner" | "notVisible" | "orphan" | "error";
+        };
+        /** LiveActivityTokenIn */
+        LiveActivityTokenIn: {
+            /**
+             * Environment
+             * @description The APNs environment the token was issued for.
+             * @default production
+             * @enum {string}
+             */
+            environment: "production" | "sandbox";
+            /**
+             * Token
+             * @description The ActivityKit push-to-start token, hex-encoded; stored in lower case.
+             */
+            token: string;
+        };
+        /** LiveActivityTokenRef */
+        LiveActivityTokenRef: {
+            /**
+             * Token
+             * @description The ActivityKit push-to-start token, hex-encoded; stored in lower case.
+             */
+            token: string;
         };
         /**
          * MailSubsampling
@@ -5788,6 +5841,70 @@ export interface operations {
                         detail?: string;
                     };
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    register_live_activity_token_api_devices_live_activity_token_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LiveActivityTokenIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
+    unregister_live_activity_token_api_devices_live_activity_token_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LiveActivityTokenRef"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

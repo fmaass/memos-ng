@@ -2436,6 +2436,50 @@
         "title": "InclusionResult",
         "type": "object"
       },
+      "LiveActivityTokenIn": {
+        "properties": {
+          "environment": {
+            "default": "production",
+            "description": "The APNs environment the token was issued for.",
+            "enum": [
+              "production",
+              "sandbox"
+            ],
+            "title": "Environment",
+            "type": "string"
+          },
+          "token": {
+            "description": "The ActivityKit push-to-start token, hex-encoded; stored in lower case.",
+            "maxLength": 512,
+            "minLength": 32,
+            "pattern": "^[0-9a-fA-F]+$",
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "LiveActivityTokenIn",
+        "type": "object"
+      },
+      "LiveActivityTokenRef": {
+        "properties": {
+          "token": {
+            "description": "The ActivityKit push-to-start token, hex-encoded; stored in lower case.",
+            "maxLength": 512,
+            "minLength": 32,
+            "pattern": "^[0-9a-fA-F]+$",
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "LiveActivityTokenRef",
+        "type": "object"
+      },
       "MailSubsampling": {
         "description": "Chroma subsampling for the mail profile, in the notation the vendor guidance uses.\n\n`4:2:0` is the mail default and is deliberately NOT what print uses: an inline mail image is\nread at a few hundred pixels on a phone, where the halved chroma resolution is invisible and\nthe bytes it saves are the difference between a message that arrives and one that bounces off\na provider's part cap. `4:4:4` is the only alternative offered \u2014 an escape hatch for an image\nwhose fine coloured detail the subsampling visibly eats. There is no `4:2:2`: it is a\ncompromise between the two that saves little and is not worth a third answer in a panel.",
         "enum": [
@@ -7828,6 +7872,96 @@
         "summary": "Issue Pass",
         "tags": [
           "passes"
+        ]
+      }
+    },
+    "/api/devices/live-activity-token": {
+      "delete": {
+        "description": "Remove this device's push-to-start token if the signed-in member holds it.\n\nAlways 204: a token that is unknown, already removed, or held by another member is left as it\nis and answered the same way.",
+        "operationId": "unregister_live_activity_token_api_devices_live_activity_token_delete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LiveActivityTokenRef"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Unregister Live Activity Token",
+        "tags": [
+          "devices"
+        ]
+      },
+      "post": {
+        "description": "Register this device's push-to-start token for the signed-in member.\n\nIdempotent: posting the same token again updates its one row. A token another member posted\nmoves to the caller, since the device has switched accounts.",
+        "operationId": "register_live_activity_token_api_devices_live_activity_token_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LiveActivityTokenIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Register Live Activity Token",
+        "tags": [
+          "devices"
         ]
       }
     },

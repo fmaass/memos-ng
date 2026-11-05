@@ -1139,6 +1139,36 @@ class PushSubscription(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class LiveActivityToken(Base):
+    """One iOS device's ActivityKit push-to-start token (MEMNG-946), so the server can start a Live
+    Activity for a capture the app never saw. Like a push endpoint, a token is one device's
+    mailbox: globally unique, so re-registration upserts and a device that switched accounts moves
+    its row to the new account. Stored as lowercase hex; the CHECKs are the shape behind the
+    router's 422 as the last line."""
+
+    __tablename__ = "live_activity_tokens"
+    __table_args__ = (
+        CheckConstraint(
+            "environment IN ('production', 'sandbox')", name="ck_live_activity_tokens_environment"
+        ),
+        CheckConstraint(
+            "token ~ '^[0-9a-f]+$' AND length(token) BETWEEN 32 AND 512",
+            name="ck_live_activity_tokens_token",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token: Mapped[str] = mapped_column(String(512), unique=True)
+    environment: Mapped[str] = mapped_column(
+        String(16), default="production", server_default=text("'production'")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 # --- Daily digest (MEMNG-233) -----------------------------------------------------------------
 #
 # The digest's state used to live in a satellite's `state.json` plus its `.env`. These five tables

@@ -107,6 +107,7 @@ from app.routers import capture_grants as capture_grants_router  # noqa: E402
 from app.routers import collection_covers as collection_covers_router  # noqa: E402
 from app.routers import collections as collections_router  # noqa: E402
 from app.routers import compat as compat_router  # noqa: E402
+from app.routers import devices as devices_router  # noqa: E402
 from app.routers import export as export_router  # noqa: E402
 from app.routers import map as map_router  # noqa: E402
 from app.routers import me as me_router  # noqa: E402
@@ -136,6 +137,7 @@ app.router.routes.extend(collections_router.router.routes)
 app.router.routes.extend(collection_covers_router.router.routes)
 app.router.routes.extend(passes_router.router.routes)
 app.router.routes.extend(push_router.router.routes)
+app.router.routes.extend(devices_router.router.routes)
 app.router.routes.extend(settings_router.router.routes)
 app.router.routes.extend(me_router.router.routes)
 app.router.routes.extend(members_router.router.routes)
