@@ -2,11 +2,12 @@
 
 The allowlist is the contract. The walk reads the RUNTIME route table — `app.router.routes`,
 mounts and `include_in_schema=False` routes included — not the OpenAPI document, and requires the
-(method, path) set of each ingest role to equal its allowlist exactly. The probe then sends the
-UNION of every role's paths, the hidden ones and `%2f` / `..` variants to each ingest role with no
-credential, a guest token, a member PAT, a member session cookie and the service token, and
-requires a refusal for everything outside the allowlist; positive controls prove the same
-machinery reaches an allowed route.
+(method, path) set of each role to equal its allowlist exactly. The probe then sends the UNION of
+every role's paths, the hidden ones and `%2f` / `..` variants to each role with no credential, a
+guest token, a member PAT, a member session cookie and the service token, and requires a refusal
+for everything outside the allowlist; positive controls prove the same machinery reaches an
+allowed route. Home alone keeps a shell catch-all, so there a GET may also answer that static
+shell, byte for byte, except on a guest path.
 """
 
 import os
@@ -17,18 +18,25 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
-from app.config import INGEST_TOKEN_MIN_CHARS, MEMBER_SETTINGS, Settings
+from app.config import INGEST_TOKEN_MIN_CHARS, MEMBER_SETTINGS, Settings, settings
+from app.ingest import guest
 from app.ingest.factory import create_app
+from app.main import FRONTEND_DIR, mount_spa
 from app.main import app as home_app
+from app.services import asset_urls
 from starlette.routing import Mount
 
 from tests.ingest_support import (
+    JPEG,
     SERVICE_TOKEN,
+    bearer,
+    complete,
     door,  # noqa: F401
     home_iface,  # noqa: F401
     ingest_env,  # noqa: F401
     redeem,
     seeded_pass,
+    upload,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -57,7 +65,152 @@ HOME_IFACE_ALLOWLIST = {
     ("POST", "/ingest/batches/{uid}/ack"),
     ("POST", "/ingest/batches/{uid}/quarantine"),
 }
-ALLOWLISTS = {"ingest": GUEST_ALLOWLIST, "ingest-home": HOME_IFACE_ALLOWLIST}
+# Home's whole surface, hidden routes included. A route added to home fails the walk until it is
+# named here, which is the point: the review of that line is where a surface change gets seen.
+# `/docs` and `/redoc` are dropped in production (app/main.py); the suite runs outside it.
+HOME_ALLOWLIST = {
+    ("GET", "/.well-known/apple-app-site-association"),
+    ("GET", "/api/admin/digest/hosting"),
+    ("GET", "/api/admin/digest/preview"),
+    ("GET", "/api/admin/digest/recipients"),
+    ("POST", "/api/admin/digest/recipients"),
+    ("DELETE", "/api/admin/digest/recipients/{recipient_id}"),
+    ("PATCH", "/api/admin/digest/recipients/{recipient_id}"),
+    ("POST", "/api/admin/digest/run"),
+    ("GET", "/api/admin/digest/runs"),
+    ("GET", "/api/admin/digest/runs/{run_id}"),
+    ("GET", "/api/admin/digest/settings"),
+    ("PUT", "/api/admin/digest/settings"),
+    ("POST", "/api/admin/digest/test-send"),
+    ("GET", "/api/admin/export/settings"),
+    ("PUT", "/api/admin/export/settings"),
+    ("GET", "/api/attachments"),
+    ("GET", "/api/attachments/buckets"),
+    ("GET", "/api/attachments/picture-tags"),
+    ("GET", "/api/attachments/tags"),
+    ("DELETE", "/api/attachments/{uid}"),
+    ("GET", "/api/attachments/{uid}"),
+    ("POST", "/api/attachments/{uid}/print"),
+    ("DELETE", "/api/attachments/{uid}/rendition/{variant_key}"),
+    ("GET", "/api/attachments/{uid}/rendition/{variant_key}"),
+    ("GET", "/api/attachments/{uid}/renditions"),
+    ("POST", "/api/attachments/{uid}/renditions"),
+    ("DELETE", "/api/attachments/{uid}/tags/{name}"),
+    ("PUT", "/api/attachments/{uid}/tags/{name}"),
+    ("GET", "/api/attachments/{uid}/{tier}"),
+    ("GET", "/api/auth/callback"),
+    ("POST", "/api/auth/local/login"),
+    ("GET", "/api/auth/login"),
+    ("POST", "/api/auth/logout"),
+    ("POST", "/api/auth/native/exchange"),
+    ("POST", "/api/auth/native/logout"),
+    ("POST", "/api/auth/native/manage-grant"),
+    ("POST", "/api/auth/native/renew"),
+    ("GET", "/api/auth/native/token"),
+    ("PATCH", "/api/auth/native/token"),
+    ("GET", "/api/auth/user"),
+    ("GET", "/api/collection-covers"),
+    ("DELETE", "/api/collection-covers/{kind}/{key}"),
+    ("PUT", "/api/collection-covers/{kind}/{key}"),
+    ("GET", "/api/collections"),
+    ("POST", "/api/collections"),
+    ("DELETE", "/api/collections/{uid}"),
+    ("GET", "/api/collections/{uid}"),
+    ("PATCH", "/api/collections/{uid}"),
+    ("GET", "/api/collections/{uid}/attachments"),
+    ("POST", "/api/collections/{uid}/attachments"),
+    ("DELETE", "/api/collections/{uid}/exclusions/{attachment_uid}"),
+    ("PUT", "/api/collections/{uid}/exclusions/{attachment_uid}"),
+    ("DELETE", "/api/collections/{uid}/members/{attachment_uid}"),
+    ("GET", "/api/collections/{uid}/passes"),
+    ("POST", "/api/collections/{uid}/passes"),
+    ("DELETE", "/api/devices/live-activity-token"),
+    ("POST", "/api/devices/live-activity-token"),
+    ("GET", "/api/events"),
+    ("GET", "/api/export"),
+    ("GET", "/api/exports/photobook"),
+    ("GET", "/api/map/assets/{path:path}"),
+    ("GET", "/api/map/manifest"),
+    ("GET", "/api/map/markers"),
+    ("GET", "/api/map/tiles/{name}"),
+    ("HEAD", "/api/map/tiles/{name}"),
+    ("GET", "/api/me"),
+    ("PATCH", "/api/me"),
+    ("GET", "/api/members"),
+    ("GET", "/api/memos"),
+    ("POST", "/api/memos"),
+    ("DELETE", "/api/memos/{uid}"),
+    ("GET", "/api/memos/{uid}"),
+    ("PATCH", "/api/memos/{uid}"),
+    ("POST", "/api/memos/{uid}/pin"),
+    ("POST", "/api/memos/{uid}/reactions"),
+    ("DELETE", "/api/memos/{uid}/reactions/{emoji}"),
+    ("POST", "/api/memos/{uid}/unpin"),
+    ("DELETE", "/api/passes/{uid}"),
+    ("GET", "/api/passes/{uid}"),
+    ("PATCH", "/api/passes/{uid}"),
+    ("GET", "/api/passes/{uid}/contributions"),
+    ("POST", "/api/passes/{uid}/contributions/hide"),
+    ("POST", "/api/passes/{uid}/contributions/remove"),
+    ("POST", "/api/passes/{uid}/contributions/unhide"),
+    ("GET", "/api/passes/{uid}/devices"),
+    ("DELETE", "/api/passes/{uid}/devices/{device_uid}"),
+    ("POST", "/api/passes/{uid}/unsuspend"),
+    ("GET", "/api/pats"),
+    ("POST", "/api/pats"),
+    ("DELETE", "/api/pats/{pat_id}"),
+    ("DELETE", "/api/push/subscribe"),
+    ("POST", "/api/push/subscribe"),
+    ("GET", "/api/push/vapid-public-key"),
+    ("GET", "/api/settings"),
+    ("PATCH", "/api/settings"),
+    ("GET", "/api/stats/heatmap"),
+    ("GET", "/api/tags"),
+    ("POST", "/api/tokens/capture-grant"),
+    ("DELETE", "/api/tokens/capture-grant/{grant_id}"),
+    ("GET", "/api/trip-ingest/quarantine"),
+    ("POST", "/api/trip-ingest/quarantine/unknown/resolve"),
+    ("POST", "/api/trip-ingest/quarantine/{batch_uid}/resolve"),
+    ("POST", "/api/uploads"),
+    ("POST", "/api/uploads/batch"),
+    ("GET", "/api/uploads/limits"),
+    ("DELETE", "/api/uploads/{upload_uid}"),
+    ("HEAD", "/api/uploads/{upload_uid}"),
+    ("PATCH", "/api/uploads/{upload_uid}"),
+    ("GET", "/api/uploads/{upload_uid}/capture"),
+    ("POST", "/api/uploads/{upload_uid}/finalize"),
+    ("GET", "/api/v1/memos"),
+    ("GET", "/api/v1/memos/{memo_id}"),
+    ("DELETE", "/api/{path:path}"),
+    ("GET", "/api/{path:path}"),
+    ("PATCH", "/api/{path:path}"),
+    ("POST", "/api/{path:path}"),
+    ("PUT", "/api/{path:path}"),
+    ("GET", "/docs"),
+    ("HEAD", "/docs"),
+    ("GET", "/docs/oauth2-redirect"),
+    ("HEAD", "/docs/oauth2-redirect"),
+    ("GET", "/file/attachments/{uid}/{filename}"),
+    ("GET", "/health"),
+    ("GET", "/ios/auth/callback"),
+    ("GET", "/metrics"),
+    ("GET", "/openapi.json"),
+    ("HEAD", "/openapi.json"),
+    ("GET", "/privacy"),
+    ("GET", "/redoc"),
+    ("HEAD", "/redoc"),
+    ("GET", "/{path:path}"),
+}
+# The two catch-alls answer every path, so they cannot excuse a probe the way a real route does.
+HOME_CATCH_ALLS = {
+    ("GET", "/{path:path}"),
+    *((m, "/api/{path:path}") for m in ("GET", "POST", "PUT", "DELETE", "PATCH")),
+}
+ALLOWLISTS = {
+    "ingest": GUEST_ALLOWLIST,
+    "ingest-home": HOME_IFACE_ALLOWLIST,
+    "home": HOME_ALLOWLIST - HOME_CATCH_ALLS,
+}
 
 
 def route_set(app) -> set[tuple[str, str]]:
@@ -85,6 +238,11 @@ def route_set(app) -> set[tuple[str, str]]:
 @pytest.mark.parametrize("role", ["ingest", "ingest-home"])
 def test_each_ingest_role_serves_exactly_its_allowlist(role):
     assert route_set(create_app(role)) == ALLOWLISTS[role]
+
+
+def test_the_home_role_serves_exactly_its_allowlist():
+    built = {("MOUNT", "/assets")} if FRONTEND_DIR.is_dir() else set()
+    assert route_set(home_app) == HOME_ALLOWLIST | built
 
 
 def test_the_home_role_serves_no_guest_or_ingest_route():
@@ -161,7 +319,7 @@ def union_probes() -> list[tuple[str, str]]:
     return sorted(probes) + [(v, "raw") for v in VARIANTS]
 
 
-async def asgi_call(app, method: str, raw: str, headers: dict[str, str]) -> int:
+async def asgi_answer(app, method: str, raw: str, headers: dict[str, str]) -> tuple[int, bytes]:
     """One request straight into the ASGI app: the path reaches the router exactly as given —
     no client normalizes a `..` away — with `%2f` decoded the way a server decodes it."""
     scope = {
@@ -188,14 +346,21 @@ async def asgi_call(app, method: str, raw: str, headers: dict[str, str]) -> int:
         return {"type": "http.disconnect"}
 
     status = 0
+    body = b""
 
     async def send(message):
-        nonlocal status
+        nonlocal status, body
         if message["type"] == "http.response.start":
             status = message["status"]
+        elif message["type"] == "http.response.body":
+            body += message.get("body", b"")
 
     await app(scope, receive, send)
-    return status
+    return status, body
+
+
+async def asgi_call(app, method: str, raw: str, headers: dict[str, str]) -> int:
+    return (await asgi_answer(app, method, raw, headers))[0]
 
 
 async def test_the_union_of_every_roles_paths_is_refused_outside_each_allowlist(
@@ -232,6 +397,77 @@ async def test_the_union_of_every_roles_paths_is_refused_outside_each_allowlist(
     assert await asgi_call(home_iface_app, "GET", "/ingest/batches", credentials["service"]) == 200
 
 
+SHELL = b"<!doctype html><title>the member app shell</title>"
+
+
+@pytest.fixture
+def home_as_built(tmp_path, monkeypatch):
+    """Home's real table and middleware with the SPA tiers as the image has them. frontend/dist is
+    a build output, so a checkout otherwise only runs the "not built" 503 branch, which is not
+    what production answers."""
+    tree = tmp_path / "dist"
+    (tree / "assets").mkdir(parents=True)
+    (tree / "index.html").write_bytes(SHELL)
+    kept = [
+        r
+        for r in home_app.router.routes
+        if not isinstance(r, Mount) and getattr(r, "path", None) != "/{path:path}"
+    ]
+    monkeypatch.setattr(home_app.router, "routes", kept)
+    mount_spa(home_app, tree)
+    return home_app
+
+
+def test_home_as_built_is_the_allowlist_plus_the_asset_tier(home_as_built):
+    assert route_set(home_as_built) == HOME_ALLOWLIST | {("MOUNT", "/assets")}
+
+
+async def test_the_union_of_every_roles_paths_is_refused_outside_the_home_allowlist(
+    home_as_built,
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    pat_client,
+):
+    _, secret = await seeded_pass(home_iface)
+    guest_token = (await redeem(door, secret))["device_token"]
+    _, _, member_token = pat_client
+    credentials = {
+        "none": {},
+        "guest": {"Authorization": f"Bearer {guest_token}"},
+        "member-pat": {"Authorization": "Bearer memos_pat_" + "a" * 43},
+        "member-session": {"Cookie": "memos_sid=abc"},
+        "service": {"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        "real-member": {"Authorization": f"Bearer {member_token}"},
+    }
+    probes = union_probes()
+    assert len(probes) > 100
+    checked = shell = 0
+    for raw, _kind in probes:
+        path = unquote(raw)
+        for method in METHODS:
+            if _allowed("home", method, path):
+                continue
+            for name, headers in credentials.items():
+                status, body = await asgi_answer(home_as_built, method, raw, headers)
+                where = (method, raw, name, status)
+                checked += 1
+                if path.startswith(("/p/", "/guest-assets")):  # never the shell: the door's alone
+                    assert status in (404, 405), where
+                elif status == 200:  # the catch-all: static bytes, not a route's answer
+                    assert (method, body) == ("GET", SHELL), where
+                    shell += 1
+                else:
+                    assert status in (401, 404, 405), where
+    assert checked > 3000
+    assert shell > 0  # control: the image's catch-all is what answered, not the 503 branch
+    # Positive controls through the very same call: home's own routes answer.
+    assert await asgi_call(home_as_built, "GET", "/health", {}) == 200
+    assert await asgi_call(home_as_built, "GET", "/api/memos", {}) == 401
+    assert await asgi_call(home_as_built, "GET", "/api/memos", credentials["real-member"]) == 200
+    for fake in ("guest", "service", "member-pat"):
+        assert await asgi_call(home_as_built, "GET", "/api/memos", credentials[fake]) == 401, fake
+
+
 async def test_member_and_foreign_credentials_are_refused_on_every_guest_route(
     door,  # noqa: F811
     home_iface,  # noqa: F811
@@ -250,6 +486,82 @@ async def test_member_and_foreign_credentials_are_refused_on_every_guest_route(
             if not path.startswith("/api/guest"):
                 continue
             assert await asgi_call(app, method, _concrete(path), header) == 401, (method, path)
+
+
+# --- the guest door mints no signed URL --------------------------------------------------------
+
+SIGNED_URL = re.compile(rb"[?&]sig=|[?&]exp=\d|/api/attachments/|/file/attachments/")
+
+
+async def test_no_signed_url_is_minted_on_the_guest_door_surface(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+):
+    """Every route of the door is driven through a whole guest session. No answer may carry a
+    signed URL, and the signer's one funnel must never run: a response model could hide a URL it
+    minted and a new field could carry one past the spy, so each check covers the other."""
+    minted: list[str] = []
+    real_sig = asset_urls._sig
+
+    def spy(uid: str, *rest) -> str:
+        minted.append(uid)
+        return real_sig(uid, *rest)
+
+    monkeypatch.setattr(asset_urls, "_sig", spy)
+    # Controls: all three minting entry points reach the spy, and the shape matches what they mint.
+    for url in (
+        asset_urls.sign_asset_url("u", "thumb", 1, now=1.0),
+        *asset_urls.signed_tier_urls("u", 1, now=1.0).values(),
+        asset_urls.signed_cover_url("u", "image/jpeg", 1, now=1.0),
+    ):
+        assert SIGNED_URL.search(url.encode()), url
+    assert len(minted) >= 3
+    minted.clear()
+
+    dist = tmp_path / "dist-guest"
+    (dist / "guest-assets").mkdir(parents=True)
+    (dist / "guest.html").write_text("<!doctype html><title>guest</title>")
+    (dist / "guest-assets" / "guest-abcd1234.js").write_bytes(b"console.log('guest')")
+    monkeypatch.setattr(guest, "GUEST_DIST", dist)
+    monkeypatch.setattr(settings, "APPLE_TEAM_ID", "TEAM123456")
+
+    answers: list[tuple[str, str, int, bytes]] = []
+
+    async def keep(response):
+        await response.aread()
+        heads = "".join(f"{k}: {v}\n" for k, v in response.headers.items()).encode()
+        request = response.request
+        answers.append(
+            (request.method, request.url.path, response.status_code, heads + response.content)
+        )
+
+    door.event_hooks["response"].append(keep)
+
+    _, secret = await seeded_pass(home_iface)
+    assert (await door.get("/health")).status_code == 200
+    assert (await door.get("/.well-known/apple-app-site-association")).status_code == 200
+    assert (await door.get("/p/joined")).status_code == 200
+    assert (await door.get("/guest-assets/guest-abcd1234.js")).status_code == 200
+    token = (await redeem(door, secret))["device_token"]
+    assert (await door.get("/api/guest/me", headers=bearer(token))).status_code == 200
+    uid = await upload(door, token, JPEG)
+    assert (await door.head(f"/api/guest/uploads/{uid}", headers=bearer(token))).status_code == 200
+    done = await complete(door, token, [uid])
+    assert done.status_code in (200, 201), done.text
+    assert (await door.get("/api/guest/batches", headers=bearer(token))).status_code == 200
+
+    # Control: the session really walked the whole door, so a zero below covers every route.
+    walked = {
+        (m, t)
+        for m, t in GUEST_ALLOWLIST
+        for method, path, status, _ in answers
+        if m == method and status < 300 and _template_regex(t).match(path)
+    }
+    assert walked == GUEST_ALLOWLIST
+    assert minted == []
+    assert [a[:3] for a in answers if SIGNED_URL.search(a[3])] == []
 
 
 # --- the service token -------------------------------------------------------------------------
@@ -379,6 +691,16 @@ def test_an_ingest_role_never_imports_a_member_module(role):
     loaded = done.stdout.split()
     assert "app.ingest.guest" in loaded  # control: the listing is real
     assert [m for m in loaded if FORBIDDEN.match(m)] == []
+
+
+def test_no_signed_url_can_be_minted_on_the_guest_door_because_the_signer_is_not_loaded():
+    door_modules = _fresh("app.ingest.asgi", "ingest")
+    assert door_modules.returncode == 0, door_modules.stderr
+    assert "app.ingest.guest" in door_modules.stdout.split()  # control: the listing is real
+    assert "app.services.asset_urls" not in door_modules.stdout.split()
+    home_modules = _fresh("app.main", "home")
+    assert home_modules.returncode == 0, home_modules.stderr
+    assert "app.services.asset_urls" in home_modules.stdout.split()  # control: home does load it
 
 
 def test_the_forbidden_pattern_does_see_the_member_routers_of_home():

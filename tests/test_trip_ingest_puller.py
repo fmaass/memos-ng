@@ -32,7 +32,7 @@ from app.ingest.factory import create_app
 from app.models import Base, Collection, IngestBlob, User
 from app.services import collections as coll_svc
 from app.services import passes as passes_svc
-from app.services import trip_ingest, variants
+from app.services import trip_ingest, trip_ingest_metrics, variants
 from app.services import uploads as uploads_svc
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, select, text
@@ -82,6 +82,22 @@ class _Cut(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield self.data
         raise httpx.ReadError("the link dropped mid-file")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _Counted(httpx.AsyncByteStream):
+    """A body sent in pieces, counting how many the reader actually pulled."""
+
+    def __init__(self, data: bytes, piece: int) -> None:
+        self.pieces = [data[i : i + piece] for i in range(0, len(data), piece)]
+        self.pulled = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for piece in self.pieces:
+            self.pulled += 1
+            yield piece
 
     async def aclose(self) -> None:
         return None
@@ -432,6 +448,47 @@ async def test_a_hostile_manifest_is_quarantined_never_acked(world, case):
     assert await _tick(world) == "ok"
     assert _pluto_batch(batch) == [("quarantined", False)]
     assert not any(p.endswith("/ack") for _, p, _ in world.wire.seen)
+
+
+async def test_a_blob_streaming_past_its_declared_size_is_cut_off_mid_stream_and_quarantined(
+    world, monkeypatch
+):
+    """The manifest is honest and the bytes hash right, so only the running count can stop this:
+    the hostile case above is also caught later by the length check, after the whole body has
+    landed on home's disk. Here the door keeps sending, and the read must stop at the size."""
+    trip = await _trip(world)
+    batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
+    piece = 256
+    stream = _Counted(JPEG + b"\0" * (piece * 64), piece)
+    landed: list[int] = []
+    real_append = trip_ingest._append_hashed_sync
+
+    def counted_append(dest, chunk, truncate, hasher):
+        landed.append(len(chunk))
+        return real_append(dest, chunk, truncate, hasher)
+
+    async def overflowing(request: httpx.Request, response: httpx.Response) -> httpx.Response:
+        if not request.url.path.startswith("/ingest/blobs/"):
+            return response
+        await response.aread()
+        return httpx.Response(200, stream=stream)
+
+    world.wire.rewrite = overflowing
+    monkeypatch.setattr(trip_ingest, "_append_hashed_sync", counted_append)
+    assert await _tick(world) == "ok"
+
+    # The stop itself: the read ended at the piece that crossed the size, the rest of the body was
+    # never pulled, and no byte past the declared size reached the staged file.
+    assert stream.pulled == len(JPEG) // piece + 1 < len(stream.pieces)
+    assert sum(landed) <= len(JPEG)
+    # The verdict: quarantined for that reason, never filed, never acked, the alert's series set.
+    assert _memos() == []
+    assert _pluto_batch(batch) == [("quarantined", False)]
+    assert _home_batch(batch) == [("quarantined", False, False, True)]
+    (detail,) = _sql("SELECT detail FROM pass_events WHERE kind = 'refused'")[0]
+    assert "streams past its declared size" in detail
+    assert not trip_ingest.staging_dir(batch).exists()
+    assert (await trip_ingest_metrics.read_state()).quarantined == 1
 
 
 async def test_a_device_of_another_pass_is_a_mismatch_and_quarantined(world):
