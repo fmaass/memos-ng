@@ -249,7 +249,12 @@ async def test_a_rolled_back_memo_write_emits_nothing(hub, household, monkeypatc
 async def test_a_guest_memo_frame_carries_the_guest_flag(hub, household):
     client, owner, member = household
     _att("ev965-g1", "test_session_user")
+    # The filing announces its own memo.created (MEMNG-1181), asynchronously after its commit: wait
+    # for the hub to fan it out, so a stream opened below cannot subscribe in time to hear it.
+    filed = hub.subscribe(owner)
     memo_uid, pass_uid = await _guest(_trip(client), "test_session_user", ["ev965-g1"], name="Anna")
+    assert (await asyncio.wait_for(filed.queue.get(), FRAME_TIMEOUT)).event == "memo.created"
+    hub.unsubscribe(filed)
     guest = {"contributor_name": "Anna", "pass_uid": pass_uid}
     async with _opened(hub, owner) as mine, _opened(hub, member) as theirs:
         _patch(client, memo_uid, content="a caption from the owner")
@@ -257,6 +262,87 @@ async def test_a_guest_memo_frame_carries_the_guest_flag(hub, household):
         assert await _got(theirs) == _memo("memo.updated", memo_uid, guest)
         assert client.delete(f"/api/memos/{memo_uid}").status_code == 204
         assert await _got(mine) == _memo("memo.deleted", memo_uid, guest)
+
+
+async def test_a_trip_ingest_guest_memo_announces_its_creation_to_the_household(hub, household):
+    """`passes.create_guest_memo` is how trip ingest files a guest batch; the memo it makes is
+    PROTECTED, so every member hears it created, with the guest flag (MEMNG-1181)."""
+    client, owner, member = household
+    _att("ev1181-g1", "test_session_user")
+    coll = _trip(client)
+    async with _opened(hub, owner) as mine, _opened(hub, member) as theirs:
+        memo_uid, pass_uid = await _guest(coll, "test_session_user", ["ev1181-g1"], name="Anna")
+        guest = {"contributor_name": "Anna", "pass_uid": pass_uid}
+        assert await _got(mine) == _memo("memo.created", memo_uid, guest)
+        assert await _got(theirs) == _memo("memo.created", memo_uid, guest)
+
+
+async def test_a_guest_name_reaches_the_frame_as_its_column_stores_it(hub, household):
+    """The guest flag is read back from the row, so a name with quotes and a hashtag rides the
+    NOTIFY intact and a long one arrives cut to the column's bound (MEMNG-1181)."""
+    from app.services.passes import CONTRIBUTOR_NAME_MAX
+
+    client, owner, member = household
+    _att("ev1181-q1", "test_session_user")
+    coll = _trip(client)
+    name = 'Ann "#beach" O\'Neil \\ ' + "x" * CONTRIBUTOR_NAME_MAX
+    async with _opened(hub, member) as theirs:
+        memo_uid, pass_uid = await _guest(coll, "test_session_user", ["ev1181-q1"], name=name)
+        stored = name[:CONTRIBUTOR_NAME_MAX]
+        assert _sql("SELECT contributor_name FROM attachments WHERE uid='ev1181-q1'") == stored
+        assert await _got(theirs) == _memo(
+            "memo.created", memo_uid, {"contributor_name": stored, "pass_uid": pass_uid}
+        )
+
+
+async def test_a_guest_filing_that_rolls_back_announces_nothing(hub, household, monkeypatch):
+    """The NOTIFY is issued inside the filing transaction, so a filing that does not commit is
+    never heard; the next one that does is (MEMNG-1181)."""
+    from app.models import Collection, User
+    from app.services import passes as pass_svc
+    from sqlalchemy import select
+
+    client, owner, member = household
+    _att("ev1181-lost", "test_session_user")
+    _att("ev1181-kept", "test_session_user")
+    coll = _trip(client)
+    issued: list[tuple[str, dict | None]] = []
+    real = es.notify_memo_changed
+
+    async def spy(db, change, *args, **kwargs):
+        issued.append((change, kwargs.get("guest")))
+        await real(db, change, *args, **kwargs)
+
+    monkeypatch.setattr(es, "notify_memo_changed", spy)
+    async with _opened(hub, owner) as mine, _opened(hub, member) as theirs:
+        async with async_session() as db:
+            user = (
+                await db.execute(select(User).where(User.subject == "test_session_user"))
+            ).scalar_one()
+            collection = (
+                await db.execute(select(Collection).where(Collection.uid == coll))
+            ).scalar_one()
+            pass_row, _ = await pass_svc.issue_pass(db, collection, user, label="lost")
+
+            async def finalize(_memo) -> list[str]:
+                return ["ev1181-lost"]
+
+            await pass_svc.create_guest_memo(
+                db,
+                pass_row,
+                caption=None,
+                contributor_name="Ben",
+                idempotency_key="trip:lost",
+                finalize=finalize,
+            )
+            await db.rollback()
+        assert [change for change, _ in issued] == ["created"]
+        assert issued[0][1] is not None and issued[0][1]["contributor_name"] == "Ben"
+        assert _sql("SELECT count(*) FROM memos WHERE pass_id IS NOT NULL") == 0
+        memo_uid, pass_uid = await _guest(coll, "test_session_user", ["ev1181-kept"], name="Anna")
+        guest = {"contributor_name": "Anna", "pass_uid": pass_uid}
+        assert await _got(mine) == _memo("memo.created", memo_uid, guest)
+        assert await _got(theirs) == _memo("memo.created", memo_uid, guest)
 
 
 def test_memo_change_frames_per_transition():

@@ -43,8 +43,8 @@ from app.models import (
     Visibility,
 )
 from app.services import collections as coll_svc
+from app.services import event_stream, reclaim, storage
 from app.services import memos as memos_svc
-from app.services import reclaim, storage
 
 DEFAULT_MAX_DEVICES = 30
 SPAN_GRACE = timedelta(days=14)
@@ -664,6 +664,17 @@ async def create_guest_memo(
     memo.guest_caption = caption or None
     _credit(memo.attachments, contributor_name, device)
     await db.flush()
+    # In the filing transaction, so a filing that does not commit announces nothing (MEMNG-1181).
+    # PROTECTED, so the household hears it, with the guest flag the flush above made readable.
+    await event_stream.notify_memo_changed(
+        db,
+        "created",
+        memo.uid,
+        owner.id,
+        before=None,
+        after=memo.visibility,
+        guest=await memos_svc.guest_flag(db, memo),
+    )
     return memo
 
 

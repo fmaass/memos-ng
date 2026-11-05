@@ -436,3 +436,106 @@ describe('upload.progress frames (MEMNG-965)', () => {
     expect(queryClient.getQueryData(['memos', 'timeline'])).toBe(before)
   })
 })
+
+// An upload started from an idle timeline lives only in the upload queue; its frames need the
+// stream open though no memo cache holds anything in flight (MEMNG-1181).
+describe('an active upload holds the stream open (MEMNG-1181)', () => {
+  class NamedSource extends FakeSource {
+    listeners = new Map<string, (event: MessageEvent) => void>()
+    addEventListener(type: string, listener: (event: MessageEvent) => void) {
+      this.listeners.set(type, listener)
+    }
+  }
+
+  function fakeUploads() {
+    const listeners = new Set<() => void>()
+    const uploads = {
+      running: false,
+      active: () => uploads.running,
+      subscribe: (onChange: () => void) => {
+        listeners.add(onChange)
+        return () => listeners.delete(onChange)
+      },
+      set(running: boolean) {
+        uploads.running = running
+        for (const listener of listeners) listener()
+      },
+      listeners,
+    }
+    return uploads
+  }
+
+  it('opens on an upload from an idle timeline, hears its frames, and closes once it ends', () => {
+    const queryClient = client()
+    queryClient.setQueryData(['memos', 'timeline'], timeline('ready'))
+    const sources: NamedSource[] = []
+    const onProgress = vi.fn()
+    const uploads = fakeUploads()
+    const stop = startMediaEvents(
+      queryClient,
+      (url) => {
+        const source = new NamedSource(url)
+        sources.push(source)
+        return source
+      },
+      () => {},
+      onProgress,
+      uploads,
+    )
+    expect(sources).toHaveLength(0)
+
+    uploads.set(true)
+    expect(sources).toHaveLength(1)
+    sources[0].listeners.get('upload.progress')!(
+      new MessageEvent('upload.progress', {
+        data: '{"upload_uid":"u1","bytes_received":5,"declared_size":10}',
+      }),
+    )
+    expect(onProgress).toHaveBeenCalledWith({
+      upload_uid: 'u1',
+      bytes_received: 5,
+      declared_size: 10,
+    })
+
+    // A cache change while the upload runs must not close the stream under it.
+    queryClient.setQueryData(['memos', { visibility: 'PUBLIC' }], timeline('ready', 'a2'))
+    expect(sources[0].close).not.toHaveBeenCalled()
+
+    uploads.set(false)
+    expect(sources[0].close).toHaveBeenCalledTimes(1)
+    expect(sources).toHaveLength(1)
+
+    stop()
+    expect(uploads.listeners.size).toBe(0)
+  })
+
+  it('reopens after a connection error while the upload still runs', () => {
+    vi.useFakeTimers()
+    try {
+      const queryClient = client()
+      queryClient.setQueryData(['memos', 'timeline'], timeline('ready'))
+      const sources: NamedSource[] = []
+      const uploads = fakeUploads()
+      startMediaEvents(
+        queryClient,
+        (url) => {
+          const source = new NamedSource(url)
+          sources.push(source)
+          return source
+        },
+        () => {},
+        () => {},
+        uploads,
+      )
+      uploads.set(true)
+      sources[0].onerror?.(new Event('error'))
+      expect(sources[0].close).toHaveBeenCalledTimes(1)
+      expect(sources).toHaveLength(1)
+
+      vi.advanceTimersByTime(RECONNECT_DELAY_MS)
+      expect(sources).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

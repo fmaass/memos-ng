@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
 import type { components } from '@/api/schema'
-import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
+import {
+  hasActiveUpload,
+  hasInFlight,
+  isTerminalStatus,
+  nextAction,
+  type TimelineData,
+} from '@/lib/sseLifecycle'
 
 type AttachmentStatus = components['schemas']['AttachmentStatus']
 type MemoOut = components['schemas']['MemoOut']
@@ -63,15 +69,56 @@ describe('hasInFlight', () => {
 
 describe('nextAction', () => {
   it.each([
-    { connected: false, inFlight: false, everConnected: false, expected: 'none' },
-    { connected: false, inFlight: false, everConnected: true, expected: 'none' },
-    { connected: false, inFlight: true, everConnected: false, expected: 'open' },
-    { connected: false, inFlight: true, everConnected: true, expected: 'open' },
-    { connected: true, inFlight: false, everConnected: false, expected: 'close' },
-    { connected: true, inFlight: false, everConnected: true, expected: 'close' },
-    { connected: true, inFlight: true, everConnected: false, expected: 'none' },
-    { connected: true, inFlight: true, everConnected: true, expected: 'none' },
+    { connected: false, inFlight: false, uploading: false, everConnected: false, expected: 'none' },
+    { connected: false, inFlight: false, uploading: false, everConnected: true, expected: 'none' },
+    { connected: false, inFlight: true, uploading: false, everConnected: false, expected: 'open' },
+    { connected: false, inFlight: true, uploading: false, everConnected: true, expected: 'open' },
+    { connected: true, inFlight: false, uploading: false, everConnected: false, expected: 'close' },
+    { connected: true, inFlight: false, uploading: false, everConnected: true, expected: 'close' },
+    { connected: true, inFlight: true, uploading: false, everConnected: false, expected: 'none' },
+    { connected: true, inFlight: true, uploading: false, everConnected: true, expected: 'none' },
+    { connected: false, inFlight: false, uploading: true, everConnected: false, expected: 'open' },
+    { connected: false, inFlight: false, uploading: true, everConnected: true, expected: 'open' },
+    { connected: true, inFlight: false, uploading: true, everConnected: true, expected: 'none' },
+    { connected: true, inFlight: true, uploading: true, everConnected: true, expected: 'none' },
   ] as const)('returns $expected for %j', ({ expected, ...state }) => {
     expect(nextAction(state)).toBe(expected)
+  })
+})
+
+describe('an active upload keeps the stream open (MEMNG-1181)', () => {
+  it.each(['queued', 'uploading'] as const)('a %s queue item is an active upload', (status) => {
+    expect(hasActiveUpload([status])).toBe(true)
+    expect(hasActiveUpload(['done', status, 'error'])).toBe(true)
+  })
+
+  it.each(['done', 'error'] as const)('a %s queue item is not', (status) => {
+    expect(hasActiveUpload([status])).toBe(false)
+  })
+
+  it('an empty queue is not', () => {
+    expect(hasActiveUpload([])).toBe(false)
+  })
+
+  // The bug: the timeline holds only finished media, so the cache alone never asks for the stream,
+  // and the upload's own progress frames are sent into a connection nobody opened.
+  const idle = timeline(['ready', 'ready'])
+
+  it('opens the stream for an upload started from an idle timeline', () => {
+    const state = {
+      connected: false,
+      everConnected: false,
+      inFlight: hasInFlight(idle),
+      uploading: hasActiveUpload(['uploading']),
+    }
+    expect(state.inFlight).toBe(false)
+    expect(nextAction(state)).toBe('open')
+  })
+
+  it('holds the stream open while the upload runs, and lets it close once it is over', () => {
+    const inFlight = hasInFlight(idle)
+    const running = { connected: true, everConnected: true, inFlight }
+    expect(nextAction({ ...running, uploading: hasActiveUpload(['queued', 'done']) })).toBe('none')
+    expect(nextAction({ ...running, uploading: hasActiveUpload(['done', 'error']) })).toBe('close')
   })
 })

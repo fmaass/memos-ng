@@ -25,13 +25,26 @@ export function hasInFlight(data: TimelineData | undefined): boolean {
   )
 }
 
+// An upload-queue item whose bytes are still to land. Its `upload.progress` frames (MEMNG-965) come
+// only over the event stream, and a file picked from an idle timeline is in no memo cache yet — so
+// the queue has to ask for the stream itself (MEMNG-1181). `done` is not active: its bytes have
+// landed, and once the memo posts the cache's own in-flight attachment holds the stream.
+export function hasActiveUpload(statuses: Iterable<string>): boolean {
+  for (const status of statuses) {
+    if (status === 'queued' || status === 'uploading') return true
+  }
+  return false
+}
+
 export function nextAction(state: {
   connected: boolean
   inFlight: boolean
+  uploading: boolean
   everConnected: boolean
 }): 'open' | 'close' | 'none' {
   void state.everConnected
-  if (state.inFlight && !state.connected) return 'open'
-  if (!state.inFlight && state.connected) return 'close'
+  const wanted = state.inFlight || state.uploading
+  if (wanted && !state.connected) return 'open'
+  if (!wanted && state.connected) return 'close'
   return 'none'
 }

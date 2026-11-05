@@ -1,6 +1,7 @@
-import { getCurrentScope, onScopeDispose, reactive } from 'vue'
+import { getCurrentScope, onScopeDispose, reactive, shallowReactive, watch } from 'vue'
 
 import { redirectToLogin } from '@/api/client'
+import { hasActiveUpload } from '@/lib/sseLifecycle'
 import { applyUploadProgress, type UploadProgressEvent } from '@/lib/uploadProgress'
 
 // Resumable chunked upload against /api/uploads (T2.1): create → PATCH each chunk with an
@@ -124,8 +125,9 @@ const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // Every queue a live component owns, so a frame of the event stream can reach its tiles without the
 // stream knowing which composer or editor is open. Registered only inside an effect scope, whose
-// teardown removes it: a queue built outside one has no teardown to leave the set by.
-const liveQueues = new Set<UploadItem[]>()
+// teardown removes it: a queue built outside one has no teardown to leave the set by. Reactive, so
+// a queue arriving or leaving is a change the event stream's lifetime is re-decided on (MEMNG-1181).
+const liveQueues = shallowReactive(new Set<UploadItem[]>())
 
 // An `upload.progress` frame (MEMNG-965) applied to the tile uploading those bytes, wherever it is.
 // The mapping is the pure applyUploadProgress; this only finds the tiles.
@@ -136,6 +138,28 @@ export function applyUploadProgressEvent(ev: UploadProgressEvent): void {
       if (next !== null) item.progress = next
     }
   }
+}
+
+// What the event stream needs to know about the upload queues to decide its own lifetime
+// (MEMNG-1181): whether any live queue is still sending bytes, and a callback for when that
+// answer changes. Injected into startMediaEvents so its tests drive it without a real queue.
+export interface UploadActivity {
+  active: () => boolean
+  subscribe: (onChange: () => void) => () => void
+}
+
+function anyLiveUploadActive(): boolean {
+  for (const items of liveQueues) {
+    if (hasActiveUpload(items.map((item) => item.status))) return true
+  }
+  return false
+}
+
+export const liveUploadActivity: UploadActivity = {
+  active: anyLiveUploadActive,
+  // `sync`: the stream opens in the same tick the first file starts, not after a render, so the
+  // upload's first progress frame is not sent into a connection that does not exist yet.
+  subscribe: (onChange) => watch(anyLiveUploadActive, () => onChange(), { flush: 'sync' }),
 }
 
 // Reactive multi-file queue with bounded concurrency. Each file uploads independently so a

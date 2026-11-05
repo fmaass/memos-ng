@@ -3,6 +3,7 @@ import { effectScope, nextTick, watchEffect } from 'vue'
 
 import {
   applyUploadProgressEvent,
+  liveUploadActivity,
   uploadFile,
   useUploadQueue,
 } from '@/composables/useResumableUpload'
@@ -422,5 +423,101 @@ describe('upload.progress reaches the tile uploading those bytes (MEMNG-965)', (
 
     scope.stop()
     expect(queue.items).toHaveLength(0)
+  })
+})
+
+describe('the event stream sees a live queue uploading (MEMNG-1181)', () => {
+  it('reports a live upload as active, says so when it changes, and forgets a stopped scope', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const method = init.method ?? 'GET'
+        if (url === '/api/uploads' && method === 'POST')
+          return jsonRes({ upload_uid: 'act', chunk_size: 4, bytes_received: 0 })
+        if (url === '/api/uploads/act' && method === 'PATCH') {
+          await gate // hold the only chunk: the upload is running until the test lets it land
+          return jsonRes({ bytes_received: 4 })
+        }
+        if (url.startsWith('/api/uploads/act/capture')) return jsonRes({ state: 'done' })
+        throw new Error(`unexpected ${method} ${url}`)
+      }),
+    )
+    const changes = vi.fn()
+    const unsubscribe = liveUploadActivity.subscribe(changes)
+    expect(liveUploadActivity.active()).toBe(false)
+
+    const scope = effectScope()
+    const queue = scope.run(() => useUploadQueue())!
+    const [item] = queue.add([fileOf(4)])
+    expect(liveUploadActivity.active()).toBe(true)
+    expect(changes).toHaveBeenCalledTimes(1)
+
+    release()
+    await vi.waitFor(() => expect(item.status).toBe('done'))
+    expect(liveUploadActivity.active()).toBe(false)
+    expect(changes).toHaveBeenCalledTimes(2)
+
+    // A queue outside any scope is not one the stream can serve: its tiles never get frames.
+    const [orphan] = useUploadQueue().add([fileOf(4)])
+    expect(orphan.status).toBe('uploading')
+    expect(liveUploadActivity.active()).toBe(false)
+
+    queue.add([fileOf(4)])
+    expect(liveUploadActivity.active()).toBe(true)
+    scope.stop()
+    expect(liveUploadActivity.active()).toBe(false)
+    expect(changes).toHaveBeenCalledTimes(4)
+
+    unsubscribe()
+    const later = effectScope()
+    later.run(() => useUploadQueue())!.add([fileOf(4)])
+    expect(changes).toHaveBeenCalledTimes(4)
+    later.stop()
+  })
+
+  it('two composers uploading at once: one finishing leaves the other holding the stream', async () => {
+    const gates = new Map<string, () => void>()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const method = init.method ?? 'GET'
+        if (url === '/api/uploads' && method === 'POST') {
+          const uid = JSON.parse(String(init.body)).filename as string
+          return jsonRes({ upload_uid: uid, chunk_size: 4, bytes_received: 0 })
+        }
+        if (method === 'PATCH') {
+          const uid = url.split('/')[3] // one gate per upload, named by its file
+          await new Promise<void>((r) => gates.set(uid, r))
+          return jsonRes({ bytes_received: 4 })
+        }
+        if (url.includes('/capture')) return jsonRes({ state: 'done' })
+        throw new Error(`unexpected ${method} ${url}`)
+      }),
+    )
+    const changes = vi.fn()
+    const unsubscribe = liveUploadActivity.subscribe(changes)
+    const first = effectScope()
+    const second = effectScope()
+    const [a] = first.run(() => useUploadQueue())!.add([fileOf(4, 'a.mp4')])
+    const [b] = second.run(() => useUploadQueue())!.add([fileOf(4, 'b.mp4')])
+    expect(liveUploadActivity.active()).toBe(true)
+    expect(changes).toHaveBeenCalledTimes(1)
+
+    await vi.waitFor(() => expect(gates.size).toBe(2))
+    gates.get('a.mp4')!()
+    await vi.waitFor(() => expect(a.status).toBe('done'))
+    expect(b.status).toBe('uploading')
+    expect(liveUploadActivity.active()).toBe(true)
+    expect(changes).toHaveBeenCalledTimes(1)
+
+    gates.get('b.mp4')!()
+    await vi.waitFor(() => expect(b.status).toBe('done'))
+    expect(liveUploadActivity.active()).toBe(false)
+    expect(changes).toHaveBeenCalledTimes(2)
+    unsubscribe()
+    first.stop()
+    second.stop()
   })
 })

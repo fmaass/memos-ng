@@ -7,7 +7,7 @@ import type { components } from '@/api/schema'
 import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
 import { parseUploadProgress, type UploadProgressEvent } from '@/lib/uploadProgress'
 
-import { applyUploadProgressEvent } from './useResumableUpload'
+import { applyUploadProgressEvent, liveUploadActivity, type UploadActivity } from './useResumableUpload'
 
 type Attachment = components['schemas']['AttachmentRef']
 
@@ -110,6 +110,7 @@ export function startMediaEvents(
   createSource: MediaEventSourceFactory,
   report: ReachabilityReporter = () => {},
   onUploadProgress: (ev: UploadProgressEvent) => void = applyUploadProgressEvent,
+  uploads: UploadActivity = liveUploadActivity,
 ): () => void {
   let source: MediaEventSource | null = null
   let connected = false
@@ -126,7 +127,10 @@ export function startMediaEvents(
   const evaluate = () => {
     if (disposed) return
     const inFlight = anyMemoCacheInFlight(queryClient)
-    const action = nextAction({ connected, inFlight, everConnected })
+    // An upload from an idle timeline is in no memo cache, yet its progress frames come only over
+    // this stream: an active upload holds it open too (MEMNG-1181).
+    const uploading = uploads.active()
+    const action = nextAction({ connected, inFlight, uploading, everConnected })
     if (action === 'close') {
       closeSource()
       return
@@ -171,6 +175,7 @@ export function startMediaEvents(
   }
 
   const unsubscribe = queryClient.getQueryCache().subscribe(evaluate)
+  const unsubscribeUploads = uploads.subscribe(evaluate)
   evaluate()
 
   return () => {
@@ -178,6 +183,7 @@ export function startMediaEvents(
     closeSource()
     if (retryTimer !== null) clearTimeout(retryTimer)
     unsubscribe()
+    unsubscribeUploads()
   }
 }
 
