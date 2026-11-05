@@ -21,6 +21,7 @@ from tests import test_trip_ingest_puller as tp
 from tests.ingest_support import JPEG
 from tests.test_lock_protocol_concurrency import WAIT_TIMEOUT, Park, _lock_waiters
 from tests.test_lock_protocol_concurrency import _wait_for_a_new_lock_wait as _wait_lock
+from tests.test_trip_filing_lock_order import _two_part_batch
 
 pluto_schema = tp.pluto_schema
 world = tp.world
@@ -96,7 +97,6 @@ def _verified(batch: str) -> dict[str, int]:
     [
         "before_journaling",
         "before_part_rename",
-        "before_reservation_token",
         "before_master_rename",
         "after_placement",
     ],
@@ -122,9 +122,6 @@ async def test_a_killed_filing_is_walked_back_and_refiles_clean(world, monkeypat
         assert _files(world.home_root, "uploads") == [], "a placeholder preceded its record"
     else:
         assert _rows() > 0
-    if point == "before_reservation_token":
-        empty = [p for p in _files(world.home_root, "originals") if p.stat().st_size == 0]
-        assert len(empty) == 1, "the kill did not land between the create and the token"
     await trip_ingest.reconcile_moves()
     assert _rows() == 0
     assert _verified(batch) == staged, "the source bytes are not back in staging"
@@ -212,23 +209,63 @@ async def test_a_failed_hop_keeps_its_chain_and_a_retry_restores_it_to_verified(
     assert _rows() == 0
 
 
-async def test_an_empty_file_at_a_journaled_dest_goes_only_while_the_source_stands(world, tmp_path):
-    """A master is never 0 bytes, and a source present means the rename never ran: the empty file is
-    the reservation a kill caught before its token. With the source gone it is what the row moved,
-    so it walks back rather than disappear."""
+@pytest.mark.parametrize("found", [b"somebody else", b""])
+async def test_another_writers_file_at_a_journaled_master_dest_survives_reconcile(
+    world, tmp_path, found
+):
+    """A later part's memo folder is committed, so an owner upload can reserve the very name a
+    crashed filing journaled. Empty or not, without this row's token the file is not this row's."""
     src, dest = tmp_path / "src", tmp_path / "dest"
     src.write_bytes(b"source")
-    dest.write_bytes(b"")
-    await _journal_row(tmp_path, src, dest)
+    dest.write_bytes(found)
+    row = await _journal_row(tmp_path, src, dest, "master")
     await trip_ingest.reconcile_moves()
-    assert src.read_bytes() == b"source" and not dest.exists()
-    assert _rows() == 0
-    gone, kept = tmp_path / "gone", tmp_path / "kept"
-    kept.write_bytes(b"")
-    await _journal_row(tmp_path, gone, kept)
+    assert (src.read_bytes(), dest.read_bytes()) == (b"source", found)
+    assert tp._sql("SELECT flagged_at IS NOT NULL FROM ingest_moves WHERE id = :i", {"i": row}) == [
+        (True,)
+    ]
+
+
+async def test_a_kill_before_the_token_flags_the_dest_and_the_part_refiles_under_the_next_name(
+    world, monkeypatch
+):
+    """The reservation is created and the kill lands before its token, in a later part, so the name
+    is in a committed memo's folder. Nothing proves that empty file is ours: it stays, its row is
+    flagged, and the part must still file, because a flagged row may not wedge the batch."""
+    _trip, batch_id, _memo, _picture = await _two_part_batch(world, monkeypatch)
+    [(batch,)] = tp._sql("SELECT uid FROM ingest_batches WHERE id = :b", {"b": batch_id})
+    staged = _verified(batch)
+    assert len(staged) == 1
+    done = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", CRASH, "before_reservation_token", str(batch_id)],
+        env={**os.environ, "DATA_ROOT": str(world.home_root)},
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == -9, done.stderr[-2000:]
+    empty = [p for p in _files(world.home_root, "originals") if p.stat().st_size == 0]
+    assert len(empty) == 1, "the kill did not land between the create and the token"
+    expected = {"one.jpg": JPEG + b"1", "two.jpg": JPEG + b"2"}[empty[0].name]
     await trip_ingest.reconcile_moves()
-    assert gone.exists() and not kept.exists()
-    assert _rows() == 0
+    assert _verified(batch) == staged, "the source original is not intact in staging"
+    assert empty[0].exists() and empty[0].stat().st_size == 0
+    flagged = "SELECT count(*) FILTER (WHERE flagged_at IS NOT NULL), count(*) FROM ingest_moves"
+    assert tp._sql(flagged) == [(1, 1)]
+    assert await tp._tick(world) == "ok"
+    refiled = empty[0].with_name(f"{empty[0].stem} (2){empty[0].suffix}")
+    assert refiled.read_bytes() == expected, "the part did not refile under the next name"
+    assert empty[0].stat().st_size == 0
+    assert tp._sql(
+        "SELECT count(*) FROM attachments a JOIN ingest_batches b ON b.memo_id = a.memo_id "
+        "WHERE b.id = :b",
+        {"b": batch_id},
+    ) == [(2,)]
+    assert tp._pluto_batch(batch) == [("acked", True)], "the flagged row wedged the batch"
+    assert tp._sql("SELECT count(*) FROM ingest_moves") == [(1,)]
+    assert await tp._tick(world) == "ok"
+    assert empty[0].stat().st_size == 0 and refiled.read_bytes() == expected
 
 
 async def test_reconcile_waits_out_a_filing_still_running(world, monkeypatch):

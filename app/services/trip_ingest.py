@@ -1042,11 +1042,9 @@ def _walk_back_sync(row_id: int, src_path: str, dest_path: str, kind: str) -> st
         dest.unlink()  # this row's own placeholder: the rename never ran
         return "done"
     if has_src and has_dest:
-        # Empty with the source still standing, the rename never ran, and nobody else writes here: a
-        # part path is named by this row's 192-bit uid, a master by a uuid or the folder of a memo
-        # still uncommitted. It is `create_upload`'s placeholder, or a reservation killed before its
-        # token. A filed file is never 0 bytes (`validate_blob`), so bytes always flag.
-        if dest.stat().st_size == 0:
+        # A part path is named by this row's 192-bit uid, so nobody else made it; empty, it is the
+        # placeholder `create_upload` leaves until the rename lands.
+        if kind == "part" and dest.stat().st_size == 0:
             dest.unlink()
             return "done"
         return "flag"
