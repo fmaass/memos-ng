@@ -7,6 +7,7 @@ an existing (committed) master is never moved — so no GC, lock, or migration i
 `docs/plans/PLAN_2026-06-22_memo-folder-layout.md`. New-writes-only is enforced by `is_unfiled`.
 """
 
+import errno
 import os
 import re
 import shutil
@@ -30,8 +31,19 @@ _BUMPED = re.compile(r"^(?P<stem>.*) \((?:[2-9]|[1-9]\d+)\)$")
 def free_bytes(root: Path) -> int:
     """Free bytes on the volume that holds `root` — the one probe of the disk floor, shared by the
     guest door (`app.ingest`) and the household upload session (MEMNG-961). Blocking: call it
-    off the loop."""
-    root.mkdir(parents=True, exist_ok=True)
+    off the loop.
+
+    `root` is made before it is measured. A volume too full to make it (ENOSPC, MEMNG-1175) has
+    answered the probe's question itself: there is no room, so 0 — and each caller refuses with
+    its own 507 (the session's `InsufficientSpace` reason, the guest door's floor) instead of the
+    OSError escaping as a 500. The errno decides, not the message; any other failure (a
+    permission, a read-only mount, an I/O fault) is a real error and propagates."""
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            return 0
+        raise
     return shutil.disk_usage(root).free
 
 
