@@ -43,3 +43,6 @@ docs/session-reviews/
 # implementation/deploy plans are local drafts; the durable record is BookStack
 # (already-tracked historical plans stay tracked)
 docs/plans/
+
+# household operations overlay for Claude Code, read beside CLAUDE.md; never public
+CLAUDE.local.md
