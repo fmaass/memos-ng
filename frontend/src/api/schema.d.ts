@@ -1694,6 +1694,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/uploads/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Upload Batch
+         * @description Open several upload sessions in one request. Each entry is answered exactly as POST /api/uploads would answer it alone — a session (complete already on a `sha256` match) or that entry's own refusal — in request order. Disk admission counts the batch: an entry is refused 507 when the volume cannot hold it on top of the earlier admitted entries that still need their bytes. The admitted sessions are created together: if the request fails, none of them exists.
+         */
+        post: operations["start_upload_batch_api_uploads_batch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/uploads/limits": {
         parameters: {
             query?: never;
@@ -3782,6 +3802,40 @@ export interface components {
             count: number;
             /** Name */
             name: string;
+        };
+        /** UploadBatchCreate */
+        UploadBatchCreate: {
+            /**
+             * Entries
+             * @description One POST /api/uploads body per session to open, 1 to 50 of them. A request with more, with none, or with any entry that is not a valid body is answered 422 whole.
+             */
+            entries: components["schemas"]["UploadCreate"][];
+        };
+        /** UploadBatchOut */
+        UploadBatchOut: {
+            /**
+             * Results
+             * @description One per entry, in request order.
+             */
+            results: components["schemas"]["UploadBatchResult"][];
+        };
+        /** UploadBatchResult */
+        UploadBatchResult: {
+            /**
+             * Detail
+             * @description Why this entry was refused. Present only when it was.
+             */
+            detail?: string;
+            /**
+             * Status
+             * @description 201 when the session was opened, and `upload` holds it. Otherwise the status POST /api/uploads would have answered for this entry alone — 413 over the size limit, 507 when the volume cannot hold it — and `detail` says why; nothing was stored for it.
+             */
+            status: number;
+            /**
+             * Upload
+             * @description The session, exactly as POST /api/uploads returns it. Present only when `status` is 201.
+             */
+            upload?: components["schemas"]["UploadOut"];
         };
         /** UploadCreate */
         UploadCreate: {
@@ -7601,6 +7655,40 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    start_upload_batch_api_uploads_batch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UploadBatchCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadBatchOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
         };
     };
     upload_limits_api_uploads_limits_get: {

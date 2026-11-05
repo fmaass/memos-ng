@@ -293,7 +293,7 @@ def _unlink_sync(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def _unlink_many_sync(paths: list[Path]) -> None:
+def unlink_many_sync(paths: list[Path]) -> None:
     """A whole batch of part files in ONE hop — N separate offloads would be N round-trips
     against a bind-mounted share. Errors propagate exactly as a single unlink's would."""
     for path in paths:
@@ -517,6 +517,7 @@ async def create_upload(
     size: int,
     last_modified: int | None = None,
     sha256: str | None = None,
+    reserved: int = 0,
 ) -> Upload:
     """Open an upload session BOUND to `owner_id`. The uid is unguessable but is not a capability:
     every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
@@ -532,7 +533,9 @@ async def create_upload(
 
     Disk admission (MEMNG-961): on the ordinary path — not on a hit, which sends no bytes — the
     volume that will hold the part must have room for `size` plus 10 %, or InsufficientSpace is
-    raised before the part is created.
+    raised before the part is created. `reserved` is what other sessions not yet written still
+    claim on that volume — a batch's earlier admitted entries, whose parts are empty when this one
+    probes — so the bound is `free >= (reserved + size) * 1.1`; a single create claims nothing.
     """
     upload_uid = secrets.token_urlsafe(24)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
@@ -564,8 +567,8 @@ async def create_upload(
         await db.flush()
         return upload
     free = await to_thread.run_sync(storage.free_bytes, part.parent)
-    if not has_room_for(size, free):
-        raise InsufficientSpace(size, free)
+    if not has_room_for(reserved + size, free):
+        raise InsufficientSpace(size, max(free - reserved, 0))
     await to_thread.run_sync(_create_part_sync, part)
     return upload
 
@@ -2360,7 +2363,7 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
     # unlink under DATA_ROOT is bounded local file I/O of the same class as the finalize's own
     # placements, not a third party, not a subprocess and not a client stream. The alternative
     # (unlink after the caller's commit) would need a second commit boundary, which §2.5 rejects.
-    await to_thread.run_sync(_unlink_many_sync, [part_path(u.upload_uid) for u in rows])
+    await to_thread.run_sync(unlink_many_sync, [part_path(u.upload_uid) for u in rows])
     for upload in rows:
         await db.delete(upload)
     await db.flush()

@@ -4204,6 +4204,66 @@
         "title": "TagCount",
         "type": "object"
       },
+      "UploadBatchCreate": {
+        "properties": {
+          "entries": {
+            "description": "One POST /api/uploads body per session to open, 1 to 50 of them. A request with more, with none, or with any entry that is not a valid body is answered 422 whole.",
+            "items": {
+              "$ref": "#/components/schemas/UploadCreate"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "title": "UploadBatchCreate",
+        "type": "object"
+      },
+      "UploadBatchOut": {
+        "properties": {
+          "results": {
+            "description": "One per entry, in request order.",
+            "items": {
+              "$ref": "#/components/schemas/UploadBatchResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "UploadBatchOut",
+        "type": "object"
+      },
+      "UploadBatchResult": {
+        "properties": {
+          "detail": {
+            "description": "Why this entry was refused. Present only when it was.",
+            "title": "Detail",
+            "type": "string"
+          },
+          "status": {
+            "description": "201 when the session was opened, and `upload` holds it. Otherwise the status POST /api/uploads would have answered for this entry alone \u2014 413 over the size limit, 507 when the volume cannot hold it \u2014 and `detail` says why; nothing was stored for it.",
+            "title": "Status",
+            "type": "integer"
+          },
+          "upload": {
+            "$ref": "#/components/schemas/UploadOut",
+            "description": "The session, exactly as POST /api/uploads returns it. Present only when `status` is 201.",
+            "title": "Upload"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "UploadBatchResult",
+        "type": "object"
+      },
       "UploadCreate": {
         "properties": {
           "filename": {
@@ -10855,6 +10915,59 @@
           }
         ],
         "summary": "Start Upload",
+        "tags": [
+          "uploads"
+        ]
+      }
+    },
+    "/api/uploads/batch": {
+      "post": {
+        "description": "Open several upload sessions in one request. Each entry is answered exactly as POST /api/uploads would answer it alone \u2014 a session (complete already on a `sha256` match) or that entry's own refusal \u2014 in request order. Disk admission counts the batch: an entry is refused 507 when the volume cannot hold it on top of the earlier admitted entries that still need their bytes. The admitted sessions are created together: if the request fails, none of them exists.",
+        "operationId": "start_upload_batch_api_uploads_batch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadBatchCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadBatchOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Start Upload Batch",
         "tags": [
           "uploads"
         ]

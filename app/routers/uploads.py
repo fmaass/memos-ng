@@ -1,10 +1,12 @@
 import time
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import structlog
 from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -101,6 +103,43 @@ class UploadOut(BaseModel):
     )
 
 
+# How many sessions one POST /api/uploads/batch may open: enough for a share sheet's selection, and
+# few enough that the one transaction holding them all stays short.
+MAX_BATCH_ENTRIES = 50
+
+
+class UploadBatchCreate(BaseModel):
+    entries: list[UploadCreate] = Field(
+        min_length=1,
+        max_length=MAX_BATCH_ENTRIES,
+        description="One POST /api/uploads body per session to open, 1 to 50 of them. A request "
+        "with more, with none, or with any entry that is not a valid body is answered 422 whole.",
+    )
+
+
+class UploadBatchResult(BaseModel):
+    # Flat, with the arm that does not apply left OUT rather than null: Apple's OpenAPI generator
+    # turns `anyOf: [$ref, {type: null}]` into no usable optional, and a oneOf without a
+    # discriminator into an anonymous enum; this renders as a plain struct of optionals.
+    status: int = Field(
+        description="201 when the session was opened, and `upload` holds it. Otherwise the status "
+        "POST /api/uploads would have answered for this entry alone — 413 over the size limit, "
+        "507 when the volume cannot hold it — and `detail` says why; nothing was stored for it."
+    )
+    upload: UploadOut | SkipJsonSchema[None] = Field(
+        default=None,
+        description="The session, exactly as POST /api/uploads returns it. Present only when "
+        "`status` is 201.",
+    )
+    detail: str | SkipJsonSchema[None] = Field(
+        default=None, description="Why this entry was refused. Present only when it was."
+    )
+
+
+class UploadBatchOut(BaseModel):
+    results: list[UploadBatchResult] = Field(description="One per entry, in request order.")
+
+
 class UploadLimitsOut(BaseModel):
     max_bytes: int = Field(
         description="The largest `size` POST /api/uploads accepts; anything larger is answered 413."
@@ -189,6 +228,10 @@ async def _get_upload(db: AsyncSession, upload_uid: str, owner_id: int) -> Uploa
     return upload
 
 
+def _too_large_detail() -> str:
+    return f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
+
+
 @router.post(
     "",
     response_model=UploadOut,
@@ -214,9 +257,7 @@ async def start_upload(
 ) -> UploadOut:
     if body.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
         upload_metrics.count_size_rejection()
-        raise HTTPException(
-            status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
-        )
+        raise HTTPException(status_code=413, detail=_too_large_detail())
     try:
         upload = await svc.create_upload(
             db,
@@ -238,6 +279,77 @@ async def start_upload(
         chunk_size=settings.UPLOAD_CHUNK_SIZE,
         bytes_received=upload.bytes_received,
     )
+
+
+# Declared before every `/{upload_uid}` route, like `/limits` below.
+@router.post(
+    "/batch",
+    response_model=UploadBatchOut,
+    response_model_exclude_none=True,
+    description="Open several upload sessions in one request. Each entry is answered exactly as "
+    "POST /api/uploads would answer it alone — a session (complete already on a `sha256` match) "
+    "or that entry's own refusal — in request order. Disk admission counts the batch: an entry "
+    "is refused 507 when the volume cannot hold it on top of the earlier admitted entries that "
+    "still need their bytes. The admitted sessions are created together: if the request fails, "
+    "none of them exists.",
+)
+async def start_upload_batch(
+    body: UploadBatchCreate,
+    # The capture grant may batch, as it may open one session (MEMNG-938).
+    user: Annotated[User, Depends(auth.require_upload_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> UploadBatchOut:
+    results: list[UploadBatchResult] = []
+    parts: list[Path] = []
+    # Bytes the sessions admitted so far will still need: their parts are empty when the next
+    # entry probes the volume, so the probe alone would admit every entry against the same space.
+    reserved = 0
+    try:
+        for entry in body.entries:
+            if entry.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
+                upload_metrics.count_size_rejection()
+                results.append(UploadBatchResult(status=413, detail=_too_large_detail()))
+                continue
+            try:
+                # A savepoint per entry: a 507 undoes the row `create_upload` flushed for THIS
+                # entry only, and the batch's transaction carries on.
+                async with db.begin_nested():
+                    upload = await svc.create_upload(
+                        db,
+                        owner_id=user.id,
+                        filename=entry.filename,
+                        mime=entry.mime,
+                        size=entry.size,
+                        last_modified=entry.last_modified,
+                        sha256=entry.sha256,
+                        reserved=reserved,
+                    )
+            except svc.InsufficientSpace as exc:
+                results.append(UploadBatchResult(status=507, detail=str(exc)))
+                continue
+            parts.append(svc.part_path(upload.upload_uid))
+            reserved += upload.declared_size - upload.bytes_received  # a hit needs nothing
+            results.append(
+                UploadBatchResult(
+                    status=201,
+                    upload=UploadOut(
+                        upload_uid=upload.upload_uid,
+                        chunk_size=settings.UPLOAD_CHUNK_SIZE,
+                        bytes_received=upload.bytes_received,
+                    ),
+                )
+            )
+        await db.commit()
+    except BaseException:
+        # Nothing is committed, and the session's close rolls every row back; the parts made for
+        # them go first, in one hop off the loop that is awaited to the end even if this request
+        # is being cancelled. A hit's part is a second name for its original: only the name goes.
+        if parts:
+            _, cancelled = await svc.finish_off_the_loop(svc.unlink_many_sync, parts)
+            if cancelled is not None:
+                raise cancelled from None
+        raise
+    return UploadBatchOut(results=results)
 
 
 # Declared before every `/{upload_uid}` route: Starlette matches in declaration order, so a
