@@ -1259,7 +1259,9 @@ async def media_event_stream(
     returns {uid,status,progress_pct} for the user's NON-ready attachments. The same snapshot is
     resent when the hub says frames may have been lost; a uid that was in flight before and has
     dropped out of it finished meanwhile, so it is announced ready with the metadata `ready_meta()`
-    reads back for it. Unit-tested with both callables bound to a real owner.
+    reads back for it. "In flight before" includes what the owner's earlier streams were watching
+    when they ended, kept by the hub for a ring window (`remember_watched`), so a reconnect after a
+    cut still hears it. Unit-tested with both callables bound to a real owner.
     """
     sub = hub.subscribe(user_id, last_event_id)
     watching: set[str] = set()
@@ -1279,7 +1281,13 @@ async def media_event_stream(
         rows = await snapshot()
         present = {row["uid"] for row in rows}
         payloads = list(rows)
-        finished = sorted(watching - present)
+        # What an earlier stream of this owner watched and may not have heard finish (MEMNG-1174):
+        # a client cut off inside a resend, or before it, reconnects to a snapshot with nothing in
+        # `watching`. Its own finished uids are remembered before the first frame goes out, since
+        # the ready frame may never arrive; the recalled ones are not remembered again, so they age
+        # out one ring window after the stream that watched them, however often the owner returns.
+        finished = sorted((watching | hub.recall_watched(user_id)) - present)
+        hub.remember_watched(user_id, watching - present)
         if finished:
             # The ready event is synthesised from an ABSENCE, so the row that now carries the
             # worker's width/height/blurhash is not in hand — it is read back here. Without it the
@@ -1335,6 +1343,9 @@ async def media_event_stream(
             yield sse_event(item.payload, hub.event_id(item.seq), item.event)
     finally:
         hub.unsubscribe(sub)
+        # Still in flight as far as this client was told, wherever it was cut off: the next
+        # snapshot of the owner announces any of them that finished meanwhile (MEMNG-1174).
+        hub.remember_watched(user_id, watching)
 
 
 async def _user_snapshot(user_id: int) -> list[dict]:

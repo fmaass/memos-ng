@@ -58,6 +58,10 @@ INBOX_MAX = 10_000
 SEQ_DIGITS_MAX = 19
 HEALTH_INTERVAL = 10.0
 HEALTH_TIMEOUT = 5.0
+# The listener close on the way out, before falling back to terminate. A stop is allowed 5 s in
+# all, and docker-entrypoint.sh's response drain (3 s) comes first, so HEALTH_TIMEOUT does not fit
+# here: a stalled connection held the stop to 3 + 5 s (MEMNG-1174).
+STOP_CLOSE_TIMEOUT = 1.0
 BACKOFF_INITIAL = 0.5
 BACKOFF_MAX = 30.0
 # upload.progress is coalesced to at most one frame per upload per this many seconds.
@@ -345,6 +349,10 @@ class EventHub:
         self._progress_interval = progress_interval
         # upload_uid -> when its last upload.progress frame went out (on `clock`).
         self._progress_sent: dict[str, float] = {}
+        # owner_id -> {uid: when it was last remembered (on `clock`)}: the attachments a stream of
+        # that owner was watching when it ended, or announced ready without knowing the client got
+        # the frame. See remember_watched.
+        self._watched: dict[int, dict[str, float]] = {}
         # Per boot, so an id from before a restart can never be mistaken for one of this run's
         # seqs: the time makes it readable, the random tail separates two processes started in the
         # same millisecond.
@@ -423,6 +431,45 @@ class EventHub:
             owned.discard(sub)
             if not owned:
                 del self._subs[sub.owner_id]
+
+    # -- watched attachments, across a reconnect (MEMNG-1174) --
+
+    def remember_watched(self, owner_id: int, uids: set[str] | list[str]) -> None:
+        """Keep `uids` for the owner's next snapshot, for the ring's window.
+
+        A ready event the stream synthesises from an absence (a watched uid that dropped out of
+        the snapshot) is rebuilt from nothing but that stream's own watched set, and a reconnect
+        starts with an empty one. So a client cut off before the frame arrived — before the
+        resend's first frame, between its frames, or at the last one, sent but never received —
+        would never hear that the attachment finished. The stream hands its watched set here when
+        it ends and its synthesised-ready uids when it builds them, and every snapshot of the same
+        owner recalls them: a uid that is still in flight is listed anyway, and one that is not is
+        announced ready again, with its metadata read back. Per owner, not per id: the client
+        keeps an id from before the cut, or from inside the snapshot, and neither names what it
+        watched. The window is the ring's because a reconnect later than that is not expected to
+        resume either; a redundant ready frame inside it is harmless, the clients apply it twice.
+        """
+        self._expire_watched(owner_id)
+        if uids:
+            now = self._clock()
+            self._watched.setdefault(owner_id, {}).update(dict.fromkeys(uids, now))
+
+    def recall_watched(self, owner_id: int) -> set[str]:
+        """The uids remembered for the owner within the ring's window."""
+        self._expire_watched(owner_id)
+        return set(self._watched.get(owner_id, ()))
+
+    def _expire_watched(self, owner_id: int) -> None:
+        # Pruned on every touch of the owner, so what is kept is what that owner watched within
+        # the window and no more; an owner nobody touches again keeps one window's worth at most.
+        remembered = self._watched.get(owner_id)
+        if remembered is None:
+            return
+        cutoff = self._clock() - self._ring_seconds
+        for uid in [uid for uid, at in remembered.items() if at <= cutoff]:
+            del remembered[uid]
+        if not remembered:
+            del self._watched[owner_id]
 
     def subscriber_count(self) -> int:
         return sum(len(s) for s in self._subs.values())
@@ -545,7 +592,7 @@ class EventHub:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks = []
-        await self._close_conn()
+        await self._close_conn(STOP_CLOSE_TIMEOUT)
 
     def abandon(self) -> None:
         """Drop a hub whose event loop is gone (each test client request runs its own loop): its
@@ -555,12 +602,12 @@ class EventHub:
             with contextlib.suppress(Exception):
                 conn.terminate()
 
-    async def _close_conn(self) -> None:
+    async def _close_conn(self, within: float = HEALTH_TIMEOUT) -> None:
         conn, self._conn = self._conn, None
         self._connected.clear()
         if conn is not None:
             try:
-                async with asyncio.timeout(HEALTH_TIMEOUT):
+                async with asyncio.timeout(within):
                     await conn.close()
             except Exception:
                 with contextlib.suppress(Exception):

@@ -79,7 +79,9 @@ if [ "$APP_ROLE" != "home" ]; then
 fi
 # A response still open when the container stops (an idle /api/events stream never ends on its
 # own) is cancelled after 3 s, so the lifespan shutdown runs and the stop lands well inside
-# docker's grace period instead of at its SIGKILL (MEMNG-1052).
+# docker's grace period instead of at its SIGKILL (MEMNG-1052). The lifespan shutdown after it
+# gives the event hub's listener close 1 s before it terminates the socket (STOP_CLOSE_TIMEOUT,
+# MEMNG-1174), so 3 s here plus that still fits the 5 s a stop is allowed.
 exec uvicorn app.main:app --host 0.0.0.0 --port 8000 \
     --proxy-headers --forwarded-allow-ips "$FORWARDED_ALLOW_IPS" \
     --timeout-graceful-shutdown 3

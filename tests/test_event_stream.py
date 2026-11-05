@@ -446,6 +446,117 @@ async def test_a_resent_snapshot_marks_only_its_last_frame_resumable(owners):
     assert h.subscribe(a, resent[1]["id"]).replay is not None
 
 
+async def _opening(gen) -> list[dict]:
+    """The data frames a stream opens with, up to its first keepalive (pass keepalive=0.2)."""
+    await _opened(gen)
+    frames = []
+    while "data" in (frame := await _next(gen)):
+        frames.append(frame)
+    return frames
+
+
+@pytest.mark.parametrize("delivered", [0, 1, 2])
+async def test_a_reconnect_cut_anywhere_in_a_resync_still_gets_the_ready_event(owners, delivered):
+    """MEMNG-1174: the resend after a resync is es-cut-2's row, then a ready frame for es-cut-1,
+    synthesised from its absence. The client is cut off before the first resend frame (0), after
+    it (1), or after the second was sent but never arrived (2: it keeps the first frame's id). Its
+    reconnect is a snapshot, and must still announce es-cut-1 ready, with its metadata."""
+    a, _ = owners
+    for uid in ("es-cut-1", "es-cut-2"):
+        _seed(uid, a, status="pending")
+    h = _bare_hub()
+    gen = _stream(h, a)
+    try:
+        await _opened(gen)
+        held = [await _next(gen) for _ in range(2)][-1]["id"]
+        _sql("UPDATE attachments SET status='ready' WHERE uid='es-cut-1'")
+        h.resync_all()  # the NOTIFY for es-cut-1 was lost
+        h.publish(a, _pending("es-cut-2"))  # lifts the head above the boundary the resync set
+        resent = [await _next(gen) for _ in range(delivered)]
+    finally:
+        await gen.aclose()
+    if resent:
+        assert [f["data"]["uid"] for f in resent] == ["es-cut-2", "es-cut-1"][:delivered]
+        held = resent[0]["id"]
+    assert h.subscribe(a, held).replay is None  # the reconnect is a snapshot, not a replay
+    gen = _stream(h, a, last_event_id=held, keepalive=0.2)
+    try:
+        opening = await _opening(gen)
+    finally:
+        await gen.aclose()
+    by_uid = {f["data"]["uid"]: f["data"] for f in opening}
+    assert by_uid.get("es-cut-1", {}).get("status") == "ready"
+    assert by_uid["es-cut-1"]["width"] == 640  # read back, not a bare status change
+    assert by_uid["es-cut-2"]["status"] == "pending"
+
+
+async def _cut_after_one_resend_frame(h, a: int) -> str:
+    """es-cut-1 finishes during a listener outage; the client hears es-cut-2's resent row and is
+    cut off before es-cut-1's ready frame. Returns the id it holds."""
+    for uid in ("es-cut-1", "es-cut-2"):
+        _seed(uid, a, status="pending")
+    gen = _stream(h, a)
+    try:
+        await _opened(gen)
+        [await _next(gen) for _ in range(2)]
+        _sql("UPDATE attachments SET status='ready' WHERE uid='es-cut-1'")
+        h.resync_all()
+        h.publish(a, _pending("es-cut-2"))
+        return (await _next(gen))["id"]
+    finally:
+        await gen.aclose()
+
+
+async def _ready_on_reconnect(h, a: int, last_event_id: str | None) -> list[str]:
+    gen = _stream(h, a, last_event_id=last_event_id, keepalive=0.2)
+    try:
+        opening = await _opening(gen)
+    finally:
+        await gen.aclose()
+    return [f["data"]["uid"] for f in opening if f["data"]["status"] == "ready"]
+
+
+async def test_two_devices_of_the_owner_both_hear_the_ready_event(owners):
+    # Another device's fresh connect must not use the remembered uid up: the cut client comes back
+    # after it and still has not heard.
+    a, b = owners
+    h = _bare_hub()
+    held = await _cut_after_one_resend_frame(h, a)
+    assert await _ready_on_reconnect(h, a, None) == ["es-cut-1"]
+    assert await _ready_on_reconnect(h, a, held) == ["es-cut-1"]
+    assert await _ready_on_reconnect(h, b, None) == []  # and nobody else's stream hears of it
+
+
+async def test_a_recalled_uid_ages_out_one_window_after_the_stream_that_watched_it(owners):
+    # A reconnect that re-announces a remembered uid must not remember it again, or an owner who
+    # keeps coming back would be told it is ready on every connect, for ever.
+    a, _ = owners
+    now = [100.0]
+    h = _bare_hub(clock=lambda: now[0], ring_seconds=10.0)
+    held = await _cut_after_one_resend_frame(h, a)
+    now[0] = 105.0
+    assert await _ready_on_reconnect(h, a, held) == ["es-cut-1"]
+    now[0] = 111.0  # inside the window of the reconnect, past that of the cut stream
+    assert await _ready_on_reconnect(h, a, held) == []
+
+
+async def test_a_remembered_uid_is_recalled_for_the_ring_window_only(owners):
+    a, b = owners
+    now = [100.0]
+    h = _bare_hub(clock=lambda: now[0], ring_seconds=10.0)
+    h.remember_watched(a, {"w1"})
+    now[0] = 105.0
+    h.remember_watched(a, {"w2"})
+    assert h.recall_watched(a) == {"w1", "w2"}
+    assert h.recall_watched(b) == set()  # per owner
+    now[0] = 110.0  # w1's window ends here; w2 has five seconds left
+    assert h.recall_watched(a) == {"w2"}
+    now[0] = 115.0
+    assert h.recall_watched(a) == set()
+    h.remember_watched(a, set())
+    assert h.recall_watched(a) == set()
+
+
 @pytest.mark.parametrize(
     "tail",
     [
@@ -595,3 +706,102 @@ async def test_an_idle_stream_does_not_hold_a_stopping_server_past_its_bound(own
             server.should_exit = True
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(serving, 5)
+
+
+class _StalledConn:
+    """A listener connection that answers until it is asked to close, and then never does."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+
+    def add_termination_listener(self, _callback) -> None:
+        pass
+
+    async def add_listener(self, _channel, _callback) -> None:
+        pass
+
+    def get_server_pid(self) -> int:
+        return 1
+
+    async def fetchval(self, _query) -> int:
+        return 1
+
+    async def close(self) -> None:
+        await asyncio.Event().wait()
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+
+async def test_a_stalled_listener_close_does_not_hold_a_stop_past_five_seconds(owners, monkeypatch):
+    """MEMNG-1174: the stop is the drain bound PLUS the lifespan shutdown, and the lifespan closes
+    the hub's listener connection. A close that hangs must fall back to terminate soon enough that
+    both fit inside the 5 s a stop is allowed."""
+    a, _ = owners
+    bound = _graceful_shutdown_seconds()
+    assert bound is not None
+    conn = _StalledConn()
+
+    async def stalled_connect(_dsn: str) -> _StalledConn:
+        return conn
+
+    h = es.EventHub("unused", es.fetch_status_frames, connect=stalled_connect)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        await h.start()
+        assert await h.wait_connected(FRAME_TIMEOUT)
+        monkeypatch.setattr(es, "_hub", h)
+        yield
+        await es.shutdown_hub()  # what app.main's lifespan runs on the way out
+
+    async def snap() -> list[dict]:
+        return []
+
+    async def meta(_uids: list[str]) -> dict[str, dict]:
+        return {}
+
+    async def events(_request):
+        return StreamingResponse(
+            media_event_stream(h, a, snap, meta), media_type="text/event-stream"
+        )
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            Starlette(routes=[Route("/api/events", events)], lifespan=lifespan),
+            host="127.0.0.1",
+            port=0,
+            lifespan="on",
+            log_config=None,
+            access_log=False,
+            timeout_graceful_shutdown=bound,
+        )
+    )
+    serving = asyncio.create_task(server.serve())
+    writer = None
+    try:
+        while not server.started:  # noqa: ASYNC110 — uvicorn exposes a flag, not an event
+            await asyncio.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /api/events HTTP/1.1\r\nHost: t\r\n\r\n")
+        await writer.drain()
+        head = b""
+        while b"retry:" not in head:
+            head += await asyncio.wait_for(reader.read(1024), FRAME_TIMEOUT)
+        started = asyncio.get_running_loop().time()
+        server.should_exit = True
+        # Room for the old bound (drain + HEALTH_TIMEOUT), so a regression measures, not hangs.
+        await asyncio.wait_for(asyncio.shield(serving), bound + es.HEALTH_TIMEOUT + 2)
+        assert asyncio.get_running_loop().time() - started < 5
+        assert conn.terminated  # the hung close was given up on, and the socket released
+    finally:
+        if writer is not None:
+            writer.close()
+        if not serving.done():
+            server.force_exit = True
+            server.should_exit = True
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(serving, 5)
+        with contextlib.suppress(Exception):
+            await h.stop()
