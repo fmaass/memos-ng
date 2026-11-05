@@ -5,6 +5,9 @@ import { getCurrentInstance, onUnmounted } from 'vue'
 import { reachability } from '@/api/reachability'
 import type { components } from '@/api/schema'
 import { hasInFlight, isTerminalStatus, nextAction, type TimelineData } from '@/lib/sseLifecycle'
+import { parseUploadProgress, type UploadProgressEvent } from '@/lib/uploadProgress'
+
+import { applyUploadProgressEvent } from './useResumableUpload'
 
 type Attachment = components['schemas']['AttachmentRef']
 
@@ -78,6 +81,8 @@ interface MediaEventSource {
   onopen: ((event: Event) => void) | null
   onmessage: ((event: MessageEvent) => void) | null
   onerror: ((event: Event) => void) | null
+  // Named frames (`upload.progress`) arrive here, never on onmessage (MEMNG-965).
+  addEventListener?: (type: string, listener: (event: MessageEvent) => void) => void
   close: () => void
 }
 
@@ -104,6 +109,7 @@ export function startMediaEvents(
   queryClient: QueryClient,
   createSource: MediaEventSourceFactory,
   report: ReachabilityReporter = () => {},
+  onUploadProgress: (ev: UploadProgressEvent) => void = applyUploadProgressEvent,
 ): () => void {
   let source: MediaEventSource | null = null
   let connected = false
@@ -149,6 +155,10 @@ export function startMediaEvents(
         old?.pages ? applyMediaEvent(old, parsed) : old,
       )
     }
+    source.addEventListener?.('upload.progress', (event: MessageEvent) => {
+      const parsed = parseUploadProgress(event.data)
+      if (parsed) onUploadProgress(parsed)
+    })
     source.onerror = () => {
       report('stream-error')
       closeSource()

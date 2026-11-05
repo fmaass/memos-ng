@@ -1,6 +1,7 @@
 import { getCurrentScope, onScopeDispose, reactive } from 'vue'
 
 import { redirectToLogin } from '@/api/client'
+import { applyUploadProgress, type UploadProgressEvent } from '@/lib/uploadProgress'
 
 // Resumable chunked upload against /api/uploads (T2.1): create → PATCH each chunk with an
 // Upload-Offset → on a chunk failure, HEAD to learn the server's authoritative offset and
@@ -41,7 +42,11 @@ async function serverOffset(uid: string): Promise<number> {
 // Upload the file's bytes and return its upload_uid. Finalize-on-post: the memo-create call
 // turns the upload into an attachment, so an abandoned compose leaves only a (self-expiring)
 // Upload and never an orphan attachment.
-export async function uploadFile(file: File, onProgress?: (pct: number) => void): Promise<string> {
+export async function uploadFile(
+  file: File,
+  onProgress?: (pct: number) => void,
+  onCreated?: (uploadUid: string) => void,
+): Promise<string> {
   const created = await postJson<UploadCreated>('/api/uploads', {
     filename: file.name,
     mime: file.type || 'application/octet-stream',
@@ -49,6 +54,7 @@ export async function uploadFile(file: File, onProgress?: (pct: number) => void)
     last_modified: file.lastModified,
   })
   const uid = created.upload_uid
+  onCreated?.(uid)
   const chunkSize = created.chunk_size
   let offset = created.bytes_received
   let retries = 0
@@ -115,6 +121,22 @@ const CAPTURE_POLL_DELAYS_MS = [0, 150, 300, 600, 1000, 1500, 2000, 3000, 3000, 
 const CAPTURE_REQUEST_TIMEOUT_MS = 4000
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// Every queue a live component owns, so a frame of the event stream can reach its tiles without the
+// stream knowing which composer or editor is open. Registered only inside an effect scope, whose
+// teardown removes it: a queue built outside one has no teardown to leave the set by.
+const liveQueues = new Set<UploadItem[]>()
+
+// An `upload.progress` frame (MEMNG-965) applied to the tile uploading those bytes, wherever it is.
+// The mapping is the pure applyUploadProgress; this only finds the tiles.
+export function applyUploadProgressEvent(ev: UploadProgressEvent): void {
+  for (const items of liveQueues) {
+    for (const item of items) {
+      const next = applyUploadProgress(item, ev)
+      if (next !== null) item.progress = next
+    }
+  }
+}
 
 // Reactive multi-file queue with bounded concurrency. Each file uploads independently so a
 // memo can be posted while a video is still uploading (the queue is not awaited by save).
@@ -194,7 +216,13 @@ export function useUploadQueue(concurrency = 2) {
       const file = files.get(item.id)!
       active++
       item.status = 'uploading'
-      uploadFile(file, (pct) => (item.progress = pct))
+      uploadFile(
+        file,
+        (pct) => (item.progress = pct),
+        // Known from the create on, so a progress frame can find this tile while it uploads.
+        // Nothing posts it before `done`: every submitter filters on status first.
+        (uploadUid) => (item.uploadUid = uploadUid),
+      )
         .then((uploadUid) => {
           item.status = 'done'
           item.progress = 100
@@ -289,7 +317,13 @@ export function useUploadQueue(concurrency = 2) {
   // would otherwise strand its preview URLs and File references for the page's lifetime
   // (MEMNG-87). Guarded, because a queue built outside any scope has nothing to own its
   // teardown — there the explicit remove()/clear() contract remains the whole story.
-  if (getCurrentScope()) onScopeDispose(clear)
+  if (getCurrentScope()) {
+    liveQueues.add(items)
+    onScopeDispose(() => {
+      clear()
+      liveQueues.delete(items)
+    })
+  }
 
   return { items, add, remove, clear }
 }

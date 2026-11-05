@@ -1217,11 +1217,12 @@ async def upload_print(
 STREAM_LIFETIME_SECONDS: float | None = None
 
 
-def sse_event(payload: dict, event_id: str) -> str:
+def sse_event(payload: dict, event_id: str, event: str = event_stream.MESSAGE) -> str:
     # `event: message` is the spec's default name, written out: shipped iOS builds drop every
     # other type and the web client listens on onmessage only, so the media-status frames keep
-    # it, and new kinds take new names that those clients then ignore.
-    return f"id: {event_id}\nevent: message\ndata: {json.dumps(payload)}\n\n"
+    # it, and new kinds take new names that those clients then ignore (MEMNG-965:
+    # `upload.progress`, `memo.created`, `memo.updated`, `memo.deleted`).
+    return f"id: {event_id}\nevent: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
 async def media_event_stream(
@@ -1234,7 +1235,8 @@ async def media_event_stream(
     keepalive: float = event_stream.KEEPALIVE_SECONDS,
     lifetime: float | None = None,
 ) -> AsyncGenerator[str]:
-    """Yield SSE frames for `user_id`'s attachments until the client goes away.
+    """Yield SSE frames for `user_id` until the client goes away: its attachments' status, and the
+    upload-progress and memo frames the hub addresses to it (MEMNG-965), under their own names.
 
     A fresh connect, or an id the hub cannot replay from, starts with the snapshot: `snapshot()`
     returns {uid,status,progress_pct} for the user's NON-ready attachments. The same snapshot is
@@ -1245,7 +1247,11 @@ async def media_event_stream(
     sub = hub.subscribe(user_id, last_event_id)
     watching: set[str] = set()
 
-    def track(payload: dict) -> None:
+    def track(payload: dict, event: str = event_stream.MESSAGE) -> None:
+        # Only media-status frames name an attachment whose status the snapshot can resend; the
+        # other kinds (upload progress, memo changes) carry no status and are never resent.
+        if event != event_stream.MESSAGE:
+            return
         if payload["status"] == "ready":
             watching.discard(payload["uid"])
         else:
@@ -1284,8 +1290,8 @@ async def media_event_stream(
         else:
             opening = []
             for frame in sub.replay:
-                track(frame.payload)
-                opening.append(sse_event(frame.payload, hub.event_id(frame.seq)))
+                track(frame.payload, frame.event)
+                opening.append(sse_event(frame.payload, hub.event_id(frame.seq), frame.event))
         yield f"retry: {event_stream.RETRY_MS}\n\n"
         for frame in opening:
             yield frame
@@ -1308,8 +1314,8 @@ async def media_event_stream(
                 async for frame in resend():
                     yield frame
                 continue
-            track(item.payload)
-            yield sse_event(item.payload, hub.event_id(item.seq))
+            track(item.payload, item.event)
+            yield sse_event(item.payload, hub.event_id(item.seq), item.event)
     finally:
         hub.unsubscribe(sub)
 

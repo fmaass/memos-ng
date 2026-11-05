@@ -12,13 +12,14 @@ the life of the process. Two processes mean two listeners, each serving its own 
 
 import asyncio
 import contextlib
+import enum
 import json
 import secrets
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 import structlog
@@ -27,7 +28,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session
-from app.models import Attachment, AttachmentStatus, JobState, MediaJob, MediaJobProgress
+from app.models import (
+    Attachment,
+    AttachmentStatus,
+    JobState,
+    MediaJob,
+    MediaJobProgress,
+    Visibility,
+)
 
 logger = structlog.get_logger()
 
@@ -52,6 +60,39 @@ HEALTH_INTERVAL = 10.0
 HEALTH_TIMEOUT = 5.0
 BACKOFF_INITIAL = 0.5
 BACKOFF_MAX = 30.0
+# upload.progress is coalesced to at most one frame per upload per this many seconds.
+PROGRESS_INTERVAL = 1.0
+# Uploads whose last frame is older than the interval are forgotten once the table grows past this.
+PROGRESS_TRACKED_MAX = 1024
+
+# The SSE `event:` names. Media-status frames keep the spec's default, which the shipped iOS builds
+# and the web client's onmessage handle; every other kind takes a name of its own, which those
+# clients ignore (see app/routers/assets.sse_event).
+MESSAGE = "message"
+UPLOAD_PROGRESS_EVENT = "upload.progress"
+MEMO_CREATED = "memo.created"
+MEMO_UPDATED = "memo.updated"
+MEMO_DELETED = "memo.deleted"
+MEMO_EVENTS = (MEMO_CREATED, MEMO_UPDATED, MEMO_DELETED)
+
+type MemoChange = Literal["created", "updated", "deleted"]
+
+
+class Audience(enum.StrEnum):
+    """Who a frame is for, relative to the `owner_id` it carries. Every subscriber of the stream is
+    a household member — `/api/events` authenticates with `require_user`, and a trip-pass guest is
+    not a user — so the household is every subscriber, and nothing outside it can ever subscribe."""
+
+    OWNER = "owner"  # the owner alone
+    OTHERS = "others"  # every household member but the owner
+    HOUSEHOLD = "household"  # every household member, the owner included
+
+    def reaches(self, owner_id: int, user_id: int) -> bool:
+        if self is Audience.OWNER:
+            return user_id == owner_id
+        if self is Audience.OTHERS:
+            return user_id != owner_id
+        return True
 
 
 # --- emitters: called inside the transaction that writes the status ---
@@ -75,6 +116,78 @@ async def notify_attachment_status_for_job(db: AsyncSession, job_id: int) -> Non
         ),
         {"ch": ATTACHMENT_STATUS, "jid": job_id},
     )
+
+
+async def notify_upload_progress(
+    db: AsyncSession, upload_uid: str, owner_id: int | None, bytes_received: int, declared_size: int
+) -> None:
+    """A committed append tail. Every one is announced; the hub coalesces (EventHub._admit_progress)
+    because each listener process hears every NOTIFY, so the bound holds per subscriber however many
+    processes take the appends."""
+    if owner_id is None:
+        return
+    payload = json.dumps(
+        {
+            "upload_uid": upload_uid,
+            "owner_id": owner_id,
+            "bytes_received": bytes_received,
+            "declared_size": declared_size,
+        }
+    )
+    await db.execute(text("SELECT pg_notify(:ch, :p)"), {"ch": UPLOAD_PROGRESS, "p": payload})
+
+
+def memo_change_frames(
+    change: MemoChange, before: Visibility | None, after: Visibility | None
+) -> list[tuple[str, Audience]]:
+    """The frames one memo write makes, by its visibility before and after — the rule
+    `services.memos.visible_clause` reads with: a PRIVATE memo is its owner's alone, any other is
+    the household's. A memo leaving a member's view is a delete for them, one entering it a
+    create; the owner always sees the edit as the edit it is."""
+    if change == "created":
+        return [(MEMO_CREATED, _audience(after))]
+    if change == "deleted":
+        return [(MEMO_DELETED, _audience(before))]
+    was_shared = before is not None and before != Visibility.PRIVATE
+    is_shared = after is not None and after != Visibility.PRIVATE
+    if was_shared == is_shared:
+        return [(MEMO_UPDATED, Audience.HOUSEHOLD if is_shared else Audience.OWNER)]
+    return [
+        (MEMO_UPDATED, Audience.OWNER),
+        (MEMO_CREATED if is_shared else MEMO_DELETED, Audience.OTHERS),
+    ]
+
+
+def _audience(visibility: Visibility | None) -> Audience:
+    if visibility is None or visibility == Visibility.PRIVATE:
+        return Audience.OWNER
+    return Audience.HOUSEHOLD
+
+
+async def notify_memo_changed(
+    db: AsyncSession,
+    change: MemoChange,
+    uid: str,
+    owner_id: int,
+    *,
+    before: Visibility | None,
+    after: Visibility | None,
+    guest: dict | None,
+) -> None:
+    """Called inside the transaction of the memo write, with the visibility the write found and the
+    one it leaves: the recipients are decided here, at emission. Ids only, plus the guest flag
+    (`MemoOut.guest`): the row is the authority, and a guest's name is bounded by its column."""
+    for event, audience in memo_change_frames(change, before, after):
+        payload = json.dumps(
+            {
+                "event": event,
+                "uid": uid,
+                "owner_id": owner_id,
+                "audience": audience.value,
+                "guest": guest,
+            }
+        )
+        await db.execute(text("SELECT pg_notify(:ch, :p)"), {"ch": MEMO_CHANGED, "p": payload})
 
 
 # --- the row read-back ---
@@ -163,6 +276,11 @@ class Frame:
     owner_id: int
     payload: dict
     at: float
+    event: str = MESSAGE
+    audience: Audience = Audience.OWNER
+
+    def reaches(self, user_id: int) -> bool:
+        return self.audience.reaches(self.owner_id, user_id)
 
 
 class Resync:
@@ -211,6 +329,8 @@ class EventHub:
         health_interval: float = HEALTH_INTERVAL,
         backoff_initial: float = BACKOFF_INITIAL,
         backoff_max: float = BACKOFF_MAX,
+        clock: Callable[[], float] = time.monotonic,
+        progress_interval: float = PROGRESS_INTERVAL,
     ) -> None:
         self._dsn = dsn
         self._fetch = fetch
@@ -221,6 +341,10 @@ class EventHub:
         self._health_interval = health_interval
         self._backoff_initial = backoff_initial
         self._backoff_max = backoff_max
+        self._clock = clock
+        self._progress_interval = progress_interval
+        # upload_uid -> when its last upload.progress frame went out (on `clock`).
+        self._progress_sent: dict[str, float] = {}
         # Per boot, so an id from before a restart can never be mistaken for one of this run's
         # seqs: the time makes it readable, the random tail separates two processes started in the
         # same millisecond.
@@ -289,7 +413,7 @@ class EventHub:
         sub = Subscription(owner_id, asyncio.Queue(self._queue_max))
         since = self._replay_from(last_event_id)
         if since is not None:
-            sub.replay = [f for f in self._ring if f.seq > since and f.owner_id == owner_id]
+            sub.replay = [f for f in self._ring if f.seq > since and f.reaches(owner_id)]
         self._subs.setdefault(owner_id, set()).add(sub)
         return sub
 
@@ -314,14 +438,75 @@ class EventHub:
             sub.queue.put_nowait(CLOSE)
             logger.warning("events_subscriber_overflow", owner_id=sub.owner_id)
 
-    def publish(self, owner_id: int, payload: dict) -> Frame:
+    def publish(
+        self,
+        owner_id: int,
+        payload: dict,
+        *,
+        event: str = MESSAGE,
+        audience: Audience = Audience.OWNER,
+    ) -> Frame:
+        """One ring entry per frame, whatever its audience: replay filters it per user exactly as
+        the live fan-out does, through `Frame.reaches`."""
         self._seq += 1
-        frame = Frame(self._seq, owner_id, payload, time.monotonic())
+        frame = Frame(self._seq, owner_id, payload, time.monotonic(), event, audience)
         self._ring.append(frame)
         self._evict()
-        for sub in list(self._subs.get(owner_id, ())):
+        if audience is Audience.OWNER:
+            targets = list(self._subs.get(owner_id, ()))
+        else:
+            targets = [
+                sub
+                for user_id, owned in self._subs.items()
+                if frame.reaches(user_id)
+                for sub in owned
+            ]
+        for sub in targets:
             self._deliver(sub, frame)
         return frame
+
+    def _admit_progress(self, upload_uid: str) -> bool:
+        """At most one upload.progress frame per upload per interval, leading edge: the first tail
+        of a window goes out, the rest of that window are dropped. A dropped tail is never sent
+        late — the next one carries a later offset, and finalize announces the attachment."""
+        now = self._clock()
+        last = self._progress_sent.get(upload_uid)
+        if last is not None and now - last < self._progress_interval:
+            return False
+        if len(self._progress_sent) >= PROGRESS_TRACKED_MAX:
+            horizon = now - self._progress_interval
+            self._progress_sent = {u: t for u, t in self._progress_sent.items() if t > horizon}
+        self._progress_sent[upload_uid] = now
+        return True
+
+    def _publish_direct(self, channel: str, raw: str) -> None:
+        """The kinds whose NOTIFY carries the whole frame: no row is read back for them."""
+        try:
+            body = json.loads(raw)
+            owner_id = int(body["owner_id"])
+            if channel == UPLOAD_PROGRESS:
+                upload_uid = str(body["upload_uid"])
+                payload = {
+                    "upload_uid": upload_uid,
+                    "bytes_received": int(body["bytes_received"]),
+                    "declared_size": int(body["declared_size"]),
+                }
+                if self._admit_progress(upload_uid):
+                    self.publish(owner_id, payload, event=UPLOAD_PROGRESS_EVENT)
+                return
+            event = str(body["event"])
+            if event not in MEMO_EVENTS:
+                raise ValueError(event)
+            audience = Audience(body["audience"])
+            payload = {
+                "uid": str(body["uid"]),
+                "kind": event.removeprefix("memo."),
+                "guest": body.get("guest"),
+            }
+        except (ValueError, KeyError, TypeError):
+            logger.warning("events_bad_payload", channel=channel)
+            return
+        self.publish(owner_id, payload, event=event, audience=audience)
 
     def resync_all(self) -> None:
         # Whatever was lost may belong after any id a client already holds, the head included, so
@@ -441,7 +626,8 @@ class EventHub:
             keys: list[tuple[str, int]] = []
             for channel, raw in batch:
                 if channel != ATTACHMENT_STATUS:
-                    continue  # the upload_progress / memo_changed emitters arrive with MEMNG-965
+                    self._publish_direct(channel, raw)
+                    continue
                 try:
                     body = json.loads(raw)
                     key = (str(body["uid"]), int(body["owner_id"]))

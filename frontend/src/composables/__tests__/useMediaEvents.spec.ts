@@ -393,3 +393,46 @@ describe('useMediaEvents', () => {
     expect(subscribe).not.toHaveBeenCalled()
   })
 })
+
+describe('upload.progress frames (MEMNG-965)', () => {
+  class NamedSource extends FakeSource {
+    listeners = new Map<string, (event: MessageEvent) => void>()
+    addEventListener(type: string, listener: (event: MessageEvent) => void) {
+      this.listeners.set(type, listener)
+    }
+  }
+
+  it('hands a parsed frame to the progress handler and leaves the feed caches alone', () => {
+    const queryClient = new QueryClient()
+    const sources: NamedSource[] = []
+    const onProgress = vi.fn()
+    startMediaEvents(
+      queryClient,
+      (url) => {
+        const source = new NamedSource(url)
+        sources.push(source)
+        return source
+      },
+      () => {},
+      onProgress,
+    )
+    queryClient.setQueryData(['memos', 'timeline'], timeline('processing'))
+    const before = queryClient.getQueryData(['memos', 'timeline'])
+    const deliver = sources[0].listeners.get('upload.progress')!
+
+    deliver(
+      new MessageEvent('upload.progress', {
+        data: '{"upload_uid":"u1","bytes_received":5,"declared_size":10}',
+      }),
+    )
+    deliver(new MessageEvent('upload.progress', { data: '{nonsense' }))
+
+    expect(onProgress).toHaveBeenCalledTimes(1)
+    expect(onProgress).toHaveBeenCalledWith({
+      upload_uid: 'u1',
+      bytes_received: 5,
+      declared_size: 10,
+    })
+    expect(queryClient.getQueryData(['memos', 'timeline'])).toBe(before)
+  })
+})

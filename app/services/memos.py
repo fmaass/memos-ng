@@ -17,6 +17,7 @@ from app.models import (
     AttachmentRendition,
     Memo,
     MemoEditKey,
+    Pass,
     Reaction,
     Tag,
     User,
@@ -86,6 +87,29 @@ def owner_subjects(owner: str | Sequence[str] | None) -> list[str]:
         if value:
             seen.setdefault(value, None)
     return list(seen)
+
+
+async def guest_flag(db: AsyncSession, memo: Memo) -> dict | None:
+    """`MemoOut.guest` as plain values for an event payload (MEMNG-965), read in SQL inside the
+    caller's transaction rather than off relationships that may be stale mid-write. Null for a
+    member memo, with no query, and once the pass record is gone (`pass_id` is SET NULL)."""
+    if memo.pass_id is None:
+        return None
+    name = (
+        select(Attachment.contributor_name)
+        .where(
+            Attachment.memo_id == memo.id,
+            Attachment.contributor_name.is_not(None),
+            Attachment.contributor_name != "",
+        )
+        .order_by(Attachment.position.nulls_last(), Attachment.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    row = (await db.execute(select(Pass.uid, name).where(Pass.id == memo.pass_id))).first()
+    if row is None:
+        return None
+    return {"contributor_name": row[1], "pass_uid": row[0]}
 
 
 def visible_clause(user: User):

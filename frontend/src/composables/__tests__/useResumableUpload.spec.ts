@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { effectScope, nextTick, watchEffect } from 'vue'
 
-import { uploadFile, useUploadQueue } from '@/composables/useResumableUpload'
+import {
+  applyUploadProgressEvent,
+  uploadFile,
+  useUploadQueue,
+} from '@/composables/useResumableUpload'
 import { instantOf } from '@/lib/__tests__/artefact'
 
 // The one dated instant these tests need is the artefact's, by id: the subject here is the FENCE,
@@ -71,8 +75,15 @@ describe('uploadFile (finalize-on-post)', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const progress: number[] = []
-    const uploadUid = await uploadFile(fileOf(10), (p) => progress.push(p))
+    const created: string[][] = []
+    const uploadUid = await uploadFile(
+      fileOf(10),
+      (p) => progress.push(p),
+      // The uid is handed over at the create, before any chunk (MEMNG-965).
+      (uid) => created.push([uid, ...patchOffsets]),
+    )
 
+    expect(created).toEqual([['u1']])
     expect(patchOffsets).toEqual(['0', '4', '8']) // 10 bytes / 4-byte chunks
     expect(finalizeCalls).toBe(0) // finalize-on-post: the memo create finalizes, not the uploader
     expect(uploadUid).toBe('u1') // returns the upload_uid, not an attachment
@@ -383,5 +394,33 @@ describe('the capture inspection is identity-fenced (MEMNG-262)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('upload.progress reaches the tile uploading those bytes (MEMNG-965)', () => {
+  it('moves a live queue tile once its upload exists, and stops once the scope is gone', () => {
+    const scope = effectScope()
+    const queue = scope.run(() => useUploadQueue())!
+    queue.items.push({
+      id: 99,
+      name: 'clip.mov',
+      progress: 5,
+      status: 'uploading',
+      uploadUid: 'u-live',
+      captureState: 'pending',
+      captureInstant: null,
+      captureCivil: null,
+      captureSource: null,
+      captureUnknown: false,
+    })
+    const tile = queue.items[0]
+
+    applyUploadProgressEvent({ upload_uid: 'u-live', bytes_received: 40, declared_size: 100 })
+    expect(tile.progress).toBe(40)
+    applyUploadProgressEvent({ upload_uid: 'u-other', bytes_received: 90, declared_size: 100 })
+    expect(tile.progress).toBe(40)
+
+    scope.stop()
+    expect(queue.items).toHaveLength(0)
   })
 })

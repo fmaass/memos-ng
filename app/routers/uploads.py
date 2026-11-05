@@ -13,7 +13,7 @@ from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import get_session
 from app.models import AttachmentStatus, Upload, User
-from app.services import storage, upload_metrics
+from app.services import event_stream, storage, upload_metrics
 from app.services import uploads as svc
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
@@ -360,6 +360,10 @@ async def append_chunk(
             # safe.
             raise HTTPException(status_code=404, detail="Upload not found")
         upload = appended.upload
+        # In the transaction of the append, so a tail that does not commit announces nothing.
+        await event_stream.notify_upload_progress(
+            db, upload.upload_uid, upload.owner_id, upload.bytes_received, upload.declared_size
+        )
         await db.commit()
         # After the commit, so bytes a 413 or a rollback discarded are never counted.
         upload_metrics.count_bytes(getattr(request.state, "auth_kind", "session"), appended.merged)

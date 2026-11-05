@@ -29,7 +29,7 @@ from app.models import (
 )
 from app.routers import RequestVisibility
 from app.routers.assets import RenditionItem, has_print, rendition_items
-from app.services import asset_paths, reclaim, storage
+from app.services import asset_paths, event_stream, reclaim, storage
 from app.services import frame_share as frame_share_svc
 from app.services import memos as svc
 from app.services import uploads as uploads_svc
@@ -973,6 +973,11 @@ async def create_memo(
                 raise _unlinkable(exc) from None
             except uploads_svc.VideoPostersInvalid as exc:
                 raise _video_posters_invalid(exc) from None
+            # In this transaction, so a create that does not commit announces nothing (MEMNG-965).
+            # A member create: no pass, so no guest flag.
+            await event_stream.notify_memo_changed(
+                db, "created", memo.uid, owner_id, before=None, after=memo.visibility, guest=None
+            )
             # After all attachments are linked, enqueue frame shares for #curated photos (no-op
             # unless configured). Savepoint-isolated so a feature error can't fail the save.
             await _enqueue_frame_shares_safe(db, memo, user)
@@ -1317,6 +1322,9 @@ async def patch_memo(
             fields = body.model_dump(
                 exclude_unset=True, exclude={"upload_uids", "attachment_uids", "edit_key"}
             )
+            # The visibility the edit found, read under the lock: who the change is announced to
+            # depends on whether it narrows or widens the memo's audience (MEMNG-965).
+            was = locked.visibility
             edited = await svc.update_memo(db, locked, **fields)
             # The ids behind the existing uids the list names, resolved UNLOCKED and owner-scoped
             # exactly as create resolves its own, so the ONE ascending attachment acquisition
@@ -1412,6 +1420,15 @@ async def patch_memo(
                     set(finalized),
                     moved,
                 )
+            await event_stream.notify_memo_changed(
+                db,
+                "updated",
+                edited.uid,
+                owner_id,
+                before=was,
+                after=edited.visibility,
+                guest=await svc.guest_flag(db, edited),
+            )
             # Enqueue after linking (new uploads are linked above) AND after update_memo re-parsed
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
             # caught. Savepoint-isolated so a feature error can't fail the memo save.
@@ -1517,6 +1534,17 @@ async def delete_memo(
     # (app/services/reclaim.py states the principle in full).
     # The LOCKED memo, not the one read before the wait: its `attachments` were reloaded through
     # the lock, so the orphan journal names what the row actually carries now (§3.3).
+    # Announced to the audience the memo had, in this transaction; the guest flag is read first,
+    # while the attachments that carry the contributor's name are still linked (MEMNG-965).
+    await event_stream.notify_memo_changed(
+        db,
+        "deleted",
+        locked.uid,
+        locked.owner_id,
+        before=locked.visibility,
+        after=None,
+        guest=await svc.guest_flag(db, locked),
+    )
     orphaned, detached_at = await svc.delete_memo(db, locked)
     await db.commit()
     await _after_commit_seam()
