@@ -1308,7 +1308,7 @@ async def _file_part(batch_id: int) -> bool | None:
     parts: list[tuple[Path, Path]] = []
     consumed: list[str] = []
     filing: list[int] = []
-    committed = commit_sent = restored = False
+    committed = commit_sent = restored = creating_part = False
     try:
         async with async_session() as db:
             try:
@@ -1358,6 +1358,10 @@ async def _file_part(batch_id: int) -> bool | None:
                         "part",
                     )
                 for up_uid, blob in planned:
+                    # Interrupted in here, the empty part file exists or is still to land from the
+                    # thread a cancellation left running, and `parts` does not list it: only its
+                    # journal row can clean it, so a restore does not drop the rows then.
+                    creating_part = True
                     up = await uploads_svc.create_upload(
                         db,
                         upload_uid=up_uid,
@@ -1369,6 +1373,7 @@ async def _file_part(batch_id: int) -> bool | None:
                             _epoch_ms(blob.last_modified) if blob.last_modified else None
                         ),
                     )
+                    creating_part = False
                     staged = _verified_path(uid, blob.sha256)
                     target = uploads_svc.part_path(up.upload_uid)
                     parts.append((staged, target))
@@ -1481,7 +1486,7 @@ async def _file_part(batch_id: int) -> bool | None:
                 committed_after_all = None
             if committed_after_all is False:
                 restored = _restore(moved, parts)  # blocking-ok: as above
-        if restored and journal.written:
+        if restored and not creating_part and journal.written:
             # Shielded with its deadline inside, like the cancel record (see `run_sync_safe`).
             await asyncio.shield(asyncio.ensure_future(journal.drop_written()))
         raise
