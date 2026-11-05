@@ -5,7 +5,8 @@ Two memo rows pointed at ONE original then lose it on the first delete — the s
 is gone while its row still promises it. The probes that must turn red are the two delete orders of
 the `same-path` shape, and the app reclaim's halves of the tier-path cases (MEMNG-1167): another
 row's rendition or print path naming this row's derived tier or print profile, and the whole-path
-case (another row naming a profile's `.tmp` sibling keeps only that file). The `staged` shape
+case (another row naming a profile's `.tmp` sibling keeps only that file), and the reverse order
+(MEMNG-1190): the row naming another row's uid-derived tier reclaimed first. The `staged` shape
 stays green on purpose: a staging hit gives each row its own hard-linked name, which no reference
 count is needed to protect, and that is the property the staged cases pin. The `sync` halves stay
 green too: they drive the maintenance script's reclaim, which no_reclaim_path_refcount_sync.patch

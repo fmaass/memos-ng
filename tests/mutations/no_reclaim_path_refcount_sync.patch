@@ -2,7 +2,8 @@ Drop the maintenance script's reference check: its synchronous reclaim unlinks e
 whether or not another row names it too (MEMNG-1167).
 
 The probes that must turn red are the `sync` halves of the tier-path cases: another row's rendition
-or print path naming this row's derived tier or print profile loses that file. Everything else in
+or print path naming this row's derived tier or print profile loses that file, and the reverse
+order (MEMNG-1190) loses the owner's tier when the naming row goes first. Everything else in
 the module drives the app's reclaim (no_reclaim_path_refcount.patch) and stays green.
 
 --- a/app/services/reclaim.py

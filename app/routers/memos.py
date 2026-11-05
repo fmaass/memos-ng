@@ -101,6 +101,33 @@ def _discard_poster_copies(copies: list[uploads_svc.PosterCopy]) -> None:
             logger.error("memo.write.poster_discard_failed", path=path)
 
 
+async def _transaction_id_to_walk_back(db: AsyncSession, *pending: list) -> int | None:
+    """The transaction id a memo write reads just before its COMMIT, when it has files to walk back
+    (MEMNG-1190) — after an exception out of the COMMIT it is the only way to learn whether the
+    write landed (`uploads_svc.commit_landed`). Flushed first, so a statement the flush refuses
+    fails here, before the COMMIT, where the plain walk-back is right. None with nothing to walk
+    back: no id needed, and none read."""
+    if not any(pending):
+        return None
+    await db.flush()
+    return await uploads_svc.current_transaction_id(db)
+
+
+async def _commit_outcome(
+    db: AsyncSession, xid: int | None
+) -> tuple[bool | None, BaseException | None]:
+    """Whether a memo write that raised landed: False — walk it back — when it raised before its
+    COMMIT (`xid` None), else what `uploads_svc.commit_landed` learns of that transaction
+    (MEMNG-1190; a raise out of the COMMIT is not proof of a rollback, MEMNG-1167). The second
+    value is a cancellation that arrived while it was asked, for the caller to re-raise.
+
+    With `xid` None this returns without ever suspending, so the walk-back behind it stays as
+    uninterruptible as the inline calls it makes (MEMNG-145): no cancellation can land here."""
+    if xid is None:
+        return False, None
+    return await uploads_svc.commit_landed(xid, db)
+
+
 async def _after_commit_seam() -> None:
     """The instant between a detaching request's commit and its after-commit reclaim.
 
@@ -898,6 +925,8 @@ async def create_memo(
         # the failure path does — discarding posters, moving originals back — destroys files that
         # a COMMITTED memo owns, so it must never run once this is set.
         committed = False
+        # Read just before the COMMIT (MEMNG-1190): set, a raise is FROM the commit or after it.
+        xid: int | None = None
         try:
             # Finalizing runs INSIDE create_memo, after the memo row is inserted and locked, so
             # this write takes the same outermost lock as every other one (see create_memo). The
@@ -982,6 +1011,7 @@ async def create_memo(
             # After all attachments are linked, enqueue frame shares for #curated photos (no-op
             # unless configured). Savepoint-isolated so a feature error can't fail the save.
             await _enqueue_frame_shares_safe(db, memo, user)
+            xid = await _transaction_id_to_walk_back(db, moved, poster_copies)
             await db.commit()
             # A plain assignment with NO await between it and the commit that earned it: a
             # cancellation cannot be delivered in that gap, so this flag can never be missing for
@@ -1015,10 +1045,26 @@ async def create_memo(
             # references — and an `await` here is not guaranteed to resume when this handler is
             # unwinding a cancellation, so anything sequenced behind one can be skipped entirely.
             # Their part files stay untouched: that is what leaves the client's poster re-postable.
-            if poster_copies:
-                _discard_poster_copies(poster_copies)
-            if moved:
-                _restore_moved(moved)
+            # A raise FROM the commit is the exception (MEMNG-1190, as MEMNG-1167 for the finalize
+            # route): it does not prove the write was lost, so its outcome is asked of the
+            # database first — awaited under a shield to the end, any cancellation handed back —
+            # and the files go back only when it provably did not land. Landed, they are the live
+            # memo's; unknown, they stay and are logged.
+            landed, cancelled = await _commit_outcome(db, xid)
+            if landed is False:
+                if poster_copies:
+                    _discard_poster_copies(poster_copies)
+                if moved:
+                    _restore_moved(moved)
+            else:
+                (logger.warning if landed else logger.error)(
+                    "memo.create.walk_back_skipped",
+                    committed=landed,
+                    placed=[(move.src, move.dest) for move in moved],
+                    posters=len(poster_copies),
+                )
+            if cancelled is not None:
+                raise cancelled from None
             raise
 
     if key is None:
@@ -1311,6 +1357,8 @@ async def patch_memo(
         detached_ids: list[tuple[int, str]] = []
         detached_at: datetime | None = None
         committed = False
+        # Read just before the COMMIT (MEMNG-1190), as on create.
+        xid: int | None = None
         try:
             # The FIRST lock this edit takes, before any upload is finalized or any attachment is
             # linked: every later lock belongs to something hanging off this memo, so they all
@@ -1449,6 +1497,7 @@ async def patch_memo(
             # tags, so both "added #curated on edit" and "added a new photo to a curated memo" are
             # caught. Savepoint-isolated so a feature error can't fail the memo save.
             await _enqueue_frame_shares_safe(db, edited, user)
+            xid = await _transaction_id_to_walk_back(db, moved)
             await db.commit()
             committed = True
             if detached_ids:
@@ -1489,11 +1538,25 @@ async def patch_memo(
                     )
             await db.refresh(edited)
             return edited
-        finally:
+        except BaseException:
             # Inline, like the create path: an unwinding cancellation would skip anything behind an
             # await, leaving this edit's originals where the rollback cannot find them (MEMNG-145).
+            # And as on create, a raise FROM the commit is asked about first (MEMNG-1190): the
+            # originals go back only when the edit provably did not land.
             if not committed and moved:
-                _restore_moved(moved)
+                landed, cancelled = await _commit_outcome(db, xid)
+                if landed is False:
+                    _restore_moved(moved)
+                else:
+                    (logger.warning if landed else logger.error)(
+                        "memo.patch.walk_back_skipped",
+                        memo_uid=uid,
+                        committed=landed,
+                        placed=[(move.src, move.dest) for move in moved],
+                    )
+                if cancelled is not None:
+                    raise cancelled from None
+            raise
 
     if key is None:
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as

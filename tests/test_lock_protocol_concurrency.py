@@ -14,7 +14,7 @@ Mechanics follow §5.1 of the design and reuse the patterns this suite already h
 * one session/connection per actor, both running the real path;
 * park hooks claim their turn SYNCHRONOUSLY (the `calls += 1` pattern of
   `tests/test_capture_concurrency.py:105-115`) and every test asserts its hook actually fired, the
-  control `tests/test_commit_race_reconcile.py:125` establishes;
+  control `tests/test_commit_race_reconcile.py:136` establishes;
 * blocking is OBSERVED (`_wait_for_a_new_lock_wait`), never timed, and the coordinator releases the
   parked winner on ANY lock wait rather than on a named relation — under the protocol the second
   actor correctly blocks EARLIER than it did before, and a barrier both actors must reach would
@@ -86,7 +86,7 @@ def _jpeg(colour: tuple[int, int, int]) -> bytes:
 
 def _cleanup() -> None:
     """DELETE, not TRUNCATE — TRUNCATE takes ACCESS EXCLUSIVE and would queue behind any reader
-    still holding a transaction on these tables (tests/test_commit_race_reconcile.py:46)."""
+    still holding a transaction on these tables (tests/test_commit_race_reconcile.py:50)."""
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:
         for table in (

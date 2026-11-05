@@ -590,37 +590,54 @@ def _restore_moves_sync(moves: list[storage.TrackedMove]) -> None:
             logger.error("uploads.finalize.restore_failed", src=move.src, dest=unrestored)
 
 
-async def _commit_outcome(
-    db: AsyncSession, upload_uid: str, attachment_uid: str
+async def _walk_back(
+    moved: list[storage.TrackedMove],
 ) -> tuple[bool | None, asyncio.CancelledError | None]:
-    """Learn whether a finalize whose commit raised committed after all (MEMNG-1167), and come
-    back only once that is known — `svc.finalize_committed`'s answer plus any cancellation that
-    arrived meanwhile, for the caller to re-raise.
+    """Walk back a finalize whose write provably did not land, in one worker thread awaited to the
+    end (`svc.finish_off_the_loop`); False — "did not land" — plus any cancellation that arrived
+    meanwhile, for the caller to re-raise."""
+    _, cancelled = await svc.finish_off_the_loop(_restore_moves_sync, moved)
+    return False, cancelled
+
+
+async def _commit_outcome(
+    db: AsyncSession,
+    upload_uid: str,
+    attachment_uid: str,
+    moved: list[storage.TrackedMove] | None = None,
+) -> tuple[bool | None, asyncio.CancelledError | None]:
+    """Learn whether a finalize whose commit raised committed after all (MEMNG-1167), walk `moved`
+    back if it provably did not, and come back only once that is done — `svc.finalize_committed`'s
+    answer plus any cancellation that arrived meanwhile, for the caller to re-raise.
 
     A task of its own awaited through a shield, the way `svc.finish_off_the_loop` awaits a thread:
     the request being torn down is one of the very ways the commit came to raise, and a
     cancellation that cut the question short would leave the walk-back with no answer. The request
-    session is closed first, so the interrupted transaction cannot sit open on OUR connection while
-    the lock below waits on it; a close that fails is logged and the question asked anyway, since
-    the lock wait is what decides, not the close.
+    session is closed first, inside the resolution's one deadline (MEMNG-1190), so the interrupted
+    transaction cannot sit open on OUR connection while the lock waits on it. The walk-back runs
+    INSIDE the resolution, while it still holds the session row's lock (MEMNG-1190), so no expiry
+    reap can take the restored row before its part is back.
     """
+    walked_back: list[asyncio.CancelledError | None] = []
 
-    async def resolve() -> bool | None:
-        try:
-            await db.close()
-        except Exception:
-            logger.exception("uploads.finalize.close_failed", upload_uid=upload_uid)
-        return await svc.finalize_committed(upload_uid, attachment_uid)
+    async def walk_back() -> None:
+        if moved:
+            _, cancelled = await _walk_back(moved)
+            walked_back.append(cancelled)
 
-    task = asyncio.create_task(resolve())
+    task = asyncio.create_task(
+        svc.finalize_committed(upload_uid, attachment_uid, holder=db, on_rolled_back=walk_back)
+    )
     cancellation: asyncio.CancelledError | None = None
     while True:
         try:
-            return await asyncio.shield(task), cancellation
+            landed = await asyncio.shield(task)
         except asyncio.CancelledError as exc:
             if task.cancelled():  # the task itself was cancelled (a loop teardown): nothing to wait
                 raise
             cancellation = exc
+            continue
+        return landed, cancellation or next(iter(walked_back), None)
 
 
 @router.post(
@@ -684,18 +701,16 @@ async def finalize_upload(
         if moved:
             # A raise before the commit proves the write was lost; a raise FROM it does not
             # (MEMNG-1167), so that outcome is asked of the database first and the files are
-            # walked back only when the transaction provably did not commit. Committed, they are
-            # the live row's; unknown, they stay where they are and are logged — a file in the
-            # wrong place can be recovered by hand, one taken from a live row cannot.
+            # walked back only when the transaction provably did not commit, and then while that
+            # check still holds the session row's lock (MEMNG-1190). Committed, they are the live
+            # row's; unknown — the deadline included — they stay where they are and are logged: a
+            # file in the wrong place can be recovered by hand, one taken from a live row cannot.
             landed, cancelled = (
-                await _commit_outcome(db, upload_uid, committing)
+                await _commit_outcome(db, upload_uid, committing, moved)
                 if committing is not None
-                else (False, None)
+                else await _walk_back(moved)
             )
-            if landed is False:
-                _, cancelled_restore = await svc.finish_off_the_loop(_restore_moves_sync, moved)
-                cancelled = cancelled or cancelled_restore
-            else:
+            if landed is not False:
                 (logger.warning if landed else logger.error)(
                     "uploads.finalize.walk_back_skipped",
                     upload_uid=upload_uid,

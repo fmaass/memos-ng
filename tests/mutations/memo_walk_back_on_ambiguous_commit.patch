@@ -1,0 +1,20 @@
+Walk a failed memo create or edit back whether or not its commit landed — the behaviour before
+MEMNG-1190.
+
+A commit that raised AFTER PostgreSQL committed (a dropped connection, a cancelled request) then
+moves the original out from under a live memo and deletes the tier copies it serves. The probes
+that must turn red are the `commit-landed` cases and the outcome-unknown cases, for both the create
+and the edit (all must keep the files); `commit-did-not-land` stays green, because walking back a
+write that was lost is the right answer and what that case pins.
+
+--- a/app/routers/memos.py
++++ b/app/routers/memos.py
+@@ -123,7 +123,7 @@
+ 
+     With `xid` None this returns without ever suspending, so the walk-back behind it stays as
+     uninterruptible as the inline calls it makes (MEMNG-145): no cancellation can land here."""
+-    if xid is None:
++    if True:
+         return False, None
+     return await uploads_svc.commit_landed(xid, db)
+ 

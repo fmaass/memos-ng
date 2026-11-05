@@ -12,7 +12,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import BinaryIO, Literal
+from typing import Any, BinaryIO, Literal
 
 import puremagic
 import structlog
@@ -323,7 +323,33 @@ def reap_consumed_sync(paths: list[str]) -> None:
             logger.error("uploads.consumed_reap_failed", path=path, error=str(exc)[:200])
 
 
-async def finalize_committed(upload_uid: str, attachment_uid: str) -> bool | None:
+async def _end_resolution(db: AsyncSession, driver: list[Any], *, drop: bool, bound: float) -> None:
+    """End the resolver's session — `invalidate` when `drop`, then `close` — within `bound`
+    seconds. Past it, the connection is terminated (a socket close, no round-trip), which ends the
+    server's transaction and releases its lock whatever the client side is still doing."""
+    with move_on_after(bound) as scope:
+        try:
+            if drop:
+                await db.invalidate()
+            await db.close()
+        except Exception as exc:
+            logger.warning("uploads.finalize.outcome_session_not_closed", error=repr(exc)[:200])
+    if scope.cancelled_caught:
+        logger.warning("uploads.finalize.outcome_session_abandoned", bound_s=bound)
+        for connection in driver:
+            try:
+                connection.terminate()
+            except Exception as exc:
+                logger.warning("uploads.finalize.outcome_session_not_terminated", error=repr(exc))
+
+
+async def finalize_committed(
+    upload_uid: str,
+    attachment_uid: str,
+    *,
+    holder: AsyncSession | None = None,
+    on_rolled_back: Callable[[], Awaitable[None]] | None = None,
+) -> bool | None:
     """Whether a finalize whose COMMIT raised committed after all (MEMNG-1167); None when that
     cannot be learned. A raising `commit()` is not a rollback: the connection can drop, or the
     request be cancelled, after PostgreSQL committed — and the caller's walk-back would then move
@@ -335,24 +361,75 @@ async def finalize_committed(upload_uid: str, attachment_uid: str) -> bool | Non
     it committed. Anything else — the row gone and no attachment, or a read that fails — is not
     proof of either, and the caller must not walk back on it. The same question
     `trip_ingest._filing_committed` asks of a filing.
+
+    `holder`, the request session whose COMMIT raised, is closed first, so the interrupted
+    transaction cannot sit open on that connection while the lock below waits on it; a close that
+    fails is logged and the question asked anyway, since the lock wait is what decides.
+
+    ONE deadline, `COMMIT_OUTCOME_TIMEOUT_S`, bounds the close and the whole resolution — the
+    connect, the lock wait and the reads (MEMNG-1190). Past it the outcome is unknown (None). The
+    resolver's own teardown is bounded by what is left of it (`_end_resolution`).
+
+    `on_rolled_back` is the walk-back, and it runs only on a definite rollback and while this still
+    holds the session row's lock (MEMNG-1190): the restored row is then fenced until the files are
+    back. An expiry reap queues behind the lock (`reap_expired` takes it without SKIP LOCKED) and
+    finds the part restored, rather than deleting the row while its part is absent and leaving the
+    restore to recreate a part no row would collect. The deadline does not cover it: a restore
+    that has started finishes under the lock, and only the teardown after it is bounded.
     """
     try:
-        async with async_session() as db:
-            await db.execute(text("SET LOCAL lock_timeout = '10s'"))
-            session_left = (
-                await db.execute(
-                    select(Upload.upload_uid)
-                    .where(Upload.upload_uid == upload_uid)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            stored = (
-                await db.execute(select(Attachment.id).where(Attachment.uid == attachment_uid))
-            ).scalar_one_or_none()
-            await db.rollback()
+        db = async_session()
     except Exception:
         logger.exception("uploads.finalize.commit_outcome_unknown", upload_uid=upload_uid)
         return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + COMMIT_OUTCOME_TIMEOUT_S
+    # The asyncpg connection under `db`, once there is one: what a teardown that outlives its
+    # bound terminates, so the server ends the transaction (and its lock) without the client.
+    driver: list[Any] = []
+    drop = False
+    try:
+        try:
+            with fail_after(COMMIT_OUTCOME_TIMEOUT_S):
+                if holder is not None:
+                    try:
+                        await holder.close()
+                    except Exception:
+                        logger.exception("uploads.finalize.close_failed", upload_uid=upload_uid)
+                # The server's own bound on the lock wait: what is LEFT of the deadline after the
+                # close and the connect, less a margin, so the server gives up first and answers
+                # rather than being cut off mid-statement (never 0, which means no bound at all).
+                left_ms = int((deadline - loop.time() - COMMIT_OUTCOME_LOCK_MARGIN_S) * 1000)
+                await db.execute(text(f"SET LOCAL lock_timeout = '{max(left_ms, 1)}ms'"))
+                driver.append(
+                    (await (await db.connection()).get_raw_connection()).driver_connection
+                )
+                session_left = (
+                    await db.execute(
+                        select(Upload.upload_uid)
+                        .where(Upload.upload_uid == upload_uid)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                stored = (
+                    await db.execute(select(Attachment.id).where(Attachment.uid == attachment_uid))
+                ).scalar_one_or_none()
+        except Exception:
+            logger.exception("uploads.finalize.commit_outcome_unknown", upload_uid=upload_uid)
+            # The deadline may have cut a statement short: drop the connection rather than ask
+            # it for the ROLLBACK a close would otherwise wait on.
+            drop = True
+            return None
+        if session_left is not None and on_rolled_back is not None:
+            await on_rolled_back()  # still holding the session row's lock, and never cut short
+    finally:
+        # Ending the transaction is what releases the lock, and it is bounded too (MEMNG-1190): by
+        # what is left of the deadline — the restore's own time is not counted against it — and
+        # never less than the margin. A teardown that outlives it is abandoned and its connection
+        # terminated, so a stalled close cannot hold the request, nor the lock, any longer.
+        await _end_resolution(
+            db, driver, drop=drop, bound=max(deadline - loop.time(), COMMIT_OUTCOME_LOCK_MARGIN_S)
+        )
     if session_left is not None:
         return False
     if stored is not None:
@@ -655,6 +732,9 @@ async def create_upload(
 COMMIT_OUTCOME_TIMEOUT_S = 5.0
 # Between two reads of a transaction's status while it is still in progress.
 COMMIT_OUTCOME_POLL_S = 0.05
+# How far inside that bound the finalize outcome's server-side lock_timeout ends, so the server
+# answers before the client gives up; also the least time its teardown gets (MEMNG-1190).
+COMMIT_OUTCOME_LOCK_MARGIN_S = 0.25
 
 
 async def commit_landed(
@@ -728,6 +808,12 @@ async def commit_landed(
             cancellation = exc
 
 
+async def current_transaction_id(db: AsyncSession) -> int:
+    """The id of `db`'s open transaction, read just before its COMMIT so that `commit_landed` can
+    ask about it if the COMMIT raises. A failure of this read is a failure before the COMMIT."""
+    return int((await db.execute(text("SELECT pg_current_xact_id()::text"))).scalar_one())
+
+
 @dataclass
 class OpenedSessions:
     """The upload sessions one request opens in ONE transaction of `db`, so that a failure removes
@@ -743,9 +829,7 @@ class OpenedSessions:
         that id is the only way to ask PostgreSQL what happened. A failure of that read is a
         failure before the COMMIT: it was never sent, and the transaction can only roll back."""
         if self.part_uids:
-            self._xid = int(
-                (await self.db.execute(text("SELECT pg_current_xact_id()::text"))).scalar_one()
-            )
+            self._xid = await current_transaction_id(self.db)
         await self.db.commit()
 
     async def discard(self) -> asyncio.CancelledError | None:

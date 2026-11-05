@@ -1,10 +1,12 @@
 """MEMNG-146 — the one window in POST /api/memos that no in-request bookkeeping can close.
 
 A failure delivered INSIDE `db.commit()` is ambiguous: the server may have committed while the
-driver raises. The handler's `committed` flag stays False, so its cleanup runs against a memo that
-IS stored — it discards the poster of a live video and moves a live memo's originals back out of
-its folder. That state is produced here for real (the commit runs, then raises, exactly as a lost
-connection would) rather than hand-assembled, so the test breaks if the handler's unwind changes.
+driver raises. The handler's `committed` flag stays False, and before MEMNG-1190 its cleanup then
+ran against a memo that IS stored — it discarded the poster of a live video and moved a live memo's
+originals back out of its folder. The handler now asks first (`_commit_outcome`), but estates keep
+what the old one left. That state is produced here through the handler's own unwind (the commit
+runs, then raises, exactly as a lost connection would, and the outcome question is answered the
+way it was before) rather than hand-assembled.
 
 The sweep then has to find both shapes, put back the one it can, and be safe to run again.
 """
@@ -81,7 +83,18 @@ def _race_the_commit(monkeypatch) -> list[bool]:
 
     Discriminated by the session's identity map so the PAT last-used stamp's own commit, which
     rides a separate background session, cannot consume the one shot.
+
+    Since MEMNG-1190 the handler asks whether a COMMIT that raised landed, and leaves a stored
+    memo's files alone — so on its own the race no longer produces the state this sweep repairs.
+    An estate can still hold it from before, so the handler's question is answered the way it was
+    answered then: "did not land", and the unwind runs.
     """
+    from app.routers import memos as memos_router
+
+    async def answered_as_before_memng_1190(db, xid):
+        return False, None
+
+    monkeypatch.setattr(memos_router, "_commit_outcome", answered_as_before_memng_1190)
     real_commit = AsyncSession.commit
     fired: list[bool] = []
 

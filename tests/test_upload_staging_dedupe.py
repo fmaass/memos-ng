@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -563,6 +564,339 @@ async def test_the_commit_outcome_waits_for_the_interrupted_transaction_to_end(
         _cleanup()
 
 
+def _finalize_whose_commit_rolls_back(
+    uploads_router, minted: list[str], *, first_close_hangs_s: float = 0
+):
+    """A `svc.finalize` stand-in that runs the real one, then makes the request's COMMIT roll back
+    and raise — the shape a dropped connection gives. `first_close_hangs_s` makes the request
+    session's FIRST close (the first thing the outcome resolution does) hang that long; a later one
+    (the request's own teardown) closes it for real."""
+    real_finalize = uploads_router.svc.finalize
+
+    async def finalize(db, *args, **kwargs):
+        attachment = await real_finalize(db, *args, **kwargs)
+        minted.append(attachment.uid)
+
+        async def lost():
+            await db.rollback()
+            raise ConnectionResetError("the connection dropped around COMMIT")
+
+        db.commit = lost
+        if first_close_hangs_s:
+            real_close = db.close
+            closes: list[None] = []
+
+            async def close():
+                closes.append(None)
+                if len(closes) == 1:
+                    await asyncio.sleep(first_close_hangs_s)
+                else:
+                    await real_close()
+
+            db.close = close
+        return attachment
+
+    return finalize
+
+
+def test_an_expiry_reap_cannot_slip_between_the_rollback_answer_and_the_restore(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1190 — a finalize whose COMMIT raised and provably rolled back puts the staged part
+    file back. If the resolver let go of the session row's lock before that restore, an expiry
+    reap could take the row in the gap — deleting it, and unlinking a part that is not there yet —
+    and the restore would then recreate a part no row will ever collect. The reap is started
+    inside the restore's window and given time to finish; it must instead wait for the lock, so
+    the row and its part go together."""
+    from app.routers import uploads as uploads_router
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, twin = _ready_memo(client)
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        _exec(
+            "UPDATE uploads SET expires_at = now() - interval '1 hour' WHERE upload_uid = :u",
+            u=staged,
+        )
+        minted: list[str] = []
+        reaped: list[int] = []
+        reap_finished_in_the_gap: list[bool] = []
+        real_restore = uploads_router._restore_moves_sync
+
+        def reap() -> None:
+            reaped.append(asyncio.run(uploads_svc.reap_expired_committed()))
+
+        def restore_with_a_reap_racing_it(moves):
+            reaper = threading.Thread(target=reap)
+            reaper.start()
+            reaper.join(1.5)  # an unfenced reap finishes well inside this
+            reap_finished_in_the_gap.append(not reaper.is_alive())
+            real_restore(moves)
+            restore_with_a_reap_racing_it.reaper = reaper
+
+        monkeypatch.setattr(
+            uploads_router.svc,
+            "finalize",
+            _finalize_whose_commit_rolls_back(uploads_router, minted),
+        )
+        monkeypatch.setattr(uploads_router, "_restore_moves_sync", restore_with_a_reap_racing_it)
+
+        failed = client.post(f"/api/uploads/{staged}/finalize")
+        restore_with_a_reap_racing_it.reaper.join(10)
+
+        assert failed.status_code == 500
+        assert len(minted) == 1
+        rows = _rows("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=staged)
+        # The invariant: a part exists exactly while a session row would collect it.
+        assert (rows, part.exists()) == ([(0,)], False)
+        assert reaped == [1]  # the reap ran, and took the session part and all…
+        assert reap_finished_in_the_gap == [False]  # …once it had waited on the row's lock
+        assert Path(_att(twin)["storage_path"]).read_bytes() == ONE
+    finally:
+        _cleanup()
+
+
+def test_a_commit_outcome_whose_close_hangs_gives_up_at_the_bound_and_leaves_the_files(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1190 — the outcome resolution has ONE deadline, the request session's close inside
+    it. A close that hangs (the database gone) must not hold the request past the bound, and the
+    outcome is then unknown: the files stay where finalize put them, although this commit in fact
+    rolled back — unknown is not rolled back."""
+    from app.routers import uploads as uploads_router
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_TIMEOUT_S", 0.5)
+    try:
+        _, twin = _ready_memo(client)
+        original = Path(_att(twin)["storage_path"])
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        minted: list[str] = []
+        monkeypatch.setattr(
+            uploads_router.svc,
+            "finalize",
+            _finalize_whose_commit_rolls_back(uploads_router, minted, first_close_hangs_s=6),
+        )
+
+        started = time.monotonic()
+        failed = client.post(f"/api/uploads/{staged}/finalize")
+        elapsed = time.monotonic() - started
+
+        assert failed.status_code == 500
+        assert elapsed < 4, elapsed  # the bound, not the hanging close
+        assert len(minted) == 1
+        assert [_tier(minted[0], tier).exists() for tier in TIERS] == [True, True]
+        assert not part.exists()
+        placed = list((tmp_path / "originals" / "_unfiled").iterdir())
+        assert len(placed) == 1 and os.path.samefile(placed[0], original)
+    finally:
+        _cleanup()
+
+
+class _StubHolder:
+    """The request session as the outcome resolution sees it: only its close is called."""
+
+    def __init__(self, close_s: float) -> None:
+        self.close_s = close_s
+
+    async def close(self) -> None:
+        await asyncio.sleep(self.close_s)
+
+
+@pytest.mark.parametrize("during", ["close", "resolution"])
+async def test_a_cancelled_commit_outcome_resolution_still_ends_at_the_bound(
+    logged_in_client, monkeypatch, tmp_path, during
+):
+    """MEMNG-1190 — the request is cancelled while the outcome is being learned: during the
+    request session's close (which hangs), or during the resolution itself (the session row's lock
+    held elsewhere). The cancellation must not cut the resolution short — it is handed back, for
+    the route to re-raise, only once the resolution is over — and the resolution must not outlast
+    its one deadline either: before, a hanging close had no bound at all and the lock wait had its
+    own 10 s one."""
+    from app.routers import uploads as uploads_router
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_TIMEOUT_S", 0.5)
+    # The server's lock_timeout ends this far inside the deadline: small, so the resolution still
+    # visibly outlives the cancellation at 0.2 s.
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_LOCK_MARGIN_S", 0.05)
+    try:
+        session = await asyncio.to_thread(_start, client, LONGER)
+        uid = session["upload_uid"]
+        eng = create_engine(SYNC_URL)
+        conn = eng.connect()
+        try:
+            tx = conn.begin()
+            if during == "resolution":
+                conn.execute(
+                    text("SELECT 1 FROM uploads WHERE upload_uid = :u FOR UPDATE"), {"u": uid}
+                )
+            holder = _StubHolder(close_s=6 if during == "close" else 0)
+
+            started = time.monotonic()
+            asked = asyncio.create_task(uploads_router._commit_outcome(holder, uid, "no-such-uid"))
+            await asyncio.sleep(0.2)
+            assert not asked.done()
+            asked.cancel()
+            landed, cancelled = await asyncio.wait_for(asked, 15)
+            elapsed = time.monotonic() - started
+
+            assert elapsed < 3, elapsed  # over at the bound
+            assert elapsed >= 0.4, elapsed  # …and not cut short by the cancellation at 0.2 s
+            assert landed is None  # unknown: the answer never arrived inside the bound
+            assert isinstance(cancelled, asyncio.CancelledError)  # handed back to re-raise
+            await asyncio.to_thread(tx.rollback)
+        finally:
+            await asyncio.to_thread(conn.close)
+            await asyncio.to_thread(eng.dispose)
+    finally:
+        # Off the loop: the abandoned resolution's connection is still being closed ON this loop,
+        # and its server backend can be holding the row lock until it is — a TRUNCATE run on the
+        # loop's own thread would wait on a close that can never run.
+        await asyncio.to_thread(_cleanup)
+
+
+def _row_lock_free(upload_uid: str) -> bool:
+    """Whether the session row's lock can be taken right now (NOWAIT): the read-back that the
+    resolver's transaction has really ended on the server, not only on the client."""
+    eng = create_engine(SYNC_URL)
+    try:
+        with eng.connect() as conn:
+            try:
+                conn.execute(
+                    text("SELECT 1 FROM uploads WHERE upload_uid = :u FOR UPDATE NOWAIT"),
+                    {"u": upload_uid},
+                )
+                return True
+            except Exception:
+                return False
+            finally:
+                conn.rollback()
+    finally:
+        eng.dispose()
+
+
+async def _eventually_free(upload_uid: str, within_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(_row_lock_free, upload_uid):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+def _end_abandoned_transactions() -> None:
+    """Test teardown only: end any transaction an abandoned session left open in this database, so
+    the cleanup's TRUNCATE is not queued behind it for ever when the code under test leaks one."""
+    _exec(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+        "AND state LIKE 'idle in transaction%'"
+    )
+
+
+def _resolver_sessions_stalling(monkeypatch, uploads_svc, method: str, stall_s: float) -> None:
+    """Make the RESOLVER's own session (the one `finalize_committed` opens) stall in `method` —
+    its invalidate or its close — while every other session behaves."""
+    real_factory = uploads_svc.async_session
+
+    def factory():
+        session = real_factory()
+
+        async def stall(*_args, **_kwargs):
+            await asyncio.sleep(stall_s)
+
+        setattr(session, method, stall)
+        return session
+
+    monkeypatch.setattr(uploads_svc, "async_session", factory)
+
+
+async def test_a_stalled_resolver_close_after_a_restore_is_cut_at_the_bound(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1190 r2 — the resolver's own teardown is bounded too. A definite rollback runs the
+    restore under the session row's lock, and that restore is NOT cut short, however long it
+    takes (the lock is held throughout it); the close that ends the transaction afterwards is what
+    is bounded. A close that stalls is abandoned at the bound and its connection dropped, so the
+    lock is released on the server, not left to a client that never finishes closing."""
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_LOCK_MARGIN_S", 0.1, raising=False)
+    try:
+        uid = (await asyncio.to_thread(_start, client, LONGER))["upload_uid"]
+        _resolver_sessions_stalling(monkeypatch, uploads_svc, "close", 6)
+        held_during_restore: list[bool] = []
+        restored: list[bool] = []
+
+        async def slow_restore() -> None:
+            await asyncio.sleep(0.8)  # past the resolution's deadline: still not cut short
+            held_during_restore.append(not await asyncio.to_thread(_row_lock_free, uid))
+            restored.append(True)
+
+        started = time.monotonic()
+        answer = await asyncio.wait_for(
+            uploads_svc.finalize_committed(uid, "no-such-uid", on_rolled_back=slow_restore), 15
+        )
+        elapsed = time.monotonic() - started
+
+        assert answer is False
+        assert restored == [True] and held_during_restore == [True]
+        assert elapsed < 3, elapsed  # the restore plus a bounded teardown, not the stalled close
+        assert await _eventually_free(uid)  # …and the transaction really ended on the server
+    finally:
+        await asyncio.to_thread(_end_abandoned_transactions)
+        await asyncio.to_thread(_cleanup)
+
+
+async def test_a_stalled_resolver_invalidate_after_the_deadline_is_cut_at_the_bound(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1190 r2 — past the resolution's deadline the resolver drops its connection
+    (invalidate). That drop is bounded as well: an invalidate that stalls is abandoned at the bound
+    and the connection terminated, rather than holding the request indefinitely."""
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(uploads_svc, "COMMIT_OUTCOME_LOCK_MARGIN_S", 0.1, raising=False)
+    try:
+        uid = (await asyncio.to_thread(_start, client, LONGER))["upload_uid"]
+        eng = create_engine(SYNC_URL)
+        conn = eng.connect()
+        try:
+            tx = conn.begin()
+            conn.execute(text("SELECT 1 FROM uploads WHERE upload_uid = :u FOR UPDATE"), {"u": uid})
+            _resolver_sessions_stalling(monkeypatch, uploads_svc, "invalidate", 6)
+
+            started = time.monotonic()
+            answer = await asyncio.wait_for(uploads_svc.finalize_committed(uid, "no-such-uid"), 15)
+            elapsed = time.monotonic() - started
+
+            assert answer is None  # the lock never came: unknown
+            assert elapsed < 3, elapsed  # the deadline plus a bounded teardown
+            await asyncio.to_thread(tx.rollback)
+        finally:
+            await asyncio.to_thread(conn.close)
+            await asyncio.to_thread(eng.dispose)
+        assert await _eventually_free(uid)  # nothing of the resolver's is left waiting on it
+    finally:
+        await asyncio.to_thread(_end_abandoned_transactions)
+        await asyncio.to_thread(_cleanup)
+
+
 def test_a_memo_create_that_fails_after_the_tier_copies_takes_them_back(
     logged_in_client, monkeypatch, tmp_path
 ):
@@ -603,6 +937,132 @@ def test_a_memo_create_that_fails_after_the_tier_copies_takes_them_back(
         assert _rows("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=staged) == [(1,)]
         # The twin is untouched: its tiers were the copies' source, never moved.
         assert [_tier(twin, tier).exists() for tier in TIERS] == [True, True]
+    finally:
+        _cleanup()
+
+
+def _memo_write_whose_commit_raises(memos_router, minted: list[str], *, landed: bool):
+    """A `finalize_pending` stand-in for the memo create and edit: the real one, then the
+    request's COMMIT either lands or rolls back — and raises either way, as a connection dropped
+    around the COMMIT does."""
+    real_finalize_pending = memos_router.uploads_svc.finalize_pending
+
+    async def finalize_pending(db, *args, **kwargs):
+        done = await real_finalize_pending(db, *args, **kwargs)
+        minted.extend(done)
+        real_commit = db.commit
+
+        async def commit_then_drop_the_connection():
+            if landed:
+                await real_commit()
+            else:
+                await db.rollback()
+            raise ConnectionResetError("the connection dropped around COMMIT")
+
+        db.commit = commit_then_drop_the_connection
+        return done
+
+    return finalize_pending
+
+
+@pytest.mark.parametrize("write", ["create", "edit"])
+@pytest.mark.parametrize("landed", [True, False], ids=["commit-landed", "commit-did-not-land"])
+def test_a_memo_write_whose_commit_raises_walks_back_only_when_it_did_not_land(
+    logged_in_client, monkeypatch, tmp_path, landed, write
+):
+    """MEMNG-1190 — the memo create and edit had the walk-back shape MEMNG-1167 fixed for the
+    finalize route: a raise out of `db.commit()` was read as a rollback, so a COMMIT that landed
+    before the connection dropped had its original moved back out of the memo folder and its tier
+    copies deleted, under a live row. Only a write that provably did not land is walked back."""
+    from app.routers import memos as memos_router
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        host, twin = _ready_memo(client)
+        original = Path(_att(twin)["storage_path"])
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        minted: list[str] = []
+        monkeypatch.setattr(
+            memos_router.uploads_svc,
+            "finalize_pending",
+            _memo_write_whose_commit_raises(memos_router, minted, landed=landed),
+        )
+
+        if write == "create":
+            failed = client.post(
+                "/api/memos",
+                json={"content": "june", "visibility": "PRIVATE", "upload_uids": [staged]},
+            )
+        else:
+            failed = client.patch(f"/api/memos/{host['uid']}", json={"upload_uids": [staged]})
+
+        assert failed.status_code == 500
+        assert len(minted) == 1 and minted[0] != twin
+        rows = _rows("SELECT storage_path FROM attachments WHERE uid = :u", u=minted[0])
+        session_rows = _rows("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=staged)
+        if landed:
+            # The write is stored, so everything its row names stays where the write put it.
+            assert len(rows) == 1
+            assert Path(rows[0][0]).read_bytes() == ONE
+            assert os.path.samefile(rows[0][0], original)
+            assert [_tier(minted[0], tier).exists() for tier in TIERS] == [True, True]
+            assert not part.exists()
+            assert session_rows == [(0,)]
+        else:
+            assert rows == []
+            assert [_tier(minted[0], tier).exists() for tier in TIERS] == [False, False]
+            assert os.path.samefile(part, original)  # the staged bytes are back where they were
+            assert session_rows == [(1,)]
+        assert [_tier(twin, tier).exists() for tier in TIERS] == [True, True]
+    finally:
+        _cleanup()
+
+
+@pytest.mark.parametrize("write", ["create", "edit"])
+def test_a_memo_write_whose_commit_outcome_cannot_be_learned_leaves_the_files(
+    logged_in_client, monkeypatch, tmp_path, write
+):
+    """MEMNG-1190 — unknown is not rolled back, on the memo writes too: when the database cannot
+    say whether the COMMIT landed, nothing is walked back, and the request still fails."""
+    from app.routers import memos as memos_router
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        host, twin = _ready_memo(client)
+        original = Path(_att(twin)["storage_path"])
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        minted: list[str] = []
+
+        def no_database():
+            raise ConnectionRefusedError("the database is unreachable")
+
+        monkeypatch.setattr(
+            memos_router.uploads_svc,
+            "finalize_pending",
+            _memo_write_whose_commit_raises(memos_router, minted, landed=False),
+        )
+        monkeypatch.setattr(uploads_svc, "async_session", no_database)
+
+        if write == "create":
+            failed = client.post(
+                "/api/memos",
+                json={"content": "june", "visibility": "PRIVATE", "upload_uids": [staged]},
+            )
+        else:
+            failed = client.patch(f"/api/memos/{host['uid']}", json={"upload_uids": [staged]})
+
+        assert failed.status_code == 500
+        assert len(minted) == 1
+        # Not walked back: the tier copies and the placed original stay where the write put them.
+        assert [_tier(minted[0], tier).exists() for tier in TIERS] == [True, True]
+        assert not part.exists()
+        placed = [p for p in (tmp_path / "originals").rglob("*") if p.is_file() and p != original]
+        assert len(placed) == 1 and os.path.samefile(placed[0], original)
     finally:
         _cleanup()
 
@@ -813,6 +1273,68 @@ def test_a_tier_path_another_row_names_survives_reclaim(
         _cleanup()
 
 
+@pytest.mark.parametrize("reclaimer", ["async", "sync"])
+@pytest.mark.parametrize(
+    "column",
+    ["rendition-names-a-tier", "rendition-names-a-variant", "print-path-names-a-profile"],
+    ids=["rendition", "variant", "print"],
+)
+def test_the_namer_reclaimed_first_leaves_the_tier_its_owner_derives(
+    logged_in_client, monkeypatch, tmp_path, column, reclaimer
+):
+    """MEMNG-1190 — the reverse order of the test above. Row B's rendition or print path names a
+    file in row A's derived tier set. A names it through its uid alone, in no column, so a check
+    that only reads columns finds no other row naming it and reclaiming B FIRST unlinks A's
+    picture. A path a surviving row owns through its uid is that row's, whichever row names it."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        owner_memo, owner = _ready_memo(client, content="may")
+        namer_memo, namer = _ready_memo(client, LONGER, content="june")
+        profile = _profile(owner)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_bytes(b"matte-of-owner")
+        variant = _tier(owner, "thumbs").with_suffix(".webp")
+        variant.write_bytes(b"webp-of-owner")
+        namer_id = _att(namer)["id"]
+        if column == "print-path-names-a-profile":
+            named = profile
+            _exec("UPDATE attachments SET print_path = :p WHERE id = :a", p=str(named), a=namer_id)
+        else:
+            named = _tier(owner, "thumbs") if column == "rendition-names-a-tier" else variant
+            _exec(
+                "INSERT INTO attachment_renditions "
+                "(attachment_id, variant_key, filename, mime, size, storage_path) "
+                "VALUES (:a, 'print', 'p.jpg', 'image/jpeg', 1, :p)",
+                a=namer_id,
+                p=str(named),
+            )
+        kept = named.read_bytes()
+
+        if reclaimer == "async":
+            assert client.delete(f"/api/memos/{namer_memo['uid']}").status_code == 204
+        else:
+            eng = create_engine(SYNC_URL)
+            try:
+                with Session(eng) as session:
+                    done = reclaim.reclaim_attachment_sync(
+                        session, namer_id, reclaim.Revalidate.IDENTITY
+                    )
+            finally:
+                eng.dispose()
+            assert done.outcome == "reclaimed"
+
+        assert _rows("SELECT count(*) FROM attachments WHERE uid = :u", u=namer) == [(0,)]
+        assert named.read_bytes() == kept  # the surviving owner's file, still there
+        # The control: the namer's own uid-derived tiers went with it.
+        assert [p for p in (_tier(namer, tier) for tier in TIERS) if p.exists()] == []
+        # And the owner's reclaim takes it: nothing is leaked by keeping it.
+        assert client.delete(f"/api/memos/{owner_memo['uid']}").status_code == 204
+        assert not named.exists()
+    finally:
+        _cleanup()
+
+
 def test_a_rows_own_column_naming_its_own_tier_does_not_keep_it(
     logged_in_client, monkeypatch, tmp_path
 ):
@@ -865,3 +1387,27 @@ def test_a_path_that_only_starts_with_a_tier_path_does_not_keep_the_tier(
         assert lookalike.read_bytes() == b"named by the other row"
     finally:
         _cleanup()
+
+
+def test_an_implicit_owner_is_matched_by_its_whole_uid_never_a_prefix(monkeypatch, tmp_path):
+    """MEMNG-1190 literal-in-string — a surviving row owns a tier or profile file through its uid,
+    matched as the WHOLE name stem: uid `ab` owns `ab.jpg` and `ab.jpg.tmp` in a profile
+    directory, never `abc.jpg`; and a uid with a dot in it is still found as a candidate."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    matte = tmp_path / "assets" / "printready" / "matte"
+    thumbs = tmp_path / "assets" / "thumbs"
+    named = [
+        str(matte / "ab.jpg"),
+        str(matte / "ab.jpg.tmp"),
+        str(matte / "abc.jpg"),
+        str(thumbs / "abc.jpg"),
+        str(thumbs / "a.b.jpg"),
+        str(tmp_path / "originals" / "ab.jpg"),  # not a derived directory: never implicit
+    ]
+
+    assert reclaim._implicitly_owned("ab", named) == {named[0], named[1]}
+    assert reclaim._implicitly_owned("abc", named) == {named[2], named[3]}
+    assert reclaim._implicitly_owned("a.b", named) == {named[4]}
+    candidates = reclaim._implicit_owner_candidates(named)
+    assert {"ab", "abc", "a", "a.b"} <= set(candidates)
+    assert reclaim._implicitly_owned("ab", [named[5]]) == set()

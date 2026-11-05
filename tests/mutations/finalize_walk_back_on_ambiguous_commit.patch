@@ -1,19 +1,21 @@
 Walk a failed finalize back whether or not its commit landed — the behaviour before MEMNG-1167.
 
 A commit that raised AFTER PostgreSQL committed (a dropped connection, a cancelled request) then
-moves the original out from under a live row and deletes the tier copies it serves. The probe that
-must turn red are the `commit-landed` case and the outcome-unknown case (both must keep the
-files); `commit-did-not-land` stays green, because walking back
-a write that was lost is the right answer and what that case pins.
+moves the original out from under a live row and deletes the tier copies it serves. The probes
+that must turn red are the `commit-landed` case and the two outcome-unknown cases — the database
+unreachable, and a close that outlasts the resolution's deadline (MEMNG-1190) — which must all
+keep the files, and the expiry-reap race (MEMNG-1190): walked back outside the resolver's lock, the
+restored part outlives the row a reap took in the gap. `commit-did-not-land` stays green, because
+walking back a write that was lost is the right answer and what that case pins.
 
 --- a/app/routers/uploads.py
 +++ b/app/routers/uploads.py
-@@ -692,7 +692,7 @@
-             # wrong place can be recovered by hand, one taken from a live row cannot.
+@@ -707,7 +707,7 @@
+             # file in the wrong place can be recovered by hand, one taken from a live row cannot.
              landed, cancelled = (
-                 await _commit_outcome(db, upload_uid, committing)
+                 await _commit_outcome(db, upload_uid, committing, moved)
 -                if committing is not None
 +                if False
-                 else (False, None)
+                 else await _walk_back(moved)
              )
-             if landed is False:
+             if landed is not False:

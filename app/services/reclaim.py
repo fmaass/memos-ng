@@ -93,7 +93,7 @@ from app.models import (
     attachment_tags,
 )
 from app.services import printready, storage
-from app.services.asset_paths import all_asset_paths
+from app.services.asset_paths import all_asset_paths, derived_tier_path, variant_paths
 
 logger = structlog.get_logger(__name__)
 
@@ -274,18 +274,83 @@ def _named_elsewhere_stmt(att_id: int, named: list[str]):
     )
 
 
+_DERIVED_TIERS = ("thumb", "mobile", "web", "poster", printready.TIER)
+
+
+def _profile_root() -> Path:
+    """The directory whose subdirectories hold the print profiles (`profile_variant_paths_sync`)."""
+    return Path(settings.DATA_ROOT) / "assets" / printready.SUBDIR
+
+
+def _implicit_owner_candidates(named: list[str]) -> list[str]:
+    """The uids that could own one of `named` through their uid alone (MEMNG-1190): every name a
+    file in a derived tier directory, or in a print profile directory, could carry. A tier file is
+    `<uid>.<ext>` and a profile file `<uid>.<anything>`, so every prefix that ends before a dot is
+    a candidate — never just the first, a migrated uid is not promised to be dot-free. A candidate
+    is only that: `_implicitly_owned` decides from the uid's own derived set."""
+    tier_dirs = {
+        resolved[0].parent
+        for tier in _DERIVED_TIERS
+        if (resolved := derived_tier_path("_", tier)) is not None
+    }
+    profile_root = _profile_root()
+    uids: set[str] = set()
+    for raw in named:
+        path = Path(raw)
+        if path.parent not in tier_dirs and path.parent.parent != profile_root:
+            continue
+        parts = path.name.split(".")
+        uids.update(".".join(parts[:end]) for end in range(1, len(parts)))
+    uids.discard("")
+    return sorted(uids)
+
+
+def _implicitly_owned(uid: str, named: list[str]) -> set[str]:
+    """Which of `named` belong to `uid` through its uid alone — the derived tiers and their
+    variants (`all_asset_paths`) and the files of its print profiles, matched by the `<uid>.`
+    prefix the profile enumeration uses (`printready.profile_variant_paths_sync`)."""
+    owned: set[str] = set()
+    for tier in _DERIVED_TIERS:
+        resolved = derived_tier_path(uid, tier)
+        if resolved is not None:
+            owned.update(str(p) for p in [resolved[0], *variant_paths(resolved[0])])
+    profile_root = _profile_root()
+    for raw in named:
+        path = Path(raw)
+        if path.parent.parent == profile_root and path.name.startswith(f"{uid}."):
+            owned.add(raw)
+    return owned & set(named)
+
+
+def _surviving_owners_stmt(att_id: int, uids: list[str]):
+    """Which of `uids` belong to an attachment row other than this one."""
+    return select(Attachment.uid).where(Attachment.id != att_id, Attachment.uid.in_(uids))
+
+
+def _owned_elsewhere(named: list[str], owners: list[str]) -> set[str]:
+    return {path for uid in owners for path in _implicitly_owned(uid, named)}
+
+
 async def _named_elsewhere(db: AsyncSession, att: Attachment, paths: list[Path]) -> frozenset[str]:
     """The reference count (MEMNG-959): which of `paths` — every file this reclaim would unlink
-    (MEMNG-1167) — another row still names, which this reclaim must leave on disk. Asked under the
-    per-path locks, so a concurrent reclaim of the other row has either committed its delete (and
-    is not counted) or waits for this one."""
+    (MEMNG-1167) — another row still names, which this reclaim must leave on disk. Named in a
+    column, or owned through its uid: a derived tier is named by no column of the row it belongs
+    to, so a rendition or print path of THIS row naming it would otherwise read as its last name
+    (MEMNG-1190). Asked under the per-path locks, so a concurrent reclaim of the other row has
+    either committed its delete (and is not counted) or waits for this one — that row's reclaim
+    takes the same lock, the path being in its own derivable set."""
     named = _candidate_paths(paths)
     if not named:
         return frozenset()
     for path in named:
         await db.execute(_path_lock_stmt(path))
     rows = await db.execute(_named_elsewhere_stmt(att.id, named))
-    return frozenset(path for (path,) in rows if path)
+    shared = {path for (path,) in rows if path}
+    candidates = _implicit_owner_candidates(named)
+    if candidates:
+        owners = (await db.execute(_surviving_owners_stmt(att.id, candidates))).scalars().all()
+        shared |= _owned_elsewhere(named, list(owners))
+    return frozenset(shared)
 
 
 def _named_elsewhere_sync(session: Session, att: Attachment, paths: list[Path]) -> frozenset[str]:
@@ -296,7 +361,12 @@ def _named_elsewhere_sync(session: Session, att: Attachment, paths: list[Path]) 
     for path in named:
         session.execute(_path_lock_stmt(path))
     rows = session.execute(_named_elsewhere_stmt(att.id, named))
-    return frozenset(path for (path,) in rows if path)
+    shared = {path for (path,) in rows if path}
+    candidates = _implicit_owner_candidates(named)
+    if candidates:
+        owners = session.execute(_surviving_owners_stmt(att.id, candidates)).scalars().all()
+        shared |= _owned_elsewhere(named, list(owners))
+    return frozenset(shared)
 
 
 def _unshared(paths: list[Path], shared: frozenset[str], att: Attachment) -> list[Path]:
