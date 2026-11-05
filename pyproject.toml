@@ -53,6 +53,9 @@ dependencies = [
     # The trip pass QR code (app/services/passes.py): a maintained, pure-Python encoder with no
     # native dependency, so the slim image needs nothing new.
     "segno>=1.6,<2",
+    # Local password sign-in (MEMNG-1097): argon2id hashes. Its bindings ship abi3 manylinux wheels
+    # for x86_64 and aarch64, so the slim image needs no compiler for it.
+    "argon2-cffi>=25,<26",
 ]
 
 [dependency-groups]

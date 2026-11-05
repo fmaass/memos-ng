@@ -5,10 +5,13 @@ import json
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
 import structlog
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import or_, select, update
@@ -47,6 +50,105 @@ def new_pkce() -> tuple[str, str]:
     return verifier, challenge
 
 
+# --- OIDC discovery (MEMNG-1089) ---
+
+# Each endpoint setting and the key that names it in an OpenID Provider Configuration document.
+OIDC_ENDPOINT_KEYS = {
+    "OIDC_AUTHORIZE_ENDPOINT": "authorization_endpoint",
+    "OIDC_TOKEN_ENDPOINT": "token_endpoint",
+    "OIDC_JWKS_URI": "jwks_uri",
+    "OIDC_USERINFO_ENDPOINT": "userinfo_endpoint",
+    "OIDC_END_SESSION_ENDPOINT": "end_session_endpoint",
+}
+# OpenID Connect Discovery 1.0 §3 only RECOMMENDS these two; every path that reads them tolerates
+# their absence, so a provider without them is not refused.
+OIDC_OPTIONAL_ENDPOINTS = frozenset({"OIDC_USERINFO_ENDPOINT", "OIDC_END_SESSION_ENDPOINT"})
+
+# What discovery resolved, per setting — written once, whole, after the document was accepted.
+_discovered: dict[str, str] = {}
+# Startup awaits discovery once; the lock only keeps an accidental second caller from asking the
+# provider again while the first is still waiting on it.
+_discovery_lock = asyncio.Lock()
+
+
+class OidcDiscoveryError(RuntimeError):
+    """The provider's configuration could not be resolved; the app refuses to start."""
+
+
+def oidc_endpoint(field: str) -> str:
+    """The endpoint to use for `field`: the setting when it is non-empty, else what discovery
+    resolved, else "" (an optional endpoint the provider does not offer)."""
+    return getattr(settings, field) or _discovered.get(field, "")
+
+
+def _is_https(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme.lower() == "https" and bool(parts.netloc)
+
+
+def _unresolved_endpoints() -> list[str]:
+    return [f for f in OIDC_ENDPOINT_KEYS if not getattr(settings, f) and f not in _discovered]
+
+
+async def discover_oidc(transport: httpx.AsyncBaseTransport | None = None) -> None:
+    """Resolve every empty endpoint setting from the issuer's discovery document.
+
+    An explicitly set endpoint always wins and is never compared with the document; when every
+    endpoint is set no request is made at all. Any failure raises `OidcDiscoveryError` naming the
+    issuer and leaves nothing half-resolved behind.
+    """
+    issuer = settings.OIDC_ISSUER
+    if not issuer:
+        return
+    async with _discovery_lock:
+        missing = _unresolved_endpoints()
+        if not missing:
+            return
+        url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+
+        def refuse(reason: str) -> OidcDiscoveryError:
+            return OidcDiscoveryError(f"OIDC discovery from issuer {issuer} failed: {reason}")
+
+        # Whoever can answer the discovery request chooses every endpoint it resolves — the
+        # userinfo answer becomes the signed-in identity — so discovery only ever runs, and only
+        # ever resolves, over TLS. An endpoint the operator set is not judged here.
+        if not _is_https(issuer):
+            raise refuse("discovery needs an https issuer")
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings.OIDC_DISCOVERY_TIMEOUT_S, transport=transport
+            ) as client:
+                resp = await client.get(url, headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            document = resp.json()
+        except httpx.HTTPStatusError as exc:
+            raise refuse(f"{url} answered HTTP {exc.response.status_code}") from exc
+        except httpx.HTTPError as exc:
+            raise refuse(f"{url} unreachable ({type(exc).__name__})") from exc
+        except ValueError as exc:
+            raise refuse(f"{url} is not JSON") from exc
+        if not isinstance(document, dict):
+            raise refuse(f"{url} is not a JSON object")
+        # Discovery §4.3: the document's issuer MUST be identical to the one it was fetched for,
+        # and it is what every id_token's `iss` is checked against.
+        if document.get("issuer") != issuer:
+            raise refuse(f"the document names issuer {document.get('issuer')!r}")
+        resolved: dict[str, str] = {}
+        for field in missing:
+            value = document.get(OIDC_ENDPOINT_KEYS[field])
+            if value is None and field in OIDC_OPTIONAL_ENDPOINTS:
+                resolved[field] = ""
+            elif isinstance(value, str) and value:
+                if not _is_https(value):
+                    raise refuse(f"{OIDC_ENDPOINT_KEYS[field]} {value!r} is not https")
+                resolved[field] = value
+            else:
+                raise refuse(f"no usable {OIDC_ENDPOINT_KEYS[field]} for {field}")
+        _discovered.update(resolved)
+    logger.info("oidc_discovered", issuer=issuer, endpoints=sorted(resolved))
+
+
 # --- OIDC network calls (mocked in tests; never use the internal authelia URL) ---
 
 
@@ -60,7 +162,7 @@ async def exchange_code(code: str, verifier: str) -> dict:
         "code_verifier": verifier,
     }
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(settings.OIDC_TOKEN_ENDPOINT, data=data)
+        resp = await client.post(oidc_endpoint("OIDC_TOKEN_ENDPOINT"), data=data)
         resp.raise_for_status()
         return resp.json()
 
@@ -71,7 +173,7 @@ _jwk_client: jwt.PyJWKClient | None = None
 def _jwks() -> jwt.PyJWKClient:
     global _jwk_client
     if _jwk_client is None:
-        _jwk_client = jwt.PyJWKClient(settings.OIDC_JWKS_URI)
+        _jwk_client = jwt.PyJWKClient(oidc_endpoint("OIDC_JWKS_URI"))
     return _jwk_client
 
 
@@ -92,15 +194,26 @@ def validate_id_token(id_token: str) -> dict:
 
 async def fetch_userinfo(access_token: str | None) -> dict:
     """Authelia returns preferred_username/name/email/groups from the userinfo endpoint, not
-    the (minimal, sub-only) id_token. Returns {} if there's no access token."""
-    if not access_token:
+    the (minimal, sub-only) id_token. Returns {} if there's no access token, or no userinfo
+    endpoint (a provider whose discovery offers none)."""
+    endpoint = oidc_endpoint("OIDC_USERINFO_ENDPOINT")
+    if not access_token or not endpoint:
         return {}
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            settings.OIDC_USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {access_token}"}
-        )
+        resp = await client.get(endpoint, headers={"Authorization": f"Bearer {access_token}"})
         resp.raise_for_status()
         return resp.json()
+
+
+def role_for_claims(claims: dict) -> str:
+    """`admin` when the claims carry the configured admin marker (`OIDC_ADMIN_CLAIM`), else
+    `user`. The marker is a group in `groups` or a claim whose value is boolean true; unset, it is
+    the `admins` group, the rule this replaced."""
+    marker = settings.OIDC_ADMIN_CLAIM
+    groups = claims.get("groups")
+    if isinstance(groups, list) and (marker or "admins") in groups:
+        return "admin"
+    return "admin" if marker and claims.get(marker) is True else "user"
 
 
 async def upsert_user(db: AsyncSession, claims: dict) -> User:
@@ -108,7 +221,7 @@ async def upsert_user(db: AsyncSession, claims: dict) -> User:
     if not subject:
         raise HTTPException(status_code=400, detail="id_token missing subject")
     user = (await db.execute(select(User).where(User.subject == subject))).scalar_one_or_none()
-    role = "admin" if "admins" in (claims.get("groups") or []) else "user"
+    role = role_for_claims(claims)
     if user is None:
         user = User(
             subject=subject,
@@ -140,6 +253,46 @@ async def create_session(db: AsyncSession, user: User, tokens: dict) -> str:
     )
     await db.flush()
     return sid
+
+
+# --- local passwords (MEMNG-1097) ---
+
+# What a local sign-in stores as a session's tokens: there are none, and this marks the session as
+# one no identity provider has to be told about at logout.
+LOCAL_SESSION_TOKENS = {"auth": "local"}
+
+# argon2-cffi's defaults are argon2id with RFC 9106's low-memory profile and a fresh 16-byte salt
+# per hash; a hash written under older parameters is upgraded at the next successful sign-in.
+_hasher = PasswordHasher()
+_dummy_hash: str | None = None
+
+
+def hash_password(password: str) -> str:
+    return _hasher.hash(password)
+
+
+def verify_password(hashed: str | None, password: str) -> bool:
+    """True only for the password `hashed` was made from. An absent or malformed hash is False,
+    never an error: an account without a local password simply cannot be opened by one."""
+    if not hashed:
+        return False
+    try:
+        return _hasher.verify(hashed, password)
+    except (VerificationError, InvalidHashError):
+        return False
+
+
+def password_needs_rehash(hashed: str) -> bool:
+    return _hasher.check_needs_rehash(hashed)
+
+
+def burn_password_check(password: str) -> None:
+    """Spend what one real verification costs, for a sign-in naming no account — so the answer's
+    timing does not say which usernames exist."""
+    global _dummy_hash
+    if _dummy_hash is None:
+        _dummy_hash = _hasher.hash(secrets.token_urlsafe(16))
+    verify_password(_dummy_hash, password)
 
 
 async def load_session(db: AsyncSession, sid: str) -> WebSession | None:

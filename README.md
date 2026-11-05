@@ -187,7 +187,10 @@ All settings come from the environment (or a `.env` file). Key variables — see
 | `MAX_UPLOAD_MIB` | `4096` | upload size cap (413 above it); a session is also refused with 507 while the volume holding its part file has less free space than its size plus 10 % |
 | `NEVER_LINKED_SWEEP_ENABLED` | `false` | lets the worker's hourly pass reclaim attachments a standalone finalize made and no memo took, 72 h after creation (MEMNG-968); while off it logs `unlinked_attachments_sweep_disabled` each pass and deletes nothing, and the orphan count metric keeps counting those rows |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | empty (push disabled) | Web Push (VAPID) keypair |
-| Authelia OIDC | — | confidential BFF client; public `https://auth…` endpoints only |
+| `OIDC_ISSUER` + `OIDC_AUTHORIZE_ENDPOINT` / `OIDC_TOKEN_ENDPOINT` / `OIDC_JWKS_URI` / `OIDC_USERINFO_ENDPOINT` / `OIDC_END_SESSION_ENDPOINT` | the household's Authelia | confidential BFF client; public `https://` endpoints only. An endpoint set to empty is resolved once at startup from `<OIDC_ISSUER>/.well-known/openid-configuration`; a non-empty one always wins and is never asked of the provider. A discovery that fails stops startup with an error naming the issuer |
+| `OIDC_DISCOVERY_TIMEOUT_S` | `10` | bound on that one discovery request |
+| `OIDC_ADMIN_CLAIM` | empty (the `admins` group) | group in the `groups` claim, or claim whose value is boolean `true`, that makes an OIDC user an admin at login |
+| `LOCAL_LOGIN` | `false` | `1` enables `POST /api/auth/local/login` (`{"username", "password"}`, same-origin only), which checks the user's argon2id `password_hash` and sets the same session cookie an OIDC login does; unset, the route answers 404. Passwords are set with `python -m app.local_password <username> [--create [--admin]]` |
 
 ## Changelog
 

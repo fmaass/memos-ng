@@ -63,6 +63,9 @@ def _create_data_dirs_sync(data_root: Path) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_runtime_secrets()  # fail fast if prod is on the dev-default key
+    # Before the first request can need an endpoint: a provider that cannot be resolved stops
+    # startup here, by name, instead of failing every login later.
+    await auth.discover_oidc()
     data_root = Path(settings.DATA_ROOT)
     await to_thread.run_sync(_create_data_dirs_sync, data_root)
     # The digest metrics snapshot: a supervised task refreshes it every 60 s and the custom

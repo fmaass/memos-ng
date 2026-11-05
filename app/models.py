@@ -152,6 +152,9 @@ class User(Base):
         Boolean, default=False, server_default=text("false")
     )
     theme: Mapped[str] = mapped_column(String(32), default="dark")
+    # argon2id hash for a local password sign-in (MEMNG-1097, only read when LOCAL_LOGIN=1). NULL is
+    # an account without a local password, which no password can open — every OIDC-created user.
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     # Retained (nullable, now UNUSED) after the SMTP frame-send path and per-user frame settings
     # were removed — #curated delivery is now a system-level album HTTP upload. Kept for one
     # rollback release; nothing reads or writes these columns.

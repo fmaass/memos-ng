@@ -311,8 +311,12 @@ class Settings(BaseSettings):
     DROPBOX_APP_SECRET: str = Field(default="", repr=False)
     DROPBOX_REFRESH_TOKEN: str = Field(default="", repr=False)
 
-    # Authelia OIDC (confidential BFF). PUBLIC https endpoints only — never the
+    # OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).
+    # Each endpoint below that is set to "" is resolved at startup from
+    # `<OIDC_ISSUER>/.well-known/openid-configuration` (MEMNG-1089); a non-empty one is used as
+    # given and never asked of the provider. The Authelia defaults stay until the household's own
+    # env names every endpoint it relies on — removing one today would move it onto discovery.
     OIDC_CLIENT_ID: str = "memos-ng"
     OIDC_CLIENT_SECRET: str = ""  # set via stack .env in prod
     OIDC_ISSUER: str = "https://auth.discomarder.live"
@@ -325,6 +329,16 @@ class Settings(BaseSettings):
     OIDC_END_SESSION_ENDPOINT: str = "https://auth.discomarder.live/api/oidc/logout"
     OIDC_REDIRECT_URI: str = "https://memos-ng.discomarder.live/api/auth/callback"
     OIDC_POST_LOGOUT_REDIRECT_URI: str = "https://memos-ng.discomarder.live/"
+    # Bounds the one discovery request; a provider slower than this fails startup by name.
+    OIDC_DISCOVERY_TIMEOUT_S: float = 10.0
+    # What makes an OIDC user an admin at login: a group of that name in the `groups` claim, or
+    # a claim of that name whose value is boolean true. Empty keeps the original rule, the
+    # `admins` group.
+    OIDC_ADMIN_CLAIM: str = ""
+    # Local username + password sign-in (MEMNG-1097): `POST /api/auth/local/login` checks a user's
+    # `password_hash` (set with `python -m app.local_password <username>`) and issues the same BFF
+    # session the OIDC callback does. Off, the route answers 404.
+    LOCAL_LOGIN: bool = False
 
     # BFF session. SESSION_SECRET is a Fernet key encrypting tokens at rest; the
     # default is DEV-ONLY and must be overridden in prod via the stack .env.

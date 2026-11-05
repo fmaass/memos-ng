@@ -50,6 +50,8 @@ ANONYMOUS_ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/api/auth/login"): "starts the OIDC login; the caller has no credential yet",
     ("GET", "/api/auth/callback"): "the OIDC redirect target; the code and state are its authority",
     ("POST", "/api/auth/logout"): "ends the session the cookie names, if any; a no-op otherwise",
+    ("POST", "/api/auth/local/login"): "LOCAL_LOGIN sign-in; the username and password are the "
+    "authority, and with LOCAL_LOGIN unset it answers 404",
     ("POST", "/api/auth/native/exchange"): "a device obtains its first token here; requiring one "
     "would be circular",
     ("POST", "/api/auth/native/manage-grant"): "the handoff code minted by a fresh Authelia login "

@@ -4,13 +4,14 @@ from urllib.parse import urlencode
 
 import httpx
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import Row, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import auth
+from app import auth, csrf
 from app.api_types import Rfc3339Datetime
 from app.config import settings
 from app.database import get_session
@@ -107,7 +108,7 @@ async def login(
     else:
         tx["next"] = _safe_next(next)
     resp = RedirectResponse(
-        f"{settings.OIDC_AUTHORIZE_ENDPOINT}?{urlencode(params)}", status_code=302
+        f"{auth.oidc_endpoint('OIDC_AUTHORIZE_ENDPOINT')}?{urlencode(params)}", status_code=302
     )
     resp.set_cookie(
         auth.TX_COOKIE,
@@ -246,6 +247,12 @@ async def callback(
     await db.commit()
     resp = RedirectResponse(_safe_next(tx.get("next")), status_code=302)  # defence in depth
     resp.delete_cookie(auth.TX_COOKIE)
+    _set_session_cookie(resp, sid)
+    return resp
+
+
+def _set_session_cookie(resp: Response, sid: str) -> None:
+    """The one shape of the BFF session cookie, whichever sign-in path minted the session."""
     resp.set_cookie(
         auth.SID_COOKIE,
         sid,
@@ -254,6 +261,64 @@ async def callback(
         secure=settings.COOKIE_SECURE,
         samesite="lax",
     )
+
+
+class LocalLoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    # Bounded so a sign-in cannot make the server hash megabytes; empty is judged, not rejected.
+    password: str = Field(max_length=1024)
+
+
+def _local_login_enabled() -> None:
+    # Declared before every other dependency, and the body is only read after it, so with
+    # LOCAL_LOGIN unset nothing about the route — not its rate limit, not its validation — answers
+    # anything but absence.
+    if not settings.LOCAL_LOGIN:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+LOCAL_LOGIN_REFUSED = "Invalid username or password"
+
+
+@router.post("/local/login", include_in_schema=False)
+async def local_login(
+    request: Request,
+    _enabled: None = Depends(_local_login_enabled),
+    _: None = Depends(auth.rate_limit()),
+    db: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    """Sign in with a local username and password (MEMNG-1097, LOCAL_LOGIN=1).
+
+    Answers with the same BFF session cookie the OIDC callback sets. A wrong password, an unknown
+    username and an account without a local password are one indistinguishable 401.
+    """
+    # No session cookie rides this request, so the CSRF middleware lets it through; a cross-site
+    # page must still not be able to sign the browser into an account of its choosing.
+    stated = csrf.stated_origin(request.headers.get("origin"), request.headers.get("referer"))
+    if stated != csrf.canonical_origin():
+        raise HTTPException(status_code=403, detail="Cross-origin sign-in refused")
+    # Read here rather than declared as a body parameter: FastAPI parses a declared JSON body
+    # before any dependency runs, so a malformed one would answer 422 even with LOCAL_LOGIN off.
+    try:
+        body = LocalLoginIn.model_validate_json(await request.body())
+    except ValidationError as invalid:
+        raise RequestValidationError(invalid.errors()) from None
+    user = (
+        await db.execute(select(User).where(User.subject == body.username))
+    ).scalar_one_or_none()
+    if user is None:
+        auth.burn_password_check(body.password)
+        raise HTTPException(status_code=401, detail=LOCAL_LOGIN_REFUSED)
+    if not auth.verify_password(user.password_hash, body.password):
+        logger.info("local_login_refused", user_id=user.id)
+        raise HTTPException(status_code=401, detail=LOCAL_LOGIN_REFUSED)
+    if user.password_hash and auth.password_needs_rehash(user.password_hash):
+        user.password_hash = auth.hash_password(body.password)
+    sid = await auth.create_session(db, user, auth.LOCAL_SESSION_TOKENS)
+    await db.commit()
+    logger.info("local_login", user_id=user.id)
+    resp = JSONResponse({"ok": True})
+    _set_session_cookie(resp, sid)
     return resp
 
 
@@ -619,18 +684,27 @@ async def logout(request: Request, db: AsyncSession = Depends(get_session)) -> J
     # Kill the local session AND hand back an RP-initiated logout URL (id_token_hint +
     # post_logout_redirect_uri) so the SPA can end the Authelia session too (plan T1.2).
     id_token = None
+    local = False
     sid = request.cookies.get(auth.SID_COOKIE)
     if sid:
         ws = await auth.load_session(db, sid)
         if ws:
             tokens = auth.decrypt(ws.encrypted_tokens) or {}
             id_token = tokens.get("id_token")
+            local = tokens == auth.LOCAL_SESSION_TOKENS
             await db.delete(ws)
             await db.commit()
     params = {"post_logout_redirect_uri": settings.OIDC_POST_LOGOUT_REDIRECT_URI}
     if id_token:
         params["id_token_hint"] = id_token
-    logout_url = f"{settings.OIDC_END_SESSION_ENDPOINT}?{urlencode(params)}"
+    end_session = auth.oidc_endpoint("OIDC_END_SESSION_ENDPOINT")
+    # A provider that offers no RP-initiated logout leaves nothing to end there, and a local
+    # sign-in never had a provider session to end.
+    logout_url = (
+        f"{end_session}?{urlencode(params)}"
+        if end_session and not local
+        else settings.OIDC_POST_LOGOUT_REDIRECT_URI
+    )
     resp = JSONResponse({"ok": True, "logout_url": logout_url})
     resp.delete_cookie(auth.SID_COOKIE)
     return resp
