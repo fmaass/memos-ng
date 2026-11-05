@@ -218,6 +218,10 @@ All settings come from the environment (or a `.env` file). Key variables — see
 - Deleting a memo takes the trip ledger rows naming it before it takes the memo's own lock, the
   order a filing uses. A delete beside a running filing could deadlock, and Postgres aborted one of
   the two with `40P01`.
+- Smaller hardening on the guest path. Refusals are ordered against a lift by event id under the
+  pass lock, so one stamped after a lift but committed before it stays spent. A batch records the
+  pass version that admitted it. The write recording a cancelled sync ends inside a
+  2 s deadline. A part the upload sweep cannot remove now leaves a log line and the rest still go.
 - One additive migration, `a13d0e5c7b21`, runs at boot on both databases. It adds the `ingest_moves`
   table, `ingest_batches.pass_version`, `resolved_at` and `resolved_by`,
   `trip_ingest_cursor.quarantined_unknown_total` and `quarantined_unknown_cleared`, and
