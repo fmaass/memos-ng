@@ -25,7 +25,7 @@ isProject: false
 
 **Current state (observed 2026-07-19):** memos-ng has a fully implemented #curated → Aura frame pipeline (plan `PLAN_2026-07-03_aura-frame-email`, status: all phases done). When a memo is tagged `#curated`, `maybe_enqueue_frame_shares` inserts rows into `frame_share_jobs`. The worker drains the queue: renders each image to a 2048px JPEG (ADR-0012), then emails it via aiosmtplib through iCloud SMTP (`smtp.mail.me.com:587`) to the user's configured `@send.auraframes.com` address. Per-user settings (`frame_send_to`, `frame_send_from` on the `users` table) are exposed in the frontend SettingsView with a "Send test photo" button.
 
-Separately, the `aura-frames` project (`/home/fabian/projects/aura-frames`, deployed at `frames.discomarder.live` on Jupiter) provides a dedicated photo album → frame management system. It accepts photo uploads (`POST /api/albums/{id}/photos`, raw binary + `X-Filename` header), auto-syncs uploads to following frames via `album_sync.trigger_album_fanout()`, and handles the SMTP delivery to Aura via its own scheduler. A target album "Damian #curated" already exists in production (the "Fabian & Laura" frame follows "Esperando a Damian" album, observed 2026-07-19).
+Separately, the `aura-frames` project (`<home>/projects/aura-frames`, deployed at `<frames-host>` on Jupiter) provides a dedicated photo album → frame management system. It accepts photo uploads (`POST /api/albums/{id}/photos`, raw binary + `X-Filename` header), auto-syncs uploads to following frames via `album_sync.trigger_album_fanout()`, and handles the SMTP delivery to Aura via its own scheduler. A target album "<child> #curated" already exists in production (the household frame follows "Esperando a <child>" album, observed 2026-07-19).
 
 **Problem / motivation:** Two systems independently implement Aura SMTP delivery — memos-ng's `frame_share.py` and aura-frames' scheduler. This is duplicated infrastructure. aura-frames is the purpose-built system for album/frame management and already handles queuing, retry, dedup, and delivery scheduling. memos-ng should delegate delivery to it by uploading to the album API and letting aura-frames handle the rest.
 
@@ -47,13 +47,13 @@ Separately, the `aura-frames` project (`/home/fabian/projects/aura-frames`, depl
 - ADR-0012 (memos-ng): 2048px longest-edge cap — do not re-litigate
 - ADR-0011 (memos-ng): at-most-once delivery via committed claim tombstone — the `claimed` state semantics carry over (httpx upload replaces SMTP send, same idempotency boundary)
 - The target album in aura-frames is pre-created. The album_id is a configuration value, not discovered at runtime.
-- **Target album is `album#5 "Damian #curated"` (`FRAME_ALBUM_ID=5`)** — the dedicated album created for this feature (user-confirmed 2026-07-19). This is NOT the same as `album#4 "Esperando a Damian"`, which the frame already follows. Because album#5 has NO frame follower yet, a follow MUST be added (see Phase 2 prerequisite) or uploaded photos will sit in the album and never reach a frame.
+- **Target album is `album#5 "<child> #curated"` (`FRAME_ALBUM_ID=5`)** — the dedicated album created for this feature (user-confirmed 2026-07-19). This is NOT the same as `album#4 "Esperando a <child>"`, which the frame already follows. Because album#5 has NO frame follower yet, a follow MUST be added (see Phase 2 prerequisite) or uploaded photos will sit in the album and never reach a frame.
 
 **Dated production evidence (2026-07-19):**
-- aura-frames DB: frame#2 "Fabian & Laura" enabled=True, `aura_email=b8c21a6d79c310d4bf5d@send.auraframes.com`
+- aura-frames DB: frame#2 (the household frame) enabled=True, `aura_email=<frame-send-to-address>`
 - aura-frames DB: frame "Yas & Flo" enabled=False
-- aura-frames DB: albums — #4 "Esperando a Damian" (followed by frame#2), **#5 "Damian #curated" (the target — currently followed by NO frame)**
-- aura-frames container env (AFTER this session's live work): `SCHEDULER_ENABLED=true`, SMTP now **Fastmail** (`smtp.fastmail.com`, `FRAME_SEND_FROM=fabianmaass@fastmail.fm`); the Aura frames were reconfigured to accept only the Fastmail sender (the old iCloud `@me.com` sender is de-authorized)
+- aura-frames DB: albums — #4 "Esperando a <child>" (followed by frame#2), **#5 "<child> #curated" (the target — currently followed by NO frame)**
+- aura-frames container env (AFTER this session's live work): `SCHEDULER_ENABLED=true`, SMTP now **Fastmail** (`smtp.fastmail.com`, `FRAME_SEND_FROM=<owner-email>`); the Aura frames were reconfigured to accept only the Fastmail sender (the old iCloud `@me.com` sender is de-authorized)
 - memos-ng: `frame_share_jobs` table exists (201 sent, 0 queued); the per-user direct-send path was **disabled this session** (user#3 `frame_send_to`/`frame_send_from` cleared) to stop `@me.com` bounces — so `#curated` photos reach no frame until this plan is built
 
 **Hard-won constraints from prior sessions:**
@@ -65,7 +65,7 @@ Separately, the `aura-frames` project (`/home/fabian/projects/aura-frames`, depl
 
 1. **Machine auth mechanism (aura-frames):** An env-based, **upload-scoped** shared secret (`FRAME_API_TOKEN`), constant-time compared with `hmac.compare_digest`, gating ONLY the album-upload endpoint — not a full-admin credential. Alternative considered and rejected: a DB-backed `api_tokens` table with hashed tokens (see Rejected Alternatives #5). The env-secret keeps `resolve_identity` synchronous (no async/DB refactor of the auth core), grants least privilege (upload only, never album/frame deletion), and needs no migration. Changing after build: swap to a DB table, medium cost.
 
-2. **Album target configuration (memos-ng):** Single env var `FRAME_ALBUM_ID=5` (album#5 "Damian #curated", user-confirmed). Alternative: per-user album mapping in DB. Changing after build: one env var (or migration + settings UI if per-user), low/medium cost — per-user is unnecessary for a single-household system.
+2. **Album target configuration (memos-ng):** Single env var `FRAME_ALBUM_ID=5` (album#5 "<child> #curated", user-confirmed). Alternative: per-user album mapping in DB. Changing after build: one env var (or migration + settings UI if per-user), low/medium cost — per-user is unnecessary for a single-household system.
 
 3. **SMTP removal scope:** Remove the SMTP *frame-delivery* path from memos-ng (frame_share.py send logic, aiosmtplib dep, settings UI section). The per-user `frame_send_to`/`frame_send_from` columns are made **nullable-and-unused** (kept, not dropped) for one rollback release — see Phase 3. Alternative: keep SMTP as fallback. Changing after removal: re-add from git history, low cost.
 
@@ -115,7 +115,7 @@ Three-phase approach ordered by dependency:
 - **Do NOT:** Add a DB `api_tokens` table, a token-CRUD router, OAuth2/JWT, per-token audit, rate limiting, or any change to `resolve_identity`. Do not grant the bearer identity `is_admin=True`.
 - **Verification:**
   ```
-  cd /home/fabian/projects/aura-frames && uv run pytest -q
+  cd <home>/projects/aura-frames && uv run pytest -q
   # Manual: upload a photo with the bearer secret
   curl -i -X POST http://localhost:8091/api/albums/<ALBUM_ID>/photos \
     -H "Authorization: Bearer $FRAME_API_TOKEN" \
@@ -132,7 +132,7 @@ Three-phase approach ordered by dependency:
 ### Phase 2 — Replace memos-ng SMTP send with album API upload
 
 - **Branch:** `feature/frame-api-upload` in memos-ng repo
-- **Prerequisite (aura-frames, one-time config — do FIRST):** make frame#2 "Fabian & Laura" follow `album#5 "Damian #curated"` (`POST /api/albums/5/frames/2` with `{"include_existing": false}`, or via the admin UI). Without this follow, `album_sync.trigger_album_fanout()` materializes nothing and uploaded photos never reach the frame. Verify: the follow row exists in `frame_album_follows` (album_id=5, frame_id=2).
+- **Prerequisite (aura-frames, one-time config — do FIRST):** make frame#2 (the household frame) follow `album#5 "<child> #curated"` (`POST /api/albums/5/frames/2` with `{"include_existing": false}`, or via the admin UI). Without this follow, `album_sync.trigger_album_fanout()` materializes nothing and uploaded photos never reach the frame. Verify: the follow row exists in `frame_album_follows` (album_id=5, frame_id=2).
 - **Build:**
   - `app/config.py`: add `FRAME_API_URL: str = ""`, `FRAME_ALBUM_ID: int = 0` (set to `5` in prod .env), `FRAME_API_TOKEN: str = ""`. Keep existing SMTP_* settings (used for other features).
   - `app/services/frame_share.py`:
@@ -150,7 +150,7 @@ Three-phase approach ordered by dependency:
 - **Do NOT:** Remove SMTP code yet (Phase 3). Change the enqueue trigger logic (#curated tag detection stays identical). Modify the render path.
 - **Verification:**
   ```
-  cd /home/fabian/projects/memos-ng
+  cd <home>/projects/memos-ng
   uv run pyright app/ && uv run ruff check app/ tests/ && uv run pytest -q
   # Integration: configure FRAME_API_URL/ALBUM_ID/TOKEN in .env, tag a memo #curated,
   # then confirm the photo landed in the aura-frames album. The upload-scoped token
@@ -181,7 +181,7 @@ Three-phase approach ordered by dependency:
 - **Do NOT:** Drop the `frame_share_jobs` table (historical audit trail) or the `frame_send_to`/`frame_send_from` columns (rollback safety this release). Remove the #curated enqueue logic (it stays, now on the upload path). Touch any non-frame SMTP usage if one exists.
 - **Verification (must pass ALL — mirrors the CI jobs):**
   ```
-  cd /home/fabian/projects/memos-ng
+  cd <home>/projects/memos-ng
   uv run pyright app/ && uv run ruff check app/ tests/ && uv run pytest -q && uv run alembic check
   # API-drift gate (the one the plan previously omitted):
   uv run python scripts/gen-openapi.py && (cd frontend && npm run gen:api)
@@ -214,10 +214,10 @@ Before merge: a **final cross-model audit** of the full branch against the Accep
 
 ## Dependencies on Current State
 
-- aura-frames deployed and healthy at `frames.discomarder.live` (confirmed 2026-07-19); scheduler enabled, Fastmail SMTP verified
-- Target album exists in aura-frames production: `album#5 "Damian #curated"` — but requires a NEW follow from frame#2 "Fabian & Laura" (Phase 2 prerequisite); it is currently unfollowed
+- aura-frames deployed and healthy at `<frames-host>` (confirmed 2026-07-19); scheduler enabled, Fastmail SMTP verified
+- Target album exists in aura-frames production: `album#5 "<child> #curated"` — but requires a NEW follow from frame#2 (the household frame) (Phase 2 prerequisite); it is currently unfollowed
 - memos-ng deployed at `memos-ng.discomarder.live` with the existing SMTP frame pipeline operational
-- Both repos cloned locally: `/home/fabian/projects/aura-frames`, `/home/fabian/projects/memos-ng`
+- Both repos cloned locally: `<home>/projects/aura-frames`, `<home>/projects/memos-ng`
 - PostgreSQL databases accessible for both projects
 
 ## Risks

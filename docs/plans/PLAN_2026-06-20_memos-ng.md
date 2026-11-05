@@ -326,7 +326,7 @@ client still resolves; client in template with `CHANGE_ME_*` placeholder.
 `chain-authelia@file`** — app-managed OIDC per ADR-0002; `autoheal=true`; curl healthcheck
 `/health` on `127.0.0.1`; `wud.watch=false` while locally built Phases 0–4) and
 `memos-ng-worker` (internal + postgres_net, `cpu_shares: 512`, `mem_limit: 4g`, no Traefik).
-Volume `/volume1/docker/memos-ng:/app/data` (create as `fabian`). Dirs `originals/`,
+Volume `/volume1/docker/memos-ng:/app/data` (create as `<nas-user>`). Dirs `originals/`,
 `assets/{thumbs,mobile,web}/`. *AC:* skeleton SPA reachable via https, both containers
 healthy, worker idles on empty queue.
 

@@ -178,7 +178,7 @@ stranger fail; **P2** is embarrassing but survivable for a week.
 | 1 | P0 | No license file; README says "not licensed for redistribution" | `README.md:1221-1223`, both repo roots | 4 |
 | 2 | P0 | **Nobody but the household can log in.** OIDC endpoints are configured one by one with Authelia defaults on `auth.discomarder.live` (`OIDC_ISSUER`, `OIDC_AUTHORIZE_ENDPOINT`, `OIDC_TOKEN_ENDPOINT`, `OIDC_JWKS_URI`, `OIDC_USERINFO_ENDPOINT`, `OIDC_END_SESSION_ENDPOINT`); no `.well-known` discovery; no local username/password path; users exist only after a first OIDC login (or the importer, `migrate_from_memos.py:105`); the `admin` role is "member of the Authelia group `admins`" | `app/config.py:299-310`, `app/auth.py:106-127`, `app/auth.py:111`, `app/routers/auth.py:51,170` | 1 |
 | 3 | P0 | Household defaults baked into `Settings`: `OIDC_REDIRECT_URI`/post-logout/`NATIVE_CALLBACK_URL` on `discomarder.live`, `TRIP_PASS_BASE_URL` on `trip.discomarder.live`, `VAPID_SUBJECT` = `mailto:admin@discomarder.live`, `SMTP_HOST` = `smtp.mail.me.com`, `IOS_BUNDLE_ID` = `live.discomarder.memosng`, `THERMAL_MAX_C` = 90 tuned to one host (`THERMAL_ZONE` already resolves the sensor by name, `:171`) | `app/config.py:309-310,334,128,243,249,355-357,180-192` | 1, 2 |
-| 4 | P0 | Tracked file with family members' names and the production inventory | `memory/parity-scope.md` (tracked; "fabian admin …, laura, 108 memos …") | 4 |
+| 4 | P0 | Tracked file with family members' names and the production inventory | `memory/parity-scope.md` (tracked; it named the owner and the second household member and listed the household's few users and their memos) | 4 |
 | 5 | P0 | The tracked `CLAUDE.md` is the household's operations manual: hostnames, LAN addresses, ports, the NFS paths, where the sudo password file lives on the NAS | `CLAUDE.md` (19.6 KB, tracked); same class in the iOS `CLAUDE.md` | 4 |
 | 6 | P0 | No secret-scan of 364 + 409 commits of history; a 44-character dev `SESSION_SECRET` is in the tree by design (refused in production by `validate_runtime_secrets`) | `app/config.py:12,395-400` | 4 |
 | 7 | P0 | GPLv2 x265 inside the `pillow-heif` wheel; no third-party notices; no ffmpeg source offer | `pyproject.toml` (`pillow-heif>=0.18,<2`), `Dockerfile:21-23` | 4 |
@@ -648,8 +648,7 @@ and a second worker container on a beefier box joins and the backlog drains twic
 - **Low-end defaults.** The compose ships `WORKER_CPU_BUDGET=2`, one light slot, one transcode
   slot at `FFMPEG_THREADS=1`; the docs show the four-core and eight-core profiles.
 
-**Hard parts.** The owner's library is small (two users, hundreds of media at cutover, thousands
-now), so none of the above has ever been measured; the budgets will move once the seed runs.
+**Hard parts.** The owner's library is small (the household's few users and their memos), so none of the above has ever been measured; the budgets will move once the seed runs.
 Multi-container workers change the heartbeat semantics that the stall detection relies on
 (`WORKER_*_STALL_SECONDS`); the alert that fires today when the one worker goes silent must become
 per-container. Hardware transcoding across vendors is a swamp; the first release supports VAAPI

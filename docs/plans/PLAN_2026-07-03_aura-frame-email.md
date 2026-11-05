@@ -67,15 +67,15 @@ isProject: false
   - iCloud SMTP: `smtp.mail.me.com:587` STARTTLS, auth = **full primary iCloud
     address + app-specific password** (requires 2FA; **all ASPs are revoked when the
     Apple ID password changes**). From may be the primary address or one of up to 3
-    **regular** iCloud aliases. `honey.linens-45@icloud.com` matches Apple's **Hide
+    **regular** iCloud aliases. `<owner-hme-alias>` matches Apple's **Hide
     My Email** format; HME addresses are a relay, not an owned SMTP identity —
     sending From an HME address over SMTP is expected to be **rejected** (55x-class),
     though no captured transcript confirms the exact code. iCloud limits: 1000
     messages/day, 20 MB/message — far above this feature's needs.
-  - **User action 2026-07-03:** the user added **`fabianmaass@me.com`** as a member
+  - **User action 2026-07-03:** the user added **`<owner-email>`** as a member
     of the Aura frame. `@me.com` is a legacy iCloud identity Apple treats as an
     owned alias of the account, so it is a legitimate SMTP From candidate — this
-    supersedes `honey.linens-45@icloud.com` as the planned sender and reduces the
+    supersedes `<owner-hme-alias>` as the planned sender and reduces the
     HME question to a curiosity probe.
 - **Scope boundary — IN:** trigger on `#curated` (create and edit paths), per-user
   settings (send-to + send-from) with a new SettingsView section and a test-send
@@ -202,7 +202,7 @@ in the UI as "accepted by mail server — check the frame", because relay accept
 not delivery. Email-address validation lives in a pure function unit-tested directly.
 
 **Verification-first.** Phase 0 empirically resolves the two facts research could not:
-whether the HME-style `honey.linens-45@icloud.com` is usable as From (expected: no),
+whether the HME-style `<owner-hme-alias>` is usable as From (expected: no),
 and which sender address Aura accepts for this frame. Nothing is built until the
 send path is proven with a 30-line probe script, because every downstream design is
 parameterized by "which From works".
@@ -243,11 +243,11 @@ parameterized by "which From works".
   an app-specific password read from an env var (never a flag, never printed).
   **User inputs required (blocking):** (1) an app-specific password from
   account.apple.com (needs 2FA on the Apple ID); (2) the primary Apple ID address
-  to authenticate as. Frame membership for `fabianmaass@me.com` is already done
-  (2026-07-03). Probe matrix: (a) From = `fabianmaass@me.com` → frame address —
+  to authenticate as. Frame membership for `<owner-email>` is already done
+  (2026-07-03). Probe matrix: (a) From = `<owner-email>` → frame address —
   the expected working pair; verify the photo appears on the frame (member check
   passes) rather than a rejection notification arriving; (b) optional curiosity:
-  From = `honey.linens-45@icloud.com` → expect 55x rejection if it is Hide My
+  From = `<owner-hme-alias>` → expect 55x rejection if it is Hide My
   Email; (c) if (a) fails at SMTP, retry with From = the primary Apple ID /
   `@icloud.com` variant and adjust the Aura membership to match.
 - **Do NOT:** build any app code, add dependencies, or store the ASP anywhere but
@@ -388,7 +388,7 @@ disciplines through every phase. Close the plan with `/session-review` +
 
 - **User-provided, blocking Phase 0:** an Apple app-specific password and the
   primary Apple ID address to authenticate as. Frame membership is already in
-  place: `fabianmaass@me.com` was added as an Aura frame member on 2026-07-03 and
+  place: `<owner-email>` was added as an Aura frame member on 2026-07-03 and
   is the planned From address.
 - No other plan must land first. Plans 1667 (per-memo originals layout) and 1665
   (screen/print renditions) proceed independently; this plan reads originals via
@@ -414,9 +414,9 @@ disciplines through every phase. Close the plan with `/session-review` +
 
 ## Risks
 
-- **Sender identity mismatch.** `honey.linens-45@icloud.com` is Hide My Email
+- **Sender identity mismatch.** `<owner-hme-alias>` is Hide My Email
   format and expected to be unusable as SMTP From; largely defused by the user
-  adding `fabianmaass@me.com` (an owned iCloud identity) as a frame member on
+  adding `<owner-email>` (an owned iCloud identity) as a frame member on
   2026-07-03. Residual risk: `@me.com` From over `smtp.mail.me.com` failing for
   this specific account — Phase 0 proves the pair in minutes, with the primary
   Apple ID / `@icloud.com` variant as fallback (plus matching Aura membership).
@@ -468,15 +468,15 @@ disciplines through every phase. Close the plan with `/session-review` +
 ## Phase 0 Findings (2026-07-03) — PROVEN, gate passed
 
 **Working send path (proven end-to-end):**
-- AUTH as `fabianmaass@me.com` + app-specific password over `smtp.mail.me.com:587`
-  STARTTLS. From = `fabianmaass@me.com`, To = `43cec2f1099546c6fad1@send.auraframes.com`.
+- AUTH as `<owner-email>` + app-specific password over `smtp.mail.me.com:587`
+  STARTTLS. From = `<owner-email>`, To = `<frame-send-to-address>`.
 - iCloud accepted every send (250 `queued as …`, zero per-recipient failures; e.g.
   queue id `ED25B1800133`).
 - **Aura confirmed delivery on the real surface:** Aura emailed the sender
-  *"We got your email and added your photo to Fabian's Frame!"* — the photo was added
+  *"We got your email and added your photo to [the household frame]!"* — the photo was added
   to the frame. This is the acceptance gate (not the SMTP 250). Note: Aura's email
   ingestion has minutes of latency — a photo not appearing instantly is normal.
-- The HME-format `honey.linens-45@icloud.com` From (probe matrix case b) was NOT
+- The HME-format `<owner-hme-alias>` From (probe matrix case b) was NOT
   exercised — the `@me.com` member path worked first try, so the HME curiosity probe
   is unneeded.
 
@@ -527,7 +527,7 @@ plan. **Must go through the Phase 2 pre-execution Codex gate before implementati
 **Deferred:** rotate the app-specific password — it was briefly exposed in this session
 (SMTP debug transcript printed the AUTH PLAIN handshake; the leaked tool-result file was
 deleted). Revoke + regenerate at account.apple.com, update `~/.config/memos-ng/frame.env`.
-Env file is now owned by `fabian` (mode 600). **DONE 2026-07-03:** the user rotated the ASP
+Env file is now owned by `<owner-user>` (mode 600). **DONE 2026-07-03:** the user rotated the ASP
 and updated `frame.env` with the new value.
 
 ## Phase 2 design decisions (pre-exec gate round, 2026-07-03) — resolves 2 REVISE blockers

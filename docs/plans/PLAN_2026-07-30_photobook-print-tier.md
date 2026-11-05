@@ -5,7 +5,7 @@ Status: **shipped** (app/services/photobook.py; #74, #127). Derived from a live-
 
 ## Problem (measured, not assumed)
 
-Fabian assembles photo books in the Pixum desktop software from memos photos. The
+The owner assembles photo books in the Pixum desktop software from memos photos. The
 software consumes >20 GB RAM and climbs during import. Cause is the images, not the
 software: memos serves full-resolution masters, and Pixum's own published system
 requirement is 2 GB RAM with a 130-page book using ~1.5 GB.
