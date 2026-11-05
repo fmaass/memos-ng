@@ -27,6 +27,15 @@ H = timedelta(hours=1)
 PNG = b"\x89PNG\r\n\x1a\n"
 
 
+@pytest.fixture(autouse=True)
+def _never_linked_sweep_on(monkeypatch):
+    """Every test here runs with the deleting half switched on (MEMNG-1203): these are the aging
+    rules the sweep applies once the owner turns it on, and the hourly wrapper skips it while
+    `NEVER_LINKED_SWEEP_ENABLED` is off. The off state has its own tests in
+    test_never_linked_switch.py."""
+    monkeypatch.setattr(settings, "NEVER_LINKED_SWEEP_ENABLED", True)
+
+
 def _cleanup():
     eng = create_engine(SYNC_URL)
     with eng.begin() as c:

@@ -1162,6 +1162,14 @@ async def sweep_detached_attachments_safe() -> int:
     silence, and this sweep deletes rows, so what it did each hour is the thing an operator needs on
     the record. (A pass its bound cancels returns nothing and logs no count; `_bounded` announces
     that one by name as `worker_housekeeping_timeout`.)
+
+    The never-linked half runs only with `NEVER_LINKED_SWEEP_ENABLED` set (MEMNG-1203): its first
+    deleting run is the owner's call. The switch is read HERE, not inside
+    `sweep_unlinked_attachments`, so a direct call keeps meaning "reclaim what is due" and the
+    switch decides only whether the hourly pass makes that call. Off, the pass logs
+    `unlinked_attachments_sweep_disabled` instead of a count — a count of zero would claim a sweep
+    that never ran — and the orphan metric, which reads its own query, is untouched. The detached
+    half is not the switch's business and runs the same either way.
     """
     deadline = time.monotonic() + HOUSEKEEPING_BOUNDS["detached_attachment_sweep"]
     reclaimed = 0
@@ -1171,6 +1179,9 @@ async def sweep_detached_attachments_safe() -> int:
         logger.exception("detached_attachments.sweep_error")
     logger.info("detached_attachments_swept", count=reclaimed)
     never_linked = 0
+    if not settings.NEVER_LINKED_SWEEP_ENABLED:
+        logger.info("unlinked_attachments_sweep_disabled", setting="NEVER_LINKED_SWEEP_ENABLED")
+        return reclaimed
     try:
         never_linked = await sweep_unlinked_attachments(deadline=deadline)
     except Exception:

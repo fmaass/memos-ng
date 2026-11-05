@@ -243,6 +243,15 @@ class Settings(BaseSettings):
     # deploy and cleared on the roll-forward (RELEASING.md, "Rollback across a migration").
     ROLLBACK_MODE: bool = False
 
+    # The never-linked attachment sweep (MEMNG-968) DELETES rows a standalone finalize made and no
+    # memo took, three days after they were created — and its first run waits on the owner's GO
+    # (MEMNG-1203). Until this is set, the worker's hourly pass skips that deleting half and logs
+    # `unlinked_attachments_sweep_disabled` on every pass instead, so off reads differently from a
+    # pass that found nothing. What only reads stays on either way: the orphan count the metric
+    # exports still counts those rows, so the owner can see what a first run would take before
+    # turning it on. The detached sweep, which shares the hourly step, is not gated by this.
+    NEVER_LINKED_SWEEP_ENABLED: bool = False
+
     # Web push (VAPID) — T2.5. Empty keys = push disabled (every send is a no-op), so the
     # pipeline runs unchanged without VAPID configured. Generate a keypair with `vapid --gen`
     # (py-vapid) and set both halves via the stack .env in prod.
