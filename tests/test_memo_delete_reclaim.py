@@ -6,10 +6,12 @@ were still on the web SPA's resources page. `delete_memo` deleted the memo and n
 attachment survived with `memo_id` NULL, its files were never unlinked, and its media jobs were
 never swept.
 
-Reclaim is unconditional and needs no reference counting: dedup only ever reuses an UNLINKED
-attachment and `link_attachments` refuses to re-point one that belongs elsewhere, so an attachment
-on a memo is exclusively that memo's. The tests below pin both halves — what the delete takes, and
-what it must not touch.
+Dedup only ever reuses an UNLINKED attachment and `link_attachments` refuses to re-point one that
+belongs elsewhere, so an attachment ROW on a memo is exclusively that memo's. Its FILES need not
+be: since MEMNG-959 reclaim keeps any path another row still names (and since MEMNG-1167 that
+covers every path it unlinks, derived tiers and print profiles included) — that reference check is
+pinned in tests/test_upload_staging_dedupe.py. The tests below pin both halves of the ordinary
+case — what the delete takes, and what it must not touch.
 """
 
 from pathlib import Path

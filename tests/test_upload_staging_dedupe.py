@@ -23,6 +23,7 @@ from app.config import settings
 from app.database import async_session
 from app.services import reclaim
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 
 from tests.conftest import SYNC_URL
 from tests.test_uploads import _drop_user, _login_as
@@ -249,6 +250,12 @@ def test_another_owners_attachment_is_never_a_candidate(logged_in_client, monkey
         part = tmp_path / "uploads" / f"{session['upload_uid']}.part"
         assert part.stat().st_size == 0
         assert not os.path.samefile(part, their_original)
+        # The positive control (MEMNG-1167): the same bytes and digest from their OWNER are a hit,
+        # so the miss above is the owner scope speaking, not a twin that could never match.
+        theirs_again = _start(other, ONE, sha256=_sha(ONE))
+        assert theirs_again["bytes_received"] == len(ONE)
+        own_part = tmp_path / "uploads" / f"{theirs_again['upload_uid']}.part"
+        assert os.path.samefile(own_part, their_original)
     finally:
         _cleanup()
         _drop_user(other_subject)
@@ -260,6 +267,9 @@ def test_no_sha256_behaves_exactly_as_before(logged_in_client, monkeypatch, tmp_
     try:
         _ready_memo(client)
         assert _start(client, ONE)["bytes_received"] == 0
+        # The positive control (MEMNG-1167): the same request WITH the digest is a hit, so the miss
+        # above is the absent sha256 speaking, not a twin that could never match.
+        assert _start(client, ONE, sha256=_sha(ONE))["bytes_received"] == len(ONE)
     finally:
         _cleanup()
 
@@ -409,6 +419,231 @@ def test_a_finalize_that_fails_after_a_staging_hit_walks_everything_back_off_the
         _cleanup()
 
 
+@pytest.mark.parametrize("landed", [True, False], ids=["commit-landed", "commit-did-not-land"])
+def test_a_finalize_whose_commit_raises_walks_back_only_when_it_did_not_land(
+    logged_in_client, monkeypatch, tmp_path, landed
+):
+    """MEMNG-1167 — `db.commit()` raising is not proof the transaction rolled back: the connection
+    can drop, or the request be cancelled, after PostgreSQL committed. Walking back then would
+    move the original out from under a LIVE row and delete the tiers it serves. The route asks the
+    database what happened, and only a write that provably did not land is walked back."""
+    from app.routers import uploads as uploads_router
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, twin = _ready_memo(client)
+        original = Path(_att(twin)["storage_path"])
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        minted: list[str] = []
+        real_finalize = uploads_router.svc.finalize
+
+        async def finalize_then_lose_the_commit_answer(db, *args, **kwargs):
+            attachment = await real_finalize(db, *args, **kwargs)
+            minted.append(attachment.uid)
+            real_commit = db.commit
+
+            async def commit_then_drop_the_connection():
+                if landed:
+                    await real_commit()
+                else:
+                    await db.rollback()
+                raise ConnectionResetError("the connection dropped around COMMIT")
+
+            db.commit = commit_then_drop_the_connection
+            return attachment
+
+        monkeypatch.setattr(uploads_router.svc, "finalize", finalize_then_lose_the_commit_answer)
+
+        failed = client.post(f"/api/uploads/{staged}/finalize")
+
+        assert failed.status_code == 500
+        assert len(minted) == 1
+        rows = _rows("SELECT storage_path FROM attachments WHERE uid = :u", u=minted[0])
+        session_rows = _rows("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=staged)
+        if landed:
+            # The row is live, so everything it names stays exactly where finalize put it.
+            assert len(rows) == 1
+            assert Path(rows[0][0]).read_bytes() == ONE
+            assert os.path.samefile(rows[0][0], original)
+            assert [_tier(minted[0], tier).exists() for tier in TIERS] == [True, True]
+            assert not part.exists()
+            assert session_rows == [(0,)]
+        else:
+            assert rows == []
+            assert [_tier(minted[0], tier).exists() for tier in TIERS] == [False, False]
+            assert os.path.samefile(part, original)  # the staged bytes are back where they were
+            assert session_rows == [(1,)]
+    finally:
+        _cleanup()
+
+
+def test_a_commit_whose_outcome_cannot_be_learned_leaves_the_files_in_place(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1167 — "unknown" is not "rolled back": when the database cannot answer whether the
+    commit landed, the walk-back does not run (a file in the wrong place is recoverable, one taken
+    from a live row is not), and the request still fails rather than answering success."""
+    from app.routers import uploads as uploads_router
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, twin = _ready_memo(client)
+        original = Path(_att(twin)["storage_path"])
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        minted: list[str] = []
+        real_finalize = uploads_router.svc.finalize
+
+        async def finalize_then_lose_the_commit(db, *args, **kwargs):
+            attachment = await real_finalize(db, *args, **kwargs)
+            minted.append(attachment.uid)
+
+            async def lost():
+                await db.rollback()
+                raise ConnectionResetError("the connection dropped around COMMIT")
+
+            db.commit = lost
+            return attachment
+
+        def no_database():
+            raise ConnectionRefusedError("the database is unreachable")
+
+        monkeypatch.setattr(uploads_router.svc, "finalize", finalize_then_lose_the_commit)
+        monkeypatch.setattr(uploads_svc, "async_session", no_database)
+
+        failed = client.post(f"/api/uploads/{staged}/finalize")
+
+        assert failed.status_code == 500
+        assert len(minted) == 1
+        # Not walked back: the tier copies and the placed original are where finalize put them.
+        assert [_tier(minted[0], tier).exists() for tier in TIERS] == [True, True]
+        assert not part.exists()
+        placed = list((tmp_path / "originals" / "_unfiled").iterdir())
+        assert len(placed) == 1 and os.path.samefile(placed[0], original)
+    finally:
+        _cleanup()
+
+
+async def test_the_commit_outcome_waits_for_the_interrupted_transaction_to_end(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1167 — a commit cut short can still be in flight on the server when the route asks.
+    Read without waiting, the session row is still visible (the delete is uncommitted) and the
+    answer would be "rolled back" for a write that is about to land; the outcome check takes the
+    row's lock, so it answers only once that transaction has ended — here, committed."""
+    from app.services import uploads as uploads_svc
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, existing = await asyncio.to_thread(_ready_memo, client)
+        session = await asyncio.to_thread(_start, client, LONGER)
+        uid = session["upload_uid"]
+        eng = create_engine(SYNC_URL)
+        conn = eng.connect()
+        try:
+            tx = conn.begin()
+            conn.execute(text("SELECT 1 FROM uploads WHERE upload_uid = :u FOR UPDATE"), {"u": uid})
+            conn.execute(text("DELETE FROM uploads WHERE upload_uid = :u"), {"u": uid})
+
+            asked = asyncio.create_task(uploads_svc.finalize_committed(uid, existing))
+            await asyncio.sleep(0.5)
+            assert not asked.done()  # waiting on the in-flight transaction, not reading past it
+            await asyncio.to_thread(tx.commit)
+
+            assert await asyncio.wait_for(asked, 10) is True
+        finally:
+            conn.close()
+            eng.dispose()
+    finally:
+        _cleanup()
+
+
+def test_a_memo_create_that_fails_after_the_tier_copies_takes_them_back(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1167 — the rollback AFTER the tier copies, on the memo-create path: a staging hit's
+    copies are made inside the create's transaction, and a create that then fails must leave no
+    tier under the uid it minted and the staged part file where it was."""
+    from app.routers import memos as memos_router
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _, twin = _ready_memo(client)
+        original = Path(_att(twin)["storage_path"])
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        part = tmp_path / "uploads" / f"{staged}.part"
+        minted: list[str] = []
+        real_finalize_pending = memos_router.uploads_svc.finalize_pending
+
+        async def finalize_then_fail(*args, **kwargs):
+            done = await real_finalize_pending(*args, **kwargs)
+            minted.extend(done)
+            # The copies are on disk at this point: this is the window the walk-back covers.
+            assert [_tier(uid, tier).exists() for uid in done for tier in TIERS] == [True, True]
+            raise RuntimeError("the create never commits")
+
+        monkeypatch.setattr(memos_router.uploads_svc, "finalize_pending", finalize_then_fail)
+
+        failed = client.post(
+            "/api/memos",
+            json={"content": "june", "visibility": "PRIVATE", "upload_uids": [staged]},
+        )
+
+        assert failed.status_code == 500
+        assert len(minted) == 1 and minted[0] != twin
+        assert [_tier(minted[0], tier).exists() for tier in TIERS] == [False, False]
+        assert os.path.samefile(part, original)
+        assert _rows("SELECT count(*) FROM attachments WHERE uid = :u", u=minted[0]) == [(0,)]
+        assert _rows("SELECT count(*) FROM uploads WHERE upload_uid = :u", u=staged) == [(1,)]
+        # The twin is untouched: its tiers were the copies' source, never moved.
+        assert [_tier(twin, tier).exists() for tier in TIERS] == [True, True]
+    finally:
+        _cleanup()
+
+
+@pytest.mark.parametrize("finalize_by", ["route", "memo"])
+def test_a_staging_hit_counts_as_linked_not_completed(
+    logged_in_client, monkeypatch, tmp_path, finalize_by
+):
+    """MEMNG-1167 — a session finalized by link is its own result: no byte crossed the wire and no
+    derive ran, so counting it as `completed` hid how often the client's digest saved an upload.
+    Both consumers of a staged session count it so: the finalize route and the memo create."""
+    from prometheus_client import REGISTRY
+
+    def sessions(result: str) -> float:
+        value = REGISTRY.get_sample_value("memosng_upload_sessions_total", {"result": result})
+        return 0.0 if value is None else value
+
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        _ready_memo(client)  # one ordinary upload: counted as completed before the baseline
+        staged = _start(client, ONE, sha256=_sha(ONE))["upload_uid"]
+        linked, completed = sessions("linked"), sessions("completed")
+
+        if finalize_by == "route":
+            done = client.post(f"/api/uploads/{staged}/finalize")
+            assert done.status_code == 200, done.text
+        else:
+            _memo(client, staged, "june")
+
+        assert sessions("linked") - linked == 1
+        assert sessions("completed") == completed
+        # The control: an ordinary upload still counts as completed, not linked.
+        plain = _upload(client, LONGER)
+        assert client.post(f"/api/uploads/{plain}/finalize").status_code == 200
+        assert sessions("completed") - completed == 1
+        assert sessions("linked") - linked == 1
+    finally:
+        _cleanup()
+
+
 # ---- delete order ---------------------------------------------------------------------------
 
 
@@ -510,5 +745,123 @@ async def test_two_concurrent_reclaims_of_a_shared_path_never_leak_it(
 
         assert [r.outcome for r in results] == ["reclaimed", "reclaimed"]
         assert not shared.exists()
+    finally:
+        _cleanup()
+
+
+def _profile(uid: str) -> Path:
+    """A non-default print profile's rendition — enumerated off disk by reclaim, never derived."""
+    return Path(settings.DATA_ROOT) / "assets" / "printready" / "matte" / f"{uid}.jpg"
+
+
+@pytest.mark.parametrize("reclaimer", ["async", "sync"])
+@pytest.mark.parametrize(
+    "column", ["rendition-names-a-tier", "print-path-names-a-profile"], ids=["rendition", "print"]
+)
+def test_a_tier_path_another_row_names_survives_reclaim(
+    logged_in_client, monkeypatch, tmp_path, column, reclaimer
+):
+    """MEMNG-1167 — the reference check covers EVERY path reclaim unlinks, not only the ones the
+    row names in a column: a derived tier and an enumerated print profile are unlinked too, and
+    another row's rendition or print path naming one of them must keep it on disk. Both reclaims —
+    the app's (a memo delete) and the maintenance script's synchronous one."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        doomed_memo, doomed = _ready_memo(client, content="may")
+        other_memo, other = _ready_memo(client, LONGER, content="june")
+        profile = _profile(doomed)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_bytes(b"matte-of-doomed")
+        other_id = _att(other)["id"]
+        if column == "rendition-names-a-tier":
+            named = _tier(doomed, "thumbs")
+            _exec(
+                "INSERT INTO attachment_renditions "
+                "(attachment_id, variant_key, filename, mime, size, storage_path) "
+                "VALUES (:a, 'print', 'p.jpg', 'image/jpeg', 1, :p)",
+                a=other_id,
+                p=str(named),
+            )
+        else:
+            named = profile
+            _exec("UPDATE attachments SET print_path = :p WHERE id = :a", p=str(named), a=other_id)
+        kept = named.read_bytes()
+
+        if reclaimer == "async":
+            assert client.delete(f"/api/memos/{doomed_memo['uid']}").status_code == 204
+        else:
+            eng = create_engine(SYNC_URL)
+            try:
+                with Session(eng) as session:
+                    done = reclaim.reclaim_attachment_sync(
+                        session, _att(doomed)["id"], reclaim.Revalidate.IDENTITY
+                    )
+            finally:
+                eng.dispose()
+            assert done.outcome == "reclaimed"
+
+        assert _rows("SELECT count(*) FROM attachments WHERE uid = :u", u=doomed) == [(0,)]
+        assert named.read_bytes() == kept  # the other row's file, still there
+        # The control: everything the doomed row alone owned is gone.
+        own = [_tier(doomed, tier) for tier in TIERS] + [profile]
+        assert [p for p in own if p != named and p.exists()] == []
+        # And the last row to name it takes it: nothing is leaked by keeping it.
+        assert client.delete(f"/api/memos/{other_memo['uid']}").status_code == 204
+        assert not named.exists()
+    finally:
+        _cleanup()
+
+
+def test_a_rows_own_column_naming_its_own_tier_does_not_keep_it(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1167 boundary — the reference check asks about OTHER rows: a row whose own print path
+    names one of its own print profiles is the last name of that file, so reclaim takes it."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        memo, uid = _ready_memo(client)
+        profile = _profile(uid)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_bytes(b"matte")
+        _exec("UPDATE attachments SET print_path = :p WHERE uid = :u", p=str(profile), u=uid)
+
+        assert client.delete(f"/api/memos/{memo['uid']}").status_code == 204
+
+        assert _rows("SELECT count(*) FROM attachments WHERE uid = :u", u=uid) == [(0,)]
+        assert not profile.exists()
+    finally:
+        _cleanup()
+
+
+def test_a_path_that_only_starts_with_a_tier_path_does_not_keep_the_tier(
+    logged_in_client, monkeypatch, tmp_path
+):
+    """MEMNG-1167 literal-in-string — the reference check matches whole paths. An interrupted
+    encode's `<uid>.jpg.tmp` sits beside the profile `<uid>.jpg` and both are reclaimed; another
+    row naming the `.tmp` keeps that file only, never the profile whose path is its prefix."""
+    client, _ = logged_in_client
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    try:
+        doomed_memo, doomed = _ready_memo(client, content="may")
+        _, other = _ready_memo(client, LONGER, content="june")
+        profile = _profile(doomed)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_bytes(b"matte")
+        lookalike = profile.with_name(profile.name + ".tmp")
+        lookalike.write_bytes(b"named by the other row")
+        _exec(
+            "INSERT INTO attachment_renditions "
+            "(attachment_id, variant_key, filename, mime, size, storage_path) "
+            "VALUES (:a, 'print', 'p.jpg', 'image/jpeg', 1, :p)",
+            a=_att(other)["id"],
+            p=str(lookalike),
+        )
+
+        assert client.delete(f"/api/memos/{doomed_memo['uid']}").status_code == 204
+
+        assert not profile.exists()
+        assert lookalike.read_bytes() == b"named by the other row"
     finally:
         _cleanup()

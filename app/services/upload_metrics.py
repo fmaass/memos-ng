@@ -30,8 +30,10 @@ AdmissionScope = Literal["user", "process"]
 # How a session ended. `rejected_size` is the fourth value this process publishes (see
 # `count_size_rejection`); `expired` is the worker's, read from its tally per scrape
 # (`upload_queue_metrics`). `withdrawn` is the owner's DELETE (MEMNG-953), counted here when it
-# commits; the reap that later removes that row counts nothing more for it.
-SessionEnd = Literal["completed", "deduped", "withdrawn"]
+# commits; the reap that later removes that row counts nothing more for it. `linked` is a staging
+# hit finalized by link (MEMNG-959): no body crossed the wire and no derive ran, so it is not a
+# `completed` upload (MEMNG-1167).
+SessionEnd = Literal["completed", "deduped", "linked", "withdrawn"]
 
 UPLOAD_BYTES = Counter(
     "memosng_upload_bytes",
@@ -69,7 +71,7 @@ EVENTS_SUBSCRIBERS = Gauge(
 # than no data.
 for _principal in ("pat", "session"):
     UPLOAD_BYTES.labels(principal=_principal)
-for _result in ("completed", "deduped", "withdrawn", "rejected_size"):
+for _result in ("completed", "deduped", "linked", "withdrawn", "rejected_size"):
     UPLOAD_SESSIONS.labels(result=_result)
 for _scope in ("user", "process"):
     ADMISSION_REJECTIONS.labels(scope=_scope)

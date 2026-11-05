@@ -1,20 +1,24 @@
-Drop reclaim's reference check: unlink every path the row names, whether or not another row names
-it too (MEMNG-959).
+Drop reclaim's reference check: unlink every path the reclaim would unlink, whether or not
+another row names it too (MEMNG-959).
 
 Two memo rows pointed at ONE original then lose it on the first delete — the second memo's picture
 is gone while its row still promises it. The probes that must turn red are the two delete orders of
-the `same-path` shape. The `staged` shape stays green on purpose: a staging hit gives each row its
-own hard-linked name, which no reference count is needed to protect, and that is the property the
-staged cases pin.
+the `same-path` shape, and the app reclaim's halves of the tier-path cases (MEMNG-1167): another
+row's rendition or print path naming this row's derived tier or print profile, and the whole-path
+case (another row naming a profile's `.tmp` sibling keeps only that file). The `staged` shape
+stays green on purpose: a staging hit gives each row its own hard-linked name, which no reference
+count is needed to protect, and that is the property the staged cases pin. The `sync` halves stay
+green too: they drive the maintenance script's reclaim, which no_reclaim_path_refcount_sync.patch
+mutates.
 
 --- a/app/services/reclaim.py
 +++ b/app/services/reclaim.py
-@@ -390,7 +390,7 @@
-         )
+@@ -491,7 +491,7 @@
          return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
      # 4. …minus whatever another row still names: that file is the other row's, not garbage.
--    shared = await _named_elsewhere(db, att)
+     candidates = all_asset_paths(att) + profile_assets
+-    shared = await _named_elsewhere(db, att, candidates)
 +    shared: frozenset[str] = frozenset()
-     paths = _unshared(all_asset_paths(att) + profile_assets, shared, att)
+     paths = _unshared(candidates, shared, att)
      failed, cancellation = await _unlink_off_the_loop(remove, paths)
      if failed:

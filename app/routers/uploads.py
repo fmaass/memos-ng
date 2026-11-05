@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -592,6 +593,39 @@ def _restore_moves_sync(moves: list[storage.TrackedMove]) -> None:
             logger.error("uploads.finalize.restore_failed", src=move.src, dest=unrestored)
 
 
+async def _commit_outcome(
+    db: AsyncSession, upload_uid: str, attachment_uid: str
+) -> tuple[bool | None, asyncio.CancelledError | None]:
+    """Learn whether a finalize whose commit raised committed after all (MEMNG-1167), and come
+    back only once that is known — `svc.finalize_committed`'s answer plus any cancellation that
+    arrived meanwhile, for the caller to re-raise.
+
+    A task of its own awaited through a shield, the way `svc.finish_off_the_loop` awaits a thread:
+    the request being torn down is one of the very ways the commit came to raise, and a
+    cancellation that cut the question short would leave the walk-back with no answer. The request
+    session is closed first, so the interrupted transaction cannot sit open on OUR connection while
+    the lock below waits on it; a close that fails is logged and the question asked anyway, since
+    the lock wait is what decides, not the close.
+    """
+
+    async def resolve() -> bool | None:
+        try:
+            await db.close()
+        except Exception:
+            logger.exception("uploads.finalize.close_failed", upload_uid=upload_uid)
+        return await svc.finalize_committed(upload_uid, attachment_uid)
+
+    task = asyncio.create_task(resolve())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(task), cancellation
+        except asyncio.CancelledError as exc:
+            if task.cancelled():  # the task itself was cancelled (a loop teardown): nothing to wait
+                raise
+            cancellation = exc
+
+
 @router.post(
     "/{upload_uid}/finalize",
     response_model=AttachmentOut,
@@ -618,6 +652,10 @@ async def finalize_upload(
     # the derived tiers it copied from the twin (MEMNG-959) — walked back if the write does not
     # land, so a copied tier never outlives the rolled-back row under a uid nothing names.
     moved: list[storage.TrackedMove] = []
+    # Set only once the commit is under way: a raise from the commit itself is the one failure that
+    # does NOT prove the write was lost (MEMNG-1167). Read before the commit, as a plain string —
+    # a failed commit expires the instance, and reading it back would be IO the loop cannot await.
+    committing: str | None = None
     try:
         try:
             attachment = await svc.finalize(
@@ -637,6 +675,7 @@ async def finalize_upload(
             ) from None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
+        committing = attachment.uid
         await db.commit()
     except BaseException:
         # Off the loop: every restore is a rename or an unlink on the data volume, and a copy's
@@ -646,7 +685,27 @@ async def finalize_upload(
         # files half walked back, and the cancellation is still delivered once the walk-back is
         # over.
         if moved:
-            _, cancelled = await svc.finish_off_the_loop(_restore_moves_sync, moved)
+            # A raise before the commit proves the write was lost; a raise FROM it does not
+            # (MEMNG-1167), so that outcome is asked of the database first and the files are
+            # walked back only when the transaction provably did not commit. Committed, they are
+            # the live row's; unknown, they stay where they are and are logged — a file in the
+            # wrong place can be recovered by hand, one taken from a live row cannot.
+            landed, cancelled = (
+                await _commit_outcome(db, upload_uid, committing)
+                if committing is not None
+                else (False, None)
+            )
+            if landed is False:
+                _, cancelled_restore = await svc.finish_off_the_loop(_restore_moves_sync, moved)
+                cancelled = cancelled or cancelled_restore
+            else:
+                (logger.warning if landed else logger.error)(
+                    "uploads.finalize.walk_back_skipped",
+                    upload_uid=upload_uid,
+                    attachment_uid=committing,
+                    committed=landed,
+                    placed=[(move.src, move.dest) for move in moved],
+                )
             if cancelled is not None:
                 raise cancelled from None
         raise

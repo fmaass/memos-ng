@@ -16,7 +16,7 @@ from typing import BinaryIO, Literal
 import puremagic
 import structlog
 from anyio import fail_after, move_on_after, to_thread
-from sqlalchemy import ColumnElement, or_, select
+from sqlalchemy import ColumnElement, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import ClientDisconnect
@@ -313,6 +313,49 @@ def reap_consumed_sync(paths: list[str]) -> None:
             Path(path).unlink(missing_ok=True)
         except OSError as exc:
             logger.error("uploads.consumed_reap_failed", path=path, error=str(exc)[:200])
+
+
+async def finalize_committed(upload_uid: str, attachment_uid: str) -> bool | None:
+    """Whether a finalize whose COMMIT raised committed after all (MEMNG-1167); None when that
+    cannot be learned. A raising `commit()` is not a rollback: the connection can drop, or the
+    request be cancelled, after PostgreSQL committed — and the caller's walk-back would then move
+    the original out from under a live row and delete the tiers it serves.
+
+    Taking the session row's lock waits until the interrupted transaction has ENDED either way (a
+    finalize holds that lock from `ensure_capture` to its end, and deletes the row). After that the
+    answer is plain: the row back means it rolled back; the row gone and the attachment there means
+    it committed. Anything else — the row gone and no attachment, or a read that fails — is not
+    proof of either, and the caller must not walk back on it. The same question
+    `trip_ingest._filing_committed` asks of a filing.
+    """
+    try:
+        async with async_session() as db:
+            await db.execute(text("SET LOCAL lock_timeout = '10s'"))
+            session_left = (
+                await db.execute(
+                    select(Upload.upload_uid)
+                    .where(Upload.upload_uid == upload_uid)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            stored = (
+                await db.execute(select(Attachment.id).where(Attachment.uid == attachment_uid))
+            ).scalar_one_or_none()
+            await db.rollback()
+    except Exception:
+        logger.exception("uploads.finalize.commit_outcome_unknown", upload_uid=upload_uid)
+        return None
+    if session_left is not None:
+        return False
+    if stored is not None:
+        return True
+    logger.error(
+        "uploads.finalize.commit_outcome_unknown",
+        upload_uid=upload_uid,
+        attachment_uid=attachment_uid,
+        reason="session_gone_and_no_attachment",
+    )
+    return None
 
 
 def _create_part_sync(path: Path) -> None:
@@ -1941,8 +1984,8 @@ async def finalize(
         if locked is not None:
             locked.candidates.setdefault(digest, attachment)  # see the minting branch below
         # No media job of either kind: the tiers are in place, and the twin's sibling outcome and
-        # metadata columns came with it.
-        upload_metrics.count_session_end(db, "completed")
+        # metadata columns came with it. Counted as its own result (MEMNG-1167).
+        upload_metrics.count_session_end(db, "linked")
         await db.delete(upload)
         await db.flush()
         return attachment

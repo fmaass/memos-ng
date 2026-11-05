@@ -149,6 +149,26 @@ def test_sessions_result_completed_deduped_and_rejected_size(clean, logged_in_cl
     assert _sample("memosng_upload_sessions_total", {"result": "rejected_size"}) - rejected == 2
 
 
+def test_every_session_result_is_published_before_its_first_count():
+    """MEMNG-1167 — `linked` joins the results pre-registered at import, so a quiet hour reads 0
+    rather than no data. Asked of a FRESH interpreter: in this one, any earlier test that counted
+    a result has already made its sample exist, pre-registered or not."""
+    import subprocess
+    import sys
+
+    probe = (
+        "from app.services import upload_metrics as um\n"
+        "print(sorted(s.labels['result'] for m in um.UPLOAD_SESSIONS.collect() "
+        "for s in m.samples if s.name.endswith('_total') and s.value == 0))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True, timeout=60
+    )
+    assert out.stdout.strip() == str(
+        sorted(["completed", "deduped", "linked", "withdrawn", "rejected_size"])
+    )
+
+
 def test_a_finalize_that_rolls_back_counts_no_result(clean, logged_in_client, monkeypatch):
     """The result is counted at COMMIT: a finalize whose transaction dies leaves the session open,
     and the client will finalize it again — counting it now would count it twice."""

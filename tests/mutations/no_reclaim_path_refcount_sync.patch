@@ -1,0 +1,18 @@
+Drop the maintenance script's reference check: its synchronous reclaim unlinks every path,
+whether or not another row names it too (MEMNG-1167).
+
+The probes that must turn red are the `sync` halves of the tier-path cases: another row's rendition
+or print path naming this row's derived tier or print profile loses that file. Everything else in
+the module drives the app's reclaim (no_reclaim_path_refcount.patch) and stays green.
+
+--- a/app/services/reclaim.py
++++ b/app/services/reclaim.py
+@@ -700,7 +700,7 @@
+         )
+         return ReclaimResult("failed_unlink", (str(printready.printready_path(uid).parent),))
+     candidates = all_asset_paths(att) + profile_assets
+-    shared = _named_elsewhere_sync(session, att, candidates)  # the reference count — see above
++    shared: frozenset[str] = frozenset()
+     paths = _unshared(candidates, shared, att)
+     failed = remove(paths)
+     if failed:

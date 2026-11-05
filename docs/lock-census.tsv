@@ -47,6 +47,7 @@ app/services/trip_ingest.py	_quarantine	refresh
 app/services/trip_ingest.py	_refuse_open	refresh
 app/services/uploads.py	append_stream.relock	for_update
 app/services/uploads.py	ensure_capture	for_update
+app/services/uploads.py	finalize_committed	for_update
 app/services/uploads.py	_lock_attachments	for_update
 app/services/uploads.py	finalize_pending	for_update
 app/services/uploads.py	finalize	for_update
