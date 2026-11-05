@@ -110,10 +110,10 @@ async def test_a_batch_the_door_named_unknown_resolves_as_a_batch_not_as_the_cou
     )
     assert first.endpoint is router.resolve_unknown  # type: ignore[union-attr]
     async with async_session() as db:
-        await router.resolve_unknown(router.UnknownResolveIn(through=2), owner, db)
+        await router.resolve_unknown(owner, db, router.UnknownResolveIn(through=2))
     assert await _gauge() == 1, "a through must clear only the counter"
     async with async_session() as db:
-        await router.resolve_unknown(router.UnknownResolveIn(), owner, db)
+        await router.resolve_unknown(owner, db, router.UnknownResolveIn())
     assert await _gauge() == 0
 
 
@@ -124,24 +124,30 @@ async def _bare_cursor() -> None:
 
 
 async def test_an_unknown_pass_is_counted_even_when_its_page_fails_and_replays(world, monkeypatch):
-    await _bare_cursor()
-    pushed: list[str] = []
+    """The real feed, twice: the page dies after the door moved, so the cursor stays and the replay
+    reads the batch as settled and returns early. Only the count taken beside the page survives."""
+    trip = await tp._trip(world)
+    batch = await tp._send(world, await tp._guest(world, trip), (JPEG, "a.jpg"))
+    tp._sql("UPDATE pluto.passes SET uid = 'not-a-home-pass'")
+    real = trip_ingest._record_batch
+    died = 0
 
-    async def push(client, uid):
-        pushed.append(uid)
-        return True
+    async def dies_after_the_entry(db, client, raw, errors):
+        nonlocal died
+        await real(db, client, raw, errors)
+        died += 1
+        raise trip_ingest.LinkDown("the page died")
 
-    monkeypatch.setattr(trip_ingest, "_push_quarantine", push)
-    raw = {"batch_id": "orphan1", "state": "complete", "pass_uid": "never-issued"}
-
-    class PageFailed(Exception):
-        pass
-
-    with pytest.raises(PageFailed):
-        async with async_session() as db:
-            await trip_ingest._record_batch(db, world.link, raw, [])
-            raise PageFailed  # the page's transaction dies after the door moved
-    assert pushed == ["orphan1"]
+    monkeypatch.setattr(trip_ingest, "_record_batch", dies_after_the_entry)
+    assert await tp._tick(world) != "ok"
+    assert died == 1
+    assert tp._pluto_batch(batch) == [("quarantined", False)]
+    assert tp._sql("SELECT quarantined_unknown_total FROM trip_ingest_cursor") == [(1,)]
+    [(since,)] = tp._sql("SELECT batches_since FROM trip_ingest_cursor")
+    monkeypatch.setattr(trip_ingest, "_record_batch", real)
+    assert await tp._tick(world) == "ok"
+    [(replayed,)] = tp._sql("SELECT batches_since FROM trip_ingest_cursor")
+    assert replayed > since, "the page never replayed"
     assert tp._sql("SELECT quarantined_unknown_total FROM trip_ingest_cursor") == [(1,)]
     assert await _gauge() == 1
 
@@ -151,13 +157,13 @@ async def test_a_stale_through_cannot_clear_a_newer_incident(world):
     tp._sql("UPDATE trip_ingest_cursor SET quarantined_unknown_total = 3 RETURNING id")
     owner = await _owner(world)
     async with async_session() as db:
-        await router.resolve_unknown(router.UnknownResolveIn(through=2), owner, db)
+        await router.resolve_unknown(owner, db, router.UnknownResolveIn(through=2))
     assert await _gauge() == 1
     async with async_session() as db:
-        await router.resolve_unknown(router.UnknownResolveIn(through=99), owner, db)
+        await router.resolve_unknown(owner, db, router.UnknownResolveIn(through=99))
     assert tp._sql("SELECT quarantined_unknown_cleared FROM trip_ingest_cursor") == [(3,)]
     async with async_session() as db:
-        await router.resolve_unknown(router.UnknownResolveIn(through=1), owner, db)
+        await router.resolve_unknown(owner, db, router.UnknownResolveIn(through=1))
     assert tp._sql("SELECT quarantined_unknown_cleared FROM trip_ingest_cursor") == [(3,)]
     assert await _gauge() == 0
 
@@ -248,3 +254,86 @@ async def test_both_lift_forms_read_as_a_pending_lift(world):
         db.add(PassEvent(pass_id=p.id, kind="unsuspend_requested", version=7))
         await db.commit()
         assert (await passes_svc.unsuspend_versions(db, [p.id])) == {p.id: 7}
+
+
+def _a_bad_door_answer(kind: str):
+    async def rewrite(request, response):
+        if request.url.path != "/ingest/passes/suspended":
+            return response
+        if kind == "old_door":
+            return httpx.Response(
+                404,
+                headers={"content-type": "application/json"},
+                stream=httpx.ByteStream(b'{"detail": "Not Found"}'),
+            )
+        body: object = {"passes": "no"}
+        if kind == "over_cap":
+            at = "2026-11-04T00:00:00Z"
+            body = {
+                "passes": [
+                    {"pass_uid": f"p{i}", "suspended_at": at}
+                    for i in range(trip_ingest.SUSPENDED_VIEW_CAP + 1)
+                ]
+            }
+        return tp._json_answer(body)
+
+    return rewrite
+
+
+@pytest.mark.parametrize("kind", ["old_door", "malformed", "over_cap", "link_down"])
+async def test_a_full_tick_carries_on_through_a_bad_door_answer_and_keeps_the_earlier_view(
+    world, kind
+):
+    trip = await tp._trip(world)
+    token = await tp._guest(world, trip)
+    await tp._send(world, token, (JPEG + b"1", "a.jpg"))
+    tp._sql("UPDATE pluto.passes SET suspended_at = now()")
+    assert await tp._tick(world) == "ok"
+    view = "SELECT s.door_suspended_at, s.door_suspended_seen_at FROM pass_sync_state s"
+    [(suspended, seen)] = tp._sql(view)
+    assert suspended is not None and seen is not None, "the earlier view never landed"
+    assert len(tp._memos()) == 1
+    tp._sql("UPDATE pluto.passes SET suspended_at = NULL")
+    await tp._send(world, token, (JPEG + b"2", "b.jpg"))
+    if kind == "link_down":
+        world.wire.down_paths = ("/ingest/passes/suspended",)
+    else:
+        world.wire.rewrite = _a_bad_door_answer(kind)
+    assert await tp._tick(world) == "ok"
+    assert len(tp._memos()) == 2, "the bad door answer stopped ingestion"
+    assert tp._sql(view) == [(suspended, seen)]
+    world.wire.down_paths, world.wire.rewrite = (), None
+    assert await tp._tick(world) == "ok"
+    [(cleared, again)] = tp._sql(view)
+    assert cleared is None and again > seen, "control: a good answer moves the view"
+
+
+def _an_unknown_named_batch() -> None:
+    tp._sql(
+        "INSERT INTO passes (uid, secret_hash, label, expires_at) "
+        "VALUES ('resolve-pass', 'h', 'l', now() + interval '1 day')"
+    )
+    for uid in ("unknown", "ordinary"):
+        tp._sql(
+            "INSERT INTO ingest_batches (uid, pass_id, state, quarantined_at) "
+            "SELECT :u, id, 'quarantined', now() FROM passes WHERE uid = 'resolve-pass'",
+            {"u": uid},
+        )
+
+
+def test_a_bodyless_post_resolves_a_batch_the_door_named_unknown(logged_in_client):
+    """Through the HTTP client, because the sheet sends no body and a handler call cannot see a 422:
+    a hostile door could name a batch so that the owner can never clear it."""
+    client, _subject = logged_in_client
+    _an_unknown_named_batch()
+    base = "/api/trip-ingest/quarantine"
+    try:
+        assert client.post(f"{base}/ordinary/resolve").status_code == 204
+        answer = client.post(f"{base}/unknown/resolve")
+        assert answer.status_code == 204, answer.text
+        assert (
+            tp._sql("SELECT uid FROM ingest_batches WHERE resolved_at IS NULL ORDER BY uid") == []
+        )
+        assert client.post(f"{base}/unknown/resolve", json={}).status_code == 204
+    finally:
+        tp._sql("DELETE FROM passes WHERE uid = 'resolve-pass'")

@@ -1658,7 +1658,7 @@ export interface paths {
         /**
          * Resolve Unknown
          * @description `through` is the total the owner saw: anything since stays counted, so no ABA and no 409.
-         *     With no `through` this is the batch whose door-chosen uid is literally `unknown`, which this
+         *     With no `through` this is the batch whose door-chosen uid is literally unknown, which this
          *     route would otherwise make unresolvable and its alert unclearable.
          */
         post: operations["resolve_unknown_api_trip_ingest_quarantine_unknown_resolve_post"];
@@ -7426,7 +7426,7 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody: {
+        requestBody?: {
             content: {
                 "application/json": components["schemas"]["UnknownResolveIn"];
             };

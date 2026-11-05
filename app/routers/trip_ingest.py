@@ -5,7 +5,7 @@ it": it files nothing, deletes nothing and sends nothing to the door, and `state
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +36,10 @@ class UnknownResolveIn(BaseModel):
     through: int | None = Field(
         default=None, ge=0, description="The `unknownTotal` the owner saw; later ones stay counted."
     )
+
+
+# The sheet resolves every batch the same way, with no body, and the door chooses the uid.
+_NO_THROUGH = UnknownResolveIn()
 
 
 async def _cursor_row(db: AsyncSession) -> TripIngestCursor | None:
@@ -86,9 +90,9 @@ async def _resolve_batch(db: AsyncSession, batch_uid: str, user: User) -> None:
 
 @router.post("/quarantine/unknown/resolve", status_code=204)
 async def resolve_unknown(
-    body: UnknownResolveIn,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    body: Annotated[UnknownResolveIn, Body()] = _NO_THROUGH,
 ) -> None:
     """`through` is the total the owner saw: anything since stays counted, so no ABA and no 409.
     With no `through` this is the batch whose door-chosen uid is literally unknown, which this

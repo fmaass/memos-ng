@@ -130,9 +130,23 @@ describe('TripPassManager', () => {
     expect(wrapper.findAll('[data-test="pass-suspended"]')).toHaveLength(1)
     const buttons = wrapper.findAll('[data-test="pass-unsuspend"]')
     expect(buttons).toHaveLength(1)
+    const before = server.calls('GET', LIST).length
     await buttons[0]!.trigger('click')
     await flushPromises()
     expect(server.calls('POST', '/api/passes/sus/unsuspend')).toHaveLength(1)
+    // The list on screen refetches: an invalidation under any other key would leave it stale.
+    expect(server.calls('GET', LIST).length).toBeGreaterThan(before)
+  })
+
+  it('says why an unsuspend failed', async () => {
+    const passes = [aPass({ uid: 'sus', doorSuspended: true })]
+    server.on('GET', LIST, () => ({ status: 200, body: passes }))
+    server.on('POST', '/api/passes/sus/unsuspend', { status: 502, body: {} })
+    const wrapper = mountSheet()
+    await flushPromises()
+    await wrapper.find('[data-test="pass-unsuspend"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-test="pass-error"]').text()).toContain('HTTP 502')
   })
 
   it('lists quarantined uploads, resolves them, and hides the section when none are left', async () => {

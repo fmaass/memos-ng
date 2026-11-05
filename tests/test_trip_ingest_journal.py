@@ -37,6 +37,13 @@ if point == "before_journaling":
     trip_ingest._MoveJournal.record_many = adie
 elif point == "before_part_rename":
     trip_ingest._replace_sync = die
+elif point == "before_reservation_token":
+    real_write = os.write
+    def write(fd, data):
+        if bytes(data).startswith(storage.RESERVATION_PREFIX):
+            die()
+        return real_write(fd, data)
+    os.write = write
 elif point == "before_master_rename":
     storage._before_journaled_rename = die
 else:
@@ -86,7 +93,13 @@ def _verified(batch: str) -> dict[str, int]:
 
 @pytest.mark.parametrize(
     "point",
-    ["before_journaling", "before_part_rename", "before_master_rename", "after_placement"],
+    [
+        "before_journaling",
+        "before_part_rename",
+        "before_reservation_token",
+        "before_master_rename",
+        "after_placement",
+    ],
 )
 async def test_a_killed_filing_is_walked_back_and_refiles_clean(world, monkeypatch, point):
     batch, batch_id = await _downloaded(
@@ -109,6 +122,9 @@ async def test_a_killed_filing_is_walked_back_and_refiles_clean(world, monkeypat
         assert _files(world.home_root, "uploads") == [], "a placeholder preceded its record"
     else:
         assert _rows() > 0
+    if point == "before_reservation_token":
+        empty = [p for p in _files(world.home_root, "originals") if p.stat().st_size == 0]
+        assert len(empty) == 1, "the kill did not land between the create and the token"
     await trip_ingest.reconcile_moves()
     assert _rows() == 0
     assert _verified(batch) == staged, "the source bytes are not back in staging"
@@ -161,6 +177,57 @@ async def test_reverse_order_restores_a_whole_chain_to_verified(world, tmp_path)
     await trip_ingest.reconcile_moves()
     assert verified.read_bytes() == b"bytes"
     assert not part.exists() and not unfiled.exists() and not memo.exists()
+    assert _rows() == 0
+
+
+async def test_a_failed_hop_keeps_its_chain_and_a_retry_restores_it_to_verified(
+    world, tmp_path, monkeypatch
+):
+    """A hop that will not move back stops its batch: the earlier rows depend on it, and walked now
+    they read "neither present" and are dropped, stranding the original with no journal."""
+    verified, part, unfiled, memo = (tmp_path / n for n in ("v", "p", "u", "m"))
+    memo.write_bytes(b"bytes")
+    for src, dest, kind in (
+        (verified, part, "part"),
+        (part, unfiled, "master"),
+        (unfiled, memo, "master"),
+    ):
+        await _journal_row(tmp_path, src, dest, kind)
+    real = os.replace
+
+    def refuses_the_memo_hop(src, dest, *a, **k):
+        if Path(src) == memo:
+            raise PermissionError(13, "injected", str(src))
+        return real(src, dest, *a, **k)
+
+    monkeypatch.setattr(os, "replace", refuses_the_memo_hop)
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    assert memo.read_bytes() == b"bytes"
+    assert _rows() == 3, "a dependent row went while its hop stood"
+    monkeypatch.setattr(os, "replace", real)
+    await trip_ingest.reconcile_moves()
+    assert verified.read_bytes() == b"bytes"
+    assert not part.exists() and not unfiled.exists() and not memo.exists()
+    assert _rows() == 0
+
+
+async def test_an_empty_file_at_a_journaled_dest_goes_only_while_the_source_stands(world, tmp_path):
+    """A master is never 0 bytes, and a source present means the rename never ran: the empty file is
+    the reservation a kill caught before its token. With the source gone it is what the row moved,
+    so it walks back rather than disappear."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    dest.write_bytes(b"")
+    await _journal_row(tmp_path, src, dest)
+    await trip_ingest.reconcile_moves()
+    assert src.read_bytes() == b"source" and not dest.exists()
+    assert _rows() == 0
+    gone, kept = tmp_path / "gone", tmp_path / "kept"
+    kept.write_bytes(b"")
+    await _journal_row(tmp_path, gone, kept)
+    await trip_ingest.reconcile_moves()
+    assert gone.exists() and not kept.exists()
     assert _rows() == 0
 
 

@@ -110,10 +110,10 @@ export function useTripPasses(collectionUid: MaybeRefOrGetter<string>) {
           params: { path: { uid: passUid } },
         })
         if (e) throw new PassError(response.status, detailOf(e))
-        await queryClient.invalidateQueries({ queryKey: ['passes', forUid] })
+        refresh(forUid)
         return true
       } catch (err) {
-        error.value = err instanceof PassError ? err : new PassError(0, String(err))
+        fail(forUid, err)
         return false
       }
     })

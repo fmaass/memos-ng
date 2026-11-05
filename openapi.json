@@ -10574,11 +10574,11 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UnknownResolveIn"
+                "$ref": "#/components/schemas/UnknownResolveIn",
+                "default": {}
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "204": {
