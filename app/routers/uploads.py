@@ -1,6 +1,5 @@
 import asyncio
 import time
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import structlog
@@ -301,10 +300,14 @@ async def start_upload_batch(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> UploadBatchOut:
     results: list[UploadBatchResult] = []
-    parts: list[Path] = []
+    # The uid of every session whose part may be on disk, recorded by `create_upload` before it
+    # makes one — not after the entry succeeds, which left a part behind when its flush or its
+    # savepoint's release failed (MEMNG-1182).
+    part_uids: list[str] = []
     # Bytes the sessions admitted so far will still need: their parts are empty when the next
     # entry probes the volume, so the probe alone would admit every entry against the same space.
     reserved = 0
+    committing = False
     try:
         for entry in body.entries:
             if entry.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
@@ -324,11 +327,11 @@ async def start_upload_batch(
                         last_modified=entry.last_modified,
                         sha256=entry.sha256,
                         reserved=reserved,
+                        part_uids_out=part_uids,
                     )
             except svc.InsufficientSpace as exc:
                 results.append(UploadBatchResult(status=507, detail=str(exc)))
                 continue
-            parts.append(svc.part_path(upload.upload_uid))
             reserved += upload.declared_size - upload.bytes_received  # a hit needs nothing
             results.append(
                 UploadBatchResult(
@@ -340,15 +343,27 @@ async def start_upload_batch(
                     ),
                 )
             )
+        committing = True
         await db.commit()
     except BaseException:
-        # Nothing is committed, and the session's close rolls every row back; the parts made for
-        # them go first, in one hop off the loop that is awaited to the end even if this request
-        # is being cancelled. A hit's part is a second name for its original: only the name goes.
-        if parts:
-            _, cancelled = await svc.finish_off_the_loop(svc.unlink_many_sync, parts)
-            if cancelled is not None:
-                raise cancelled from None
+        # Before the COMMIT nothing is committed, and the session's close rolls every row back.
+        # An exception out of the COMMIT proves no rollback — PostgreSQL may have accepted it before
+        # the connection dropped or the request was cancelled — so a fresh read decides, and only
+        # the parts of sessions that did not land go; an outcome that cannot be read unlinks
+        # nothing (MEMNG-1182). The parts go in one hop off the loop that is awaited to the end even
+        # if this request is being cancelled. A hit's part is a second name for its original: only
+        # the name goes.
+        cancelled: asyncio.CancelledError | None = None
+        doomed = part_uids
+        if committing and part_uids:
+            landed, cancelled = await svc.landed_upload_uids(part_uids)
+            doomed = [] if landed is None else [u for u in part_uids if u not in landed]
+        if doomed:
+            parts = [svc.part_path(u) for u in doomed]
+            _, cancelled_unlinking = await svc.finish_off_the_loop(svc.unlink_many_sync, parts)
+            cancelled = cancelled or cancelled_unlinking
+        if cancelled is not None:
+            raise cancelled from None
         raise
     return UploadBatchOut(results=results)
 

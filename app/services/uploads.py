@@ -561,6 +561,7 @@ async def create_upload(
     last_modified: int | None = None,
     sha256: str | None = None,
     reserved: int = 0,
+    part_uids_out: list[str] | None = None,
 ) -> Upload:
     """Open an upload session BOUND to `owner_id`. The uid is unguessable but is not a capability:
     every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
@@ -579,6 +580,11 @@ async def create_upload(
     raised before the part is created. `reserved` is what other sessions not yet written still
     claim on that volume — a batch's earlier admitted entries, whose parts are empty when this one
     probes — so the bound is `free >= (reserved + size) * 1.1`; a single create claims nothing.
+
+    `part_uids_out` (MEMNG-1182) receives the session's uid BEFORE the first hop that can put its
+    part (or staging link) on disk, so a caller cleaning up after a failure — in this call, a later
+    flush, or its savepoint's release — knows every name that may exist. A uid whose part was never
+    made (a refused link, a 507) is in it too; unlinking that name finds nothing.
     """
     upload_uid = secrets.token_urlsafe(24)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
@@ -600,6 +606,10 @@ async def create_upload(
     # The part file last, after everything that can raise: made first, a `last_modified` past
     # year 9999 (OverflowError) left a part file with no row to find it by, once per attempt.
     part = part_path(upload_uid)
+    # Registered before the hop, not after it: a cancellation reaching that hop is delivered only
+    # once the thread has made the file, and would skip anything placed after the await.
+    if part_uids_out is not None:
+        part_uids_out.append(upload_uid)
     if sha256 is not None and await _link_staged_twin(db, owner_id, sha256, size, part):
         upload.bytes_received = size
         # Recorded only on a HIT: the part is now a hard link to an original of this owner's row
@@ -614,6 +624,64 @@ async def create_upload(
         raise InsufficientSpace(size, max(free - reserved, 0))
     await to_thread.run_sync(_create_part_sync, part)
     return upload
+
+
+# How long a request whose COMMIT raised waits to learn what landed (MEMNG-1182). Bounded because
+# the usual cause is the database going away, and an unbounded read would hold that request — under
+# a shield, past its own cancellation — for as long as the driver keeps trying to connect.
+COMMIT_OUTCOME_TIMEOUT_S = 5.0
+
+
+async def landed_upload_uids(
+    upload_uids: Sequence[str],
+) -> tuple[set[str] | None, asyncio.CancelledError | None]:
+    """Which of `upload_uids` have a committed row — how a caller whose COMMIT raised learns
+    whether it landed (MEMNG-1182). An exception out of the commit (a cancellation, the connection
+    dropped after PostgreSQL accepted it) proves nothing either way; a row read in a FRESH session
+    does. None when that read fails or times out: the outcome stays unknown, and the caller must
+    then treat every session as possibly committed.
+
+    The read runs in a task of its own, awaited under a shield until it is done — the caller is
+    usually unwinding a cancellation, and a level-triggered cancel scope would cancel the read at
+    its first await. Each cancellation meanwhile is remembered and handed back, as
+    `finish_off_the_loop` does, for the caller to re-raise once it has acted on the answer.
+    """
+
+    async def read() -> set[str] | None:
+        try:
+            with fail_after(COMMIT_OUTCOME_TIMEOUT_S):
+                async with async_session() as db:
+                    found = await db.execute(
+                        select(Upload.upload_uid).where(Upload.upload_uid.in_(list(upload_uids)))
+                    )
+                    return set(found.scalars().all())
+        except Exception as exc:
+            logger.error(
+                "uploads.commit_outcome_unknown", sessions=len(upload_uids), error=repr(exc)[:200]
+            )
+            return None
+
+    task = asyncio.create_task(read())
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(task), cancellation
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                # The read itself was cancelled — a shutdown cancels every task. Awaiting it again
+                # would raise at once without yielding, a loop that blocks the event loop, so the
+                # outcome is unknown. A cancellation of the caller in the same tick lands here
+                # too; `cancelling()` still counts it, and it is handed back.
+                logger.error(
+                    "uploads.commit_outcome_unknown",
+                    sessions=len(upload_uids),
+                    error="outcome read cancelled",
+                )
+                current = asyncio.current_task()
+                if cancellation is None and current is not None and current.cancelling():
+                    cancellation = exc
+                return None, cancellation
+            cancellation = exc
 
 
 class BodyIdle(ClientDisconnect):
