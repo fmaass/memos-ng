@@ -814,7 +814,12 @@ async def attach_rendition(
     upload = (
         await db.execute(
             select(Upload)
-            .where(Upload.upload_uid == body.upload_uid, Upload.owner_id == user.id)
+            .where(
+                Upload.upload_uid == body.upload_uid,
+                Upload.owner_id == user.id,
+                # A withdrawn session is never consumed (MEMNG-953); it answers as unknown here.
+                Upload.withdrawn_at.is_(None),
+            )
             .with_for_update()
             .execution_options(populate_existing=True)
         )

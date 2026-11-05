@@ -541,12 +541,13 @@ async def authenticate_capture_grant(db: AsyncSession, grant: str) -> User | Non
 async def require_upload_user(request: Request, db: AsyncSession = Depends(get_session)) -> User:
     """`require_user`, widened by exactly one credential: an upload-only capture grant.
 
-    Declared ONLY on the three upload-protocol operations a share extension needs — open a session
-    (POST /api/uploads), append bytes (PATCH /api/uploads/{uid}) and read the offset (HEAD) — so a
-    grant reaches those and nothing else; every other route takes `require_user`, whose PAT lookup
-    refuses a grant row. Dispatch is on the prefix, so a token is looked up exactly as before and a
-    grant is never tried as a token or the other way round; a grant that does not authenticate is a
-    401 with no fallback to the cookie (Decision 6).
+    Declared ONLY on the four upload-protocol operations a share extension needs — open a session
+    (POST /api/uploads), append bytes (PATCH /api/uploads/{uid}), read the offset (HEAD) and
+    withdraw the session (DELETE, MEMNG-953) — so a grant reaches those and nothing else; every
+    other route takes `require_user`, whose PAT lookup refuses a grant row. Dispatch is on the
+    prefix, so a token is looked up exactly as before and a grant is never tried as a token or the
+    other way round; a grant that does not authenticate is a 401 with no fallback to the cookie
+    (Decision 6).
     """
     credential = bearer_credential(request)
     if credential is None or not credential.startswith(CAPTURE_GRANT_PREFIX):

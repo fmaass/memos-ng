@@ -1721,7 +1721,20 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Withdraw Upload
+         * @description Withdraw an upload session the caller no longer wants.
+         *
+         *     A withdrawn session takes no more bytes (PATCH answers 409 with `upload_withdrawn`), is no
+         *     longer offered for resuming (HEAD answers 404), and is never finalized (finalize answers 409
+         *     with `upload_withdrawn`; a memo naming it reports it as missing). Its bytes are removed within
+         *     the hour.
+         *
+         *     Always 204, and idempotent: the same answer for a session withdrawn earlier, for one that no
+         *     longer exists, and for a uid this caller does not own. A session that was already finalized
+         *     is left as it is: the attachment it became is not touched.
+         */
+        delete: operations["withdraw_upload_api_uploads__upload_uid__delete"];
         options?: never;
         /** Upload Offset */
         head: operations["upload_offset_api_uploads__upload_uid__head"];
@@ -3818,6 +3831,25 @@ export interface components {
             chunk_size: number;
             /** Upload Uid */
             upload_uid: string;
+        };
+        /**
+         * UploadWithdrawnDetail
+         * @description Why a finalize was refused: the session was withdrawn with DELETE, so it will never become
+         *     an attachment. Nothing was stored or changed. A file that is still wanted needs a new
+         *     session.
+         */
+        UploadWithdrawnDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "upload_withdrawn";
+            /** Message */
+            message: string;
+        };
+        /** UploadWithdrawnError */
+        UploadWithdrawnError: {
+            detail: components["schemas"]["UploadWithdrawnDetail"];
         };
         /**
          * UploadsUnlinkableDetail
@@ -7592,6 +7624,36 @@ export interface operations {
             503: components["responses"]["DatabaseBusy"];
         };
     };
+    withdraw_upload_api_uploads__upload_uid__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_uid: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            503: components["responses"]["DatabaseBusy"];
+        };
+    };
     upload_offset_api_uploads__upload_uid__head: {
         parameters: {
             query?: never;
@@ -7652,7 +7714,7 @@ export interface operations {
                     "application/json": components["schemas"]["UploadOut"];
                 };
             };
-            /** @description Offset gap — re-sync with HEAD and resend from the offset it reports. */
+            /** @description Offset gap — re-sync with HEAD and resend from the offset it reports. A `detail` of `upload_withdrawn` instead means the session was withdrawn with DELETE: it takes no more bytes, and re-syncing will not help. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7738,6 +7800,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AttachmentOut"];
+                };
+            };
+            /** @description The session was withdrawn with DELETE (`upload_withdrawn`). Nothing was stored; a file that is still wanted needs a new session. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadWithdrawnError"];
                 };
             };
             /** @description Validation Error */

@@ -629,6 +629,11 @@ class Upload(Base):
     capture_source: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the owner withdrew the session (MEMNG-953: `DELETE /api/uploads/{uid}`). A withdrawn
+    # session takes no more bytes and is never consumed — every consuming path refuses it under
+    # the row lock — and the same write pulls `expires_at` to that instant, so the hourly reap
+    # claims row and part exactly as it claims an abandoned session. NULL: never withdrawn.
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 PASS_SCOPES = ("contribute", "contribute_view")

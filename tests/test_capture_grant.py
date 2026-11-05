@@ -196,15 +196,20 @@ async def test_every_other_route_refuses_the_grant_with_401(pat_client):
     assert (await bearer.get("/api/memos")).status_code == 200
 
 
-async def test_delete_on_an_upload_reaches_no_route_and_changes_nothing(pat_client):
-    """There is no DELETE on /api/uploads: the /api fallback answers 404 before any credential is
-    read, for a grant exactly as for a token. The case pins: not a 2xx, and nothing deleted."""
+async def test_the_grant_withdraws_a_session_of_its_owner(pat_client):
+    """DELETE on an upload session (MEMNG-953) is part of the upload protocol a share extension
+    speaks, so the grant reaches it as its owner — here a session the parent token opened — and
+    the withdrawn session then refuses its finalize."""
     bearer, _, _ = pat_client
     grant = await _mint(bearer)
     uid = (await _start(bearer)).json()["upload_uid"]
     async with _bearer(grant["token"]) as g:
-        assert (await g.delete(f"/api/uploads/{uid}")).status_code == 404
-    assert len(_sql("SELECT upload_uid FROM uploads WHERE upload_uid = :u", u=uid)) == 1
+        assert (await g.delete(f"/api/uploads/{uid}")).status_code == 204
+    rows = _sql("SELECT withdrawn_at FROM uploads WHERE upload_uid = :u", u=uid)
+    assert len(rows) == 1 and rows[0].withdrawn_at is not None
+    fin = await bearer.post(f"/api/uploads/{uid}/finalize")
+    assert fin.status_code == 409, fin.text
+    assert fin.json()["detail"]["code"] == "upload_withdrawn"
 
 
 async def test_a_grant_in_the_grant_scheme_is_not_a_management_grant(pat_client):

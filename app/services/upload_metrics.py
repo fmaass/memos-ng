@@ -27,10 +27,11 @@ logger = structlog.get_logger(__name__)
 Principal = Literal["pat", "session", "capture_grant"]
 # Which cap refused: one account's bodies or the whole process's.
 AdmissionScope = Literal["user", "process"]
-# How a consumed session ended. `rejected_size` is the third value this process publishes (see
+# How a session ended. `rejected_size` is the fourth value this process publishes (see
 # `count_size_rejection`); `expired` is the worker's, read from its tally per scrape
-# (`upload_queue_metrics`), and `withdrawn` has no server path (see `count_session_end`).
-SessionEnd = Literal["completed", "deduped"]
+# (`upload_queue_metrics`). `withdrawn` is the owner's DELETE (MEMNG-953), counted here when it
+# commits; the reap that later removes that row counts nothing more for it.
+SessionEnd = Literal["completed", "deduped", "withdrawn"]
 
 UPLOAD_BYTES = Counter(
     "memosng_upload_bytes",
@@ -68,7 +69,7 @@ EVENTS_SUBSCRIBERS = Gauge(
 # than no data.
 for _principal in ("pat", "session"):
     UPLOAD_BYTES.labels(principal=_principal)
-for _result in ("completed", "deduped", "rejected_size"):
+for _result in ("completed", "deduped", "withdrawn", "rejected_size"):
     UPLOAD_SESSIONS.labels(result=_result)
 for _scope in ("user", "process"):
     ADMISSION_REJECTIONS.labels(scope=_scope)
@@ -111,15 +112,16 @@ def count_size_rejection() -> None:
 
 @_never_raises
 def count_session_end(db: AsyncSession, result: SessionEnd) -> None:
-    """Record a session's end, to be counted only if the transaction that deletes its row commits.
+    """Record a session's end, to be counted only if the transaction that ends it commits.
 
     A finalize that rolls back leaves the session open, and the client finalizes it again; counted
     here it would be counted twice. Called at every site that consumes an `uploads` row, which is
-    every caller of the finalize family — the standalone route, the memo create, a trip filing.
+    every caller of the finalize family — the standalone route, the memo create, a trip filing —
+    and at the withdraw, which ends a session without deleting its row (the reap does that later).
 
     `expired` is not counted here: the reaper runs in the worker, which serves no `/metrics`, so it
     bumps a tally row in its own transaction (`tallies.count_upload_sessions`) that the scrape
-    reads. `withdrawn` has no server path (no route deletes a session on request).
+    reads.
     """
     db.sync_session.info.setdefault(_PENDING_KEY, []).append(result)
 

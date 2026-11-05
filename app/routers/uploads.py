@@ -150,6 +150,30 @@ class CaptureOut(BaseModel):
     capture_source: str | None
 
 
+class UploadWithdrawnDetail(BaseModel):
+    """Why a finalize was refused: the session was withdrawn with DELETE, so it will never become
+    an attachment. Nothing was stored or changed. A file that is still wanted needs a new
+    session."""
+
+    code: Literal["upload_withdrawn"]  # required, not defaulted: generated clients switch on it
+    message: str
+
+
+class UploadWithdrawnError(BaseModel):
+    detail: UploadWithdrawnDetail
+
+
+# The PATCH 409 keeps its declared shape (a string `detail`), so its withdrawn answer is this one
+# fixed token rather than the finalize's object; both name the same cause.
+WITHDRAWN = "upload_withdrawn"
+
+
+def _withdrawn_gone() -> HTTPException:
+    """A withdrawn session as the read-only verbs (HEAD, capture) answer it: exactly as the unknown
+    uid it becomes at the reap, so the answer never depends on whether the reap has run yet."""
+    return HTTPException(status_code=404, detail="Upload not found")
+
+
 async def _get_upload(db: AsyncSession, upload_uid: str, owner_id: int) -> Upload:
     """Resolve an upload session the caller OWNS. Scoping the lookup (rather than fetching then
     comparing) makes another user's session answer exactly as an unknown uid does — same 404, same
@@ -248,7 +272,8 @@ async def upload_limits(_: Annotated[User, Depends(auth.require_user)]) -> Uploa
             "200": {"headers": _upload_offset_header()},
             "409": {
                 "description": "Offset gap — re-sync with HEAD and resend from the offset it "
-                "reports.",
+                "reports. A `detail` of `upload_withdrawn` instead means the session was "
+                "withdrawn with DELETE: it takes no more bytes, and re-syncing will not help.",
                 "content": {
                     "application/json": {
                         "schema": {
@@ -285,6 +310,10 @@ async def append_chunk(
     upload_offset: Annotated[int, Header(alias="Upload-Offset")] = 0,
 ) -> UploadOut:
     upload = await _get_upload(db, upload_uid, user.id)
+    if upload.withdrawn_at is not None:
+        # Refused before the body is read; a withdraw landing while it streams is caught again
+        # under the row lock (svc.UploadWithdrawn below).
+        raise HTTPException(status_code=409, detail=WITHDRAWN)
     # End the lookup transaction before the body arrives: left open, it pins a pooled connection
     # for as long as the client takes to send the bytes, and a few slow uploads drain the pool for
     # every request (MEMNG-621). Commit, not rollback — `expire_on_commit=False` keeps `upload`
@@ -322,6 +351,8 @@ async def append_chunk(
             raise HTTPException(status_code=413, detail=detail) from None
         except ValueError:
             raise HTTPException(status_code=409, detail="Offset gap; re-sync via HEAD") from None
+        except svc.UploadWithdrawn:
+            raise HTTPException(status_code=409, detail=WITHDRAWN) from None
         if appended is None:
             # The session was consumed (or reaped) while this append waited for its row. Same
             # answer as an unknown uid — because that is what it now is — rather than the 500
@@ -370,7 +401,32 @@ async def upload_offset(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> Response:
     upload = await _get_upload(db, upload_uid, user.id)
+    if upload.withdrawn_at is not None:
+        raise _withdrawn_gone()
     return Response(status_code=200, headers={"Upload-Offset": str(upload.bytes_received)})
+
+
+@router.delete("/{upload_uid}", status_code=204, response_class=Response)
+async def withdraw_upload(
+    upload_uid: str,
+    # Also an upload-only capture grant (MEMNG-938): withdrawing is part of the upload protocol.
+    user: Annotated[User, Depends(auth.require_upload_user)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    """Withdraw an upload session the caller no longer wants.
+
+    A withdrawn session takes no more bytes (PATCH answers 409 with `upload_withdrawn`), is no
+    longer offered for resuming (HEAD answers 404), and is never finalized (finalize answers 409
+    with `upload_withdrawn`; a memo naming it reports it as missing). Its bytes are removed within
+    the hour.
+
+    Always 204, and idempotent: the same answer for a session withdrawn earlier, for one that no
+    longer exists, and for a uid this caller does not own. A session that was already finalized
+    is left as it is: the attachment it became is not touched.
+    """
+    await svc.withdraw(db, upload_uid, user.id)
+    await db.commit()
+    return Response(status_code=204)
 
 
 @router.get("/{upload_uid}/capture", response_model=CaptureOut)
@@ -392,6 +448,8 @@ async def upload_capture(
     that exactly-once, and every later poll is a plain read.
     """
     upload = await _get_upload(db, upload_uid, user.id)
+    if upload.withdrawn_at is not None:
+        raise _withdrawn_gone()
     settled = await svc.ensure_capture(db, upload)
     if settled is None:
         # Finalized (or reaped) while this read waited for the row: the session is gone, and a
@@ -418,7 +476,17 @@ def _restore_moves_sync(moves: list[storage.TrackedMove]) -> None:
             logger.error("uploads.finalize.restore_failed", src=move.src, dest=unrestored)
 
 
-@router.post("/{upload_uid}/finalize", response_model=AttachmentOut)
+@router.post(
+    "/{upload_uid}/finalize",
+    response_model=AttachmentOut,
+    responses={
+        409: {
+            "model": UploadWithdrawnError,
+            "description": "The session was withdrawn with DELETE (`upload_withdrawn`). Nothing "
+            "was stored; a file that is still wanted needs a new session.",
+        }
+    },
+)
 async def finalize_upload(
     upload_uid: str,
     user: Annotated[User, Depends(auth.require_user)],
@@ -443,6 +511,14 @@ async def finalize_upload(
             # The session was consumed by another finalize while this one waited for its row.
             # Same answer as an unknown uid — because that is what it now is.
             raise HTTPException(status_code=404, detail="Upload not found") from None
+        except svc.UploadWithdrawn:
+            raise HTTPException(
+                status_code=409,
+                detail=UploadWithdrawnDetail(
+                    code="upload_withdrawn",
+                    message="This upload session was withdrawn and cannot be finalized.",
+                ).model_dump(),
+            ) from None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         await db.commit()

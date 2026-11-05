@@ -111,7 +111,11 @@ INSERT of a private row, which is not an acquisition (R8).
   transaction's own insert) and stays loud: asserted, never silently skipped. This is the contract
   every other lock already honours — `ensure_capture` returns `None` for a vanished upload,
   `reclaim_attachment` answers `"vanished"`, `guard_publish` treats a missing job row as the
-  delete having won.
+  delete having won. `withdraw` (`DELETE /api/uploads/{uid}`, MEMNG-953) takes ONE U row, owner
+  scoped, and nothing else in its transaction; a `None` after the wait is a finalize that won, and
+  the route answers its idempotent 204 with nothing changed. Every consuming path re-reads
+  `withdrawn_at` on the U row it already holds (`finalize`, `append_stream.relock`) or filters it
+  in its one ascending U statement (`finalize_pending` pass 0), so no lock is added to the order.
 - **R7 — J → A is the protocol.** `SKIP LOCKED` stays where it is (reclaim's job sweep, the claim,
   the recovery sweeps): it is a *queue* mechanism there, never a way to omit a requested row.
 - **R7a — a sweep that touches many attachments acquires them as one ascending set.**

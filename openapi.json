@@ -4294,6 +4294,38 @@
         "title": "UploadOut",
         "type": "object"
       },
+      "UploadWithdrawnDetail": {
+        "description": "Why a finalize was refused: the session was withdrawn with DELETE, so it will never become\nan attachment. Nothing was stored or changed. A file that is still wanted needs a new\nsession.",
+        "properties": {
+          "code": {
+            "const": "upload_withdrawn",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "UploadWithdrawnDetail",
+        "type": "object"
+      },
+      "UploadWithdrawnError": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/UploadWithdrawnDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "UploadWithdrawnError",
+        "type": "object"
+      },
       "UploadsUnlinkableDetail": {
         "description": "Why a memo write was refused: the requested uploads cannot become attachments.\n\nThe two buckets carry different remedies: `missing_upload_uids` (never existed, or expired and\nreaped \u2014 an upload owned by another user reads as missing too) need a fresh upload;\n`incomplete_upload_uids` (fewer bytes received than the declared size) need the transfer\nresumed from HEAD.",
         "properties": {
@@ -10861,6 +10893,51 @@
       }
     },
     "/api/uploads/{upload_uid}": {
+      "delete": {
+        "description": "Withdraw an upload session the caller no longer wants.\n\nA withdrawn session takes no more bytes (PATCH answers 409 with `upload_withdrawn`), is no\nlonger offered for resuming (HEAD answers 404), and is never finalized (finalize answers 409\nwith `upload_withdrawn`; a memo naming it reports it as missing). Its bytes are removed within\nthe hour.\n\nAlways 204, and idempotent: the same answer for a session withdrawn earlier, for one that no\nlonger exists, and for a uid this caller does not own. A session that was already finalized\nis left as it is: the attachment it became is not touched.",
+        "operationId": "withdraw_upload_api_uploads__upload_uid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "upload_uid",
+            "required": true,
+            "schema": {
+              "title": "Upload Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/DatabaseBusy"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Withdraw Upload",
+        "tags": [
+          "uploads"
+        ]
+      },
       "head": {
         "operationId": "upload_offset_api_uploads__upload_uid__head",
         "parameters": [
@@ -10980,7 +11057,7 @@
                 }
               }
             },
-            "description": "Offset gap \u2014 re-sync with HEAD and resend from the offset it reports."
+            "description": "Offset gap \u2014 re-sync with HEAD and resend from the offset it reports. A `detail` of `upload_withdrawn` instead means the session was withdrawn with DELETE: it takes no more bytes, and re-syncing will not help."
           },
           "422": {
             "content": {
@@ -11111,6 +11188,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadWithdrawnError"
+                }
+              }
+            },
+            "description": "The session was withdrawn with DELETE (`upload_withdrawn`). Nothing was stored; a file that is still wanted needs a new session."
           },
           "422": {
             "content": {

@@ -1114,7 +1114,10 @@ async def _judge_picture_list(
             (
                 await db.execute(
                     select(Upload.upload_uid).where(
-                        Upload.upload_uid.in_(unknown), Upload.owner_id == owner_id
+                        Upload.upload_uid.in_(unknown),
+                        Upload.owner_id == owner_id,
+                        # Withdrawn (MEMNG-953): naming it in upload_uids would not help either.
+                        Upload.withdrawn_at.is_(None),
                     )
                 )
             ).scalars()

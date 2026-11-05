@@ -98,6 +98,16 @@ class UploadsUnlinkable(Exception):
         self.incomplete = incomplete
 
 
+class UploadWithdrawn(Exception):
+    """The session was withdrawn by its owner (MEMNG-953), found so UNDER the row lock: it takes no
+    more bytes and is never consumed. Raised before anything is written or moved, so the caller's
+    transaction holds nothing to undo; the hourly reap removes row and part."""
+
+    def __init__(self, upload_uid: str) -> None:
+        super().__init__(f"upload {upload_uid} was withdrawn")
+        self.upload_uid = upload_uid
+
+
 # Why a video poster override can be refused, as a closed machine-readable set. Each value is one
 # CATEGORY of reason, so a client can act on it without parsing prose: the `poster_missing` /
 # `poster_incomplete` pair means "send those bytes again", every other value means "this request is
@@ -760,7 +770,7 @@ async def append_stream(
         # the session and deletes it. A lock acquisition may lose its row, and losing it is an
         # ordinary answer, not a 500 (MEMNG-278; the protocol's R6a, the same contract
         # `ensure_capture` and `reclaim_attachment` already honour).
-        return (
+        row = (
             await db.execute(
                 select(Upload)
                 .where(Upload.upload_uid == upload.upload_uid)
@@ -768,6 +778,11 @@ async def append_stream(
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+        # Withdrawn while this body streamed: under the lock is the only place that is decided
+        # for good, and no byte of the body has reached the part file yet.
+        if row is not None and row.withdrawn_at is not None:
+            raise UploadWithdrawn(row.upload_uid)
+        return row
 
     async def completed(row: Upload) -> Upload:
         # The upload just COMPLETED — the one moment its bytes are all here and nothing has
@@ -972,7 +987,11 @@ async def _resolve_video_poster(
     else:
         poster_upload = (
             await db.execute(
-                select(Upload).where(Upload.upload_uid == poster_uid, Upload.owner_id == owner_id)
+                select(Upload).where(
+                    Upload.upload_uid == poster_uid,
+                    Upload.owner_id == owner_id,
+                    Upload.withdrawn_at.is_(None),
+                )
             )
         ).scalar_one_or_none()
     if poster_upload is None:  # unknown, expired, or another user's — one fail-closed answer
@@ -1383,7 +1402,13 @@ async def finalize_pending(
             (
                 await db.execute(
                     select(Upload)
-                    .where(Upload.upload_uid.in_(requested), Upload.owner_id == owner_id)
+                    .where(
+                        Upload.upload_uid.in_(requested),
+                        Upload.owner_id == owner_id,
+                        # A withdrawn session reads as missing — re-evaluated once the lock is
+                        # granted, so a withdraw committed while this queued is honoured too.
+                        Upload.withdrawn_at.is_(None),
+                    )
                     .order_by(Upload.upload_uid)
                     .with_for_update()
                     .execution_options(populate_existing=True)
@@ -1808,6 +1833,10 @@ async def finalize(
         # is that finalize's business now (moved into place, or reaped after its commit), so this
         # one must not touch it: it answers exactly as an unknown uid does.
         raise UploadsUnlinkable([upload.upload_uid], [])
+    if settled.withdrawn_at is not None:
+        # Judged on the LOCKED row: a withdraw that committed while this call queued is seen here,
+        # and one still queued behind this lock will find the row consumed and change nothing.
+        raise UploadWithdrawn(settled.upload_uid)
     upload = settled
     part = part_path(upload.upload_uid)
     actual = await to_thread.run_sync(_part_size_sync, part)
@@ -2248,6 +2277,37 @@ def _reap_spools_sync(spools: list[Path], cutoff: float, live_uids: frozenset[st
     return reaped
 
 
+async def withdraw(db: AsyncSession, upload_uid: str, owner_id: int) -> bool:
+    """Withdraw `owner_id`'s session `upload_uid` (MEMNG-953). True when THIS call withdrew it.
+
+    Nothing is unlinked here. The row is stamped `withdrawn_at` and its `expires_at` pulled to the
+    same instant, so the hourly reap claims row and part under its own row lock, exactly as it
+    claims an abandoned session; until then every consuming path refuses the row under that lock.
+
+    The row is taken FOR UPDATE, owner-scoped, and judged after the wait. A finalize holding it
+    either commits — the row is gone once the lock is granted, the attachment it made stands, and
+    this answers False having changed nothing — or rolls back, and the session is withdrawn as
+    asked. An unknown, foreign or already-withdrawn uid also answers False and writes nothing: the
+    caller's answer is the same for all of them, so it discloses nothing.
+    """
+    row = (
+        await db.execute(
+            select(Upload)
+            .where(Upload.upload_uid == upload_uid, Upload.owner_id == owner_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if row is None or row.withdrawn_at is not None:
+        return False
+    now = datetime.now(UTC)
+    row.withdrawn_at = now
+    row.expires_at = now
+    await db.flush()
+    upload_metrics.count_session_end(db, "withdrawn")
+    return True
+
+
 async def reap_expired_committed(now: datetime | None = None) -> int:
     """The worker's reap entry: a dedicated session that COMMITS the deletions. A flush alone
     dies with the session, which is how expired rows resurrected every cycle — their part files
@@ -2305,8 +2365,10 @@ async def reap_expired(db: AsyncSession, now: datetime | None = None) -> int:
         await db.delete(upload)
     await db.flush()
     # Counted in THIS transaction (MEMNG-1046): the row just deleted was the only record of the
-    # session, and a sweep that rolls back un-counts what it un-deletes.
-    await tallies.count_upload_sessions(db, "expired", len(rows))
+    # session, and a sweep that rolls back un-counts what it un-deletes. A WITHDRAWN session ended
+    # when its owner withdrew it, and was counted `withdrawn` then; reaping it is only cleanup.
+    expired = sum(1 for u in rows if u.withdrawn_at is None)
+    await tallies.count_upload_sessions(db, "expired", expired)
     # Whatever survived the deletion above IS the live set. Reading it as that complement rather
     # than re-deriving it from expires_at keeps a never-expiring row (NULL expires_at), which the
     # row sweep also never collects, on the spared side instead of orphaning its spool.
