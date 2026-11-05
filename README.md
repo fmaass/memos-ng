@@ -194,6 +194,32 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.15.0
+
+- Sign-in can find its provider by itself. An OIDC endpoint setting left empty is read once at
+  startup from `<OIDC_ISSUER>/.well-known/openid-configuration`; an endpoint that is set always
+  wins and is never asked of the provider. Discovery refuses an issuer or a discovered endpoint
+  that is not `https://`, and a failed discovery stops startup with an error naming the issuer.
+  `OIDC_ADMIN_CLAIM` names the group or boolean claim that makes an OIDC user an admin; empty keeps
+  the `admins` group. A configuration that sets every endpoint behaves exactly as before.
+- Local password sign-in, off by default. With `LOCAL_LOGIN=1`, `POST /api/auth/local/login`
+  checks an argon2id hash and sets the same session cookie an OIDC login does; unset, the route
+  answers 404. The hash lives in a new nullable `users.password_hash` column (an additive
+  migration; existing accounts have none).
+- The trip door reports its sequence high-water mark on every feed page, and home records a named
+  sync error instead of reading healthy when its cursor is ahead of the door, for example after the
+  door was restored from a backup. A door without the field keeps working as before.
+- Web guest uploads ride out a short network drop: checking and creating an upload now retry
+  network errors, 5xx and 429 answers with the existing backoff and pause while the browser is
+  offline, so the queue is no longer spent during a drop. A refusal still fails at once, and a
+  Retry all button appears while any item has failed.
+- Creating a session answers 507, not 500, when the uploads directory cannot be created on a full
+  volume.
+- A partial event-stream resync keeps its ready event, and closing the event listener is bounded
+  so a stop stays inside its 5 seconds.
+- Memo-live pushes close two small races: visibility is re-checked right before sending, and a
+  deleted memo's id is read before the reclaim lock.
+
 ### v2.14.0
 
 - Uploads can now be up to 4 GiB. `GET /api/uploads/limits` publishes the new limit, and creating a
