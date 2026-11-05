@@ -220,7 +220,8 @@ async def test_the_candidate_is_still_reused_when_the_failed_reclaim_left_its_by
 ):
     """The control both probes need, and it differs from them in one thing only: this reclaim
     failed BEFORE it removed anything, so the row it left still has its original. Dedup itself is
-    untouched, and the adopted row is no longer something a sweep may take."""
+    untouched, and the adopted row's detach instant restarts at the adoption: the standalone route
+    links nothing, so the row stays the detached sweep's — but only once a whole new grace is up."""
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     try:
         owner_id, att_id, _uid, original = _seed_committed(tmp_path, "solo_ok")
@@ -229,12 +230,13 @@ async def test_the_candidate_is_still_reused_when_the_failed_reclaim_left_its_by
         async with async_session() as db:
             upload = await _upload_of(db, owner_id, "again.png")
             await db.commit()
+            adopting_from = datetime.now(UTC)
             made = await up_svc.finalize(db, upload, owner_id)
             await db.commit()
             made_id, made_detached = made.id, made.detached_at
 
         assert made_id == att_id
-        assert made_detached is None  # adopted rows are nobody's garbage
+        assert made_detached is not None and made_detached >= adopting_from, made_detached
     finally:
         _cleanup()
 

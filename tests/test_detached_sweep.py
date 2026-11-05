@@ -7,9 +7,9 @@ is the detach instant, and these tests hold the sweep to it: old enough by THAT 
 has touched it since, or it is left alone.
 
 The interesting half is under the row lock. A pass selects a row, and by the time the reclaim takes
-its lock the row may have been adopted by a dedup (its instant cleared) or relinked and detached
-again (a newer one). Both belong to whoever touched them last, so both are refused against the very
-cutoff the pass selected on.
+its lock the row may have been adopted by a standalone finalize's dedup or relinked and detached
+again — either way it carries a newer instant. Both belong to whoever touched them last, so both
+are refused against the very cutoff the pass selected on.
 """
 
 import asyncio
@@ -397,7 +397,8 @@ async def _adopted_in_the_gap(client, monkeypatch, tmp_path, request):
     """Run `request(async_client, memo_uid)` and let a REAL standalone finalize adopt the row it
     detaches, in the gap between its commit and its after-commit reclaim.
 
-    Returns `(the request's response, the attachment uid, its original, the captured logs)`.
+    Returns `(the request's response, the attachment uid, its original, the captured logs, the
+    instant just before the adoption)`.
     """
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     shared = _png(b"adopt")
@@ -423,19 +424,24 @@ async def _adopted_in_the_gap(client, monkeypatch, tmp_path, request):
             detaching = asyncio.create_task(request(detacher, memo.json()["uid"]))
             await asyncio.wait_for(seam.entered.wait(), timeout=SEAM_TIMEOUT)
             # The detach has COMMITTED and its reclaim has not run: this is the window.
+            adopting_from = datetime.now(UTC)
             adopted = await adopter.post(f"/api/uploads/{twin}/finalize")
             assert adopted.status_code == 200, adopted.text
             assert adopted.json()["uid"] == att_uid, "the finalize did not dedup onto the row"
             seam.release.set()
             answer = await detaching
     seam.fired()
-    return answer, att_uid, original, logs
+    return answer, att_uid, original, logs, adopting_from
 
 
-def _still_adopted(att_uid: str, original: Path) -> None:
-    assert _rows("SELECT uid, memo_id, detached_at FROM attachments WHERE uid=:u", u=att_uid) == [
-        (att_uid, None, None)
-    ], "the reclaim took the row the adopter now owns"
+def _still_adopted(att_uid: str, original: Path, adopting_from: datetime) -> None:
+    """Still there, still off every memo, and stamped by the ADOPTION — the standalone finalize
+    restarts the instant, so the row carries the adopter's clock rather than the detach's."""
+    rows = _rows("SELECT memo_id, detached_at FROM attachments WHERE uid=:u", u=att_uid)
+    assert len(rows) == 1, "the reclaim took the row the adopter now owns"
+    [(memo_id, detached_at)] = rows
+    assert memo_id is None
+    assert detached_at is not None and detached_at >= adopting_from, detached_at
     assert original.exists(), "the reclaim took the bytes the adopter now owns"
 
 
@@ -453,9 +459,9 @@ async def test_a_delete_leaves_the_row_a_finalize_adopted_after_its_commit(
 ):
     """DELETE's after-commit loop, against a REAL adoption in its own gap.
 
-    `memo_id` is NULL either way — the adoption clears the instant, it does not relink — so linkage
-    cannot tell the adopter's row from this delete's garbage. Only the epoch can, which is why the
-    loop has to carry the instant its own transaction stamped.
+    `memo_id` is NULL either way — the adoption restarts the instant, it does not relink — so
+    linkage cannot tell the adopter's row from this delete's garbage. Only the epoch can, which is
+    why the loop has to carry the instant its own transaction stamped.
     """
     client, _ = logged_in_client
     try:
@@ -465,13 +471,13 @@ async def test_a_delete_leaves_the_row_a_finalize_adopted_after_its_commit(
             asked.append(memo_uid)
             return await async_client.delete(f"/api/memos/{memo_uid}")
 
-        answer, att_uid, original, logs = await _adopted_in_the_gap(
+        answer, att_uid, original, logs, adopting_from = await _adopted_in_the_gap(
             client, monkeypatch, tmp_path, delete
         )
 
         assert answer.status_code == 204, answer.text
         assert _rows("SELECT id FROM memos") == []
-        _still_adopted(att_uid, original)
+        _still_adopted(att_uid, original, adopting_from)
         _not_reclaimed(logs, "memo.delete.attachment_not_reclaimed", asked[0])
     finally:
         _cleanup()
@@ -490,13 +496,13 @@ async def test_a_patch_leaves_the_row_a_finalize_adopted_after_its_commit(
             asked.append(memo_uid)
             return await async_client.patch(f"/api/memos/{memo_uid}", json={"attachment_uids": []})
 
-        answer, att_uid, original, logs = await _adopted_in_the_gap(
+        answer, att_uid, original, logs, adopting_from = await _adopted_in_the_gap(
             client, monkeypatch, tmp_path, patch
         )
 
         assert answer.status_code == 200, answer.text
         assert answer.json()["attachments"] == []
-        _still_adopted(att_uid, original)
+        _still_adopted(att_uid, original, adopting_from)
         _not_reclaimed(logs, "memo.patch.attachment_not_reclaimed", asked[0])
     finally:
         _cleanup()
@@ -584,6 +590,7 @@ async def test_the_sweep_leaves_the_row_an_upload_adopted_in_its_gap(
         with structlog.testing.capture_logs() as logs:
             sweeping = asyncio.create_task(worker.sweep_detached_attachments())
             await asyncio.wait_for(gap.entered.wait(), timeout=SEAM_TIMEOUT)
+            adopting_from = datetime.now(UTC)
             async with _async_client(client) as adopter:
                 adopted = await adopter.post(f"/api/uploads/{twin}/finalize")
             assert adopted.status_code == 200, adopted.text
@@ -597,8 +604,139 @@ async def test_the_sweep_leaves_the_row_an_upload_adopted_in_its_gap(
         assert [entry["reason"] for entry in logs if entry["event"] == "reclaim.skipped"] == [
             "adopted_or_redetached"
         ]
-        _still_adopted(att_uid, original)
+        _still_adopted(att_uid, original, adopting_from)
         assert original.read_bytes() == shared, "the sweep took the bytes the adopter now owns"
+    finally:
+        _cleanup()
+
+
+# --- a byte-identical upload onto a row that is still detached ----------------------------------
+
+
+def _detached_and_its_twin(client, monkeypatch, tmp_path, marker: bytes) -> tuple[str, Path, str]:
+    """A route-made attachment left detached and aged past the grace, plus a fresh upload session
+    holding the same bytes. Returns the attachment's uid, its original and the session's uid."""
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    shared = _png(marker)
+    memo = client.post(
+        "/api/memos",
+        json={
+            "content": "pics",
+            "visibility": "PRIVATE",
+            "upload_uids": [_upload(client, "shot.png", shared)],
+        },
+    )
+    assert memo.status_code == 201, memo.text
+    att_uid, original = _the_attachment()
+    _left_for_the_sweep(att_uid, datetime.now(UTC) - 2 * GRACE)
+    return att_uid, original, _upload(client, "shot.png", shared)
+
+
+async def test_a_standalone_finalize_onto_a_detached_row_leaves_it_to_the_detached_sweep(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """The standalone finalize route links nothing, so the row it dedups onto is still off every
+    memo afterwards, with its original in the memo folder it was detached from — which the
+    never-linked sweep never matches. The detached sweep is the only one left that can reach it,
+    and it can only if the adoption leaves the row a detach instant. The adoption RESTARTS it: the
+    client that got the uid back keeps the whole grace to put it in a memo, and once that is up the
+    sweep's own selection and revalidation take it.
+    """
+    client, _ = logged_in_client
+    try:
+        att_uid, original, twin = _detached_and_its_twin(client, monkeypatch, tmp_path, b"alone")
+
+        adopted = client.post(f"/api/uploads/{twin}/finalize")
+        assert adopted.status_code == 200, adopted.text
+        assert adopted.json()["uid"] == att_uid, "the finalize did not dedup onto the row"
+
+        assert await worker.sweep_detached_attachments() == 0, "the adopter's grace was cut short"
+        assert original.exists()
+        assert await worker.sweep_detached_attachments(now=datetime.now(UTC) + 2 * GRACE) == 1, (
+            "no sweep reaches the row a standalone finalize adopted: it lives forever"
+        )
+        assert _rows("SELECT id FROM attachments WHERE uid=:u", u=att_uid) == []
+        assert not original.exists()
+    finally:
+        _cleanup()
+
+
+async def test_a_standalone_finalize_restarts_the_detach_instant_rather_than_clearing_it(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """The column itself: still off every memo, stamped at the adoption — not NULL (no sweep), and
+    not the old instant (the sweep would take a row the client was just handed)."""
+    client, _ = logged_in_client
+    try:
+        att_uid, _original, twin = _detached_and_its_twin(client, monkeypatch, tmp_path, b"stamp")
+
+        adopting_from = datetime.now(UTC)
+        adopted = client.post(f"/api/uploads/{twin}/finalize")
+        assert adopted.status_code == 200, adopted.text
+        assert adopted.json()["uid"] == att_uid, "the finalize did not dedup onto the row"
+
+        [(memo_id, detached_at)] = _rows(
+            "SELECT memo_id, detached_at FROM attachments WHERE uid=:u", u=att_uid
+        )
+        assert memo_id is None
+        assert detached_at is not None and detached_at >= adopting_from, detached_at
+    finally:
+        _cleanup()
+
+
+async def test_a_memo_that_dedups_onto_a_detached_row_links_it_and_clears_the_instant(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """The batch path, unchanged: a memo create that dedups onto the detached row links it in the
+    same transaction, so the row is the memo's and carries no detach instant for any sweep."""
+    client, _ = logged_in_client
+    try:
+        att_uid, _original, twin = _detached_and_its_twin(client, monkeypatch, tmp_path, b"memo")
+
+        memo = client.post(
+            "/api/memos",
+            json={"content": "again", "visibility": "PRIVATE", "upload_uids": [twin]},
+        )
+        assert memo.status_code == 201, memo.text
+        assert [a["uid"] for a in memo.json()["attachments"]] == [att_uid], (
+            "the memo did not dedup onto the detached row"
+        )
+
+        [(memo_id,)] = _rows("SELECT id FROM memos WHERE uid=:m", m=memo.json()["uid"])
+        [(linked_to, detached_at, path)] = _rows(
+            "SELECT memo_id, detached_at, storage_path FROM attachments WHERE uid=:u", u=att_uid
+        )
+        assert (linked_to, detached_at) == (memo_id, None)
+        assert await worker.sweep_detached_attachments(now=datetime.now(UTC) + 2 * GRACE) == 0
+        assert Path(path).exists()
+    finally:
+        _cleanup()
+
+
+async def test_a_standalone_finalize_onto_a_never_linked_row_leaves_it_unstamped(
+    db_engine, logged_in_client, monkeypatch, tmp_path
+):
+    """Only a DETACHED row has its instant restarted. A row a standalone finalize made and no memo
+    ever took has no instant, its original is in `_unfiled/`, and it belongs to the never-linked
+    sweep; stamping it on a second adoption would hand it to the wrong sweep on the wrong clock."""
+    client, _ = logged_in_client
+    try:
+        monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+        shared = _png(b"never")
+        first = client.post(f"/api/uploads/{_upload(client, 'shot.png', shared)}/finalize")
+        assert first.status_code == 200, first.text
+        again = client.post(f"/api/uploads/{_upload(client, 'shot.png', shared)}/finalize")
+        assert again.status_code == 200, again.text
+        assert again.json()["uid"] == first.json()["uid"], "the finalize did not dedup onto the row"
+
+        att_uid, original = _the_attachment()
+        assert _rows("SELECT memo_id, detached_at FROM attachments WHERE uid=:u", u=att_uid) == [
+            (None, None)
+        ]
+        later = datetime.now(UTC) + timedelta(days=4)
+        assert await worker.sweep_detached_attachments(now=later) == 0
+        assert await worker.sweep_unlinked_attachments(now=later) == 1
+        assert not original.exists()
     finally:
         _cleanup()
 

@@ -2009,9 +2009,17 @@ async def finalize(
         if existing is not None and not await asset_paths.adoptable(existing):
             existing = None
     if existing is not None:
-        # Adopting is the inverse of detaching, so the instant goes with the link: a row handed to
-        # a memo is not something a sweep of detached rows may still take.
-        existing.detached_at = None
+        if locked is not None:
+            # The batch links this row in its own transaction, and the instant goes with the link:
+            # a row handed to a memo is not something a sweep of detached rows may still take.
+            existing.detached_at = None
+        elif existing.detached_at is not None:
+            # The standalone route links nothing, so a detached row stays detached — with its
+            # original in the memo folder it came off, where the never-linked sweep never looks.
+            # Clearing the instant would leave it to no sweep at all. Restarting it gives the
+            # client this call answers the whole grace to put the row in a memo (which clears it),
+            # and the detached sweep the row once that grace is up.
+            existing.detached_at = datetime.now(UTC)
         await _consume(part, consumed_out)
         upload_metrics.count_session_end(db, "deduped")
         await db.delete(upload)

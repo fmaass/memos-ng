@@ -134,8 +134,9 @@ class Revalidate(enum.StrEnum):
     its grace period. Age is the whole of what that establishes — nothing in it says the request
     that detached the row has finished cleaning up after its own commit — so the premise is the
     predicate itself, and the instant is re-read under the lock against the SAME cutoff the pass
-    selected on: a row adopted since carries no instant, and a row detached again since carries a
-    newer one, and both belong to whoever touched them last."""
+    selected on: a row a memo linked since carries no instant, and a row detached again since — or
+    adopted by a standalone finalize, which restarts the instant (MEMNG-1168) — carries a newer
+    one, and each belongs to whoever touched it last."""
 
     LEAKED_ORPHAN = "leaked_orphan"
     """A blind scan picked this row BECAUSE it looked like garbage — the reconcile script. Its
@@ -332,9 +333,10 @@ def _ineligible(
         return "path_left_the_predicate"
     if mode is Revalidate.ORPHANED and detached_at is not None:
         # The epoch fence: this reclaim was issued ABOUT one detachment, and the row must still
-        # carry it. NULL means a dedup adopted the row; a newer instant means something detached it
-        # again, and that detachment's own cleanup owns it. A caller that names no instant is
-        # asking the older question — "is this row still unlinked?" — and gets the older answer.
+        # carry it. A newer instant means a standalone finalize adopted the row (it restarts the
+        # clock) or something detached it again, and either owns it now; NULL means a memo took
+        # it. A caller that names no instant is asking the older question — "is this row still
+        # unlinked?" — and gets the older answer.
         if att.detached_at != detached_at:
             return "adopted_or_redetached"
     if mode is Revalidate.DETACHED:
