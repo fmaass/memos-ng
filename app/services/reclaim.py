@@ -155,10 +155,17 @@ Outcome = Literal["reclaimed", "vanished", "skipped_ineligible", "failed_unlink"
 
 @dataclass(frozen=True)
 class ReclaimResult:
-    """What one reclaim did. `failed_paths` is non-empty only for `failed_unlink`."""
+    """What one reclaim did. `failed_paths` is non-empty only for `failed_unlink`.
+
+    `memo_id` is set only on `reclaimed`: the memo the row was on when it was read UNDER ITS LOCK,
+    i.e. the memo that just lost this file. A caller that read the row before the reclaim locked
+    it holds an older answer — a memo can take the row in between — so whatever follows from the
+    deletion for that memo (the asset delete route's live announcement, MEMNG-1189) is keyed on
+    this, never on the caller's own read. None for a row that was on no memo."""
 
     outcome: Outcome
     failed_paths: tuple[str, ...] = field(default=())
+    memo_id: int | None = None
 
 
 def never_linked_clauses() -> list[ColumnElement[bool]]:
@@ -575,9 +582,10 @@ async def reclaim_attachment(
         logger.error("reclaim.unlink_failed", attachment_id=attachment_id, paths=failed)
         result = ReclaimResult("failed_unlink", tuple(failed))
     else:
+        memo_id = att.memo_id  # still under the lock, and before the delete detaches the instance
         await db.delete(att)
         await db.commit()
-        result = ReclaimResult("reclaimed")
+        result = ReclaimResult("reclaimed", memo_id=memo_id)
     if cancellation is not None:
         # Only NOW, with the unlinks over: the row's lock outlived the thread doing them, which is
         # the guarantee this holds a cancellation back for. Unwinding at the await above would have
@@ -779,6 +787,7 @@ def reclaim_attachment_sync(
         session.rollback()  # fail closed — see reclaim_attachment
         logger.error("reclaim.unlink_failed", attachment_id=attachment_id, paths=failed)
         return ReclaimResult("failed_unlink", tuple(failed))
+    memo_id = att.memo_id  # under the lock — see ReclaimResult
     session.delete(att)
     session.commit()
-    return ReclaimResult("reclaimed")
+    return ReclaimResult("reclaimed", memo_id=memo_id)

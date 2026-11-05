@@ -655,7 +655,7 @@ def test_only_the_upload_pipeline_notifies_the_owner(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
     sent: list[int | None] = []
 
-    async def _spy(db, user_id, payload) -> int:
+    async def _spy(db, user_id, payload, **_) -> int:
         sent.append(user_id)
         return 1
 

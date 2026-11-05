@@ -7,7 +7,8 @@ tile, and the owner already got the per-file "failed" push; waiting for it would
 unannounced for ever. A memo with no files is live at create.
 
 Who: the owner, always; and every OTHER user with `notify_on_household_posts` on — but only when
-the memo is PROTECTED or PUBLIC when the push is sent. A PRIVATE memo reaches nobody but its owner.
+the memo is PROTECTED or PUBLIC as last committed before each of their pushes is sent. A PRIVATE
+memo reaches nobody but its owner (`announce` names the one send a late switch can still miss).
 
 Exactly once: `claim` is one conditional UPDATE that stamps `memos.live_notified_at` only while it
 is NULL and no file is in flight, and RETURNs the row only to the transaction that stamped it. Two
@@ -17,6 +18,8 @@ own `ready` commit, so whichever finishes last always sees every file terminal �
 missed either. The claim commits before anything is sent: a crash between the two loses the push
 rather than doubling it (at most once, and a push is best-effort anyway).
 """
+
+import functools
 
 import structlog
 from sqlalchemy import exists, func, select, update
@@ -98,14 +101,31 @@ async def announce(db: AsyncSession, memo_id: int) -> int:
         )
     sent = 0
     for user_id in recipients:
+        if user_id == memo.owner_id:
+            await notify.notify(db, user_id, event)
+            sent += 1
+            continue
         # Re-read before every household push, never only once up front (MEMNG-1184): the owner may
         # make the memo PRIVATE, or delete it, while this loop is sending, and the edit commits
         # without waiting for it. Each read is its own statement under READ COMMITTED, so it sees
-        # that commit, and no member pushed after it hears of the memo. Coordinating through the
-        # memo row lock instead would hold the owner's edit behind every push service round-trip.
-        if user_id != memo.owner_id and not await _household_may_see(db, memo_id):
+        # every commit made before it — and it is asked again before each DEVICE of the member
+        # (`still_wanted`, MEMNG-1189), not once for all of them: a phone and a laptop are two
+        # sends a push service round-trip apart, and the edit can land between them.
+        #
+        # What that guarantees, and no more: a push whose read ran after the edit committed is
+        # never sent. What it does not: the ONE push already past its read when the edit commits —
+        # read, then on the wire — still goes, title and all; and an edit not yet committed when
+        # the read runs is invisible to it. So at most one push, to one device of one member,
+        # carries the memo after the switch to PRIVATE. A delivered push cannot be recalled, so
+        # closing that last window means the edit waiting until the send is over: delivery
+        # holding the memo row (FOR SHARE) across the push, which would put the owner's edit behind
+        # a push service round-trip — a slow or dead push service would stall the edit. That is the
+        # trade declined here (MEMNG-1189): the window is one send wide, the edit never waits.
+        if not await _household_may_see(db, memo_id):
             continue
-        await notify.notify(db, user_id, event)
+        await notify.notify(
+            db, user_id, event, still_wanted=functools.partial(_household_may_see, db, memo_id)
+        )
         sent += 1
     return sent
 

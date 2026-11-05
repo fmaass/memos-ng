@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import pywebpush
 from app import worker
 from app.config import settings
@@ -149,6 +150,58 @@ async def test_send_to_user_noop_without_vapid(adb, monkeypatch):
     assert sent == 0 and called == []  # VAPID unset → push disabled
 
 
+async def _three_subscriptions(adb, monkeypatch, subject: str) -> tuple[int, list[dict]]:
+    monkeypatch.setattr(settings, "VAPID_PRIVATE_KEY", "PRIVKEY")
+    u = await _make_user(adb, subject)
+    adb.add_all(
+        [
+            PushSubscription(user_id=u.id, endpoint=f"https://p/{i}", p256dh="a", auth="b")
+            for i in range(3)
+        ]
+    )
+    await adb.flush()
+    calls: list[dict] = []
+    monkeypatch.setattr(pywebpush, "webpush", lambda **kw: calls.append(kw))
+    return u.id, calls
+
+
+async def test_send_to_user_asks_still_wanted_before_every_send_the_first_included(
+    adb, monkeypatch
+):
+    """MEMNG-1189: the gate is asked before EACH subscription — before the first one too, and the
+    first False stops every send still to come."""
+    user_id, calls = await _three_subscriptions(adb, monkeypatch, "push_gate_user")
+    answers = iter([True, False, True])
+    asked: list[int] = []
+
+    async def still_wanted() -> bool:
+        asked.append(len(calls))  # how many had left when it was asked
+        return next(answers)
+
+    sent = await push.send_to_user(adb, user_id, {"uid": "x"}, still_wanted=still_wanted)
+    assert (sent, len(calls), asked) == (1, 1, [0, 1])
+
+    async def never() -> bool:
+        return False
+
+    calls.clear()
+    assert await push.send_to_user(adb, user_id, {"uid": "x"}, still_wanted=never) == 0
+    assert calls == []
+
+
+async def test_send_to_user_a_failing_still_wanted_sends_nothing(adb, monkeypatch):
+    """A gate that cannot answer (its read failed) is not a yes: the error reaches the caller and
+    nothing is sent on the strength of it (MEMNG-1189)."""
+    user_id, calls = await _three_subscriptions(adb, monkeypatch, "push_gate_err_user")
+
+    async def broken() -> bool:
+        raise RuntimeError("visibility read failed")
+
+    with pytest.raises(RuntimeError, match="visibility read failed"):
+        await push.send_to_user(adb, user_id, {"uid": "x"}, still_wanted=broken)
+    assert calls == []
+
+
 # --- worker hook: notify only on a terminal attachment state ---
 
 
@@ -167,7 +220,7 @@ async def test_worker_notifies_on_ready(adb, monkeypatch):
 
     calls: list[tuple] = []
 
-    async def _fake_send(db, user_id, payload):
+    async def _fake_send(db, user_id, payload, **_):
         calls.append((user_id, payload))
         return 1
 
@@ -193,7 +246,7 @@ async def test_worker_skips_notify_while_processing(adb, monkeypatch):
 
     calls: list = []
 
-    async def _fake_send(db, user_id, payload):
+    async def _fake_send(db, user_id, payload, **_):
         calls.append(payload)
         return 1
 

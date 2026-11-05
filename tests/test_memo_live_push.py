@@ -21,7 +21,7 @@ from app import worker
 from app.config import settings
 from app.database import async_session
 from app.models import JobKind
-from app.services import memo_live, notify
+from app.services import memo_live, notify, reclaim
 from PIL import Image
 from sqlalchemy import create_engine, text
 from structlog.testing import capture_logs
@@ -523,7 +523,7 @@ def test_deleting_one_of_two_in_flight_files_announces_nothing_until_the_last(
 def test_a_failing_announcement_never_fails_the_delete(pushes, member_memo, monkeypatch):
     client, muid, _, busy, _h = member_memo
 
-    async def down(db, user_id, event) -> None:
+    async def down(db, user_id, event, **_) -> None:
         raise RuntimeError("push backend down")
 
     monkeypatch.setattr(notify, "CONSUMERS", [down])
@@ -552,3 +552,102 @@ def test_an_edit_that_detaches_nothing_schedules_no_announcement(pushes, member_
     assert r.status_code == 200, r.text
 
     assert scheduled == []
+
+
+# --- MEMNG-1189: the residual races of the MEMNG-1184 announcement ---
+
+
+def test_a_memo_made_private_mid_delivery_reaches_no_further_device_of_the_same_member(
+    pushes, household, tmp_path, monkeypatch
+):
+    """A member with two devices. The owner's switch to PRIVATE commits while the push to the
+    member's FIRST device is on the wire: that one push is the only one that still carries the memo
+    after the commit — the member's second device, whose push would leave after it, hears nothing.
+    Before MEMNG-1189 the member's visibility was read once for all of their devices."""
+    member = household.endpoint("member_on")
+    _sql(
+        "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) "
+        "VALUES (:u, :e, 'k', 'a')",
+        {"u": household.ids["member_on"], "e": f"{member}-ipad"},
+    )
+    mid, _ = _memo(household.ids["owner"], "PROTECTED")
+    _files(tmp_path, household.ids["owner"], mid, 1)
+
+    def made_private_during_the_members_first_push(**kw) -> None:
+        pushes(**kw)
+        if kw["subscription_info"]["endpoint"].startswith(member):
+            # The edit commits while this device's push is in flight, as PATCH would commit it.
+            _sql("UPDATE memos SET visibility = 'PRIVATE' WHERE id = :m", {"m": mid})
+
+    monkeypatch.setattr(pywebpush, "webpush", made_private_during_the_members_first_push)
+
+    asyncio.run(_drain())
+
+    per_endpoint = pushes.live_per_endpoint(household.prefix)
+    assert per_endpoint[household.endpoint("owner")] == 1
+    to_member = {e: n for e, n in per_endpoint.items() if e.startswith(member)}
+    assert sum(to_member.values()) == 1, to_member  # the in-flight push, and not the second device
+
+
+def test_the_owners_own_devices_are_never_held_back_by_the_visibility_gate(
+    pushes, household, tmp_path, monkeypatch
+):
+    """The owner hears of their own memo on every device whatever it is switched to mid-delivery:
+    the MEMNG-1189 per-device gate is the household's, never the owner's."""
+    owner = household.endpoint("owner")
+    _sql(
+        "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) "
+        "VALUES (:u, :e, 'k', 'a')",
+        {"u": household.ids["owner"], "e": f"{owner}-ipad"},
+    )
+    mid, _ = _memo(household.ids["owner"], "PROTECTED")
+    _files(tmp_path, household.ids["owner"], mid, 1)
+
+    def made_private_during_the_owners_first_push(**kw) -> None:
+        pushes(**kw)
+        live = json.loads(kw["data"]).get("kind") == "memo_live"  # not the file's own push
+        if live and kw["subscription_info"]["endpoint"].startswith(owner):
+            _sql("UPDATE memos SET visibility = 'PRIVATE' WHERE id = :m", {"m": mid})
+
+    monkeypatch.setattr(pywebpush, "webpush", made_private_during_the_owners_first_push)
+
+    asyncio.run(_drain())
+
+    assert pushes.live_per_endpoint(household.prefix) == Counter({owner: 1, f"{owner}-ipad": 1})
+
+
+def test_an_attachment_linked_to_a_memo_while_its_delete_is_on_the_way_announces_that_memo(
+    pushes, logged_in_client, tmp_path, monkeypatch
+):
+    """The delete route read the attachment while it was on no memo; before the reclaim takes its
+    lock a memo is created around it (the memo's own after-create claim finds the file in flight
+    and stands down). The delete then removes that memo's last in-flight file, so the memo is live
+    now, and only an announcement scheduled against the memo the reclaim SAW under its lock says
+    so — never the one read before it (MEMNG-1189)."""
+    client, subject = logged_in_client
+    owner = _sql("SELECT id FROM users WHERE subject = :s", {"s": subject})[0][0]
+    h = _Household()
+    mid, muid = _memo(owner, "PROTECTED")
+    [aid] = _files(tmp_path, owner, mid, 1)
+    _sql("UPDATE attachments SET memo_id = NULL WHERE id = :a", {"a": aid})  # not yet on the memo
+    [(att_uid,)] = _sql("SELECT uid FROM attachments WHERE id = :a", {"a": aid})
+    real_reclaim = reclaim.reclaim_row_shielded
+
+    async def linked_before_the_lock(attachment_id, mode, **kw):
+        # The memo create commits between the route's read and the reclaim's row lock.
+        _sql("UPDATE attachments SET memo_id = :m WHERE id = :a", {"m": mid, "a": aid})
+        return await real_reclaim(attachment_id, mode, **kw)
+
+    monkeypatch.setattr(reclaim, "reclaim_row_shielded", linked_before_the_lock)
+    try:
+        assert client.delete(f"/api/attachments/{att_uid}").status_code == 204
+
+        assert _sql("SELECT 1 FROM attachments WHERE id = :a", {"a": aid}) == []
+        assert [(e, p["uid"]) for e, p in pushes.live(h.prefix)] == [
+            (h.endpoint("member_on"), muid)
+        ]
+    finally:
+        _sql("DELETE FROM media_jobs WHERE attachment_id = :a", {"a": aid})
+        _sql("DELETE FROM attachments WHERE owner_id = :u", {"u": owner})
+        _sql("DELETE FROM memos WHERE owner_id = :u", {"u": owner})
+        h.cleanup()

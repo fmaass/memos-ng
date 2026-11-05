@@ -9,8 +9,9 @@ The web-push consumer reaches the sender through the `push` MODULE (`push.send_t
 name imported from it, so a test that replaces `push.send_to_user` still sees every send.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable
 from dataclasses import dataclass
+from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,18 +52,45 @@ class MemoLive:
 
 
 Event = AttachmentTerminal | MemoLive
-Consumer = Callable[[AsyncSession, int | None, Event], Awaitable[None]]
 
 
-async def web_push(db: AsyncSession, user_id: int | None, event: Event) -> None:
-    await push.send_to_user(db, user_id, event.payload())
+class Consumer(Protocol):
+    """One delivery channel for an event; `still_wanted` as `notify` documents it."""
+
+    def __call__(
+        self,
+        db: AsyncSession,
+        user_id: int | None,
+        event: Event,
+        *,
+        still_wanted: push.StillWanted | None = None,
+    ) -> Awaitable[None]: ...
+
+
+async def web_push(
+    db: AsyncSession,
+    user_id: int | None,
+    event: Event,
+    *,
+    still_wanted: push.StillWanted | None = None,
+) -> None:
+    await push.send_to_user(db, user_id, event.payload(), still_wanted=still_wanted)
 
 
 CONSUMERS: list[Consumer] = [web_push]
 
 
-async def notify(db: AsyncSession, user_id: int | None, event: Event) -> None:
+async def notify(
+    db: AsyncSession,
+    user_id: int | None,
+    event: Event,
+    *,
+    still_wanted: push.StillWanted | None = None,
+) -> None:
     """Deliver `event` to `user_id` through every consumer. Best-effort is each consumer's own
-    contract (`push.send_to_user` never raises on a push-service error); this only fans out."""
+    contract (`push.send_to_user` never raises on a push-service error); this only fans out.
+
+    `still_wanted` is the caller's premise for sending at all, handed to every consumer to ask
+    again before each single delivery it makes (MEMNG-1189); None sends unconditionally."""
     for consumer in CONSUMERS:
-        await consumer(db, user_id, event)
+        await consumer(db, user_id, event, still_wanted=still_wanted)
