@@ -14,7 +14,12 @@ export interface Wire {
   uids?: string[]
   status: number
   referrer?: string
+  sha256?: string
 }
+
+/** A request the door's own code never answered: dropped on the way, or refused by what stands in
+ * front of it (a proxy's 502 carries no JSON). */
+export type Fault = 'network' | { status: number; retryAfter?: number; detail?: string }
 
 interface Upload {
   uid: string
@@ -44,6 +49,13 @@ export class FakeDoor {
   gate: Promise<void> | null = null
   patchStatus: number | null = null
   completeHang: Promise<void> | null = null
+  /** While set, every request meets this fault before the door sees it. */
+  outage: Fault | null = null
+  /** The next creates / HEADs meet these faults, one each, in order. */
+  createFaults: Fault[] = []
+  headFaults: Fault[] = []
+  /** Commit the next create like the server, then lose the response on the wire. */
+  loseNextCreateResponse = false
   private n = 0
 
   fetch: FetchLike = async (input, init) => {
@@ -53,6 +65,21 @@ export class FakeDoor {
     const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null
     const entry: Wire = { method, path: input, token, status: 0, referrer: String(init.referrerPolicy) }
     this.wire.push(entry)
+    const meet = (fault: Fault) => {
+      if (fault === 'network') {
+        entry.status = -1
+        throw new TypeError('network connection was lost')
+      }
+      entry.status = fault.status
+      const body = fault.detail === undefined ? '<html>Bad Gateway</html>' : JSON.stringify({ detail: fault.detail })
+      const extra: Record<string, string> = fault.retryAfter === undefined ? {} : { 'Retry-After': String(fault.retryAfter) }
+      return new Response(method === 'HEAD' ? null : body, { status: fault.status, headers: extra })
+    }
+    if (this.outage) return meet(this.outage)
+    const isCreate = input === '/api/guest/uploads' && method === 'POST'
+    const faults = isCreate ? this.createFaults : method === 'HEAD' ? this.headFaults : []
+    const fault = faults.shift()
+    if (fault) return meet(fault)
     const answer = (status: number, body: unknown = null, extra: Record<string, string> = {}) => {
       entry.status = status
       const text = body === null ? null : JSON.stringify(body)
@@ -67,9 +94,16 @@ export class FakeDoor {
       const body = JSON.parse(String(init.body))
       const ext = String(body.filename).split('.').pop()!.toLowerCase()
       if (!['jpg', 'jpeg', 'png', 'heic', 'mov', 'mp4'].includes(ext)) return answer(415, { detail: 'This file type is not accepted' })
+      entry.sha256 = body.sha256
       if (body.sha256 && this.received.has(body.sha256)) return answer(200, { already_received: true, upload_uid: null, bytes_received: 0, chunk_size: 0, max_patch_bytes: 0 })
+      // As create_upload does: nothing is keyed on (device, sha256), so a repeat opens another row.
       const uid = `u${String(++this.n).padStart(3, '0')}`
       this.uploads.set(uid, { uid, filename: body.filename, size: body.size, sha256: body.sha256, data: new Uint8Array(0) })
+      if (this.loseNextCreateResponse) {
+        this.loseNextCreateResponse = false
+        entry.status = -1
+        throw new TypeError('network connection was lost')
+      }
       return answer(201, { already_received: false, upload_uid: uid, bytes_received: 0, chunk_size: this.limits.chunk_size, max_patch_bytes: this.limits.max_patch_bytes })
     }
     const m = /^\/api\/guest\/uploads\/(.+)$/.exec(input)

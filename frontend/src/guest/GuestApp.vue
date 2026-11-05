@@ -43,6 +43,7 @@ const items = computed<UploadItem[]>(() => (tick.value, uploader.value ? uploade
 const total = computed(() => items.value.length)
 const received = computed(() => items.value.filter((i) => i.state === 'received').length)
 const busy = computed(() => (tick.value, uploader.value?.inFlight ?? false))
+const anyFailed = computed(() => items.value.some((i) => i.state === 'failed'))
 
 let starting: { epoch: number; run: Promise<void> } | null = null
 
@@ -114,6 +115,12 @@ function pick(event: Event): void {
     }
   }
   bump()
+}
+
+function retryAll(): void {
+  const current = uploader.value
+  if (!current) return
+  for (const item of current.items) current.retry(item)
 }
 
 function label(item: UploadItem): string {
@@ -233,6 +240,7 @@ onBeforeUnmount(() => {
       <p class="muted small">Keep this page open while it sends.</p>
       <p v-if="total" class="summary">{{ received }} of {{ total }} received</p>
       <p v-if="lastReceipt?.status === 'held'" class="notice">The last batch is held for review.</p>
+      <button v-if="anyFailed" type="button" class="button small" @click="retryAll">Retry all</button>
       <ul class="files">
         <li v-for="item in items" :key="item.id" :class="item.state">
           <img v-if="thumbs.get(item.id)" :src="thumbs.get(item.id)" alt="" />

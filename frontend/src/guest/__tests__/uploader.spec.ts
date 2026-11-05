@@ -5,8 +5,8 @@ import { createGuestApi, type Receipt } from '../api'
 import { openBindings, type BindingStore } from '../bindings'
 import { CredentialStore } from '../credential'
 import { digestFile } from '../digest'
-import { GuestUploader } from '../uploader'
-import { bytes, FakeDoor, fileOf, sha } from './fakeDoor'
+import { GuestUploader, type Connectivity } from '../uploader'
+import { bytes, FakeDoor, fileOf, sha, type Fault } from './fakeDoor'
 
 function memoryStorage(): Storage {
   const data = new Map<string, string>()
@@ -32,7 +32,12 @@ interface Setup {
   hashed: string[]
 }
 
-async function setup(door = new FakeDoor(), factory = new IDBFactory(), sleep?: (ms: number) => Promise<void>): Promise<Setup> {
+async function setup(
+  door = new FakeDoor(),
+  factory = new IDBFactory(),
+  sleep?: (ms: number) => Promise<void>,
+  network?: Connectivity,
+): Promise<Setup> {
   const credentials = new CredentialStore(memoryStorage())
   credentials.set('trip_dev_one', 'dev1')
   const bindings = await openBindings(factory)
@@ -50,6 +55,7 @@ async function setup(door = new FakeDoor(), factory = new IDBFactory(), sleep?: 
     limits: door.limits,
     deviceId: 'dev1',
     sleep: sleep ?? (async () => {}),
+    network,
     onReceipt: (r) => receipts.push(r),
     onRefused: (s) => refused.push(s),
   })
@@ -433,5 +439,638 @@ describe('guest uploader', () => {
     expect(after[0].path).toBe('/api/guest/memos')
     expect(reopened.receipts).toHaveLength(1)
     expect(await reopened.bindings.getPending('dev1')).toBeNull()
+  })
+})
+
+// Time here is discrete: it moves only when the earliest pending timer fires, so a 60 s outage takes
+// no real time and a request "during" it is one that really met it.
+function virtualClock() {
+  const timers: { at: number; run: () => void }[] = []
+  const clock = {
+    now: 0,
+    slept: [] as number[],
+    sleep: (ms: number) =>
+      new Promise<void>((resolve) => {
+        clock.slept.push(ms)
+        timers.push({ at: clock.now + ms, run: resolve })
+      }),
+    at: (when: number, run: () => void) => void timers.push({ at: when, run }),
+    fire: () => {
+      timers.sort((a, b) => a.at - b.at)
+      const timer = timers.shift()
+      if (!timer) return false
+      clock.now = Math.max(clock.now, timer.at)
+      timer.run()
+      return true
+    },
+  }
+  return clock
+}
+
+function fakeNetwork(online = true) {
+  const listeners = new Set<() => void>()
+  let state = online
+  return {
+    listeners,
+    online: () => state,
+    onOnline: (listener: () => void) => {
+      listeners.add(listener)
+      return () => void listeners.delete(listener)
+    },
+    set: (next: boolean) => {
+      state = next
+      if (next) for (const listener of [...listeners]) listener()
+    },
+  }
+}
+
+const settle = async () => {
+  for (let i = 0; i < 12; i++) await tick()
+}
+
+/** Lets the uploader run until it goes idle, moving time only when it has nothing else to do. */
+async function drive(uploader: GuestUploader, clock: ReturnType<typeof virtualClock>): Promise<void> {
+  for (let i = 0; i < 2000; i++) {
+    await settle()
+    if (!uploader.inFlight) return
+    clock.fire()
+  }
+  throw new Error('uploader never went idle')
+}
+
+async function rounds(n: number, clock: ReturnType<typeof virtualClock>): Promise<void> {
+  await settle()
+  for (let i = 0; i < n; i++) {
+    clock.fire()
+    await settle()
+  }
+}
+
+const creates = (door: FakeDoor) => door.calls('POST', '/api/guest/uploads')
+const opened = (door: FakeDoor) => creates(door).filter((w) => w.status === 201)
+const BACKOFFS = [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000]
+
+/** An open upload the device already knows about, so its next selection asks HEAD first. */
+async function seedBinding(s: Setup, data: Uint8Array<ArrayBuffer>, kept: number): Promise<File> {
+  const file = fileOf(data, 'a.jpg')
+  const digest = await digestFile(file, () => {}, 1500)
+  s.door.uploads.set('u900', { uid: 'u900', filename: 'a.jpg', size: data.length, sha256: digest.sha256, data: data.slice(0, kept) })
+  await s.bindings.put({
+    deviceId: 'dev1',
+    sha256: digest.sha256,
+    uploadUid: 'u900',
+    size: data.length,
+    offset: kept,
+    state: 'open',
+    name: 'a.jpg',
+    lastModified: file.lastModified,
+    head: digest.head,
+  })
+  return file
+}
+
+describe('guest uploader through a drop', () => {
+  it.each<[string, Fault, boolean]>([
+    ['a dropped connection', 'network', true],
+    ['a door behind a 502', { status: 502 }, true],
+    ['a browser that knows it is offline', 'network', false],
+  ])('a 60 s outage of %s spends none of a 50-item queue', async (_label, fault, online) => {
+    const door = new FakeDoor()
+    const clock = virtualClock()
+    const net = fakeNetwork()
+    const data = Array.from({ length: 50 }, (_, i) => bytes(2000, 100 + i))
+    const orig = door.fetch
+    let began: number | null = null
+    door.fetch = async (input, init) => {
+      const answered = await orig(input, init)
+      // Opens right after the fifth create lands, whatever else is on the wire.
+      if (began === null && opened(door).length === 5) {
+        began = clock.now
+        door.outage = fault
+        net.set(online)
+        clock.at(began + 60_000, () => {
+          door.outage = null
+          net.set(true)
+        })
+      }
+      return answered
+    }
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add(data.map((d, i) => fileOf(d, `IMG_${i}.jpg`)))
+    await drive(s.uploader, clock)
+
+    expect(began).not.toBeNull()
+    expect(clock.now).toBeGreaterThanOrEqual(began! + 60_000)
+    const met = fault === 'network' ? -1 : (fault as { status: number }).status
+    expect(creates(door).filter((w) => w.status === met).length).toBeGreaterThanOrEqual(2) // it really met the outage
+    expect(s.uploader.items.map((i) => i.state)).toEqual(Array(50).fill('received'))
+    expect(door.received).toEqual(new Set(data.map(sha)))
+    expect(opened(door)).toHaveLength(50)
+    expect(new Set(opened(door).map((w) => w.sha256)).size).toBe(50)
+    expect(door.uploads.size).toBe(0) // nothing left open at the door
+    expect(s.receipts).toHaveLength(1)
+    expect(net.listeners.size).toBe(0)
+  }, 30_000)
+
+  it.each<[string, Fault[], number[]]>([
+    ['a network error', ['network', 'network'], [1000, 2000]],
+    ['a 5xx', [{ status: 502 }, { status: 500, detail: 'boom' }], [1000, 2000]],
+    ['a 503 with Retry-After (the pool answer)', [{ status: 503, retryAfter: 5, detail: 'Database busy; retry later' }], [5000]],
+    ['a 429 with Retry-After', [{ status: 429, retryAfter: 7 }], [7000]],
+    ['a 429 without Retry-After', [{ status: 429 }], [1000]],
+  ])('create retries %s with the backoff and ends received on one upload', async (_label, faults, waits) => {
+    const door = new FakeDoor()
+    door.createFaults = [...faults]
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 201), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(clock.slept).toEqual(waits)
+    expect(creates(door)).toHaveLength(faults.length + 1)
+    expect(opened(door)).toHaveLength(1)
+  })
+
+  it.each<[string, Fault[], number[]]>([
+    ['a network error', ['network'], [1000]],
+    ['a 5xx', [{ status: 502 }, { status: 503 }], [1000, 2000]],
+    ['a 429 with Retry-After', [{ status: 429, retryAfter: 7 }], [7000]],
+    ['a 429 without Retry-After', [{ status: 429 }], [1000]],
+  ])('HEAD retries %s and resumes from the answered offset without a create', async (_label, faults, waits) => {
+    const door = new FakeDoor()
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const file = await seedBinding(s, bytes(3000, 202), 1000)
+    door.headFaults = [...faults]
+    s.uploader.add([file])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(clock.slept).toEqual(waits)
+    expect(door.calls('HEAD', '/')).toHaveLength(faults.length + 1)
+    expect(door.calls('PATCH', '/')[0].offset).toBe(1000)
+    expect(creates(door)).toEqual([])
+  })
+
+  it('a resync HEAD after a broken PATCH honours Retry-After too', async () => {
+    const door = new FakeDoor()
+    door.cutNextPatchAt = 100
+    door.headFaults = [{ status: 429, retryAfter: 7 }]
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(3000, 203), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(clock.slept).toEqual([1000, 7000]) // the PATCH's own backoff, then the HEAD's
+  })
+
+  it.each<[number, string]>([
+    [400, 'failed'],
+    [403, 'failed'],
+    [404, 'failed'],
+    [409, 'failed'], // create_upload raises no 409; nothing says one would clear by itself
+    [422, 'failed'],
+    [413, 'too-large'],
+    [415, 'unsupported'],
+    [507, 'quota'], // a 5xx by number, a verdict by meaning
+  ])('a %i on create is a refusal: one request, no wait, state %s', async (status, state) => {
+    const door = new FakeDoor()
+    door.createFaults = [{ status, detail: `refused ${status}` }]
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 204), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe(state)
+    expect(s.uploader.items[0].message).toBe(`refused ${status}`)
+    expect(creates(door)).toHaveLength(1)
+    expect(clock.slept).toEqual([])
+  })
+
+  it('a file-cap 429 (Retry-After 3600) fails now with the door sentence, not an hour of Checking', async () => {
+    const door = new FakeDoor()
+    door.createFaults = [{ status: 429, retryAfter: 3600, detail: 'This device has sent all it can' }]
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 205), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('failed')
+    expect(s.uploader.items[0].message).toBe('This device has sent all it can')
+    expect(creates(door)).toHaveLength(1)
+    expect(clock.slept).toEqual([])
+  })
+
+  it.each<[number, boolean]>([
+    [121, true], // exactly what the whole budget adds up to
+    [122, false],
+  ])('a Retry-After of %i s is waited out: %s', async (retryAfter, waited) => {
+    const door = new FakeDoor()
+    door.createFaults = [{ status: 429, retryAfter, detail: 'later' }]
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 206), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(clock.slept).toEqual(waited ? [retryAfter * 1000] : [])
+    expect(s.uploader.items[0].state).toBe(waited ? 'received' : 'failed')
+  })
+
+  it.each<[string, Fault[], number]>([
+    ['at once', [{ status: 401, detail: 'no' }], 401],
+    ['at once', [{ status: 410, detail: 'no' }], 410],
+    ['after a transient failure', ['network', { status: 410, detail: 'no' }], 410],
+  ])('a refusal on create reaches refused() %s (%#)', async (_label, faults, status) => {
+    const door = new FakeDoor()
+    door.createFaults = [...faults]
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 207), 'a.jpg')])
+    await rounds(faults.length, clock)
+    expect(s.refused).toEqual([status])
+    expect(s.credentials.get()).toBeNull()
+    expect(creates(door)).toHaveLength(faults.length)
+    expect(s.uploader.items[0].state).toBe('waiting')
+  })
+
+  it('a refusal on HEAD reaches refused() and opens nothing', async () => {
+    const door = new FakeDoor()
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const file = await seedBinding(s, bytes(3000, 208), 1000)
+    door.headFaults = [{ status: 410 }]
+    s.uploader.add([file])
+    await rounds(0, clock)
+    expect(s.refused).toEqual([410])
+    expect(s.credentials.get()).toBeNull()
+    expect(door.calls('HEAD', '/')).toHaveLength(1)
+    expect(creates(door)).toEqual([])
+    expect(clock.slept).toEqual([])
+  })
+
+  it('a stale refusal through a retried create never clears the newer credential', async () => {
+    const door = new FakeDoor()
+    door.createFaults = ['network']
+    const orig = door.fetch
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    let attempts = 0
+    door.fetch = async (input, init) => {
+      if (input === '/api/guest/uploads' && ++attempts === 2) await held // the retry on the wire
+      return orig(input, init)
+    }
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 209), 'a.jpg')])
+    await rounds(1, clock)
+    expect(attempts).toBe(2)
+    door.tokens = new Set(['trip_dev_two']) // the old token now earns a 401
+    s.credentials.set('trip_dev_two', 'dev1')
+    release()
+    await settle()
+    expect(s.credentials.get()?.token).toBe('trip_dev_two')
+    expect(s.refused).toEqual([])
+  })
+
+  it('create spends exactly its budget: eight retries still land, a ninth is not made', async () => {
+    const door = new FakeDoor()
+    door.createFaults = Array<Fault>(8).fill('network')
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 210), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(clock.slept).toEqual(BACKOFFS)
+    expect(creates(door)).toHaveLength(9)
+
+    door.outage = 'network'
+    s.uploader.add([fileOf(bytes(500, 211), 'b.jpg')])
+    await drive(s.uploader, clock)
+    const item = s.uploader.items[1]
+    expect(item.state).toBe('failed')
+    expect(item.message).toBe('The connection was lost')
+    expect(creates(door)).toHaveLength(18)
+    expect(clock.slept).toEqual([...BACKOFFS, ...BACKOFFS])
+
+    door.outage = null // the entry was forgotten: a Retry opens one fresh create
+    s.uploader.retry(item)
+    await drive(s.uploader, clock)
+    expect(item.state).toBe('received')
+    expect(opened(door)).toHaveLength(2)
+  })
+
+  it('HEAD spends its budget, then ends Failed with the binding kept for a Retry', async () => {
+    const door = new FakeDoor()
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const file = await seedBinding(s, bytes(3000, 212), 1000)
+    door.outage = { status: 502 }
+    s.uploader.add([file])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('failed')
+    expect(door.calls('HEAD', '/')).toHaveLength(9)
+    expect(clock.slept).toEqual(BACKOFFS)
+    expect(creates(door)).toEqual([])
+    expect((await s.bindings.list('dev1')).map((b) => b.uploadUid)).toEqual(['u900'])
+  })
+
+  it('time offline spends no budget: bounded waits, then the budget is still whole', async () => {
+    const door = new FakeDoor()
+    door.outage = 'network'
+    const clock = virtualClock()
+    const net = fakeNetwork(false)
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(500, 213), 'a.jpg')])
+    await rounds(12, clock) // six minutes
+    expect(s.uploader.items[0].state).toBe('checking')
+    expect(creates(door)).toHaveLength(13) // well past the 9 an online outage would have allowed
+    expect(clock.slept).toEqual(Array(13).fill(30_000))
+    expect(net.listeners.size).toBe(1) // one wait, one listener, however long it lasts
+
+    net.set(true) // the browser says online, the network is still away: backoff is the mechanism
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('failed')
+    expect(clock.slept.slice(13)).toEqual(BACKOFFS)
+    expect(net.listeners.size).toBe(0)
+  })
+
+  it('the online event ends the wait at once', async () => {
+    const door = new FakeDoor()
+    door.outage = 'network'
+    const clock = virtualClock()
+    const net = fakeNetwork(false)
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(500, 214), 'a.jpg')])
+    await settle()
+    expect(creates(door)).toHaveLength(1)
+    door.outage = null
+    net.set(true)
+    await settle() // no timer fired
+    expect(clock.now).toBe(0)
+    expect(creates(door)).toHaveLength(2)
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(net.listeners.size).toBe(0)
+  })
+
+  it('a browser that wrongly says offline does not hold the request: the event never fires, the bound does', async () => {
+    const door = new FakeDoor()
+    const clock = virtualClock()
+    const net = fakeNetwork(false)
+    const s = await setup(door, undefined, clock.sleep, net)
+    // Answered first try: being told offline delays nothing.
+    s.uploader.add([fileOf(bytes(500, 215), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(clock.slept).toEqual([])
+
+    door.createFaults = ['network']
+    s.uploader.add([fileOf(bytes(500, 216), 'b.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[1].state).toBe('received')
+    expect(clock.slept).toEqual([30_000])
+    expect(net.listeners.size).toBe(0)
+  })
+
+  it('an HTTP answer proves the network is there: a 5xx spends budget even when told offline', async () => {
+    const door = new FakeDoor()
+    door.outage = { status: 502 }
+    const clock = virtualClock()
+    const net = fakeNetwork(false)
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(500, 217), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('failed')
+    expect(clock.slept).toEqual(BACKOFFS)
+    expect(net.listeners.size).toBe(0)
+  })
+
+  it('a PATCH cut by going offline waits without spending budget, then resumes at HEAD', async () => {
+    const door = new FakeDoor()
+    const orig = door.fetch
+    let cut = false
+    door.fetch = async (input, init) => {
+      if (init.method === 'PATCH' && !cut) {
+        cut = true
+        door.outage = 'network'
+        net.set(false)
+      }
+      return orig(input, init)
+    }
+    const clock = virtualClock()
+    const net = fakeNetwork()
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(3000, 218), 'a.jpg')])
+    await rounds(12, clock)
+    expect(s.uploader.items[0].state).toBe('sending')
+    expect(clock.slept.every((ms) => ms === 30_000)).toBe(true)
+    door.outage = null
+    net.set(true)
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(net.listeners.size).toBe(0)
+  })
+
+  it('a resync HEAD waits out an offline browser without spending budget', async () => {
+    const door = new FakeDoor()
+    door.cutNextPatchAt = 100
+    const orig = door.fetch
+    let cut = false
+    door.fetch = async (input, init) => {
+      if (init.method === 'HEAD' && !cut) {
+        cut = true
+        door.outage = 'network'
+        net.set(false)
+      }
+      return orig(input, init)
+    }
+    const clock = virtualClock()
+    const net = fakeNetwork()
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(3000, 219), 'a.jpg')])
+    await rounds(13, clock) // the PATCH's own 1 s, then a dozen bounded waits
+    expect(s.uploader.items[0].state).toBe('sending')
+    door.outage = null
+    net.set(true)
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+  })
+
+  it('a completion cut by going offline waits without spending its rounds', async () => {
+    const door = new FakeDoor()
+    const orig = door.fetch
+    let cut = false
+    door.fetch = async (input, init) => {
+      if (input === '/api/guest/memos' && !cut) {
+        cut = true
+        door.outage = 'network'
+        net.set(false)
+      }
+      return orig(input, init)
+    }
+    const clock = virtualClock()
+    const net = fakeNetwork()
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(500, 220), 'a.jpg')])
+    await rounds(12, clock)
+    expect(s.uploader.items[0].state).toBe('uploaded') // not handed back as failed after six
+    expect(door.calls('POST', '/api/guest/memos')).toHaveLength(13)
+    door.outage = null
+    net.set(true)
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(s.receipts).toHaveLength(1)
+    expect(net.listeners.size).toBe(0)
+  })
+
+  it('reset during a create backoff: the loop sends nothing more', async () => {
+    const door = new FakeDoor()
+    door.createFaults = ['network', 'network']
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 221), 'a.jpg')])
+    await settle()
+    expect(creates(door)).toHaveLength(1)
+    s.uploader.reset()
+    await rounds(3, clock)
+    expect(door.wire).toHaveLength(1)
+    expect(clock.slept).toEqual([1000])
+  })
+
+  it('reset during a HEAD backoff: the loop sends nothing more', async () => {
+    const door = new FakeDoor()
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const file = await seedBinding(s, bytes(3000, 222), 1000)
+    door.headFaults = ['network', 'network']
+    s.uploader.add([file])
+    await settle()
+    expect(door.calls('HEAD', '/')).toHaveLength(1)
+    s.uploader.reset()
+    await rounds(3, clock)
+    expect(door.wire).toHaveLength(1)
+  })
+
+  it('a credential change during a backoff: nothing more is sent, under either token', async () => {
+    const door = new FakeDoor()
+    door.createFaults = ['network', 'network']
+    door.tokens = new Set(['trip_dev_one', 'trip_dev_two'])
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(500, 223), 'a.jpg'), fileOf(bytes(500, 224), 'b.jpg')])
+    await settle()
+    expect(creates(door)).toHaveLength(2) // both workers in their backoff
+    s.credentials.set('trip_dev_two', 'dev1')
+    await rounds(4, clock)
+    expect(door.wire).toHaveLength(2)
+    expect(s.refused).toEqual([])
+    expect(s.credentials.get()?.token).toBe('trip_dev_two')
+    expect(s.uploader.items.map((i) => i.state)).not.toContain('failed') // the answer is dropped
+  })
+
+  it('reset during an offline wait: nothing more is sent and the listener goes with the bound', async () => {
+    const door = new FakeDoor()
+    door.outage = 'network'
+    const clock = virtualClock()
+    const net = fakeNetwork(false)
+    const s = await setup(door, undefined, clock.sleep, net)
+    s.uploader.add([fileOf(bytes(500, 225), 'a.jpg')])
+    await settle()
+    expect(net.listeners.size).toBe(1)
+    s.uploader.reset()
+    await rounds(1, clock)
+    expect(net.listeners.size).toBe(0)
+    expect(door.wire).toHaveLength(1)
+  })
+
+  it('an abandoned create loop cannot forget the create of the generation after it', async () => {
+    const door = new FakeDoor()
+    door.createFaults = ['network']
+    const orig = door.fetch
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    let attempts = 0
+    door.fetch = async (input, init) => {
+      if (input === '/api/guest/uploads' && ++attempts === 2) await held
+      return orig(input, init)
+    }
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const a = bytes(500, 226)
+    s.uploader.add([fileOf(a, 'a.jpg')])
+    await settle()
+    s.uploader.reset()
+    s.uploader.add([fileOf(a, 'a.jpg')])
+    await settle()
+    expect(attempts).toBe(2) // the new generation's create, held on the wire
+    await rounds(1, clock) // the old loop wakes, sees its fence fall, and rejects
+    expect(attempts).toBe(2)
+    s.uploader.add([fileOf(a, 'a copy.jpg')]) // joins the create in flight, or opens a second
+    await settle()
+    release()
+    await drive(s.uploader, clock)
+    expect(s.uploader.items.map((i) => i.state)).toEqual(['received', 'received'])
+    expect(opened(door)).toHaveLength(1)
+  })
+
+  it('same bytes through a failing create: one create at a time, one upload, both received', async () => {
+    const door = new FakeDoor()
+    door.createFaults = ['network', { status: 502 }]
+    const orig = door.fetch
+    let inFlight = 0
+    let peak = 0
+    door.fetch = async (input, init) => {
+      if (input !== '/api/guest/uploads') return orig(input, init)
+      peak = Math.max(peak, ++inFlight)
+      try {
+        await tick() // long enough for a second caller to start one of its own
+        return await orig(input, init)
+      } finally {
+        inFlight--
+      }
+    }
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const a = bytes(5000, 227)
+    s.uploader.add([fileOf(a, 'a.jpg'), fileOf(a, 'a copy.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items.map((i) => i.state)).toEqual(['received', 'received'])
+    expect(peak).toBe(1)
+    expect(creates(door)).toHaveLength(3)
+    expect(clock.slept).toEqual([1000, 2000]) // one loop's waits, not one per caller
+    expect(opened(door)).toHaveLength(1)
+    expect(door.calls('PATCH', '/').reduce((n, w) => n + (w.bytes ?? 0), 0)).toBe(5000)
+  })
+
+  it('same bytes through a spent budget: both Failed, no rejected create joined, a Retry opens one', async () => {
+    const door = new FakeDoor()
+    door.outage = 'network'
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    const a = bytes(500, 228)
+    s.uploader.add([fileOf(a, 'a.jpg'), fileOf(a, 'a copy.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items.map((i) => i.state)).toEqual(['failed', 'failed'])
+    expect(creates(door)).toHaveLength(9)
+
+    door.outage = null
+    for (const item of [...s.uploader.items]) s.uploader.retry(item)
+    await drive(s.uploader, clock)
+    expect(s.uploader.items.map((i) => i.state)).toEqual(['received', 'received'])
+    expect(opened(door)).toHaveLength(1)
+  })
+
+  // The door keys nothing on (device, sha256) (app/ingest/guest.py create_upload), and it lists no
+  // open uploads a client could look its lost uid up in. So this one case leaves a row behind, which
+  // holds its cap share until the door's 24 h expiry; no client can do better. Pinned, not endorsed.
+  it('a create whose response was lost: the retry opens a second row, the first is left to expire', async () => {
+    const door = new FakeDoor()
+    door.loseNextCreateResponse = true
+    const clock = virtualClock()
+    const s = await setup(door, undefined, clock.sleep)
+    s.uploader.add([fileOf(bytes(3000, 229), 'a.jpg')])
+    await drive(s.uploader, clock)
+    expect(s.uploader.items[0].state).toBe('received')
+    expect(creates(door).map((w) => w.status)).toEqual([-1, 201])
+    const [orphan] = door.uploads.keys()
+    expect(door.uploads.get(orphan)!.data.length).toBe(0) // not one byte was sent to it
+    expect(door.calls('PATCH', '/').every((w) => !w.path.endsWith(orphan))).toBe(true)
+    expect(s.receipts).toHaveLength(1)
   })
 })

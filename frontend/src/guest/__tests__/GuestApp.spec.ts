@@ -1,9 +1,11 @@
-import { flushPromises, mount } from '@vue/test-utils'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import GuestApp from '../GuestApp.vue'
 import { openBindings } from '../bindings'
 import { CREDENTIAL_KEY } from '../credential'
+import { digestFile } from '../digest'
+import { browserNetwork } from '../uploader'
 import { FakeDoor, bytes, fileOf, sha } from './fakeDoor'
 
 // The IndexedDB transport, held shut until released: the window in which the page knows the pass
@@ -109,6 +111,153 @@ describe('GuestApp picker', () => {
     expect(door.calls('POST', '/api/pass/redeem')).toHaveLength(1)
     expect(idb.opens()).toBe(1)
     expect(door.calls('POST', '/api/guest/memos')).toHaveLength(1)
+    wrapper.unmount()
+  })
+})
+
+class HashingWorker {
+  onmessage: ((e: MessageEvent) => void) | null = null
+  postMessage({ id, file }: { id: number; file: Blob }): void {
+    void digestFile(file, () => {}).then(({ sha256, head }) =>
+      this.onmessage?.({ data: { id, type: 'done', sha256, head } } as MessageEvent),
+    )
+  }
+  terminate(): void {}
+}
+
+describe('GuestApp Retry all', () => {
+  let door: FakeDoor
+
+  const pick = async (wrapper: VueWrapper, files: File[]) => {
+    await vi.waitFor(() => expect(wrapper.find('input[type=file]').exists()).toBe(true))
+    const input = wrapper.find('input[type=file]')
+    Object.defineProperty(input.element, 'files', { value: files, configurable: true })
+    await input.trigger('change')
+  }
+  const retryAll = (wrapper: VueWrapper) => wrapper.findAll('button').filter((b) => b.text() === 'Retry all')
+  const states = (wrapper: VueWrapper) => wrapper.findAll('.files li').map((li) => li.classes()[0])
+
+  beforeEach(() => {
+    door = new FakeDoor()
+    localStorage.setItem(CREDENTIAL_KEY, JSON.stringify({ token: 'trip_dev_one', deviceId: 'dev1' }))
+    history.replaceState(null, '', '/p/joined')
+    vi.stubGlobal('fetch', (input: string, init: RequestInit) => door.fetch(input, init))
+    vi.stubGlobal('Worker', HashingWorker)
+    vi.stubGlobal('indexedDB', new IDBFactory())
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  it('shows one button only while an item is Failed, and sends every Failed item again', async () => {
+    door.createFaults = [{ status: 400, detail: 'not now' }, { status: 400, detail: 'not now' }]
+    const wrapper = mount(GuestApp)
+    await pick(wrapper, [fileOf(bytes(64, 21), 'a.jpg'), fileOf(bytes(64, 22), 'b.jpg')])
+    await vi.waitFor(() => expect(states(wrapper)).toEqual(['failed', 'failed']))
+    expect(retryAll(wrapper)).toHaveLength(1)
+
+    await retryAll(wrapper)[0].trigger('click')
+    await vi.waitFor(() => expect(states(wrapper)).toEqual(['received', 'received']))
+    expect(retryAll(wrapper)).toHaveLength(0)
+    expect(door.calls('POST', '/api/guest/uploads').filter((w) => w.status === 201)).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('leaves a file alone that did not fail, and a name that merely says Retry all shows nothing', async () => {
+    const wrapper = mount(GuestApp)
+    await pick(wrapper, [fileOf(bytes(64, 23), 'Retry all.jpg')])
+    await vi.waitFor(() => expect(states(wrapper)).toEqual(['received']))
+    expect(wrapper.text()).toContain('Retry all.jpg')
+    expect(retryAll(wrapper)).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it.each<[number, string]>([
+    [415, 'unsupported'],
+    [413, 'too-large'],
+    [507, 'quota'],
+  ])('a %i is a verdict, not a failure: state %s offers no Retry all', async (status, state) => {
+    door.createFaults = [{ status, detail: 'no' }]
+    const wrapper = mount(GuestApp)
+    await pick(wrapper, [fileOf(bytes(64, 24), 'a.jpg')])
+    await vi.waitFor(() => expect(states(wrapper)).toEqual([state]))
+    expect(retryAll(wrapper)).toHaveLength(0)
+    wrapper.unmount()
+  })
+
+  it('goes away on the click even while the retried create is still out, and a double tap sends once', async () => {
+    door.createFaults = [{ status: 400, detail: 'not now' }]
+    const wrapper = mount(GuestApp)
+    await pick(wrapper, [fileOf(bytes(64, 25), 'a.jpg')])
+    await vi.waitFor(() => expect(states(wrapper)).toEqual(['failed']))
+    const orig = door.fetch
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    door.fetch = async (input, init) => {
+      if (input === '/api/guest/uploads') await held
+      return orig(input, init)
+    }
+    const button = retryAll(wrapper)[0]
+    void button.trigger('click')
+    await button.trigger('click')
+    await flushPromises()
+    expect(retryAll(wrapper)).toHaveLength(0)
+    expect(states(wrapper)).not.toContain('failed')
+    release()
+    await vi.waitFor(() => expect(states(wrapper)).toEqual(['received']))
+    expect(door.calls('POST', '/api/guest/uploads').filter((w) => w.status === 201)).toHaveLength(1)
+    wrapper.unmount()
+  })
+})
+
+describe('the browser network', () => {
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, 'onLine')
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  const setOnLine = (value: boolean) => Object.defineProperty(navigator, 'onLine', { value, configurable: true })
+
+  it('reads navigator.onLine', () => {
+    setOnLine(false)
+    expect(browserNetwork.online()).toBe(false)
+    setOnLine(true)
+    expect(browserNetwork.online()).toBe(true)
+  })
+
+  it('hears the online event until it is unsubscribed, and leaves no listener behind', () => {
+    const listener = vi.fn()
+    const off = browserNetwork.onOnline(listener)
+    window.dispatchEvent(new Event('online'))
+    expect(listener).toHaveBeenCalledTimes(1)
+    off()
+    window.dispatchEvent(new Event('online'))
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
+
+  it('is what the page runs on: a real online event sends the waiting create at once', async () => {
+    const door = new FakeDoor()
+    localStorage.setItem(CREDENTIAL_KEY, JSON.stringify({ token: 'trip_dev_one', deviceId: 'dev1' }))
+    history.replaceState(null, '', '/p/joined')
+    vi.stubGlobal('fetch', (input: string, init: RequestInit) => door.fetch(input, init))
+    vi.stubGlobal('Worker', HashingWorker)
+    vi.stubGlobal('indexedDB', new IDBFactory())
+    const wrapper = mount(GuestApp)
+    await vi.waitFor(() => expect(wrapper.find('input[type=file]').exists()).toBe(true))
+    door.outage = 'network' // the page itself loaded before the drop
+    setOnLine(false)
+    const input = wrapper.find('input[type=file]')
+    Object.defineProperty(input.element, 'files', { value: [fileOf(bytes(64, 26), 'a.jpg')], configurable: true })
+    await input.trigger('change')
+    await vi.waitFor(() => expect(door.calls('POST', '/api/guest/uploads')).toHaveLength(1))
+    await flushPromises()
+    door.outage = null
+    setOnLine(true)
+    window.dispatchEvent(new Event('online'))
+    await vi.waitFor(() => expect(wrapper.find('.files li').classes()).toContain('received'))
     wrapper.unmount()
   })
 })

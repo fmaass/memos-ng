@@ -19,6 +19,8 @@ import type { Digest } from './digest'
 // - A refusal (401/410) clears the credential only if the credential that EARNED it is current.
 // - After any interrupted or uncertain PATCH the next byte sent is at the server's HEAD offset.
 // - A failed upload is identified by its UID (HEAD), never by a filename in an error detail.
+// - A drop does not spend the queue: create and HEAD sit out a transient failure on one budget per
+//   request, inside the one request's own slot, and time the browser reports offline spends none.
 
 export type ItemState =
   | 'waiting'
@@ -61,8 +63,25 @@ export interface UploaderDeps {
   onRefused?: (status: number) => void
   onReceipt?: (receipt: Receipt) => void
   sleep?: (ms: number) => Promise<void>
+  network?: Connectivity
   parallel?: number
   patchTimeoutMs?: number
+}
+
+/** What the browser believes about its connection. A hint, wrong in both directions at times: it
+ * may only shorten a wait or skip spending budget, never decide that a request is not sent. */
+export interface Connectivity {
+  online(): boolean
+  /** Subscribes to the browser coming back online; answers the unsubscribe. */
+  onOnline(listener: () => void): () => void
+}
+
+export const browserNetwork: Connectivity = {
+  online: () => typeof navigator === 'undefined' || navigator.onLine !== false,
+  onOnline: (listener) => {
+    window.addEventListener('online', listener)
+    return () => window.removeEventListener('online', listener)
+  },
 }
 
 interface Fence {
@@ -77,6 +96,17 @@ const MAX_FAILURES = 8
 const DEFAULT_SLICE = 5 * 1024 * 1024
 
 const backoff = (n: number) => Math.min(30_000, 1000 * 2 ** Math.max(0, n - 1))
+
+// What one request's whole budget adds up to (121 s). A Retry-After beyond it is no blip to sit out
+// but a statement about the hours ahead: the door's file caps answer create with 3600 s
+// (FILE_CAP_RETRY_AFTER_S in app/ingest/guest.py), and holding a worker on "Checking" for that long
+// would hide the door's own sentence from the guest. So it fails now, and a Retry may ask again.
+const RETRY_BUDGET_MS = Array.from({ length: MAX_FAILURES }, (_, n) => backoff(n + 1)).reduce((a, b) => a + b)
+
+/** Worth asking again: no answer at all, a busy door, or a server fault. 507 is a 5xx by number
+ * only: "no room" is a verdict with its own state. */
+const isTransient = (error: unknown): boolean =>
+  !(error instanceof GuestHttpError) || error.status === 429 || (error.status >= 500 && error.status !== 507)
 
 export class GuestUploader {
   readonly items: UploadItem[] = []
@@ -95,12 +125,14 @@ export class GuestUploader {
    * in a loop; anything else that is uploaded is judged after a completion settles. */
   private unsettled = new Set<string>()
   private readonly sleep: (ms: number) => Promise<void>
+  private readonly network: Connectivity
   /** The credential this uploader was built for. Its device namespace and every request belong
    * to it; once another credential is current this uploader starts nothing more. */
   private readonly origin: Credential | null
 
   constructor(private readonly deps: UploaderDeps) {
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+    this.network = deps.network ?? browserNetwork
     this.origin = deps.credentials.get()
   }
 
@@ -177,6 +209,7 @@ export class GuestUploader {
     item.state = 'waiting'
     item.message = null
     this.pump()
+    this.changed() // a create that now sits out a drop answers nothing for a while
   }
 
   private pump(): void {
@@ -227,7 +260,7 @@ export class GuestUploader {
           const binding = await bindings.get(deviceId, item.sha256)
           if (!this.alive(f)) return
           if (binding) {
-            const offset = await this.deps.api.head(f.credential.token, binding.uploadUid)
+            const offset = await this.persisting(f, () => this.deps.api.head(f.credential.token, binding.uploadUid))
             if (!this.alive(f)) return
             if (offset === null) {
               await bindings.delete(deviceId, item.sha256)
@@ -272,13 +305,18 @@ export class GuestUploader {
     const key = item.sha256!
     const joined = this.creating.get(key)
     if (joined) return joined
-    const created = this.deps.api.create(f.credential.token, {
+    // The retries live inside the stored promise, so a twin joins the whole loop and never starts a
+    // second create. Its fence is every joiner's: this map only holds one generation's creates
+    // (reset() clears it) and all of them share the uploader's one credential.
+    const created = this.persisting(f, () =>
+      this.deps.api.create(f.credential.token, {
         filename: item.name,
         mime: item.file.type,
         size: item.size,
         last_modified: item.file.lastModified || null,
         sha256: key,
-    })
+      }),
+    )
     // Kept after it answers: the same bytes picked again later in this generation reuse the
     // upload rather than open a second one. Forgotten on failure and when the upload is gone.
     created.catch(() => {
@@ -286,6 +324,52 @@ export class GuestUploader {
     })
     this.creating.set(key, created)
     return created
+  }
+
+  /** Repeats one request through transient failures until it answers. Rejects when it cannot go on
+   * (see sitOut); a rejection under a fallen fence lands in fail(), which drops it. */
+  private async persisting<T>(f: Fence, request: () => Promise<T>): Promise<T> {
+    let failures = 0
+    for (;;) {
+      try {
+        return await request()
+      } catch (error) {
+        failures = await this.sitOut(error, failures, f)
+      }
+    }
+  }
+
+  /** Waits out one failed try and answers the failures counted so far. Throws the error instead
+   * when it is a verdict, the budget is spent, or the fence fell: nothing follows a fallen fence. */
+  private async sitOut(error: unknown, failures: number, f: Fence): Promise<number> {
+    if (!this.alive(f) || !isTransient(error)) throw error
+    if (await this.offlinePause(error)) {
+      if (!this.alive(f)) throw error
+      return failures
+    }
+    const spent = failures + 1
+    const asked = error instanceof GuestHttpError && error.retryAfter ? error.retryAfter * 1000 : null
+    if (spent > MAX_FAILURES || (asked ?? 0) > RETRY_BUDGET_MS) throw error
+    await this.sleep(asked ?? backoff(spent))
+    if (!this.alive(f)) throw error
+    return spent
+  }
+
+  /** A request that got no answer while the browser reports offline waits for the network, at no
+   * cost to any budget; answers whether it waited. An HTTP answer proves the network, and a request
+   * is always tried first, so a browser wrongly saying offline delays nothing that can go. */
+  private async offlinePause(error: unknown): Promise<boolean> {
+    if (error instanceof GuestHttpError || this.network.online()) return false
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        off()
+        resolve()
+      }
+      const off = this.network.onOnline(done)
+      // Bounded: the event may never fire even though the network is back.
+      void this.sleep(backoff(MAX_FAILURES)).then(done)
+    })
+    return true
   }
 
   private async bind(item: UploadItem, f: Fence): Promise<void> {
@@ -343,11 +427,7 @@ export class GuestUploader {
           resync = false
           this.uncertain.delete(uid)
         } catch (error) {
-          if (!this.alive(f)) return 'stopped'
-          if (error instanceof GuestHttpError && error.status < 500 && error.status !== 429) throw error
-          if (++failures > MAX_FAILURES) throw error
-          await this.sleep(backoff(failures))
-          if (!this.alive(f)) return 'stopped'
+          failures = await this.sitOut(error, failures, f)
           continue
         }
       } else {
@@ -363,6 +443,11 @@ export class GuestUploader {
           this.uncertain.delete(uid)
         } catch (error) {
           if (!this.alive(f)) return 'stopped'
+          if (await this.offlinePause(error)) {
+            if (!this.alive(f)) return 'stopped'
+            resync = true
+            continue
+          }
           if (error instanceof GuestHttpError) {
             if (error.status === 404) {
               await bindings.delete(deviceId, item.sha256!)
@@ -477,6 +562,10 @@ export class GuestUploader {
           )
         } catch (error) {
           if (!this.alive(f)) return
+          if (await this.offlinePause(error)) {
+            if (!this.alive(f)) return
+            continue
+          }
           if (!(error instanceof GuestHttpError)) {
             stalled++
             await this.sleep(backoff(stalled)) // response lost: replay the SAME set
