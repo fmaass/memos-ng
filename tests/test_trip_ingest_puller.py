@@ -486,6 +486,34 @@ def test_the_memo_key_is_bounded_and_namespaced():
 # --- the link -----------------------------------------------------------------------------------
 
 
+async def test_a_real_door_purged_of_every_row_still_reads_healthy_to_home(world):
+    """MEMNG-1205 against the real door: its acked rows and devices are gone, home's cursors stand
+    above anything left in those tables, and the tick is still a clean sync."""
+    trip = await _trip(world)
+    token = await _guest(world, trip)
+    uid = await _send(world, token, (JPEG, "a.jpg"))
+    assert await _tick(world) == "ok"
+    assert _home_batch(uid) == [("acked", True, True, False)]
+    cursors = _sql("SELECT devices_since, batches_since FROM trip_ingest_cursor WHERE id = 1")[0]
+    assert all(c > 0 for c in cursors)
+    for table in ("ingest_blobs", "ingest_batches", "guest_uploads", "pass_devices"):
+        _sql(f"DELETE FROM pluto.{table}")
+    assert _sql(
+        "SELECT (SELECT max(change_seq) FROM pluto.ingest_batches), "
+        "(SELECT max(change_seq) FROM pluto.pass_devices)"
+    ) == [(None, None)]
+
+    assert await _tick(world) == "ok"
+
+    after = _sql(
+        "SELECT devices_since, batches_since, last_error FROM trip_ingest_cursor WHERE id = 1"
+    )[0]
+    assert (after[0], after[1]) == cursors
+    assert after[2] is None
+    head = (await world.link.get("/ingest/batches", params={"since": cursors[1]})).json()["head"]
+    assert head >= max(cursors)
+
+
 async def test_a_link_down_is_retried_and_quarantines_nothing(world):
     trip = await _trip(world)
     batch = await _send(world, await _guest(world, trip), (JPEG, "a.jpg"))
@@ -648,7 +676,10 @@ async def test_a_pull_never_clears_a_home_revocation(world):
     await _revoke(trip, world.owner_id)
     # The ingest host keeps showing the device live and moves its cursor.
     world.wire.down_paths = ("/ingest/device-revocations",)
-    _sql("UPDATE pluto.pass_devices SET change_seq = change_seq + 1000, uploads_count = 7")
+    _sql(
+        "UPDATE pluto.pass_devices "
+        "SET change_seq = nextval('pluto.ingest_change_seq'), uploads_count = 7"
+    )
     assert await _tick(world) == "link_down"
     _sql("UPDATE trip_ingest_cursor SET devices_since = 0")
     await trip_ingest.pull_devices(world.link)
@@ -1658,6 +1689,8 @@ async def test_a_cursor_past_bigint_is_a_malformed_page_and_bigint_max_is_kept(w
         if request.url.path != f"/ingest/{feed}":
             return response
         page = json.loads(await response.aread())
+        # The bound is what this pins, so the door has no `head` to be above (MEMNG-1205).
+        del page["head"]
         if page[feed]:
             page["next"] = nxt["value"]
         return _json_answer(page)

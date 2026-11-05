@@ -96,6 +96,14 @@ async def next_change_seq(db: AsyncSession) -> int:
     return (await db.execute(select(func.nextval(INGEST_CHANGE_SEQ.name)))).scalar_one()
 
 
+async def change_seq_head(db: AsyncSession) -> int:
+    """The highest change cursor ever drawn, or 0 if none was, without drawing one. From the
+    sequence and not `max(change_seq)`: the purge deletes acked rows, so a max over them can fall
+    below a cursor home already holds. Nothing rolls a sequence back but a restored backup."""
+    row = (await db.execute(text("SELECT last_value, is_called FROM ingest_change_seq"))).one()
+    return row.last_value if row.is_called else 0
+
+
 async def lock_disk_reservation(db: AsyncSession) -> None:
     """Serialize the volume-floor check and the session insert it admits, across all passes."""
     await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": DISK_RESERVATION_LOCK})

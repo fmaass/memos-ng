@@ -257,9 +257,13 @@ class DeviceOut(BaseModel):
     cursor: int
 
 
+# `head` on a feed page: the sequence's high-water mark, for home to notice a cursor of its own
+# ahead of this door (MEMNG-1205). A page reads it AFTER its rows: a change committed in between
+# would otherwise put the page's `next` above its `head`, and an honest door would read as a jump.
 class DevicePage(BaseModel):
     devices: list[DeviceOut]
     next: int
+    head: int
 
 
 @router.get("/devices", response_model=DevicePage)
@@ -293,7 +297,11 @@ async def pull_devices(
         )
         for d, pass_uid in rows
     ]
-    return DevicePage(devices=devices, next=devices[-1].cursor if devices else since)
+    return DevicePage(
+        devices=devices,
+        next=devices[-1].cursor if devices else since,
+        head=await core.change_seq_head(db),
+    )
 
 
 class BlobOut(BaseModel):
@@ -320,6 +328,7 @@ class BatchOut(BaseModel):
 class BatchPage(BaseModel):
     batches: list[BatchOut]
     next: int
+    head: int
 
 
 @router.get("/batches", response_model=BatchPage)
@@ -368,7 +377,11 @@ async def pull_batches(
                 cursor=batch.change_seq or 0,
             )
         )
-    return BatchPage(batches=out, next=out[-1].cursor if out else since)
+    return BatchPage(
+        batches=out,
+        next=out[-1].cursor if out else since,
+        head=await core.change_seq_head(db),
+    )
 
 
 @router.get("/blobs/{sha256}")

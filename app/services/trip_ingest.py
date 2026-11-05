@@ -116,6 +116,13 @@ class LinkDown(Exception):
     sent an answer that does not parse. Retryable — it never quarantines a batch."""
 
 
+class CursorAhead(Exception):
+    """A feed cursor stands above the door's own sequence head: the door was restored from a backup
+    or handed out a jump. Not retryable the way a down link is, and nothing resets it here: the tick
+    fails, so `last_sync_at` stops and `GuestSyncStale` fires, until the door catches up or the
+    operator lowers the cursor."""
+
+
 class Hostile(Exception):
     """A manifest (or the bytes it names) home will not take. Quarantined, never acknowledged."""
 
@@ -241,6 +248,21 @@ def _a_cursor(value: object) -> TypeGuard[int]:
     """A feed's `next`: it is committed into a BIGINT cursor column, where a larger value would
     abort the page's transaction on every tick."""
     return _is_int(value) and 0 <= value <= INT64_MAX
+
+
+def _refuse_a_cursor_ahead(feed: str, page: dict, since: int, nxt: int) -> None:
+    """Runs before a feed page is judged or its cursor committed, and before an empty page ends the
+    walk, the shape a restored door answers in. A door without `head` predates the check (the door
+    deploys first) and is not judged at all, so a door that omits it escapes this."""
+    if "head" not in page:
+        return
+    head = page["head"]
+    if not _a_cursor(head):
+        raise LinkDown(f"GET /ingest/{feed}: malformed page")
+    # `next` is never below `since` here (both walks refuse that first), and an empty page answers
+    # with `since` itself, so this one comparison also covers a cursor already above the head.
+    if nxt > head:
+        raise CursorAhead(f"cursor_ahead: {feed} since={since} next={nxt} head={head}")
 
 
 def _an_id(value: object) -> TypeGuard[str]:
@@ -643,6 +665,7 @@ async def pull_devices(client: httpx.AsyncClient) -> int:
         nxt = page.get("next") if isinstance(page, dict) else None
         if not isinstance(devices, list) or not _a_cursor(nxt) or nxt < since:
             raise LinkDown("GET /ingest/devices: malformed page")
+        _refuse_a_cursor_ahead("devices", page, since, nxt)
         if not devices:
             return seen
         valid = [d for d in map(_valid_device, devices) if d is not None]
@@ -792,6 +815,7 @@ async def pull_batches(client: httpx.AsyncClient, errors: list[str]) -> int:
         nxt = page.get("next") if isinstance(page, dict) else None
         if not isinstance(batches, list) or not _a_cursor(nxt) or nxt < since:
             raise LinkDown("GET /ingest/batches: malformed page")
+        _refuse_a_cursor_ahead("batches", page, since, nxt)
         if not batches:
             return seen
         # A batch whose device the mirror does not hold yet: the device feed is drained again
@@ -1771,6 +1795,10 @@ async def run_sync_safe(client: httpx.AsyncClient | None = None, budget_s: float
         # this wait and leave the task queued on the row or the pool.
         await asyncio.shield(asyncio.ensure_future(_record_cancelled()))
         raise
+    except CursorAhead as exc:
+        logger.error("trip_ingest.cursor_ahead", error=str(exc))
+        await _record_tick_safe(str(exc))
+        return "cursor_ahead"
     except LinkDown as exc:
         logger.warning("trip_ingest.link_down", error=str(exc))
         await _record_tick_safe(f"link: {exc}")

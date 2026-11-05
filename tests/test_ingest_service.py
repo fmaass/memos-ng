@@ -12,9 +12,10 @@ import pytest
 import structlog
 from app.config import settings
 from app.database import async_session
+from app.database import engine as door_engine
 from app.ingest import guest as guest_module
 from app.ingest import service_api
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from tests.ingest_support import (
     HEIC,
@@ -268,6 +269,105 @@ async def test_ack_and_quarantine_are_idempotent_and_quarantine_is_sticky(door, 
     assert q.json()["state"] == "quarantined"
     assert (await home_iface.post(f"/ingest/batches/{batch}/ack")).status_code == 409
     assert (await home_iface.post("/ingest/batches/nope/ack")).status_code == 404
+
+
+# --- the feeds' high-water mark (MEMNG-1205) ----------------------------------------------------
+
+
+def _sequence_last_value() -> tuple[int, bool]:
+    return _sql("SELECT last_value, is_called FROM ingest_change_seq")[0]
+
+
+@pytest.mark.parametrize(("route", "key"), [("devices", "devices"), ("batches", "batches")])
+async def test_both_feeds_report_the_sequence_head_and_reading_it_draws_nothing(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    route,
+    key,
+):
+    await _batch(door, home_iface, JPEG)
+    drawn = _sql("SELECT nextval('ingest_change_seq')")[0][
+        0
+    ]  # above every row: not a max over them
+    for since in (0, drawn):
+        page = (await home_iface.get(f"/ingest/{route}", params={"since": since})).json()
+        assert page["head"] == drawn
+        assert set(page) == {key, "next", "head"}  # home up to 2.13.0 reads two keys by name
+    assert _sequence_last_value() == (drawn, True)
+    assert _sql("SELECT nextval('ingest_change_seq')")[0][0] == drawn + 1
+
+
+@pytest.mark.parametrize("route", ["devices", "batches"])
+async def test_a_sequence_never_drawn_reports_head_zero(home_iface, route):  # noqa: F811
+    """`last_value` of an unused sequence reads 1, which no cursor has ever been."""
+    stood_at = _sequence_last_value()[0]
+    _sql("ALTER SEQUENCE ingest_change_seq RESTART")
+    try:
+        assert _sequence_last_value()[1] is False
+        page = (await home_iface.get(f"/ingest/{route}")).json()
+        assert page["head"] == 0
+        assert page["next"] == 0
+    finally:
+        _sql("SELECT setval('ingest_change_seq', :v)", {"v": stood_at})
+
+
+@pytest.mark.parametrize(
+    ("route", "table"), [("devices", "pass_devices"), ("batches", "ingest_batches")]
+)
+async def test_a_writer_committing_while_a_page_is_read_never_puts_next_above_head(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    route,
+    table,
+):
+    """An honest door must not trip home's check. The writer commits just before the page's rows
+    are read, so the page holds a cursor a head read any earlier could not have seen."""
+    await _batch(door, home_iface, JPEG)
+    rows_read = f"{table}.change_seq > "
+    fired: list[int] = []
+
+    def writer(conn, cursor, statement, parameters, context, executemany) -> None:
+        if rows_read in statement and not fired:
+            fired.append(1)
+            _sql(f"UPDATE {table} SET change_seq = nextval('ingest_change_seq')")
+
+    event.listen(door_engine.sync_engine, "before_cursor_execute", writer)
+    try:
+        page = (await home_iface.get(f"/ingest/{route}", params={"since": 0})).json()
+    finally:
+        event.remove(door_engine.sync_engine, "before_cursor_execute", writer)
+    assert fired
+    assert page["next"] > 0
+    assert page["next"] <= page["head"]
+
+
+async def test_the_purge_leaves_the_head_at_or_above_every_cursor_it_handed_out(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    ingest_env,  # noqa: F811
+):
+    """The purge deletes acked rows, so a max over them can honestly fall below home's cursor."""
+    batch = await _batch(door, home_iface, JPEG)
+    devices_at = (await home_iface.get("/ingest/devices", params={"since": 0})).json()["next"]
+    batches_at = (await home_iface.get("/ingest/batches", params={"since": 0})).json()["next"]
+    await home_iface.post(f"/ingest/batches/{batch}/ack")
+    _age(batch, 60)
+    assert (await service_api.purge())["batches"] == 1
+    _sql("DELETE FROM guest_uploads")
+    _sql("DELETE FROM pass_devices")
+    assert _sql(
+        "SELECT (SELECT max(change_seq) FROM ingest_batches), "
+        "(SELECT max(change_seq) FROM pass_devices)"
+    ) == [(None, None)]
+
+    for route, key, cursor in (
+        ("devices", "devices", devices_at),
+        ("batches", "batches", batches_at),
+    ):
+        page = (await home_iface.get(f"/ingest/{route}", params={"since": cursor})).json()
+        assert page[key] == []
+        assert page["next"] == cursor
+        assert page["head"] >= cursor
 
 
 def _age(batch: str, days: int) -> None:
