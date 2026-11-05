@@ -1,0 +1,13 @@
+diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
+index 22698a1..66e6c28 100644
+--- a/app/services/trip_ingest.py
++++ b/app/services/trip_ingest.py
+@@ -1135,7 +1135,7 @@ async def reconcile_moves() -> None:
+                 ).scalars()
+             )
+             for row in rows:
+-                if row.kind == "master" and await _attachment_names(db, row.dest):
++                if False and await _attachment_names(db, row.dest):
+                     # Not this row's file: the filing it journaled gave that name up, and somebody
+                     # committed it since (an owner upload, or an older build refiling the part).
+                     # The flag takes this row out of every later walk, so the stop lasts this pass:

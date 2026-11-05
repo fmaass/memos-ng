@@ -47,7 +47,7 @@ import httpx
 import structlog
 from anyio import to_thread
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +56,7 @@ from app.database import async_session, engine
 from app.ingest import core as ingest_core
 from app.models import (
     PASS_DEVICE_PLATFORMS,
+    Attachment,
     IngestBatch,
     IngestBlob,
     IngestMove,
@@ -990,14 +991,19 @@ class _MoveJournal:
 
     def __init__(self, batch_id: int) -> None:
         self.batch_id = batch_id
+        self.written: set[int] = set()
 
     async def record_many(self, moves: Sequence[tuple[str, str]], kind: str) -> None:
         async with async_session() as db:
-            db.add_all(
+            rows = [
                 IngestMove(batch_id=self.batch_id, src=src, dest=dest, kind=kind)
                 for src, dest in moves
-            )
+            ]
+            db.add_all(rows)
+            await db.flush()
+            row_ids = [row.id for row in rows]
             await db.commit()
+        self.written.update(row_ids)
 
     async def record(self, src: str, dest: str, kind: str) -> int:
         async with async_session() as db:
@@ -1006,12 +1012,34 @@ class _MoveJournal:
             await db.flush()
             row_id = row.id
             await db.commit()
-            return row_id
+        self.written.add(row_id)
+        return row_id
 
     async def forget(self, row_id: int) -> None:
         async with async_session() as db:
             await db.execute(delete(IngestMove).where(IngestMove.id == row_id))
             await db.commit()
+        self.written.discard(row_id)
+
+    async def drop_written(self) -> None:
+        """A fully restored filing's rows: left behind, they read a name its restore vacated as
+        theirs, and the next owner of that name loses the file. Runs after the filing's session has
+        closed, because a filing interrupted at its own delete still holds these rows until then.
+        Ends on its own, like the cancel record; rows it cannot drop stay for reconcile, whose
+        attachment check is what makes them harmless."""
+        try:
+            async with asyncio.timeout(CANCEL_RECORD_DEADLINE_S):
+                async with async_session() as db:
+                    await db.execute(
+                        delete(IngestMove).where(
+                            IngestMove.id.in_(self.written), IngestMove.flagged_at.is_(None)
+                        )
+                    )
+                    await db.commit()
+        except TimeoutError:
+            logger.error("trip_ingest.journal_drop_timed_out", batch=self.batch_id)
+        except Exception:
+            logger.exception("trip_ingest.journal_drop_failed", batch=self.batch_id)
 
 
 class _JournaledMoves(list[storage.TrackedMove]):
@@ -1062,6 +1090,18 @@ class ReconcileIncomplete(Exception):
     not where a retry expects them, and `GuestSyncStale` stays the loud signal."""
 
 
+async def _attachment_names(db: AsyncSession, path: str) -> bool:
+    """Whether a committed attachment stores exactly this path, as the display or the print master.
+    Both columns hold the `str()` of the path `place_master` returned, as a journal row's dest does.
+    Renditions are left out: theirs are uuid names under `print/`, which no filing journals."""
+    found = await db.execute(
+        select(Attachment.id)
+        .where(or_(Attachment.storage_path == path, Attachment.print_path == path))
+        .limit(1)
+    )
+    return found.first() is not None
+
+
 async def reconcile_moves() -> None:
     """Walk back whatever a crashed filing left, before anything is filed. For each batch with rows:
     the batch row FIRST, which waits out a filing still running (the sync advisory lock is on
@@ -1095,10 +1135,26 @@ async def reconcile_moves() -> None:
                 ).scalars()
             )
             for row in rows:
-                try:
-                    outcome = await to_thread.run_sync(
-                        _walk_back_sync, row.id, row.src, row.dest, row.kind
+                if row.kind == "master" and await _attachment_names(db, row.dest):
+                    # Not this row's file: the filing it journaled gave that name up, and somebody
+                    # committed it since (an owner upload, or an older build refiling the part).
+                    # The flag takes this row out of every later walk, so the stop lasts this pass:
+                    # the earlier hops are each right on their own, and the next tick walks them.
+                    row.flagged_at = datetime.now(UTC)
+                    failed += 1
+                    logger.error(
+                        "trip_ingest.reconcile_dest_committed",
+                        move=row.id,
+                        src=row.src,
+                        dest=row.dest,
                     )
+                    break
+                try:
+                    # blocking-ok: anyio holds no native `task.cancel()` for a running thread, so
+                    # awaited, the rename can outlive this session and the batch lock it holds,
+                    # and land after a later reconcile and a refile. Only a crash leaves work here,
+                    # and a rename is short.
+                    outcome = _walk_back_sync(row.id, row.src, row.dest, row.kind)
                 except OSError as exc:
                     failed += 1
                     logger.error(
@@ -1126,13 +1182,16 @@ async def reconcile_moves() -> None:
         raise ReconcileIncomplete(f"{failed} journaled moves would not walk back")
 
 
-def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -> None:
+def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -> bool:
     """Walk a rolled-back filing's files back to the staging area, so the next tick finds them.
     Inline, not in a thread: this may run while a cancellation unwinds (see the memo router's
-    `_restore_moved`). A file that will not move is logged and left where it is."""
+    `_restore_moved`). A file that will not move is logged and left where it is, and the answer is
+    False: only True says the filing's journal rows have nothing left to describe."""
+    clean = True
     for move in reversed(moved):
         unrestored = move.restore()
         if unrestored is not None:
+            clean = False
             logger.error("trip_ingest.restore_failed", src=move.src, dest=unrestored)
     for staged, part in parts:
         try:
@@ -1144,7 +1203,9 @@ def _restore(moved: list[storage.TrackedMove], parts: list[tuple[Path, Path]]) -
             elif part.exists():
                 os.replace(part, staged)
         except OSError as exc:
+            clean = False
             logger.error("trip_ingest.restore_failed", src=str(part), error=type(exc).__name__)
+    return clean
 
 
 def _epoch_ms(value: datetime) -> int:
@@ -1247,7 +1308,7 @@ async def _file_part(batch_id: int) -> bool | None:
     parts: list[tuple[Path, Path]] = []
     consumed: list[str] = []
     filing: list[int] = []
-    committed = commit_sent = False
+    committed = commit_sent = restored = False
     try:
         async with async_session() as db:
             try:
@@ -1311,7 +1372,9 @@ async def _file_part(batch_id: int) -> bool | None:
                     staged = _verified_path(uid, blob.sha256)
                     target = uploads_svc.part_path(up.upload_uid)
                     parts.append((staged, target))
-                    await to_thread.run_sync(_replace_sync, staged, target)
+                    # blocking-ok: awaited, a cancellation leaves this rename running in its thread,
+                    # where it can land after `_restore` has dropped the only row that describes it.
+                    _replace_sync(staged, target)
                     # The completion state a member's last chunk leaves: every byte received, its
                     # hash known. The capture read happens in finalize's `ensure_capture`.
                     up.bytes_received = blob.size_bytes
@@ -1401,7 +1464,7 @@ async def _file_part(batch_id: int) -> bool | None:
                     # blocking-ok: a cancellation may be unwinding through here, and an await
                     # could be interrupted before the files are back (the memo router restores
                     # inline too).
-                    _restore(moved, parts)
+                    restored = _restore(moved, parts)
                 raise
     except BaseException:
         if commit_sent and not committed:
@@ -1417,7 +1480,10 @@ async def _file_part(batch_id: int) -> bool | None:
             except BaseException:
                 committed_after_all = None
             if committed_after_all is False:
-                _restore(moved, parts)  # blocking-ok: as above
+                restored = _restore(moved, parts)  # blocking-ok: as above
+        if restored and journal.written:
+            # Shielded with its deadline inside, like the cancel record (see `run_sync_safe`).
+            await asyncio.shield(asyncio.ensure_future(journal.drop_written()))
         raise
     if consumed:
         await to_thread.run_sync(uploads_svc.reap_consumed_sync, consumed)

@@ -5,14 +5,16 @@ is exactly what a hard crash loses and no in-process raise can prove otherwise."
 
 import asyncio
 import os
+import secrets
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 from app.database import async_session
-from app.models import IngestBlob, IngestMove, Pass, User
+from app.models import Attachment, AttachmentStatus, IngestBlob, IngestMove, Pass, User
 from app.services import passes as passes_svc
 from app.services import storage, trip_ingest
 from sqlalchemy import select, text
@@ -363,3 +365,420 @@ async def test_a_full_part_files_inside_the_housekeeping_bound(world, monkeypatc
     assert await asyncio.to_thread(_rows) == 0
     async with async_session() as db:
         assert (await db.execute(select(IngestMove))).first() is None
+
+
+def _cancels_then_runs(call, holder: dict, seen: dict):
+    """The hop under test: cancel the task from inside it, give a cancellation that can reach the
+    coroutine time to unwind it, then do the rename and say whether the task had already gone."""
+    loop = asyncio.get_running_loop()
+
+    def hop(*args, **kwargs):
+        loop.call_soon_threadsafe(holder["task"].cancel)
+        limit = time.monotonic() + 1
+        while not holder["task"].done() and time.monotonic() < limit:
+            time.sleep(0.01)
+        seen["task_had_gone"] = holder["task"].done()
+        try:
+            return call(*args, **kwargs)
+        finally:
+            seen["hopped"].set()
+
+    return hop
+
+
+async def test_a_cancelled_reconcile_moves_nothing_after_it_let_the_batch_go(
+    world, tmp_path, monkeypatch
+):
+    """anyio does not hold a native `task.cancel()` for a running thread: the coroutine unwinds and
+    closes its session, so the batch lock is gone while the rename is still to come. A later
+    reconcile and a refile can then finish first, and the late thread takes the new master away."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    dest.write_bytes(b"bytes")
+    await _journal_row(tmp_path, src, dest)
+    holder: dict = {}
+    seen: dict = {"hopped": threading.Event()}
+    monkeypatch.setattr(os, "replace", _cancels_then_runs(os.replace, holder, seen))
+    holder["task"] = asyncio.ensure_future(trip_ingest.reconcile_moves())
+    await asyncio.wait([holder["task"]], timeout=WAIT_TIMEOUT)
+    assert await asyncio.to_thread(seen["hopped"].wait, WAIT_TIMEOUT)
+    assert holder["task"].cancelled()
+    assert seen["task_had_gone"] is False, "the rename ran after the batch lock was released"
+    monkeypatch.undo()
+    await trip_ingest.reconcile_moves()
+    assert src.read_bytes() == b"bytes" and not dest.exists()
+    assert _rows() == 0
+
+
+async def test_a_cancelled_part_rename_cannot_land_after_the_restore(world, monkeypatch):
+    """The restore runs while the cancellation unwinds, and it now drops the journal when it is
+    done: a rename still running in a thread would land after both, with no row to find it."""
+    batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    staged = _verified(batch)
+    holder: dict = {}
+    seen: dict = {"hopped": threading.Event()}
+    hop = _cancels_then_runs(trip_ingest._replace_sync, holder, seen)
+    monkeypatch.setattr(trip_ingest, "_replace_sync", hop)
+    holder["task"] = asyncio.ensure_future(trip_ingest._file_part(batch_id))
+    await asyncio.wait([holder["task"]], timeout=WAIT_TIMEOUT)
+    assert await asyncio.to_thread(seen["hopped"].wait, WAIT_TIMEOUT)
+    assert holder["task"].cancelled()
+    assert seen["task_had_gone"] is False, "the part rename ran after the filing had unwound"
+    assert _verified(batch) == staged
+    assert _files(world.home_root, "uploads") == []
+    assert _rows() == 0
+
+
+async def _failed_filing(monkeypatch, batch_id: int) -> None:
+    """A filing that placed its files and then fails in process, with nothing committed."""
+
+    def failing(real):
+        async def then_fails(*a, **k):
+            await real(*a, **k)
+            raise RuntimeError("injected")
+
+        return then_fails
+
+    with monkeypatch.context() as m:
+        m.setattr(passes_svc, "create_guest_memo", failing(passes_svc.create_guest_memo))
+        m.setattr(passes_svc, "append_guest_files", failing(passes_svc.append_guest_files))
+        with pytest.raises(RuntimeError, match="injected"):
+            await trip_ingest._file_part(batch_id)
+
+
+async def _stale_rows(monkeypatch, batch_id: int) -> None:
+    """A filing's rows outliving its full restore, as a failed drop or an older build leaves it."""
+
+    async def kept(self):
+        return None
+
+    with monkeypatch.context() as m:
+        m.setattr(trip_ingest._MoveJournal, "drop_written", kept, raising=False)
+        await _failed_filing(m, batch_id)
+    assert _rows() > 0
+
+
+def _last_master_dest() -> Path:
+    [(dest,)] = tp._sql(
+        "SELECT dest FROM ingest_moves WHERE kind = 'master' ORDER BY id DESC LIMIT 1"
+    )
+    return Path(dest)
+
+
+def _flagged() -> int:
+    return tp._sql("SELECT count(*) FROM ingest_moves WHERE flagged_at IS NOT NULL")[0][0]
+
+
+def _batch_attachments(batch_id: int) -> list[tuple[str, str]]:
+    return tp._sql(
+        "SELECT a.filename, a.storage_path FROM attachments a "
+        "JOIN ingest_batches b ON b.memo_id = a.memo_id WHERE b.id = :b ORDER BY a.id",
+        {"b": batch_id},
+    )
+
+
+async def test_a_fully_restored_filing_leaves_no_rows(world, monkeypatch):
+    batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    staged = _verified(batch)
+    await _failed_filing(monkeypatch, batch_id)
+    assert _verified(batch) == staged
+    assert _files(world.home_root, "originals") == []
+    assert _rows() == 0, "a restored filing's rows treat a vacated name as theirs"
+
+
+async def test_a_cancelled_filing_still_drops_its_rows_after_a_full_restore(world, monkeypatch):
+    batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    staged = _verified(batch)
+    park = Park()
+    real = passes_svc.create_guest_memo
+
+    async def parked(*args, **kwargs):
+        memo = await real(*args, **kwargs)
+        if park.claim():
+            await park.hold()
+        return memo
+
+    monkeypatch.setattr(passes_svc, "create_guest_memo", parked)
+    filing = asyncio.ensure_future(trip_ingest._file_part(batch_id))
+    await asyncio.wait_for(park.entered.wait(), timeout=WAIT_TIMEOUT)
+    assert _rows() > 0
+    filing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await filing
+    assert _verified(batch) == staged
+    assert _rows() == 0
+
+
+async def test_a_restore_that_left_a_file_behind_keeps_the_rows_for_reconcile(world, monkeypatch):
+    batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    staged = _verified(batch)
+    real_replace, real_restore = os.replace, trip_ingest._restore
+
+    def refused_restore(moved, parts):
+        def refuses(src, dest, *a, **k):
+            raise PermissionError(13, "injected", str(src))
+
+        os.replace = refuses
+        try:
+            return real_restore(moved, parts)
+        finally:
+            os.replace = real_replace
+
+    with monkeypatch.context() as m:
+        m.setattr(trip_ingest, "_restore", refused_restore)
+        await _failed_filing(m, batch_id)
+    assert len(_files(world.home_root, "originals")) == 1
+    assert _rows() > 0, "the only record of the stranded file went"
+    await trip_ingest.reconcile_moves()
+    assert _verified(batch) == staged
+    assert _rows() == 0
+
+
+async def test_the_journal_drop_ends_inside_its_deadline_and_leaves_the_rows(world, monkeypatch):
+    """A held row makes the drop fail, not the filing hang: the failure still surfaces inside the
+    deadline, nothing stays queued on the row, and the surviving rows are reconcile's to clear."""
+    batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    staged = _verified(batch)
+    holder = async_session()
+    real_drop = trip_ingest._MoveJournal.drop_written
+
+    async def held_drop(self):
+        await holder.execute(text("SELECT id FROM ingest_moves FOR UPDATE"))
+        await real_drop(self)
+
+    monkeypatch.setattr(trip_ingest._MoveJournal, "drop_written", held_drop)
+    try:
+        async with asyncio.timeout(trip_ingest.CANCEL_RECORD_DEADLINE_S + 2):
+            await _failed_filing(monkeypatch, batch_id)
+    finally:
+        await holder.rollback()
+        await holder.close()
+    waiting = tp._sql(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+        "AND datname = current_database()"
+    )
+    assert waiting == [(0,)]
+    assert _verified(batch) == staged
+    assert _rows() > 0
+    await trip_ingest.reconcile_moves()
+    assert _rows() == 0
+    assert _verified(batch) == staged
+
+
+@pytest.mark.parametrize("column", ["storage_path", "print_path"])
+async def test_an_owners_committed_attachment_at_a_journaled_dest_stays_and_the_batch_files_once(
+    world, monkeypatch, column
+):
+    """The normal case: a failed filing's stale rows, and an owner upload that took the vacated
+    name before the next tick. The kept chain costs the batch one tick and nothing else: the flag
+    is permanent, the earlier rows walk on the next pass, and the part refiles under the next name.
+    """
+    _trip, batch_id, _memo, _picture = await _two_part_batch(world, monkeypatch)
+    await _stale_rows(monkeypatch, batch_id)
+    dest = _last_master_dest()
+    expected = {"one.jpg": JPEG + b"1", "two.jpg": JPEG + b"2"}[dest.name]
+    assert not dest.exists()
+    dest.write_bytes(b"the owner's print")
+    async with async_session() as db:
+        db.add(
+            Attachment(
+                uid=secrets.token_urlsafe(16),
+                filename=dest.name,
+                mime="image/jpeg",
+                size=17,
+                status=AttachmentStatus.ready,
+                **{column: str(dest)},
+            )
+        )
+        await db.commit()
+    unflagged = "SELECT count(*) FROM ingest_moves WHERE flagged_at IS NULL"
+    left = _rows()
+
+    assert await tp._tick(world) == "error"
+    assert dest.read_bytes() == b"the owner's print"
+    assert _flagged() == 1
+    assert tp._sql(unflagged) == [(left - 1,)], "the rest of the chain did not stop at the flag"
+    assert len(_batch_attachments(batch_id)) == 1, "the batch filed on the tick that flagged"
+
+    assert await tp._tick(world) == "ok"
+    assert dest.read_bytes() == b"the owner's print"
+    refiled = dest.with_name(f"{dest.stem} (2){dest.suffix}")
+    assert refiled.read_bytes() == expected
+    assert len(_batch_attachments(batch_id)) == 2
+    assert _rows() == 1 and _flagged() == 1
+    [(batch,)] = tp._sql("SELECT uid FROM ingest_batches WHERE id = :b", {"b": batch_id})
+    assert tp._pluto_batch(batch) == [("acked", True)], "the kept chain wedged the batch"
+    assert await tp._tick(world) == "ok"
+    assert dest.read_bytes() == b"the owner's print" and refiled.read_bytes() == expected
+    assert len(_batch_attachments(batch_id)) == 2
+
+
+async def test_a_row_surviving_a_rollback_leaves_the_part_that_build_refiled(world, monkeypatch):
+    """A row survives, 2.12.0 (which neither reads nor deletes the table) refiles the part under the
+    same name and commits it, and the roll-forward's reconcile finds the row: the file is the
+    committed attachment's, so it stays, the row is flagged, and nothing is filed again."""
+    _trip, batch_id, _memo, _picture = await _two_part_batch(world, monkeypatch)
+    await _stale_rows(monkeypatch, batch_id)
+    dest = _last_master_dest()
+    expected = {"one.jpg": JPEG + b"1", "two.jpg": JPEG + b"2"}[dest.name]
+    async with async_session() as db:
+        survivors = [
+            {c: getattr(r, c) for c in ("id", "batch_id", "src", "dest", "kind")}
+            for r in (await db.execute(select(IngestMove).order_by(IngestMove.id))).scalars()
+        ]
+    async with async_session() as db:
+        await db.execute(text("DELETE FROM ingest_moves"))
+        await db.commit()
+    assert await trip_ingest._file_part(batch_id) is True
+    assert (dest.name, str(dest)) in _batch_attachments(batch_id), "not refiled under that name"
+    async with async_session() as db:
+        db.add_all(IngestMove(**row) for row in survivors)
+        await db.commit()
+
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    assert dest.read_bytes() == expected, "the committed original was taken away"
+    assert _flagged() == 1
+
+    assert await tp._tick(world) == "ok"
+    assert dest.read_bytes() == expected
+    assert len(_batch_attachments(batch_id)) == 2, "a filed part was filed again"
+    assert _rows() == 1 and _flagged() == 1
+    [(batch,)] = tp._sql("SELECT uid FROM ingest_batches WHERE id = :b", {"b": batch_id})
+    assert tp._pluto_batch(batch) == [("acked", True)]
+
+
+async def test_a_committed_dest_stops_the_chain_and_the_next_pass_brings_the_bytes_back(
+    world, tmp_path
+):
+    """The chain matters when the bytes never reached the taken name: they sit one hop back. The
+    flag stops this pass, and only the flagged row is out of the walk from then on."""
+    verified, part, memo = (tmp_path / n for n in ("v", "p", "m"))
+    part.write_bytes(b"the guest's bytes")
+    memo.write_bytes(b"the owner's print")
+    await _journal_row(tmp_path, verified, part, "part")
+    await _journal_row(tmp_path, part, memo, "master")
+    async with async_session() as db:
+        db.add(
+            Attachment(
+                uid=secrets.token_urlsafe(16),
+                filename="m",
+                mime="image/jpeg",
+                size=17,
+                status=AttachmentStatus.ready,
+                storage_path=str(memo),
+            )
+        )
+        await db.commit()
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    assert part.read_bytes() == b"the guest's bytes" and not verified.exists()
+    assert memo.read_bytes() == b"the owner's print"
+    assert (_rows(), _flagged()) == (2, 1)
+    await trip_ingest.reconcile_moves()
+    assert verified.read_bytes() == b"the guest's bytes" and not part.exists()
+    assert memo.read_bytes() == b"the owner's print"
+    assert (_rows(), _flagged()) == (1, 1)
+
+
+async def _owner_attachment(path: str) -> None:
+    async with async_session() as db:
+        db.add(
+            Attachment(
+                uid=secrets.token_urlsafe(16),
+                filename=Path(path).name,
+                mime="image/jpeg",
+                size=17,
+                status=AttachmentStatus.ready,
+                storage_path=path,
+            )
+        )
+        await db.commit()
+
+
+async def test_a_committed_dest_with_no_file_there_still_flags_and_touches_nothing(world, tmp_path):
+    """Boundary: the attachment's file is gone. The name is still somebody else's, so the row does
+    not go quietly, and the bytes at its source stay where they are."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    await _journal_row(tmp_path, src, dest)
+    await _owner_attachment(str(dest))
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    assert src.read_bytes() == b"source" and not dest.exists()
+    assert (_rows(), _flagged()) == (1, 1)
+
+
+async def test_an_attachment_at_a_longer_path_does_not_claim_the_dest(world, tmp_path):
+    """The comparison is exact: a name that merely starts with this dest is another file."""
+    src, dest = tmp_path / "src", tmp_path / "a.jpg"
+    dest.write_bytes(b"bytes")
+    await _journal_row(tmp_path, src, dest)
+    await _owner_attachment(f"{dest}.print")
+    await trip_ingest.reconcile_moves()
+    assert src.read_bytes() == b"bytes" and not dest.exists()
+    assert _rows() == 0
+
+
+async def test_a_failed_drop_keeps_the_rows_and_the_filings_own_error(world, monkeypatch):
+    batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    staged = _verified(batch)
+    real_restore = trip_ingest._restore
+    real_session = trip_ingest.async_session
+
+    def no_session():
+        raise OSError("injected: the database went away")
+
+    def restore_then_lose_the_database(moved, parts):
+        monkeypatch.setattr(trip_ingest, "async_session", no_session)
+        return real_restore(moved, parts)
+
+    monkeypatch.setattr(trip_ingest, "_restore", restore_then_lose_the_database)
+    await _failed_filing(monkeypatch, batch_id)  # still RuntimeError, not the drop's OSError
+    monkeypatch.setattr(trip_ingest, "async_session", real_session)
+    assert _rows() > 0
+    await trip_ingest.reconcile_moves()
+    assert _rows() == 0
+    assert _verified(batch) == staged
+
+
+async def test_the_drop_takes_only_what_this_filing_wrote(world, monkeypatch, tmp_path):
+    """Not by batch: a row of this batch from before the filing, one of another batch and a flagged
+    one all describe something this filing's restore knows nothing about."""
+    _batch, batch_id = await _downloaded(world, monkeypatch, (JPEG + b"1", "a.jpg"))
+    earlier = await trip_ingest._MoveJournal(batch_id).record(
+        str(tmp_path / "s1"), str(tmp_path / "d1"), "master"
+    )
+    other = await _journal_row(tmp_path, tmp_path / "s2", tmp_path / "d2")
+    flagged = await trip_ingest._MoveJournal(batch_id).record(
+        str(tmp_path / "s3"), str(tmp_path / "d3"), "master"
+    )
+    async with async_session() as db:
+        await db.execute(
+            text("UPDATE ingest_moves SET flagged_at = now() WHERE id = :i"), {"i": flagged}
+        )
+        await db.commit()
+    await _failed_filing(monkeypatch, batch_id)
+    assert sorted(r[0] for r in tp._sql("SELECT id FROM ingest_moves")) == sorted(
+        [earlier, other, flagged]
+    )
+
+
+async def test_a_row_dropped_beside_a_walk_does_not_fail_the_reconcile(
+    world, tmp_path, monkeypatch
+):
+    """Two writers: a cancelled tick's shielded drop can outlive the tick and meet the next tick's
+    reconcile on the same row. Both mean the row is finished, so neither may raise."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    dest.write_bytes(b"bytes")
+    row = await _journal_row(tmp_path, src, dest)
+    real_walk = trip_ingest._walk_back_sync
+
+    def walk_beside_a_drop(*args):
+        outcome = real_walk(*args)
+        tp._sql("DELETE FROM ingest_moves WHERE id = :i", {"i": row})
+        assert _rows() == 0
+        return outcome
+
+    monkeypatch.setattr(trip_ingest, "_walk_back_sync", walk_beside_a_drop)
+    await trip_ingest.reconcile_moves()
+    assert src.read_bytes() == b"bytes" and _rows() == 0

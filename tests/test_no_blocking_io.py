@@ -150,6 +150,10 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         # same reason as the memo router's `_restore_moved` — a cancellation may be unwinding.
         # Twice: the rolled-back filing, and the interrupted COMMIT read back as not committed.
         ("app/services/trip_ingest.py", "_file_part", "_restore"): 2,
+        # Worker only: a thread is not held by a native cancellation, so these renames would outlive
+        # the coroutine (and, in reconcile, the batch lock); see the sites.
+        ("app/services/trip_ingest.py", "_file_part", "_replace_sync"): 1,
+        ("app/services/trip_ingest.py", "reconcile_moves", "_walk_back_sync"): 1,
     }
 )
 
