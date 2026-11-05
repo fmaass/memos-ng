@@ -190,6 +190,48 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.13.0
+
+- Quarantined guest uploads can now be marked as seen. `GET /api/trip-ingest/quarantine` lists the
+  batches nobody has resolved yet, plus a count of quarantines naming a pass this server never
+  issued, which have no batch row. `POST /api/trip-ingest/quarantine/{batch_uid}/resolve` marks a
+  batch, and `POST /api/trip-ingest/quarantine/unknown/resolve` with `{"through": <total>}` clears
+  that count up to the total the reader saw, so any that arrived since stay counted. The pass
+  manager shows both, each with a Mark seen button. Resolving files nothing, deletes nothing and
+  sends nothing to the door: the batch stays `quarantined`, a quarantine delivery still owed goes
+  out, and the guest's bytes stay on the door. `guest_batches_quarantined` now counts unresolved
+  batches plus the open count, so an alert on it above zero clears once everything has been seen.
+- The pass manager shows a pass the door has suspended, with an Unsuspend button on the existing
+  `POST /api/passes/{uid}/unsuspend`. After each sync, home reads the door's new
+  `GET /ingest/passes/suspended`, a complete list under home's bearer token, and pass answers carry
+  the result as `doorSuspended` and `doorSuspendedAt`. It is display only and changes no pass state,
+  because the door is not trusted to decide one. A failure there does not stop ingestion. An older
+  door's 404, a malformed answer or more than 500 suspended passes leave the last view in place,
+  and a view older than 15 minutes reads as `doorSuspended: null`, unknown, and shows nothing.
+- Trip filing keeps a crash journal. Each rename's source and destination is committed to the new
+  `ingest_moves` table before the rename happens, and the filing's commit deletes those rows, so a
+  row that survives means that filing never committed. Before this, a kill between placing a file
+  and the commit lost the list of moves and left the bytes orphaned. Each sync now walks surviving
+  rows back, newest first, before it files anything, and it overwrites nothing: when both ends of a
+  move exist and the destination is not that move's own placeholder, the row is flagged, an error
+  is logged and both files stay. A file that will not move back ends the sync before any filing.
+- Deleting a memo takes the trip ledger rows naming it before it takes the memo's own lock, the
+  order a filing uses. A delete beside a running filing could deadlock, and Postgres aborted one of
+  the two with `40P01`.
+- One additive migration, `a13d0e5c7b21`, runs at boot on both databases. It adds the `ingest_moves`
+  table, `ingest_batches.pass_version`, `resolved_at` and `resolved_by`,
+  `trip_ingest_cursor.quarantined_unknown_total` and `quarantined_unknown_cleared`, and
+  `pass_sync_state.door_suspended_at` and `door_suspended_seen_at`. `ck_pass_events_kind` also
+  accepts `unsuspend_requested` and `unsuspended`, which nothing writes yet: lifts keep the form
+  2.12.0 reads, and readers here accept either.
+- Rolling back to 2.12.0 needs `ROLLBACK_MODE=1` on both services and keeps the schema
+  (`RELEASING.md`, "Rollback across a migration"). A resolved batch reads as quarantined again, so
+  `guest_batches_quarantined` counts it and the alert fires again until the roll-forward; its
+  `resolved_at` stays on the row and nothing is lost. The count of quarantines for an unissued pass
+  drops out of that gauge meanwhile, because 2.12.0 reads only batch rows. 2.12.0 ignores
+  `ingest_moves`, so a surviving journal row waits for the next forward deploy, whose first sync
+  walks it back.
+
 ### v2.12.0
 
 - File caps on the guest door. `POST /api/guest/uploads` answers 429 with `Retry-After: 3600`
