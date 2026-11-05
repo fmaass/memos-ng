@@ -1250,9 +1250,7 @@ async def media_event_stream(
         at = hub.event_id(hub.head)
         rows = await snapshot()
         present = {row["uid"] for row in rows}
-        for row in rows:
-            track(row)
-            yield sse_event(row, at)
+        payloads = list(rows)
         finished = sorted(watching - present)
         if finished:
             # The ready event is synthesised from an ABSENCE, so the row that now carries the
@@ -1260,10 +1258,17 @@ async def media_event_stream(
             # client learns only that the status changed and lays a fresh upload out in the
             # fallback box, with no srcset, until something refetches the feed.
             meta = await ready_meta(finished)
-            for uid in finished:
-                payload = {"uid": uid, "status": "ready", "progress_pct": 100, **meta.get(uid, {})}
-                track(payload)
-                yield sse_event(payload, at)
+            payloads += [
+                {"uid": uid, "status": "ready", "progress_pct": 100, **meta.get(uid, {})}
+                for uid in finished
+            ]
+        # The snapshot is resumable only once all of it arrived: every frame before the last
+        # carries an id the hub never replays from, so a client cut off partway — which keeps the
+        # id of the last frame it saw — is sent the snapshot again instead of the frames after
+        # `at`. An id-less frame would not do: the client would keep its previous id instead.
+        for i, payload in enumerate(payloads):
+            track(payload)
+            yield sse_event(payload, at if i == len(payloads) - 1 else hub.unresumable_id)
 
     deadline = None if lifetime is None else asyncio.get_running_loop().time() + lifetime
     try:

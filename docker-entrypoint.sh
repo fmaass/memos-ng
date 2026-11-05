@@ -77,5 +77,9 @@ if [ "$APP_ROLE" != "home" ]; then
     exec uvicorn app.ingest.asgi:app --host "${BIND_HOST:-0.0.0.0}" \
         --port "${BIND_PORT:-8000}" --no-proxy-headers --no-access-log
 fi
+# A response still open when the container stops (an idle /api/events stream never ends on its
+# own) is cancelled after 3 s, so the lifespan shutdown runs and the stop lands well inside
+# docker's grace period instead of at its SIGKILL (MEMNG-1052).
 exec uvicorn app.main:app --host 0.0.0.0 --port 8000 \
-    --proxy-headers --forwarded-allow-ips "$FORWARDED_ALLOW_IPS"
+    --proxy-headers --forwarded-allow-ips "$FORWARDED_ALLOW_IPS" \
+    --timeout-graceful-shutdown 3

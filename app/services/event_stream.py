@@ -43,6 +43,11 @@ RING_SECONDS = 300.0
 # count raises the replay floor exactly as expiry does, and a client below it gets the snapshot.
 RING_MAX = 20_000
 QUEUE_MAX = 512
+# Notifications waiting for the dispatcher while it reads rows back. Past it a notification is
+# dropped and every subscriber is resynced, whose snapshot reads the row the dropped one named.
+INBOX_MAX = 10_000
+# The longest seq an id may carry: nineteen digits hold any int64, and nothing longer is parsed.
+SEQ_DIGITS_MAX = 19
 HEALTH_INTERVAL = 10.0
 HEALTH_TIMEOUT = 5.0
 BACKOFF_INITIAL = 0.5
@@ -202,6 +207,7 @@ class EventHub:
         ring_seconds: float = RING_SECONDS,
         ring_max: int = RING_MAX,
         queue_max: int = QUEUE_MAX,
+        inbox_max: int = INBOX_MAX,
         health_interval: float = HEALTH_INTERVAL,
         backoff_initial: float = BACKOFF_INITIAL,
         backoff_max: float = BACKOFF_MAX,
@@ -220,11 +226,18 @@ class EventHub:
         # same millisecond.
         self.epoch = f"{time.time_ns() // 1_000_000:x}{secrets.token_hex(2)}"
         self._seq = 0
-        # Every frame with seq > _floor is in the ring; an id below it may have missed one.
+        # Every frame with seq > _floor is in the ring; an id below it may have missed one. Eviction
+        # moves it, and only eviction.
         self._floor = 0
+        # An id at or below this may have missed a frame that never reached the ring (a resync:
+        # the listener reconnected, a read-back failed, the inbox overflowed). Monotonic — a later
+        # eviction must not bring an invalidated id back. Seq 0 names no frame and is at or below
+        # it from birth, so `event_id(0)` is the id that always asks for a snapshot.
+        self._invalid = 0
         self._ring: deque[Frame] = deque()
         self._subs: dict[int, set[Subscription]] = {}
-        self._inbox: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._inbox: asyncio.Queue[tuple[str, str]] = asyncio.Queue(inbox_max)
+        self._inbox_overflowed = False
         self._connected = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._conn: Any = None
@@ -241,14 +254,27 @@ class EventHub:
     def event_id(self, seq: int) -> str:
         return f"{self.epoch}.{seq}"
 
+    @property
+    def unresumable_id(self) -> str:
+        """An id of this boot that no replay accepts: the frames of a snapshot before its last
+        carry it, so a client that drops partway through is sent the snapshot again."""
+        return self.event_id(0)
+
     def _replay_from(self, last_event_id: str | None) -> int | None:
         if not last_event_id:
             return None
         epoch, _, seq_text = last_event_id.strip().rpartition(".")
-        if epoch != self.epoch or not seq_text.isdigit():
+        # ASCII digits only: str.isdigit() also says yes to '²' (which int() then refuses) and to
+        # other scripts' digits (which int() reads), and a garbled header must mean "snapshot".
+        if (
+            epoch != self.epoch
+            or not seq_text.isascii()
+            or not seq_text.isdigit()
+            or len(seq_text) > SEQ_DIGITS_MAX
+        ):
             return None
         seq = int(seq_text)
-        if seq < self._floor or seq > self._seq:
+        if seq <= self._invalid or seq < self._floor or seq > self._seq:
             return None
         return seq
 
@@ -257,7 +283,8 @@ class EventHub:
     def subscribe(self, owner_id: int, last_event_id: str | None = None) -> Subscription:
         """Register before anything is read, so a frame published while the caller builds its
         snapshot lands in the queue rather than in the gap. `replay` is None when the caller must
-        send a snapshot instead: no id, another boot's id, or one older than the ring."""
+        send a snapshot instead: no id, another boot's id, one older than the ring, or one a resync
+        invalidated."""
         self._evict()
         sub = Subscription(owner_id, asyncio.Queue(self._queue_max))
         since = self._replay_from(last_event_id)
@@ -297,9 +324,9 @@ class EventHub:
         return frame
 
     def resync_all(self) -> None:
-        # Whatever was lost may have been the only frame of an id a client already holds, so
+        # Whatever was lost may belong after any id a client already holds, the head included, so
         # every id up to now stops being replayable.
-        self._floor = self._seq
+        self._invalid = self._seq
         for owned in list(self._subs.values()):
             for sub in list(owned):
                 self._deliver(sub, RESYNC)
@@ -355,7 +382,15 @@ class EventHub:
                     conn.terminate()
 
     def _on_notify(self, _conn: Any, _pid: int, channel: str, payload: str) -> None:
-        self._inbox.put_nowait((channel, payload))
+        try:
+            self._inbox.put_nowait((channel, payload))
+        except asyncio.QueueFull:
+            # The dispatcher is stuck behind a read-back. Dropping is safe only because the
+            # dispatcher resyncs every subscriber once it next drains the inbox: that is after
+            # this drop, so the snapshot it causes reads the row this notification named.
+            if not self._inbox_overflowed:
+                logger.warning("events_inbox_overflow", inbox_max=self._inbox.maxsize)
+            self._inbox_overflowed = True
 
     async def _listen(self) -> None:
         delay = self._backoff_initial
@@ -398,6 +433,11 @@ class EventHub:
             batch = [await self._inbox.get()]
             while not self._inbox.empty():
                 batch.append(self._inbox.get_nowait())
+            if self._inbox_overflowed:
+                # One resync per overflow episode, not per dropped notification: a drop after this
+                # line needs the inbox full again, so this loop comes back round to it.
+                self._inbox_overflowed = False
+                self.resync_all()
             keys: list[tuple[str, int]] = []
             for channel, raw in batch:
                 if channel != ATTACHMENT_STATUS:
