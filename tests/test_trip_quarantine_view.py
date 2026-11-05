@@ -96,7 +96,7 @@ async def test_resolving_what_is_not_quarantined_is_a_404(world):
 
 async def test_a_batch_the_door_named_unknown_resolves_as_a_batch_not_as_the_counter(world):
     """The uid is door-chosen, and the literal route shadows `{batch_uid}` for this one name, so a
-    bare POST there is the batch; only a `through` is the counter. Unhandled, its alert never ends."""
+    bare POST there is the batch; only a `through` is the counter. Unhandled, its alert stays."""
     owner = await _owner(world)
     uid = await _quarantined(world)
     tp._sql("UPDATE ingest_batches SET uid = 'unknown' WHERE uid = :u", {"u": uid})
