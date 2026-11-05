@@ -57,6 +57,7 @@ from app.ingest import core as ingest_core
 from app.models import (
     PASS_DEVICE_PLATFORMS,
     Attachment,
+    AttachmentRendition,
     IngestBatch,
     IngestBlob,
     IngestMove,
@@ -1091,15 +1092,18 @@ class ReconcileIncomplete(Exception):
 
 
 async def _attachment_names(db: AsyncSession, path: str) -> bool:
-    """Whether a committed attachment stores exactly this path, as the display or the print master.
-    Both columns hold the `str()` of the path `place_master` returned, as a journal row's dest does.
-    Renditions are left out: theirs are uuid names under `print/`, which no filing journals."""
-    found = await db.execute(
-        select(Attachment.id)
-        .where(or_(Attachment.storage_path == path, Attachment.print_path == path))
-        .limit(1)
-    )
-    return found.first() is not None
+    """Whether a committed row stores exactly this path: an attachment's display or print master, or
+    a rendition, which a filing journals and places in the memo folder under its own filename. Each
+    column holds the `str()` of the path `place_master` returned, as a journal row's dest does."""
+    for names in (
+        select(Attachment.id).where(
+            or_(Attachment.storage_path == path, Attachment.print_path == path)
+        ),
+        select(AttachmentRendition.id).where(AttachmentRendition.storage_path == path),
+    ):
+        if (await db.execute(names.limit(1))).first() is not None:
+            return True
+    return False
 
 
 async def reconcile_moves() -> None:

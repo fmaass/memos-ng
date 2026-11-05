@@ -782,3 +782,76 @@ async def test_a_row_dropped_beside_a_walk_does_not_fail_the_reconcile(
     monkeypatch.setattr(trip_ingest, "_walk_back_sync", walk_beside_a_drop)
     await trip_ingest.reconcile_moves()
     assert src.read_bytes() == b"bytes" and _rows() == 0
+
+
+async def test_a_row_surviving_a_rollback_leaves_a_refiled_print_and_its_screen(world, monkeypatch):
+    """The print's row is newer than its screen's, so it walks first: a check that looked only at
+    the attachment columns moved the committed rendition's original away before the screen's row
+    could stop anything, and deleted the rows that could have brought it back."""
+    files = {
+        "one.jpg": JPEG + b"s1",
+        "one - print.jpg": JPEG + b"p1",
+        "two.jpg": JPEG + b"s2",
+        "two - print.jpg": JPEG + b"p2",
+    }
+    monkeypatch.setattr(trip_ingest, "FILE_PART_FILES", 2)
+    trip = await tp._trip(world)
+    token = await tp._guest(world, trip)
+    batch = await tp._send(world, token, *((data, name) for name, data in files.items()))
+    real_file_open = trip_ingest.file_open
+    monkeypatch.setattr(trip_ingest, "file_open", tp._no_filing)
+    assert await tp._tick(world) == "ok"
+    monkeypatch.setattr(trip_ingest, "file_open", real_file_open)
+    [(batch_id,)] = tp._sql("SELECT id FROM ingest_batches WHERE uid = :u", {"u": batch})
+    async with async_session() as db:
+        blobs = list(
+            (await db.execute(select(IngestBlob).where(IngestBlob.batch_id == batch_id))).scalars()
+        )
+    await trip_ingest.download(world.link, batch, blobs, deadline=float("inf"))
+    assert await trip_ingest._file_part(batch_id) is False, "the first pair did not file alone"
+
+    await _stale_rows(monkeypatch, batch_id)
+    async with async_session() as db:
+        survivors = [
+            {c: getattr(r, c) for c in ("id", "batch_id", "src", "dest", "kind")}
+            for r in (await db.execute(select(IngestMove).order_by(IngestMove.id))).scalars()
+        ]
+        await db.execute(text("DELETE FROM ingest_moves"))
+        await db.commit()
+    assert await trip_ingest._file_part(batch_id) is True
+    async with async_session() as db:
+        db.add_all(IngestMove(**row) for row in survivors)
+        await db.commit()
+
+    prints = tp._sql("SELECT filename, storage_path FROM attachment_renditions ORDER BY id")
+    screens = _batch_attachments(batch_id)
+    assert (len(prints), len(screens)) == (2, 2)
+    dests = {row["dest"] for row in survivors}
+    taken = [(name, path) for name, path in [*prints, *screens] if path in dests]
+    assert {Path(path).name for _, path in taken} in (
+        {"one.jpg", "one - print.jpg"},
+        {"two.jpg", "two - print.jpg"},
+    ), "the refile did not take the journaled names, so this proves nothing"
+
+    def all_files_read() -> None:
+        for name, path in [*prints, *screens]:
+            assert Path(path).read_bytes() == files[name], f"{name} was taken away"
+
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    all_files_read()
+    assert _flagged() == 1
+    assert tp._sql("SELECT dest FROM ingest_moves WHERE flagged_at IS NOT NULL")[0][0] in {
+        path for _, path in prints
+    }, "the print's row, the newest, walks first"
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    all_files_read()
+    assert _flagged() == 2
+
+    assert await tp._tick(world) == "ok"
+    all_files_read()
+    assert tp._sql("SELECT count(*) FROM attachment_renditions") == [(2,)]
+    assert len(_batch_attachments(batch_id)) == 2, "a filed part was filed again"
+    assert (_rows(), _flagged()) == (2, 2)
+    assert tp._pluto_batch(batch) == [("acked", True)]

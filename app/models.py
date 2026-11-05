@@ -454,7 +454,9 @@ class AttachmentRendition(Base):
     mime: Mapped[str] = mapped_column(String(255))
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     sha256: Mapped[str | None] = mapped_column(String(64))  # informational only (never file-shared)
-    storage_path: Mapped[str] = mapped_column(String(1024))  # a unique uuid-named file under print/
+    storage_path: Mapped[str] = mapped_column(
+        String(1024)
+    )  # as placed: the memo folder, under its own filename
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

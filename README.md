@@ -214,9 +214,9 @@ All settings come from the environment (or a `.env` file). Key variables — see
   and the commit lost the list of moves and left the bytes orphaned. Each sync now walks surviving
   rows back, newest first, before it files anything, and it overwrites nothing: when both ends of a
   move exist and the destination is not that move's own placeholder, the row is flagged, an error
-  is logged and both files stay. A destination that a committed attachment names is never moved: the
-  row is flagged, and that sync ends before any filing, as it does for a file that will not move
-  back. A filing that fails in process and restores every file deletes its own rows, so a name it
+  is logged and both files stay. A destination that a committed attachment or print rendition names
+  is never moved: the row is flagged, and that sync ends before any filing, as it does for a file
+  that will not move back. A filing that fails in process and restores every file deletes its own rows, so a name it
   gave up is not read as its own later.
 - Deleting a memo takes the trip ledger rows naming it before it takes the memo's own lock, the
   order a filing uses. A delete beside a running filing could deadlock, and Postgres aborted one of
@@ -237,9 +237,9 @@ All settings come from the environment (or a `.env` file). Key variables — see
   `resolved_at` stays on the row and nothing is lost. The count of quarantines for an unissued pass
   drops out of that gauge meanwhile, because 2.12.0 reads only batch rows. 2.12.0 ignores
   `ingest_moves`, so a surviving journal row waits for the next forward deploy, whose first sync
-  walks it back. The exception is a row whose destination a committed attachment now names, which
-  happens when 2.12.0 refiled the part under the same name: that file stays with its attachment, the
-  row is flagged and kept, and each such row ends one sync with an error before filing. Later syncs
+  walks it back. The exception is a row whose destination a committed attachment or print rendition
+  now names, which happens when 2.12.0 refiled the part under the same name: that file stays where
+  it is, the row is flagged and kept, and each such row ends one sync with an error before filing. Later syncs
   walk the batch's other rows and file whatever the batch still owes.
 
 ### v2.12.0
