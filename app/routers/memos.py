@@ -1273,6 +1273,7 @@ async def patch_memo(
     body: MemoPatch,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    background: BackgroundTasks,
 ) -> MemoOut:
     memo = await _require_owned(db, user, uid)
     # Read the ids off the ORM objects BEFORE anything can roll back: a rollback expires every
@@ -1450,6 +1451,11 @@ async def patch_memo(
             await _enqueue_frame_shares_safe(db, edited, user)
             await db.commit()
             committed = True
+            if detached_ids:
+                # A detach can take the memo's last in-flight file off it, and then the memo is
+                # live with no worker completion left to say so (MEMNG-1184). Scheduled only by
+                # the attempt that committed the edit, as on create: a replay committed nothing.
+                _announce_after_response(background, memo_id)
             await _after_commit_seam()
             if consumed:
                 await to_thread.run_sync(_unlink_all, consumed)

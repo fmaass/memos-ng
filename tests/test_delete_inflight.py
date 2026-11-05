@@ -27,6 +27,7 @@ from app.models import User
 from app.routers.assets import delete_attachment
 from app.services import media, printready
 from app.worker import run_once
+from fastapi import BackgroundTasks
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import OperationalError
 
@@ -262,7 +263,8 @@ def test_transcode_outliving_a_delete_publishes_nothing(monkeypatch, tmp_path):
                     user = (await api_db.execute(select(User).where(User.id == owner))).scalar_one()
                     started = time.monotonic()
                     await asyncio.wait_for(
-                        delete_attachment(uid, user, api_db), DELETE_BUDGET_SECONDS
+                        delete_attachment(uid, user, api_db, BackgroundTasks()),
+                        DELETE_BUDGET_SECONDS,
                     )
                     elapsed = time.monotonic() - started
                 transcode_still_running = not job.done()

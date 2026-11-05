@@ -66,7 +66,8 @@ def first_line(content: str) -> str:
 
 async def announce(db: AsyncSession, memo_id: int) -> int:
     """Send the memo-live event to every recipient, reading the memo as it is NOW (its visibility
-    at send time). Returns how many users it was addressed to; 0 when the memo is gone."""
+    at send time, re-read before each household push). Returns how many users it was addressed
+    to; 0 when the memo is gone."""
     memo = await db.get(Memo, memo_id)
     if memo is None:
         return 0
@@ -95,9 +96,27 @@ async def announce(db: AsyncSession, memo_id: int) -> int:
                 )
             ).scalars()
         )
+    sent = 0
     for user_id in recipients:
+        # Re-read before every household push, never only once up front (MEMNG-1184): the owner may
+        # make the memo PRIVATE, or delete it, while this loop is sending, and the edit commits
+        # without waiting for it. Each read is its own statement under READ COMMITTED, so it sees
+        # that commit, and no member pushed after it hears of the memo. Coordinating through the
+        # memo row lock instead would hold the owner's edit behind every push service round-trip.
+        if user_id != memo.owner_id and not await _household_may_see(db, memo_id):
+            continue
         await notify.notify(db, user_id, event)
-    return len(recipients)
+        sent += 1
+    return sent
+
+
+async def _household_may_see(db: AsyncSession, memo_id: int) -> bool:
+    """The memo's visibility as last committed: True while it is PROTECTED or PUBLIC, False once it
+    is PRIVATE or gone."""
+    visibility = (
+        await db.execute(select(Memo.visibility).where(Memo.id == memo_id))
+    ).scalar_one_or_none()
+    return visibility in (Visibility.PROTECTED, Visibility.PUBLIC)
 
 
 async def announce_if_live(session_factory: async_sessionmaker[AsyncSession], memo_id: int) -> bool:

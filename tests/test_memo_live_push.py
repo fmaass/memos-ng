@@ -21,9 +21,10 @@ from app import worker
 from app.config import settings
 from app.database import async_session
 from app.models import JobKind
-from app.services import memo_live
+from app.services import memo_live, notify
 from PIL import Image
 from sqlalchemy import create_engine, text
+from structlog.testing import capture_logs
 
 from tests.conftest import SYNC_URL
 
@@ -423,3 +424,131 @@ def test_the_migration_marks_existing_memos_announced_and_new_ones_not(logged_in
         assert default is None
     finally:
         _sql("DELETE FROM memos WHERE id IN (:a, :b)", {"a": old_id, "b": new_id})
+
+
+# --- MEMNG-1184: memos that go live without a worker completion, and visibility at send time ---
+
+
+def test_a_memo_made_private_mid_delivery_reaches_no_further_household_member(
+    pushes, household, tmp_path, monkeypatch
+):
+    """The owner switches the memo to PRIVATE while its live push is being delivered: the member
+    already pushed keeps theirs, every member after the switch hears nothing of it."""
+    _sql(
+        "UPDATE users SET notify_on_household_posts = true WHERE id = :u",
+        {"u": household.ids["member_off"]},
+    )  # a second opted-in member, delivered to after `member_on` (ascending id)
+    mid, _ = _memo(household.ids["owner"], "PROTECTED")
+    _files(tmp_path, household.ids["owner"], mid, 1)
+
+    def made_private_after_the_first_member(**kw) -> None:
+        pushes(**kw)
+        if kw["subscription_info"]["endpoint"] == household.endpoint("member_on"):
+            # The edit commits between two recipients, exactly as PATCH would commit it.
+            _sql("UPDATE memos SET visibility = 'PRIVATE' WHERE id = :m", {"m": mid})
+
+    monkeypatch.setattr(pywebpush, "webpush", made_private_after_the_first_member)
+
+    asyncio.run(_drain())
+
+    assert pushes.live_per_endpoint(household.prefix) == Counter(
+        {household.endpoint("owner"): 1, household.endpoint("member_on"): 1}
+    )
+
+
+@pytest.fixture
+def member_memo(pushes, logged_in_client, tmp_path):
+    """A PROTECTED memo of the logged-in user with one `ready` file and one still `processing`,
+    not yet announced; and the household that would hear of it. Yields
+    (client, memo uid, ready uid, processing uid, household)."""
+    client, subject = logged_in_client
+    owner = _sql("SELECT id FROM users WHERE subject = :s", {"s": subject})[0][0]
+    h = _Household()
+    mid, muid = _memo(owner, "PROTECTED")
+    ready, busy = _files(tmp_path, owner, mid, 2)
+    _sql("UPDATE attachments SET status = 'ready' WHERE id = :a", {"a": ready})
+    _sql("DELETE FROM media_jobs WHERE attachment_id = :a", {"a": ready})
+    uid = {a: u for a, u in _sql("SELECT id, uid FROM attachments WHERE memo_id = :m", {"m": mid})}
+    try:
+        yield client, muid, uid[ready], uid[busy], h
+    finally:
+        _sql(
+            "DELETE FROM media_jobs WHERE attachment_id IN "
+            "(SELECT id FROM attachments WHERE owner_id = :u)",
+            {"u": owner},
+        )
+        _sql("DELETE FROM attachments WHERE owner_id = :u", {"u": owner})
+        _sql("DELETE FROM memos WHERE owner_id = :u", {"u": owner})
+        h.cleanup()
+
+
+def test_deleting_the_last_in_flight_file_announces_the_memo(pushes, member_memo):
+    client, muid, _, busy, h = member_memo
+    assert pushes.live(h.prefix) == []  # still waiting on the file
+
+    assert client.delete(f"/api/attachments/{busy}").status_code == 204
+
+    assert [(e, p["uid"], p["attachments"]) for e, p in pushes.live(h.prefix)] == [
+        (h.endpoint("member_on"), muid, 1)
+    ]
+
+
+def test_detaching_the_last_in_flight_file_with_patch_announces_the_memo(pushes, member_memo):
+    client, muid, ready, _, h = member_memo
+
+    r = client.patch(f"/api/memos/{muid}", json={"attachment_uids": [ready]})
+
+    assert r.status_code == 200, r.text
+    assert [a["uid"] for a in r.json()["attachments"]] == [ready]
+    assert [(e, p["uid"], p["attachments"]) for e, p in pushes.live(h.prefix)] == [
+        (h.endpoint("member_on"), muid, 1)
+    ]
+
+
+def test_deleting_one_of_two_in_flight_files_announces_nothing_until_the_last(
+    pushes, member_memo, tmp_path
+):
+    client, muid, _, busy, h = member_memo
+    [(mid, owner)] = _sql("SELECT id, owner_id FROM memos WHERE uid = :u", {"u": muid})
+    [other] = _files(tmp_path, owner, mid, 1)
+    [(other_uid,)] = _sql("SELECT uid FROM attachments WHERE id = :a", {"a": other})
+
+    assert client.delete(f"/api/attachments/{busy}").status_code == 204
+    assert pushes.live(h.prefix) == []  # one file is still in flight
+
+    assert client.delete(f"/api/attachments/{other_uid}").status_code == 204
+    assert len(pushes.live(h.prefix)) == 1
+
+
+def test_a_failing_announcement_never_fails_the_delete(pushes, member_memo, monkeypatch):
+    client, muid, _, busy, _h = member_memo
+
+    async def down(db, user_id, event) -> None:
+        raise RuntimeError("push backend down")
+
+    monkeypatch.setattr(notify, "CONSUMERS", [down])
+
+    with capture_logs() as logs:
+        assert client.delete(f"/api/attachments/{busy}").status_code == 204
+    assert _sql("SELECT 1 FROM attachments WHERE uid = :u", {"u": busy}) == []
+    # Best-effort, not silent: the lost push is on the record.
+    assert [e["error"] for e in logs if e["event"] == "memo_live_notify_failed"] == [
+        "push backend down"
+    ]
+
+
+def test_an_edit_that_detaches_nothing_schedules_no_announcement(pushes, member_memo, monkeypatch):
+    client, muid, ready, busy, _h = member_memo
+    scheduled: list[int] = []
+
+    async def spy(session_factory, memo_id: int) -> None:
+        scheduled.append(memo_id)
+
+    monkeypatch.setattr(memo_live, "announce_safely", spy)
+
+    r = client.patch(f"/api/memos/{muid}", json={"content": "Beach day, edited"})
+    assert r.status_code == 200, r.text
+    r = client.patch(f"/api/memos/{muid}", json={"attachment_uids": [ready, busy]})
+    assert r.status_code == 200, r.text
+
+    assert scheduled == []

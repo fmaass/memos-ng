@@ -12,7 +12,15 @@ from typing import Annotated, Any, Literal
 from zoneinfo import available_timezones
 
 from anyio import to_thread
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -37,6 +45,7 @@ from app.services import (
     asset_urls,
     camera,
     event_stream,
+    memo_live,
     poster,
     printready,
     reclaim,
@@ -1050,6 +1059,7 @@ async def delete_attachment(
     uid: str,
     user: Annotated[User, Depends(auth.require_user)],
     db: Annotated[AsyncSession, Depends(get_session)],
+    background: BackgroundTasks,
 ) -> None:
     """Delete an attachment — OWNER-only (a mutation, unlike viewing). Removes its media jobs,
     DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
@@ -1070,6 +1080,7 @@ async def delete_attachment(
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
     if att is None or att.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Attachment not found")
+    memo_id = att.memo_id  # read now: the reclaim below ends with the row gone
     # One seam for every attachment deletion (app/services/reclaim.py): jobs, then the row locked
     # and revalidated, then its files, then the row — all in one transaction. This route used to
     # delete the row, commit, and unlink afterwards, so a crash in that gap left files that no row
@@ -1102,6 +1113,12 @@ async def delete_attachment(
         raise HTTPException(
             status_code=500, detail="Could not remove this attachment's files; nothing was deleted"
         )
+    if memo_id is not None:
+        # The delete is committed (the reclaim ran its own transaction). If this file was the last
+        # one of its memo still in flight, the memo is live now and no worker completion will ever
+        # say so (MEMNG-1184): the same after-response claim the create route schedules — a no-op
+        # for a memo still waiting on another file, or one announced long ago.
+        background.add_task(memo_live.announce_safely, async_session, memo_id)
 
 
 def _save_print_sync(part_dir: Path, uid: str, staged: Path, suffix: str) -> str:
