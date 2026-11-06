@@ -5730,7 +5730,7 @@
     },
     "/api/attachments/{uid}": {
       "delete": {
-        "description": "Delete an attachment \u2014 OWNER-only (a mutation, unlike viewing). Removes its media jobs,\nDB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the\nmemo keeps its text; only the media is removed.",
+        "description": "Delete an attachment \u2014 its OWNER's, or any member's when it is on a guest memo (a mutation,\nunlike viewing). Removes its media jobs,\nDB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the\nmemo keeps its text; only the media is removed.",
         "operationId": "delete_attachment_api_attachments__uid__delete",
         "parameters": [
           {

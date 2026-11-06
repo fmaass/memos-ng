@@ -257,8 +257,11 @@ def _password_column(db_engine) -> list[tuple]:
     with db_engine.connect() as c:
         return c.execute(
             text(
+                # This schema's table only: the trip-ingest suites keep a `pluto` copy of every
+                # table for the whole session, and which of them ran first is file order.
                 "SELECT is_nullable, column_default FROM information_schema.columns "
-                "WHERE table_name='users' AND column_name='password_hash'"
+                "WHERE table_schema = current_schema() AND table_name='users' "
+                "AND column_name='password_hash'"
             )
         ).all()
 

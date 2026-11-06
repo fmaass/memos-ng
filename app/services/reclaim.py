@@ -66,7 +66,7 @@ happen to exist is the other half of it — a path that is empty now may not be 
 import asyncio
 import enum
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -110,6 +110,11 @@ _LEAKED_PATH = re.compile(LEAKED_PATH_RE)
 # `created_at` — the instant finalize inserted it (a twin-built row does not copy its twin's).
 NEVER_LINKED_COUNT_AFTER = timedelta(hours=24)
 NEVER_LINKED_RECLAIM_AFTER = timedelta(hours=72)
+
+
+# A caller's own premise for selecting the row, re-asked under its lock on the reclaim's session —
+# for what `Revalidate` cannot know, such as WHO asked (the attachment route's member rule).
+type Premise = Callable[[AsyncSession, Attachment], Awaitable[bool]]
 
 
 class Revalidate(enum.StrEnum):
@@ -475,6 +480,7 @@ async def reclaim_attachment(
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
     created_before: datetime | None = None,
+    premise: Premise | None = None,
 ) -> ReclaimResult:
     """Reclaim ONE attachment in its own transaction, in the order this module documents.
 
@@ -535,6 +541,10 @@ async def reclaim_attachment(
         and not await _still_never_linked(db, att.id, created_before)
     ):
         ineligible = "left_the_never_linked_predicate"
+    if ineligible is None and premise is not None and not await premise(db, att):
+        # The caller's own authorisation, asked again of the row as it stands under the lock: a
+        # member let in through a guest memo has no claim on a picture that left it (MEMNG-1264).
+        ineligible = "premise_withdrawn"
     if ineligible is not None:
         uid = att.uid  # read BEFORE the rollback: it expires every instance, and reading an
         # expired column would try to refresh it — blocking IO from a place the async session
@@ -626,6 +636,7 @@ async def reclaim_row(
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
     created_before: datetime | None = None,
+    premise: Premise | None = None,
 ) -> ReclaimResult:
     """ONE row's reclaim, session and all, as one inseparable unit — what every caller runs.
 
@@ -643,6 +654,7 @@ async def reclaim_row(
             detached_at=detached_at,
             detached_before=detached_before,
             created_before=created_before,
+            premise=premise,
         )
 
 
@@ -654,6 +666,7 @@ async def reclaim_row_shielded(
     detached_at: datetime | None = None,
     detached_before: datetime | None = None,
     created_before: datetime | None = None,
+    premise: Premise | None = None,
 ) -> ReclaimResult:
     """`reclaim_row` as a TASK of its own, awaited through a shield — how every caller calls it.
 
@@ -685,6 +698,7 @@ async def reclaim_row_shielded(
             detached_at=detached_at,
             detached_before=detached_before,
             created_before=created_before,
+            premise=premise,
         )
     )
     _pending.add(task)

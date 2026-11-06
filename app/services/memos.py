@@ -113,6 +113,16 @@ async def guest_flag(db: AsyncSession, memo: Memo) -> dict | None:
     return {"contributor_name": row[1], "pass_uid": row[0]}
 
 
+def may_edit(memo: Memo, user: User) -> bool:
+    """Whether `user` may edit or delete `memo`, or take a picture off it (MEMNG-1264). A member
+    memo is its owner's alone. A guest memo (`pass_id` set) is the household's: the pass issuer
+    owns it only because a guest has no account here, so ownership must not lock the rest of the
+    household out of moderating it. Adding to a guest memo is a separate refusal, for everyone
+    (`routers.memos._refuse_guest_additions`). Once the pass record is gone `pass_id` is SET NULL
+    and the memo reads, and is guarded, as a plain member memo."""
+    return memo.owner_id == user.id or memo.pass_id is not None
+
+
 def visible_clause(user: User):
     """A memo is visible to `user` if they own it OR it is not PRIVATE."""
     return or_(Memo.owner_id == user.id, Memo.visibility != Visibility.PRIVATE)

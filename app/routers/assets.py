@@ -69,7 +69,7 @@ from app.services.attachments import (
     parse_bucket_key,
 )
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
-from app.services.memos import visible_clause
+from app.services.memos import may_edit, visible_clause
 
 router = APIRouter(prefix="/api", tags=["assets"])
 
@@ -1058,6 +1058,20 @@ async def remove_picture_tag(
     await db.commit()
 
 
+async def _may_delete_attachment(db: AsyncSession, att: Attachment, user: User) -> bool:
+    """The owner always; anyone else only through the memo the picture is on, by the memo edit rule
+    (`services.memos.may_edit`, MEMNG-1264) — a guest memo's pictures are the household's to
+    remove. A memo the caller cannot see answers as if the picture were not there."""
+    if att.owner_id == user.id:
+        return True
+    if att.memo_id is None:
+        return False
+    memo = (
+        await db.execute(select(Memo).where(Memo.id == att.memo_id, visible_clause(user)))
+    ).scalar_one_or_none()
+    return memo is not None and may_edit(memo, user)
+
+
 @router.delete("/attachments/{uid}", status_code=204)
 async def delete_attachment(
     uid: str,
@@ -1065,7 +1079,8 @@ async def delete_attachment(
     db: Annotated[AsyncSession, Depends(get_session)],
     background: BackgroundTasks,
 ) -> None:
-    """Delete an attachment — OWNER-only (a mutation, unlike viewing). Removes its media jobs,
+    """Delete an attachment — its OWNER's, or any member's when it is on a guest memo (a mutation,
+    unlike viewing). Removes its media jobs,
     DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
     memo keeps its text; only the media is removed."""
     # (Kept out of the docstring, which FastAPI publishes as this endpoint's OpenAPI description.)
@@ -1082,7 +1097,7 @@ async def delete_attachment(
     # in-flight row belongs to its worker, which discards job and partial output on finding the
     # attachment gone (media.AttachmentGone → worker.run_once).
     att = (await db.execute(select(Attachment).where(Attachment.uid == uid))).scalar_one_or_none()
-    if att is None or att.owner_id != user.id:
+    if att is None or not await _may_delete_attachment(db, att, user):
         raise HTTPException(status_code=404, detail="Attachment not found")
     # One seam for every attachment deletion (app/services/reclaim.py): jobs, then the row locked
     # and revalidated, then its files, then the row — all in one transaction. This route used to
@@ -1106,8 +1121,16 @@ async def delete_attachment(
     # the reclaim it leaves behind is registered where a shutdown can still await it
     # (`reclaim.drain_pending_reclaims`), which a reclaim awaited on this request's session would
     # not be once the request is gone.
-    result = await reclaim.reclaim_row_shielded(att.id, reclaim.Revalidate.IDENTITY)
-    if result.outcome == "vanished":  # a concurrent delete won between the read above and the lock
+    # The member rule is asked again under the row lock: the picture may have left the guest memo
+    # that let this caller in between the check above and the lock (MEMNG-1264).
+    result = await reclaim.reclaim_row_shielded(
+        att.id,
+        reclaim.Revalidate.IDENTITY,
+        premise=lambda session, locked: _may_delete_attachment(session, locked, user),
+    )
+    if result.outcome in ("vanished", "skipped_ineligible"):
+        # Vanished: a concurrent delete won between the read above and the lock. Ineligible: the
+        # premise above no longer holds for this caller — the same answer the check gives.
         raise HTTPException(status_code=404, detail="Attachment not found")
     if result.outcome == "failed_unlink":
         # The row was KEPT on purpose (app/services/reclaim.py): its files are still on disk and it

@@ -1507,6 +1507,9 @@ async def _file_part(batch_id: int) -> bool | None:
                         device=device,
                         finalize=finalize,
                         moved_out=moved,
+                        # What each browser said about its file: the date of a batch whose files
+                        # state none (MEMNG-1262).
+                        client_mtimes=[b.last_modified for b in upload_for.values()],
                     )
                 by_uid = {a.uid: a for a in memo.attachments}
                 now = datetime.now(UTC)

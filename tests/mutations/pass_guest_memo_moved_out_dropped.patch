@@ -2,7 +2,7 @@ diff --git a/app/services/passes.py b/app/services/passes.py
 --- a/app/services/passes.py
 +++ b/app/services/passes.py
 @@ -623,7 +623,6 @@
-         finalize=finalize,
+         finalize=dated,
          # The final placement into the memo folder is a move like finalize's own, and a filing
          # that rolls back has to be able to walk it back too.
 -        moved_out=moved_out,

@@ -10,4 +10,4 @@ index 83888c3..b5c1949 100644
 +        content=f"{content} {caption or ''} {contributor_name or ''}",
          visibility=Visibility.PROTECTED,
          idempotency_key=idempotency_key,
-         finalize=finalize,
+         finalize=dated,

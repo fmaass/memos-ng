@@ -626,6 +626,27 @@ def _credit(attachments: Iterable[Attachment], name: str | None, device: PassDev
         att.contributed_by_device_id = device.id if device is not None else None
 
 
+async def _capture_date(
+    db: AsyncSession, attachment_uids: Sequence[str], client_mtimes: Sequence[datetime]
+) -> datetime | None:
+    """When a guest batch was taken: the earliest instant its files state; else the earliest client
+    mtime the batch carried; else None, which leaves the memo the filing's own now(). The mtimes
+    come from the caller because an attachment keeps none: its `captured_at` already folded the
+    mtime and the filing time into one value, and a `min()` over it would let the filing time of
+    an undated file outrank an mtime that lies after it."""
+    if attachment_uids:
+        stated = (
+            await db.execute(
+                select(func.min(Attachment.capture_instant)).where(
+                    Attachment.uid.in_(attachment_uids)
+                )
+            )
+        ).scalar_one_or_none()
+        if stated is not None:
+            return stated
+    return min(client_mtimes) if client_mtimes else None
+
+
 async def create_guest_memo(
     db: AsyncSession,
     p: Pass,
@@ -636,6 +657,7 @@ async def create_guest_memo(
     device: PassDevice | None = None,
     finalize: Callable[[Memo], Awaitable[Sequence[str]]] | None = None,
     moved_out: list[storage.TrackedMove] | None = None,
+    client_mtimes: Sequence[datetime | None] = (),
 ) -> Memo:
     """The ONE place a guest batch becomes a home memo. Owner, visibility, tag and destination
     come from the pass's home rows only: the issuer owns it, it is PROTECTED, and its `content` is
@@ -650,13 +672,26 @@ async def create_guest_memo(
     owner = await db.get(User, p.created_by) if p.created_by is not None else None
     if owner is None:
         raise PassGone(p.uid)
+
+    async def dated(memo: Memo) -> Sequence[str]:
+        """The batch's own finalize, then the memo dated by what it made (MEMNG-1262). Here and
+        not after `create_memo`: the attachments exist only once finalize ran, and
+        `link_attachments`, which runs next, names the memo's folder from `memo.created_at` once
+        and for good — a later UPDATE would leave the folder telling another date."""
+        made = list(await finalize(memo)) if finalize is not None else []
+        taken = await _capture_date(db, made, [m for m in client_mtimes if m is not None])
+        if taken is not None:
+            memo.created_at = taken
+            await db.flush()
+        return made
+
     memo = await memos_svc.create_memo(
         db,
         owner,
         content=content,
         visibility=Visibility.PROTECTED,
         idempotency_key=idempotency_key,
-        finalize=finalize,
+        finalize=dated,
         # The final placement into the memo folder is a move like finalize's own, and a filing
         # that rolls back has to be able to walk it back too.
         moved_out=moved_out,

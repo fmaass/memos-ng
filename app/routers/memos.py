@@ -1103,6 +1103,42 @@ async def _require_owned(db: AsyncSession, user: User, uid: str) -> Memo:
     return memo
 
 
+def _require_editable(memo: Memo, user: User) -> None:
+    """The one edit rule (`services.memos.may_edit`), as the answer the memo routes give."""
+    if not svc.may_edit(memo, user):
+        raise HTTPException(status_code=403, detail="Not your memo")
+
+
+async def _refuse_guest_additions(
+    db: AsyncSession,
+    memo: Memo,
+    upload_uids: Sequence[str] | None,
+    attachment_uids: Sequence[str] | None,
+) -> None:
+    """A guest memo takes nothing new (MEMNG-1264): no upload, and no list naming a picture it
+    does not already carry. Asked of the LOCKED row, before the edit key or any byte: a refused
+    edit records nothing and moves nothing.
+
+    Answered like the 403 beside it, with a plain detail and outside PATCH_RESPONSES: a third
+    member of the documented 409 union is a shape the vendored iOS client cannot decode
+    (tests/test_ios_client_contract.py), and no app offers an Add on a guest memo to earn it."""
+    if memo.pass_id is None:
+        return
+    adds = bool(upload_uids)
+    if not adds and attachment_uids:
+        carried = set(
+            (await db.execute(select(Attachment.uid).where(Attachment.memo_id == memo.id)))
+            .scalars()
+            .all()
+        )
+        adds = not set(attachment_uids) <= carried
+    if adds:
+        raise HTTPException(
+            status_code=409,
+            detail="A guest memo takes no new pictures; remove pictures or delete the memo",
+        )
+
+
 @router.get("/memos/{uid}", response_model=MemoOut)
 async def get_memo(
     uid: str,
@@ -1112,17 +1148,23 @@ async def get_memo(
     return await _render(await _require_owned(db, user, uid), user.id)
 
 
-def _replayed_or_conflict(found: Memo, memo_id: int, key: str) -> Memo:
-    """The memo a known `edit_key` names — provided it is the memo this request addressed."""
+def _replayed_or_conflict(found: Memo, memo_id: int, key: str, viewer_id: int) -> Memo:
+    """The memo a known `edit_key` names — provided it is the memo this request addressed.
+
+    The key lives in the memo OWNER's namespace, and a member editing a guest memo writes into the
+    issuer's (MEMNG-1264): the clash is still refused, but a memo the caller could not read
+    (`services.memos.get_memo`'s rule) is not named — the conflict carries no uid instead."""
     if found.id == memo_id:
         return found
+    visible = found.owner_id == viewer_id or found.visibility != Visibility.PRIVATE
+    where = f"memo {found.uid}" if visible else "another memo"
     raise HTTPException(
         status_code=409,
         detail=EditKeyConflictDetail(
             code="edit_key_conflict",
-            memo_uid=found.uid,
+            memo_uid=found.uid if visible else "",
             message=(
-                f"edit_key {key} was already used on memo {found.uid}. An edit key names one edit "
+                f"edit_key {key} was already used on {where}. An edit key names one edit "
                 "of one memo — use a fresh key for this one."
             ),
         ).model_dump(),
@@ -1322,12 +1364,14 @@ async def patch_memo(
     background: BackgroundTasks,
 ) -> MemoOut:
     memo = await _require_owned(db, user, uid)
+    _require_editable(memo, user)
     # Read the ids off the ORM objects BEFORE anything can roll back: a rollback expires every
     # object in the session, and a later `user.id` / `memo.id` would lazy-refresh — sync IO in an
     # async context, i.e. a MissingGreenlet rather than a working attribute read (MEMNG-110).
-    owner_id, memo_id = user.id, memo.id
-    if memo.owner_id != owner_id:
-        raise HTTPException(status_code=403, detail="Not your memo")
+    # `owner_id` is the MEMO's owner: the scope its pictures, uploads and edit keys live in. It is
+    # the caller for a member memo (`_require_editable`) and the pass issuer for a guest memo any
+    # member may edit; `viewer_id` is who the answer is rendered for.
+    owner_id, memo_id, viewer_id = memo.owner_id, memo.id, user.id
     key = body.edit_key
     if key is not None:
         # The replay lookup comes FIRST — ahead of the uploads (MEMNG-124 before MEMNG-113). By the
@@ -1336,7 +1380,9 @@ async def patch_memo(
         # protect, and the edit it is asking about is already applied, media included.
         replayed = await svc.get_memo_by_edit_key(db, owner_id, key)
         if replayed is not None:
-            return await _render(_replayed_or_conflict(replayed, memo_id, key), owner_id)
+            return await _render(
+                _replayed_or_conflict(replayed, memo_id, key, viewer_id), viewer_id
+            )
 
     async def attempt() -> Memo:
         """One whole edit, from recording the key to commit. Owns its own `moved` list: if the write
@@ -1377,6 +1423,10 @@ async def patch_memo(
                 # memo that is not there. `_apply_or_replay` catches IntegrityError alone, so it
                 # travels out untouched.
                 raise HTTPException(status_code=404, detail="Memo not found")
+            # Judged again on the row the lock re-read: its pass may have gone meanwhile (SET
+            # NULL), and with it the household's right to edit it.
+            _require_editable(locked, user)
+            await _refuse_guest_additions(db, locked, body.upload_uids, body.attachment_uids)
             if key is not None:
                 # Recorded BEFORE any work: the loser of a same-key race blocks on the unique
                 # constraint and fails here, having moved no bytes — so it has none to move back.
@@ -1561,11 +1611,11 @@ async def patch_memo(
     if key is None:
         # No key, no dedupe and no recovery: an IntegrityError here is a real fault, exactly as
         # before this feature existed.
-        return await _render(await attempt(), owner_id)
+        return await _render(await attempt(), viewer_id)
 
     async def read_back() -> Memo | None:
         found = await svc.get_memo_by_edit_key(db, owner_id, key)
-        return None if found is None else _replayed_or_conflict(found, memo_id, key)
+        return None if found is None else _replayed_or_conflict(found, memo_id, key, viewer_id)
 
     # tries=1: unlike a create, a collision this read-back cannot resolve is NOT retryable here. The
     # only way the key frees itself is the memo being deleted (the record cascades with it), and a
@@ -1588,7 +1638,7 @@ async def patch_memo(
             ).model_dump(),
         ),
     )
-    return await _render(settled, owner_id)
+    return await _render(settled, viewer_id)
 
 
 @router.delete("/memos/{uid}", status_code=204, responses=MEMO_NOT_FOUND_RESPONSE)
@@ -1598,8 +1648,7 @@ async def delete_memo(
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> None:
     memo = await _require_owned(db, user, uid)
-    if memo.owner_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your memo")
+    _require_editable(memo, user)
     # M FIRST, before this transaction touches anything else (MEMNG-267 R6). The ORM delete below
     # emits `UPDATE attachments SET memo_id=NULL` and only then `DELETE FROM memos`, so left to
     # itself this request takes the attachment rows before the memo row — the protocol's order
@@ -1615,6 +1664,7 @@ async def delete_memo(
         # there is no row left to delete and no attachment left to reclaim, and saying so is
         # honest where a 204 would report work this request did not do (R6a).
         raise HTTPException(status_code=404, detail="Memo not found")
+    _require_editable(locked, user)  # on the re-read row, as the edit route judges it
     # PHASE 1: the memo goes and its attachments are left ORPHANED, on purpose. Deleting their rows
     # here would put this request one crash away from files that no row names any more; an orphan
     # row is the durable journal that survives the crash and is reconcilable afterwards
