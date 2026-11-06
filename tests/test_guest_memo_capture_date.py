@@ -26,7 +26,8 @@ world = tp.world
 DATETIME_ORIGINAL = 0x9003
 OFFSET_TIME_ORIGINAL = 0x9011
 
-LATER = datetime(2031, 3, 4, 17, 45, 10, tzinfo=UTC)
+# One day, so the batch is one memo: a batch over several days is one memo PER day (MEMNG-1266).
+LATER = datetime(2031, 3, 2, 17, 45, 10, tzinfo=UTC)
 EARLIER = datetime(2031, 3, 2, 8, 15, 30, tzinfo=UTC)
 
 
@@ -86,10 +87,10 @@ async def test_a_guest_memo_takes_the_earliest_exif_capture_and_its_folder_says_
     created_at, uid, paths = await _file(
         world,
         # The LATER picture first: the order of the batch does not decide. And a picture whose
-        # file states no instant, with a browser mtime a month earlier still: a client mtime is
+        # file states no instant, with a browser mtime hours earlier still: a client mtime is
         # the fallback for a batch that states nothing, never a vote against one that does.
         (_exif_jpeg(LATER, (10, 20, 30)), "late.jpg", None),
-        (JPEG, "forwarded.jpg", _ms(EARLIER - timedelta(days=30))),
+        (JPEG, "forwarded.jpg", _ms(EARLIER - timedelta(hours=7))),
         (_exif_jpeg(EARLIER, (200, 100, 50)), "early.jpg", None),
     )
     assert created_at == EARLIER
@@ -101,7 +102,7 @@ async def test_with_no_exif_the_earliest_client_mtime_dates_the_memo(world):
     first = datetime(2031, 5, 6, 7, 8, 9, tzinfo=UTC)
     created_at, uid, paths = await _file(
         world,
-        (JPEG, "a.jpg", _ms(first + timedelta(days=2))),
+        (JPEG, "a.jpg", _ms(first + timedelta(hours=2))),
         (JPEG + b"\x00", "b.jpg", _ms(first)),
     )
     assert created_at == first
@@ -110,17 +111,37 @@ async def test_with_no_exif_the_earliest_client_mtime_dates_the_memo(world):
 
 async def test_a_client_mtime_outranks_the_filing_time_even_when_it_is_later(world):
     """One file with no date at all and one whose browser mtime lies AFTER the filing: the mtime is
-    still what a client said about its file, and the filing time is only for a batch that said
+    still what a client said about its file, and the filing time is only for files that said
     nothing. A `min()` over captured_at would pick the filing time here."""
     ahead = datetime.now(UTC) + timedelta(days=40)
     ahead = ahead.replace(microsecond=0)
-    created_at, uid, paths = await _file(
-        world,
-        (JPEG, "undated.jpg", None),
-        (JPEG + b"\x00", "ahead.jpg", _ms(ahead)),
+    trip = await tp._trip(world)
+    token = await tp._guest(world, trip)
+    undated = await upload(world.door, token, JPEG, "undated.jpg")
+    later = await upload(world.door, token, JPEG + b"\x00", "ahead.jpg", last_modified=_ms(ahead))
+    before = datetime.now(UTC)
+    r = await complete(world.door, token, [undated, later])
+    assert r.status_code in (200, 201), r.text
+    assert await tp._tick(world) == "ok"
+    after = datetime.now(UTC)
+    # Two memos, not one: a batch is filed one memo per capture day (MEMNG-1266), and the undated
+    # file lands on the day home recorded the batch while the other lands on its mtime's day, so
+    # the claim is held per memo: the mtime dates its own memo, the filing time only the memo
+    # whose file said nothing.
+    rows = tp._sql(
+        "SELECT m.id, m.created_at, m.uid, a.filename, a.storage_path FROM memos m "
+        "JOIN attachments a ON a.memo_id = m.id ORDER BY m.created_at"
     )
-    assert created_at == ahead
-    _in_folder_of(world, created_at, uid, paths)
+    assert [name for *_, name, _ in rows] == ["undated.jpg", "ahead.jpg"]
+    by_name = {
+        name: (created.astimezone(UTC), uid, Path(path)) for _, created, uid, name, path in rows
+    }
+    filed_at, filed_uid, filed_path = by_name["undated.jpg"]
+    assert before <= filed_at <= after
+    _in_folder_of(world, filed_at, filed_uid, [filed_path])
+    dated_at, dated_uid, dated_path = by_name["ahead.jpg"]
+    assert dated_at == ahead
+    _in_folder_of(world, dated_at, dated_uid, [dated_path])
 
 
 async def test_with_no_exif_and_no_mtime_the_memo_is_dated_now(world):

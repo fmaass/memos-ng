@@ -38,10 +38,11 @@ import shutil
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeGuard
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -59,14 +60,17 @@ from app.models import (
     Attachment,
     AttachmentRendition,
     IngestBatch,
+    IngestBatchMemo,
     IngestBlob,
     IngestMove,
+    Memo,
     Pass,
     PassDevice,
     PassEvent,
     PassSyncState,
     TripIngestCursor,
 )
+from app.services import memos as memos_svc
 from app.services import passes as passes_svc
 from app.services import storage, variants
 from app.services import uploads as uploads_svc
@@ -164,6 +168,64 @@ def idempotency_key(batch_uid: str) -> str:
     namespaced, so no member's client key can collide with it."""
     digest = base64.urlsafe_b64encode(hashlib.sha256(batch_uid.encode()).digest()).rstrip(b"=")
     return f"trip:{digest.decode()}"
+
+
+def day_key(batch_uid: str, day: date) -> str:
+    """The key of a batch's memo for one capture day (MEMNG-1266): while that memo lives, a retried
+    or racing part of the same day is refused by the memo key instead of filing a second one."""
+    return idempotency_key(f"{batch_uid}/{day.isoformat()}")
+
+
+# The zone a trip's days are counted in, shared with the memo date (`passes.trip_zone`).
+trip_zone = passes_svc.trip_zone
+
+
+def capture_day(
+    civil: str | None,
+    instant: datetime | None,
+    client_mtime: datetime | None,
+    zone: ZoneInfo,
+    recorded: datetime,
+) -> date:
+    """The day a guest file was taken, which decides the memo it is filed into (MEMNG-1266). The
+    camera's wall clock as written, when the file states one with no offset: that is the day as
+    the photographer lived it, whatever zone the trip says. Else the first moment there is — the
+    capture instant, the client mtime, the instant home recorded the batch — counted in the trip's
+    zone. So every file lands on a day, and a file stating nothing lands on its batch's day."""
+    if civil:
+        try:
+            return datetime.fromisoformat(civil).date()
+        except ValueError:
+            pass
+    moment = next(m for m in (instant, client_mtime, recorded) if m is not None)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    try:
+        return moment.astimezone(zone).date()
+    except OverflowError:  # a moment at the end of year 9999, moved east of UTC
+        return moment.astimezone(UTC).date()
+
+
+def split_by_day(files: Sequence[tuple[str, str, date]]) -> list[tuple[date, list[str]]]:
+    """(upload uid, filename, day) into the days of a filing part, earliest first, each with its
+    uids in the order given. Every screen keeps its own day: two screens of one name are two
+    pictures (two `IMG_0001.jpg`, Safari's `image.jpg`). A print is bound to a screen of its base
+    name inside one finalize (`uploads.finalize_pending`, keyed on the exact base), so it files on
+    its screen's day; with several screens of that name, on the earliest of their days, where
+    finalize still finds one to bind to. Prints with no screen in the part keep together on their
+    earliest day."""
+    screen_days: dict[str, list[date]] = {}
+    print_days: dict[str, list[date]] = {}
+    for _, name, day in files:
+        parsed = variants.parse_variant(name)
+        (print_days if parsed.is_print else screen_days).setdefault(parsed.base, []).append(day)
+    days: dict[date, list[str]] = {}
+    for uid, name, day in files:
+        parsed = variants.parse_variant(name)
+        if parsed.is_print:
+            day = min(screen_days.get(parsed.base) or print_days[parsed.base])
+        days.setdefault(day, []).append(uid)
+    return sorted(days.items())
 
 
 def staging_dir(batch_uid: str) -> Path:
@@ -1362,6 +1424,27 @@ def _filing_parts(blobs: Sequence[IngestBlob]) -> list[list[IngestBlob]]:
     return parts
 
 
+async def _hold_day_memos(db: AsyncSession, memo_ids: Sequence[int | None]) -> None:
+    """A part spanning several days takes every earlier day memo it may append to, and their
+    attachments, ascending, before its first day is filed: each day ends by writing album members
+    (C) and the pass link (P), so a second day that only then asked for its memo (M) or that memo's
+    attachments (A) would be asking for them while holding C and P (docs/LOCK-ORDER.md, H < M < U <
+    A < C < P). With them held up front, every later day takes only rows it already holds or rows
+    no other transaction can see."""
+    ids = sorted({m for m in memo_ids if m is not None})
+    for memo_id in ids:
+        memo = await db.get(Memo, memo_id)
+        if memo is not None:
+            await memos_svc.lock_memo_for_write(db, memo)
+    if ids:
+        await db.execute(
+            select(Attachment.id)
+            .where(Attachment.memo_id.in_(ids))
+            .order_by(Attachment.id)
+            .with_for_update()
+        )
+
+
 async def _file_part(batch_id: int) -> bool | None:
     """File the next part of a downloaded batch into its guest memo (the first part makes it,
     every later part is appended to it), in one transaction with the ledger marks that say it is
@@ -1373,6 +1456,7 @@ async def _file_part(batch_id: int) -> bool | None:
     parts: list[tuple[Path, Path]] = []
     consumed: list[str] = []
     filing: list[int] = []
+    made: list[Memo] = []
     committed = commit_sent = restored = creating_part = False
     try:
         async with async_session() as db:
@@ -1388,7 +1472,7 @@ async def _file_part(batch_id: int) -> bool | None:
                 if batch is None or batch.state != "open":
                     return None
                 uid = batch.uid
-                p, _collection = await _filing_target(db, batch)
+                p, collection = await _filing_target(db, batch)
                 assert p.created_by is not None
                 owner_id = p.created_by
                 blobs = list(
@@ -1402,12 +1486,8 @@ async def _file_part(batch_id: int) -> bool | None:
                 )
                 pending = [b for b in blobs if b.filed_at is None]
                 part = _filing_parts(pending)[0] if pending else []
-                # The first part keeps the batch's own key, so a batch of one part is keyed
-                # exactly as a whole batch; a later part is keyed by the file it starts with.
-                key = idempotency_key(
-                    uid if len(pending) == len(blobs) else f"{uid}/{part[0].sha256}"
-                )
                 upload_for: dict[str, IngestBlob] = {}
+                upload_rows: dict[str, Any] = {}
                 # Journaled before the empty part files exist: a crash before this commit leaves
                 # nothing to find, and one after it leaves rows that say what to clean.
                 planned = [(secrets.token_urlsafe(24), blob) for blob in part]
@@ -1446,11 +1526,40 @@ async def _file_part(batch_id: int) -> bool | None:
                     # where it can land after `_restore` has dropped the only row that describes it.
                     _replace_sync(staged, target)
                     # The completion state a member's last chunk leaves: every byte received, its
-                    # hash known. The capture read happens in finalize's `ensure_capture`.
+                    # hash known. The capture read happens below, before any memo.
                     up.bytes_received = blob.size_bytes
                     up.sha256 = blob.sha256
                     upload_for[up.upload_uid] = blob
+                    upload_rows[up.upload_uid] = up
                 await db.flush()
+                # The capture read finalize's `ensure_capture` would make, made here, because the
+                # memo a file goes into is its capture day (MEMNG-1266) and has to be known before
+                # any memo is; finalize then joins this answer. The rows are this transaction's
+                # own inserts, written by the flush above, so the read waits on nobody.
+                zone = trip_zone(collection.tz)
+                dated: list[tuple[str, str, date]] = []
+                for up_uid, blob in upload_for.items():
+                    row = await uploads_svc.ensure_capture(db, upload_rows[up_uid])
+                    row = row or upload_rows[up_uid]
+                    day = capture_day(
+                        row.capture_civil,
+                        row.capture_instant,
+                        blob.last_modified,
+                        zone,
+                        batch.created_at,
+                    )
+                    dated.append((up_uid, blob.filename, day))
+                days = split_by_day(dated)
+                filed = {
+                    r.day: r
+                    for r in (
+                        await db.execute(
+                            select(IngestBatchMemo).where(IngestBatchMemo.batch_id == batch.id)
+                        )
+                    ).scalars()
+                }
+                if len(days) > 1:
+                    await _hold_day_memos(db, [filed[d].memo_id for d, _ in days if d in filed])
                 device = (
                     await db.get(PassDevice, batch.pass_device_id)
                     if batch.pass_device_id is not None
@@ -1458,9 +1567,11 @@ async def _file_part(batch_id: int) -> bool | None:
                 )
                 resolved: dict[str, str] = {}
                 positions: dict[str, int] = {}
-                order = list(upload_for)
 
-                async def finalize(memo, carried: Sequence[int] = ()) -> list[str]:
+                def finalize_for(order: list[str]):
+                    return lambda memo, carried=(): finalize(order, carried)
+
+                async def finalize(order: list[str], carried: Sequence[int] = ()) -> list[str]:
                     done = await uploads_svc.finalize_pending(
                         db,
                         order,
@@ -1481,43 +1592,56 @@ async def _file_part(batch_id: int) -> bool | None:
                     return sorted(done, key=lambda u: positions.get(u, len(done)))
 
                 name = device.display_name if device is not None else None
-                # A later part goes into the memo the first part made: one batch, one memo, its
-                # caption once (the MEMNG-1014 chaos AC). Only when the owner deleted that memo
-                # meanwhile does a part start a memo of its own.
-                memo = (
-                    await passes_svc.append_guest_files(
-                        db,
-                        p,
-                        batch.memo_id,
-                        contributor_name=name,
-                        device=device,
-                        finalize=finalize,
-                        moved_out=moved,
+                # One memo per capture day of the batch, each with the batch's caption (MEMNG-1266,
+                # the owner's call). A later part goes into the memo of ITS day (the MEMNG-1014
+                # chaos AC, per day) and may start a new day's; only when the owner deleted a day's
+                # memo meanwhile does that day start a memo again.
+                for day, day_uids in days:
+                    ledger = filed.get(day)
+                    memo = (
+                        await passes_svc.append_guest_files(
+                            db,
+                            p,
+                            ledger.memo_id,
+                            contributor_name=name,
+                            device=device,
+                            finalize=finalize_for(day_uids),
+                            moved_out=moved,
+                            client_mtimes=[upload_for[u].last_modified for u in day_uids],
+                        )
+                        if ledger is not None and ledger.memo_id is not None
+                        else None
                     )
-                    if batch.memo_id is not None
-                    else None
-                )
-                if memo is None:
-                    memo = await passes_svc.create_guest_memo(
-                        db,
-                        p,
-                        caption=batch.caption,
-                        contributor_name=name,
-                        idempotency_key=key,
-                        device=device,
-                        finalize=finalize,
-                        moved_out=moved,
-                        # What each browser said about its file: the date of a batch whose files
-                        # state none (MEMNG-1262).
-                        client_mtimes=[b.last_modified for b in upload_for.values()],
-                    )
-                by_uid = {a.uid: a for a in memo.attachments}
+                    if memo is None:
+                        memo = await passes_svc.create_guest_memo(
+                            db,
+                            p,
+                            caption=batch.caption,
+                            contributor_name=name,
+                            idempotency_key=day_key(uid, day),
+                            device=device,
+                            finalize=finalize_for(day_uids),
+                            moved_out=moved,
+                            # What each browser said about the files of THIS day: the date of a
+                            # day whose files state none (MEMNG-1262). Another day's mtimes would
+                            # date this memo outside its own day.
+                            client_mtimes=[upload_for[u].last_modified for u in day_uids],
+                        )
+                    if ledger is None:
+                        ledger = filed[day] = IngestBatchMemo(batch_id=batch.id, day=day)
+                        db.add(ledger)
+                    ledger.memo_id = memo.id
+                    made.append(memo)
+                by_uid = {a.uid: a for memo in made for a in memo.attachments}
                 now = datetime.now(UTC)
                 for up_uid, blob in upload_for.items():
                     att = by_uid.get(resolved.get(up_uid, ""))
                     blob.attachment_id = att.id if att is not None else None
                     blob.filed_at = now
-                batch.memo_id = memo.id
+                # The earliest day's memo, for every reader that knows one memo per batch.
+                batch.memo_id = next(
+                    (filed[d].memo_id for d in sorted(filed) if filed[d].memo_id is not None), None
+                )
                 complete = len(part) == len(pending)
                 if complete:
                     batch.state = "complete"
@@ -1562,7 +1686,13 @@ async def _file_part(batch_id: int) -> bool | None:
         await to_thread.run_sync(uploads_svc.reap_consumed_sync, consumed)
     if complete:
         await to_thread.run_sync(_rmtree_sync, staging_dir(uid))
-    logger.info("trip_ingest.filed", batch=uid, memo=memo.uid, files=len(part), complete=complete)
+    logger.info(
+        "trip_ingest.filed",
+        batch=uid,
+        memos=[m.uid for m in made],
+        files=len(part),
+        complete=complete,
+    )
     return complete
 
 

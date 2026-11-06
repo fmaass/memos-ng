@@ -45,6 +45,7 @@ app/services/trip_ingest.py	push_device_revocations	refresh
 app/services/trip_ingest.py	_mirror_device	for_update
 app/services/trip_ingest.py	reconcile_moves	for_update
 app/services/trip_ingest.py	_filing_committed	for_update
+app/services/trip_ingest.py	_hold_day_memos	for_update
 app/services/trip_ingest.py	_file_part	for_update
 app/services/trip_ingest.py	_ack	refresh
 app/services/trip_ingest.py	_quarantine	refresh

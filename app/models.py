@@ -834,6 +834,23 @@ class IngestBatch(Base):
     change_seq: Mapped[int | None] = mapped_column(BigInteger, index=True, unique=True)
 
 
+class IngestBatchMemo(Base):
+    """Which memo a guest batch filed for one capture day (MEMNG-1266): a batch is one memo per day
+    its pictures were taken, and a later part of the batch files into the memo of ITS day. A
+    deleted memo nulls `memo_id`, and the next part of that day starts a fresh one.
+    `ingest_batches.memo_id` stays the earliest day's memo."""
+
+    __tablename__ = "ingest_batch_memos"
+    __table_args__ = (UniqueConstraint("batch_id", "day", name="uq_ingest_batch_memos_batch_day"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("ingest_batches.id", ondelete="CASCADE"))
+    day: Mapped[date] = mapped_column(Date)
+    memo_id: Mapped[int | None] = mapped_column(
+        ForeignKey("memos.id", ondelete="SET NULL"), index=True
+    )
+
+
 class IngestBlob(Base):
     """One file of an ingest batch, named by its content hash."""
 

@@ -1,7 +1,7 @@
 diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
 --- a/app/services/trip_ingest.py
 +++ b/app/services/trip_ingest.py
-@@ -1081,7 +1081,7 @@
+@@ -1473,7 +1473,7 @@
                          .execution_options(populate_existing=True)
                      )
                  ).scalar_one_or_none()
@@ -9,4 +9,4 @@ diff --git a/app/services/trip_ingest.py b/app/services/trip_ingest.py
 +                if batch is None:
                      return None
                  uid = batch.uid
-                 p, _collection = await _filing_target(db, batch)
+                 p, collection = await _filing_target(db, batch)

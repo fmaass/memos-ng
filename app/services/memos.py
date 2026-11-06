@@ -16,6 +16,7 @@ from app.models import (
     Attachment,
     AttachmentRendition,
     IngestBatch,
+    IngestBatchMemo,
     Memo,
     MemoEditKey,
     Pass,
@@ -262,10 +263,18 @@ async def lock_referencing_batches(db: AsyncSession, memo_id: int) -> None:
     Deleting a memo writes them through ON DELETE SET NULL, and a later filing part holds its batch
     row while it asks for the memo: left implicit, the delete is M → H against the filing's H → M, a
     40P01 (`tests/test_trip_filing_lock_order.py`). The set cannot grow under the delete: a batch
-    names a memo only from the commit that made that memo."""
+    names a memo only from the commit that made that memo. A batch names its later days' memos
+    through `ingest_batch_memos` (MEMNG-1266), whose SET NULL the delete writes too."""
     await db.execute(
         select(IngestBatch.id)
-        .where(IngestBatch.memo_id == memo_id)
+        .where(
+            or_(
+                IngestBatch.memo_id == memo_id,
+                IngestBatch.id.in_(
+                    select(IngestBatchMemo.batch_id).where(IngestBatchMemo.memo_id == memo_id)
+                ),
+            )
+        )
         .order_by(IngestBatch.id)
         .with_for_update()
     )

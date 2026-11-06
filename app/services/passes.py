@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import segno
 from sqlalchemy import and_, exists, func, or_, select, update
@@ -626,24 +627,57 @@ def _credit(attachments: Iterable[Attachment], name: str | None, device: PassDev
         att.contributed_by_device_id = device.id if device is not None else None
 
 
+def trip_zone(tz: str | None) -> ZoneInfo:
+    """The zone a trip's days are counted in: its own IANA `tz`, else UTC. A name this host's
+    zone database does not know reads as UTC, never as a refusal of the batch. The same zone
+    groups a guest batch into days (`trip_ingest.capture_day`) and dates each day's memo."""
+    if tz:
+        try:
+            return ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return ZoneInfo("UTC")
+
+
+def _civil_instant(civil: str | None, zone: ZoneInfo) -> datetime | None:
+    """A camera wall clock with no offset (`capture_civil`), read in the trip's zone: the instant
+    the photographer's clock meant there. None when there is none or it does not parse."""
+    if not civil:
+        return None
+    try:
+        return datetime.fromisoformat(civil).replace(tzinfo=zone).astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
 async def _capture_date(
-    db: AsyncSession, attachment_uids: Sequence[str], client_mtimes: Sequence[datetime]
+    db: AsyncSession,
+    attachment_uids: Sequence[str],
+    zone: ZoneInfo,
+    client_mtimes: Sequence[datetime],
 ) -> datetime | None:
-    """When a guest batch was taken: the earliest instant its files state; else the earliest client
-    mtime the batch carried; else None, which leaves the memo the filing's own now(). The mtimes
+    """When a guest memo's pictures were taken: the earliest capture its files state — a file's
+    instant, else its camera wall clock read in the trip's zone, the clock its day group came from
+    (MEMNG-1266); else the earliest client mtime the caller carried; else None, which leaves the
+    memo the filing's own now(). A client mtime never votes against a stated capture. The mtimes
     come from the caller because an attachment keeps none: its `captured_at` already folded the
     mtime and the filing time into one value, and a `min()` over it would let the filing time of
-    an undated file outrank an mtime that lies after it."""
+    an undated file outrank an mtime that lies after it (MEMNG-1262)."""
     if attachment_uids:
-        stated = (
+        rows = (
             await db.execute(
-                select(func.min(Attachment.capture_instant)).where(
+                select(Attachment.capture_instant, Attachment.capture_civil).where(
                     Attachment.uid.in_(attachment_uids)
                 )
             )
-        ).scalar_one_or_none()
-        if stated is not None:
-            return stated
+        ).all()
+        stated = [
+            moment
+            for instant, civil in rows
+            if (moment := instant or _civil_instant(civil, zone)) is not None
+        ]
+        if stated:
+            return min(stated)
     return min(client_mtimes) if client_mtimes else None
 
 
@@ -679,7 +713,9 @@ async def create_guest_memo(
         `link_attachments`, which runs next, names the memo's folder from `memo.created_at` once
         and for good — a later UPDATE would leave the folder telling another date."""
         made = list(await finalize(memo)) if finalize is not None else []
-        taken = await _capture_date(db, made, [m for m in client_mtimes if m is not None])
+        taken = await _capture_date(
+            db, made, trip_zone(collection.tz), [m for m in client_mtimes if m is not None]
+        )
         if taken is not None:
             memo.created_at = taken
             await db.flush()
@@ -724,13 +760,15 @@ async def append_guest_files(
     device: PassDevice | None = None,
     finalize: Callable[[Memo, Sequence[int]], Awaitable[Sequence[str]]],
     moved_out: list[storage.TrackedMove] | None = None,
+    client_mtimes: Sequence[datetime | None] = (),
 ) -> Memo | None:
-    """A later part of a guest batch, filed into the memo its first part made, so one batch is
-    one memo with its caption once. The memo row is locked first, as every memo edit does
-    (`memos.lock_memo_for_write`); `finalize` gets it and the ids of the attachments it already
-    carries, which its one ascending attachment acquisition must cover because the append re-locks
-    them to number after them. None when that memo is gone or is not this pass's guest memo (the
-    owner deleted it): the caller files the part as a memo of its own."""
+    """A later part of a guest batch, filed into the memo an earlier part made for the same
+    capture day, so one day of a batch is one memo with its caption once. The memo row is locked
+    first, as every memo edit does (`memos.lock_memo_for_write`); `finalize` gets it and the ids
+    of the attachments it already carries, which its one ascending attachment acquisition must
+    cover because the append re-locks them to number after them. None when that memo is gone or
+    is not this pass's guest memo (the owner deleted it): the caller files the part as a memo of
+    its own."""
     collection = await pass_collection(db, p)
     if collection is None:
         raise PassGone(p.uid)
@@ -749,6 +787,22 @@ async def append_guest_files(
     )
     await db.refresh(locked)
     added = [a for a in locked.attachments if a.id not in before]
+    # The memo is dated by ALL its files, so a later part carrying an earlier capture of the day
+    # moves it (MEMNG-1262 per day, MEMNG-1266). Only after linking: the part's files were placed
+    # in the folder the memo already has, which is named from the date its first part gave it and
+    # never renamed, so the memo keeps one folder whatever its date becomes.
+    taken = await _capture_date(
+        db,
+        [a.uid for a in locked.attachments],
+        trip_zone(collection.tz),
+        # A stated capture wins as in a single filing, even when it lies after the date an earlier
+        # part's mtime gave: a client mtime never outvotes one (MEMNG-1266). Mtimes only ever move
+        # the memo earlier, because an attachment keeps none and the earlier parts' mtimes
+        # survive only as that date.
+        [*(m for m in client_mtimes if m is not None), locked.created_at],
+    )
+    if taken is not None and taken != locked.created_at:
+        locked.created_at = taken
     await _file_into_album(db, collection, [a.id for a in added], locked.owner_id)
     _credit(added, contributor_name, device)
     await db.flush()
