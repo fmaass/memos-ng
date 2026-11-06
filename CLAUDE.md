@@ -231,7 +231,8 @@ met until its tests exist and pass.
   MEMNG-796, 2026-10-13; local copy `docs/plans/PLAN_2026-10-13_sibling-metadata.md`; Phase 4
   release train executed 2026-10-13 — record 4290; MEMNG-796 Delivered). **4637** (Daily Dami Pages — the digest mail
   becomes a link to a seven-day family page on pluto, MEMNG-1239, DD-1..DD-4 milestones 503–506,
-  2026-11-06; local copy `docs/plans/PLAN_2026-11-06_daily-dami-pages.md`; Codex plan gate pending).
+  2026-11-06; local copy `docs/plans/PLAN_2026-11-06_daily-dami-pages.md`; Codex plan gate APPROVE
+  2026-11-06 after one folded REVISE round; driven by Pfadfinder lane e, prefix `DD-`).
 - Investigation reports (book level): **3926** (aligning the web picture library with the iOS
   Photos app, 2026-09-22).
 - Feature pages (book level): **1663** (Media serving), **3836** (Places map).
