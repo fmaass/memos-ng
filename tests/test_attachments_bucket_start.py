@@ -185,3 +185,151 @@ def test_the_unbounded_list_is_unchanged(blib):
     _seed(me)
     assert _open(client, "order=taken_desc") == DESC_ALL  # control for every case above
     assert _sql("SELECT count(*) FROM attachments")[0][0] == 7
+
+
+# MEMNG-732: the two edges of the bucket arithmetic the ordinary-day seeds above never touch.
+# A picture taken at exactly local midnight on a bucket boundary, once in summer time (22:00Z on
+# 31 Aug is midnight of 1 Sept) and once in winter time (23:00Z on 31 Dec is midnight of 1 Jan, a
+# year boundary too), each with a picture one second before it.
+def _seed_midnight(me):
+    _att("mn-oldyear", me, capture_instant="2025-12-31T22:59:59Z")  # 23:59:59 on 31 Dec 2025
+    _att("mn-newyear", me, capture_instant="2025-12-31T23:00:00Z")  # 00:00:00 on 1 Jan 2026
+    _att("mn-before", me, capture_instant="2026-08-31T21:59:59Z")  # 23:59:59 on 31 Aug
+    _att("mn-midnight", me, capture_instant="2026-08-31T22:00:00Z")  # 00:00:00 on 1 Sept
+    _att("mn-after", me, capture_instant="2026-09-01T10:00:00Z")
+
+
+MN_DESC = ["mn-after", "mn-midnight", "mn-before", "mn-newyear", "mn-oldyear"]
+
+
+@pytest.mark.parametrize(
+    ("bucket", "expected"),
+    [
+        ("2026-09", MN_DESC),
+        ("2026-09-01", MN_DESC),
+        ("2026-08", MN_DESC[2:]),  # local midnight is the 1st's, never the 31st's
+        ("2026-08-31", MN_DESC[2:]),
+        ("2026", MN_DESC),
+        ("2026-01", MN_DESC[3:]),
+        ("2026-01-01", MN_DESC[3:]),
+        ("2025", ["mn-oldyear"]),
+        ("2025-12-31", ["mn-oldyear"]),
+    ],
+)
+def test_taken_desc_opens_a_picture_taken_at_local_midnight_in_its_new_bucket(
+    blib, bucket, expected
+):
+    client, me = blib
+    _seed_midnight(me)
+    assert _open(client, f"order=taken_desc&bucket={bucket}&tz=Europe/Zurich") == expected
+
+
+@pytest.mark.parametrize(
+    ("bucket", "expected"),
+    [
+        ("2026-09", ["mn-midnight", "mn-after"]),
+        ("2026-09-01", ["mn-midnight", "mn-after"]),
+        ("2026-08-31", ["mn-before", "mn-midnight", "mn-after"]),
+        ("2026", ["mn-newyear", "mn-before", "mn-midnight", "mn-after"]),
+        ("2026-01-01", ["mn-newyear", "mn-before", "mn-midnight", "mn-after"]),
+        ("2025-12-31", MN_DESC[::-1]),
+    ],
+)
+def test_taken_asc_opens_a_picture_taken_at_local_midnight_in_its_new_bucket(
+    blib, bucket, expected
+):
+    client, me = blib
+    _seed_midnight(me)
+    assert _open(client, f"order=taken_asc&bucket={bucket}&tz=Europe/Zurich") == expected
+
+
+def test_the_buckets_count_a_picture_taken_at_local_midnight_in_its_new_bucket(blib):
+    client, me = blib
+    _seed_midnight(me)
+    assert _buckets(client, "month") == [
+        ("2026-09", 2, "mn-after"),
+        ("2026-08", 1, "mn-before"),
+        ("2026-01", 1, "mn-newyear"),
+        ("2025-12", 1, "mn-oldyear"),
+    ]
+
+
+# Both 2026 changeover days in Zurich: 29 March is 23 hours long (23:00Z to 22:00Z the next day)
+# and 25 October 25 hours (22:00Z to 23:00Z the next day). Each day gets a picture half an hour
+# inside either end and a neighbour half an hour outside, so a bucket counted at one fixed
+# offset, summer's or winter's, misplaces at least one of them.
+def _seed_dst(me):
+    _att("dst-mar28-late", me, capture_instant="2026-03-28T22:30:00Z")  # 23:30 CET, 28 Mar
+    _att("dst-mar29-early", me, capture_instant="2026-03-28T23:30:00Z")  # 00:30 CET, 29 Mar
+    _att("dst-mar29-late", me, capture_instant="2026-03-29T21:30:00Z")  # 23:30 CEST, 29 Mar
+    _att("dst-mar30-early", me, capture_instant="2026-03-29T22:30:00Z")  # 00:30 CEST, 30 Mar
+    _att("dst-oct24-late", me, capture_instant="2026-10-24T21:30:00Z")  # 23:30 CEST, 24 Oct
+    _att("dst-oct25-early", me, capture_instant="2026-10-24T22:30:00Z")  # 00:30 CEST, 25 Oct
+    _att("dst-oct25-late", me, capture_instant="2026-10-25T22:30:00Z")  # 23:30 CET, 25 Oct
+    _att("dst-oct26-early", me, capture_instant="2026-10-25T23:30:00Z")  # 00:30 CET, 26 Oct
+
+
+DST_DESC = [
+    "dst-oct26-early",
+    "dst-oct25-late",
+    "dst-oct25-early",
+    "dst-oct24-late",
+    "dst-mar30-early",
+    "dst-mar29-late",
+    "dst-mar29-early",
+    "dst-mar28-late",
+]
+
+
+def _buckets(client, size):
+    r = client.get(f"/api/attachments/buckets?size={size}&tz=Europe/Zurich")
+    assert r.status_code == 200, r.text
+    return [(b["key"], b["count"], b["coverUid"]) for b in r.json()]
+
+
+def test_the_buckets_count_both_changeover_days_by_their_local_length(blib):
+    client, me = blib
+    _seed_dst(me)
+    assert _buckets(client, "day") == [
+        ("2026-10-26", 1, "dst-oct26-early"),
+        ("2026-10-25", 2, "dst-oct25-late"),
+        ("2026-10-24", 1, "dst-oct24-late"),
+        ("2026-03-30", 1, "dst-mar30-early"),
+        ("2026-03-29", 2, "dst-mar29-late"),
+        ("2026-03-28", 1, "dst-mar28-late"),
+    ]
+    assert _buckets(client, "month") == [
+        ("2026-10", 4, "dst-oct26-early"),
+        ("2026-03", 4, "dst-mar30-early"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("order", "bucket", "expected"),
+    [
+        ("taken_desc", "2026-10-25", DST_DESC[1:]),
+        ("taken_desc", "2026-03-29", DST_DESC[5:]),
+        ("taken_asc", "2026-10-25", ["dst-oct25-early", "dst-oct25-late", "dst-oct26-early"]),
+        ("taken_asc", "2026-03-29", DST_DESC[::-1][1:]),
+    ],
+)
+def test_a_changeover_day_opens_at_its_own_first_picture(blib, order, bucket, expected):
+    client, me = blib
+    _seed_dst(me)
+    assert _open(client, f"order={order}&bucket={bucket}&tz=Europe/Zurich") == expected
+
+
+@pytest.mark.parametrize("size", ["day", "month"])
+def test_every_bucket_around_a_changeover_opens_where_its_count_says(blib, size):
+    """The open position agrees with the counts the SPA draws: a desc walk opened at a bucket
+    starts at its cover and holds exactly that bucket's count more than the walk opened at the
+    next older bucket; an asc walk opened at it holds the counts of it and every newer one."""
+    client, me = blib
+    _seed_dst(me)
+    buckets = _buckets(client, size)
+    for i, (key, _, cover) in enumerate(buckets):
+        desc = _open(client, f"order=taken_desc&bucket={key}&tz=Europe/Zurich")
+        asc = _open(client, f"order=taken_asc&bucket={key}&tz=Europe/Zurich")
+        assert desc[:1] == [cover], key
+        assert len(desc) == sum(n for _, n, _ in buckets[i:]), key
+        assert len(asc) == sum(n for _, n, _ in buckets[: i + 1]), key
