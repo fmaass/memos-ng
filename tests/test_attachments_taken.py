@@ -311,6 +311,24 @@ def test_a_video_bucket_covers_with_its_poster_and_an_image_bucket_with_its_thum
         assert r.content == path.read_bytes()
 
 
+def test_a_bucket_names_its_covers_media_type(lib):
+    """MEMNG-914: a bucket carries its cover's mime, the same string the list gives as `mime`.
+    Each month holds the other kind as an older item, so a cover mime taken from the wrong row,
+    or one hard-coded to either kind, cannot pass both."""
+    client, me = lib
+    _att("cm-sep-img", me, mime="image/jpeg", capture_instant="2026-09-01T10:00:00Z")
+    _att("cm-sep-vid", me, mime="video/mp4", capture_instant="2026-09-20T10:00:00Z")
+    _att("cm-aug-vid", me, mime="video/quicktime", capture_instant="2026-08-01T10:00:00Z")
+    _att("cm-aug-img", me, mime="image/png", capture_instant="2026-08-20T10:00:00Z")
+    r = client.get("/api/attachments/buckets?size=month")
+    assert r.status_code == 200, r.text
+    got = [(b["key"], b["coverUid"], b.get("coverMime")) for b in r.json()]
+    assert got == [
+        ("2026-09", "cm-sep-vid", "video/mp4"),
+        ("2026-08", "cm-aug-img", "image/png"),
+    ]
+
+
 @pytest.mark.parametrize(
     "query",
     ["size=week", "size=", "size=month&tz=Mars/Olympus_Mons", "size=month&tz=", "tz=UTC"],
@@ -449,7 +467,9 @@ def test_the_literal_routes_are_answered_by_their_own_handlers(lib):
     assert _matched_endpoint("/api/attachments/ro-a") == "attachment_meta"  # control
     b = client.get("/api/attachments/buckets?size=month")
     assert b.status_code == 200, b.text
-    assert [set(i) for i in b.json()] == [{"key", "count", "coverUid", "coverThumbnailUrl", "tags"}]
+    assert [set(i) for i in b.json()] == [
+        {"key", "count", "coverUid", "coverThumbnailUrl", "coverMime", "tags"}
+    ]
     t = client.get("/api/attachments/tags")
     assert t.status_code == 200, t.text
     assert t.json() == [{"name": "ro", "count": 1}]  # not {uid}'s AttachmentMeta or its 404

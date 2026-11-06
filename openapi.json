@@ -43,6 +43,10 @@
             "title": "Count",
             "type": "integer"
           },
+          "coverMime": {
+            "title": "Covermime",
+            "type": "string"
+          },
           "coverThumbnailUrl": {
             "title": "Coverthumbnailurl",
             "type": "string"
@@ -68,6 +72,7 @@
           "count",
           "coverUid",
           "coverThumbnailUrl",
+          "coverMime",
           "tags"
         ],
         "title": "AttachmentBucket",

@@ -8,6 +8,7 @@ const bucket = (key: string, count: number) => ({
   count,
   coverUid: `cover-${key}`,
   coverThumbnailUrl: `/api/attachments/cover-${key}/thumb`,
+  coverMime: 'image/jpeg',
   tags: [] as string[],
 })
 

@@ -566,6 +566,9 @@ class AttachmentBucket(BaseModel):
     count: int
     coverUid: str  # the bucket's newest item by (takenAt, upload order)
     coverThumbnailUrl: str  # that item's signed thumbnail, minted for the requesting viewer
+    # That item's media type, the same mime string the list gives as `mime`, so a client can mark
+    # a video cover without fetching the item. MEMNG-914, additive.
+    coverMime: str
     # The tags of the memos the bucket's pictures hang on: the tag on the most of them first, then
     # by name, every one of them (a client showing three counts the rest). MEMNG-651, additive.
     tags: list[str]
@@ -611,6 +614,7 @@ async def attachment_buckets(
             count=count,
             coverUid=uid,
             coverThumbnailUrl=asset_urls.signed_cover_url(uid, mime, user.id, now=now),
+            coverMime=mime,
             tags=tags,
         )
         for key, count, uid, mime, tags in await library_buckets(

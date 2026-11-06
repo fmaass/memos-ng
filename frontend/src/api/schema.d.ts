@@ -1974,6 +1974,8 @@ export interface components {
         AttachmentBucket: {
             /** Count */
             count: number;
+            /** Covermime */
+            coverMime: string;
             /** Coverthumbnailurl */
             coverThumbnailUrl: string;
             /** Coveruid */
