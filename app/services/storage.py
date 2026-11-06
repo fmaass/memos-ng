@@ -19,7 +19,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
+import structlog
 from anyio import to_thread
+
+logger = structlog.get_logger(__name__)
 
 # Cap the human-browsable name so a pathological dumped filename can't blow the share's NAME_MAX.
 MAX_NAME_LEN = 200
@@ -64,6 +67,32 @@ RESERVATION_PREFIX = b"memos-ng-ingest-move:"
 
 def reservation_token(row_id: int) -> bytes:
     return RESERVATION_PREFIX + str(row_id).encode()
+
+
+# Where a journaled placement writes its token BEFORE the reservation exists (MEMNG-1188). The
+# reservation used to be an O_EXCL create followed by a separate token write, so a SIGKILL between
+# the two left an EMPTY file at the journaled name — and an empty file proves nothing: an owner
+# print upload can reserve that same free name and rename real media onto it, and the batch lock
+# does not serialize with the print route, so deleting by size took another writer's original
+# (tried at 2e2dda4, reproduced by the gate). So the token goes into this private temp first and is
+# hard-linked onto the name: the name never holds anything but a complete token. The temp's NAME is
+# half the ownership proof — it carries the row id, and no other writer can make a dot-name in a
+# memo folder (`sanitize_name` trims leading dots to a fixed point). The other half is its bytes: a
+# prefix of that row's token, since a sanitizer before the fix let a dot-name through and a file
+# from then may sit at the name. Reconcile removes it on both, never by size.
+RESERVATION_TEMP_PREFIX = ".memos-ng-reserve-"
+
+
+# A link refused because THIS VOLUME will not make one, as opposed to an I/O or space error that
+# would hit the same disk again on any fallback. EEXIST is not here: that is the lost race.
+_LINK_UNSUPPORTED = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK, errno.ENOSYS}
+)
+
+
+def reservation_temp(dest: Path, row_id: int) -> Path:
+    """The row's own temp, beside the dest it reserves: a hard link cannot cross a mount."""
+    return dest.parent / f"{RESERVATION_TEMP_PREFIX}{row_id}"
 
 
 class MoveAbandoned(Exception):
@@ -187,10 +216,24 @@ def sanitize_name(filename: str) -> str:
     path separators + non-printable/control chars removed, leading/trailing dots and spaces trimmed
     (no hidden/Windows trailing-dot files), byte-capped. Empty result falls back to 'file'."""
     name = Path(filename).name  # drop posix dir components
-    cleaned = "".join(c for c in name if c.isprintable() and c not in ("/", "\\"))
-    cleaned = cleaned.strip().strip(".").strip()
-    # cap by encoded bytes (not code points) with headroom for a ` (NN)` collision suffix
-    return _truncate_bytes(cleaned, MAX_NAME_LEN) if cleaned else "file"
+    cleaned = _trim_dots_and_spaces(
+        "".join(c for c in name if c.isprintable() and c not in ("/", "\\"))
+    )
+    # cap by encoded bytes (not code points) with headroom for a ` (NN)` collision suffix — and trim
+    # again after it: a stem whose first char cannot fit leaves only `.ext`
+    cleaned = _trim_dots_and_spaces(_truncate_bytes(cleaned, MAX_NAME_LEN)) if cleaned else ""
+    return cleaned or "file"
+
+
+def _trim_dots_and_spaces(name: str) -> str:
+    """Strip dots and whitespace from both ends until neither is left there. One pass is not enough
+    (MEMNG-1188 review): `. .memos-ng-reserve-7` loses its dot, then its space, and the next dot is
+    exposed — a client name in the reservation-temp namespace (`RESERVATION_TEMP_PREFIX`)."""
+    while True:
+        trimmed = name.strip().strip(".").strip()
+        if trimmed == name:
+            return name
+        name = trimmed
 
 
 def memo_folder_name(created_at: datetime, uid: str) -> str:
@@ -266,17 +309,45 @@ def _free_candidate(dest_dir: Path, name: str, attempt: int) -> tuple[Path, int]
         attempt += 1
 
 
-def _journaled_place_sync(track: TrackedMove, candidate: Path, token: bytes) -> Path:
+def _journaled_place_sync(track: TrackedMove, candidate: Path, row_id: int) -> Path:
     """Reserve exactly the journaled name, marked as that row's own, then rename onto it. A lost
-    race raises FileExistsError with nothing moved; the caller re-journals under another name."""
+    race raises FileExistsError with nothing moved; the caller re-journals under another name.
+
+    The reservation is `os.link(temp, candidate)`: an exclusive create that already holds the
+    token, refusing a taken name with FileExistsError exactly as O_EXCL does (see
+    `RESERVATION_TEMP_PREFIX`). A kill before the link leaves only the temp; one after it leaves the
+    token at the name, which `_is_reservation` already proves, and maybe the temp. Any OSError
+    from the link other than a taken name is the placement's own error, and the filing unwinds
+    as it does for a failed rename — except a refusal that says this volume makes no hard links
+    (`_LINK_UNSUPPORTED`). Whether the originals share links was never proven live, and a trip
+    ingest stalled on every placement is worse than the empty-file window this closes, so there
+    the reservation falls back to the O_CREAT|O_EXCL create and the token write it used before,
+    logged loudly each time so a deploy onto such a volume is seen (MEMNG-1188)."""
 
     def move(src: Path) -> Path:
         candidate.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        temp = reservation_temp(candidate, row_id)
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         try:
-            os.write(fd, token)
+            try:
+                _write_all(fd, reservation_token(row_id))
+            finally:
+                os.close(fd)
+            try:
+                os.link(temp, candidate)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                if exc.errno not in _LINK_UNSUPPORTED:
+                    raise
+                logger.error(
+                    "storage.reservation_link_unsupported",
+                    errno=errno.errorcode.get(exc.errno or 0, str(exc.errno)),
+                    dest=str(candidate),
+                )
+                _reserve_with_token_sync(candidate, reservation_token(row_id))
         finally:
-            os.close(fd)
+            temp.unlink(missing_ok=True)
         _before_journaled_rename()
         try:
             os.replace(src, candidate)
@@ -286,6 +357,34 @@ def _journaled_place_sync(track: TrackedMove, candidate: Path, token: bytes) -> 
         return candidate
 
     return track.perform(move)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of `data`. `os.write` may take fewer than asked without raising, and a token
+    cut short is one `_is_reservation` rejects — linked onto the name, a kill before the rename
+    would leave exactly the flagged leftover MEMNG-1188 removes. A write that takes nothing is an
+    error, so the caller unwinds instead of reserving an incomplete token."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "a reservation token write made no progress")
+        view = view[written:]
+
+
+def _reserve_with_token_sync(candidate: Path, token: bytes) -> None:
+    """The pre-1188 reservation, for a volume without hard links: an exclusive create, then the
+    token. A kill between the two leaves an empty file that reconcile flags and never deletes. A
+    write that fails in-process takes the name back: this call just created it, so it is ours."""
+    fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        try:
+            _write_all(fd, token)
+        finally:
+            os.close(fd)
+    except OSError:
+        candidate.unlink(missing_ok=True)
+        raise
 
 
 def _before_journaled_rename() -> None:
@@ -301,9 +400,7 @@ async def _journaled_place(
         candidate, attempt = await to_thread.run_sync(_free_candidate, dest_dir, clean, attempt)
         row_id = await journal.record(str(src), str(candidate), "master")
         try:
-            return await to_thread.run_sync(
-                _journaled_place_sync, track, candidate, reservation_token(row_id)
-            )
+            return await to_thread.run_sync(_journaled_place_sync, track, candidate, row_id)
         except FileExistsError:
             await journal.forget(row_id)
             attempt += 1

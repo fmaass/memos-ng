@@ -4,6 +4,7 @@ The crash tests run the REAL filing in a subprocess and SIGKILL it, because the 
 is exactly what a hard crash loses and no in-process raise can prove otherwise."""
 
 import asyncio
+import errno
 import os
 import secrets
 import subprocess
@@ -18,6 +19,7 @@ from app.models import Attachment, AttachmentStatus, IngestBlob, IngestMove, Pas
 from app.services import passes as passes_svc
 from app.services import storage, trip_ingest
 from sqlalchemy import select, text
+from structlog.testing import capture_logs
 
 from tests import test_trip_ingest_puller as tp
 from tests.ingest_support import JPEG
@@ -47,6 +49,16 @@ elif point == "before_reservation_token":
             die()
         return real_write(fd, data)
     os.write = write
+elif point in ("before_reservation_link", "after_reservation_link"):
+    real_link = os.link
+    def link(src, dst, *a, **k):
+        own = os.path.basename(src).startswith(storage.RESERVATION_TEMP_PREFIX)
+        if own and point == "before_reservation_link":
+            die()
+        real_link(src, dst, *a, **k)
+        if own:
+            die()
+    os.link = link
 elif point == "before_master_rename":
     storage._before_journaled_rename = die
 else:
@@ -99,6 +111,9 @@ def _verified(batch: str) -> dict[str, int]:
     [
         "before_journaling",
         "before_part_rename",
+        "before_reservation_token",
+        "before_reservation_link",
+        "after_reservation_link",
         "before_master_rename",
         "after_placement",
     ],
@@ -228,12 +243,13 @@ async def test_another_writers_file_at_a_journaled_master_dest_survives_reconcil
     ]
 
 
-async def test_a_kill_before_the_token_flags_the_dest_and_the_part_refiles_under_the_next_name(
+async def test_a_kill_before_the_token_leaves_the_dest_free_and_the_part_refiles_under_its_name(
     world, monkeypatch
 ):
-    """The reservation is created and the kill lands before its token, in a later part, so the name
-    is in a committed memo's folder. Nothing proves that empty file is ours: it stays, its row is
-    flagged, and the part must still file, because a flagged row may not wedge the batch."""
+    """MEMNG-1188: the kill lands before the token, in a later part, so the name is in a committed
+    memo's folder. The dest name never held anything but a complete token, so nothing is left there
+    to prove or to flag: only the row's own dot-temp, which reconcile removes by its name, and the
+    part files under the name it was journaled for."""
     _trip, batch_id, _memo, _picture = await _two_part_batch(world, monkeypatch)
     [(batch,)] = tp._sql("SELECT uid FROM ingest_batches WHERE id = :b", {"b": batch_id})
     staged = _verified(batch)
@@ -247,27 +263,126 @@ async def test_a_kill_before_the_token_flags_the_dest_and_the_part_refiles_under
         check=False,
     )
     assert done.returncode == -9, done.stderr[-2000:]
-    empty = [p for p in _files(world.home_root, "originals") if p.stat().st_size == 0]
-    assert len(empty) == 1, "the kill did not land between the create and the token"
-    expected = {"one.jpg": JPEG + b"1", "two.jpg": JPEG + b"2"}[empty[0].name]
+    # the chain is part -> _unfiled -> memo folder; the last hop is the reserving placement
+    [(row, dest)] = tp._sql("SELECT id, dest FROM ingest_moves ORDER BY id DESC LIMIT 1")
+    dest = Path(dest)
+    assert not dest.exists(), "the kill left a file at the journaled dest"
+    temp = storage.reservation_temp(dest, row)
+    assert [p for p in _files(world.home_root, "originals") if p.stat().st_size == 0] == [temp]
     await trip_ingest.reconcile_moves()
     assert _verified(batch) == staged, "the source original is not intact in staging"
-    assert empty[0].exists() and empty[0].stat().st_size == 0
-    flagged = "SELECT count(*) FILTER (WHERE flagged_at IS NOT NULL), count(*) FROM ingest_moves"
-    assert tp._sql(flagged) == [(1, 1)]
+    assert not temp.exists(), "reconcile left the row's own temp"
+    assert (_rows(), _flagged()) == (0, 0)
     assert await tp._tick(world) == "ok"
-    refiled = empty[0].with_name(f"{empty[0].stem} (2){empty[0].suffix}")
-    assert refiled.read_bytes() == expected, "the part did not refile under the next name"
-    assert empty[0].stat().st_size == 0
+    expected = {"one.jpg": JPEG + b"1", "two.jpg": JPEG + b"2"}[dest.name]
+    assert dest.read_bytes() == expected, "the part did not refile under its journaled name"
+    assert not dest.with_name(f"{dest.stem} (2){dest.suffix}").exists()
+    assert [p for p in _files(world.home_root, "originals") if p.stat().st_size == 0] == []
+    assert [p for p in _files(world.home_root, "originals") if p.name.startswith(".")] == []
     assert tp._sql(
         "SELECT count(*) FROM attachments a JOIN ingest_batches b ON b.memo_id = a.memo_id "
         "WHERE b.id = :b",
         {"b": batch_id},
     ) == [(2,)]
-    assert tp._pluto_batch(batch) == [("acked", True)], "the flagged row wedged the batch"
-    assert tp._sql("SELECT count(*) FROM ingest_moves") == [(1,)]
-    assert await tp._tick(world) == "ok"
-    assert empty[0].stat().st_size == 0 and refiled.read_bytes() == expected
+    assert tp._pluto_batch(batch) == [("acked", True)]
+    assert _rows() == 0
+
+
+@pytest.mark.parametrize("cut", [None, 0, 5], ids=["whole", "empty", "partial"])
+async def test_reconcile_removes_the_rows_own_temp_whole_or_cut_short(world, tmp_path, cut):
+    """The row's temp NAME plus bytes that are a prefix of the row's token — empty included, since
+    a kill can land before the first byte — is the proof, never a size alone."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    row = await _journal_row(tmp_path, src, dest)
+    temp = storage.reservation_temp(dest, row)
+    temp.write_bytes(storage.reservation_token(row)[:cut])
+    await trip_ingest.reconcile_moves()
+    assert not temp.exists()
+    assert src.read_bytes() == b"source" and not dest.exists()
+    assert _rows() == 0
+
+
+@pytest.mark.parametrize("found", ["media", "one-byte-off", "token-plus", "other-row"])
+async def test_another_writers_bytes_at_the_rows_temp_name_survive_reconcile(
+    world, tmp_path, found
+):
+    """Review MEMNG-1188 round 2: a sanitizer before this fix let `. .memos-ng-reserve-7` through as
+    a dot-name, so an owner's media can sit at a row's temp name. Only bytes that are a prefix of
+    THIS row's token are this row's; anything else there stays for its owner."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    row = await _journal_row(tmp_path, src, dest)
+    token = storage.reservation_token(row)
+    content = {
+        "media": JPEG,
+        "one-byte-off": token[:-1] + b"x",
+        "token-plus": token + b"0",
+        "other-row": storage.reservation_token(row + 1),
+    }[found]
+    temp = storage.reservation_temp(dest, row)
+    temp.write_bytes(content)
+    with capture_logs() as logs:
+        await trip_ingest.reconcile_moves()
+    assert temp.read_bytes() == content, "another writer's file at the temp name was deleted"
+    assert src.read_bytes() == b"source"
+    assert [e["event"] for e in logs].count("trip_ingest.reconcile_temp_foreign") == 1
+
+
+async def test_a_kill_after_the_link_leaves_two_names_of_the_token_and_both_go(world, tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    row = await _journal_row(tmp_path, src, dest)
+    temp = storage.reservation_temp(dest, row)
+    temp.write_bytes(storage.reservation_token(row))
+    os.link(temp, dest)
+    await trip_ingest.reconcile_moves()
+    assert not temp.exists() and not dest.exists()
+    assert src.read_bytes() == b"source" and _rows() == 0
+
+
+async def test_another_rows_temp_and_a_lookalike_name_survive_reconcile(world, tmp_path):
+    """Boundary: row N's walk takes `.memos-ng-reserve-N` only, never N+1's, N*10's, or a name
+    without the dot, all holding row N's token."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    row = await _journal_row(tmp_path, src, dest)
+    token = storage.reservation_token(row)
+    others = [
+        storage.reservation_temp(dest, row + 1),
+        storage.reservation_temp(dest, row * 10),
+        tmp_path / f"{storage.RESERVATION_TEMP_PREFIX.lstrip('.')}{row}",
+    ]
+    for other in others:
+        other.write_bytes(token)
+    await trip_ingest.reconcile_moves()
+    assert [p.read_bytes() for p in others] == [token] * 3
+    assert _rows() == 0
+
+
+async def test_a_flagged_rows_own_temp_still_goes(world, tmp_path):
+    """The kill lands before the link and an owner commits the journaled name meanwhile: the row is
+    flagged (the dest is not its), but the temp named for it is, and must not stay for ever."""
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.write_bytes(b"source")
+    dest.write_bytes(b"owner")
+    row = await _journal_row(tmp_path, src, dest)
+    temp = storage.reservation_temp(dest, row)
+    temp.write_bytes(storage.reservation_token(row))
+    await _owner_attachment(str(dest))
+    with pytest.raises(trip_ingest.ReconcileIncomplete):
+        await trip_ingest.reconcile_moves()
+    assert not temp.exists(), "the flagged row's own temp was left"
+    assert (src.read_bytes(), dest.read_bytes()) == (b"source", b"owner")
+    assert (_rows(), _flagged()) == (1, 1)
+
+
+def test_a_client_name_shaped_like_the_temp_cannot_become_one():
+    """Literal-in-string: a client file called `.memos-ng-reserve-7` is placed without its dot, so
+    reconcile of row 7 can never take it for its temp."""
+    clean = storage.sanitize_name(f"{storage.RESERVATION_TEMP_PREFIX}7")
+    assert not clean.startswith(".")
+    assert Path("/m", clean) != storage.reservation_temp(Path("/m/x.jpg"), 7)
 
 
 async def test_reconcile_waits_out_a_filing_still_running(world, monkeypatch):
@@ -310,6 +425,171 @@ async def test_a_taken_name_re_journals_under_the_next_one(world, tmp_path):
     assert placed.name == "a (2).jpg" and placed.read_bytes() == b"new"
     assert (folder / "a.jpg").read_bytes() == b"old"
     assert tp._sql("SELECT dest FROM ingest_moves") == [(str(placed),)]
+    assert sorted(p.name for p in folder.iterdir()) == ["a (2).jpg", "a.jpg"], "a temp was left"
+
+
+def test_a_racing_writer_loses_at_the_link_and_leaves_no_temp(tmp_path, monkeypatch):
+    """Concurrency: B reaches the same journaled name while A holds it between link and rename. B's
+    link is the exclusive create, so B gets FileExistsError with nothing moved, its temp goes, and
+    A's reservation is whole when B looks — the name never holds less than a complete token."""
+    folder = tmp_path / "memo"
+    a_src, b_src = tmp_path / "a", tmp_path / "b"
+    a_src.write_bytes(b"from a")
+    b_src.write_bytes(b"from b")
+    candidate = folder / "x.jpg"
+    seen: list[tuple[bytes, list[str]]] = []
+
+    def b_tries() -> None:
+        monkeypatch.setattr(storage, "_before_journaled_rename", lambda: None)
+        with pytest.raises(FileExistsError):
+            storage._journaled_place_sync(storage.TrackedMove(src=str(b_src)), candidate, 2)
+        seen.append((candidate.read_bytes(), sorted(p.name for p in folder.iterdir())))
+
+    monkeypatch.setattr(storage, "_before_journaled_rename", b_tries)
+    placed = storage._journaled_place_sync(storage.TrackedMove(src=str(a_src)), candidate, 1)
+    assert seen == [(storage.reservation_token(1), ["x.jpg"])]
+    assert placed.read_bytes() == b"from a" and b_src.read_bytes() == b"from b"
+    assert sorted(p.name for p in folder.iterdir()) == ["x.jpg"]
+
+
+def _link_raising(code: int):
+    def link(*a, **k):
+        raise OSError(code, os.strerror(code))
+
+    return link
+
+
+@pytest.mark.parametrize(
+    "code", [errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV], ids=errno.errorcode.get
+)
+def test_a_volume_without_hard_links_still_places_the_master(tmp_path, monkeypatch, code):
+    """MEMNG-1188 follow-up: a volume that refuses hard links must not stall trip filing. The
+    reservation falls back to the O_EXCL create and the token write — the old window, on a volume
+    the link cannot close it on — leaves no temp, and says so loudly, once."""
+    src, folder = tmp_path / "src", tmp_path / "memo"
+    src.write_bytes(b"bytes")
+    candidate = folder / "x.jpg"
+    seen: list[bytes] = []
+    monkeypatch.setattr(
+        storage, "_before_journaled_rename", lambda: seen.append(candidate.read_bytes())
+    )
+    monkeypatch.setattr(os, "link", _link_raising(code))
+    with capture_logs() as logs:
+        placed = storage._journaled_place_sync(storage.TrackedMove(src=str(src)), candidate, 3)
+    assert seen == [storage.reservation_token(3)], "the fallback reservation lacks its token"
+    assert placed == candidate and placed.read_bytes() == b"bytes" and not src.exists()
+    assert sorted(p.name for p in folder.iterdir()) == ["x.jpg"], "a temp was left"
+    events = [e for e in logs if e["event"] == "storage.reservation_link_unsupported"]
+    assert len(events) == 1 and events[0]["errno"] == errno.errorcode[code]
+
+
+def test_a_volume_without_hard_links_still_loses_a_race_as_a_lost_race(tmp_path, monkeypatch):
+    """The fallback keeps O_EXCL's answer to a taken name: FileExistsError, nothing moved, no
+    temp, and the taken name's bytes untouched."""
+    src, folder = tmp_path / "src", tmp_path / "memo"
+    src.write_bytes(b"bytes")
+    folder.mkdir()
+    (folder / "x.jpg").write_bytes(b"owner")
+    monkeypatch.setattr(os, "link", _link_raising(errno.EPERM))
+    with pytest.raises(FileExistsError):
+        storage._journaled_place_sync(storage.TrackedMove(src=str(src)), folder / "x.jpg", 3)
+    assert src.read_bytes() == b"bytes" and (folder / "x.jpg").read_bytes() == b"owner"
+    assert sorted(p.name for p in folder.iterdir()) == ["x.jpg"]
+
+
+@pytest.mark.parametrize("code", [errno.EIO, errno.ENOSPC], ids=errno.errorcode.get)
+def test_a_link_failing_for_another_reason_propagates_and_leaves_nothing(
+    tmp_path, monkeypatch, code
+):
+    """An I/O or space error is not "this volume has no hard links": it is the placement's own
+    error, and falling back would only hit the same disk again."""
+    src, folder = tmp_path / "src", tmp_path / "memo"
+    src.write_bytes(b"bytes")
+    monkeypatch.setattr(os, "link", _link_raising(code))
+    with capture_logs() as logs, pytest.raises(OSError) as raised:
+        storage._journaled_place_sync(storage.TrackedMove(src=str(src)), folder / "x.jpg", 3)
+    assert raised.value.errno == code
+    assert src.read_bytes() == b"bytes" and list(folder.iterdir()) == []
+    assert [e for e in logs if e["event"] == "storage.reservation_link_unsupported"] == []
+
+
+def _short_writes(monkeypatch, step: int, whole_first: int = 0) -> None:
+    """os.write that takes at most `step` bytes a call — a legal short count, not an error — after
+    `whole_first` ordinary calls (the temp's token, when the stall is meant for the fallback's)."""
+    real_write = os.write
+    calls = [0]
+
+    def write(fd, data):
+        calls[0] += 1
+        if calls[0] <= whole_first:
+            return real_write(fd, data)
+        return real_write(fd, bytes(data)[:step]) if step else 0
+
+    monkeypatch.setattr(os, "write", write)
+
+
+@pytest.mark.parametrize("links", [True, False], ids=["link", "no_hard_links"])
+def test_a_short_write_still_reserves_the_whole_token(tmp_path, monkeypatch, links):
+    """Review MEMNG-1188: os.write may take fewer bytes than asked without raising. The token must
+    reach the reserved name whole, or a kill before the rename leaves a dest `_is_reservation`
+    rejects — the flagged leftover again."""
+    src, folder = tmp_path / "src", tmp_path / "memo"
+    src.write_bytes(b"bytes")
+    candidate = folder / "x.jpg"
+    seen: list[bytes] = []
+    monkeypatch.setattr(
+        storage, "_before_journaled_rename", lambda: seen.append(candidate.read_bytes())
+    )
+    if not links:
+        monkeypatch.setattr(os, "link", _link_raising(errno.EPERM))
+    _short_writes(monkeypatch, 5)
+    placed = storage._journaled_place_sync(storage.TrackedMove(src=str(src)), candidate, 31)
+    assert seen == [storage.reservation_token(31)], "an incomplete token was reserved"
+    assert placed.read_bytes() == b"bytes"
+    assert sorted(p.name for p in folder.iterdir()) == ["x.jpg"]
+
+
+@pytest.mark.parametrize("links", [True, False], ids=["link", "no_hard_links"])
+def test_a_write_that_makes_no_progress_unwinds_with_nothing_left(tmp_path, monkeypatch, links):
+    """A write that takes nothing is an error, not a token: nothing is linked or reserved, the temp
+    goes, and the source stays where it was. Without hard links the temp's write succeeds and the
+    stall hits the fallback's own write, at a name that call just created, which it takes back."""
+    src, folder = tmp_path / "src", tmp_path / "memo"
+    src.write_bytes(b"bytes")
+    if not links:
+        monkeypatch.setattr(os, "link", _link_raising(errno.EPERM))
+    _short_writes(monkeypatch, 0, whole_first=0 if links else 1)
+    with pytest.raises(OSError) as raised:
+        storage._journaled_place_sync(storage.TrackedMove(src=str(src)), folder / "x.jpg", 32)
+    assert not isinstance(raised.value, FileExistsError), "read as a lost race"
+    assert src.read_bytes() == b"bytes" and list(folder.iterdir()) == []
+
+
+async def test_eexist_from_the_link_re_journals_under_the_next_name(world, tmp_path, monkeypatch):
+    """A taken name answered by the link itself (the race the free-name probe cannot see) is the
+    lost-race path: the row is forgotten and the next name is journaled and placed."""
+    src, folder = tmp_path / "src", tmp_path / "memo"
+    src.write_bytes(b"new")
+    folder.mkdir()
+    real_link = os.link
+
+    def taken_once(a, b, *rest, **k):
+        if Path(b).name == "a.jpg":
+            Path(b).write_bytes(b"racer")  # the other writer lands between probe and link
+            raise FileExistsError(errno.EEXIST, "File exists", str(b))
+        return real_link(a, b, *rest, **k)
+
+    monkeypatch.setattr(os, "link", taken_once)
+    moves = trip_ingest._JournaledMoves(trip_ingest._MoveJournal(997))
+    track = storage.TrackedMove(src=str(src))
+    moves.append(track)
+    with capture_logs() as logs:
+        placed = await storage.place_master(src, folder, "a.jpg", track)
+    assert placed.name == "a (2).jpg" and placed.read_bytes() == b"new"
+    assert (folder / "a.jpg").read_bytes() == b"racer"
+    assert sorted(p.name for p in folder.iterdir()) == ["a (2).jpg", "a.jpg"]
+    assert tp._sql("SELECT dest FROM ingest_moves WHERE batch_id = 997") == [(str(placed),)]
+    assert [e for e in logs if e["event"] == "storage.reservation_link_unsupported"] == []
 
 
 async def test_a_refusal_records_the_version_that_admitted_the_batch(world, monkeypatch):

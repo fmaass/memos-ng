@@ -47,6 +47,24 @@ def test_sanitize_name(raw, expected):
     assert storage.sanitize_name(raw) == expected
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [". .memos-ng-reserve-7", ". . .x", " .x", ". x", ". \u00a0.x", "..  ..x.jpg"],
+)
+def test_sanitize_name_never_starts_with_a_dot(raw):
+    """Review MEMNG-1188 round 2: one strip pass let a dot through once the whitespace behind it
+    went, so a client name could reach the reservation-temp namespace (`.memos-ng-reserve-<id>`)."""
+    out = storage.sanitize_name(raw)
+    assert out and not out.startswith(".") and out == out.strip()
+
+
+def test_a_truncated_name_never_starts_with_a_dot():
+    """Truncation keeps the extension; a stem whose first char cannot fit must not leave `.ext`."""
+    out = storage.sanitize_name("\U0001f600." + "e" * (storage.MAX_NAME_LEN - 3))
+    assert len(out.encode()) <= storage.MAX_NAME_LEN
+    assert out and not out.startswith(".")
+
+
 def test_sanitize_name_caps_length():
     out = storage.sanitize_name("x" * 500 + ".png")
     assert len(out) <= storage.MAX_NAME_LEN

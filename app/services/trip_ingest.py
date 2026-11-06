@@ -1087,9 +1087,32 @@ def _is_reservation(dest: Path, row_id: int) -> bool:
     return dest.read_bytes() == token
 
 
+def _drop_reservation_temp(row_id: int, dest_path: str) -> None:
+    """Remove the temp a killed placement of THIS row left beside its dest (MEMNG-1188). Ownership
+    takes both halves: the exact name, which carries the row id, AND bytes that are a prefix of the
+    row's token — empty included, since a kill can land before the first byte. A sanitizer before
+    the review fix let `. .memos-ng-reserve-7` through as a dot-name, so an owner's media may sit at
+    that name; anything but a token prefix there is another writer's, and stays, logged. An empty
+    file at the dest itself is NOT this: only a pre-1188 build left one, and it stays flagged,
+    because a size proves nothing about whose it is (see `RESERVATION_TEMP_PREFIX`)."""
+    temp = storage.reservation_temp(Path(dest_path), row_id)
+    token = storage.reservation_token(row_id)
+    try:
+        with temp.open("rb") as held:
+            found = held.read(len(token) + 1)
+    except FileNotFoundError:
+        return
+    if not token.startswith(found):
+        logger.error("trip_ingest.reconcile_temp_foreign", move=row_id, temp=str(temp))
+        return
+    temp.unlink(missing_ok=True)
+
+
 def _walk_back_sync(row_id: int, src_path: str, dest_path: str, kind: str) -> str:
     """One journal row's reconciliation; `done` drops the row, `flag` keeps it. Never overwrites."""
     src, dest = Path(src_path), Path(dest_path)
+    if kind == "master":
+        _drop_reservation_temp(row_id, dest_path)
     has_src, has_dest = src.exists(), dest.exists()
     if has_dest and kind == "master" and _is_reservation(dest, row_id):
         dest.unlink()  # this row's own placeholder: the rename never ran
@@ -1176,6 +1199,20 @@ async def reconcile_moves() -> None:
                         src=row.src,
                         dest=row.dest,
                     )
+                    # The dest is not this row's, but a temp named for it is — a kill before the
+                    # link, while the owner took the name — and a flagged row is never walked
+                    # again, so this is its last chance to go. Left behind it is a hidden file and
+                    # no media, so a failure only logs: the flag is already the loud signal.
+                    try:
+                        # blocking-ok: one unlink, crash recovery only, beside the walk-back above
+                        _drop_reservation_temp(row.id, row.dest)
+                    except OSError as exc:
+                        logger.error(
+                            "trip_ingest.reconcile_temp_kept",
+                            move=row.id,
+                            dest=row.dest,
+                            error=type(exc).__name__,
+                        )
                     break
                 try:
                     # blocking-ok: anyio holds no native `task.cancel()` for a running thread, so

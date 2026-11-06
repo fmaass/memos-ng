@@ -154,6 +154,8 @@ EXPECTED_EXEMPTIONS: dict[tuple[str, str, str], int] = dict(
         # the coroutine (and, in reconcile, the batch lock); see the sites.
         ("app/services/trip_ingest.py", "_file_part", "_replace_sync"): 1,
         ("app/services/trip_ingest.py", "reconcile_moves", "_walk_back_sync"): 1,
+        # MEMNG-1188: a flagged row's own reservation temp, the same crash-recovery-only reason.
+        ("app/services/trip_ingest.py", "reconcile_moves", "_drop_reservation_temp"): 1,
     }
 )
 
