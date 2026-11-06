@@ -1,0 +1,20 @@
+Remove the idle bound on a guest upload body: the door's PATCH route hands the raw request stream
+to the append again, so a guest body that stops sending holds its request, and its device's body
+slot, until something outside the app ends it (MEMNG-1158).
+
+The probes that must turn red are the two cases of the one probe that stalls a guest body on an open
+connection (half a file sent, then nothing; nothing at all): the stalled PATCH must end within the
+bound with its bytes kept, and the same device's next PATCH be admitted.
+Every other door probe sends whole bodies and must stay green.
+
+--- a/app/ingest/guest.py
++++ b/app/ingest/guest.py
+@@ -853,7 +853,7 @@
+         # `keep_cut`, so the bytes that arrived are kept and the answer is 200 with the offset they
+         # reached — and the `finally` below frees the device's slot instead of holding it until
+         # Traefik's read timeout.
+-        body_stream = upload_bytes.idle_bounded(request.stream(), settings.UPLOAD_BODY_IDLE_SECONDS)
++        body_stream = request.stream()
+         appended = await upload_bytes.append_offset_stream(
+             db,
+             row,

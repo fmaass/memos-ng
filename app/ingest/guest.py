@@ -848,11 +848,17 @@ async def append(
         ).scalar_one_or_none()
 
     try:
+        # Each wait for the next body chunk is bounded, as on the account route (MEMNG-934,
+        # MEMNG-1158): a body that goes silent ends as a cut — `append_offset_stream` spools with
+        # `keep_cut`, so the bytes that arrived are kept and the answer is 200 with the offset they
+        # reached — and the `finally` below frees the device's slot instead of holding it until
+        # Traefik's read timeout.
+        body_stream = upload_bytes.idle_bounded(request.stream(), settings.UPLOAD_BODY_IDLE_SECONDS)
         appended = await upload_bytes.append_offset_stream(
             db,
             row,
             upload_offset,
-            request.stream(),
+            body_stream,
             part=core.part_path(upload_uid),
             spool=_spool_path(upload_uid),
             body_ceiling=min(settings.INGEST_PATCH_MAX_BYTES, guest_ceiling(row)),

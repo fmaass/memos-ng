@@ -370,7 +370,9 @@ async def upload_limits(_: Annotated[User, Depends(auth.require_user)]) -> Uploa
     response_model=UploadOut,
     description="Append bytes at `Upload-Offset`. The body may be any length from 1 byte to the "
     "bytes remaining; `chunk_size` is a hint for clients that chunk. Bytes received before a "
-    "disconnect are kept, and HEAD reports the offset they reached.",
+    "disconnect are kept, and HEAD reports the offset they reached. A body that sends nothing for "
+    "longer than the idle bound is cut the same way: the bytes received are kept and the answer "
+    "is 200 with the offset they reached.",
     openapi_extra={
         "requestBody": {
             "required": True,

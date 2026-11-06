@@ -1868,19 +1868,39 @@ _IDLE = 0.5
 _IDLE_MARGIN = 2.0
 
 
-def _stalling_receive(pieces):
+def _stalling_receive(pieces, silent=None):
     """ASGI `receive` for a client that sends `pieces` and then goes silent on an open
     connection: no more bytes, and no `http.disconnect` either — exactly what a dead mobile radio
-    looks like from the server until a read timeout fires."""
+    looks like from the server until a read timeout fires. `silent`, when given, is set the moment
+    the server asks for a chunk after the last piece: every piece is delivered, and the request is
+    now waiting on a body that sends nothing — the point a test syncs on instead of a sleep."""
     queue = [{"type": "http.request", "body": p, "more_body": True} for p in pieces]
 
     async def receive():
         if queue:
             return queue.pop(0)
+        if silent is not None:
+            silent.set()
         await asyncio.Event().wait()  # never set
         raise AssertionError("unreachable")
 
     return receive
+
+
+async def _until_silent(task, silent):
+    """Wait until a stalled PATCH has taken every piece and gone silent (`silent` set), for at
+    most the bound plus the margin. The request must still be running then: one that already
+    ended never reached the silent wait the bound is about."""
+    waiter = asyncio.ensure_future(silent.wait())
+    try:
+        await asyncio.wait(
+            {waiter, task}, timeout=_IDLE + _IDLE_MARGIN, return_when="FIRST_COMPLETED"
+        )
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+    assert silent.is_set(), "the stalled PATCH never asked for the chunk after its last piece"
+    assert not task.done(), "the stalled PATCH ended before it went silent"
 
 
 async def _within_the_bound(task):
@@ -1919,15 +1939,20 @@ async def test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot(
     monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_USER", 1)
     content = os.urandom(10_000)
     uid = await _start_bearer(bearer, content)
+    silent = asyncio.Event()
     stalled = None
     try:
         stalled = asyncio.create_task(
             _asgi_patch(
-                token, uid, 0, len(content), _stalling_receive([content[:2500], content[2500:4000]])
+                token,
+                uid,
+                0,
+                len(content),
+                _stalling_receive([content[:2500], content[2500:4000]], silent),
             )
         )
         # Not vacuous: while the stalled body holds the account's one permit, a retry is refused.
-        await asyncio.sleep(_IDLE / 5)
+        await _until_silent(stalled, silent)
         early = await bearer.patch(
             f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"}
         )
@@ -2067,16 +2092,19 @@ async def test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_noth
     content = os.urandom(10_000)
     uid = await _start_bearer(bearer, content, "race.bin")
     stale = os.urandom(4000)  # different bytes, so a cut that DID land would corrupt the file
+    silent = asyncio.Event()
     stalled = None
     try:
         stalled = asyncio.create_task(
-            _asgi_patch(token, uid, 0, len(content), _stalling_receive([stale]))
+            _asgi_patch(token, uid, 0, len(content), _stalling_receive([stale], silent))
         )
-        await asyncio.sleep(_IDLE / 5)
+        await _until_silent(stalled, silent)
         retry = await bearer.patch(
             f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"}
         )
         assert retry.status_code == 200 and retry.json()["bytes_received"] == len(content)
+        # The retry really overtook: the stalled body was still open when the retry landed.
+        assert not stalled.done()
         await _within_the_bound(stalled)
         status, out = stalled.result()
         assert (status, out["bytes_received"]) == (200, len(content))
@@ -2117,7 +2145,9 @@ async def test_idle_bounded_lets_every_other_outcome_of_a_wait_through_unchanged
     # Only the bound's own expiry is a cut. The stream's own errors — a real disconnect, an I/O
     # error, even a TimeoutError of its own — and a cancellation from outside keep their identity,
     # so none of them is quietly turned into "keep the bytes and answer 200".
-    for raised in (OSError("socket"), TimeoutError("stream's own")):
+    from starlette.requests import ClientDisconnect
+
+    for raised in (OSError("socket"), TimeoutError("stream's own"), ClientDisconnect()):
 
         async def failing(exc=raised):
             yield b"ab"
@@ -2126,6 +2156,9 @@ async def test_idle_bounded_lets_every_other_outcome_of_a_wait_through_unchanged
         with pytest.raises(type(raised)) as seen:
             async for _ in svc.idle_bounded(failing(), 10):
                 pass
+        # The very exception the stream raised, not a look-alike: a real disconnect stays a plain
+        # ClientDisconnect, never re-labelled as the bound's own BodyIdle (its subclass).
+        assert seen.value is raised
         assert not isinstance(seen.value, svc.BodyIdle)
 
     async def consume():

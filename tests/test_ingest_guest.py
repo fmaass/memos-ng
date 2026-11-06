@@ -8,6 +8,7 @@ parked behind them.
 
 import asyncio
 import hashlib
+import json
 import re
 from datetime import UTC, datetime, timedelta
 
@@ -38,6 +39,7 @@ from tests.ingest_support import (
 )
 from tests.test_attachments_taken import _sql
 from tests.test_lock_protocol_concurrency import Park
+from tests.test_uploads import _IDLE, _stalling_receive, _until_silent, _within_the_bound
 
 
 async def _waiters(n: int, budget_s: float = 10.0) -> None:
@@ -884,6 +886,99 @@ async def test_every_429_tells_the_client_when_to_retry(door, home_iface, monkey
         f"/api/guest/uploads/{uid}", content=JPEG, headers={**bearer(token), "Upload-Offset": "0"}
     )
     assert r.status_code == 200 and r.headers["Upload-Offset"] == str(len(JPEG))  # control
+
+
+async def _door_patch(token: str, uid: str, offset: int, content_length: int, receive):
+    """A guest PATCH through the complete door app with the caller's own ASGI `receive`, so a test
+    can send what httpx cannot: a body that stalls on an open connection."""
+    path = f"/api/guest/uploads/{uid}"
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "PATCH",
+        "headers": [
+            (b"host", b"door"),
+            (b"authorization", f"Bearer {token}".encode()),
+            (b"upload-offset", str(offset).encode()),
+            (b"content-type", b"application/offset+octet-stream"),
+            (b"content-length", str(content_length).encode()),
+        ],
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "server": ("door", 80),
+        "client": ("127.0.0.1", 50000),
+        "root_path": "",
+    }
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    await create_app("ingest")(scope, receive, send)
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, json.loads(body)
+
+
+@pytest.mark.parametrize("sent", ["half", "nothing"])
+async def test_an_idle_guest_body_ends_at_the_bound_and_frees_the_device_slot(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+    sent,
+):
+    """MEMNG-1158: the guest append holds one of its device's body slots while the body streams.
+    A body that goes silent on an open connection is cut at the idle bound like the account
+    route's — bytes kept, 200 with the offset reached — and the slot is free again, instead of
+    held until Traefik's read timeout. `tests/mutations/guest_body_idle_unbounded.patch` removes
+    the bound."""
+    monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
+    # One slot per device, so a slot the stalled body kept would answer the next PATCH 429.
+    monkeypatch.setattr(settings, "GUEST_BODIES_PER_DEVICE", 1)
+    _, secret = await seeded_pass(home_iface)
+    token = (await redeem(door, secret))["device_token"]
+    r = await door.post(
+        "/api/guest/uploads", json={"filename": "a.jpg", "size": len(JPEG)}, headers=bearer(token)
+    )
+    uid = r.json()["upload_uid"]
+    # A body silent from its first byte is the boundary: nothing to keep, and the slot still freed.
+    half = len(JPEG) // 2 if sent == "half" else 0
+    pieces = [JPEG[:half]] if half else []
+    silent = asyncio.Event()
+    stalled = asyncio.create_task(
+        _door_patch(token, uid, 0, len(JPEG), _stalling_receive(pieces, silent))
+    )
+    try:
+        await _until_silent(stalled, silent)
+        # Not vacuous: while the stalled body holds the device's one slot, a second body is refused.
+        early = await door.patch(
+            f"/api/guest/uploads/{uid}",
+            content=JPEG,
+            headers={**bearer(token), "Upload-Offset": "0"},
+        )
+        assert early.status_code == 429
+
+        elapsed = await _within_the_bound(stalled)
+        assert elapsed >= _IDLE * 0.5  # ended by the bound, not by something earlier
+        status, out = stalled.result()
+        assert (status, out["bytes_received"]) == (200, half)
+        assert _sql("SELECT bytes_received FROM guest_uploads") == [(half,)]
+
+        # The slot is free: the same device's next PATCH is admitted and completes the file.
+        rest = await door.patch(
+            f"/api/guest/uploads/{uid}",
+            content=JPEG[half:],
+            headers={**bearer(token), "Upload-Offset": str(half)},
+        )
+        assert rest.status_code == 200, rest.text
+        assert rest.json()["bytes_received"] == len(JPEG)
+    finally:
+        if not stalled.done():
+            stalled.cancel()
+        await asyncio.gather(stalled, return_exceptions=True)
 
 
 async def test_the_limits_keep_their_wire_bytes(door, home_iface):  # noqa: F811
