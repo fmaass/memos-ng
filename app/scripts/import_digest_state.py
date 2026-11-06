@@ -69,6 +69,7 @@ from app.database import async_session
 from app.models import (
     DIGEST_DEFAULT_LANGUAGE,
     DigestDelivery,
+    DigestGroupDelivery,
     DigestRecipient,
     DigestRun,
     DigestRunStatus,
@@ -77,6 +78,7 @@ from app.models import (
     DigestVisibilityScope,
     Memo,
 )
+from app.services.digest import ledger as digest_ledger
 from app.services.digest.domain import (
     SETTINGS_ID,
     SettingsMissing,
@@ -559,8 +561,6 @@ async def run_import(
                         [
                             {
                                 "memo_id": memo_id,
-                                # The satellite mailed ONE group; it is today's single language.
-                                "language": DIGEST_DEFAULT_LANGUAGE.value,
                                 "run_id": run_id,
                                 "part_index": IMPORT_PART_INDEX,
                                 "incomplete": False,
@@ -568,11 +568,29 @@ async def run_import(
                             for memo_id in mapping.values()
                         ]
                     )
-                    .on_conflict_do_nothing(index_elements=["memo_id", "language"])
+                    .on_conflict_do_nothing(index_elements=["memo_id"])
                     .returning(DigestDelivery.memo_id)
                 )
             ).all()
             report.registry.inserted = len(inserted)
+            # The satellite mailed ONE group, today's single language: its history goes into
+            # the per-group ledger too, or that group's next run would mail it all again.
+            await db.execute(
+                pg_insert(DigestGroupDelivery)
+                .values(
+                    [
+                        {
+                            "memo_id": memo_id,
+                            "language": DIGEST_DEFAULT_LANGUAGE.value,
+                            "run_id": run_id,
+                            "part_index": IMPORT_PART_INDEX,
+                            "incomplete": False,
+                        }
+                        for memo_id in mapping.values()
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=["memo_id", "language"])
+            )
         report.registry.already_present = report.registry.mapped - report.registry.inserted
         # The run row aggregates rows another pass may be inserting at the same time, so it is
         # LOCKED before it is read and rewritten, and the count is computed IN the UPDATE. A total
@@ -612,6 +630,7 @@ async def run_import(
     report.recipients.rejected = rejected
     report.recipients.unique = len(addresses)
     if execute and addresses:
+        before = await digest_ledger.active_languages(db)
         inserted_rows = (
             await db.execute(
                 pg_insert(DigestRecipient)
@@ -621,6 +640,8 @@ async def run_import(
             )
         ).all()
         report.recipients.inserted = len(inserted_rows)
+        await db.flush()
+        await digest_ledger.seed_newly_active(db, before)
         report.recipients.already_present = len(addresses) - report.recipients.inserted
 
     # --- 3. settings ---------------------------------------------------------------------------

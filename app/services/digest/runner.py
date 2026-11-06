@@ -67,7 +67,7 @@ from app.models import (
     HostedMediaStatus,
 )
 from app.services import media, printready
-from app.services.digest import domain, hosting, render
+from app.services.digest import domain, hosting, ledger, render
 from app.services.digest import select as selection_mod
 from app.services.digest.domain import DigestConfig, sender_address
 from app.services.digest.gate import FALLBACK_TIMEZONE, LEDGER_TRIGGERS, local_date_of, resolve_zone
@@ -355,22 +355,14 @@ async def commit_part(
     if advanced is None:
         await db.rollback()
         raise RunLost(f"run {run_id} is no longer in flight at part {part_index}")
-    for memo_id in memo_ids:
-        await db.execute(
-            sa_text(
-                "INSERT INTO digest_deliveries "
-                "(memo_id, language, run_id, part_index, incomplete) "
-                "VALUES (:memo_id, :language, :run_id, :part_index, :incomplete) "
-                "ON CONFLICT (memo_id, language) DO NOTHING"
-            ),
-            {
-                "memo_id": memo_id,
-                "language": language,
-                "run_id": run_id,
-                "part_index": part_index,
-                "incomplete": memo_id in incomplete_ids,
-            },
-        )
+    await ledger.record(
+        db,
+        run_id=run_id,
+        language=language,
+        part_index=part_index,
+        memo_ids=memo_ids,
+        incomplete_ids=incomplete_ids,
+    )
     await db.commit()
 
 

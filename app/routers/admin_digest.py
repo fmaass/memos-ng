@@ -40,6 +40,7 @@ from app.models import (
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 from app.services.digest import domain as digest_domain
 from app.services.digest import hosting as digest_hosting
+from app.services.digest import ledger as digest_ledger
 from app.services.digest import metrics as digest_metrics
 from app.services.digest import runner as digest_runner
 from app.services.digest.domain import MAX_EMAIL_LENGTH, normalise_email
@@ -437,6 +438,7 @@ async def add_digest_recipient(
         # Compared against the NORMALISED form, so `A@B.com` collides with `a@b.com` — one mailbox
         # listed twice would receive the digest twice.
         raise HTTPException(status_code=409, detail="that address is already a recipient")
+    before = await digest_ledger.active_languages(db)
     row = DigestRecipient(
         email=email,
         display_name=body.display_name,
@@ -446,6 +448,10 @@ async def add_digest_recipient(
     )
     db.add(row)
     try:
+        await db.flush()
+        # A language that just came alive inherits the delivered history (MEMNG-1245), in this
+        # same transaction, so its first run does not replay everything ever sent.
+        await digest_ledger.seed_newly_active(db, before)
         await db.commit()
     except IntegrityError as exc:
         # The check above loses to a concurrent POST of the same address; the unique index is what
@@ -467,6 +473,7 @@ async def update_digest_recipient(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="recipient not found")
+    before = await digest_ledger.active_languages(db)
     if "display_name" in body.model_fields_set:
         row.display_name = body.display_name
     if body.enabled is False:
@@ -475,6 +482,8 @@ async def update_digest_recipient(
         row.enabled = body.enabled
     if body.language is not None:
         row.language = body.language
+    await db.flush()
+    await digest_ledger.seed_newly_active(db, before)
     await db.commit()
     return _recipient_out(row)
 

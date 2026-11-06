@@ -42,6 +42,7 @@ from tests.conftest import SYNC_URL
 # --- database reset -----------------------------------------------------------------------------
 
 DIGEST_TABLES = (
+    "digest_group_deliveries",
     "digest_deliveries",
     "digest_hosted_media",
     "digest_runs",
@@ -239,8 +240,23 @@ def delivery_rows() -> list[dict]:
     with engine.begin() as conn:
         rows = conn.execute(
             text(
+                "SELECT memo_id, run_id, part_index, incomplete FROM digest_deliveries "
+                "ORDER BY memo_id"
+            )
+        ).mappings()
+        result = [dict(row) for row in rows]
+    engine.dispose()
+    return result
+
+
+def group_rows() -> list[dict]:
+    """The per-language-group ledger (MEMNG-1245) that selection reads."""
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
                 "SELECT memo_id, language, run_id, part_index, incomplete "
-                "FROM digest_deliveries ORDER BY memo_id, language"
+                "FROM digest_group_deliveries ORDER BY memo_id, language"
             )
         ).mappings()
         result = [dict(row) for row in rows]

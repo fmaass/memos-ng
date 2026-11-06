@@ -1,25 +1,22 @@
-"""digest recipient language, per-language delivery ledger, run groups
+"""digest recipient language, per-language-group delivery ledger, run groups
 
 Revision ID: f47fc5fd5044
 Revises: f8af654fa068
 Create Date: 2026-11-06 20:00:00
 
-Expand, with one add-only backfill (MEMNG-1245). Every recipient gets a language and a run sends
-one mail per language group, so the delivery registry has to say WHICH group got a memo:
+Expand only (MEMNG-1245). Every recipient gets a language and a run sends one mail per language
+group, so the run needs a ledger that says WHICH group got a memo:
 
 * `digest_recipients.language` — NOT NULL, server default 'de', checked to de|es|en. Every
   existing recipient reads 'de' from the default the moment the column exists.
 * `digest_runs.groups_attempted` / `groups_accepted` — text arrays, default '{}'.
-* `digest_deliveries.language` — added nullable, BACKFILLED, then NOT NULL and checked. The
-  backfill writes 'de': the single language every recipient holds after the first step, so every
-  memo already mailed stays mailed for the one group that exists today and nothing is re-sent.
-  The column keeps no server default afterwards, like `run_id`: an insert that forgot to name its
-  group must fail, not silently close the memo for 'de'.
-* The primary key moves from `(memo_id)` to `(memo_id, language)`, under the same name.
+* NEW `digest_group_deliveries`, keyed `(memo_id, language)`, BACKFILLED with one 'de' row per
+  existing `digest_deliveries` row: 'de' is the single language every recipient holds after the
+  first step, so nothing already mailed is mailed again.
 
-No existing value is rewritten and nothing is dropped except the one-column key the new key
-replaces. The downgrade is lossy by necessity — one row per memo cannot hold two languages — and
-keeps the 'de' row (else the oldest) of a memo mailed to several groups.
+`digest_deliveries` is NOT touched — same columns, same `(memo_id)` key — so the previous image
+keeps reading and writing it unchanged after a rollback, and the run keeps writing it beside the
+new ledger. The downgrade drops what this revision added and nothing else.
 """
 
 from collections.abc import Sequence
@@ -56,31 +53,37 @@ def upgrade() -> None:
             ),
         )
 
-    op.add_column("digest_deliveries", sa.Column("language", sa.String(length=2), nullable=True))
+    op.create_table(
+        "digest_group_deliveries",
+        sa.Column("memo_id", sa.Integer(), autoincrement=False, nullable=False),
+        sa.Column("language", sa.String(length=2), nullable=False),
+        sa.Column("run_id", sa.Integer(), nullable=False),
+        sa.Column(
+            "sent_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
+        ),
+        sa.Column("part_index", sa.Integer(), server_default=sa.text("1"), nullable=False),
+        sa.Column("incomplete", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.CheckConstraint(LANGUAGE_CHECK, name="ck_digest_group_deliveries_language"),
+        sa.ForeignKeyConstraint(["memo_id"], ["memos.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["run_id"], ["digest_runs.id"]),
+        sa.PrimaryKeyConstraint("memo_id", "language"),
+    )
+    op.create_index(
+        op.f("ix_digest_group_deliveries_run_id"), "digest_group_deliveries", ["run_id"]
+    )
     op.execute(
         sa.text(
-            "UPDATE digest_deliveries SET language = :language WHERE language IS NULL"
+            "INSERT INTO digest_group_deliveries "
+            "(memo_id, language, run_id, sent_at, part_index, incomplete) "
+            "SELECT memo_id, :language, run_id, sent_at, part_index, incomplete "
+            "FROM digest_deliveries"
         ).bindparams(language=BACKFILL_LANGUAGE)
     )
-    op.alter_column("digest_deliveries", "language", nullable=False)
-    op.create_check_constraint("ck_digest_deliveries_language", "digest_deliveries", LANGUAGE_CHECK)
-    op.drop_constraint("digest_deliveries_pkey", "digest_deliveries", type_="primary")
-    op.create_primary_key("digest_deliveries_pkey", "digest_deliveries", ["memo_id", "language"])
 
 
 def downgrade() -> None:
-    op.execute(
-        sa.text(
-            "DELETE FROM digest_deliveries d USING digest_deliveries keep "
-            "WHERE d.memo_id = keep.memo_id AND d.language <> keep.language "
-            "AND (keep.language = 'de' OR (d.language <> 'de' AND "
-            "(keep.sent_at, keep.language) < (d.sent_at, d.language)))"
-        )
-    )
-    op.drop_constraint("digest_deliveries_pkey", "digest_deliveries", type_="primary")
-    op.create_primary_key("digest_deliveries_pkey", "digest_deliveries", ["memo_id"])
-    op.drop_constraint("ck_digest_deliveries_language", "digest_deliveries", type_="check")
-    op.drop_column("digest_deliveries", "language")
+    op.drop_index(op.f("ix_digest_group_deliveries_run_id"), table_name="digest_group_deliveries")
+    op.drop_table("digest_group_deliveries")
     op.drop_column("digest_runs", "groups_accepted")
     op.drop_column("digest_runs", "groups_attempted")
     op.drop_constraint("ck_digest_recipients_language", "digest_recipients", type_="check")

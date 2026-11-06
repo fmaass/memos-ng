@@ -48,6 +48,10 @@ PARTIAL_ALERT = "memosng_digest_partial_alert"
 # One `partial` run is a group the next run retries; two in a row is a group that keeps being
 # refused, and that is what the alert is for (MEMNG-1245).
 PARTIAL_ALERT_STREAK = 2
+# A run in which a group was refused: `partial`, or `failed` after attempting at least one group
+# (every group refused). A `failed` run that never reached a group (a guard, the over-cap check)
+# is a different failure, the stale alert's, and it ends the streak like any other outcome.
+_REFUSED_GROUP = "(status = :partial OR (status = :failed AND cardinality(groups_attempted) > 0))"
 
 # A run that did not actually mail the household: an import writes history and a test-send goes to
 # one admin address. Neither may read as an SMTP success, or an import on the morning of
@@ -72,7 +76,7 @@ class Snapshot:
     # missing series is indistinguishable from a broken exporter.
     last_success: float
     runs_by_status: dict[str, int] = field(default_factory=dict)
-    # How many of the newest terminal DELIVERING runs in a row are `partial`.
+    # How many of the newest terminal DELIVERING runs in a row refused a group.
     partial_streak: int = 0
 
 
@@ -107,12 +111,16 @@ async def read_snapshot(db: AsyncSession) -> Snapshot:
     runs_by_status = {row[0]: int(row[1]) for row in rows}
     streak = await db.scalar(
         sa_text(
-            "SELECT count(*) FROM digest_runs WHERE status = :partial "
+            f"SELECT count(*) FROM digest_runs WHERE {_REFUSED_GROUP} "
             "AND trigger <> ALL(:triggers) AND id > COALESCE(("
-            "SELECT max(id) FROM digest_runs WHERE status IS NOT NULL AND status <> :partial "
+            f"SELECT max(id) FROM digest_runs WHERE status IS NOT NULL AND NOT ({_REFUSED_GROUP}) "
             "AND trigger <> ALL(:triggers)), 0)"
         ),
-        {"partial": DigestRunStatus.partial.value, "triggers": list(NON_DELIVERING_TRIGGERS)},
+        {
+            "partial": DigestRunStatus.partial.value,
+            "failed": DigestRunStatus.failed.value,
+            "triggers": list(NON_DELIVERING_TRIGGERS),
+        },
     )
     return Snapshot(
         taken_at=time.time(),
@@ -194,7 +202,7 @@ class DigestCollector:
         )
         yield GaugeMetricFamily(
             PARTIAL_ALERT,
-            "1 when the last two digest runs were both partial (a group keeps being refused).",
+            "1 when the last two digest runs each refused a language group (partial or failed).",
             value=1.0 if snapshot.partial_streak >= PARTIAL_ALERT_STREAK else 0.0,
         )
         yield GaugeMetricFamily(

@@ -22,11 +22,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from anyio import to_thread
-from sqlalchemy import exists, select
+from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models import (
     DigestDelivery,
+    DigestGroupDelivery,
     DigestVisibilityScope,
     Memo,
     Visibility,
@@ -184,7 +186,7 @@ async def load_candidates(
     first — for ONE language group: a memo stays a candidate for `language` until a
     `(memo, language)` row exists, whatever the other groups have had (MEMNG-1245).
 
-    `NOT EXISTS` against `digest_deliveries` rather than a LEFT JOIN … IS NULL: the registry's
+    `NOT EXISTS` against `digest_group_deliveries` rather than a LEFT JOIN … IS NULL: the registry's
     primary key IS `(memo_id, language)`, so the anti-join is a single index probe per memo and
     cannot duplicate a row when a memo has rows for several languages.
     """
@@ -195,7 +197,15 @@ async def load_candidates(
     # `exists` is what tells `tests/test_no_blocking_io.py`'s AST scanner that this is a SQL
     # construct and not a `Path.exists()` on the request loop.
     delivered = exists().where(
-        DigestDelivery.memo_id == Memo.id, DigestDelivery.language == language
+        DigestGroupDelivery.memo_id == Memo.id, DigestGroupDelivery.language == language
+    )
+    # A legacy row with no group row in ANY language was written by the previous image while it
+    # ran after a rollback: it mailed every recipient, so no group gets that memo again. Every
+    # legacy row this image writes has a group row beside it, so this matches nothing else.
+    any_group = aliased(DigestGroupDelivery)
+    mailed_by_previous_image = and_(
+        exists().where(DigestDelivery.memo_id == Memo.id),
+        ~exists().where(any_group.memo_id == Memo.id),
     )
     statement = (
         select(Memo)
@@ -204,6 +214,7 @@ async def load_candidates(
             Memo.archived_at.is_(None),
             Memo.created_at >= start_of_local_day_utc(settings.start_date, settings.timezone),
             ~delivered,
+            ~mailed_by_previous_image,
         )
         .order_by(Memo.created_at.asc(), Memo.id.asc())
     )

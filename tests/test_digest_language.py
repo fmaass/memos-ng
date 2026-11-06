@@ -26,6 +26,7 @@ from tests.digest_support import (
     FakeTransport,
     add_recipients,
     delivery_rows,
+    group_rows,
     insert_run,
     plain_part,
     reset_digest_state,
@@ -85,7 +86,12 @@ async def _seed_photo_memos(subject: str, data_root, count: int) -> list[int]:
 
 
 def _ledger() -> set[tuple[int, str]]:
-    return {(row["memo_id"], row["language"]) for row in delivery_rows()}
+    return {(row["memo_id"], row["language"]) for row in group_rows()}
+
+
+def _legacy() -> set[int]:
+    """What the PREVIOUS image reads after a rollback: one row per memo, any group."""
+    return {row["memo_id"] for row in delivery_rows()}
 
 
 class _FirstSendRaises(FakeTransport):
@@ -212,6 +218,7 @@ async def test_two_languages_send_two_localized_mails_and_the_run_records_both_g
     assert row["groups_attempted"] == ["de", "en"]
     assert row["groups_accepted"] == ["de", "en"]
     assert _ledger() == {(m, lang) for m in memo_ids for lang in ("de", "en")}
+    assert _legacy() == set(memo_ids)
 
 
 async def test_a_rejected_group_writes_no_rows_while_the_accepted_group_commits(env):
@@ -225,6 +232,8 @@ async def test_a_rejected_group_writes_no_rows_while_the_accepted_group_commits(
 
     assert result is not None and result.status == digest_runner.PARTIAL
     assert _ledger() == {(m, "en") for m in memo_ids}
+    # The previous image cannot tell groups apart: after a rollback it must not mail these again.
+    assert _legacy() == set(memo_ids)
     row = run_rows()[0]
     assert row["status"] == digest_runner.PARTIAL
     assert row["groups_attempted"] == ["de", "en"]
@@ -268,9 +277,7 @@ async def test_the_next_run_reselects_exactly_the_refused_groups_memos(env):
     assert second["groups_attempted"] == ["de"]
     assert second["groups_accepted"] == ["de"]
     second_rows = {
-        (row["memo_id"], row["language"])
-        for row in delivery_rows()
-        if row["run_id"] == second["id"]
+        (row["memo_id"], row["language"]) for row in group_rows() if row["run_id"] == second["id"]
     }
     assert second_rows == {(m, "de") for m in memo_ids}
 
@@ -303,7 +310,10 @@ async def test_a_group_with_nothing_new_is_not_attempted_while_another_group_sen
     engine = create_engine(SYNC_URL)
     with engine.begin() as conn:
         conn.execute(
-            text("INSERT INTO digest_deliveries (memo_id, run_id, language) VALUES (:m, :r, 'de')"),
+            text(
+                "INSERT INTO digest_group_deliveries (memo_id, run_id, language) "
+                "VALUES (:m, :r, 'de')"
+            ),
             {"m": memo_ids[0], "r": insert_run(status="sent")},
         )
     engine.dispose()
@@ -328,6 +338,7 @@ async def test_every_group_refused_is_a_failed_run_not_a_partial_one(env):
 
     assert result is not None and result.status == digest_runner.FAILED
     assert delivery_rows() == []
+    assert group_rows() == []
     assert run_rows()[0]["groups_accepted"] == []
 
 
@@ -383,9 +394,41 @@ def _alembic_config() -> Config:
     return Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
 
 
-def test_the_migration_backfills_existing_deliveries_with_todays_single_recipient_language(
-    db_engine,
-):
+# The previous image's ledger write, verbatim in shape: it names `memo_id` as the conflict target.
+PREVIOUS_IMAGE_INSERT = (
+    "INSERT INTO digest_deliveries (memo_id, run_id, part_index, incomplete) "
+    "VALUES (:m, :r, 1, false) ON CONFLICT (memo_id) DO NOTHING"
+)
+
+
+def _primary_key(conn, table: str) -> list[str]:
+    return list(
+        conn.execute(
+            text(
+                "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
+                "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                "WHERE i.indrelid = CAST(:t AS regclass) AND i.indisprimary "
+                "ORDER BY array_position(i.indkey, a.attnum)"
+            ),
+            {"t": table},
+        ).scalars()
+    )
+
+
+def _digest_tables(conn) -> set[str]:
+    return set(
+        conn.execute(
+            text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name LIKE 'digest%'"
+            )
+        ).scalars()
+    )
+
+
+def test_the_migration_backfills_the_group_ledger_and_leaves_the_legacy_ledger_alone(db_engine):
+    """Expand only: the previous image keeps its table, its key and its insert shape, so a retag
+    after this migration is a rollback, not an outage."""
     config = _alembic_config()
     engine = create_engine(SYNC_URL)
     subject = f"digest-lang-mig-{secrets.token_hex(4)}"
@@ -405,7 +448,7 @@ def test_the_migration_backfills_existing_deliveries_with_todays_single_recipien
                     ),
                     {"uid": f"{subject}-{index}", "owner": user_id},
                 ).scalar_one()
-                for index in range(2)
+                for index in range(3)
             ]
             run_id = conn.execute(
                 text(
@@ -413,35 +456,55 @@ def test_the_migration_backfills_existing_deliveries_with_todays_single_recipien
                     "VALUES ('scheduled', 'sent', '2026-07-01') RETURNING id"
                 )
             ).scalar_one()
-            for memo_id in memo_ids:
+            for memo_id in memo_ids[:2]:
                 conn.execute(
                     text("INSERT INTO digest_deliveries (memo_id, run_id) VALUES (:m, :r)"),
                     {"m": memo_id, "r": run_id},
                 )
             conn.execute(text("INSERT INTO digest_recipients (email) VALUES ('old@example.com')"))
+            legacy_before = set(
+                conn.execute(
+                    text("SELECT memo_id, run_id, part_index, incomplete FROM digest_deliveries")
+                ).all()
+            )
 
         command.upgrade(config, "head")
 
-        with engine.connect() as conn:
-            delivered = set(
-                conn.execute(text("SELECT memo_id, language FROM digest_deliveries")).all()
+        with engine.begin() as conn:
+            grouped = set(
+                conn.execute(text("SELECT memo_id, language FROM digest_group_deliveries")).all()
             )
             recipient_languages = set(
                 conn.execute(text("SELECT language FROM digest_recipients")).scalars()
             )
-            key = list(
+            legacy_after = set(
                 conn.execute(
-                    text(
-                        "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
-                        "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-                        "WHERE i.indrelid = 'digest_deliveries'::regclass AND i.indisprimary "
-                        "ORDER BY array_position(i.indkey, a.attnum)"
-                    )
-                ).scalars()
+                    text("SELECT memo_id, run_id, part_index, incomplete FROM digest_deliveries")
+                ).all()
+            )
+            legacy_key = _primary_key(conn, "digest_deliveries")
+            group_key = _primary_key(conn, "digest_group_deliveries")
+            # The previous image's write, after the upgrade: a fresh memo lands, a delivered one
+            # is a no-op rather than a key violation.
+            conn.execute(text(PREVIOUS_IMAGE_INSERT), {"m": memo_ids[2], "r": run_id})
+            conn.execute(text(PREVIOUS_IMAGE_INSERT), {"m": memo_ids[0], "r": run_id})
+            legacy_written = set(
+                conn.execute(text("SELECT memo_id FROM digest_deliveries")).scalars()
             )
         assert recipient_languages == {"de"}
-        assert delivered == {(m, "de") for m in memo_ids}
-        assert key == ["memo_id", "language"]
+        assert grouped == {(m, "de") for m in memo_ids[:2]}
+        assert legacy_after == legacy_before
+        assert legacy_key == ["memo_id"]
+        assert group_key == ["memo_id", "language"]
+        assert legacy_written == set(memo_ids)
+
+        command.downgrade(config, BEFORE_LANGUAGE_REVISION)
+        with engine.connect() as conn:
+            tables = _digest_tables(conn)
+            legacy_kept = set(conn.execute(text("SELECT memo_id FROM digest_deliveries")).scalars())
+        assert "digest_group_deliveries" not in tables
+        assert "digest_deliveries" in tables
+        assert legacy_kept == set(memo_ids), "the downgrade lost history the previous image needs"
     finally:
         command.upgrade(config, "head")
         reset_digest_state()
@@ -469,15 +532,18 @@ def test_a_memo_is_registered_once_per_language(db_engine):
             ).scalar_one()
         run_id = insert_run(status="sent")
         insert = text(
-            "INSERT INTO digest_deliveries (memo_id, run_id, language) VALUES (:m, :r, :l)"
+            "INSERT INTO digest_group_deliveries (memo_id, run_id, language) VALUES (:m, :r, :l)"
         )
         with engine.begin() as conn:
             conn.execute(insert, {"m": memo_id, "r": run_id, "l": "de"})
             conn.execute(insert, {"m": memo_id, "r": run_id, "l": "en"})
-        with pytest.raises(Exception, match="digest_deliveries_pkey"), engine.begin() as conn:
+        with (
+            pytest.raises(Exception, match="digest_group_deliveries_pkey"),
+            engine.begin() as conn,
+        ):
             conn.execute(insert, {"m": memo_id, "r": run_id, "l": "de"})
         with (
-            pytest.raises(Exception, match="ck_digest_deliveries_language"),
+            pytest.raises(Exception, match="ck_digest_group_deliveries_language"),
             engine.begin() as conn,
         ):
             conn.execute(insert, {"m": memo_id, "r": run_id, "l": "fr"})
@@ -517,3 +583,239 @@ async def test_an_empty_test_send_speaks_the_asked_language(env):
         address="admin@x", empty=True, language="es", transport=transport, now_utc=NOW
     )
     assert i18n.text("es", "mail.empty") in plain_part(transport.sent[0].message)
+
+
+# --- rollback safety: the legacy ledger (MEMNG-1245 review round 1) ----------------------------
+
+
+async def test_a_memo_delivered_to_the_es_group_has_a_legacy_row(env):
+    subject, data_root = env
+    add_recipients("tia@example.com", language="es")
+    memo_ids = await _seed_photo_memos(subject, data_root, 1)
+
+    result = await digest_runner.run_digest(transport=FakeTransport(), now_utc=NOW)
+
+    assert result is not None and result.status == digest_runner.SENT
+    assert _ledger() == {(memo_ids[0], "es")}
+    assert [(row["memo_id"], row["run_id"]) for row in delivery_rows()] == [
+        (memo_ids[0], run_rows()[0]["id"])
+    ]
+
+
+async def test_a_memo_the_previous_image_mailed_after_a_rollback_is_no_groups_candidate(env):
+    """A legacy row with no group row at all was written by the previous image, which mailed
+    every recipient: rolling forward again must not mail that memo to any group a second time."""
+    subject, data_root = env
+    add_recipients(*GERMAN, language="de")
+    add_recipients(*ENGLISH, language="en")
+    memo_ids = await _seed_photo_memos(subject, data_root, 2)
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        conn.execute(
+            text(PREVIOUS_IMAGE_INSERT), {"m": memo_ids[0], "r": insert_run(status="sent")}
+        )
+    engine.dispose()
+
+    result = await digest_runner.run_digest(
+        trigger=DigestTrigger.manual, transport=FakeTransport(), now_utc=NOW
+    )
+
+    assert result is not None and result.status == digest_runner.SENT
+    assert _ledger() == {(memo_ids[1], "de"), (memo_ids[1], "en")}
+
+
+# --- a group that comes alive inherits the history (MEMNG-1245 review round 1) -----------------
+
+RECIPIENTS = "/api/admin/digest/recipients"
+
+
+def _recipient_id(client, email: str) -> int:
+    return next(r["id"] for r in client.get(RECIPIENTS).json() if r["email"] == email)
+
+
+def _group_row(memo_id: int, language: str) -> None:
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO digest_group_deliveries (memo_id, language, run_id) "
+                "VALUES (:m, :l, :r)"
+            ),
+            {"m": memo_id, "l": language, "r": insert_run(status="sent")},
+        )
+    engine.dispose()
+
+
+def _rows_of(run_id: int, language: str) -> set[int]:
+    return {
+        row["memo_id"]
+        for row in group_rows()
+        if row["run_id"] == run_id and row["language"] == language
+    }
+
+
+async def test_moving_a_recipient_from_de_to_es_sends_no_previously_delivered_memo(
+    env, admin_client
+):
+    subject, data_root = env
+    client, _ = admin_client
+    add_recipients(*GERMAN, language="de")
+    old = await _seed_photo_memos(subject, data_root, 2)
+    first = await digest_runner.run_digest(transport=FakeTransport(), now_utc=NOW)
+    assert first is not None and first.status == digest_runner.SENT
+
+    moved = client.patch(
+        f"{RECIPIENTS}/{_recipient_id(client, GERMAN[0])}", json={"language": "es"}
+    )
+    assert moved.status_code == 200, moved.text
+    assert {(m, "es") for m in old} <= _ledger(), (
+        "the PATCH did not seed the group it brought alive"
+    )
+    [new] = await _seed_photo_memos(f"{subject}-later", data_root, 1)
+    transport = FakeTransport()
+    second = await digest_runner.run_digest(
+        trigger=DigestTrigger.manual, transport=transport, now_utc=LATER
+    )
+
+    assert second is not None and second.status == digest_runner.SENT
+    assert [mail.recipients for mail in transport.sent] == [GERMAN[1:], GERMAN[:1]]
+    assert _rows_of(second.run_id, "es") == {new}
+    assert _rows_of(second.run_id, "de") == {new}
+
+
+async def test_the_same_move_with_more_history_than_max_memos_per_run_does_not_abort_the_run(
+    env, admin_client
+):
+    """Without the seed the es group's first selection is the whole history, which is over the cap
+    and fails the run every morning from then on."""
+    subject, data_root = env
+    client, _ = admin_client
+    set_digest_settings(max_memos_per_run=3)
+    add_recipients(*GERMAN, language="de")
+    old = await _seed_photo_memos(subject, data_root, 3)
+    first = await digest_runner.run_digest(transport=FakeTransport(), now_utc=NOW)
+    assert first is not None and first.status == digest_runner.SENT
+
+    moved = client.patch(
+        f"{RECIPIENTS}/{_recipient_id(client, GERMAN[0])}", json={"language": "es"}
+    )
+    assert moved.status_code == 200, moved.text
+    [new] = await _seed_photo_memos(f"{subject}-later", data_root, 1)
+    second = await digest_runner.run_digest(
+        trigger=DigestTrigger.manual, transport=FakeTransport(), now_utc=LATER
+    )
+
+    assert second is not None and second.status == digest_runner.SENT, second.error
+    assert {m for m, language in _ledger() if language == "es"} == set(old) | {new}
+
+
+async def test_a_recipient_joining_an_already_active_group_seeds_nothing(env, admin_client):
+    subject, data_root = env
+    client, _ = admin_client
+    add_recipients(*GERMAN, language="de")
+    add_recipients(*ENGLISH, language="en")
+    memo_ids = await _seed_photo_memos(subject, data_root, 2)
+    _group_row(memo_ids[0], "de")
+    _group_row(memo_ids[1], "de")
+    _group_row(memo_ids[0], "en")  # the en group has had less than the de group
+    before = _ledger()
+
+    for email, language in (("erin@example.com", "en"), ("frieda@example.com", "de")):
+        created = client.post(RECIPIENTS, json={"email": email, "language": language})
+        assert created.status_code == 201, created.text
+    moved = client.patch(
+        f"{RECIPIENTS}/{_recipient_id(client, GERMAN[0])}", json={"language": "en"}
+    )
+    assert moved.status_code == 200, moved.text
+
+    assert _ledger() == before
+
+
+async def test_re_enabling_the_only_recipient_of_a_group_seeds_it(env, admin_client):
+    subject, data_root = env
+    client, _ = admin_client
+    add_recipients(*GERMAN, language="de")
+    add_recipients("dora@example.com", language="es", enabled=False)
+    memo_ids = await _seed_photo_memos(subject, data_root, 2)
+    _group_row(memo_ids[0], "de")
+    _group_row(memo_ids[1], "en")  # a group that has since gone quiet still counts as history
+
+    enabled = client.patch(
+        f"{RECIPIENTS}/{_recipient_id(client, 'dora@example.com')}", json={"enabled": True}
+    )
+
+    assert enabled.status_code == 200, enabled.text
+    assert {m for m, language in _ledger() if language == "es"} == set(memo_ids)
+
+
+async def test_creating_the_first_recipient_of_a_language_seeds_it(env, admin_client):
+    subject, data_root = env
+    client, _ = admin_client
+    add_recipients(*GERMAN, language="de")
+    memo_ids = await _seed_photo_memos(subject, data_root, 2)
+    _group_row(memo_ids[0], "de")
+
+    created = client.post(RECIPIENTS, json={"email": "carol@example.com", "language": "en"})
+
+    assert created.status_code == 201, created.text
+    assert _ledger() == {(memo_ids[0], "de"), (memo_ids[0], "en")}
+
+
+# --- per-part commits inside a group (MEMNG-1245 review round 1) -------------------------------
+
+
+async def test_a_two_part_group_whose_second_part_is_refused_keeps_the_first_parts_rows(env):
+    subject, data_root = env
+    add_recipients(*GERMAN, language="de")
+    add_recipients(*ENGLISH, language="en")
+    memo_ids = await _seed_photo_memos(subject, data_root, 2)
+    set_digest_settings(max_email_bytes=6000)  # one photo memo per part
+    # Sends 1 and 2 are the de group's two parts, 3 and 4 the en group's.
+    transport = FakeTransport(refusals_by_part={2: _refused(GERMAN)})
+
+    result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
+
+    assert result is not None and result.status == digest_runner.PARTIAL
+    assert len(transport.sent) == 4
+    de_rows = [row for row in group_rows() if row["language"] == "de"]
+    assert [(row["memo_id"], row["part_index"]) for row in de_rows] == [(memo_ids[0], 1)]
+    assert {m for m, language in _ledger() if language == "en"} == set(memo_ids)
+    row = run_rows()[0]
+    assert row["status"] == digest_runner.PARTIAL
+    assert row["groups_attempted"] == ["de", "en"]
+    assert row["groups_accepted"] == ["en"]
+
+
+# --- the alert counts every run that refused a group (MEMNG-1245 review round 1) ---------------
+
+
+def _set_groups(run_id: int, attempted: list[str]) -> None:
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE digest_runs SET groups_attempted = :g WHERE id = :i"),
+            {"g": attempted, "i": run_id},
+        )
+    engine.dispose()
+
+
+async def test_a_partial_run_then_an_all_refused_run_raise_the_alert(env):
+    insert_run(trigger="scheduled", status="partial", local_date=date(2026, 7, 1))
+    failed = insert_run(trigger="scheduled", status="failed", local_date=date(2026, 7, 2))
+    _set_groups(failed, ["de", "en"])
+    assert await _alert_value() == 1.0
+
+
+async def test_two_all_refused_runs_in_a_row_raise_the_alert(env):
+    for day in (1, 2):
+        run_id = insert_run(trigger="scheduled", status="failed", local_date=date(2026, 7, day))
+        _set_groups(run_id, ["de"])
+    assert await _alert_value() == 1.0
+
+
+async def test_a_failed_run_that_never_reached_a_group_ends_the_streak(env):
+    """A guard or the over-cap check failed it before any mail: the stale alert's failure, not a
+    group being refused."""
+    insert_run(trigger="scheduled", status="partial", local_date=date(2026, 7, 1))
+    insert_run(trigger="scheduled", status="failed", local_date=date(2026, 7, 2))
+    assert await _alert_value() == 0.0

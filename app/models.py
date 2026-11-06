@@ -1607,14 +1607,8 @@ class DigestRun(Base):
 
 
 class DigestDelivery(Base):
-    """The registry of what has already been mailed: one row per memo AND LANGUAGE, forever. It is
-    what stops a memo being sent twice to one language group across runs, so `(memo_id,
-    language)` is the primary key and not merely indexed (MEMNG-1245: a run sends one mail per
-    language group, and a group whose mail was refused must be able to get the memo later while an
-    accepted group never sees it again — one row per memo could not tell the two apart).
-
-    `language` carries no server default, for the reason `run_id` does not: a delivery that forgot
-    to say which group got the memo would silently close that memo for a group that never saw it.
+    """The registry of what has already been mailed: one row per memo, forever. It is what stops a
+    memo being sent twice across runs, so `memo_id` is the primary key and not merely indexed.
 
     `run_id` is NOT NULL and carries NO server default, deliberately. It is a required FK, and a
     default would let an insert that forgot it either fail obscurely on the FK or — worse — attach
@@ -1628,8 +1622,37 @@ class DigestDelivery(Base):
     """
 
     __tablename__ = "digest_deliveries"
+
+    memo_id: Mapped[int] = mapped_column(
+        ForeignKey("memos.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("digest_runs.id"), index=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    part_index: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    # The memo went out with some of its media left off (shed to stay under max_email_bytes).
+    incomplete: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+
+
+class DigestGroupDelivery(Base):
+    """The per-language-group delivery ledger (MEMNG-1245): one row per memo AND language a run
+    mailed it to, forever. A run sends one mail per language group, and only this key can tell a
+    group whose mail was refused (it gets the memo later) from one that was accepted (it never sees
+    the memo again). Selection anti-joins THIS table per group.
+
+    It sits BESIDE `digest_deliveries` rather than replacing its key, so the previous image keeps
+    working after a rollback: every accepted group's commit also writes the legacy row
+    (`ON CONFLICT (memo_id) DO NOTHING`), and the legacy reader then sees every memo that any group
+    has had and re-sends nothing.
+
+    `language` and `run_id` carry no server default for the reason `DigestDelivery.run_id` does
+    not: an insert that forgot either must fail rather than silently close a memo for a group.
+    """
+
+    __tablename__ = "digest_group_deliveries"
     __table_args__ = (
-        CheckConstraint(_in("language", DIGEST_LANGUAGES), name="ck_digest_deliveries_language"),
+        CheckConstraint(
+            _in("language", DIGEST_LANGUAGES), name="ck_digest_group_deliveries_language"
+        ),
     )
 
     memo_id: Mapped[int] = mapped_column(
@@ -1639,7 +1662,6 @@ class DigestDelivery(Base):
     run_id: Mapped[int] = mapped_column(ForeignKey("digest_runs.id"), index=True)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     part_index: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
-    # The memo went out with some of its media left off (shed to stay under max_email_bytes).
     incomplete: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 

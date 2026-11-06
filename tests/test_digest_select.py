@@ -188,7 +188,7 @@ async def test_a_memo_with_a_delivery_row_is_excluded(adb):
     )
     await adb.execute(
         text(
-            "INSERT INTO digest_deliveries (memo_id, run_id, language) "
+            "INSERT INTO digest_group_deliveries (memo_id, run_id, language) "
             "VALUES (:memo_id, :run_id, 'de')"
         ),
         {"memo_id": delivered.id, "run_id": run_id},
