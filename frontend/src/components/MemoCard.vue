@@ -170,6 +170,7 @@ function confirmDeleteMemo() {
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Delete', severity: 'danger' },
+    defaultFocus: 'reject',
     accept: () => emit('delete-memo', props.memo.uid),
   })
 }
@@ -284,6 +285,7 @@ function onAttachPrint({ uid, file, variantKey, replacing }: AttachPrintPayload)
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Replace' },
+    defaultFocus: 'reject',
     accept: () => emit('attach-print', { uid, file, variantKey }),
   })
 }
@@ -295,6 +297,7 @@ function onRemovePrint({ uid, variantKey }: { uid: string; variantKey: string })
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Remove', severity: 'danger' },
+    defaultFocus: 'reject',
     accept: () => emit('remove-print', { uid, variantKey }),
   })
 }
@@ -306,6 +309,7 @@ function onDeleteAttachment(uid: string) {
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Delete', severity: 'danger' },
+    defaultFocus: 'reject',
     accept: () => emit('delete-attachment', uid),
   })
 }

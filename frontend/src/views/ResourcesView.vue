@@ -544,6 +544,7 @@ function onAttachPrint({ uid, file, variantKey, replacing }: AttachPrintPayload)
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Replace' },
+    defaultFocus: 'reject',
     accept: () => printMaster.attach({ uid, file, variantKey }),
   })
 }
@@ -555,6 +556,7 @@ function onRemovePrint({ uid, variantKey }: { uid: string; variantKey: string })
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Remove', severity: 'danger' },
+    defaultFocus: 'reject',
     accept: () => printMaster.remove({ uid, variantKey }),
   })
 }
@@ -566,6 +568,7 @@ function onDelete(uid: string) {
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Cancel', severity: 'secondary', outlined: true },
     acceptProps: { label: 'Delete', severity: 'danger' },
+    defaultFocus: 'reject',
     accept: async () => {
       if (!(await deleteAttachment(api, uid))) {
         toast.add({ severity: 'error', summary: 'Delete failed', life: 4000 })

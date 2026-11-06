@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import MemoCard from '@/components/MemoCard.vue'
+import type { LightboxHandlers } from '@/composables/useMediaLightbox'
 
 // The Delete action routes through PrimeVue's confirm dialog (a service with no ConfirmDialog
 // mounted in these unit specs). Mock useConfirm so we can capture the options and invoke accept().
@@ -468,6 +469,72 @@ describe('MemoCard', () => {
     expect(requireSpy).toHaveBeenCalledTimes(1)
     expect(requireSpy.mock.calls[0][0]).toMatchObject({ header: 'Remove all photos', defaultFocus: 'reject' })
     wrapper.unmount()
+  })
+
+  // Every other confirm on the card whose accept deletes or replaces data opens on Cancel too (MEMNG-574).
+  describe('destructive confirms open with focus on Cancel', () => {
+    type ViewerHandlers = Required<LightboxHandlers>
+
+    // The viewer's print/delete actions reach the card through the handlers it hands to open().
+    async function viewerHandlers(wrapper: ReturnType<typeof mountCard>) {
+      lightboxOpen.mockClear()
+      await wrapper.find('[data-test="tile-image"]').trigger('click')
+      expect(lightboxOpen).toHaveBeenCalledTimes(1)
+      return lightboxOpen.mock.calls[0][2] as ViewerHandlers
+    }
+
+    it('Delete memo', async () => {
+      requireSpy.mockClear()
+      const wrapper = mountCard({ memo: memo('to delete') })
+      const delItem = await openAction(wrapper, 'memo-action-delete')
+      delItem.click()
+      expect(requireSpy).toHaveBeenCalledTimes(1)
+      expect(requireSpy.mock.calls[0][0]).toMatchObject({ header: 'Delete memo', defaultFocus: 'reject' })
+      wrapper.unmount()
+    })
+
+    it('Delete media (one photo, from the editor)', async () => {
+      requireSpy.mockClear()
+      const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
+      const editItem = await openAction(wrapper, 'memo-action-edit')
+      editItem.click()
+      await nextTick()
+      await wrapper.find('[data-test="edit-remove-attachment"]').trigger('click')
+      expect(requireSpy).toHaveBeenCalledTimes(1)
+      expect(requireSpy.mock.calls[0][0]).toMatchObject({ header: 'Delete media', defaultFocus: 'reject' })
+      wrapper.unmount()
+    })
+
+    it('Replace print master (from the viewer)', async () => {
+      requireSpy.mockClear()
+      const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
+      const { onAttachPrint } = await viewerHandlers(wrapper)
+      onAttachPrint({ uid: 'img1', file: new File(['x'], 'print.tif'), variantKey: 'print', replacing: true })
+      expect(requireSpy).toHaveBeenCalledTimes(1)
+      expect(requireSpy.mock.calls[0][0]).toMatchObject({ header: 'Replace print master', defaultFocus: 'reject' })
+      wrapper.unmount()
+    })
+
+    it('Remove print master (from the viewer)', async () => {
+      requireSpy.mockClear()
+      const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
+      const { onRemovePrint } = await viewerHandlers(wrapper)
+      onRemovePrint({ uid: 'img1', variantKey: 'print' })
+      expect(requireSpy).toHaveBeenCalledTimes(1)
+      expect(requireSpy.mock.calls[0][0]).toMatchObject({ header: 'Remove print master', defaultFocus: 'reject' })
+      wrapper.unmount()
+    })
+
+    it('a first print attach replaces nothing, so it asks no confirm at all', async () => {
+      requireSpy.mockClear()
+      const wrapper = mountCard({ memo: memo('pics', [], [imageAtt('img1')]) })
+      const { onAttachPrint } = await viewerHandlers(wrapper)
+      const file = new File(['x'], 'print.tif')
+      onAttachPrint({ uid: 'img1', file, variantKey: 'print', replacing: false })
+      expect(requireSpy).not.toHaveBeenCalled()
+      expect(wrapper.emitted('attach-print')).toEqual([[{ uid: 'img1', file, variantKey: 'print' }]])
+      wrapper.unmount()
+    })
   })
 
   it('hides Remove all in the editor when the memo has no photos', async () => {
