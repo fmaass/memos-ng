@@ -4,6 +4,7 @@ import { type Ref, computed, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 import {
   type DigestConfigDraft,
+  type DigestLanguage,
   apiErrorMessage,
   draftFromSettings,
   putBodyFromDraft,
@@ -27,6 +28,7 @@ export const RUNS_LIMIT = 20
 export interface NewRecipient {
   email: string
   display_name: string | null
+  language: DigestLanguage
 }
 
 export function useDigest() {
@@ -98,7 +100,12 @@ export function useDigest() {
   const createRecipient = useMutation({
     mutationFn: async (body: NewRecipient) => {
       const { data, error, response } = await api.POST('/api/admin/digest/recipients', {
-        body: { email: body.email, display_name: body.display_name, enabled: true },
+        body: {
+          email: body.email,
+          display_name: body.display_name,
+          enabled: true,
+          language: body.language,
+        },
       })
       if (error) throw new Error(apiErrorMessage(error, response?.status))
       return data
@@ -107,10 +114,11 @@ export function useDigest() {
   })
 
   const patchRecipient = useMutation({
-    mutationFn: async (vars: { id: number; enabled: boolean }) => {
+    mutationFn: async (vars: { id: number; enabled?: boolean; language?: DigestLanguage }) => {
+      const { id, ...body } = vars
       const { data, error, response } = await api.PATCH(
         '/api/admin/digest/recipients/{recipient_id}',
-        { params: { path: { recipient_id: vars.id } }, body: { enabled: vars.enabled } },
+        { params: { path: { recipient_id: id } }, body },
       )
       if (error) throw new Error(apiErrorMessage(error, response?.status))
       return data
@@ -229,6 +237,14 @@ export function useDigest() {
     )
   }
 
+  function setRecipientLanguage(id: number, language: DigestLanguage): Promise<boolean> {
+    return runRecipientChange(
+      id,
+      () => patchRecipient.mutateAsync({ id, language }),
+      'Recipient language changed.',
+    )
+  }
+
   function removeRecipient(id: number): Promise<boolean> {
     return runRecipientChange(id, () => deleteRecipient.mutateAsync(id), 'Recipient removed.')
   }
@@ -260,6 +276,7 @@ export function useDigest() {
     setEnabled,
     addRecipient,
     setRecipientEnabled,
+    setRecipientLanguage,
     removeRecipient,
     refreshRuns,
   }

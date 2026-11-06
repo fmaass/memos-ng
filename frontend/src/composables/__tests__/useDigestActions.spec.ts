@@ -25,6 +25,8 @@ const PREVIEW = {
 function run(over: Partial<DigestRun> = {}): DigestRun {
   return {
     id: 12,
+    groups_attempted: [],
+    groups_accepted: [],
     trigger: 'manual',
     started_at: '2026-08-30T05:00:00Z',
     finished_at: null,
@@ -89,12 +91,21 @@ describe('useDigestActions', () => {
     const actions = useDigestActions()
 
     expect((await actions.sendTest(false))?.memo_count).toBe(3)
-    expect(POST).toHaveBeenCalledWith('/api/admin/digest/test-send', { body: { empty: false } })
+    expect(POST).toHaveBeenCalledWith('/api/admin/digest/test-send', {
+      body: { empty: false, language: 'de' },
+    })
     expect(actions.actionNotice.value).toMatch(/3 memos/)
 
     await actions.sendTest(true)
-    expect(POST).toHaveBeenLastCalledWith('/api/admin/digest/test-send', { body: { empty: true } })
+    expect(POST).toHaveBeenLastCalledWith('/api/admin/digest/test-send', {
+      body: { empty: true, language: 'de' },
+    })
     expect(actions.actionNotice.value).toMatch(/empty test mail/i)
+
+    await actions.sendTest(false, 'es')
+    expect(POST).toHaveBeenLastCalledWith('/api/admin/digest/test-send', {
+      body: { empty: false, language: 'es' },
+    })
   })
 
   it('reports a refused test send rather than claiming it went out', async () => {

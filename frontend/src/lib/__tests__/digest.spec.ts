@@ -5,7 +5,9 @@ import {
   type DigestConfigDraft,
   type DigestRun,
   type DigestSettings,
+  DIGEST_LANGUAGES,
   checkNewRecipient,
+  checkRecipientLanguage,
   describeNextSend,
   dirtyConfigFields,
   draftFromSettings,
@@ -56,6 +58,8 @@ function draft(over: Partial<DigestConfigDraft> = {}): DigestConfigDraft {
 function run(over: Partial<DigestRun> = {}): DigestRun {
   return {
     id: 1,
+    groups_attempted: [],
+    groups_accepted: [],
     trigger: 'scheduled',
     started_at: '2026-08-30T05:00:00Z',
     finished_at: '2026-08-30T05:01:00Z',
@@ -484,5 +488,22 @@ describe('formatMib', () => {
   it('reads a byte cap back as MiB', () => {
     expect(formatMib(20971520)).toBe('20.0 MiB')
     expect(formatMib(1048576)).toBe('1.0 MiB')
+  })
+})
+
+describe('checkRecipientLanguage', () => {
+  it.each(['de', 'es', 'en'])('accepts %s', (language) => {
+    expect(checkRecipientLanguage(language)).toEqual({ ok: true, language })
+  })
+
+  it.each(['fr', 'DE', ' de', 'de ', '', 'deu', 'english', null, undefined, 1, ['de']])(
+    'refuses %j',
+    (value) => {
+      expect(checkRecipientLanguage(value).ok).toBe(false)
+    },
+  )
+
+  it('names the three languages the API knows, in send order', () => {
+    expect(DIGEST_LANGUAGES).toEqual(['de', 'es', 'en'])
   })
 })

@@ -31,6 +31,7 @@ from jinja2 import Environment, FileSystemLoader, Template, select_autoescape
 from app.config import settings as app_settings
 from app.services import media
 from app.services.asset_paths import derived_tier_path
+from app.services.digest import i18n
 from app.services.digest.gate import FALLBACK_TIMEZONE, resolve_zone
 from app.services.digest.hosting import MediaLinks
 from app.services.digest.select import MAIL_IMAGE_TIER, Candidate
@@ -253,8 +254,12 @@ class DayGroup:
     cards: list[Card] = field(default_factory=list)
 
 
-def group_by_local_day(cards: Iterable[Card], timezone: str) -> list[DayGroup]:
-    """Cards grouped by their memo's LOCAL calendar date, newest day first (satellite parity)."""
+def group_by_local_day(
+    cards: Iterable[Card], timezone: str, language: str = "en"
+) -> list[DayGroup]:
+    """Cards grouped by their memo's LOCAL calendar date, newest day first (satellite parity).
+
+    The day is decided in the digest timezone FIRST and only then named by Babel in `language`."""
     zone = resolve_zone(timezone) or ZoneInfo(FALLBACK_TIMEZONE)
     buckets: dict[str, list[Card]] = {}
     labels: dict[str, str] = {}
@@ -262,33 +267,32 @@ def group_by_local_day(cards: Iterable[Card], timezone: str) -> list[DayGroup]:
         local = card.created_at.astimezone(zone)
         key = local.date().isoformat()
         buckets.setdefault(key, []).append(card)
-        labels.setdefault(key, local.strftime("%A, %B %-d, %Y"))
+        labels.setdefault(key, i18n.day_label(local.date(), language))
     return [
         DayGroup(date_label=labels[key], iso=key, cards=buckets[key])
         for key in sorted(buckets, reverse=True)
     ]
 
 
-def subject_date_range(day_groups: list[DayGroup]) -> str:
-    """The satellite's date range, exactly (`app/render.py:63-72`) — it is part of the subject
-    line the household recognises."""
+def subject_date_range(day_groups: list[DayGroup], language: str = "en") -> str:
+    """The satellite's date range (`app/render.py:63-72`) in `language` — in English it is still
+    exactly the line the household recognises."""
     if not day_groups:
         return ""
     dates = sorted(date.fromisoformat(group.iso) for group in day_groups)
-    lo, hi = dates[0], dates[-1]
-    if lo == hi:
-        return lo.strftime("%B %-d, %Y")
-    if lo.year == hi.year and lo.month == hi.month:
-        return f"{lo.strftime('%B %-d')} – {hi.strftime('%-d, %Y')}"
-    return f"{lo.strftime('%B %-d')} – {hi.strftime('%B %-d, %Y')}"
+    return i18n.date_range(dates[0], dates[-1], language)
 
 
-def subject_for(mail_title: str, date_range: str, part_index: int, part_total: int) -> str:
+def subject_for(
+    mail_title: str, date_range: str, part_index: int, part_total: int, language: str = "en"
+) -> str:
     """`"<mail_title> — <date range>"`, with `" (Part X of Y)"` appended only when there is more
     than one part (`app/__main__.py:252`). The single-part subject must stay byte-identical to
     what the household has been receiving."""
     base = f"{mail_title} — {date_range}" if date_range else mail_title
-    return f"{base} (Part {part_index} of {part_total})" if part_total > 1 else base
+    if part_total <= 1:
+        return base
+    return i18n.text(language, "subject.part", base=base, index=part_index, total=part_total)
 
 
 _VIDEO_REF = "!\\[[^\\]]*\\]\\([^)]*{uid}[^)]*\\)\\s*"
@@ -476,8 +480,15 @@ def render_html(
     memo_count: int,
     part_index: int = 1,
     part_total: int = 1,
+    language: str = "en",
 ) -> str:
+    def t(key: str, **values: object) -> str:
+        return i18n.text(language, key, **values)
+
     return _template().render(
+        t=t,
+        language=language,
+        summary=i18n.summary(language, memo_count, len(day_groups)),
         day_groups=day_groups,
         subject=subject,
         mail_title=mail_title,
@@ -495,6 +506,7 @@ def render_plain(
     memo_count: int,
     part_index: int = 1,
     part_total: int = 1,
+    language: str = "en",
 ) -> str:
     """The `text/plain` alternative (satellite `app/render.py:212-239`).
 
@@ -503,7 +515,7 @@ def render_plain(
     """
     lines = [subject, "=" * len(subject), ""]
     if part_total > 1:
-        lines += [f"Part {part_index} of {part_total}", ""]
+        lines += [i18n.text(language, "mail.part_of", index=part_index, total=part_total), ""]
     for day in day_groups:
         lines += [day.date_label, "-" * len(day.date_label)]
         for card in day.cards:
@@ -518,27 +530,30 @@ def render_plain(
                 # stated here, below the text, or the text part would silently lose them.
                 lines.append(" ".join(f"#{tag}" for tag in card.tags))
             if card.images:
-                lines.append(f"  [{len(card.images)} image(s)]")
+                lines.append("  " + i18n.text(language, "plain.images", count=len(card.images)))
             for video in card.videos:
                 if video.status == HOSTED:
-                    lines.append(f"  [video: {video.filename} — {video.url or ''}]")
+                    key, extra = "plain.video_hosted", {"url": video.url or ""}
                 elif video.status == PROCESSING:
-                    lines.append(f"  [video processing: {video.filename}]")
+                    key, extra = "plain.video_processing", {}
                 else:
-                    lines.append(f"  [video: {video.filename} — not hosted]")
+                    key, extra = "plain.video_not_hosted", {}
+                lines.append("  " + i18n.text(language, key, filename=video.filename, **extra))
             for shed in card.shed_links:
-                lines.append(f"  [full size: {shed.url}]")
+                lines.append("  " + i18n.text(language, "plain.full_size", url=shed.url))
             if card.overflow_count:
-                lines.append(f"  +{card.overflow_count} more (not shown)")
+                lines.append(
+                    "  " + i18n.text(language, "plain.more_not_shown", count=card.overflow_count)
+                )
         lines.append("")
-    lines.append(f"{memo_count} new memo(s) across {len(day_groups)} day(s)")
+    lines.append(i18n.text(language, "plain.summary", memos=memo_count, days=len(day_groups)))
     return "\n".join(lines)
 
 
-EMPTY_BODY_NOTE = "No memos selected."
+EMPTY_BODY_NOTE = "No memos selected."  # the English catalogue's `mail.empty`
 
 
-def render_empty(mail_title: str) -> tuple[str, str]:
+def render_empty(mail_title: str, language: str = "en") -> tuple[str, str]:
     """The "no memos selected" body a test-send falls back to, so it is always a usable SMTP probe
     (and so the probe needs no settings write anywhere in it)."""
     html = render_html(
@@ -547,6 +562,7 @@ def render_empty(mail_title: str) -> tuple[str, str]:
         mail_title=mail_title,
         date_range="",
         memo_count=0,
+        language=language,
     )
-    plain = "\n".join([mail_title, "=" * len(mail_title), "", EMPTY_BODY_NOTE])
+    plain = "\n".join([mail_title, "=" * len(mail_title), "", i18n.text(language, "mail.empty")])
     return html, plain

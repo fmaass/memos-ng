@@ -396,7 +396,8 @@ export interface paths {
         post?: never;
         /**
          * Delete Attachment
-         * @description Delete an attachment — OWNER-only (a mutation, unlike viewing). Removes its media jobs,
+         * @description Delete an attachment — its OWNER's, or any member's when it is on a guest memo (a mutation,
+         *     unlike viewing). Removes its media jobs,
          *     DB row, and all on-disk files (original + derived tiers). If it was linked to a memo, the
          *     memo keeps its text; only the media is removed.
          */
@@ -2664,6 +2665,12 @@ export interface components {
              * @default true
              */
             enabled: boolean;
+            /**
+             * Language
+             * @default de
+             * @enum {string}
+             */
+            language: "de" | "es" | "en";
         };
         /** DigestRecipientOut */
         DigestRecipientOut: {
@@ -2682,6 +2689,8 @@ export interface components {
             enabled: boolean;
             /** Id */
             id: number;
+            /** Language */
+            language: string;
         };
         /**
          * DigestRecipientPatch
@@ -2695,6 +2704,11 @@ export interface components {
             display_name?: string | null;
             /** Enabled */
             enabled?: boolean | null;
+            /**
+             * Language
+             * @enum {string|null}
+             */
+            language?: "de" | "es" | "en" | null;
         };
         /**
          * DigestRunClaimOut
@@ -2737,6 +2751,10 @@ export interface components {
              * Format: date-time
              */
             finished_at: string | null;
+            /** Groups Accepted */
+            groups_accepted: string[];
+            /** Groups Attempted */
+            groups_attempted: string[];
             /** Id */
             id: number;
             /**
@@ -2870,6 +2888,12 @@ export interface components {
              * @default false
              */
             empty: boolean;
+            /**
+             * Language
+             * @default de
+             * @enum {string}
+             */
+            language: "de" | "es" | "en";
         };
         /** DigestTestSendOut */
         DigestTestSendOut: {

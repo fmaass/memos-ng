@@ -423,7 +423,7 @@ def test_the_delivery_registry_survives_a_memo_delete_as_a_cascade(db_session):
     run = _run(trigger=DigestTrigger.manual)
     db_session.add(run)
     db_session.flush()
-    db_session.add(DigestDelivery(memo_id=memo_id, run_id=run.id))
+    db_session.add(DigestDelivery(memo_id=memo_id, run_id=run.id, language="de"))
     db_session.flush()
 
     db_session.execute(text("DELETE FROM memos WHERE id = :m"), {"m": memo_id})

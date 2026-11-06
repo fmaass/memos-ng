@@ -239,9 +239,11 @@ describe('useDigest', () => {
     seedSettings()
     const digest = useDigest()
 
-    expect(await digest.addRecipient({ email: 'a@example.test', display_name: 'A' })).toBe(true)
+    expect(
+      await digest.addRecipient({ email: 'a@example.test', display_name: 'A', language: 'es' }),
+    ).toBe(true)
     expect(POST).toHaveBeenCalledWith('/api/admin/digest/recipients', {
-      body: { email: 'a@example.test', display_name: 'A', enabled: true },
+      body: { email: 'a@example.test', display_name: 'A', enabled: true, language: 'es' },
     })
 
     expect(await digest.setRecipientEnabled(7, false)).toBe(true)

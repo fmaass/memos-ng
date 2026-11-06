@@ -58,7 +58,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as app_settings
 from app.database import async_session
-from app.models import Attachment, DigestRunStatus, DigestTrigger, HostedMediaStatus
+from app.models import (
+    DIGEST_DEFAULT_LANGUAGE,
+    DIGEST_LANGUAGES,
+    Attachment,
+    DigestRunStatus,
+    DigestTrigger,
+    HostedMediaStatus,
+)
 from app.services import media, printready
 from app.services.digest import domain, hosting, render
 from app.services.digest import select as selection_mod
@@ -87,6 +94,7 @@ SENT = DigestRunStatus.sent
 NOTHING_TO_SEND = DigestRunStatus.nothing_to_send
 DEFERRED = DigestRunStatus.deferred
 FAILED = DigestRunStatus.failed
+PARTIAL = DigestRunStatus.partial
 
 # Fifteen minutes of SILENCE, not of elapsed time. A healthy run stamps `heartbeat_at` before and
 # after every part send and after every Dropbox upload-session operation, so the longest gap it
@@ -153,6 +161,8 @@ class RenderedDigest:
     selected: list[Candidate] = field(default_factory=list)
     deferred: list[Deferral] = field(default_factory=list)
     links: MediaLinks = field(default_factory=MediaLinks)
+    # The language every word and date of these parts is written in (MEMNG-1245).
+    language: str = "en"
 
 
 def _sql_values(values: tuple[str, ...]) -> str:
@@ -290,13 +300,26 @@ async def claim_part(db: AsyncSession, run_id: int, part_index: int) -> bool:
     return claimed is not None
 
 
-async def record_progress(db: AsyncSession, run_id: int, *, parts: int, recipients: int) -> bool:
+async def record_progress(
+    db: AsyncSession,
+    run_id: int,
+    *,
+    parts: int,
+    recipients: int,
+    groups_attempted: list[str] | None = None,
+) -> bool:
     updated = await db.scalar(
         sa_text(
             "UPDATE digest_runs SET parts = :parts, recipients = :recipients, "
+            "groups_attempted = :groups, "
             "heartbeat_at = now() WHERE id = :id AND status IS NULL RETURNING id"
         ),
-        {"id": run_id, "parts": parts, "recipients": recipients},
+        {
+            "id": run_id,
+            "parts": parts,
+            "recipients": recipients,
+            "groups": list(groups_attempted or []),
+        },
     )
     await db.commit()
     return updated is not None
@@ -309,18 +332,25 @@ async def commit_part(
     part_index: int,
     memo_ids: list[int],
     incomplete_ids: set[int],
+    language: str,
+    sent_before: int | None = None,
 ) -> None:
     """This part's deliveries and its `parts_sent` advance, in ONE transaction.
 
     The fenced advance goes FIRST: if it updates no row the run is not ours any more, and the
     deliveries must not be written — so the transaction is rolled back before a single row lands.
+
+    `part_index` is the part's place in ITS group's mail (what the subject's "Part X of Y" says
+    and what the row records); `sent_before` is how many parts the whole run has committed so far,
+    which is what the fence compares — a refused group leaves the two apart (MEMNG-1245).
     """
+    previous = part_index - 1 if sent_before is None else sent_before
     advanced = await db.scalar(
         sa_text(
             "UPDATE digest_runs SET parts_sent = parts_sent + 1, heartbeat_at = now() "
             "WHERE id = :id AND parts_sent = :previous AND status IS NULL RETURNING id"
         ),
-        {"id": run_id, "previous": part_index - 1},
+        {"id": run_id, "previous": previous},
     )
     if advanced is None:
         await db.rollback()
@@ -328,12 +358,14 @@ async def commit_part(
     for memo_id in memo_ids:
         await db.execute(
             sa_text(
-                "INSERT INTO digest_deliveries (memo_id, run_id, part_index, incomplete) "
-                "VALUES (:memo_id, :run_id, :part_index, :incomplete) "
-                "ON CONFLICT (memo_id) DO NOTHING"
+                "INSERT INTO digest_deliveries "
+                "(memo_id, language, run_id, part_index, incomplete) "
+                "VALUES (:memo_id, :language, :run_id, :part_index, :incomplete) "
+                "ON CONFLICT (memo_id, language) DO NOTHING"
             ),
             {
                 "memo_id": memo_id,
+                "language": language,
                 "run_id": run_id,
                 "part_index": part_index,
                 "incomplete": memo_id in incomplete_ids,
@@ -349,6 +381,8 @@ async def finish_run(
     status: str,
     memos_sent: int = 0,
     error: str | None = None,
+    groups_attempted: list[str] | None = None,
+    groups_accepted: list[str] | None = None,
 ) -> bool:
     """The terminal write: `status`, `finished_at` and the aggregates, once, fenced.
 
@@ -359,10 +393,19 @@ async def finish_run(
     finished = await db.scalar(
         sa_text(
             "UPDATE digest_runs SET status = :status, finished_at = now(), "
-            "memos_sent = :memos_sent, error = :error, heartbeat_at = now() "
+            "memos_sent = :memos_sent, error = :error, heartbeat_at = now(), "
+            "groups_attempted = COALESCE(:attempted, groups_attempted), "
+            "groups_accepted = COALESCE(:accepted, groups_accepted) "
             "WHERE id = :id AND status IS NULL RETURNING id"
         ),
-        {"id": run_id, "status": status, "memos_sent": memos_sent, "error": error},
+        {
+            "id": run_id,
+            "status": status,
+            "memos_sent": memos_sent,
+            "error": error,
+            "attempted": groups_attempted,
+            "accepted": groups_accepted,
+        },
     )
     await db.commit()
     if finished is None:
@@ -443,11 +486,18 @@ async def load_export_config(db: AsyncSession) -> ExportConfig:
     return await load_export_settings(db)
 
 
-async def enabled_recipients(db: AsyncSession) -> list[str]:
+async def enabled_recipient_groups(db: AsyncSession) -> dict[str, list[str]]:
+    """Every language, in send order, with its enabled addresses — an empty list for a language
+    nobody reads, which the run SKIPS rather than fails (MEMNG-1245)."""
     rows = await db.execute(
-        sa_text("SELECT email FROM digest_recipients WHERE enabled IS TRUE ORDER BY email ASC")
+        sa_text(
+            "SELECT email, language FROM digest_recipients WHERE enabled IS TRUE ORDER BY email ASC"
+        )
     )
-    return [row[0] for row in rows]
+    groups: dict[str, list[str]] = {language: [] for language in DIGEST_LANGUAGES}
+    for email, language in rows:
+        groups[language].append(email)
+    return groups
 
 
 async def last_ledger_local_date(db: AsyncSession) -> date | None:
@@ -727,6 +777,7 @@ async def build_digest(
     export: ExportConfig,
     host: MediaHost | None,
     ledger: HostedLedger | None = None,
+    language: str = DIGEST_DEFAULT_LANGUAGE,
 ) -> RenderedDigest:
     """Host, render and split an already-made selection — everything up to (not including) SMTP.
 
@@ -743,7 +794,9 @@ async def build_digest(
     `export` is the caller's snapshot and is never re-read here — see `load_export_config`.
     """
     included = selection.included[: settings.max_memos_per_run]
-    rendered = RenderedDigest(selected=included, deferred=list(selection.deferred))
+    rendered = RenderedDigest(
+        selected=included, deferred=list(selection.deferred), language=language
+    )
     if not included:
         return rendered
 
@@ -783,8 +836,8 @@ async def build_digest(
         blocked_hosts=render.memos_ng_hosts(),
     )
     rendered.inline_by_cid = {image.cid: image for image in inline}
-    rendered.day_groups = render.group_by_local_day(cards, settings.timezone)
-    rendered.date_range = render.subject_date_range(rendered.day_groups)
+    rendered.day_groups = render.group_by_local_day(cards, settings.timezone, language)
+    rendered.date_range = render.subject_date_range(rendered.day_groups, language)
     split = split_into_parts(
         rendered.day_groups, build_cid_to_bytes(inline), settings.max_email_bytes
     )
@@ -800,7 +853,10 @@ def part_payload(
     part = rendered.parts[part_index - 1]
     total = len(rendered.parts)
     cards = part.cards()
-    subject = render.subject_for(settings.mail_title, rendered.date_range, part_index, total)
+    language = rendered.language
+    subject = render.subject_for(
+        settings.mail_title, rendered.date_range, part_index, total, language
+    )
     html = render.render_html(
         part.day_groups,
         subject=subject,
@@ -809,6 +865,7 @@ def part_payload(
         memo_count=len(cards),
         part_index=part_index,
         part_total=total,
+        language=language,
     )
     plain = render.render_plain(
         part.day_groups,
@@ -816,6 +873,7 @@ def part_payload(
         memo_count=len(cards),
         part_index=part_index,
         part_total=total,
+        language=language,
     )
     images = [
         rendered.inline_by_cid[cid]
@@ -929,9 +987,10 @@ async def _execute_run(
 ) -> RunResult | None:
     async with session_factory() as db:
         settings = await load_settings(db)
-        recipients = await enabled_recipients(db)
+        groups = await enabled_recipient_groups(db)
         export = await load_export_config(db)
     sender = sender_address(settings)
+    recipients = [address for addresses in groups.values() for address in addresses]
 
     # Capability and plausibility guards, all BEFORE any render or upload work (LSN-0022: never
     # claim work you structurally cannot complete). Each writes a `failed` ROW rather than staying
@@ -950,18 +1009,25 @@ async def _execute_run(
                 run_id=run_id, status=FAILED, parts=0, parts_sent=0, memos_sent=0, error=message
             )
 
-    candidates = await selection_mod.select_for_run(session_factory, settings, moment)
-    if len(candidates.included) > settings.max_memos_per_run:
-        message = (
-            f"selection {len(candidates.included)} exceeds max_memos_per_run "
-            f"{settings.max_memos_per_run}"
+    # A language nobody reads is SKIPPED: it is not a group, so it can neither fail nor make the
+    # run partial (MEMNG-1245).
+    languages = [language for language in DIGEST_LANGUAGES if groups[language]]
+    selections: dict[str, selection_mod.Selection] = {}
+    for language in languages:
+        selections[language] = await selection_mod.select_for_run(
+            session_factory, settings, moment, language=language
         )
-        async with session_factory() as db:
-            await finish_run(db, run_id, status=FAILED, error=message)
-        logger.warning("digest.run_refused", run_id=run_id, reason=message)
-        return RunResult(
-            run_id=run_id, status=FAILED, parts=0, parts_sent=0, memos_sent=0, error=message
-        )
+        if len(selections[language].included) > settings.max_memos_per_run:
+            message = (
+                f"selection {len(selections[language].included)} exceeds max_memos_per_run "
+                f"{settings.max_memos_per_run}"
+            )
+            async with session_factory() as db:
+                await finish_run(db, run_id, status=FAILED, error=message)
+            logger.warning("digest.run_refused", run_id=run_id, reason=message)
+            return RunResult(
+                run_id=run_id, status=FAILED, parts=0, parts_sent=0, memos_sent=0, error=message
+            )
 
     async def beat() -> None:
         async with session_factory() as db:
@@ -981,97 +1047,143 @@ async def _execute_run(
             run_id=run_id,
             detail="hosting is enabled but no media host is available; sending inline-only",
         )
+    rendered_by_language: dict[str, RenderedDigest] = {}
     try:
-        rendered = await build_digest(
-            session_factory,
-            settings,
-            candidates,
-            export=export,
-            host=host,
-            ledger=SessionLedger(session_factory, run_id=run_id),
-        )
+        # One render per group: each has its own backlog and its own words. A file one group's
+        # render hosted is a ledger row the next group's render reuses, never a second upload.
+        for language in languages:
+            rendered_by_language[language] = await build_digest(
+                session_factory,
+                settings,
+                selections[language],
+                export=export,
+                host=host,
+                ledger=SessionLedger(session_factory, run_id=run_id),
+                language=language,
+            )
     finally:
         # Every path, not just the happy one: the host owns an httpx client, and a run that raised
         # between here and the end would leak it once per day for as long as the fault lasted.
         if host is not None:
             await host.aclose()
 
-    if not rendered.parts:
-        status = DEFERRED if rendered.deferred else NOTHING_TO_SEND
+    attempted = [language for language in languages if rendered_by_language[language].parts]
+    if not attempted:
+        any_deferred = any(rendered.deferred for rendered in rendered_by_language.values())
+        status = DEFERRED if any_deferred else NOTHING_TO_SEND
         async with session_factory() as db:
             await finish_run(db, run_id, status=status)
         return RunResult(run_id=run_id, status=status, parts=0, parts_sent=0, memos_sent=0)
 
+    total_parts = sum(len(rendered_by_language[language].parts) for language in attempted)
     async with session_factory() as db:
-        await record_progress(db, run_id, parts=len(rendered.parts), recipients=len(recipients))
+        await record_progress(
+            db, run_id, parts=total_parts, recipients=len(recipients), groups_attempted=attempted
+        )
     active_transport = transport or default_transport()
 
     errors: list[str] = []
+    accepted: list[str] = []
+    parts_claimed = 0
     parts_sent = 0
     memos_sent = 0
-    for part_index in range(1, len(rendered.parts) + 1):
-        async with session_factory() as db:
-            claimed = await claim_part(db, run_id, part_index)
-        if not claimed:
-            logger.warning("digest.claim_lost", run_id=run_id, part=part_index)
-            return None
-        subject, html, plain, images, memo_ids, incomplete = part_payload(
-            rendered, part_index, settings
-        )
-        message = build_message(
-            subject=subject,
-            from_email=sender,
-            from_name=settings.from_name,
-            html_body=html,
-            plain_body=plain,
-            inline_images=images,
-        )
-        try:
-            refusals = await active_transport.send(message, sender, recipients)
-        except Exception as exc:  # any transport failure ends the RUN, never the worker
-            errors.append(f"part {part_index}: send failed ({type(exc).__name__})")
-            logger.warning(
-                "digest.part_send_failed", run_id=run_id, part=part_index, error=str(exc)
-            )
-            break
-        await beat()
-        if accepted_count(recipients, refusals) == 0:
-            errors.append(f"part {part_index}: refused by all {len(recipients)} recipient(s)")
-            logger.warning("digest.part_refused_by_all", run_id=run_id, part=part_index)
-            break
-        try:
+    for language in attempted:
+        rendered = rendered_by_language[language]
+        group = groups[language]
+        # Error lines keep their historic shape on a one-group run and name the group otherwise.
+        label = f"{language}: " if len(attempted) > 1 else ""
+        group_accepted = True
+        for part_index in range(1, len(rendered.parts) + 1):
+            parts_claimed += 1
             async with session_factory() as db:
-                await commit_part(
-                    db,
-                    run_id,
-                    part_index=part_index,
-                    memo_ids=memo_ids,
-                    incomplete_ids=incomplete,
+                claimed = await claim_part(db, run_id, parts_claimed)
+            if not claimed:
+                logger.warning("digest.claim_lost", run_id=run_id, part=parts_claimed)
+                return None
+            subject, html, plain, images, memo_ids, incomplete = part_payload(
+                rendered, part_index, settings
+            )
+            message = build_message(
+                subject=subject,
+                from_email=sender,
+                from_name=settings.from_name,
+                html_body=html,
+                plain_body=plain,
+                inline_images=images,
+            )
+            try:
+                refusals = await active_transport.send(message, sender, group)
+            except Exception as exc:  # any transport failure ends the GROUP, never the worker
+                errors.append(f"{label}part {part_index}: send failed ({type(exc).__name__})")
+                logger.warning(
+                    "digest.part_send_failed",
+                    run_id=run_id,
+                    language=language,
+                    part=part_index,
+                    error=str(exc),
                 )
-        except RunLost:
-            logger.warning("digest.commit_lost", run_id=run_id, part=part_index)
-            return None
-        parts_sent += 1
-        memos_sent += len(memo_ids)
-        if refusals:
-            errors.append(refusal_note(part_index, refusals))
+                group_accepted = False
+                break
+            await beat()
+            if accepted_count(group, refusals) == 0:
+                errors.append(f"{label}part {part_index}: refused by all {len(group)} recipient(s)")
+                logger.warning(
+                    "digest.part_refused_by_all", run_id=run_id, language=language, part=part_index
+                )
+                group_accepted = False
+                break
+            try:
+                async with session_factory() as db:
+                    await commit_part(
+                        db,
+                        run_id,
+                        part_index=part_index,
+                        memo_ids=memo_ids,
+                        incomplete_ids=incomplete,
+                        language=language,
+                        sent_before=parts_sent,
+                    )
+            except RunLost:
+                logger.warning("digest.commit_lost", run_id=run_id, part=parts_claimed)
+                return None
+            parts_sent += 1
+            memos_sent += len(memo_ids)
+            if refusals:
+                errors.append(label + refusal_note(part_index, refusals))
+        if group_accepted:
+            accepted.append(language)
 
-    status = SENT if parts_sent == len(rendered.parts) else FAILED
+    if accepted == attempted:
+        status = SENT
+    elif accepted:
+        status = PARTIAL
+    else:
+        status = FAILED
     error = "\n".join(errors) if errors else None
     async with session_factory() as db:
-        await finish_run(db, run_id, status=status, memos_sent=memos_sent, error=error)
+        await finish_run(
+            db,
+            run_id,
+            status=status,
+            memos_sent=memos_sent,
+            error=error,
+            groups_attempted=attempted,
+            groups_accepted=accepted,
+        )
     logger.info(
         "digest.run_finished",
         run_id=run_id,
         status=status,
-        parts=len(rendered.parts),
+        parts=total_parts,
         parts_sent=parts_sent,
         memos=memos_sent,
+        groups_attempted=attempted,
+        groups_accepted=accepted,
     )
     return RunResult(
         run_id=run_id,
         status=status,
-        parts=len(rendered.parts),
+        parts=total_parts,
         parts_sent=parts_sent,
         memos_sent=memos_sent,
         error=error,
@@ -1323,15 +1435,22 @@ async def _reconcile_pending(
 
 
 async def preview(
-    session_factory: SessionFactory = async_session, *, now_utc: datetime | None = None
+    session_factory: SessionFactory = async_session,
+    *,
+    now_utc: datetime | None = None,
+    language: str = DIGEST_DEFAULT_LANGUAGE,
 ) -> tuple[RenderedDigest, DigestConfig]:
-    """Render what would go out now. Persists nothing and uploads nothing."""
+    """Render what would go out now to the `language` group. Persists nothing, uploads nothing."""
     async with session_factory() as db:
         settings = await load_settings(db)
         export = await load_export_config(db)
     moment = now_utc or datetime.now(UTC)
-    selection = await selection_mod.select_for_run(session_factory, settings, moment)
-    rendered = await build_digest(session_factory, settings, selection, export=export, host=None)
+    selection = await selection_mod.select_for_run(
+        session_factory, settings, moment, language=language
+    )
+    rendered = await build_digest(
+        session_factory, settings, selection, export=export, host=None, language=language
+    )
     return rendered, settings
 
 
@@ -1340,6 +1459,7 @@ async def test_send(
     *,
     address: str,
     empty: bool = False,
+    language: str = DIGEST_DEFAULT_LANGUAGE,
     transport: MailTransport | None = None,
     now_utc: datetime | None = None,
 ) -> int:
@@ -1356,6 +1476,8 @@ async def test_send(
     in the request that asked. Its database reads are still taken in short sessions that are
     CLOSED before SMTP is contacted: "bounded" is about how long the work takes, not a licence to
     hold a connection through it.
+
+    `language` picks which group's mail it is: that group's selection, words and dates.
     """
     async with session_factory() as db:
         settings = await load_settings(db)
@@ -1370,7 +1492,7 @@ async def test_send(
         # and worse here because a test-send is what an admin uses to CHECK the channel.
         raise SenderIsRecipient(ERROR_SENDER_IS_RECIPIENT)
     if empty:
-        html, plain = render.render_empty(settings.mail_title)
+        html, plain = render.render_empty(settings.mail_title, language)
         message = build_message(
             subject=settings.mail_title,
             from_email=sender,
@@ -1382,10 +1504,14 @@ async def test_send(
         await active_transport.send(message, sender, [address])
         return 0
 
-    selection = await selection_mod.select_for_run(session_factory, settings, moment)
-    rendered = await build_digest(session_factory, settings, selection, export=export, host=None)
+    selection = await selection_mod.select_for_run(
+        session_factory, settings, moment, language=language
+    )
+    rendered = await build_digest(
+        session_factory, settings, selection, export=export, host=None, language=language
+    )
     if not rendered.parts:
-        html, plain = render.render_empty(settings.mail_title)
+        html, plain = render.render_empty(settings.mail_title, language)
         message = build_message(
             subject=settings.mail_title,
             from_email=sender,

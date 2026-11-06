@@ -1,5 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import SelectButton from 'primevue/selectbutton'
 import { ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -33,6 +34,7 @@ const recipients: DigestRecipient[] = [
     email: 'one@example.test',
     display_name: null,
     enabled: true,
+    language: 'de',
     added_by: 'fabian',
     added_at: '2026-08-30T10:00:00Z',
   },
@@ -41,6 +43,7 @@ const recipients: DigestRecipient[] = [
     email: 'two@example.test',
     display_name: 'Two',
     enabled: true,
+    language: 'de',
     added_by: 'fabian',
     added_at: '2026-08-30T10:00:00Z',
   },
@@ -49,6 +52,8 @@ const recipients: DigestRecipient[] = [
 function aRun(over: Partial<DigestRun> = {}): DigestRun {
   return {
     id: 1,
+    groups_attempted: [],
+    groups_accepted: [],
     trigger: 'scheduled',
     started_at: '2026-08-30T05:00:00Z',
     finished_at: '2026-08-30T05:01:00Z',
@@ -254,6 +259,7 @@ describe('DigestPanel', () => {
     await flushPromises()
     expect(digest.addRecipient).toHaveBeenCalledWith({
       email: 'three@example.test',
+      language: 'de',
       display_name: null,
     })
 
@@ -347,11 +353,23 @@ describe('DigestPanel', () => {
     expect(wrapper.find('[data-test="drawer-stub"]').attributes('data-visible')).toBe('true')
   })
 
+  it('sends the test mail in the language the selector names', async () => {
+    const wrapper = mountPanel()
+    const selector = wrapper
+      .findAllComponents(SelectButton)
+      .find((c) => c.attributes('data-test') === 'digest-test-language')
+    selector?.vm.$emit('update:modelValue', 'es')
+    await flushPromises()
+    await wrapper.find('[data-test="digest-test-send"]').trigger('click')
+    await flushPromises()
+    expect(actions.sendTest).toHaveBeenCalledWith(false, 'es')
+  })
+
   it('sends a test to the admin and claims a run', async () => {
     const wrapper = mountPanel()
     await wrapper.find('[data-test="digest-test-send"]').trigger('click')
     await flushPromises()
-    expect(actions.sendTest).toHaveBeenCalledWith(false)
+    expect(actions.sendTest).toHaveBeenCalledWith(false, 'de')
 
     await wrapper.find('[data-test="digest-run-now"]').trigger('click')
     await flushPromises()

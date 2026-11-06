@@ -1262,6 +1262,24 @@ class DigestRunStatus(enum.StrEnum):
     nothing_to_send = "nothing_to_send"
     deferred = "deferred"
     failed = "failed"
+    # At least one language group was accepted and at least one was not (MEMNG-1245). The refused
+    # group's memos stay undelivered FOR THAT LANGUAGE and are retried by the next run.
+    partial = "partial"
+
+
+class DigestLanguage(enum.StrEnum):
+    """The languages a digest recipient reads, and so the mails a run can send: one per group.
+
+    The order is the order a run sends its groups in, which is what makes a run's sends (and a
+    test's refusal of exactly one group) deterministic."""
+
+    de = "de"
+    es = "es"
+    en = "en"
+
+
+DIGEST_LANGUAGES: tuple[str, ...] = tuple(language.value for language in DigestLanguage)
+DIGEST_DEFAULT_LANGUAGE = DigestLanguage.de
 
 
 # The default is the digest design's choice (3285 §9).
@@ -1464,11 +1482,18 @@ class DigestRecipient(Base):
     the same address normalise to the same stored string and the second insert conflicts."""
 
     __tablename__ = "digest_recipients"
+    __table_args__ = (
+        CheckConstraint(_in("language", DIGEST_LANGUAGES), name="ck_digest_recipients_language"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     display_name: Mapped[str | None] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    # Which mail this recipient gets: a run sends one per language group (MEMNG-1245).
+    language: Mapped[str] = mapped_column(
+        String(2), default=DIGEST_DEFAULT_LANGUAGE.value, server_default=text("'de'")
+    )
     added_by: Mapped[str | None] = mapped_column(String(255))
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -1542,6 +1567,15 @@ class DigestRun(Base):
     recipients: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     error: Mapped[str | None] = mapped_column(Text)
     local_date: Mapped[date] = mapped_column(Date)
+    # The language groups this run mailed (a group with recipients and something new to send) and
+    # the ones whose every part was accepted (MEMNG-1245). `sent` means the two are equal; a
+    # `partial` run names the group that tomorrow's run will retry.
+    groups_attempted: Mapped[list[str]] = mapped_column(
+        ARRAY(String(2)), default=list, server_default=text("'{}'")
+    )
+    groups_accepted: Mapped[list[str]] = mapped_column(
+        ARRAY(String(2)), default=list, server_default=text("'{}'")
+    )
     # LIVENESS, which is what the stale-run sweep must test — never elapsed time. A legitimate run
     # can exceed two hours (up to `max_memos_per_run` memos, several videos each, Dropbox upload
     # sessions that allow 600 s PER OPERATION), so a sweep measuring from `started_at` would
@@ -1573,8 +1607,14 @@ class DigestRun(Base):
 
 
 class DigestDelivery(Base):
-    """The registry of what has already been mailed: one row per memo, forever. It is what stops a
-    memo being sent twice across runs, so `memo_id` is the primary key and not merely indexed.
+    """The registry of what has already been mailed: one row per memo AND LANGUAGE, forever. It is
+    what stops a memo being sent twice to one language group across runs, so `(memo_id,
+    language)` is the primary key and not merely indexed (MEMNG-1245: a run sends one mail per
+    language group, and a group whose mail was refused must be able to get the memo later while an
+    accepted group never sees it again — one row per memo could not tell the two apart).
+
+    `language` carries no server default, for the reason `run_id` does not: a delivery that forgot
+    to say which group got the memo would silently close that memo for a group that never saw it.
 
     `run_id` is NOT NULL and carries NO server default, deliberately. It is a required FK, and a
     default would let an insert that forgot it either fail obscurely on the FK or — worse — attach
@@ -1588,10 +1628,14 @@ class DigestDelivery(Base):
     """
 
     __tablename__ = "digest_deliveries"
+    __table_args__ = (
+        CheckConstraint(_in("language", DIGEST_LANGUAGES), name="ck_digest_deliveries_language"),
+    )
 
     memo_id: Mapped[int] = mapped_column(
         ForeignKey("memos.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
     )
+    language: Mapped[str] = mapped_column(String(2), primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("digest_runs.id"), index=True)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     part_index: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))

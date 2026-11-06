@@ -1688,6 +1688,16 @@
             "default": true,
             "title": "Enabled",
             "type": "boolean"
+          },
+          "language": {
+            "default": "de",
+            "enum": [
+              "de",
+              "es",
+              "en"
+            ],
+            "title": "Language",
+            "type": "string"
           }
         },
         "required": [
@@ -1728,6 +1738,10 @@
           "id": {
             "title": "Id",
             "type": "integer"
+          },
+          "language": {
+            "title": "Language",
+            "type": "string"
           }
         },
         "required": [
@@ -1735,6 +1749,7 @@
           "email",
           "display_name",
           "enabled",
+          "language",
           "added_by",
           "added_at"
         ],
@@ -1756,6 +1771,19 @@
             "title": "Enabled",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "language": {
+            "enum": [
+              "de",
+              "es",
+              "en",
+              null
+            ],
+            "title": "Language",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -1840,6 +1868,20 @@
               "null"
             ]
           },
+          "groups_accepted": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Groups Accepted",
+            "type": "array"
+          },
+          "groups_attempted": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Groups Attempted",
+            "type": "array"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
@@ -1898,7 +1940,9 @@
           "parts_claimed",
           "recipients",
           "error",
-          "local_date"
+          "local_date",
+          "groups_attempted",
+          "groups_accepted"
         ],
         "title": "DigestRunOut",
         "type": "object"
@@ -2122,6 +2166,16 @@
             "default": false,
             "title": "Empty",
             "type": "boolean"
+          },
+          "language": {
+            "default": "de",
+            "enum": [
+              "de",
+              "es",
+              "en"
+            ],
+            "title": "Language",
+            "type": "string"
           }
         },
         "title": "DigestTestSendIn",

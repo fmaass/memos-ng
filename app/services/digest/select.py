@@ -177,13 +177,16 @@ def _existing_paths_sync(paths: list[Path]) -> set[Path]:
     return {p for p in paths if p.exists()}
 
 
-async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Candidate]:
+async def load_candidates(
+    db: AsyncSession, settings: DigestConfig, *, language: str
+) -> list[Candidate]:
     """Every memo eligible by scope, archive state, start date and the delivery registry, oldest
-    first.
+    first — for ONE language group: a memo stays a candidate for `language` until a
+    `(memo, language)` row exists, whatever the other groups have had (MEMNG-1245).
 
     `NOT EXISTS` against `digest_deliveries` rather than a LEFT JOIN … IS NULL: the registry's
-    primary key IS `memo_id`, so the anti-join is a single index probe per memo and cannot
-    duplicate a row if the table ever gains a second one per memo.
+    primary key IS `(memo_id, language)`, so the anti-join is a single index probe per memo and
+    cannot duplicate a row when a memo has rows for several languages.
     """
     visibilities = SCOPE_VISIBILITIES.get(
         settings.visibility_scope, SCOPE_VISIBILITIES[DigestVisibilityScope.PUBLIC_PROTECTED]
@@ -191,7 +194,9 @@ async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Cand
     # `exists().where(...)` rather than `select(...).exists()`: identical SQL, and the leading
     # `exists` is what tells `tests/test_no_blocking_io.py`'s AST scanner that this is a SQL
     # construct and not a `Path.exists()` on the request loop.
-    delivered = exists().where(DigestDelivery.memo_id == Memo.id)
+    delivered = exists().where(
+        DigestDelivery.memo_id == Memo.id, DigestDelivery.language == language
+    )
     statement = (
         select(Memo)
         .where(
@@ -224,7 +229,11 @@ async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Cand
 
 
 async def select_for_run(
-    session_factory: Callable[[], AsyncSession], settings: DigestConfig, now_utc: datetime
+    session_factory: Callable[[], AsyncSession],
+    settings: DigestConfig,
+    now_utc: datetime,
+    *,
+    language: str,
 ) -> Selection:
     """Load the candidates and apply the readiness rule — the whole selection step of a run.
 
@@ -235,7 +244,7 @@ async def select_for_run(
     service shares with the rest of the app (ADR-0009).
     """
     async with session_factory() as db:
-        candidates = await load_candidates(db, settings)
+        candidates = await load_candidates(db, settings, language=language)
     if not candidates:
         return Selection(included=[], deferred=[])
     paths: list[Path] = []

@@ -67,6 +67,7 @@ from zoneinfo import ZoneInfo
 import structlog
 from app.database import async_session
 from app.models import (
+    DIGEST_DEFAULT_LANGUAGE,
     DigestDelivery,
     DigestRecipient,
     DigestRun,
@@ -558,6 +559,8 @@ async def run_import(
                         [
                             {
                                 "memo_id": memo_id,
+                                # The satellite mailed ONE group; it is today's single language.
+                                "language": DIGEST_DEFAULT_LANGUAGE.value,
                                 "run_id": run_id,
                                 "part_index": IMPORT_PART_INDEX,
                                 "incomplete": False,
@@ -565,7 +568,7 @@ async def run_import(
                             for memo_id in mapping.values()
                         ]
                     )
-                    .on_conflict_do_nothing(index_elements=["memo_id"])
+                    .on_conflict_do_nothing(index_elements=["memo_id", "language"])
                     .returning(DigestDelivery.memo_id)
                 )
             ).all()

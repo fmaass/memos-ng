@@ -782,7 +782,9 @@ async def test_a_test_send_uses_an_ALREADY_hosted_link_without_uploading(env):
 
 async def test_a_test_send_always_sends_even_with_an_empty_selection(env):
     transport = FakeTransport()
-    count = await digest_runner.test_send(address="admin@x", transport=transport, now_utc=NOW)
+    count = await digest_runner.test_send(
+        address="admin@x", language="en", transport=transport, now_utc=NOW
+    )
     assert count == 0
     assert len(transport.sent) == 1
     assert "No memos selected." in html_part(transport.sent[0].message)
@@ -795,7 +797,7 @@ async def test_the_empty_flag_never_consults_the_selection(env):
     await _seed_photo_memos(subject, data_root, 3)
     transport = FakeTransport()
     count = await digest_runner.test_send(
-        address="admin@x", empty=True, transport=transport, now_utc=NOW
+        address="admin@x", empty=True, language="en", transport=transport, now_utc=NOW
     )
     assert count == 0
     assert "No memos selected." in html_part(transport.sent[0].message)

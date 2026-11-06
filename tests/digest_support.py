@@ -201,16 +201,20 @@ def reset_export_settings() -> None:
     engine.dispose()
 
 
-def add_recipients(*emails: str, enabled: bool = True) -> None:
+def add_recipients(*emails: str, enabled: bool = True, language: str = "en") -> None:
+    """`language` defaults to English, the language every pre-MEMNG-1245 test asserts its bytes
+    in; the column's own default (de) is asserted by `test_digest_language.py`."""
     engine = create_engine(SYNC_URL)
     with engine.begin() as conn:
         for email in emails:
             conn.execute(
                 text(
-                    "INSERT INTO digest_recipients (email, enabled) VALUES (:email, :enabled) "
-                    "ON CONFLICT (email) DO UPDATE SET enabled = EXCLUDED.enabled"
+                    "INSERT INTO digest_recipients (email, enabled, language) "
+                    "VALUES (:email, :enabled, :language) "
+                    "ON CONFLICT (email) DO UPDATE SET enabled = EXCLUDED.enabled, "
+                    "language = EXCLUDED.language"
                 ),
-                {"email": email, "enabled": enabled},
+                {"email": email, "enabled": enabled, "language": language},
             )
     engine.dispose()
 
@@ -221,8 +225,8 @@ def run_rows() -> list[dict]:
         rows = conn.execute(
             text(
                 "SELECT id, trigger, status, parts, parts_sent, parts_claimed, memos_sent, "
-                "recipients, error, heartbeat_at, started_at, finished_at, local_date "
-                "FROM digest_runs ORDER BY id"
+                "recipients, error, heartbeat_at, started_at, finished_at, local_date, "
+                "groups_attempted, groups_accepted FROM digest_runs ORDER BY id"
             )
         ).mappings()
         result = [dict(row) for row in rows]
@@ -235,8 +239,8 @@ def delivery_rows() -> list[dict]:
     with engine.begin() as conn:
         rows = conn.execute(
             text(
-                "SELECT memo_id, run_id, part_index, incomplete FROM digest_deliveries "
-                "ORDER BY memo_id"
+                "SELECT memo_id, language, run_id, part_index, incomplete "
+                "FROM digest_deliveries ORDER BY memo_id, language"
             )
         ).mappings()
         result = [dict(row) for row in rows]
