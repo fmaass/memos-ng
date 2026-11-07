@@ -88,10 +88,13 @@ def _pass(
     return rows[0][0]
 
 
-def _synced(pass_id: int, acked_version: int) -> None:
+def _synced(pass_id: int, acked_version: int, *, acked_ago: timedelta = timedelta(0)) -> None:
+    """The ingest host acknowledged `acked_version`; `push_passes` stamps `last_push_at` in the
+    same statement as the version it acks."""
     _sql(
-        "INSERT INTO pass_sync_state (pass_id, acked_version) VALUES (:p, :v)",
-        {"p": pass_id, "v": acked_version},
+        "INSERT INTO pass_sync_state (pass_id, acked_version, last_push_at) "
+        "VALUES (:p, :v, now() - :ago)",
+        {"p": pass_id, "v": acked_version, "ago": acked_ago},
     )
 
 
@@ -143,7 +146,8 @@ GONE = timedelta(days=31)  # past the 30-day window in which an ended pass still
 
 
 def _expired_pass() -> int:
-    """A pass that ended more than 30 days ago, so it alone requires no sync."""
+    """A pass that ended more than 30 days ago: once a tick has completed since, it alone
+    requires no sync."""
     return _pass("p-expired", expires_in=-GONE)
 
 
@@ -179,16 +183,79 @@ async def test_a_pass_requires_sync_while_honoured_or_ended_within_30_days(
         _pass("p1", expires_in=-timedelta(hours=1))
     elif case == "expired_over_30_days":
         _expired_pass()
+        _cursor(datetime.now(UTC))  # a pull has completed since the expiry
     elif case == "revoked_and_acked_recently":
         _synced(_pass("p1", revoked=True, revoked_ago=timedelta(hours=1), version=2), 2)
     elif case == "revoked_and_acked_over_30_days":
-        _synced(_pass("p1", revoked=True, revoked_ago=GONE, version=2), 2)
+        _synced(_pass("p1", revoked=True, revoked_ago=GONE, version=2), 2, acked_ago=GONE)
+        _cursor(datetime.now(UTC))  # a pull has completed since the ack
     elif case == "revoked_not_acked_over_30_days":
         _synced(_pass("p1", revoked=True, revoked_ago=GONE, version=2), 1)
     elif case == "revoked_not_acked":
         _synced(_pass("p1", revoked=True, version=2), 1)
     else:
         _pass("p1", revoked=True, version=2)
+    assert _value(_scrape(client), m.REQUIRED) == required
+
+
+@pytest.mark.parametrize(
+    "last_tick_ago",
+    [
+        timedelta(days=41),  # the last tick that completed was before the outage
+        # A tick completed after the revocation while the ingest host still held an older version
+        # (`push_passes` records no ack then and the tick goes on): only the ack can anchor it.
+        timedelta(days=35),
+    ],
+)
+async def test_a_revocation_acked_after_a_long_outage_requires_sync_until_a_pull_completes(
+    clean, client, last_tick_ago
+):
+    """MEMNG-1179, the ticket's scenario. The pass is revoked while the link is down for more than
+    30 days, and the ingest host accepts a batch meanwhile (it honours the pass until it acks the
+    revocation). On reconnect `push_passes` commits the ack and the worker dies before
+    `pull_batches`: home holds no row for that batch and the pass is no longer live, so only the
+    window, measured from the ACK rather than from `revoked_at`, can say a sync is owed."""
+    _cursor(datetime.now(UTC) - last_tick_ago)
+    pass_id = _pass("p1", revoked=True, revoked_ago=timedelta(days=40), version=2)
+    _synced(pass_id, 2, acked_ago=timedelta(seconds=5))  # the ack, committed on reconnect
+    assert _value(_scrape(client), m.REQUIRED) == 1.0
+
+
+@pytest.mark.parametrize("pulled_ago", [timedelta(days=34), timedelta(0)])
+async def test_a_revoked_pass_pulled_after_its_ack_over_30_days_ago_requires_no_sync(
+    clean, client, pulled_ago
+):
+    """Once a pull has completed after the ack, the ingest host can hold nothing more for the pass
+    (it refuses uploads from the ack on), so the 30-day window from the ack is all that remains."""
+    _cursor(datetime.now(UTC) - pulled_ago)
+    pass_id = _pass("p1", revoked=True, revoked_ago=timedelta(days=40), version=2)
+    _synced(pass_id, 2, acked_ago=timedelta(days=35))
+    assert _value(_scrape(client), m.REQUIRED) == 0.0
+
+
+@pytest.mark.parametrize(
+    "known, last_sync_ago, required",
+    [
+        (True, timedelta(days=41), 1.0),  # no pull completed since the pass expired
+        (True, None, 1.0),  # no tick ever completed
+        (True, timedelta(0), 0.0),  # pulled since the expiry, which is over 30 days ago
+        # Never acked as far as home knows: the ingest host may still hold it (the 200 of its
+        # first push lost, or home died before committing the ack), so the same rule applies.
+        (False, timedelta(days=41), 1.0),
+        (False, None, 1.0),
+        (False, timedelta(0), 0.0),
+    ],
+)
+async def test_an_expired_pass_requires_sync_until_a_pull_completes_after_its_expiry(
+    clean, client, known, last_sync_ago, required
+):
+    """Expiry has the same hole: a pass that expires during an outage of more than 30 days may
+    have batches the ingest host accepted before the expiry and home has never pulled."""
+    if last_sync_ago is not None:
+        _cursor(datetime.now(UTC) - last_sync_ago)
+    pass_id = _pass("p1", expires_in=-timedelta(days=40))
+    if known:
+        _synced(pass_id, 1, acked_ago=timedelta(days=45))
     assert _value(_scrape(client), m.REQUIRED) == required
 
 
@@ -206,6 +273,7 @@ async def test_a_pass_requires_sync_while_honoured_or_ended_within_30_days(
 async def test_a_batch_home_still_owes_an_answer_requires_sync_with_no_live_pass(
     clean, client, state, kwargs, required
 ):
+    _cursor(datetime.now(UTC))
     _batch(_expired_pass(), "b1", state, **kwargs)
     assert _value(_scrape(client), m.REQUIRED) == required
 

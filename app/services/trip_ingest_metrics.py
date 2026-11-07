@@ -24,7 +24,7 @@ from anyio import fail_after, from_thread
 from prometheus_client import CollectorRegistry
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.metrics_core import Metric
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database import async_session
@@ -68,14 +68,37 @@ def _statement():
         Pass.expires_at > func.now(),
         or_(Pass.revoked_at.is_(None), ~revocation_acked),
     )
-    # Recent = the pass ended (expired or revoked, whichever came first) less than
-    # RECENT_PASS_WINDOW ago. Home cannot see a batch the ingest host has not been pulled for:
-    # one completed after the last sync, with the pass expired or its revocation acked since,
-    # leaves no home row at all. The plan's puller keeps ticking "while a pass existed in the
-    # last 30 days (to discover new batches)", so a sync stays required for as long.
-    recent_pass = exists().where(
-        func.least(Pass.expires_at, func.coalesce(Pass.revoked_at, Pass.expires_at))
-        > func.now() - RECENT_PASS_WINDOW
+    # Recent = the pass ended for the ingest host less than RECENT_PASS_WINDOW ago, or ended
+    # after the last completed pull (or no pull has completed). Home cannot see a batch the
+    # ingest host has not been pulled for: one completed after the last sync, with the pass
+    # expired or its revocation acked since, leaves no home row at all. The plan's puller keeps
+    # ticking "while a pass existed in the last 30 days (to discover new batches)", so a sync
+    # stays required for as long.
+    # The ingest host honours a pass until it expires or until it ACKS the revocation, so a
+    # revocation ends the pass at the ack (`last_push_at`, stamped in the statement that records
+    # the acked version), not at `revoked_at`: a pass revoked during an outage of more than 30 days
+    # is still accepting batches until the reconnect (MEMNG-1179).
+    revocation_ack = case(
+        (
+            and_(Pass.revoked_at.is_not(None), PassSyncState.acked_version >= Pass.version),
+            func.coalesce(PassSyncState.last_push_at, Pass.revoked_at),
+        ),
+    )
+    ended_at = func.least(Pass.expires_at, func.coalesce(revocation_ack, Pass.expires_at))
+    # Until a tick completes after the end, the window alone is not enough: a worker that dies
+    # between the ack and `pull_batches`, or a link down for 30 days past an expiry, would leave
+    # the batch unpulled and nothing saying so. `last_sync_at` is stamped only once a whole tick,
+    # `pull_batches` included, has returned. Every pass is judged so, acked or not: a missing ack
+    # does not prove the ingest host never held the pass (the 200 of a push can be lost, or home
+    # can die before committing the ack), and `push_passes` records nothing before its request.
+    last_sync_at = (
+        select(TripIngestCursor.last_sync_at).where(TripIngestCursor.id == 1).scalar_subquery()
+    )
+    unpulled_since_end = or_(last_sync_at.is_(None), last_sync_at < ended_at)
+    recent_pass = exists(
+        select(Pass.id)
+        .outerjoin(PassSyncState, PassSyncState.pass_id == Pass.id)
+        .where(or_(ended_at > func.now() - RECENT_PASS_WINDOW, unpulled_since_end))
     )
     # Unacked = home still owes the ingest host its answer: not filed yet, filed but the ack not
     # delivered, or refused but the quarantine not delivered. A delivered quarantine is settled.
