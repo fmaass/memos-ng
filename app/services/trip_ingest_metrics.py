@@ -69,10 +69,11 @@ def _statement():
         or_(Pass.revoked_at.is_(None), ~revocation_acked),
     )
     # Recent = the pass ended for the ingest host less than RECENT_PASS_WINDOW ago, or ended
-    # before the last completed pull. Home cannot see a batch the ingest host has not been pulled
-    # for: one completed after the last sync, with the pass expired or its revocation acked since,
-    # leaves no home row at all. The plan's puller keeps ticking "while a pass existed in the
-    # last 30 days (to discover new batches)", so a sync stays required for as long.
+    # after the last completed pull (or no pull has completed). Home cannot see a batch the
+    # ingest host has not been pulled for: one completed after the last sync, with the pass
+    # expired or its revocation acked since, leaves no home row at all. The plan's puller keeps
+    # ticking "while a pass existed in the last 30 days (to discover new batches)", so a sync
+    # stays required for as long.
     # The ingest host honours a pass until it expires or until it ACKS the revocation, so a
     # revocation ends the pass at the ack (`last_push_at`, stamped in the statement that records
     # the acked version), not at `revoked_at`: a pass revoked during an outage of more than 30 days
