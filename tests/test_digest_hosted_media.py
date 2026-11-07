@@ -230,7 +230,10 @@ async def test_the_ledger_row_survives_the_attachment_and_is_still_swept(env):
     engine = create_engine(SYNC_URL)
     with engine.begin() as conn:
         conn.execute(
-            text("UPDATE digest_hosted_media SET uploaded_at = now() - interval '31 days'")
+            text(
+                "UPDATE digest_hosted_media SET uploaded_at = now() - interval '31 days', "
+                "expires_at = now() - interval '1 day'"
+            )
         )
     engine.dispose()
     swept_host = FakeHost()
@@ -606,6 +609,7 @@ async def test_no_transaction_is_open_during_a_retention_delete_or_a_probe(env):
         status="uploaded",
         shared_link="https://dropbox.example/old.mp4?raw=1",
         uploaded_at=datetime(2026, 1, 1, tzinfo=UTC),
+        expires_at=datetime(2026, 1, 31, tzinfo=UTC),
     )
     stale = insert_hosted_row(
         kind="video", dropbox_path="/memos-mail/run/stuck.mp4", status="pending"

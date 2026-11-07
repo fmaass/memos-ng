@@ -42,6 +42,8 @@ from tests.conftest import SYNC_URL
 # --- database reset -----------------------------------------------------------------------------
 
 DIGEST_TABLES = (
+    "daily_sync_outbox",
+    "daily_pushes",
     "digest_group_deliveries",
     "digest_deliveries",
     "digest_hosted_media",
@@ -300,7 +302,10 @@ def age_hosted_media(attachment_id: int, *, days: int) -> None:
     with engine.begin() as conn:
         conn.execute(
             text(
-                "UPDATE digest_hosted_media SET uploaded_at = now() - make_interval(days => :d) "
+                # Time passing, for a row and its window alike: the sweep deletes by `expires_at`
+                # (MEMNG-1244), so aging only `uploaded_at` would age nothing the sweep reads.
+                "UPDATE digest_hosted_media SET uploaded_at = now() - make_interval(days => :d), "
+                "expires_at = expires_at - make_interval(days => :d) "
                 "WHERE attachment_id = :id"
             ),
             {"id": attachment_id, "d": days},

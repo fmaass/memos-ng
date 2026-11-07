@@ -16,6 +16,8 @@ That last number is why the run's liveness signal is a heartbeat and not elapsed
 """
 
 import json
+import os
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,8 +27,10 @@ import httpx
 import structlog
 from anyio import to_thread
 
+from app.services import media
 from app.services.asset_paths import derived_tier_path
-from app.services.digest.select import Candidate
+from app.services.digest.select import MAIL_IMAGE_TIER, Candidate
+from app.services.export_settings import MailProfile
 
 logger = structlog.get_logger(__name__)
 
@@ -51,8 +55,21 @@ UPLOAD_TIMEOUT_S = 120.0
 SESSION_TIMEOUT_S = 600.0
 LINK_TIMEOUT_S = 15.0
 
+# The ledger's KINDS (`digest_hosted_media.kind`). A hosted link is identified by
+# (attachment_id, kind) — one video carries an mp4 AND a poster — so every consumer names the kind
+# it wants rather than taking "the attachment's link" (MEMNG-1244).
 VIDEO = "video"
 IMAGE_FULL = "image_full"
+# Link mode (MEMNG-1244): the day page shows every photo as the 1600 px MAIL-profile JPEG and every
+# video as its poster, both from Dropbox.
+IMAGE_MAIL = "image_mail"
+POSTER = "poster"
+# What an attachments-mode card links to: a video's mp4, an image's full-size copy. An attachment
+# is one or the other, so at most one of these exists per attachment.
+ATTACHMENTS_KINDS = (VIDEO, IMAGE_FULL)
+
+# The live links the ledger knows, keyed by (attachment_id, kind).
+HostedLinks = dict[tuple[int, str], str]
 
 # Awaited after every Dropbox HTTP operation. A run's liveness stamp rides on it — see the module
 # docstring and `runner.heartbeat`.
@@ -83,6 +100,28 @@ class MediaLinks:
     # Videos whose transcoded mp4 is not on disk yet: the card shows "video still processing"
     # rather than a link, exactly as the satellite does.
     processing: set[int] = field(default_factory=set)
+
+
+@dataclass
+class LinkMedia:
+    """What a link-mode upload pass left on Dropbox for the run's days (MEMNG-1244).
+
+    `failed` is not a degradation here but a verdict: a day page with a hole in it is not
+    published, so any entry defers the run (`runner._execute_run`)."""
+
+    links: HostedLinks = field(default_factory=dict)
+    uploaded: list[HostedUpload] = field(default_factory=list)
+    failed: list[tuple[int, str]] = field(default_factory=list)
+
+
+def links_of_kinds(links: HostedLinks, kinds: tuple[str, ...]) -> dict[int, str]:
+    """One link per attachment, choosing among `kinds` in the order given."""
+    chosen: dict[int, str] = {}
+    for kind in reversed(kinds):
+        for (attachment_id, link_kind), link in links.items():
+            if link_kind == kind:
+                chosen[attachment_id] = link
+    return chosen
 
 
 class DropboxError(RuntimeError):
@@ -494,7 +533,7 @@ async def resolve_links(
     *,
     host: MediaHost | None,
     ledger: HostedLedger | None = None,
-    existing: dict[int, str],
+    existing: HostedLinks,
     max_videos_per_memo: int,
     link_images_full: bool,
     image_full_sources: dict[int, Path] | None = None,
@@ -522,8 +561,12 @@ async def resolve_links(
     question the reconciliation sweep can ask Dropbox. Accumulating the successes in memory and
     writing them once at the end (the shape this replaces) leaves an object no row names, and
     nothing can ever find it again.
+
+    `existing` is the ledger's answer BY KIND; the cards take an attachment's mp4 or full-size
+    copy (`ATTACHMENTS_KINDS`) and never its poster or mail picture, and the upload skip keys on
+    the same (attachment_id, kind) pair.
     """
-    links = MediaLinks(by_attachment=dict(existing))
+    links = MediaLinks(by_attachment=links_of_kinds(existing, ATTACHMENTS_KINDS))
     videos: list[tuple[int, str, Path]] = []
     images: list[tuple[int, str, Path]] = []
     for candidate in candidates:
@@ -552,9 +595,10 @@ async def resolve_links(
     if ledger is None:
         raise ValueError("a host without a ledger would upload an object nothing owns")
 
+    hosted = set(existing)
     for kind, group in ((VIDEO, videos), (IMAGE_FULL, images)):
         for attachment_id, filename, path in group:
-            if path not in present or attachment_id in links.by_attachment:
+            if path not in present or (attachment_id, kind) in hosted:
                 continue
             dropbox_path = host.dropbox_path_for(filename)
             ledger_id = await ledger.claim(
@@ -570,6 +614,7 @@ async def resolve_links(
                 logger.warning("digest.hosting_upload_failed", attachment_id=attachment_id)
                 continue
             await ledger.mark_uploaded(ledger_id, shared_link=link, size=size)
+            hosted.add((attachment_id, kind))
             links.by_attachment[attachment_id] = link
             links.uploaded.append(
                 HostedUpload(
@@ -581,3 +626,112 @@ async def resolve_links(
                 )
             )
     return links
+
+
+def poster_source_path(uid: str) -> Path | None:
+    resolved = derived_tier_path(uid, "poster")
+    return None if resolved is None else resolved[0]
+
+
+def image_mail_source_path(uid: str) -> Path | None:
+    """The tier a photo's MAIL picture is encoded from — the one the attachments mail inlines."""
+    resolved = derived_tier_path(uid, MAIL_IMAGE_TIER)
+    return None if resolved is None else resolved[0]
+
+
+def _encode_mail_copy_sync(source: Path, profile: MailProfile) -> Path | None:
+    """`source` re-encoded to the mail profile in a private temporary file, or None when it will
+    not read or decode (the same degradation the attachments mail applies to one photo)."""
+    try:
+        raw = source.read_bytes()
+    except OSError:
+        return None
+    image = media.encode_for_mail(raw, profile)
+    if image is None:
+        return None
+    handle, name = tempfile.mkstemp(prefix="digest-mail-", suffix=".jpg")
+    with os.fdopen(handle, "wb") as out:
+        out.write(image.data)
+    return Path(name)
+
+
+def _unlink_sync(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+async def host_link_media(
+    candidates: list[Candidate],
+    *,
+    host: MediaHost,
+    ledger: HostedLedger,
+    existing: HostedLinks,
+    max_videos_per_memo: int,
+    mail_profile: MailProfile,
+) -> LinkMedia:
+    """Put what the run's day pages show on Dropbox: per photo its 1600 px MAIL picture
+    (`image_mail`), per video its `poster` and, within `max_videos_per_memo`, its mp4 (MEMNG-1244).
+
+    The identity is (attachment_id, kind): a key `existing` already holds — from an earlier run,
+    or an earlier group of this one — is reused, never uploaded twice, and a hosted mp4 does not
+    stand in for the poster. Every upload is bracketed by the ledger exactly as in
+    `resolve_links` (claim, upload, mark), and an uploaded row carries NO `expires_at` here: its
+    window starts when its day is published (`runner.record_publication`).
+
+    A failed upload is recorded in `failed` and the pass goes on, so one run settles as many files
+    as it can; the caller defers the whole run on any failure, because a page with a missing
+    picture is not one to publish. A source not on disk yet is neither uploaded nor a failure:
+    readiness is the selection's business, and a late file is the refresh's (MEMNG-1247).
+    """
+    wanted: list[tuple[int, str, str, Path, bool]] = []
+    for candidate in candidates:
+        for ref in candidate.images:
+            source = image_mail_source_path(ref.uid)
+            if source is not None:
+                wanted.append((ref.attachment_id, IMAGE_MAIL, f"{ref.uid}.mail.jpg", source, True))
+        for index, ref in enumerate(candidate.videos):
+            poster = poster_source_path(ref.uid)
+            if poster is not None:
+                wanted.append((ref.attachment_id, POSTER, f"{ref.uid}.poster.jpg", poster, False))
+            video = video_source_path(ref.uid) if index < max_videos_per_memo else None
+            if video is not None:
+                wanted.append((ref.attachment_id, VIDEO, f"{ref.uid}.mp4", video, False))
+
+    present = await to_thread.run_sync(_existing_sync, [item[3] for item in wanted])
+    result = LinkMedia(links=dict(existing))
+    for attachment_id, kind, filename, source, encode in wanted:
+        if source not in present or (attachment_id, kind) in result.links:
+            continue
+        local = source
+        if encode:
+            encoded = await to_thread.run_sync(_encode_mail_copy_sync, source, mail_profile)
+            if encoded is None:
+                continue
+            local = encoded
+        dropbox_path = host.dropbox_path_for(filename)
+        try:
+            ledger_id = await ledger.claim(
+                attachment_id=attachment_id, kind=kind, dropbox_path=dropbox_path
+            )
+            try:
+                link, size = await host.upload(local, dropbox_path)
+            except (DropboxError, httpx.HTTPError):
+                logger.warning(
+                    "digest.hosting_upload_failed", attachment_id=attachment_id, kind=kind
+                )
+                result.failed.append((attachment_id, kind))
+                continue
+            await ledger.mark_uploaded(ledger_id, shared_link=link, size=size)
+        finally:
+            if encode:
+                await to_thread.run_sync(_unlink_sync, local)
+        result.links[(attachment_id, kind)] = link
+        result.uploaded.append(
+            HostedUpload(
+                attachment_id=attachment_id,
+                kind=kind,
+                dropbox_path=dropbox_path,
+                shared_link=link,
+                bytes=size,
+            )
+        )
+    return result

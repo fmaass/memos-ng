@@ -21,9 +21,11 @@ from app.services.digest import runner as digest_runner
 from sqlalchemy import delete
 
 from tests.digest_support import (
+    FakeHost,
     FakeTransport,
     add_recipients,
     group_rows,
+    host_factory_for,
     html_part,
     jpeg_bytes,
     plain_part,
@@ -61,6 +63,7 @@ class FakePublisher:
                 url=f"https://{self.host}/d/{day.isoformat()}-{secrets.token_hex(4)}",
                 online_until=datetime(day.year, day.month, day.day, 6, tzinfo=UTC)
                 + timedelta(days=7),
+                published_at=datetime(day.year, day.month, day.day, 6, tzinfo=UTC),
             )
             for day in days
         ]
@@ -129,7 +132,12 @@ async def test_a_link_mail_has_one_small_image_one_page_link_and_the_url_in_its_
     )
     transport, publisher = FakeTransport(), FakePublisher()
 
-    result = await digest_runner.run_digest(transport=transport, publisher=publisher, now_utc=NOW)
+    result = await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=publisher,
+        now_utc=NOW,
+    )
 
     assert result is not None and result.status == digest_runner.SENT
     assert len(transport.sent) == 1
@@ -156,7 +164,12 @@ async def test_the_mail_says_until_when_the_page_is_online_and_counts_the_day(en
     await _seed(subject, data_root, [("A day out", datetime(2026, 6, 30, 9, 0, tzinfo=UTC), 3, 1)])
     transport = FakeTransport()
 
-    await digest_runner.run_digest(transport=transport, publisher=FakePublisher(), now_utc=NOW)
+    await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=FakePublisher(),
+        now_utc=NOW,
+    )
 
     for body in (html_part(transport.sent[0].message), plain_part(transport.sent[0].message)):
         assert "Online until July 7, 2026" in body
@@ -184,7 +197,12 @@ async def test_a_three_day_run_links_the_newest_day_counts_only_that_day_and_nam
     )
     transport, publisher = FakeTransport(), FakePublisher()
 
-    await digest_runner.run_digest(transport=transport, publisher=publisher, now_utc=NOW)
+    await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=publisher,
+        now_utc=NOW,
+    )
 
     assert publisher.calls == [[date(2026, 6, 27), date(2026, 6, 28), date(2026, 6, 29)]]
     message = transport.sent[0].message
@@ -210,7 +228,12 @@ async def test_a_run_touching_more_than_seven_dates_publishes_all_and_links_the_
     await _seed(subject, data_root, specs)
     transport, publisher = FakeTransport(), FakePublisher()
 
-    await digest_runner.run_digest(transport=transport, publisher=publisher, now_utc=NOW)
+    await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=publisher,
+        now_utc=NOW,
+    )
 
     assert publisher.calls == [[date(2026, 6, 20 + n) for n in range(9)]]
     message = transport.sent[0].message
@@ -231,7 +254,12 @@ async def test_a_memos_ng_link_is_still_stripped_in_link_mode_and_the_page_host_
     await _seed(subject, data_root, [(content, datetime(2026, 6, 30, 9, 0, tzinfo=UTC), 0, 0)])
     transport = FakeTransport()
 
-    await digest_runner.run_digest(transport=transport, publisher=FakePublisher(), now_utc=NOW)
+    await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=FakePublisher(),
+        now_utc=NOW,
+    )
 
     html = html_part(transport.sent[0].message)
     assert "memos.discomarder.live" not in html
@@ -249,7 +277,9 @@ async def test_link_mode_without_a_configured_publisher_defers_and_sends_nothing
     await _seed(subject, data_root, [("x", datetime(2026, 6, 30, 9, 0, tzinfo=UTC), 1, 0)])
     transport = FakeTransport()
 
-    result = await digest_runner.run_digest(transport=transport, now_utc=NOW)
+    result = await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()), transport=transport, now_utc=NOW
+    )
 
     assert result is not None and result.status == digest_runner.DEFERRED
     assert transport.sent == []
@@ -266,7 +296,10 @@ async def test_a_publication_off_the_page_host_is_refused_and_nothing_is_sent(en
     transport = FakeTransport()
 
     result = await digest_runner.run_digest(
-        transport=transport, publisher=FakePublisher(host="memos.discomarder.live"), now_utc=NOW
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=FakePublisher(host="memos.discomarder.live"),
+        now_utc=NOW,
     )
 
     assert result is not None and result.status == digest_runner.DEFERRED
@@ -281,7 +314,12 @@ async def test_a_page_host_that_is_a_memos_ng_host_defers_the_run(env, monkeypat
     transport = FakeTransport()
     publisher = FakePublisher(host="memos.discomarder.live")
 
-    result = await digest_runner.run_digest(transport=transport, publisher=publisher, now_utc=NOW)
+    result = await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=publisher,
+        now_utc=NOW,
+    )
 
     assert result is not None and result.status == digest_runner.DEFERRED
     assert transport.sent == [] and publisher.calls == []
@@ -291,7 +329,12 @@ async def test_an_empty_link_mode_run_publishes_nothing(env):
     add_recipients(*ENGLISH, language="en")
     transport, publisher = FakeTransport(), FakePublisher()
 
-    result = await digest_runner.run_digest(transport=transport, publisher=publisher, now_utc=NOW)
+    result = await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=publisher,
+        now_utc=NOW,
+    )
 
     assert result is not None and result.status == digest_runner.NOTHING_TO_SEND
     assert publisher.calls == [] and transport.sent == []
@@ -314,7 +357,12 @@ async def test_each_language_group_gets_its_own_localized_link_mail(env):
     )
     transport, publisher = FakeTransport(), FakePublisher()
 
-    result = await digest_runner.run_digest(transport=transport, publisher=publisher, now_utc=NOW)
+    result = await digest_runner.run_digest(
+        host_factory=host_factory_for(FakeHost()),
+        transport=transport,
+        publisher=publisher,
+        now_utc=NOW,
+    )
 
     assert result is not None and result.status == digest_runner.SENT
     assert [mail.recipients for mail in transport.sent] == [GERMAN, ENGLISH]

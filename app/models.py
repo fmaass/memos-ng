@@ -26,7 +26,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy import Sequence as SqlSequence
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship, validates
 
@@ -1789,6 +1789,12 @@ class DigestHostedMedia(Base):
             "status IN ('pending', 'uploaded', 'swept')",
             name="ck_digest_hosted_media_status",
         ),
+        # The lookup's key since MEMNG-1244: a link is identified by (attachment, KIND), so a
+        # video's poster can never stand in for its mp4. Deliberately NOT unique — see
+        # `existing_hosted_links`: one attachment may legally carry several rows of one kind
+        # (swept and re-hosted, or a stale `pending` reconciled after a re-upload), and the
+        # identity is the newest `uploaded` row per key, which the lookup enforces.
+        Index("ix_digest_hosted_media_attachment_kind", "attachment_id", "kind"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -1821,3 +1827,62 @@ class DigestHostedMedia(Base):
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
     swept_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the object may be deleted (MEMNG-1244). The sweep deletes by THIS, never by age. An
+    # attachments-mode upload is stamped `uploaded_at + retention_days` as it lands; a link-mode
+    # upload stays NULL until its day is published and is then stamped `published_at +
+    # retention_days` from the day's FIRST publication (`daily_pushes`), re-stamped at every
+    # publish — so a file whose page never appeared is never swept out from under the page that
+    # a later run publishes.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DailyPush(Base):
+    """One local day published as a page on the door (MEMNG-1244, the Window).
+
+    `published_at` is the door's, minted on the day's FIRST publication and never moved by a later
+    one: it is the one clock the page and every hosted file of the day share. `retired_at` is set
+    in the same transaction that enqueues the day's `day_delete`, which is what makes "exactly one
+    retirement per day" a row lock rather than a hope.
+    """
+
+    __tablename__ = "daily_pushes"
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    page_url: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DailySyncOutboxKind(enum.StrEnum):
+    recipients = "recipients"
+    revocation = "revocation"
+    day_delete = "day_delete"
+
+
+class DailySyncOutbox(Base):
+    """What home still owes the door, durably (DD-1 S1.4).
+
+    A row is written in the transaction that decides it and stays until the door acknowledges it
+    (`acked_at`), so a door outage delays a retirement or a recipient change and never loses one.
+    MEMNG-1244 only ENQUEUES (`day_delete`, from the retention sweep); the drain is MEMNG-1247.
+    """
+
+    __tablename__ = "daily_sync_outbox"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('recipients', 'revocation', 'day_delete')",
+            name="ck_daily_sync_outbox_kind",
+        ),
+        Index(
+            "ix_daily_sync_outbox_unacked",
+            "id",
+            postgresql_where=text("acked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

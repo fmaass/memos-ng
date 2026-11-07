@@ -34,11 +34,17 @@ class PublisherUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class DayPublication:
-    """One local day's page on the door: what the mail links to and until when it answers."""
+    """One local day's page on the door: what the mail links to and until when it answers.
+
+    `published_at` is the door's clock, minted on the day's FIRST publication and kept on every
+    later one (MEMNG-1247 mints it). Home stores it on `daily_pushes` and stamps every hosted file
+    of the day `published_at + retention_days` from it (MEMNG-1244), so page and files share one
+    window."""
 
     day: date
     url: str
     online_until: datetime
+    published_at: datetime
 
 
 class DayPublisher(Protocol):
@@ -106,4 +112,6 @@ def probe_publications(
     real page (its sign-in), which keeps the probe's one link working rather than a made-up id."""
     url = f"https://{page_host()}/"
     until = now + timedelta(days=retention_days)
-    return {day: DayPublication(day=day, url=url, online_until=until) for day in days}
+    return {
+        day: DayPublication(day=day, url=url, online_until=until, published_at=now) for day in days
+    }

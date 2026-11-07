@@ -300,7 +300,7 @@ async def test_resolve_links_uploads_nothing_when_there_is_no_host(tmp_path, mon
     links = await hosting.resolve_links(
         [_candidate_with_video("vid-1", 7)],
         host=None,
-        existing={7: "https://dropbox.example/old.mp4?raw=1"},
+        existing={(7, hosting.VIDEO): "https://dropbox.example/old.mp4?raw=1"},
         max_videos_per_memo=2,
         link_images_full=False,
     )
@@ -330,7 +330,7 @@ async def test_an_already_linked_attachment_is_not_re_uploaded(tmp_path, monkeyp
         [_candidate_with_video("vid-1", 7)],
         host=host,
         ledger=ledger,
-        existing={7: "https://dropbox.example/old.mp4?raw=1"},
+        existing={(7, hosting.VIDEO): "https://dropbox.example/old.mp4?raw=1"},
         max_videos_per_memo=2,
         link_images_full=False,
     )

@@ -44,7 +44,7 @@ cleanable orphan and an unfindable one.
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -62,6 +62,7 @@ from app.models import (
     DIGEST_DEFAULT_LANGUAGE,
     DIGEST_LANGUAGES,
     Attachment,
+    DailySyncOutboxKind,
     DigestDeliveryMode,
     DigestRunStatus,
     DigestTrigger,
@@ -72,7 +73,13 @@ from app.services.digest import domain, hosting, ledger, link_mail, publish, ren
 from app.services.digest import select as selection_mod
 from app.services.digest.domain import DigestConfig, sender_address
 from app.services.digest.gate import FALLBACK_TIMEZONE, LEDGER_TRIGGERS, local_date_of, resolve_zone
-from app.services.digest.hosting import DropboxHost, HostedLedger, MediaHost, MediaLinks
+from app.services.digest.hosting import (
+    DropboxHost,
+    HostedLedger,
+    HostedLinks,
+    MediaHost,
+    MediaLinks,
+)
 from app.services.digest.mailer import (
     MailTransport,
     SmtplibTransport,
@@ -507,28 +514,36 @@ async def last_ledger_local_date(db: AsyncSession) -> date | None:
     )
 
 
-async def existing_hosted_links(db: AsyncSession, attachment_ids: list[int]) -> dict[int, str]:
-    """Links already recorded for these attachments and not yet swept.
+async def existing_hosted_links(db: AsyncSession, attachment_ids: list[int]) -> HostedLinks:
+    """Links already recorded for these attachments and not yet swept, BY KIND.
+
+    The key is (attachment_id, kind) because one attachment carries several remote objects — a
+    video's mp4 and its poster — and a lookup keyed on the attachment alone hands whichever was
+    uploaded last to every consumer, so a poster could replace the mp4 a card links to
+    (MEMNG-1244). Each consumer takes the kinds it means: the attachments mail
+    `hosting.ATTACHMENTS_KINDS`, a day page `image_mail`, `poster` and `video`.
 
     A test-send and a preview render from these and upload nothing: a probe must never create a
     Dropbox file the ledger does not know about.
 
-    `uploaded` only, and the NEWEST per attachment: a `pending` row promises no link at all, a
-    `swept` row's object is gone, and one attachment can carry several rows because a later run
-    hosts it again under a new run folder.
+    `uploaded` only, and the NEWEST per key: a `pending` row promises no link at all, a `swept`
+    row's object is gone, and one key can carry several rows because a later run hosts the file
+    again under a new run folder. That "newest per key" IS the ledger's identity — it is not a
+    unique constraint, because live rows may legally repeat a key (see the migration
+    `5b8e2f71c9d4`).
     """
     if not attachment_ids:
         return {}
     rows = await db.execute(
         sa_text(
-            "SELECT DISTINCT ON (attachment_id) attachment_id, shared_link "
+            "SELECT DISTINCT ON (attachment_id, kind) attachment_id, kind, shared_link "
             "FROM digest_hosted_media "
             "WHERE attachment_id = ANY(:ids) AND status = :status AND shared_link IS NOT NULL "
-            "ORDER BY attachment_id, uploaded_at DESC, id DESC"
+            "ORDER BY attachment_id, kind, uploaded_at DESC, id DESC"
         ),
         {"ids": attachment_ids, "status": HostedMediaStatus.uploaded},
     )
-    return {row[0]: row[1] for row in rows}
+    return {(row[0], row[1]): row[2] for row in rows}
 
 
 class SessionLedger:
@@ -540,10 +555,18 @@ class SessionLedger:
     """
 
     def __init__(
-        self, session_factory: SessionFactory = async_session, *, run_id: int | None = None
+        self,
+        session_factory: SessionFactory = async_session,
+        *,
+        run_id: int | None = None,
+        expires_after_days: int | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._run_id = run_id
+        # The attachments mail's clock: its files expire `retention_days` after they land. None
+        # for a link-mode run, whose files wait for their day's publication to be stamped
+        # (`record_publication`) — a file never expires before the page that shows it exists.
+        self._expires_after_days = expires_after_days
 
     async def claim(self, *, attachment_id: int, kind: str, dropbox_path: str) -> int:
         """Commit `dropbox_path` as `pending`, owned by this run, and return its ledger row id.
@@ -602,13 +625,15 @@ class SessionLedger:
             updated = await db.scalar(
                 sa_text(
                     "UPDATE digest_hosted_media SET status = :uploaded, shared_link = :link, "
-                    "bytes = :bytes, uploaded_at = now() "
+                    "bytes = :bytes, uploaded_at = now(), expires_at = COALESCE(expires_at, "
+                    "now() + make_interval(hours => 24 * CAST(:days AS integer))) "
                     "WHERE id = :id AND status = :pending RETURNING id"
                 ),
                 {
                     "id": ledger_id,
                     "link": shared_link,
                     "bytes": size,
+                    "days": self._expires_after_days,
                     "pending": HostedMediaStatus.pending,
                     "uploaded": HostedMediaStatus.uploaded,
                 },
@@ -1031,6 +1056,125 @@ def default_transport() -> MailTransport:
     )
 
 
+# --- link mode: hosting and the day window (MEMNG-1244) ------------------------------------------
+
+ERROR_LINK_HOSTING_UNAVAILABLE = "link mode: Dropbox hosting is unavailable"
+
+
+class LinkHostingFailed(RuntimeError):
+    """A link-mode run cannot put its days' pictures on Dropbox: it publishes and mails nothing."""
+
+
+async def _host_and_publish(
+    session_factory: SessionFactory,
+    settings: DigestConfig,
+    export: ExportConfig,
+    selections: Mapping[str, selection_mod.Selection],
+    days: list[date],
+    *,
+    run_id: int,
+    host_factory: HostFactory | None,
+    publisher: publish.DayPublisher,
+    beat: hosting.Operation,
+) -> dict[date, publish.DayPublication]:
+    """Host every file the run's day pages show, then publish the pages and open their window.
+
+    Raises `LinkHostingFailed` when there is no Dropbox host or any upload failed — before the
+    door is contacted, so no page is ever published with a hole in it — and lets the publisher's
+    `PublisherUnavailable` through. Uploads a failed publish leaves behind keep `expires_at` NULL
+    and are REUSED by the next run, whose publish stamps them."""
+    host = None if host_factory is None else await host_factory(beat)
+    if host is None:
+        raise LinkHostingFailed(ERROR_LINK_HOSTING_UNAVAILABLE)
+    candidates = list(
+        {
+            candidate.memo_id: candidate
+            for selection in selections.values()
+            for candidate in selection.included[: settings.max_memos_per_run]
+        }.values()
+    )
+    try:
+        attachment_ids = [
+            ref.attachment_id
+            for candidate in candidates
+            for ref in (*candidate.images, *candidate.videos)
+        ]
+        async with session_factory() as db:
+            existing = await existing_hosted_links(db, attachment_ids)
+        media = await hosting.host_link_media(
+            candidates,
+            host=host,
+            ledger=SessionLedger(session_factory, run_id=run_id),
+            existing=existing,
+            max_videos_per_memo=settings.max_videos_per_memo,
+            mail_profile=export.mail_profile,
+        )
+    finally:
+        await host.aclose()
+    if media.failed:
+        raise LinkHostingFailed(f"link mode: {len(media.failed)} Dropbox upload(s) failed")
+    publications = publish.checked_publications(await publisher.publish(days), days)
+    for day in days:
+        await record_publication(
+            session_factory,
+            publications[day],
+            retention_days=settings.retention_days,
+            timezone=settings.timezone,
+        )
+    return publications
+
+
+async def record_publication(
+    session_factory: SessionFactory,
+    publication: publish.DayPublication,
+    *,
+    retention_days: int,
+    timezone: str,
+) -> datetime:
+    """Record a day's publication on `daily_pushes` and open its files' window. Returns the day's
+    `published_at` — the FIRST one, kept across every later publication.
+
+    Every live (`pending` or `uploaded`) hosted file of the day — the local day, in the digest's
+    zone, of the memo its attachment belongs to — is stamped `published_at + retention_days`,
+    re-stamping reused uploads at each publication, so files and page share one clock and a file
+    that waited for a failed publish gets its window the moment a publish succeeds. One
+    transaction: a day is never recorded as published without its files being stamped."""
+    zone = resolve_zone(timezone) or ZoneInfo(FALLBACK_TIMEZONE)
+    async with session_factory() as db:
+        published_at = await db.scalar(
+            sa_text(
+                "INSERT INTO daily_pushes (day, published_at, page_url, updated_at) "
+                "VALUES (:day, :published_at, :url, now()) "
+                "ON CONFLICT (day) DO UPDATE SET page_url = EXCLUDED.page_url, updated_at = now() "
+                "RETURNING published_at"
+            ),
+            {
+                "day": publication.day,
+                "published_at": publication.published_at,
+                "url": publication.url,
+            },
+        )
+        if published_at is None:  # pragma: no cover — the row was written a statement ago
+            raise RuntimeError(f"daily push for {publication.day} vanished")
+        await db.execute(
+            sa_text(
+                "UPDATE digest_hosted_media AS m SET expires_at = :expires_at "
+                "FROM attachments AS a JOIN memos AS mo ON mo.id = a.memo_id "
+                "WHERE m.attachment_id = a.id AND m.status IN (:pending, :uploaded) "
+                "AND CAST(mo.created_at AT TIME ZONE :zone AS date) = :day"
+            ),
+            {
+                "expires_at": published_at + timedelta(days=retention_days),
+                "pending": HostedMediaStatus.pending,
+                "uploaded": HostedMediaStatus.uploaded,
+                "zone": zone.key,
+                "day": publication.day,
+            },
+        )
+        await db.commit()
+    return published_at
+
+
 # --- the run --------------------------------------------------------------------------------------
 
 
@@ -1124,9 +1268,11 @@ async def _execute_run(
     link_mode = settings.delivery_mode == DigestDeliveryMode.link
     publications: dict[date, publish.DayPublication] | None = None
     if link_mode:
-        # Link mode: the day pages are published ONCE for the run, over every group's days, before
-        # any mail is built. No page means no mail and no delivery row — DEFERRED, with the reason
-        # on the row — and never a fall-back to an attachments mail nobody chose (MEMNG-1246).
+        # Link mode: Dropbox first, page last (MEMNG-1244). Every picture and poster of the run's
+        # days is hosted, THEN the day pages are published once for the run, over every group's
+        # days, and only then is any mail built. No working Dropbox, a failed upload or no page
+        # means no mail and no delivery row — DEFERRED, with the reason on the row, which keeps the
+        # stale alert's clock still — and never a fall-back to a mail nobody chose (MEMNG-1246).
         days = sorted(
             {
                 day
@@ -1139,11 +1285,18 @@ async def _execute_run(
             if problem is not None:
                 raise publish.PublisherUnavailable(problem)
             if days:
-                active_publisher = publisher or publish.default_publisher()
-                publications = publish.checked_publications(
-                    await active_publisher.publish(days), days
+                publications = await _host_and_publish(
+                    session_factory,
+                    settings,
+                    export,
+                    selections,
+                    days,
+                    run_id=run_id,
+                    host_factory=host_factory,
+                    publisher=publisher or publish.default_publisher(),
+                    beat=beat,
                 )
-        except publish.PublisherUnavailable as exc:
+        except (publish.PublisherUnavailable, LinkHostingFailed) as exc:
             async with session_factory() as db:
                 await finish_run(db, run_id, status=DEFERRED, error=str(exc))
             logger.warning("digest.link_mode_deferred", run_id=run_id, reason=str(exc))
@@ -1152,7 +1305,7 @@ async def _execute_run(
             )
 
     host = None
-    # Link mode uploads nothing in this release: the mail carries no hosted link of its own.
+    # A link-mode mail carries no hosted link of its own: its hosting happened above, for the page.
     if host_factory is not None and not link_mode:
         host = await host_factory(beat)
     if host is None and settings.hosting_enabled and not link_mode:
@@ -1177,7 +1330,11 @@ async def _execute_run(
                 selections[language],
                 export=export,
                 host=host,
-                ledger=SessionLedger(session_factory, run_id=run_id),
+                ledger=SessionLedger(
+                    session_factory,
+                    run_id=run_id,
+                    expires_after_days=None if link_mode else settings.retention_days,
+                ),
                 language=language,
                 publications=publications,
             )
@@ -1399,11 +1556,10 @@ async def sweep_hosted_media_safe(
 
     Two kinds of row are due, and the sweep is the only thing that closes either:
 
-    * `uploaded` past `retention_days` — delete the remote object, then stamp `swept`. Age is
-      measured from `uploaded_at`, which is safe because deliveries are one-shot: a memo is
-      selected at most once, so no LATER day's mail can reference an older upload. The one
-      exception is the duplicate window in the delivery guarantee, which re-references uploads a
-      few days old at most — harmless at a 30-day retention.
+    * `uploaded` past its `expires_at` — delete the remote object, then stamp `swept`. Never by
+      age (MEMNG-1244): an attachments-mode file is stamped `uploaded_at + retention_days` as it
+      lands, a link-mode file `published_at + retention_days` when its day is published, and an
+      unstamped one (its publish has not happened yet) is not due at all.
     * `pending` past `PENDING_RECONCILE_MINUTES` — a process died between committing the intention
       and recording the result, so the remote is the only authority on what happened: present
       means the upload landed (record it, and let ordinary retention sweep it later), absent means
@@ -1416,7 +1572,11 @@ async def sweep_hosted_media_safe(
     try:
         async with session_factory() as db:
             settings = await load_settings(db)
-            due = await _due_hosted_media(db, retention_days=settings.retention_days)
+        # Days first and independent of Dropbox: a page whose window has ended is retired through
+        # the outbox even when no host can be built to delete its files.
+        await retire_expired_days(session_factory, retention_days=settings.retention_days)
+        async with session_factory() as db:
+            due = await _due_hosted_media(db)
         if not due:
             return 0
         factory = host_factory or make_dropbox_host_factory(settings, datetime.now(UTC))
@@ -1429,7 +1589,9 @@ async def sweep_hosted_media_safe(
             logger.info("digest.retention_sweep_skipped", reason="hosting unavailable")
             return 0
         try:
-            swept = await _resolve_due(session_factory, host, due)
+            swept = await _resolve_due(
+                session_factory, host, due, retention_days=settings.retention_days
+            )
         finally:
             await host.aclose()  # every path: the sweep owns this host's client
         if swept:
@@ -1442,8 +1604,36 @@ async def sweep_hosted_media_safe(
         return 0
 
 
+async def retire_expired_days(session_factory: SessionFactory, *, retention_days: int) -> int:
+    """Enqueue one `day_delete` per published day whose window has ended. Returns how many.
+
+    The door is never called from here: the outbox entry is the obligation, and its drain
+    (MEMNG-1247) retries until the door acknowledges, so a door outage delays a retirement and
+    never loses one. Marking the day `retired_at` and enqueueing happen in ONE statement, and the
+    row lock the UPDATE takes is what makes two concurrent sweeps retire a day exactly once."""
+    async with session_factory() as db:
+        rows = await db.execute(
+            sa_text(
+                "WITH retired AS ("
+                "  UPDATE daily_pushes SET retired_at = now() "
+                "  WHERE retired_at IS NULL "
+                "    AND published_at + make_interval(hours => 24 * :days) <= now() "
+                "  RETURNING day"
+                ") INSERT INTO daily_sync_outbox (kind, payload, created_at) "
+                "SELECT :kind, jsonb_build_object('day', to_char(day, 'YYYY-MM-DD')), now() "
+                "FROM retired ORDER BY day RETURNING id"
+            ),
+            {"days": retention_days, "kind": DailySyncOutboxKind.day_delete.value},
+        )
+        retired = len(rows.all())
+        await db.commit()
+    if retired:
+        logger.info("digest.days_retired", count=retired, retention_days=retention_days)
+    return retired
+
+
 async def _due_hosted_media(
-    db: AsyncSession, *, retention_days: int, stale_minutes: int = STALE_RUN_MINUTES
+    db: AsyncSession, *, stale_minutes: int = STALE_RUN_MINUTES
 ) -> list[_DueMedia]:
     """Every row the sweep may act on, and — for a `pending` one — only if nobody is still using it.
 
@@ -1465,7 +1655,7 @@ async def _due_hosted_media(
             "SELECT m.id, m.dropbox_path, m.status FROM digest_hosted_media AS m "
             "LEFT JOIN digest_runs AS r ON r.id = m.run_id "
             "WHERE (m.status = :uploaded "
-            "       AND m.uploaded_at < now() - make_interval(days => :days)) "
+            "       AND m.expires_at IS NOT NULL AND m.expires_at <= now()) "
             "   OR (m.status = :pending "
             "       AND m.created_at < now() - make_interval(mins => :mins) "
             "       AND (r.id IS NULL OR r.status IS NOT NULL "
@@ -1476,7 +1666,6 @@ async def _due_hosted_media(
         {
             "uploaded": HostedMediaStatus.uploaded,
             "pending": HostedMediaStatus.pending,
-            "days": retention_days,
             "mins": PENDING_RECONCILE_MINUTES,
             "stale": stale_minutes,
         },
@@ -1500,14 +1689,16 @@ async def _stamp_swept(session_factory: SessionFactory, row: _DueMedia) -> None:
 
 
 async def _resolve_due(
-    session_factory: SessionFactory, host: MediaHost, due: list[_DueMedia]
+    session_factory: SessionFactory, host: MediaHost, due: list[_DueMedia], *, retention_days: int
 ) -> int:
     """Delete or reconcile each due row. Returns how many objects are now gone from Dropbox."""
     swept = 0
     for row in due:
         if row.status == HostedMediaStatus.pending:
             try:
-                reconciled_away = await _reconcile_pending(session_factory, host, row)
+                reconciled_away = await _reconcile_pending(
+                    session_factory, host, row, retention_days=retention_days
+                )
             except (hosting.DropboxError, httpx.HTTPError):
                 # The probe could not answer — a 409 with a tag other than `not_found`, a 5xx, a
                 # timeout. "Unknown" is not "absent": the row is left exactly as it is and the
@@ -1529,9 +1720,13 @@ async def _resolve_due(
 
 
 async def _reconcile_pending(
-    session_factory: SessionFactory, host: MediaHost, row: _DueMedia
+    session_factory: SessionFactory, host: MediaHost, row: _DueMedia, *, retention_days: int
 ) -> bool:
-    """Ask Dropbox what happened to a stuck `pending` row. Returns whether it ended up `swept`."""
+    """Ask Dropbox what happened to a stuck `pending` row. Returns whether it ended up `swept`.
+
+    A row found present becomes `uploaded` with `expires_at` kept when its day's publication
+    already stamped it, and `retention_days` from now otherwise — a file nobody's page names must
+    still expire, or it would outlive every sweep."""
     if not await host.remote_exists(row.dropbox_path):
         await _stamp_swept(session_factory, row)
         logger.info("digest.hosted_media_reconciled", ledger_id=row.id, outcome="absent")
@@ -1541,11 +1736,14 @@ async def _reconcile_pending(
         await db.execute(
             sa_text(
                 "UPDATE digest_hosted_media SET status = :uploaded, shared_link = :link, "
-                "uploaded_at = now() WHERE id = :id AND status = :pending"
+                "uploaded_at = now(), expires_at = COALESCE(expires_at, "
+                "now() + make_interval(hours => 24 * :days)) "
+                "WHERE id = :id AND status = :pending"
             ),
             {
                 "id": row.id,
                 "link": link,
+                "days": retention_days,
                 "uploaded": HostedMediaStatus.uploaded,
                 "pending": HostedMediaStatus.pending,
             },
