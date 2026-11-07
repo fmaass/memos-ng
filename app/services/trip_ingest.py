@@ -80,11 +80,8 @@ logger = structlog.get_logger(__name__)
 ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_BATCH_FILES = 2000
-MAX_BATCH_BYTES = 50 * 1024**3
-CAPTION_MAX = 2000
-# The guest door's own bound (`guest.py` UploadIn.filename, and every filename column): a name
-# the ingest host accepted is one home can file — placement sanitizes and byte-caps it.
-FILENAME_MAX = 512
+# The file name, caption and byte rules live in `app.ingest.core`, which the guest door runs on
+# the same values (MEMNG-1200): a value the door accepted is one home files.
 DISPLAY_NAME_MAX = 64
 # The mirror's count columns (`pass_devices.uploads_count` INTEGER, `bytes_total` BIGINT): a value
 # past them fails only inside PostgreSQL, aborting the whole page's transaction.
@@ -352,39 +349,16 @@ def _datetime_or_none(value: object, what: str) -> datetime | None:
         raise Hostile(f"{what} is not a timestamp") from None
 
 
-def _text_ok(value: str) -> bool:
-    """Text PostgreSQL will store: no NUL, and no lone surrogate (JSON can escape one)."""
-    if "\x00" in value:
-        return False
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
-def _filename_ok(name: object) -> bool:
-    # A plain base name: the name reaches `place_master`, which sanitizes it, but home does not
-    # rely on that for a value the ingest host chose.
-    return (
-        isinstance(name, str)
-        and 0 < len(name) <= FILENAME_MAX
-        and not name.startswith(".")
-        and not any(c in name for c in "/\\\x00")
-        and all(c.isprintable() for c in name)
-    )
-
-
 def validate_blob(raw: object) -> BlobIn:
     if not isinstance(raw, dict):
         raise Hostile("a file entry is not an object")
     sha, size, mime, name = raw.get("sha256"), raw.get("size"), raw.get("mime"), raw.get("filename")
     if not isinstance(sha, str) or not SHA256.fullmatch(sha):
         raise Hostile("a file's sha256 is not 64 lowercase hex digits")
-    if not _is_int(size) or not 0 < size <= settings.MAX_UPLOAD_MIB * 1024 * 1024:
+    if not _is_int(size) or not ingest_core.blob_size_ok(size):
         # Fixed words, never the value: the ingest host holds home's bearer and could reflect it.
         raise Hostile(f"{sha}: the declared size is outside 1..MAX_UPLOAD_MIB")
-    if not _filename_ok(name):
+    if not ingest_core.filename_ok(name):
         raise Hostile(f"{sha}: the file name is not a plain name")
     assert isinstance(name, str)
     # The ingest host's own allowlist: one extension -> MIME map for both sides, so an honest
@@ -409,9 +383,7 @@ def validate_batch(raw: dict) -> BatchIn:
         raise Hostile("the pass id is malformed")
     if not isinstance(device_id, str) or not ID.fullmatch(device_id):
         raise Hostile("the device id is malformed or missing")
-    if caption is not None and (
-        not isinstance(caption, str) or len(caption) > CAPTION_MAX or not _text_ok(caption)
-    ):
+    if not ingest_core.caption_ok(caption):
         raise Hostile("the caption is not text of at most 2000 characters")
     blobs_raw = raw.get("blobs")
     if not isinstance(blobs_raw, list) or not 0 < len(blobs_raw) <= MAX_BATCH_FILES:
@@ -419,7 +391,7 @@ def validate_batch(raw: dict) -> BatchIn:
     blobs = tuple(validate_blob(b) for b in blobs_raw)
     if len({b.sha256 for b in blobs}) != len(blobs):
         raise Hostile("the batch names one file twice")
-    if sum(b.size for b in blobs) > MAX_BATCH_BYTES:
+    if not ingest_core.batch_bytes_ok(sum(b.size for b in blobs)):
         raise Hostile("the batch is larger than 50 GB")
     return BatchIn(
         uid=uid,
@@ -649,7 +621,9 @@ def _valid_device(raw: object) -> dict | None:
         return None
     if not (isinstance(pass_uid, str) and ID.fullmatch(pass_uid)):
         return None
-    if not (isinstance(name, str) and 0 < len(name) <= DISPLAY_NAME_MAX and _text_ok(name)):
+    if not (
+        isinstance(name, str) and 0 < len(name) <= DISPLAY_NAME_MAX and ingest_core.text_ok(name)
+    ):
         return None
     if raw.get("platform") not in PASS_DEVICE_PLATFORMS:
         return None

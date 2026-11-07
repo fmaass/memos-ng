@@ -8,6 +8,7 @@ cycle.
 """
 
 import html
+import json
 import os
 import re
 import secrets
@@ -19,8 +20,10 @@ from urllib.parse import urlsplit
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,9 +92,11 @@ REFUSALS: dict[int, str] = {
     "Completion: an upload is unknown, already completed, or not fully received.",
     410: "The pass has ended: expired, revoked or suspended.",
     413: "The file is larger than the upload limit, or one append body is larger than "
-    "max_patch_bytes or than what the upload still owes.",
-    415: "The file name is not an accepted picture or video type, or the bytes are not the type "
-    "the name says.",
+    "max_patch_bytes or than what the upload still owes. Completion: the files together are "
+    "larger than one batch can hold.",
+    415: "The file name is not a plain name (a leading dot, a path separator or an unprintable "
+    "character) or not an accepted picture or video type, or the bytes are not the type the name "
+    "says.",
     429: "Redeem: too many attempts from this address, or the pass has no room for another "
     "device. Append: too many bodies streaming at once; nothing was read or stored. Resend "
     "after Retry-After seconds.",
@@ -119,6 +124,15 @@ def _upload_offset_header() -> dict[str, Any]:
             "schema": {"type": "integer"},
         }
     }
+
+
+async def validation_refused(request: Request, exc: Exception) -> Response:
+    """FastAPI's own 422 body, written as ASCII JSON. The default handler echoes each refused
+    input back, and one holding a lone surrogate (JSON can escape one; pydantic refuses it, as
+    home refuses it in a name or caption) cannot be encoded as UTF-8: the refusal became a 500."""
+    assert isinstance(exc, RequestValidationError)
+    body = json.dumps({"detail": jsonable_encoder(exc.errors())})
+    return Response(content=body, status_code=422, media_type="application/json")
 
 
 def refusals(*statuses: int, body: bool = True) -> dict[int | str, dict[str, Any]]:
@@ -557,7 +571,7 @@ async def me(guest: Annotated[Guest, Depends(require_guest)]) -> MeOut:
 
 
 class GuestUploadIn(BaseModel):
-    filename: str = Field(min_length=1, max_length=512)
+    filename: str = Field(min_length=1, max_length=core.FILENAME_MAX)
     mime: str = Field(default="", max_length=255)
     size: int = Field(ge=1)
     # Milliseconds since 1970 that a datetime can hold (years 1 to 9999 UTC): one past either edge
@@ -674,9 +688,13 @@ async def create_upload(
     guest: Annotated[Guest, Depends(require_guest)],
     db: Annotated[AsyncSession, Depends(get_session)],
 ) -> GuestUploadOut:
+    # Home quarantines the whole batch over one name it will not file (MEMNG-1200): a leading
+    # dot, a path separator, NUL or an unprintable character is refused here, before a byte.
+    if not core.filename_ok(body.filename):
+        raise HTTPException(status_code=415, detail="This file name is not accepted")
     if core.extension_of(body.filename) is None:
         raise HTTPException(status_code=415, detail="This file type is not accepted")
-    if body.size > settings.MAX_UPLOAD_MIB * 1024 * 1024:
+    if not core.blob_size_ok(body.size):
         raise HTTPException(
             status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_MIB} MiB limit"
         )
@@ -894,7 +912,15 @@ async def append(
 
 class CompleteIn(BaseModel):
     upload_uids: list[str] = Field(min_length=1, max_length=MAX_BATCH_FILES)
-    caption: str | None = Field(default=None, max_length=2000)
+    caption: str | None = Field(default=None, max_length=core.CAPTION_MAX)
+
+    @field_validator("caption")
+    @classmethod
+    def _a_caption_home_files(cls, caption: str | None) -> str | None:
+        # Text PostgreSQL stores, by home's own rule (MEMNG-1200): no NUL, no lone surrogate.
+        if not core.caption_ok(caption):
+            raise ValueError("the caption is not text home can store")
+        return caption
 
 
 class ReceiptFile(BaseModel):
@@ -972,7 +998,7 @@ async def _discard(db: AsyncSession, row: GuestUpload) -> None:
     response_model=Receipt,
     operation_id="guestComplete",
     responses={
-        **refusals(*AUTHED, 409, 415),
+        **refusals(*AUTHED, 409, 413, 415),
         # Declaring 422 replaces FastAPI's own, and this route sends both bodies: a request that
         # fails validation, and a file whose bytes do not match its declared sha256.
         422: {
@@ -1045,6 +1071,13 @@ async def complete(
             await _discard(db, r)
             raise HTTPException(status_code=422, detail=f"{r.filename} arrived damaged")
         checked.append((r, mime, sha))
+    # The batch's bytes as home counts them, one file per distinct hash: the pass byte cap is
+    # pushed by home and is not bound to home's batch limit, so the door checks that limit too.
+    distinct = {sha: r.declared_size for r, _, sha in checked}
+    if not core.batch_bytes_ok(sum(distinct.values())):
+        raise HTTPException(
+            status_code=413, detail="These files together are more than one batch can hold"
+        )
     now = datetime.now(UTC)
     batch = IngestBatch(
         uid=secrets.token_urlsafe(16),
