@@ -194,6 +194,35 @@ All settings come from the environment (or a `.env` file). Key variables — see
 
 ## Changelog
 
+### v2.16.0
+
+Released 2026-11-07.
+
+- Hearted pictures go to the frame. With `FRAME_FAVORITES_ALBUM_ID` set, a picture that has stayed
+  hearted for `FRAME_FAVORITE_DEBOUNCE_SECONDS` (60; a re-heart restarts the wait) is queued for a
+  separate favorites album on aura-frames, through the same URL and token as the curated album, and
+  the worker spaces those uploads by `FRAME_FAVORITE_PACE_SECONDS` (10). The album id defaults to 0,
+  which disables favorites only; the curated album is unaffected either way. The queue is a new
+  `favorite_frame_jobs` table (an additive migration). Pictures hearted before this release are
+  queued by `python -m app.scripts.backfill_favorites_frame --execute`, which never uploads itself.
+- Every frame upload, curated or favorite, carries an `X-Source-Ref` header
+  (`memos-attachment:<id>`), the value aura-frames dedupes a frame's photos on.
+- A guest memo belongs to the household: any member may edit or delete it or take a picture off it,
+  not only the member who issued the pass. Nobody adds to a guest memo. Once its pass is gone, the
+  memo is guarded as a plain member memo.
+- A guest batch that spans several capture days files one memo per day, each with the batch's
+  caption, and a later part of the batch goes into the memo of its own day. A new
+  `ingest_batch_memos` table records each day's memo (an additive migration that adds one row per
+  batch already filed).
+- Delete and remove confirmations on the memo card and in Resources focus Cancel by default.
+- Attachment buckets carry `coverMime`, the cover item's media type, so a client can mark a video
+  cover without fetching the item.
+- A journaled file placement writes its token to a private temp and hard-links it onto the
+  reserved name, so a kill mid-reservation no longer leaves an empty file at that name.
+- A guest upload body that sends nothing for longer than the idle bound is cut like a disconnect:
+  the bytes received are kept, the answer is 200 with the offset they reached, and the device's
+  slot is freed.
+
 ### v2.15.0
 
 - Sign-in can find its provider by itself. An OIDC endpoint setting left empty is read once at
