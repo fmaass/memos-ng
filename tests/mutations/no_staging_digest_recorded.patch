@@ -6,11 +6,11 @@ POST /api/uploads is still open. The probe that must turn red is the route-level
 
 --- a/app/services/uploads.py
 +++ b/app/services/uploads.py
-@@ -550,7 +550,6 @@
+@@ -718,7 +718,6 @@
          # with this digest and size, so the claim has been checked against stored bytes. It is what
          # holds that row against the never-linked sweep while this session is open (MEMNG-968). A
          # miss stores nothing — an unchecked claim must not read as a digest.
 -        upload.sha256 = sha256
          await db.flush()
          return upload
-     free = await to_thread.run_sync(storage.free_bytes, part.parent)
+     if admit_space:

@@ -655,6 +655,7 @@ async def create_upload(
     reserved: int = 0,
     part_uids_out: list[str] | None = None,
     upload_uid: str | None = None,
+    admit_space: bool = True,
 ) -> Upload:
     """Open an upload session BOUND to `owner_id`. The uid is unguessable but is not a capability:
     every later verb re-checks the owner, so the binding — not the uid's secrecy — is what keeps
@@ -681,6 +682,10 @@ async def create_upload(
 
     `upload_uid` is trip filing's: it journals the part path before the empty part file exists
     (`trip_ingest._file_part`).
+
+    `admit_space=False` is trip filing's too (MEMNG-1202): it renames a blob already staged on this
+    volume onto the part, so the session needs no new space, and the admission would only hold a
+    batch open on a full disk that filing it does not fill. Every other caller keeps the default.
     """
     upload_uid = upload_uid or secrets.token_urlsafe(24)
     # Integer arithmetic, not `fromtimestamp(ms / 1000)`: the float division stores a different
@@ -716,9 +721,10 @@ async def create_upload(
         upload.sha256 = sha256
         await db.flush()
         return upload
-    free = await to_thread.run_sync(storage.free_bytes, part.parent)
-    if not has_room_for(reserved + size, free):
-        raise InsufficientSpace(size, max(free - reserved, 0))
+    if admit_space:
+        free = await to_thread.run_sync(storage.free_bytes, part.parent)
+        if not has_room_for(reserved + size, free):
+            raise InsufficientSpace(size, max(free - reserved, 0))
     _, cancelled = await finish_off_the_loop(_create_part_sync, part)
     if cancelled is not None:
         raise cancelled
