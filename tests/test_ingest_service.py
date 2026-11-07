@@ -67,11 +67,14 @@ async def test_a_pushed_lift_clears_a_suspension_standing_before_it(home_iface):
     assert out[0]["applied"] is True and out[0]["suspended_at"] is not None  # an edit lifts nothing
     out = await push(home_iface, pass_state(uid, secret, version=3, unsuspend_version=3))
     assert out[0] == {"uid": uid, "version": 3, "applied": True, "suspended_at": None}
+    # The dedicated kind, never the legacy `updated` + detail form, and only on the lift: the
+    # `pushed` rows beside it stay `updated` (MEMNG-1180).
     assert _sql(
-        "SELECT version FROM pass_events WHERE detail = 'unsuspended' "
+        "SELECT kind, version, detail FROM pass_events "
+        "WHERE (kind = 'unsuspended' OR detail = 'unsuspended') "
         "AND pass_id = (SELECT id FROM passes WHERE uid = :u)",
         {"u": uid},
-    ) == [(3,)]
+    ) == [("unsuspended", 3, "unsuspended")]
 
 
 async def test_a_stale_push_never_undoes_a_newer_state(home_iface):  # noqa: F811

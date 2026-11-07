@@ -61,8 +61,9 @@ def ip_hash(ip: str) -> str:
 
 PassState = Literal["active", "expired", "revoked", "suspended"]
 
-# The PassEvent detail this host records when a pushed lift clears its suspension; the refusal
-# count that suspends a pass starts again from the newest one.
+# The PassEvent detail this host records when a pushed lift clears its suspension, written under
+# the `unsuspended` kind (older rows carry it under `updated`); the refusal count that suspends a
+# pass starts again from the newest one.
 LIFTED = "unsuspended"
 
 

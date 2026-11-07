@@ -446,7 +446,11 @@ def test_unsuspend_raises_the_version_records_the_lift_and_owes_an_immediate_pus
         "WHERE pass_id=(SELECT id FROM passes WHERE uid=:u) ORDER BY id",
         {"u": p},
     )
-    assert [tuple(e) for e in events] == [("issued", 1, None), ("updated", 2, "unsuspend")]
+    # The dedicated kind, never the legacy `updated` + detail form (MEMNG-1180).
+    assert [tuple(e) for e in events] == [
+        ("issued", 1, None),
+        ("unsuspend_requested", 2, "unsuspend"),
+    ]
 
 
 def test_unsuspend_of_a_revoked_pass_is_410_and_changes_nothing(lib):

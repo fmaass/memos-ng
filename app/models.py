@@ -663,8 +663,9 @@ PASS_EVENT_KINDS = (
     "hidden",
     "unhidden",
     "removed",
-    # Readable since 2.13.0, written by nobody yet: 2.12.0 readers know only the legacy `updated` +
-    # detail form, so a writer flip waits for the train after this one (MEMNG-1082 #4).
+    # Readable since 2.13.0 and written since MEMNG-1180: home's lift writes `unsuspend_requested`
+    # and the ingest host's applied lift `unsuspended`. The readers keep the legacy `updated` +
+    # detail form for the rows written before the flip (MEMNG-1082 #4).
     "unsuspend_requested",
     "unsuspended",
 )

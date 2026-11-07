@@ -254,6 +254,10 @@ async def test_both_lift_forms_read_as_a_pending_lift(world):
         db.add(PassEvent(pass_id=p.id, kind="unsuspend_requested", version=7))
         await db.commit()
         assert (await passes_svc.unsuspend_versions(db, [p.id])) == {p.id: 7}
+        # The legacy form an older home wrote still reads, and the newest of either wins.
+        db.add(PassEvent(pass_id=p.id, kind="updated", version=9, detail=passes_svc.UNSUSPEND))
+        await db.commit()
+        assert (await passes_svc.unsuspend_versions(db, [p.id])) == {p.id: 9}
 
 
 def _a_bad_door_answer(kind: str):

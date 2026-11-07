@@ -146,7 +146,7 @@ async def apply_pass_state(db: AsyncSession, state: PassStateIn) -> PassPushResu
         lift = state.unsuspend_version
         if p.suspended_at is not None and lift is not None and held < lift <= state.version:
             p.suspended_at = None
-            db.add(PassEvent(pass_id=p.id, kind="updated", version=lift, detail=core.LIFTED))
+            db.add(PassEvent(pass_id=p.id, kind="unsuspended", version=lift, detail=core.LIFTED))
     if applied:
         db.add(PassEvent(pass_id=p.id, kind="updated", version=p.version, detail="pushed"))
     await db.flush()

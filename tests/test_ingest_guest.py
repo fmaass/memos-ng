@@ -201,6 +201,26 @@ async def test_a_lifted_pass_counts_only_the_refusals_after_the_lift(
     assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
 
 
+async def test_a_lift_in_the_legacy_form_still_spends_the_refusals_before_it(
+    door,  # noqa: F811
+    home_iface,  # noqa: F811
+    monkeypatch,
+):
+    """MEMNG-1180: this host now writes the `unsuspended` kind, but a lift an older one recorded
+    as `updated` + `core.LIFTED` stays in the table and must still start the count over."""
+    _, _, body = await _a_suspended_pass(door, home_iface, monkeypatch)
+    _sql(
+        "WITH lifted AS (UPDATE passes SET suspended_at = NULL RETURNING id, version) "
+        "INSERT INTO pass_events (pass_id, kind, version, detail) "
+        "SELECT id, 'updated', version, :d FROM lifted",
+        {"d": core.LIFTED},
+    )
+    await _refused(door, body, 20, 3)
+    assert _sql("SELECT suspended_at IS NULL FROM passes") == [(True,)], "a spent refusal counted"
+    await _refused(door, body, 30, 1)
+    assert _sql("SELECT suspended_at IS NOT NULL FROM passes") == [(True,)]
+
+
 async def test_an_address_past_the_hourly_refusals_is_shut_out_before_any_lookup(
     door,  # noqa: F811
     home_iface,  # noqa: F811

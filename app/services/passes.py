@@ -317,7 +317,8 @@ async def update_pass(db: AsyncSession, p: Pass, actor: User, changes: dict[str,
     return locked
 
 
-# The PassEvent detail of an owner's lift; the push carries the newest one's version.
+# The PassEvent detail of an owner's lift. It is written under the `unsuspend_requested` kind;
+# older rows carry it under `updated`. The push carries the newest lift's version.
 UNSUSPEND = "unsuspend"
 
 
@@ -328,7 +329,7 @@ async def unsuspend_pass(db: AsyncSession, p: Pass, actor: User) -> Pass:
     one set after it. A revoked pass refuses (`PassRevoked`)."""
     locked = await _lock_pass(db, p.id)
     locked.version += 1
-    await _event(db, locked, "updated", actor=actor, detail=UNSUSPEND)
+    await _event(db, locked, "unsuspend_requested", actor=actor, detail=UNSUSPEND)
     await _request_push(db, locked.id, urgent=True)
     await db.flush()
     await db.refresh(locked)
