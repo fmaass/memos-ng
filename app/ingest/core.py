@@ -174,6 +174,52 @@ def sniff_matches(path: Path, filename: str) -> str | None:
     return mime if sniff_family(header) == family else None
 
 
+# --- what home files: one predicate per rule, run by the door and by home ----------------------
+# Home quarantines a WHOLE batch over one value it will not file, so the door refuses each such
+# value with a 4xx where it first sees it. Both sides call these, so the two cannot drift.
+
+FILENAME_MAX = 512
+CAPTION_MAX = 2000
+MAX_BATCH_BYTES = 50 * 1024**3
+
+
+def text_ok(value: str) -> bool:
+    """Text PostgreSQL will store: no NUL, and no lone surrogate (JSON can escape one)."""
+    if "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def filename_ok(name: object) -> bool:
+    """A plain base name: the name reaches home's `place_master`, which sanitizes it, but home
+    does not rely on that for a value the ingest host chose."""
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= FILENAME_MAX
+        and not name.startswith(".")
+        and not any(c in name for c in "/\\\x00")
+        and all(c.isprintable() for c in name)
+    )
+
+
+def caption_ok(caption: object) -> bool:
+    return caption is None or (
+        isinstance(caption, str) and len(caption) <= CAPTION_MAX and text_ok(caption)
+    )
+
+
+def blob_size_ok(size: int) -> bool:
+    return 0 < size <= settings.MAX_UPLOAD_MIB * 1024 * 1024
+
+
+def batch_bytes_ok(total: int) -> bool:
+    return total <= MAX_BATCH_BYTES
+
+
 # --- in-process limits -------------------------------------------------------------------------
 
 

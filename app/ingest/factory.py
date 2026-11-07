@@ -10,6 +10,7 @@ from typing import Literal
 import structlog
 from anyio import to_thread
 from fastapi import APIRouter, FastAPI, Response
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from sqlalchemy import text
 from starlette.datastructures import MutableHeaders
@@ -119,6 +120,7 @@ def create_app(role: IngestRole) -> FastAPI:
     app.router.routes.extend(health_router.routes)
     if role == "ingest":
         app.router.routes.extend(guest.router.routes)
+        app.add_exception_handler(RequestValidationError, guest.validation_refused)
     elif role == "ingest-home":
         app.router.routes.extend(service_api.router.routes)
     else:

@@ -192,6 +192,8 @@ PROVOKED = {
     ("POST", "/api/guest/memos", 401): _FOREIGN_401,
     ("POST", "/api/guest/memos", 409): _G + "test_an_incomplete_upload_cannot_be_completed",
     ("POST", "/api/guest/memos", 410): _ENDED_410,
+    ("POST", "/api/guest/memos", 413): "tests/test_ingest_door_home_rules.py::"
+    + "test_a_batch_over_the_batch_byte_limit_is_refused_at_completion",
     ("POST", "/api/guest/memos", 415): _G
     + "test_the_bytes_must_be_what_the_name_says_or_the_completion_is_415[3]",
     ("POST", "/api/guest/memos", 422): _G

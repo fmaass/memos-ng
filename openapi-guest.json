@@ -567,6 +567,16 @@
             },
             "description": "The pass has ended: expired, revoked or suspended."
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes. Completion: the files together are larger than one batch can hold."
+          },
           "415": {
             "content": {
               "application/json": {
@@ -575,7 +585,7 @@
                 }
               }
             },
-            "description": "The file name is not an accepted picture or video type, or the bytes are not the type the name says."
+            "description": "The file name is not a plain name (a leading dot, a path separator or an unprintable character) or not an accepted picture or video type, or the bytes are not the type the name says."
           },
           "422": {
             "content": {
@@ -665,7 +675,7 @@
                 }
               }
             },
-            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes."
+            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes. Completion: the files together are larger than one batch can hold."
           },
           "415": {
             "content": {
@@ -675,7 +685,7 @@
                 }
               }
             },
-            "description": "The file name is not an accepted picture or video type, or the bytes are not the type the name says."
+            "description": "The file name is not a plain name (a leading dot, a path separator or an unprintable character) or not an accepted picture or video type, or the bytes are not the type the name says."
           },
           "422": {
             "content": {
@@ -878,7 +888,7 @@
                 }
               }
             },
-            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes."
+            "description": "The file is larger than the upload limit, or one append body is larger than max_patch_bytes or than what the upload still owes. Completion: the files together are larger than one batch can hold."
           },
           "422": {
             "content": {

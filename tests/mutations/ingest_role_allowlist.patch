@@ -1,11 +1,10 @@
 diff --git a/app/ingest/factory.py b/app/ingest/factory.py
-index b68ccdd..7c8d847 100644
 --- a/app/ingest/factory.py
 +++ b/app/ingest/factory.py
-@@ -119,6 +119,7 @@ def create_app(role: IngestRole) -> FastAPI:
-     app.router.routes.extend(health_router.routes)
+@@ -121,6 +121,7 @@
      if role == "ingest":
          app.router.routes.extend(guest.router.routes)
+         app.add_exception_handler(RequestValidationError, guest.validation_refused)
 +        app.router.routes.extend(service_api.router.routes)
      elif role == "ingest-home":
          app.router.routes.extend(service_api.router.routes)
