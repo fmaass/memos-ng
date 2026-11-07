@@ -27,6 +27,34 @@
         "title": "CompleteIn",
         "type": "object"
       },
+      "DeviceNameIn": {
+        "properties": {
+          "display_name": {
+            "description": "Trimmed of surrounding whitespace, then 1 to 64 Unicode code points (scalars, not grapheme clusters). A name outside that is 422 and is never shortened. The answer carries the stored, trimmed name.",
+            "maxLength": 256,
+            "title": "Display Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name"
+        ],
+        "title": "DeviceNameIn",
+        "type": "object"
+      },
+      "DeviceNameOut": {
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name"
+        ],
+        "title": "DeviceNameOut",
+        "type": "object"
+      },
       "GuestError": {
         "description": "The body of every refusal the door sends: FastAPI's rendering of an HTTPException.",
         "properties": {
@@ -467,6 +495,70 @@
           }
         ],
         "summary": "Batches"
+      }
+    },
+    "/api/guest/device": {
+      "patch": {
+        "description": "Rename the device that presents the credential \u2014 never another one: the row written is the\none the bearer token named. Overlapping renames take turns on the device row lock and the one\nthat commits last stands; a revocation that lands while this waits wins (401).",
+        "operationId": "guestRenameDevice",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceNameIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceNameOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "No guest credential, or one that names no device or a revoked device."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuestError"
+                }
+              }
+            },
+            "description": "The pass has ended: expired, revoked or suspended."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "guestBearer": []
+          }
+        ],
+        "summary": "Rename Device"
       }
     },
     "/api/guest/me": {

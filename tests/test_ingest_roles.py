@@ -48,6 +48,7 @@ GUEST_ALLOWLIST = {
     ("GET", "/guest-assets/{name}"),
     ("POST", "/api/pass/redeem"),
     ("GET", "/api/guest/me"),
+    ("PATCH", "/api/guest/device"),
     ("POST", "/api/guest/uploads"),
     ("HEAD", "/api/guest/uploads/{upload_uid}"),
     ("PATCH", "/api/guest/uploads/{upload_uid}"),
@@ -546,6 +547,10 @@ async def test_no_signed_url_is_minted_on_the_guest_door_surface(
     assert (await door.get("/guest-assets/guest-abcd1234.js")).status_code == 200
     token = (await redeem(door, secret))["device_token"]
     assert (await door.get("/api/guest/me", headers=bearer(token))).status_code == 200
+    renamed = await door.patch(
+        "/api/guest/device", json={"display_name": "Anna B"}, headers=bearer(token)
+    )
+    assert renamed.status_code == 200, renamed.text
     uid = await upload(door, token, JPEG)
     assert (await door.head(f"/api/guest/uploads/{uid}", headers=bearer(token))).status_code == 200
     done = await complete(door, token, [uid])

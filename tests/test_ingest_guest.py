@@ -844,6 +844,9 @@ async def test_every_authed_guest_route_is_410_once_its_pass_has_ended(door, hom
     auth = bearer(token)
     answers = {
         "me": await door.get("/api/guest/me", headers=auth),
+        "rename": await door.patch(
+            "/api/guest/device", json={"display_name": "Anna B"}, headers=auth
+        ),
         "create": await door.post(
             "/api/guest/uploads", json={"filename": "b.jpg", "size": 10}, headers=auth
         ),

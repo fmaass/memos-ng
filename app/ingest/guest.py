@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from anyio import to_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -551,6 +551,64 @@ async def me(guest: Annotated[Guest, Depends(require_guest)]) -> MeOut:
             "bytes_total": d.bytes_total,
         }
     )
+
+
+# --- rename the calling device -----------------------------------------------------------------
+
+DISPLAY_NAME_MAX = 64
+
+
+class DeviceNameIn(BaseModel):
+    # The raw bound only keeps a huge body out; the rule is the trimmed name's, checked below.
+    display_name: str = Field(
+        max_length=4 * DISPLAY_NAME_MAX,
+        description=f"Trimmed of surrounding whitespace, then 1 to {DISPLAY_NAME_MAX} Unicode code "
+        "points (scalars, not grapheme clusters). A name outside that is 422 and is never "
+        "shortened. The answer carries the stored, trimmed name.",
+    )
+
+    @field_validator("display_name")
+    @classmethod
+    def _trimmed_and_storable(cls, value: str) -> str:
+        """Whole code points only, so nothing is ever cut inside a character: a name over the cap
+        is refused, not shortened. A NUL is refused because PostgreSQL cannot store it, and home's
+        device puller (`trip_ingest._valid_device`) drops a device whose name it could not store.
+        (A lone surrogate never gets here: pydantic refuses it as `string_unicode`.)"""
+        name = value.strip()
+        if not 1 <= len(name) <= DISPLAY_NAME_MAX:
+            raise ValueError(f"the trimmed name must be 1 to {DISPLAY_NAME_MAX} characters")
+        if "\x00" in name:
+            raise ValueError("the name may not contain a NUL character")
+        return name
+
+
+class DeviceNameOut(BaseModel):
+    display_name: str
+
+
+@router.patch(
+    "/api/guest/device",
+    response_model=DeviceNameOut,
+    operation_id="guestRenameDevice",
+    responses=refusals(*AUTHED),
+)
+async def rename_device(
+    body: DeviceNameIn,
+    guest: Annotated[Guest, Depends(require_guest)],
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> DeviceNameOut:
+    """Rename the device that presents the credential — never another one: the row written is the
+    one the bearer token named. Overlapping renames take turns on the device row lock and the one
+    that commits last stands; a revocation that lands while this waits wins (401)."""
+    try:
+        guest = await _refence(db, guest, device_for_update=True)
+    except GuestRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    guest.device.display_name = body.display_name
+    # A fresh cursor puts the device back on home's `GET /ingest/devices?since=` feed.
+    guest.device.change_seq = await core.next_change_seq(db)
+    await db.commit()
+    return DeviceNameOut(display_name=guest.device.display_name)
 
 
 # --- upload sessions ---------------------------------------------------------------------------

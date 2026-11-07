@@ -32,6 +32,7 @@ COMMITTED = REPO_ROOT / "openapi-guest.json"
 GUEST_OPERATIONS = {
     ("POST", "/api/pass/redeem"),
     ("GET", "/api/guest/me"),
+    ("PATCH", "/api/guest/device"),
     ("POST", "/api/guest/uploads"),
     ("HEAD", "/api/guest/uploads/{upload_uid}"),
     ("PATCH", "/api/guest/uploads/{upload_uid}"),
@@ -148,6 +149,7 @@ def test_optional_guest_fields_reach_the_client_as_type_arrays():
 OPERATION_IDS = {
     ("POST", "/api/pass/redeem"): "guestRedeem",
     ("GET", "/api/guest/me"): "guestMe",
+    ("PATCH", "/api/guest/device"): "guestRenameDevice",
     ("POST", "/api/guest/uploads"): "guestCreateUpload",
     ("HEAD", "/api/guest/uploads/{upload_uid}"): "guestUploadOffset",
     ("PATCH", "/api/guest/uploads/{upload_uid}"): "guestAppendUpload",
@@ -169,6 +171,8 @@ PROVOKED = {
     ("POST", "/api/pass/redeem", 429): _G + "test_every_429_tells_the_client_when_to_retry",
     ("GET", "/api/guest/me", 401): _FOREIGN_401,
     ("GET", "/api/guest/me", 410): _ENDED_410,
+    ("PATCH", "/api/guest/device", 401): _FOREIGN_401,
+    ("PATCH", "/api/guest/device", 410): _ENDED_410,
     ("POST", "/api/guest/uploads", 401): _FOREIGN_401,
     ("POST", "/api/guest/uploads", 410): _ENDED_410,
     ("POST", "/api/guest/uploads", 413): _G
