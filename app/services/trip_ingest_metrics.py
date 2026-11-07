@@ -87,15 +87,13 @@ def _statement():
     # Until a tick completes after the end, the window alone is not enough: a worker that dies
     # between the ack and `pull_batches`, or a link down for 30 days past an expiry, would leave
     # the batch unpulled and nothing saying so. `last_sync_at` is stamped only once a whole tick,
-    # `pull_batches` included, has returned. A pass the ingest host never acked a version of can
-    # hold no batch there.
+    # `pull_batches` included, has returned. Every pass is judged so, acked or not: a missing ack
+    # does not prove the ingest host never held the pass (the 200 of a push can be lost, or home
+    # can die before committing the ack), and `push_passes` records nothing before its request.
     last_sync_at = (
         select(TripIngestCursor.last_sync_at).where(TripIngestCursor.id == 1).scalar_subquery()
     )
-    unpulled_since_end = and_(
-        PassSyncState.last_push_at.is_not(None),
-        or_(last_sync_at.is_(None), last_sync_at < ended_at),
-    )
+    unpulled_since_end = or_(last_sync_at.is_(None), last_sync_at < ended_at)
     recent_pass = exists(
         select(Pass.id)
         .outerjoin(PassSyncState, PassSyncState.pass_id == Pass.id)

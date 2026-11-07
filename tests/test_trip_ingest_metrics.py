@@ -146,7 +146,8 @@ GONE = timedelta(days=31)  # past the 30-day window in which an ended pass still
 
 
 def _expired_pass() -> int:
-    """A pass that ended more than 30 days ago, so it alone requires no sync."""
+    """A pass that ended more than 30 days ago: once a tick has completed since, it alone
+    requires no sync."""
     return _pass("p-expired", expires_in=-GONE)
 
 
@@ -182,6 +183,7 @@ async def test_a_pass_requires_sync_while_honoured_or_ended_within_30_days(
         _pass("p1", expires_in=-timedelta(hours=1))
     elif case == "expired_over_30_days":
         _expired_pass()
+        _cursor(datetime.now(UTC))  # a pull has completed since the expiry
     elif case == "revoked_and_acked_recently":
         _synced(_pass("p1", revoked=True, revoked_ago=timedelta(hours=1), version=2), 2)
     elif case == "revoked_and_acked_over_30_days":
@@ -237,7 +239,11 @@ async def test_a_revoked_pass_pulled_after_its_ack_over_30_days_ago_requires_no_
         (True, timedelta(days=41), 1.0),  # no pull completed since the pass expired
         (True, None, 1.0),  # no tick ever completed
         (True, timedelta(0), 0.0),  # pulled since the expiry, which is over 30 days ago
-        (False, timedelta(days=41), 0.0),  # never acked: the ingest host never held the pass
+        # Never acked as far as home knows: the ingest host may still hold it (the 200 of its
+        # first push lost, or home died before committing the ack), so the same rule applies.
+        (False, timedelta(days=41), 1.0),
+        (False, None, 1.0),
+        (False, timedelta(0), 0.0),
     ],
 )
 async def test_an_expired_pass_requires_sync_until_a_pull_completes_after_its_expiry(
@@ -267,6 +273,7 @@ async def test_an_expired_pass_requires_sync_until_a_pull_completes_after_its_ex
 async def test_a_batch_home_still_owes_an_answer_requires_sync_with_no_live_pass(
     clean, client, state, kwargs, required
 ):
+    _cursor(datetime.now(UTC))
     _batch(_expired_pass(), "b1", state, **kwargs)
     assert _value(_scrape(client), m.REQUIRED) == required
 
