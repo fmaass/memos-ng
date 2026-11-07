@@ -2595,6 +2595,13 @@ export interface components {
             uid: string;
         };
         /**
+         * DigestDeliveryMode
+         * @description What the daily mail carries: every picture inline (`attachments`), or one preview and a
+         *     link to the day's page (`link`).
+         * @enum {string}
+         */
+        DigestDeliveryMode: "attachments" | "link";
+        /**
          * DigestHostingOut
          * @description Whether media hosting can work at all, as the panel's status line reads it.
          *
@@ -2643,8 +2650,18 @@ export interface components {
         DigestPreviewOut: {
             /** Deferred */
             deferred: components["schemas"]["DigestDeferralOut"][];
+            delivery_mode: components["schemas"]["DigestDeliveryMode"];
             /** Html */
             html: string;
+            /**
+             * Link Day
+             * Format: date
+             */
+            link_day?: string | null;
+            /** Link Older Days */
+            link_older_days?: number | null;
+            /** Link Url */
+            link_url?: string | null;
             /** Memo Count */
             memo_count: number;
             /** Parts */
@@ -2784,6 +2801,7 @@ export interface components {
         };
         /** DigestSettingsOut */
         DigestSettingsOut: {
+            delivery_mode: components["schemas"]["DigestDeliveryMode"];
             /** Dropbox Folder */
             dropbox_folder: string;
             /** Enabled */
@@ -2839,6 +2857,8 @@ export interface components {
          *     they exist so a typo cannot arm something absurd, and the admin stays free inside them.
          */
         DigestSettingsPut: {
+            /** Delivery Mode */
+            delivery_mode?: components["schemas"]["DigestDeliveryMode"];
             /** Dropbox Folder */
             dropbox_folder: string;
             /** Enabled */

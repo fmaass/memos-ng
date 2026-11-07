@@ -29,5 +29,15 @@
   "plain.video_not_hosted": "[vídeo: {filename} — sin alojar]",
   "plain.full_size": "[tamaño completo: {url}]",
   "plain.more_not_shown": "+{count} más (no se muestran)",
-  "plain.summary": "{memos} memo(s) nuevo(s) en {days} día(s)"
+  "plain.summary": "{memos} memo(s) nuevo(s) en {days} día(s)",
+  "link.open": "Abrir la página del día",
+  "link.online_until": "En línea hasta el {date}",
+  "link.older_days_one": "y {count} día anterior",
+  "link.older_days_other": "y {count} días anteriores",
+  "link.memos_one": "{count} memo",
+  "link.memos_other": "{count} memos",
+  "link.photos_one": "{count} foto",
+  "link.photos_other": "{count} fotos",
+  "link.videos_one": "{count} vídeo",
+  "link.videos_other": "{count} vídeos"
 }

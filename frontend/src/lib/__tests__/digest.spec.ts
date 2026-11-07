@@ -7,6 +7,7 @@ import {
   type DigestSettings,
   DIGEST_LANGUAGES,
   checkNewRecipient,
+  deliveryModeHint,
   checkRecipientLanguage,
   describeNextSend,
   dirtyConfigFields,
@@ -19,6 +20,7 @@ import {
   nextSendLabel,
   normaliseEmail,
   normaliseSendTime,
+  previewSummary,
   putBodyFromDraft,
   ranOn,
   recipientChangeGuard,
@@ -45,6 +47,7 @@ function settings(over: Partial<DigestSettings> = {}): DigestSettings {
     dropbox_folder: '/memos-digest',
     retention_days: 90,
     link_images_full: true,
+    delivery_mode: 'attachments' as const,
     updated_at: '2026-08-30T10:00:00Z',
     updated_by: 'fabian',
     ...over,
@@ -237,6 +240,7 @@ describe('the grouped config', () => {
     expect(body.mail_title).toBe('Daily memos')
     expect(Object.keys(body).sort()).toEqual(
       [
+        'delivery_mode',
         'dropbox_folder',
         'enabled',
         'from_email',
@@ -505,5 +509,48 @@ describe('checkRecipientLanguage', () => {
 
   it('names the three languages the API knows, in send order', () => {
     expect(DIGEST_LANGUAGES).toEqual(['de', 'es', 'en'])
+  })
+})
+
+describe('delivery mode (MEMNG-1246)', () => {
+  it('carries the mode through the draft, the dirty check and the PUT body', () => {
+    expect(draftFromSettings(settings({ delivery_mode: 'link' })).delivery_mode).toBe('link')
+    expect(dirtyConfigFields(draft({ delivery_mode: 'link' }), settings())).toEqual([
+      'delivery_mode',
+    ])
+    expect(putBodyFromDraft(draft({ delivery_mode: 'link' }), false).delivery_mode).toBe('link')
+  })
+
+  it('says what each mode sends, and that link mode defers until pages publish', () => {
+    expect(deliveryModeHint('attachments')).toContain('inline')
+    expect(deliveryModeHint('link')).toContain('deferred')
+  })
+
+  it('summarises an attachments preview by parts', () => {
+    expect(previewSummary({ memo_count: 1, parts: 1, delivery_mode: 'attachments' })).toBe(
+      '1 memo · 1 part',
+    )
+    expect(previewSummary({ memo_count: 3, parts: 2, delivery_mode: 'attachments' })).toBe(
+      '3 memos · 2 parts',
+    )
+  })
+
+  it('summarises a link preview by the day it links and the older days it covers', () => {
+    const base = { memo_count: 2, parts: 1, delivery_mode: 'link' as const }
+    expect(previewSummary({ ...base, link_day: '2026-06-29', link_older_days: 0 })).toBe(
+      '2 memos · link mail to 2026-06-29',
+    )
+    expect(previewSummary({ ...base, link_day: '2026-06-29', link_older_days: 1 })).toBe(
+      '2 memos · link mail to 2026-06-29 + 1 older day',
+    )
+    expect(previewSummary({ ...base, link_day: '2026-06-29', link_older_days: 2 })).toBe(
+      '2 memos · link mail to 2026-06-29 + 2 older days',
+    )
+  })
+
+  it('does not invent a day for an empty link preview', () => {
+    expect(
+      previewSummary({ memo_count: 0, parts: 0, delivery_mode: 'link', link_day: null }),
+    ).toBe('0 memos · link mail')
   })
 })

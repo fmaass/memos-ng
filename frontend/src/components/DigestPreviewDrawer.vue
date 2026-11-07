@@ -4,6 +4,7 @@ import SelectButton from 'primevue/selectbutton'
 import { ref } from 'vue'
 
 import type { DigestPreview } from '@/composables/useDigestActions'
+import { previewSummary } from '@/lib/digest'
 
 defineProps<{
   visible: boolean
@@ -44,8 +45,7 @@ const width = ref(720)
           data-test="digest-preview-width"
         />
         <p v-if="preview" class="text-sm text-muted-color" data-test="digest-preview-summary">
-          {{ preview.memo_count }} memo{{ preview.memo_count === 1 ? '' : 's' }} ·
-          {{ preview.parts }} part{{ preview.parts === 1 ? '' : 's' }}
+          {{ previewSummary(preview) }}
         </p>
       </div>
 
@@ -63,6 +63,15 @@ const width = ref(720)
       </p>
 
       <template v-else-if="preview">
+        <!-- Link mode: where the one link goes. In a preview that is the door's front page,
+             because a preview publishes nothing. -->
+        <p
+          v-if="preview.delivery_mode === 'link' && preview.link_url"
+          class="text-sm break-all"
+          data-test="digest-preview-link"
+        >
+          Links to <span class="font-mono text-xs">{{ preview.link_url }}</span>
+        </p>
         <!-- sandbox="" : the rendered digest is memo content, so it is displayed with no script,
              no form and no same-origin access to this app. -->
         <iframe

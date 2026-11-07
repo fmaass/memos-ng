@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator
+from pydantic.json_schema import SkipJsonSchema
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +31,7 @@ from app.api_types import Rfc3339Datetime
 from app.config import settings as app_settings
 from app.database import async_session, get_session
 from app.models import (
+    DigestDeliveryMode,
     DigestRecipient,
     DigestRun,
     DigestSettings,
@@ -42,6 +44,7 @@ from app.services.digest import domain as digest_domain
 from app.services.digest import hosting as digest_hosting
 from app.services.digest import ledger as digest_ledger
 from app.services.digest import metrics as digest_metrics
+from app.services.digest import publish as digest_publish
 from app.services.digest import runner as digest_runner
 from app.services.digest.domain import MAX_EMAIL_LENGTH, normalise_email
 from app.services.digest.gate import local_date_of
@@ -75,8 +78,15 @@ class DigestSettingsOut(BaseModel):
     dropbox_folder: str
     retention_days: int
     link_images_full: bool
+    delivery_mode: DigestDeliveryMode
     updated_at: Rfc3339Datetime
     updated_by: str | None
+
+
+def _reject_null_mode(value: Any) -> Any:
+    if value is None:
+        raise ValueError("must be a delivery mode; omit the field to keep the stored one")
+    return value
 
 
 # One Save bar for the whole panel is the digest design's shape (3285 §6).
@@ -109,6 +119,14 @@ class DigestSettingsPut(BaseModel):
     dropbox_folder: str = Field(min_length=1, max_length=255)
     retention_days: int = Field(ge=1, le=3650)
     link_images_full: bool
+    # `attachments` (the self-contained mail) or `link` (the small mail pointing at the day's page,
+    # MEMNG-1246). The ONE field a whole-row PUT may omit, and omitting it keeps the stored mode:
+    # it arrived after clients that build this body from their own copy of the schema (the iOS
+    # snapshot), and a required field would 422 them, while a defaulted one would silently switch
+    # a household on `link` back to `attachments` on their next Save. An explicit null is a 422.
+    delivery_mode: Annotated[
+        DigestDeliveryMode | SkipJsonSchema[None], BeforeValidator(_reject_null_mode)
+    ] = None
 
     @field_validator("timezone")
     @classmethod
@@ -282,6 +300,7 @@ def _settings_out(row: DigestSettings) -> DigestSettingsOut:
         dropbox_folder=row.dropbox_folder,
         retention_days=row.retention_days,
         link_images_full=row.link_images_full,
+        delivery_mode=DigestDeliveryMode(row.delivery_mode),
         updated_at=row.updated_at,
         updated_by=row.updated_by,
     )
@@ -396,7 +415,9 @@ async def put_digest_settings(
     row = await _settings_row(db, for_update=True)
     if body.enabled:
         await _refuse_arming_with_no_recipients(db)
-    for field, value in body.model_dump().items():
+    # An omitted `delivery_mode` keeps the stored one; every other field is the whole row.
+    kept = {"delivery_mode"} if body.delivery_mode is None else set()
+    for field, value in body.model_dump(exclude=kept).items():
         setattr(row, field, value)
     row.updated_by = admin.subject
     await db.commit()
@@ -682,6 +703,13 @@ class DigestPreviewOut(BaseModel):
     parts: int
     selected: list[DigestPreviewMemo]
     deferred: list[DigestDeferralOut]
+    # What kind of mail this is (MEMNG-1246). In `link` mode the three fields below describe the
+    # one link: the newest local day it points at, how many older days the run also covers, and
+    # the url — the door's front page in a preview, since a preview publishes nothing.
+    delivery_mode: DigestDeliveryMode
+    link_day: date | None = None
+    link_older_days: int | None = None
+    link_url: str | None = None
 
 
 class DigestTestSendIn(BaseModel):
@@ -711,7 +739,12 @@ async def preview_digest(
     and the reads it needs are taken in short sessions that close before that walk starts — a
     request session would be an idle transaction held across all of it.
     """
-    rendered, settings_row = await digest_runner.preview()
+    try:
+        rendered, settings_row = await digest_runner.preview()
+    except digest_publish.PublisherUnavailable as exc:
+        # Link mode with an unusable page host: say why rather than render a link to nowhere.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    link = rendered.link
     if rendered.parts:
         payload = digest_runner.part_payload(rendered, 1, settings_row)
         html, plain = payload[1], payload[2]
@@ -736,6 +769,10 @@ async def preview_digest(
         deferred=[
             DigestDeferralOut(uid=item.uid, reason=item.reason) for item in rendered.deferred
         ],
+        delivery_mode=DigestDeliveryMode(settings_row.delivery_mode),
+        link_day=None if link is None else date.fromisoformat(link.day.iso),
+        link_older_days=None if link is None else link.older_days,
+        link_url=None if link is None else link.publication.url,
     )
 
 
@@ -766,7 +803,7 @@ async def test_send_digest(
         memo_count = await digest_runner.test_send(
             address=admin.email, empty=body.empty, language=body.language
         )
-    except digest_runner.SenderIsRecipient as exc:
+    except (digest_runner.SenderIsRecipient, digest_publish.PublisherUnavailable) as exc:
         # The same refusal a real run applies. Answered 422 rather than sent-and-hoped: iCloud
         # drops From == To with attachments, so the probe would report success and deliver
         # nothing — and a probe that lies is worse than no probe.

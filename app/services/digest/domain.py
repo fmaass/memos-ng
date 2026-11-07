@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as app_settings
-from app.models import DigestSettings
+from app.models import DigestDeliveryMode, DigestSettings
 
 # The settings table holds exactly one row, and this is its id. `CHECK (id = 1)` in the migration
 # makes a second row impossible at the database; every writer UPDATEs this row and none of them
@@ -124,6 +124,8 @@ class DigestConfig:
     dropbox_folder: str
     retention_days: int
     link_images_full: bool
+    # Defaulted so a snapshot built field by field elsewhere keeps meaning today's mail.
+    delivery_mode: str = DigestDeliveryMode.attachments.value
 
     @classmethod
     def of(cls, row: DigestSettings) -> "DigestConfig":
@@ -144,6 +146,7 @@ class DigestConfig:
             dropbox_folder=row.dropbox_folder,
             retention_days=row.retention_days,
             link_images_full=row.link_images_full,
+            delivery_mode=row.delivery_mode,
         )
 
 

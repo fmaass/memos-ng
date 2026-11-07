@@ -1571,6 +1571,15 @@
         "title": "DigestDeferralOut",
         "type": "object"
       },
+      "DigestDeliveryMode": {
+        "description": "What the daily mail carries: every picture inline (`attachments`), or one preview and a\nlink to the day's page (`link`).",
+        "enum": [
+          "attachments",
+          "link"
+        ],
+        "title": "DigestDeliveryMode",
+        "type": "string"
+      },
       "DigestHostingOut": {
         "description": "Whether media hosting can work at all, as the panel's status line reads it.\n\nTwo independent facts, and the difference between them is the whole value of the endpoint:\n\n* `configured` is the PRESENCE of the three `DROPBOX_*` env keys \u2014 never their value, which is\n  secret and is echoed nowhere. It answers \"could this work?\" without touching the network.\n* `account` is who those keys actually authenticate as, read live from Dropbox. It is the only\n  thing that distinguishes keys that are set from keys that WORK \u2014 a rotated refresh token\n  leaves `configured` true forever while every upload silently falls back to inline-only.\n\n`account` is null whenever that answer cannot be had \u2014 unconfigured, refused, unreachable \u2014\nbecause an admin status line must never be the reason a page 500s.",
         "properties": {
@@ -1633,9 +1642,34 @@
             "title": "Deferred",
             "type": "array"
           },
+          "delivery_mode": {
+            "$ref": "#/components/schemas/DigestDeliveryMode"
+          },
           "html": {
             "title": "Html",
             "type": "string"
+          },
+          "link_day": {
+            "format": "date",
+            "title": "Link Day",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "link_older_days": {
+            "title": "Link Older Days",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "link_url": {
+            "title": "Link Url",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "memo_count": {
             "title": "Memo Count",
@@ -1663,7 +1697,8 @@
           "memo_count",
           "parts",
           "selected",
-          "deferred"
+          "deferred",
+          "delivery_mode"
         ],
         "title": "DigestPreviewOut",
         "type": "object"
@@ -1949,6 +1984,9 @@
       },
       "DigestSettingsOut": {
         "properties": {
+          "delivery_mode": {
+            "$ref": "#/components/schemas/DigestDeliveryMode"
+          },
           "dropbox_folder": {
             "title": "Dropbox Folder",
             "type": "string"
@@ -2044,6 +2082,7 @@
           "dropbox_folder",
           "retention_days",
           "link_images_full",
+          "delivery_mode",
           "updated_at",
           "updated_by"
         ],
@@ -2053,6 +2092,10 @@
       "DigestSettingsPut": {
         "description": "The WHOLE settings row, not a patch.\n\nThe panel edits these fields behind one Save bar, so the request that Save\nsends IS the new state \u2014 which also means a field the client omits is a client bug rather than\n\"leave it alone\", and pydantic says so with a 422. Bounds are plausibility bounds, not policy:\nthey exist so a typo cannot arm something absurd, and the admin stays free inside them.",
         "properties": {
+          "delivery_mode": {
+            "$ref": "#/components/schemas/DigestDeliveryMode",
+            "title": "Delivery Mode"
+          },
           "dropbox_folder": {
             "maxLength": 255,
             "minLength": 1,

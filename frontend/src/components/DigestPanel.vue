@@ -12,11 +12,13 @@ import { useDigest } from '@/composables/useDigest'
 import { useDigestActions } from '@/composables/useDigestActions'
 import {
   DEFAULT_DIGEST_LANGUAGE,
+  DELIVERY_MODE_OPTIONS,
   DIGEST_LANGUAGES,
   DIGEST_LANGUAGE_LABELS,
   type DigestConfigDraft,
   type DigestLanguage,
   describeNextSend,
+  deliveryModeHint,
   dirtyConfigFields,
   draftFromSettings,
   formatMib,
@@ -431,6 +433,24 @@ const scopeOptions = [
           />
           <span>Link inline images to the full-size file</span>
         </div>
+      </div>
+
+      <!-- delivery mode (MEMNG-1246) -->
+      <div class="flex flex-col gap-2" data-test="digest-delivery">
+        <h3 class="font-medium">Delivery</h3>
+        <SelectButton
+          v-model="draft.delivery_mode"
+          :options="DELIVERY_MODE_OPTIONS"
+          option-label="label"
+          option-value="value"
+          :allow-empty="false"
+          size="small"
+          aria-label="What the mail carries"
+          data-test="digest-delivery-mode"
+        />
+        <p class="text-sm text-muted-color" data-test="digest-delivery-mode-hint">
+          {{ deliveryModeHint(draft.delivery_mode) }}
+        </p>
       </div>
 
       <!-- hosting -->

@@ -1342,6 +1342,21 @@ DIGEST_LANGUAGES: tuple[str, ...] = tuple(language.value for language in DigestL
 DIGEST_DEFAULT_LANGUAGE = DigestLanguage.de
 
 
+# MEMNG-1246. `attachments` is the self-contained mail the household has been receiving: every
+# picture inline, split into parts under `max_email_bytes`; it stays as the fallback (D7). `link`
+# is the small mail: one inline preview, the newest day's first memo, its counts and one link to
+# that day's page on the door (D5).
+class DigestDeliveryMode(enum.StrEnum):
+    """What the daily mail carries: every picture inline (`attachments`), or one preview and a
+    link to the day's page (`link`)."""
+
+    attachments = "attachments"
+    link = "link"
+
+
+DIGEST_DELIVERY_MODES: tuple[str, ...] = tuple(mode.value for mode in DigestDeliveryMode)
+
+
 # The default is the digest design's choice (3285 §9).
 class DigestVisibilityScope(enum.StrEnum):
     """Which memos a digest may mail. `PUBLIC_PROTECTED` is the default."""
@@ -1390,7 +1405,12 @@ class DigestSettings(Base):
     """
 
     __tablename__ = "digest_settings"
-    __table_args__ = (CheckConstraint("id = 1", name="ck_digest_settings_singleton"),)
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_digest_settings_singleton"),
+        CheckConstraint(
+            _in("delivery_mode", DIGEST_DELIVERY_MODES), name="ck_digest_settings_delivery_mode"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=False, server_default=text("1"), default=1
@@ -1444,6 +1464,13 @@ class DigestSettings(Base):
     retention_days: Mapped[int] = mapped_column(Integer, default=30, server_default=text("30"))
     link_images_full: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
+    )
+    # `attachments` until the admin switches it: the existing row keeps sending exactly the mail
+    # it sent before this column existed (MEMNG-1246, D7).
+    delivery_mode: Mapped[str] = mapped_column(
+        String(16),
+        default=DigestDeliveryMode.attachments.value,
+        server_default=DigestDeliveryMode.attachments.value,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

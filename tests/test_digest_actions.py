@@ -410,3 +410,47 @@ async def test_a_test_send_in_an_unknown_language_is_422_and_sends_nothing(
     response = client.post(f"{PREFIX}/test-send", json={"language": "fr"})
     assert response.status_code == 422
     assert capture_sends.sent == []
+
+
+# --- link mode (MEMNG-1246) ----------------------------------------------------------------------
+
+
+async def test_a_link_mode_preview_names_the_day_it_links_and_publishes_nothing(
+    env, admin_client, capture_sends, monkeypatch
+):
+    subject, data_root = env
+    monkeypatch.setattr(app_settings, "DAILY_PAGE_HOST", "dami.discomarder.live")
+    set_digest_settings(delivery_mode="link")
+    await _seed_memo_with_photo(subject, data_root)
+    client, _ = admin_client
+    response = client.get(f"{PREFIX}/preview")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["delivery_mode"] == "link"
+    assert body["link_day"] == "2026-06-20" and body["link_older_days"] == 0
+    assert body["link_url"] == "https://dami.discomarder.live/"
+    assert 'href="https://dami.discomarder.live/"' in body["html"]
+    assert body["parts"] == 1
+    assert run_rows() == [] and capture_sends.sent == []
+
+
+async def test_an_attachments_preview_carries_no_link_fields(env, admin_client):
+    subject, data_root = env
+    await _seed_memo_with_photo(subject, data_root)
+    client, _ = admin_client
+    body = client.get(f"{PREFIX}/preview").json()
+    assert body["delivery_mode"] == "attachments"
+    assert body["link_day"] is None and body["link_url"] is None
+
+
+async def test_a_link_mode_preview_with_a_memos_ng_page_host_is_a_422(
+    env, admin_client, monkeypatch
+):
+    subject, data_root = env
+    monkeypatch.setattr(app_settings, "DAILY_PAGE_HOST", MEMOS_HOST)
+    set_digest_settings(delivery_mode="link")
+    await _seed_memo_with_photo(subject, data_root)
+    client, _ = admin_client
+    response = client.get(f"{PREFIX}/preview")
+    assert response.status_code == 422
+    assert "memos-ng host" in response.json()["detail"]

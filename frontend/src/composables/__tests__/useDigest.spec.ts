@@ -58,6 +58,7 @@ const SERVER: DigestSettings = {
   dropbox_folder: '/memos-digest',
   retention_days: 90,
   link_images_full: true,
+  delivery_mode: 'attachments' as const,
   updated_at: '2026-08-30T10:00:00Z',
   updated_by: 'fabian',
 }
@@ -320,5 +321,6 @@ function digestDraft() {
     dropbox_folder: '/memos-digest',
     retention_days: 90,
     link_images_full: true,
+    delivery_mode: 'attachments' as const,
   }
 }

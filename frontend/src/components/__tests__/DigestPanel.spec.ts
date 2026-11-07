@@ -24,6 +24,7 @@ const SERVER: DigestSettings = {
   dropbox_folder: '/memos-digest',
   retention_days: 90,
   link_images_full: true,
+  delivery_mode: 'attachments' as const,
   updated_at: '2026-08-30T10:00:00Z',
   updated_by: 'fabian',
 }
@@ -351,6 +352,22 @@ describe('DigestPanel', () => {
 
     expect(actions.loadPreview).toHaveBeenCalledTimes(1)
     expect(wrapper.find('[data-test="drawer-stub"]').attributes('data-visible')).toBe('true')
+  })
+
+  it('switches the delivery mode as part of the saved draft (MEMNG-1246)', async () => {
+    const wrapper = mountPanel()
+    expect(wrapper.find('[data-test="digest-delivery-mode-hint"]').text()).toContain('inline')
+    const modes = wrapper
+      .findAllComponents(SelectButton)
+      .find((c) => c.attributes('data-test') === 'digest-delivery-mode')
+    expect(modes).toBeDefined()
+    modes?.vm.$emit('update:modelValue', 'link')
+    await flushPromises()
+    expect(wrapper.find('[data-test="digest-save-bar"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="digest-delivery-mode-hint"]').text()).toContain('deferred')
+    await wrapper.find('[data-test="digest-save"]').trigger('click')
+    await flushPromises()
+    expect(digest.saveConfig.mock.calls[0][0]).toMatchObject({ delivery_mode: 'link' })
   })
 
   it('sends the test mail in the language the selector names', async () => {

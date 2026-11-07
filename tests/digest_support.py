@@ -73,6 +73,7 @@ def digest_config(**overrides) -> DigestConfig:
         "dropbox_folder": "/memos-mail",
         "retention_days": 30,
         "link_images_full": False,
+        "delivery_mode": "attachments",
     }
     values.update(overrides)
     return DigestConfig(**values)  # pyright: ignore[reportArgumentType]

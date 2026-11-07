@@ -42,7 +42,7 @@ Dropbox — but can never leave an object that no row names. That is the differe
 cleanable orphan and an unfindable one.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -62,12 +62,13 @@ from app.models import (
     DIGEST_DEFAULT_LANGUAGE,
     DIGEST_LANGUAGES,
     Attachment,
+    DigestDeliveryMode,
     DigestRunStatus,
     DigestTrigger,
     HostedMediaStatus,
 )
 from app.services import media, printready
-from app.services.digest import domain, hosting, ledger, render
+from app.services.digest import domain, hosting, ledger, link_mail, publish, render
 from app.services.digest import select as selection_mod
 from app.services.digest.domain import DigestConfig, sender_address
 from app.services.digest.gate import FALLBACK_TIMEZONE, LEDGER_TRIGGERS, local_date_of, resolve_zone
@@ -163,6 +164,9 @@ class RenderedDigest:
     links: MediaLinks = field(default_factory=MediaLinks)
     # The language every word and date of these parts is written in (MEMNG-1245).
     language: str = "en"
+    # Set in link mode only (MEMNG-1246): the one small mail this group gets. `parts` then holds a
+    # single part over EVERY day of the run, so the whole run's memos commit with that one send.
+    link: link_mail.LinkMail | None = None
 
 
 def _sql_values(values: tuple[str, ...]) -> str:
@@ -770,8 +774,13 @@ async def build_digest(
     host: MediaHost | None,
     ledger: HostedLedger | None = None,
     language: str = DIGEST_DEFAULT_LANGUAGE,
+    publications: Mapping[date, publish.DayPublication] | None = None,
 ) -> RenderedDigest:
     """Host, render and split an already-made selection — everything up to (not including) SMTP.
+
+    In link mode (`settings.delivery_mode`) nothing is hosted or split: the group gets the one
+    small mail `_build_link_digest` renders, linking the page `publications` names for the run's
+    newest day.
 
     `host=None` is the probe contract: links are resolved from the hosted-media ledger alone and
     no Dropbox call is made, so a preview or a test-send can never leave a hosted file behind.
@@ -791,6 +800,8 @@ async def build_digest(
     )
     if not included:
         return rendered
+    if settings.delivery_mode == DigestDeliveryMode.link:
+        return await _build_link_digest(rendered, settings, export, publications)
 
     attachment_ids = selection_mod.unresolved_attachment_ids(
         selection_mod.Selection(included=included, deferred=[])
@@ -838,10 +849,92 @@ async def build_digest(
     return rendered
 
 
+def run_days(candidates: list[Candidate], timezone: str) -> list[date]:
+    """The local days `candidates` fall on, oldest first — what a link-mode run publishes."""
+    return sorted({local_date_of(candidate.created_at, timezone) for candidate in candidates})
+
+
+async def _build_link_digest(
+    rendered: RenderedDigest,
+    settings: DigestConfig,
+    export: ExportConfig,
+    publications: Mapping[date, publish.DayPublication] | None,
+) -> RenderedDigest:
+    """The link-mode mail for one group: no uploads, no splitter, one small preview.
+
+    The cards are built by the SAME `render.build_cards` the attachments mail uses, with no files
+    and no links, so each memo's text passes the same sanitiser and the same memos-ng host strip;
+    only the target day's first card and counts reach the mail. Raises `PublisherUnavailable` when
+    the newest day has no page to link to — the caller defers the run rather than send it."""
+    included, language = rendered.selected, rendered.language
+    cards, _ = render.build_cards(
+        included,
+        {},
+        MediaLinks(),
+        max_videos_per_memo=settings.max_videos_per_memo,
+        link_images_full=False,
+        blocked_hosts=render.memos_ng_hosts(),
+    )
+    rendered.day_groups = render.group_by_local_day(cards, settings.timezone, language)
+    rendered.date_range = render.subject_date_range(rendered.day_groups, language)
+    day, older_days = link_mail.target_day(rendered.day_groups)
+    publication = (publications or {}).get(date.fromisoformat(day.iso))
+    if publication is None:
+        raise publish.PublisherUnavailable(publish.ERROR_PUBLISHER_UNCONFIGURED)
+    candidates = link_mail.day_candidates(included, day)
+    encoded = await link_mail.read_preview(
+        link_mail.preview_source(candidates), export.mail_profile.subsampling
+    )
+    preview = (
+        None
+        if encoded is None
+        else InlineImage(cid=f"{link_mail.PREVIEW_CID}-{day.iso}", data=encoded.data)
+    )
+    rendered.link = link_mail.LinkMail(
+        day=day,
+        publication=publication,
+        counts=link_mail.day_counts(candidates, settings.max_videos_per_memo),
+        older_days=older_days,
+        first_card=day.cards[0],
+        preview=preview,
+        preview_width=None if encoded is None else encoded.width,
+        preview_height=None if encoded is None else encoded.height,
+    )
+    rendered.inline_by_cid = {} if preview is None else {preview.cid: preview}
+    rendered.parts = [
+        Part(day_groups=rendered.day_groups, inline_image_cids=set(rendered.inline_by_cid))
+    ]
+    return rendered
+
+
+def _link_payload(
+    rendered: RenderedDigest, link: link_mail.LinkMail, settings: DigestConfig
+) -> tuple[str, str, str, list[InlineImage], list[int], set[int]]:
+    language = rendered.language
+    subject = render.subject_for(settings.mail_title, rendered.date_range, 1, 1, language)
+    html = link_mail.render_html(
+        link,
+        subject=subject,
+        mail_title=settings.mail_title,
+        date_range=rendered.date_range,
+        timezone=settings.timezone,
+        language=language,
+    )
+    plain = link_mail.render_plain(
+        link, subject=subject, timezone=settings.timezone, language=language
+    )
+    cards = rendered.parts[0].cards()
+    images = [] if link.preview is None else [link.preview]
+    incomplete = {card.memo_id for card in cards if card.is_incomplete}
+    return subject, html, plain, images, [card.memo_id for card in cards], incomplete
+
+
 def part_payload(
     rendered: RenderedDigest, part_index: int, settings: DigestConfig
 ) -> tuple[str, str, str, list[InlineImage], list[int], set[int]]:
     """`(subject, html, plain, inline images, memo ids, incomplete memo ids)` for one part."""
+    if rendered.link is not None:
+        return _link_payload(rendered, rendered.link, settings)
     part = rendered.parts[part_index - 1]
     total = len(rendered.parts)
     cards = part.cards()
@@ -948,6 +1041,7 @@ async def run_digest(
     transport: MailTransport | None = None,
     host_factory: HostFactory | None = None,
     now_utc: datetime | None = None,
+    publisher: publish.DayPublisher | None = None,
 ) -> RunResult | None:
     """Open a run row and perform it. Returns None when the run was aborted by a lost claim.
 
@@ -966,6 +1060,7 @@ async def run_digest(
         session_factory=session_factory,
         transport=transport,
         host_factory=host_factory,
+        publisher=publisher,
     )
 
 
@@ -976,6 +1071,7 @@ async def _execute_run(
     session_factory: SessionFactory,
     transport: MailTransport | None,
     host_factory: HostFactory | None,
+    publisher: publish.DayPublisher | None = None,
 ) -> RunResult | None:
     async with session_factory() as db:
         settings = await load_settings(db)
@@ -1025,10 +1121,41 @@ async def _execute_run(
         async with session_factory() as db:
             await heartbeat(db, run_id)
 
+    link_mode = settings.delivery_mode == DigestDeliveryMode.link
+    publications: dict[date, publish.DayPublication] | None = None
+    if link_mode:
+        # Link mode: the day pages are published ONCE for the run, over every group's days, before
+        # any mail is built. No page means no mail and no delivery row — DEFERRED, with the reason
+        # on the row — and never a fall-back to an attachments mail nobody chose (MEMNG-1246).
+        days = sorted(
+            {
+                day
+                for selection in selections.values()
+                for day in run_days(selection.included, settings.timezone)
+            }
+        )
+        try:
+            problem = publish.page_host_problem()
+            if problem is not None:
+                raise publish.PublisherUnavailable(problem)
+            if days:
+                active_publisher = publisher or publish.default_publisher()
+                publications = publish.checked_publications(
+                    await active_publisher.publish(days), days
+                )
+        except publish.PublisherUnavailable as exc:
+            async with session_factory() as db:
+                await finish_run(db, run_id, status=DEFERRED, error=str(exc))
+            logger.warning("digest.link_mode_deferred", run_id=run_id, reason=str(exc))
+            return RunResult(
+                run_id=run_id, status=DEFERRED, parts=0, parts_sent=0, memos_sent=0, error=str(exc)
+            )
+
     host = None
-    if host_factory is not None:
+    # Link mode uploads nothing in this release: the mail carries no hosted link of its own.
+    if host_factory is not None and not link_mode:
         host = await host_factory(beat)
-    if host is None and settings.hosting_enabled:
+    if host is None and settings.hosting_enabled and not link_mode:
         # ONE line per run, and it is the CONSEQUENCE rather than the cause: hosting was asked for
         # and is not available, so this mail goes out inline-only with the "video not hosted" chip
         # on every video card. The cause (keys unset, token refresh failed) is logged where it is
@@ -1052,6 +1179,7 @@ async def _execute_run(
                 host=host,
                 ledger=SessionLedger(session_factory, run_id=run_id),
                 language=language,
+                publications=publications,
             )
     finally:
         # Every path, not just the happy one: the host owns an httpx client, and a run that raised
@@ -1187,6 +1315,7 @@ async def run_scheduled_digest_safe(
     session_factory: SessionFactory = async_session,
     transport: MailTransport | None = None,
     now_utc: datetime | None = None,
+    publisher: publish.DayPublisher | None = None,
 ) -> RunResult | None:
     """The worker's entry point for a SCHEDULED run, with EVERY error isolated.
 
@@ -1205,6 +1334,7 @@ async def run_scheduled_digest_safe(
             transport=transport,
             host_factory=factory,
             now_utc=moment,
+            publisher=publisher,
         )
     except RunSkipped:
         logger.info("digest.run_skipped_another_in_flight")
@@ -1220,6 +1350,7 @@ async def run_claimed_digest_safe(
     session_factory: SessionFactory = async_session,
     transport: MailTransport | None = None,
     now_utc: datetime | None = None,
+    publisher: publish.DayPublisher | None = None,
 ) -> RunResult | None:
     """Execute a run row somebody else committed — the manual endpoint's, adopted by this worker.
 
@@ -1239,6 +1370,7 @@ async def run_claimed_digest_safe(
             session_factory=session_factory,
             transport=transport,
             host_factory=factory,
+            publisher=publisher,
         )
     except Exception:
         logger.exception("digest.run_error", run_id=run_id)
@@ -1426,6 +1558,24 @@ async def _reconcile_pending(
 # --- the probes the admin panel drives ------------------------------------------------------------
 
 
+def probe_publications(
+    settings: DigestConfig, selection: selection_mod.Selection, moment: datetime
+) -> dict[date, publish.DayPublication] | None:
+    """What a preview or test-send links to in link mode: the door's front page, published nowhere.
+
+    None in attachments mode, where nothing links to a page. Raises `PublisherUnavailable` when the
+    page host is unusable, which the panel shows rather than a mail linking somewhere wrong."""
+    if settings.delivery_mode != DigestDeliveryMode.link:
+        return None
+    problem = publish.page_host_problem()
+    if problem is not None:
+        raise publish.PublisherUnavailable(problem)
+    days = run_days(selection.included[: settings.max_memos_per_run], settings.timezone)
+    return dict(
+        publish.probe_publications(days, now=moment, retention_days=settings.retention_days)
+    )
+
+
 async def preview(
     session_factory: SessionFactory = async_session,
     *,
@@ -1441,7 +1591,13 @@ async def preview(
         session_factory, settings, moment, language=language
     )
     rendered = await build_digest(
-        session_factory, settings, selection, export=export, host=None, language=language
+        session_factory,
+        settings,
+        selection,
+        export=export,
+        host=None,
+        language=language,
+        publications=probe_publications(settings, selection, moment),
     )
     return rendered, settings
 
@@ -1500,7 +1656,13 @@ async def test_send(
         session_factory, settings, moment, language=language
     )
     rendered = await build_digest(
-        session_factory, settings, selection, export=export, host=None, language=language
+        session_factory,
+        settings,
+        selection,
+        export=export,
+        host=None,
+        language=language,
+        publications=probe_publications(settings, selection, moment),
     )
     if not rendered.parts:
         html, plain = render.render_empty(settings.mail_title, language)

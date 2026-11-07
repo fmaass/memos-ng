@@ -317,6 +317,11 @@ class Settings(BaseSettings):
     DROPBOX_APP_KEY: str = Field(default="", repr=False)
     DROPBOX_APP_SECRET: str = Field(default="", repr=False)
     DROPBOX_REFRESH_TOKEN: str = Field(default="", repr=False)
+    # The door's hostname (Daily Dami Pages, D6): the ONE host a link-mode digest points at, and
+    # the only one of the household's that a memo's own link may keep in the mail. It must never
+    # be a memos-ng host — a link-mode run refuses one (`digest.publish.page_host_problem`).
+    # Empty disables link mode: such a run is deferred, never sent in attachments mode instead.
+    DAILY_PAGE_HOST: str = "dami.discomarder.live"
 
     # OIDC (confidential BFF). PUBLIC https endpoints only — never the
     # internal http://authelia:9091 (that caused the X-Forwarded-Proto 400 / 401).

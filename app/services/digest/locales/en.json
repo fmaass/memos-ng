@@ -29,5 +29,15 @@
   "plain.video_not_hosted": "[video: {filename} — not hosted]",
   "plain.full_size": "[full size: {url}]",
   "plain.more_not_shown": "+{count} more (not shown)",
-  "plain.summary": "{memos} new memo(s) across {days} day(s)"
+  "plain.summary": "{memos} new memo(s) across {days} day(s)",
+  "link.open": "Open the day's page",
+  "link.online_until": "Online until {date}",
+  "link.older_days_one": "and {count} older day",
+  "link.older_days_other": "and {count} older days",
+  "link.memos_one": "{count} memo",
+  "link.memos_other": "{count} memos",
+  "link.photos_one": "{count} photo",
+  "link.photos_other": "{count} photos",
+  "link.videos_one": "{count} video",
+  "link.videos_other": "{count} videos"
 }

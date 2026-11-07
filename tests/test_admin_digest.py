@@ -957,3 +957,39 @@ def test_a_run_reports_its_groups(admin_client):
     assert body["status"] == "partial"
     assert body["groups_attempted"] == ["de", "en"]
     assert body["groups_accepted"] == ["en"]
+
+
+# --- delivery mode (MEMNG-1246) -----------------------------------------------------------------
+
+
+def test_the_delivery_mode_reads_attachments_until_it_is_switched(admin_client):
+    client, _ = admin_client
+    assert client.get(f"{PREFIX}/settings").json()["delivery_mode"] == "attachments"
+
+
+def test_a_put_switches_the_delivery_mode_to_link_and_back(admin_client):
+    client, _ = admin_client
+    response = client.put(f"{PREFIX}/settings", json=_settings_payload(delivery_mode="link"))
+    assert response.status_code == 200, response.text
+    assert response.json()["delivery_mode"] == "link"
+    assert client.get(f"{PREFIX}/settings").json()["delivery_mode"] == "link"
+    response = client.put(f"{PREFIX}/settings", json=_settings_payload(delivery_mode="attachments"))
+    assert response.json()["delivery_mode"] == "attachments"
+
+
+def test_a_put_that_omits_the_delivery_mode_keeps_the_stored_one(admin_client):
+    """An older client's whole-row Save must not quietly switch a `link` household back."""
+    client, _ = admin_client
+    client.put(f"{PREFIX}/settings", json=_settings_payload(delivery_mode="link"))
+    response = client.put(f"{PREFIX}/settings", json=_settings_payload(mail_title="renamed"))
+    assert response.status_code == 200, response.text
+    assert response.json()["delivery_mode"] == "link"
+    assert response.json()["mail_title"] == "renamed"
+
+
+@pytest.mark.parametrize("value", ["inline", "", None, "LINK"])
+def test_an_unknown_or_null_delivery_mode_is_a_422(admin_client, value):
+    client, _ = admin_client
+    response = client.put(f"{PREFIX}/settings", json=_settings_payload(delivery_mode=value))
+    assert response.status_code == 422
+    assert client.get(f"{PREFIX}/settings").json()["delivery_mode"] == "attachments"

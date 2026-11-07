@@ -29,5 +29,15 @@
   "plain.video_not_hosted": "[Video: {filename} — nicht gehostet]",
   "plain.full_size": "[volle Größe: {url}]",
   "plain.more_not_shown": "+{count} weitere (nicht angezeigt)",
-  "plain.summary": "{memos} neue(s) Memo(s) an {days} Tag(en)"
+  "plain.summary": "{memos} neue(s) Memo(s) an {days} Tag(en)",
+  "link.open": "Tagesseite öffnen",
+  "link.online_until": "Online bis {date}",
+  "link.older_days_one": "und {count} älterer Tag",
+  "link.older_days_other": "und {count} ältere Tage",
+  "link.memos_one": "{count} Memo",
+  "link.memos_other": "{count} Memos",
+  "link.photos_one": "{count} Foto",
+  "link.photos_other": "{count} Fotos",
+  "link.videos_one": "{count} Video",
+  "link.videos_other": "{count} Videos"
 }

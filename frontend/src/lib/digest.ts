@@ -135,6 +135,7 @@ export interface DigestConfigDraft {
   dropbox_folder: string
   retention_days: number
   link_images_full: boolean
+  delivery_mode: DigestSettings['delivery_mode']
 }
 
 export const CONFIG_FIELDS = [
@@ -153,6 +154,7 @@ export const CONFIG_FIELDS = [
   'dropbox_folder',
   'retention_days',
   'link_images_full',
+  'delivery_mode',
 ] as const satisfies readonly (keyof DigestConfigDraft)[]
 
 /** `07:00:00` from the API and `07:00` from an `<input type="time">` are the same instant; without
@@ -182,6 +184,7 @@ export function draftFromSettings(settings: DigestSettings): DigestConfigDraft {
     dropbox_folder: settings.dropbox_folder,
     retention_days: settings.retention_days,
     link_images_full: settings.link_images_full,
+    delivery_mode: settings.delivery_mode,
   }
 }
 
@@ -446,4 +449,46 @@ export function apiErrorMessage(error: unknown, status?: number): string {
   if (status === 409) return 'That conflicts with something already there.'
   if (typeof status === 'number') return `The request failed (${status}).`
   return 'The request failed.'
+}
+
+// --- delivery mode (MEMNG-1246) ---------------------------------------------------------------
+
+/** The two mails a run can send, in the order the switch shows them. */
+export const DELIVERY_MODE_OPTIONS: { label: string; value: DigestSettings['delivery_mode'] }[] = [
+  { label: 'Pictures in the mail', value: 'attachments' },
+  { label: 'Link to the day page', value: 'link' },
+]
+
+/** One line under the switch saying what the chosen mode sends. */
+export function deliveryModeHint(mode: DigestSettings['delivery_mode']): string {
+  return mode === 'link'
+    ? 'One small mail per language: a preview, the newest day and a link to its page. ' +
+        'Until the day pages are published, a run in this mode is deferred and sends nothing.'
+    : 'Every picture inline, split into parts under the size cap.'
+}
+
+/** The fields of a preview this module reads — the generated `DigestPreviewOut`, narrowed so the
+ * helper stays testable without the whole response. */
+export interface PreviewSummaryInput {
+  memo_count: number
+  parts: number
+  delivery_mode: DigestSettings['delivery_mode']
+  link_day?: string | null
+  link_older_days?: number | null
+}
+
+function plural(count: number, one: string, other: string): string {
+  return `${count} ${count === 1 ? one : other}`
+}
+
+/** The drawer's summary line: parts for the attachments mail, the linked day for the link mail. */
+export function previewSummary(preview: PreviewSummaryInput): string {
+  const memos = plural(preview.memo_count, 'memo', 'memos')
+  if (preview.delivery_mode !== 'link') {
+    return `${memos} · ${plural(preview.parts, 'part', 'parts')}`
+  }
+  if (!preview.link_day) return `${memos} · link mail`
+  const older = preview.link_older_days ?? 0
+  const tail = older > 0 ? ` + ${plural(older, 'older day', 'older days')}` : ''
+  return `${memos} · link mail to ${preview.link_day}${tail}`
 }

@@ -10,6 +10,7 @@ const PREVIEW: DigestPreview = {
   plain: 'the mail',
   memo_count: 2,
   parts: 1,
+  delivery_mode: 'attachments',
   selected: [
     { uid: 'aaa', memo_id: 1, created_at: '2026-08-30T05:00:00Z', local_day: '2026-08-30' },
   ],
@@ -83,5 +84,31 @@ describe('DigestPreviewDrawer', () => {
     expect(error.getAttribute('role')).toBe('alert')
     
     expect(document.querySelector('[data-test="digest-preview-frame"]')).toBeNull()
+  })
+
+  it('names the linked day and the link in link mode (MEMNG-1246)', async () => {
+    await mountDrawer({
+      preview: {
+        ...PREVIEW,
+        delivery_mode: 'link',
+        link_day: '2026-08-30',
+        link_older_days: 2,
+        link_url: 'https://dami.example/',
+      },
+    })
+    expect(document.querySelector('[data-test="digest-preview-summary"]')!.textContent).toContain(
+      'link mail to 2026-08-30 + 2 older days',
+    )
+    expect(document.querySelector('[data-test="digest-preview-link"]')!.textContent).toContain(
+      'https://dami.example/',
+    )
+  })
+
+  it('shows no link row for the attachments mail', async () => {
+    await mountDrawer()
+    expect(document.querySelector('[data-test="digest-preview-link"]')).toBeNull()
+    expect(document.querySelector('[data-test="digest-preview-summary"]')!.textContent).toContain(
+      '2 memos · 1 part',
+    )
   })
 })

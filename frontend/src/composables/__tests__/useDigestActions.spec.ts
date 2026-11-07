@@ -18,6 +18,7 @@ const PREVIEW = {
   plain: 'hello',
   memo_count: 2,
   parts: 1,
+  delivery_mode: 'attachments',
   selected: [{ uid: 'abc', memo_id: 1, created_at: '2026-08-30T05:00:00Z', local_day: '2026-08-30' }],
   deferred: [{ uid: 'def', reason: 'card exceeds max_email_bytes after shedding' }],
 }

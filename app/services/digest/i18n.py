@@ -88,6 +88,11 @@ def day_label(value: date, language: str) -> str:
     return _format(value, language, "date.day")
 
 
+def long_date(value: date, language: str) -> str:
+    """One calendar date, written out (`July 7, 2026`) — the link mail's "online until" date."""
+    return _format(value, language, "date.single")
+
+
 def date_range(lo: date, hi: date, language: str) -> str:
     """The subject's date range: one day, a span inside one month, or a span across months."""
     if lo == hi:
