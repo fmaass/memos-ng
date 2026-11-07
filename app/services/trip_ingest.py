@@ -1517,6 +1517,8 @@ async def _file_part(batch_id: int) -> bool | None:
                         last_modified=(
                             _epoch_ms(blob.last_modified) if blob.last_modified else None
                         ),
+                        # The staged blob is renamed onto the part: no new space (MEMNG-1202).
+                        admit_space=False,
                     )
                     creating_part = False
                     staged = _verified_path(uid, blob.sha256)
