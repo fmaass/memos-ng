@@ -12,6 +12,8 @@ Two layers:
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import httpx
+from app.config import settings
 from app.models import (
     Attachment,
     AttachmentRendition,
@@ -22,6 +24,7 @@ from app.models import (
     Visibility,
 )
 from app.scripts import backfill_frame_album as bf
+from app.services import frame_share as fs
 from app.services.frame_share import CURATED_TAG
 
 MEMO_DATE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -40,7 +43,7 @@ class _Upload:
         self.calls: list[tuple[str, bytes]] = []
         self.fail_on = fail_on or set()
 
-    async def __call__(self, filename: str, jpeg: bytes) -> None:
+    async def __call__(self, filename: str, jpeg: bytes, *, source_ref: str | None = None) -> None:
         self.calls.append((filename, jpeg))
         if filename in self.fail_on:
             raise RuntimeError("simulated upload failure")
@@ -85,6 +88,32 @@ async def test_execute_uploads_with_jpg_name_and_memo_date(tmp_path):
     assert name == "café.jpg"  # the screen render is a .jpg named from the original stem
     assert rr.calls == [(str(tmp_path / "café.png"), MEMO_DATE)]  # photo_date = memo.created_at
     assert jpeg == b"JPEG:" + str(tmp_path / "café.png").encode()
+
+
+async def test_execute_sends_the_attachment_source_ref_header(tmp_path, monkeypatch):
+    # The script's own default uploader against aura-frames at the HTTP boundary: a backfilled
+    # photo must carry the same X-Source-Ref as the worker's upload of the same attachment.
+    monkeypatch.setattr(settings, "FRAME_API_URL", "http://aura-frames.test")
+    monkeypatch.setattr(settings, "FRAME_API_TOKEN", "tok")
+    monkeypatch.setattr(settings, "FRAME_ALBUM_ID", 12)
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(201, json={"status": "created", "id": 1})
+
+    transport = httpx.MockTransport(handler)
+    orig = httpx.AsyncClient
+    monkeypatch.setattr(
+        fs.httpx, "AsyncClient", lambda *a, **kw: orig(*a, **{**kw, "transport": transport})
+    )
+    (tmp_path / "p.png").write_bytes(b"x")
+    targets = [_target(77, tmp_path / "p.png", filename="p.png", memo_id=5)]
+    stats = await bf._upload_targets(
+        targets, execute=True, render=_Render(), upload=bf.upload_to_album
+    )
+    assert stats.uploaded == 1 and stats.failed == 0
+    assert [r.headers.get("X-Source-Ref") for r in captured] == ["memos-attachment:77"]
 
 
 async def test_missing_or_empty_file_is_skipped_not_uploaded(tmp_path):

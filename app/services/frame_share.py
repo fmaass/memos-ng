@@ -16,13 +16,23 @@ import pi_heif
 import structlog
 from anyio import to_thread
 from PIL import Image, ImageOps
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session
-from app.models import Attachment, FrameShareJob, FrameShareState, Memo, Tag, User, memo_tags
+from app.models import (
+    Attachment,
+    FavoriteFrameJob,
+    FrameShareJob,
+    FrameShareState,
+    Memo,
+    Tag,
+    User,
+    attachment_tags,
+    memo_tags,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -30,6 +40,9 @@ pi_heif.register_heif_opener()  # decode HEIC/HEIF originals (also registered in
 
 # The tag that opts a memo's photos into frame sharing.
 CURATED_TAG = "curated"
+# The PICTURE tag (attachment_tags, not memo_tags) that sends one picture to the favorites album.
+FAVORITES_TAG = "favorites"
+UNFAVORITED_ERROR = "unfavorited before send"
 
 
 # Render/send tuning. q95 4:4:4 downscaled to a 2048px longest edge (user-decided 2026-07-04,
@@ -58,12 +71,66 @@ def is_frame_image(mime: str) -> bool:
     return m.startswith("image/") and m != "image/svg+xml"
 
 
+# Either queue's job row: the curated `frame_share_jobs` and the favorites `favorite_frame_jobs`
+# share the lease columns, the outcome writes and the stale-claim sweep.
+FrameJob = FrameShareJob | FavoriteFrameJob
+
+
+def frame_api_base_configured() -> bool:
+    """The aura-frames endpoint and its bearer token are both set — what EVERY album upload needs,
+    whichever album it targets. The token is not album-scoped, so one pair serves both queues."""
+    return bool(settings.FRAME_API_URL and settings.FRAME_API_TOKEN)
+
+
 def frame_api_configured() -> bool:
-    """Global on/off switch for the HTTP album upload: enabled only when the endpoint URL and the
-    bearer token are both set AND the album id is non-zero. Any missing piece disables the feature
-    entirely — no jobs are enqueued and the worker claims none (same empty-default-disables pattern
-    as SMTP/VAPID)."""
-    return bool(settings.FRAME_API_URL and settings.FRAME_API_TOKEN and settings.FRAME_ALBUM_ID)
+    """Global on/off switch for the CURATED album upload: enabled only when the endpoint URL and
+    the bearer token are both set AND the curated album id is non-zero. Any missing piece disables
+    the curated feature entirely — no jobs are enqueued and the worker claims none (same
+    empty-default-disables pattern as SMTP/VAPID)."""
+    return frame_api_base_configured() and bool(settings.FRAME_ALBUM_ID)
+
+
+def favorites_configured() -> bool:
+    """The favorites queue's switch: the shared endpoint + token AND a non-zero favorites album.
+    Independent of FRAME_ALBUM_ID, so a favorites-only deployment still enqueues and drains."""
+    return frame_api_base_configured() and bool(settings.FRAME_FAVORITES_ALBUM_ID)
+
+
+async def enqueue_favorite(db: AsyncSession, att: Attachment, user: User) -> bool:
+    """Queue (or re-arm) the favorites-album upload of `att` after a heart. ONE upsert, inside the
+    caller's transaction (the heart's): a new row, or any existing row short of `sent`, becomes
+    `queued` with a not-before one debounce after the DATABASE clock — the clock the claim compares
+    against — so a re-heart restarts the window from the latest heart and resurrects a
+    skipped/failed/claimed row (clearing its lease, which fences an in-flight worker's outcome
+    writes). A `sent` row is never touched: the photo stays in the album. Returns whether a row
+    was written. Callers check favorites_configured() first."""
+    not_before = func.now() + timedelta(seconds=settings.FRAME_FAVORITE_DEBOUNCE_SECONDS)
+    ins = pg_insert(FavoriteFrameJob).values(
+        attachment_id=att.id,
+        user_id=user.id,
+        state=FrameShareState.queued,
+        attempts=0,
+        next_attempt_at=not_before,
+    )
+    result = await db.execute(
+        ins.on_conflict_do_update(
+            index_elements=["attachment_id"],
+            set_={
+                "state": FrameShareState.queued,
+                "next_attempt_at": not_before,
+                "attempts": 0,
+                "error": None,
+                "claimed_by": None,
+                "claimed_at": None,
+                "user_id": ins.excluded.user_id,
+            },
+            where=FavoriteFrameJob.state != FrameShareState.sent,
+        ).returning(FavoriteFrameJob.id)
+    )
+    written = result.first() is not None
+    if written:
+        logger.info("favorite_frame.enqueued", attachment_id=att.id, user_id=user.id)
+    return written
 
 
 async def maybe_enqueue_frame_shares(db: AsyncSession, memo: Memo, user: User) -> int:
@@ -175,16 +242,34 @@ def _safe_upload_error(exc: Exception) -> str:
     return f"upload failed: {type(exc).__name__}"
 
 
-async def upload_to_album(filename: str, jpeg_bytes: bytes) -> None:
+def frame_source_ref(att: Attachment) -> str:
+    """The `X-Source-Ref` aura-frames dedupes a frame's photos on (plan Phase D): the same value
+    for one picture on the curated and the favorites path. Built from the numeric attachment id,
+    printable ASCII and far under aura's 200-char limit by construction — the public uid comes
+    from imports too and is not guaranteed ASCII, and a value aura refuses is a 422 that would
+    block the upload."""
+    return f"memos-attachment:{att.id}"
+
+
+async def upload_to_album(
+    filename: str,
+    jpeg_bytes: bytes,
+    album_id: int | None = None,
+    source_ref: str | None = None,
+) -> int | None:
     """POST ONE rendered JPEG to the aura-frames album API, which then owns delivery to the frame
-    (replacing the direct SMTP send). aura-frames returns 201 for a newly stored photo and 200 for a
-    SHA-duplicate — both mean the photo is safely in the album, so BOTH are success. Any other
+    (replacing the direct SMTP send). `album_id` defaults to the curated FRAME_ALBUM_ID.
+    aura-frames returns 201 for a newly stored photo and 200 for a SHA-duplicate — both mean the
+    photo is safely in the album, so BOTH are success, and both answer `{"status", "id"}` with the
+    album photo id, which is returned (None when the body carries no integer id: the upload still
+    succeeded, memos just learns no identity). Any other
     status raises httpx.HTTPStatusError (carrying .response.status_code) so the caller can classify
     transient vs permanent. The bearer token is a secret — never log it (it lives only in the
     Authorization header, never in the URL or any raised exception message)."""
     # rstrip("/") so a trailing slash in FRAME_API_URL doesn't yield `//api/albums/...` (redirects
     # aren't followed, so a stray `//` could hard-fail the upload).
-    url = f"{settings.FRAME_API_URL.rstrip('/')}/api/albums/{settings.FRAME_ALBUM_ID}/photos"
+    album = settings.FRAME_ALBUM_ID if album_id is None else album_id
+    url = f"{settings.FRAME_API_URL.rstrip('/')}/api/albums/{album}/photos"
     headers = {
         "Authorization": f"Bearer {settings.FRAME_API_TOKEN}",
         "Content-Type": "image/jpeg",
@@ -193,19 +278,34 @@ async def upload_to_album(filename: str, jpeg_bytes: bytes) -> None:
         # (it stores by sha), so a percent-encoded name is fine — and it stays non-empty + .jpg.
         "X-Filename": quote(filename),
     }
+    if source_ref is not None:
+        headers["X-Source-Ref"] = source_ref
     # Explicit 30s timeout (httpx defaults to 5s connect / no overall cap here would let a hung
     # server stall the worker drain long enough to flap the healthcheck — 30s is generous for one
     # small JPEG, matching the old SMTP timeout).
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         resp = await client.post(url, content=jpeg_bytes, headers=headers)
     if resp.status_code in (200, 201):
-        return
+        return _album_photo_id(resp)
     # 4xx/5xx → HTTPStatusError with .response.status_code for the caller's transient/permanent
     # split; a stray non-2xx that raise_for_status ignores (e.g. an unfollowed 3xx) still errors.
     resp.raise_for_status()
     raise httpx.HTTPStatusError(
         f"unexpected status {resp.status_code}", request=resp.request, response=resp
     )
+
+
+def _album_photo_id(resp: httpx.Response) -> int | None:
+    """The `id` of a 2xx upload answer, or None for a body that is not JSON or has no integer id
+    (bool is excluded: it is an int subclass and never an id)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    photo_id = body.get("id") if isinstance(body, dict) else None
+    if isinstance(photo_id, int) and not isinstance(photo_id, bool):
+        return photo_id
+    return None
 
 
 def _file_exists(path: str) -> bool:
@@ -265,7 +365,7 @@ async def _revalidate(db: AsyncSession, job: FrameShareJob) -> tuple[Attachment,
 
 async def _write_claimed_outcome(
     db: AsyncSession,
-    job: FrameShareJob,
+    job: FrameJob,
     lease: tuple[str | None, datetime | None],
     **values: object,
 ) -> bool:
@@ -288,18 +388,20 @@ async def _write_claimed_outcome(
     nothing else may have touched the row while the lease stood.
 
     On success the instance is refreshed from the row actually written, so callers and tests read
-    committed truth rather than a hopeful in-memory value.
+    committed truth rather than a hopeful in-memory value. The table is the job's own (curated or
+    favorites): both carry the same lease columns.
     """
+    model = type(job)
     claimed_by, claimed_at = lease
     result = await db.execute(
-        update(FrameShareJob)
+        update(model)
         .where(
-            FrameShareJob.id == job.id,
-            FrameShareJob.claimed_by == claimed_by,
-            FrameShareJob.claimed_at == claimed_at,
+            model.id == job.id,
+            model.claimed_by == claimed_by,
+            model.claimed_at == claimed_at,
         )
         .values(**values)
-        .returning(FrameShareJob.id)  # RETURNING, not rowcount: a matched row yields a row
+        .returning(model.id)  # RETURNING, not rowcount: a matched row yields a row
         .execution_options(synchronize_session=False)
     )
     if result.first() is None:
@@ -324,16 +426,30 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
         logger.info("frame_share.skipped", job_id=job.id)
         return "skipped"
     att, memo, _user = reval
-    assert att.storage_path is not None  # _revalidate guarantees a present file
-    filename = Path(att.filename).stem + ".jpg"
     # Stamp DateTimeOriginal from the MEMO's date, not attachment.captured_at: for curated exports
     # captured_at is unreliable (mostly NULL, else upload time); the memo's created_at is the user's
     # curated/back-dated event date — the intended chronological position on the frame.
+    return await _send_claimed(db, job, lease, att, memo.created_at)
+
+
+async def _send_claimed(
+    db: AsyncSession,
+    job: FrameJob,
+    lease: tuple[str | None, datetime | None],
+    att: Attachment,
+    photo_date: datetime | None,
+    *,
+    album_id: int | None = None,
+) -> str:
+    """Render + upload one revalidated, claimed job and write its outcome through the lease fence
+    — the tail both queues share. `album_id` None is the curated album. Does NOT commit."""
+    assert att.storage_path is not None  # the caller's revalidation guarantees a present file
+    filename = Path(att.filename).stem + ".jpg"
     # Render step: a decode/render failure is a permanent data problem (corrupt original), not a
     # transient send error. Fail terminally on the first attempt instead of retrying with backoff
     # through all five (~15 min of churn) — and never reach the upload.
     try:
-        jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, memo.created_at)
+        jpeg = await to_thread.run_sync(render_for_frame, att.storage_path, photo_date)
     except Exception as exc:
         written = await _write_claimed_outcome(
             db,
@@ -356,7 +472,7 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
     # network/timeout + HTTP 408/429/5xx; permanent = any other 4xx. A 200 (SHA-duplicate) or 201
     # (new photo) is success — upload_to_album returns without raising.
     try:
-        await upload_to_album(filename, jpeg)
+        photo_id = await upload_to_album(filename, jpeg, album_id, frame_source_ref(att))
     except Exception as exc:
         # A malformed-header failure (bad token) embeds the full `Bearer <token>` in str(exc), in
         # escaped forms redaction can't catch — so build the stored/logged error from the exception
@@ -385,19 +501,155 @@ async def process_claimed_job(db: AsyncSession, job: FrameShareJob) -> str:
             return "lease_lost"
         logger.warning("frame_share.retry", job_id=job.id, attempts=job.attempts, error=safe)
         return "retry"
-    written = await _write_claimed_outcome(
-        db, job, lease, state=FrameShareState.sent, sent_at=datetime.now(UTC)
-    )
+    sent: dict[str, object] = {"state": FrameShareState.sent, "sent_at": datetime.now(UTC)}
+    if isinstance(job, FavoriteFrameJob):
+        # aura's own id for the stored photo: what acceptance joins to `album_photos.id`.
+        sent["aura_album_photo_id"] = photo_id
+    written = await _write_claimed_outcome(db, job, lease, **sent)
     if not written:
         return "lease_lost"
     logger.info("frame_share.sent", job_id=job.id, bytes=len(jpeg))
     return "sent"
 
 
+# --- favorites send side: revalidate, conditional skip, pace ---
+
+
+def _favorite_tag_present(attachment_id: object):
+    """EXISTS: the picture carries the `favorites` picture tag right now (household-shared)."""
+    return exists(
+        select(1)
+        .select_from(attachment_tags.join(Tag, Tag.id == attachment_tags.c.tag_id))
+        .where(attachment_tags.c.attachment_id == attachment_id, Tag.name == FAVORITES_TAG)
+    )
+
+
+async def revalidate_favorite(
+    db: AsyncSession, job: FavoriteFrameJob
+) -> tuple[str, Attachment | None, datetime | None]:
+    """Send-time check of a claimed favorite: ("send", att, photo_date) when it may go,
+    ("unfavorited", None, None) when the heart is gone — cancelled only through
+    skip_if_unfavorited — and ("ineligible", None, None) for everything else (feature off, picture
+    gone, not a frame image, original missing). No memo is needed. The photo date stamped into a
+    source without DateTimeOriginal is the memo's date when there is a memo, else the file's own
+    capture instant, else the upload time."""
+    if not favorites_configured():
+        return "ineligible", None, None
+    att = await db.get(Attachment, job.attachment_id)
+    if att is None or not is_frame_image(att.mime):
+        return "ineligible", None, None
+    present = (await db.execute(select(_favorite_tag_present(att.id)))).scalar()
+    if not present:
+        return "unfavorited", None, None
+    if not att.storage_path or not await to_thread.run_sync(_file_exists, att.storage_path):
+        return "ineligible", None, None
+    memo = await db.get(Memo, att.memo_id) if att.memo_id is not None else None
+    photo_date = memo.created_at if memo is not None else (att.capture_instant or att.created_at)
+    return "send", att, photo_date
+
+
+async def skip_if_unfavorited(
+    db: AsyncSession, job: FavoriteFrameJob, lease: tuple[str | None, datetime | None]
+) -> bool:
+    """The ONLY write that cancels a favorite, as one conditional UPDATE: `skipped` only while
+    this actor's lease stands AND the tag is absent at statement time. A heart committed first
+    makes NOT EXISTS false; a re-heart's upsert committed first cleared the lease; a heart still
+    uncommitted either waits behind this row lock and then re-arms the skipped row, or holds the
+    lock itself and this statement re-evaluates against its committed version. In every order a
+    present favorite ends `queued` or `sent`, never `skipped`. Returns whether it matched."""
+    claimed_by, claimed_at = lease
+    result = await db.execute(
+        update(FavoriteFrameJob)
+        .where(
+            and_(
+                FavoriteFrameJob.id == job.id,
+                FavoriteFrameJob.claimed_by == claimed_by,
+                FavoriteFrameJob.claimed_at == claimed_at,
+                ~_favorite_tag_present(FavoriteFrameJob.attachment_id),
+            )
+        )
+        .values(state=FrameShareState.skipped, error=UNFAVORITED_ERROR)
+        .returning(FavoriteFrameJob.id)
+        .execution_options(synchronize_session=False)
+    )
+    if result.first() is None:
+        return False
+    await db.refresh(job)
+    return True
+
+
+async def favorite_paced(db: AsyncSession) -> bool:
+    """True while a favorite upload finished within FRAME_FAVORITE_PACE_SECONDS (DB clock). The
+    worker's pass sleeps only when nothing was processed, so without this back-to-back favorites
+    would upload with no gap; refusing here restores the poll sleep between them."""
+    recent = select(1).where(
+        FavoriteFrameJob.sent_at
+        > func.now() - timedelta(seconds=settings.FRAME_FAVORITE_PACE_SECONDS)
+    )
+    return bool((await db.execute(select(exists(recent)))).scalar())
+
+
+async def _favorite_lease_held(
+    db: AsyncSession, job: FavoriteFrameJob, lease: tuple[str | None, datetime | None]
+) -> bool:
+    """Whether the row is still `claimed` under exactly this lease, read from the database."""
+    claimed_by, claimed_at = lease
+    held = select(FavoriteFrameJob.id).where(
+        FavoriteFrameJob.id == job.id,
+        FavoriteFrameJob.state == FrameShareState.claimed,
+        FavoriteFrameJob.claimed_by == claimed_by,
+        FavoriteFrameJob.claimed_at == claimed_at,
+    )
+    return (await db.execute(held)).first() is not None
+
+
+async def process_claimed_favorite(db: AsyncSession, job: FavoriteFrameJob) -> str:
+    """Revalidate + send one claimed favorite to FRAME_FAVORITES_ALBUM_ID; same lease fence and
+    commit contract as process_claimed_job. An unfavorited job is cancelled by the conditional
+    skip; if that skip matches nothing (the heart came back) the claim is handed back as `queued`
+    and due, so the next pass re-reads it — or, when the lease is gone, the newer generation owns
+    the row."""
+    lease = (job.claimed_by, job.claimed_at)
+    verdict, att, photo_date = await revalidate_favorite(db, job)
+    if verdict == "unfavorited":
+        if await skip_if_unfavorited(db, job, lease):
+            logger.info("favorite_frame.skipped", job_id=job.id)
+            return "skipped"
+        handed_back = await _write_claimed_outcome(
+            db,
+            job,
+            lease,
+            state=FrameShareState.queued,
+            claimed_by=None,
+            claimed_at=None,
+            next_attempt_at=None,
+        )
+        return "requeued" if handed_back else "lease_lost"
+    if verdict != "send" or att is None:
+        if not await _write_claimed_outcome(db, job, lease, state=FrameShareState.skipped):
+            return "lease_lost"
+        logger.info("favorite_frame.skipped", job_id=job.id, reason="ineligible")
+        return "skipped"
+    if not await _favorite_lease_held(db, job, lease):
+        # A re-heart since the claim re-armed the row (fresh not-before, lease cleared): the
+        # outcome fence would refuse the `sent` anyway, but only AFTER an upload made under a
+        # lease this worker no longer holds. Stand down before the external side effect instead.
+        logger.warning("frame_share.lease_lost", job_id=job.id, claimed_by=lease[0])
+        return "lease_lost"
+    return await _send_claimed(
+        db, job, lease, att, photo_date, album_id=settings.FRAME_FAVORITES_ALBUM_ID
+    )
+
+
 # --- stale-claim recovery (MEMNG-35): un-strand jobs a crashed worker left in `claimed` ---
 
 
-async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -> int:
+async def recover_stale_claimed(
+    db: AsyncSession,
+    now: datetime | None = None,
+    *,
+    model: type[FrameShareJob] | type[FavoriteFrameJob] = FrameShareJob,
+) -> int:
     """Re-queue (or terminally fail) frame-share jobs stuck in `claimed` past the stale horizon.
 
     The worker COMMITS the `claimed` tombstone before the external album upload, and only `queued`
@@ -423,6 +675,9 @@ async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -
     JPEG bytes, so the duplicate is absorbed downstream. It is only truly visible if the source or
     the memo's date changed between the two attempts (the render then differs → a new sha).
 
+    `model` picks the queue (curated by default); the favorites queue has the same lease columns
+    and the same trade.
+
     Returns the number of rows recovered; FLUSHES only — the caller owns the commit.
     """
     now = now or datetime.now(UTC)
@@ -430,12 +685,12 @@ async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -
     rows = (
         (
             await db.execute(
-                select(FrameShareJob)
+                select(model)
                 .where(
-                    FrameShareJob.state == FrameShareState.claimed,
+                    model.state == FrameShareState.claimed,
                     or_(
-                        FrameShareJob.claimed_at.is_(None),
-                        FrameShareJob.claimed_at < cutoff,
+                        model.claimed_at.is_(None),
+                        model.claimed_at < cutoff,
                     ),
                 )
                 # skip_locked: a row another worker holds mid-claim is someone else's business.
@@ -462,10 +717,14 @@ async def recover_stale_claimed(db: AsyncSession, now: datetime | None = None) -
     return len(rows)
 
 
-async def recover_stale_claimed_committed(now: datetime | None = None) -> int:
+async def recover_stale_claimed_committed(
+    now: datetime | None = None,
+    *,
+    model: type[FrameShareJob] | type[FavoriteFrameJob] = FrameShareJob,
+) -> int:
     """The worker's recovery entry: a dedicated session that COMMITS. A flush alone dies with the
     session, so the re-queue would evaporate and the job stay stranded (the MEMNG-37 shape)."""
     async with async_session() as db:
-        recovered = await recover_stale_claimed(db, now)
+        recovered = await recover_stale_claimed(db, now, model=model)
         await db.commit()
     return recovered

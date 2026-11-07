@@ -1,0 +1,23 @@
+Upload a favorite under a lost lease: drop the database lease read before the send.
+
+A re-heart committed between the claim and the send re-arms the row (queued, fresh not-before,
+lease cleared). The tag is present again, so revalidation says "send"; the outcome fence still
+refuses the `sent`, but only after the upload already reached the album under a lease this worker
+no longer holds. The probe that re-hearts between the claim and the send must turn red on its
+zero-upload assertion; every other probe in the module passes straight through it.
+
+--- a/app/services/frame_share.py
++++ b/app/services/frame_share.py
+@@ -630,12 +630,6 @@
+             return "lease_lost"
+         logger.info("favorite_frame.skipped", job_id=job.id, reason="ineligible")
+         return "skipped"
+-    if not await _favorite_lease_held(db, job, lease):
+-        # A re-heart since the claim re-armed the row (fresh not-before, lease cleared): the
+-        # outcome fence would refuse the `sent` anyway, but only AFTER an upload made under a
+-        # lease this worker no longer holds. Stand down before the external side effect instead.
+-        logger.warning("frame_share.lease_lost", job_id=job.id, claimed_by=lease[0])
+-        return "lease_lost"
+     return await _send_claimed(
+         db, job, lease, att, photo_date, album_id=settings.FRAME_FAVORITES_ALBUM_ID
+     )

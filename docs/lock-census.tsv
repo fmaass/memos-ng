@@ -63,3 +63,4 @@ app/worker.py	claim_one	for_update
 app/worker.py	recover_stale_media_claims	for_update
 app/worker.py	recover_stale_media_claims	for_update
 app/worker.py	claim_frame_share_one	for_update
+app/worker.py	claim_favorite_one	for_update

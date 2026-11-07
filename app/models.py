@@ -27,6 +27,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import Sequence as SqlSequence
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship, validates
 
 from app.database import Base
@@ -1109,6 +1110,47 @@ class FrameShareJob(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FavoriteFrameJob(Base):
+    """One job per hearted picture to upload into the favorites album (FRAME_FAVORITES_ALBUM_ID).
+
+    Its own table rather than a `source` column on frame_share_jobs: a favorite may have no memo
+    (frame_share_jobs.memo_id is NOT NULL) and may also be curated, and the curated upsert's
+    ON CONFLICT (attachment_id) needs that table's unique index untouched. UNIQUE attachment_id is
+    again the idempotency guard; a `sent` row is terminal. `next_attempt_at` doubles as the
+    debounce not-before written at heart time. `user_id` is the member who hearted last (the tag
+    itself records nobody), SET NULL so a departed member does not erase the sent ledger.
+
+    `state` reuses the curated queue's `frame_share_state` type, so the column type is the
+    postgresql ENUM with create_type=False: the generic Enum would emit CREATE TYPE for a type
+    prod already has."""
+
+    __tablename__ = "favorite_frame_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attachment_id: Mapped[int] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    state: Mapped[FrameShareState] = mapped_column(
+        PgEnum(FrameShareState, name="frame_share_state", create_type=False),
+        default=FrameShareState.queued,
+        index=True,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    claimed_by: Mapped[str | None] = mapped_column(String(255))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # aura-frames' album photo id from the upload answer (created or duplicate alike): aura
+    # re-renders every upload, so this — not a sha256 of memos' own render — is what joins a job
+    # to its `album_photos` row.
+    aura_album_photo_id: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class WebSession(Base):

@@ -41,6 +41,7 @@ from app.models import Attachment, Memo, Tag, memo_tags
 from app.services.frame_share import (
     CURATED_TAG,
     frame_api_configured,
+    frame_source_ref,
     is_frame_image,
     render_for_frame,
     upload_to_album,
@@ -53,7 +54,7 @@ logger = structlog.get_logger(__name__)
 # The render step is synchronous CPU work (Pillow); the upload step is an async HTTP POST. Both are
 # injectable so the runner can be unit-tested without a filesystem/Pillow decode or a live album.
 RenderFn = Callable[[str, datetime | None], bytes]
-UploadFn = Callable[[str, bytes], Awaitable[None]]
+UploadFn = Callable[..., Awaitable[object]]  # (filename, jpeg, *, source_ref)
 
 
 @dataclass
@@ -118,7 +119,7 @@ async def _upload_targets(
         try:
             jpeg = await to_thread.run_sync(render, att.storage_path, memo.created_at)
             filename = Path(att.filename).stem + ".jpg"
-            await upload(filename, jpeg)
+            await upload(filename, jpeg, source_ref=frame_source_ref(att))
             stats.uploaded += 1
             logger.info("backfill.uploaded", memo_id=memo.id, attachment_id=att.id, bytes=len(jpeg))
         except Exception as exc:  # per-item isolation: one bad photo never aborts the whole run

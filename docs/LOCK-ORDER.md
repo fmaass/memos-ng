@@ -30,7 +30,7 @@ analysis and the per-site derivation live in the design page, BookStack `/link/3
 | J | `media_jobs` | `media_jobs.id` |
 | A | `attachments` | `attachments.id` |
 | R | `attachment_renditions` | `attachment_renditions.id` |
-| F | `frame_share_jobs` | `frame_share_jobs.id` |
+| F | `frame_share_jobs`, `favorite_frame_jobs` (the favorites queue: same shape, same rules; a heart takes its row after the picture's A KEY SHARE, and the worker's claim / conditional skip hold one F row and read A unlocked) | `frame_share_jobs.id` / `favorite_frame_jobs.id` |
 | E | `export_settings` | singleton |
 | D | digest settings / runs | singleton |
 | C | `collections` (+ `collection_exclusions`, `collection_members`, `collection_covers`) | `collections.id`; `collection_covers` by `(kind, key)` — after A, never before; one row when taken explicitly (`update_collection`, `collection_covers.set_cover`, `add_member` / `remove_member`, `passes._tag_trip_if_untagged` when a trip's pass is issued), possibly many when taken implicitly by an attachment delete's SET NULL / CASCADE (R11) |

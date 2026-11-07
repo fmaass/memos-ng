@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from zoneinfo import available_timezones
 
+import structlog
 from anyio import to_thread
 from fastapi import (
     APIRouter,
@@ -54,6 +55,7 @@ from app.services import (
     variants,
 )
 from app.services import attachment_tags as tag_svc
+from app.services import frame_share as frame_share_svc
 from app.services import uploads as up_svc
 from app.services.asset_paths import derived_tier_path, tier_path, web_ready_uids
 from app.services.attachments import (
@@ -1021,6 +1023,20 @@ async def _taggable(db: AsyncSession, user: User, uid: str, name: str) -> Attach
     return await _owned(db, user, uid)
 
 
+async def _enqueue_favorite_safe(db: AsyncSession, att: Attachment, user: User) -> None:
+    """Queue the heart for the favorites album inside a SAVEPOINT: an error in this optional
+    feature rolls back only its own work and the heart itself still commits and answers 204 (the
+    pattern of the memo router's _enqueue_frame_shares_safe). The heart is the only sink that
+    enqueues; an un-heart writes nothing and the worker's conditional skip cancels."""
+    try:
+        async with db.begin_nested():
+            await frame_share_svc.enqueue_favorite(db, att, user)
+    except Exception as exc:
+        structlog.get_logger(__name__).warning(
+            "favorite_frame.enqueue_error", attachment_id=att.id, error=str(exc)[:200]
+        )
+
+
 @router.put("/attachments/{uid}/tags/{name}", status_code=204, responses=_TAG_WRITE_RESPONSES)
 async def add_picture_tag(
     uid: str,
@@ -1034,6 +1050,8 @@ async def add_picture_tag(
     att = await _taggable(db, user, uid, name)
     try:
         await tag_svc.add(db, att, name)
+        if name == FAVORITES_TAG and frame_share_svc.favorites_configured():
+            await _enqueue_favorite_safe(db, att, user)
         await db.commit()
     except IntegrityError as exc:
         # Only a vanished attachment is the caller's 404; any other integrity failure is not.

@@ -1,0 +1,19 @@
+Cancel a favorite on the lease alone: drop the tag predicate from the conditional skip.
+
+The skip that cancels a hearted picture's upload must match only while the `favorites` tag is
+absent AT STATEMENT TIME. Without the NOT EXISTS it trusts the revalidation read taken just before,
+so a heart that landed in between — with the lease still standing, as when the heart's own enqueue
+never ran — is cancelled anyway and the favorite never reaches the album. The interleaving (a)
+probe that holds the lease and re-tags between the read and the skip must turn red; every other
+probe in the module passes straight through it.
+
+--- a/app/services/frame_share.py
++++ b/app/services/frame_share.py
+@@ -551,7 +551,6 @@
+                 FavoriteFrameJob.id == job.id,
+                 FavoriteFrameJob.claimed_by == claimed_by,
+                 FavoriteFrameJob.claimed_at == claimed_at,
+-                ~_favorite_tag_present(FavoriteFrameJob.attachment_id),
+             )
+         )
+         .values(state=FrameShareState.skipped, error=UNFAVORITED_ERROR)

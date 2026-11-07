@@ -40,6 +40,7 @@ from app.models import (
     Attachment,
     AttachmentStatus,
     FailureReason,
+    FavoriteFrameJob,
     FrameShareJob,
     FrameShareState,
     JobKind,
@@ -1250,18 +1251,79 @@ async def run_frame_share_once(db: AsyncSession) -> str:
     return "processed"
 
 
-async def run_frame_share_drain() -> str:
-    """Drain one frame-share job in its own session, isolating ALL errors so a DB failure inside the
-    claim/revalidate/commit path can never propagate into run()'s loop and halt media processing.
-    Returns run_frame_share_once's status, or 'error' when the drain raised (treated as
-    non-processed so the loop backs off but keeps running). This is the boundary guard for
-    "media processing is immune to the optional frame-share feature"."""
+async def claim_favorite_one(db: AsyncSession) -> FavoriteFrameJob | None:
+    """claim_frame_share_one for the favorites queue: the same due predicate (the not-before is
+    the heart's debounce or a retry backoff), SKIP LOCKED, and the same lease stamp."""
+    stmt = (
+        select(FavoriteFrameJob)
+        .where(
+            FavoriteFrameJob.state == FrameShareState.queued,
+            or_(
+                FavoriteFrameJob.next_attempt_at.is_(None),
+                FavoriteFrameJob.next_attempt_at <= func.now(),
+            ),
+        )
+        .order_by(FavoriteFrameJob.id)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    job = (await db.execute(stmt)).scalar_one_or_none()
+    if job is not None:
+        job.state = FrameShareState.claimed
+        job.claimed_by = WORKER_ID
+        job.claimed_at = datetime.now(UTC)
+        await db.flush()
+    return job
+
+
+async def run_favorite_frame_once(db: AsyncSession) -> str:
+    """Claim + process one favorites job: 'processed' | 'idle' | 'deferred'. Guarded by its OWN
+    config (endpoint + token + favorites album), so a favorites-only worker drains and a
+    curated-only one never claims a favorite. 'deferred' while the pace since the last favorite
+    upload has not elapsed, which hands the pass its poll sleep. Same claim-commit-first contract
+    as run_frame_share_once."""
+    if not frame_share.favorites_configured():
+        await db.commit()
+        return "idle"
+    if media.too_hot() or await frame_share.favorite_paced(db):
+        await db.commit()
+        return "deferred"
+    job = await claim_favorite_one(db)
+    if job is None:
+        await db.commit()
+        return "idle"
+    await db.commit()  # the `claimed` tombstone before the external send, as for curated
+    await frame_share.process_claimed_favorite(db, job)
+    await db.commit()
+    return "processed"
+
+
+async def _drain_isolated(once: Callable[[AsyncSession], Awaitable[str]], event: str) -> str:
     try:
         async with async_session() as db:
-            return await run_frame_share_once(db)
+            return await once(db)
     except Exception:
-        logger.exception("frame_share.drain_error")
+        logger.exception(event)
         return "error"
+
+
+async def run_frame_share_drain() -> str:
+    """Drain one curated frame-share job and then one favorites job, each in its own session with
+    ALL errors isolated, so a DB failure inside either claim/revalidate/commit path can never
+    propagate into run()'s loop and halt media processing — nor stop the other queue. Both run
+    inside this one bounded step (the housekeeping budget has no room for another bound).
+    'processed' when either processed (the pass goes again at once); otherwise 'error' if either
+    raised, else 'deferred' if either deferred, else 'idle' — all non-processed, so the loop backs
+    off. This is the boundary guard for "media processing is immune to the optional frame-share
+    feature"."""
+    statuses = (
+        await _drain_isolated(run_frame_share_once, "frame_share.drain_error"),
+        await _drain_isolated(run_favorite_frame_once, "favorite_frame.drain_error"),
+    )
+    for status in ("processed", "error", "deferred"):
+        if status in statuses:
+            return status
+    return "idle"
 
 
 async def run_frame_share_recover_safe() -> int:
@@ -1273,7 +1335,13 @@ async def run_frame_share_recover_safe() -> int:
         recovered = await frame_share.recover_stale_claimed_committed()
     except Exception:
         logger.exception("frame_share.recover_error")
-        return 0
+        recovered = 0
+    # The favorites queue has the same claim-before-send tombstone; swept separately so an error
+    # in one table never leaves the other stranded.
+    try:
+        recovered += await frame_share.recover_stale_claimed_committed(model=FavoriteFrameJob)
+    except Exception:
+        logger.exception("favorite_frame.recover_error")
     if recovered:
         logger.info("frame_share_recovered", count=recovered)
     return recovered

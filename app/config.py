@@ -279,6 +279,13 @@ class Settings(BaseSettings):
     FRAME_API_URL: str = ""
     FRAME_ALBUM_ID: int = 0
     FRAME_API_TOKEN: str = Field(default="", repr=False)
+    # Hearted pictures go to their OWN album through the same URL + token (plan
+    # PLAN_2026-11-06_favorites-to-aura-frame.md). 0 disables favorites only; the curated album
+    # above is unaffected either way. A heart is sent once it has stood for the debounce (DB clock,
+    # restarted by a re-heart), and favorite uploads are spaced by the pace.
+    FRAME_FAVORITES_ALBUM_ID: int = 0
+    FRAME_FAVORITE_DEBOUNCE_SECONDS: int = 60
+    FRAME_FAVORITE_PACE_SECONDS: int = 10
 
     # img-manager's stem lookup, asked by the `sibling` media job for a photo whose own file said
     # nothing about when or where (MEMNG-796). All three or none: an empty value disables the
