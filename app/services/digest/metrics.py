@@ -42,6 +42,16 @@ ENABLED = "memosng_digest_enabled"
 LAST_SUCCESS = "memosng_digest_last_success_timestamp_seconds"
 RUNS = "memosng_digest_runs"
 SNAPSHOT_AGE = "memosng_digest_snapshot_age_seconds"
+PARTIAL_STREAK = "memosng_digest_partial_streak"
+PARTIAL_ALERT = "memosng_digest_partial_alert"
+
+# One `partial` run is a group the next run retries; two in a row is a group that keeps being
+# refused, and that is what the alert is for (MEMNG-1245).
+PARTIAL_ALERT_STREAK = 2
+# A run in which a group was refused: `partial`, or `failed` after attempting at least one group
+# (every group refused). A `failed` run that never reached a group (a guard, the over-cap check)
+# is a different failure, the stale alert's, and it ends the streak like any other outcome.
+_REFUSED_GROUP = "(status = :partial OR (status = :failed AND cardinality(groups_attempted) > 0))"
 
 # A run that did not actually mail the household: an import writes history and a test-send goes to
 # one admin address. Neither may read as an SMTP success, or an import on the morning of
@@ -51,7 +61,10 @@ SNAPSHOT_AGE = "memosng_digest_snapshot_age_seconds"
 # `runner` both decide what "a success" is, and two copies of a status string are two places for
 # it to be spelled differently once.
 NON_DELIVERING_TRIGGERS = (DigestTrigger.test, DigestTrigger.import_)
-SUCCESS_STATUSES = (DigestRunStatus.sent, DigestRunStatus.nothing_to_send)
+#
+# `partial` is a delivery: some group WAS mailed. A group that keeps failing is the partial alert's
+# signal, not the stale alert's.
+SUCCESS_STATUSES = (DigestRunStatus.sent, DigestRunStatus.nothing_to_send, DigestRunStatus.partial)
 
 
 @dataclass(frozen=True)
@@ -63,6 +76,8 @@ class Snapshot:
     # missing series is indistinguishable from a broken exporter.
     last_success: float
     runs_by_status: dict[str, int] = field(default_factory=dict)
+    # How many of the newest terminal DELIVERING runs in a row refused a group.
+    partial_streak: int = 0
 
 
 _snapshot: Snapshot | None = None
@@ -93,11 +108,26 @@ async def read_snapshot(db: AsyncSession) -> Snapshot:
     rows = await db.execute(
         sa_text("SELECT status, count(*) FROM digest_runs WHERE status IS NOT NULL GROUP BY status")
     )
+    runs_by_status = {row[0]: int(row[1]) for row in rows}
+    streak = await db.scalar(
+        sa_text(
+            f"SELECT count(*) FROM digest_runs WHERE {_REFUSED_GROUP} "
+            "AND trigger <> ALL(:triggers) AND id > COALESCE(("
+            f"SELECT max(id) FROM digest_runs WHERE status IS NOT NULL AND NOT ({_REFUSED_GROUP}) "
+            "AND trigger <> ALL(:triggers)), 0)"
+        ),
+        {
+            "partial": DigestRunStatus.partial.value,
+            "failed": DigestRunStatus.failed.value,
+            "triggers": list(NON_DELIVERING_TRIGGERS),
+        },
+    )
     return Snapshot(
         taken_at=time.time(),
         enabled=enabled,
         last_success=float(last) if last is not None else 0.0,
-        runs_by_status={row[0]: int(row[1]) for row in rows},
+        runs_by_status=runs_by_status,
+        partial_streak=int(streak or 0),
     )
 
 
@@ -165,6 +195,16 @@ class DigestCollector:
         for status, count in sorted(snapshot.runs_by_status.items()):
             runs.add_metric([status], float(count))
         yield runs
+        yield GaugeMetricFamily(
+            PARTIAL_STREAK,
+            "Newest digest runs in a row that reached only some language groups.",
+            value=float(snapshot.partial_streak),
+        )
+        yield GaugeMetricFamily(
+            PARTIAL_ALERT,
+            "1 when the last two digest runs each refused a language group (partial or failed).",
+            value=1.0 if snapshot.partial_streak >= PARTIAL_ALERT_STREAK else 0.0,
+        )
         yield GaugeMetricFamily(
             SNAPSHOT_AGE,
             "Age of the snapshot these digest metrics are served from.",

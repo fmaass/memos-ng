@@ -56,6 +56,27 @@ export function normaliseEmail(raw: string): string | null {
 
 export type RecipientCheck = { ok: true; email: string } | { ok: false; reason: string }
 
+/** The languages a digest recipient reads (MEMNG-1245) — the API's enum, in send order. */
+export const DIGEST_LANGUAGES = ['de', 'es', 'en'] as const
+export type DigestLanguage = (typeof DIGEST_LANGUAGES)[number]
+export const DEFAULT_DIGEST_LANGUAGE: DigestLanguage = 'de'
+export const DIGEST_LANGUAGE_LABELS: Record<DigestLanguage, string> = {
+  de: 'Deutsch',
+  es: 'Español',
+  en: 'English',
+}
+
+export type LanguageCheck = { ok: true; language: DigestLanguage } | { ok: false; reason: string }
+
+/** A recipient row's language, checked before it is sent: exactly de, es or en and nothing else
+ * (no other case, no surrounding space) — the same set the API answers 422 outside of. */
+export function checkRecipientLanguage(value: unknown): LanguageCheck {
+  if (typeof value === 'string' && (DIGEST_LANGUAGES as readonly string[]).includes(value)) {
+    return { ok: true, language: value as DigestLanguage }
+  }
+  return { ok: false, reason: 'Choose Deutsch, Español or English.' }
+}
+
 /** Whether this typed address can be added, and the stored form it would take. */
 export function checkNewRecipient(raw: string, existing: readonly string[]): RecipientCheck {
   if (!raw.trim()) return { ok: false, reason: 'Enter an e-mail address.' }

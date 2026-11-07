@@ -140,7 +140,7 @@ async def test_scope_public_protected_admits_both_and_never_private(adb):
     public = await seed_memo(adb, user, visibility=Visibility.PUBLIC)
     protected = await seed_memo(adb, user, visibility=Visibility.PROTECTED)
     await seed_memo(adb, user, visibility=Visibility.PRIVATE)
-    found = await digest_select.load_candidates(adb, _settings())
+    found = await digest_select.load_candidates(adb, _settings(), language="de")
     assert {c.memo_id for c in found} == {public.id, protected.id}
 
 
@@ -149,7 +149,7 @@ async def test_scope_public_admits_only_public(adb):
     public = await seed_memo(adb, user, visibility=Visibility.PUBLIC)
     await seed_memo(adb, user, visibility=Visibility.PROTECTED)
     found = await digest_select.load_candidates(
-        adb, _settings(visibility_scope=DigestVisibilityScope.PUBLIC)
+        adb, _settings(visibility_scope=DigestVisibilityScope.PUBLIC), language="de"
     )
     assert {c.memo_id for c in found} == {public.id}
 
@@ -158,7 +158,7 @@ async def test_an_archived_memo_is_never_a_candidate(adb):
     user = await seed_user(adb)
     live = await seed_memo(adb, user)
     await seed_memo(adb, user, archived=True)
-    found = await digest_select.load_candidates(adb, _settings())
+    found = await digest_select.load_candidates(adb, _settings(), language="de")
     assert {c.memo_id for c in found} == {live.id}
 
 
@@ -168,7 +168,9 @@ async def test_the_start_date_is_a_LOCAL_day_boundary(adb):
     user = await seed_user(adb)
     just_before = await seed_memo(adb, user, created_at=datetime(2026, 5, 31, 21, 59, tzinfo=UTC))
     just_after = await seed_memo(adb, user, created_at=datetime(2026, 5, 31, 22, 1, tzinfo=UTC))
-    found = {c.memo_id for c in await digest_select.load_candidates(adb, _settings())}
+    found = {
+        c.memo_id for c in await digest_select.load_candidates(adb, _settings(), language="de")
+    }
     assert just_after.id in found
     assert just_before.id not in found
 
@@ -185,11 +187,16 @@ async def test_a_memo_with_a_delivery_row_is_excluded(adb):
         )
     )
     await adb.execute(
-        text("INSERT INTO digest_deliveries (memo_id, run_id) VALUES (:memo_id, :run_id)"),
+        text(
+            "INSERT INTO digest_group_deliveries (memo_id, run_id, language) "
+            "VALUES (:memo_id, :run_id, 'de')"
+        ),
         {"memo_id": delivered.id, "run_id": run_id},
     )
     await adb.flush()
-    found = {c.memo_id for c in await digest_select.load_candidates(adb, _settings())}
+    found = {
+        c.memo_id for c in await digest_select.load_candidates(adb, _settings(), language="de")
+    }
     assert fresh.id in found
     assert delivered.id not in found
 
@@ -199,7 +206,7 @@ async def test_candidates_come_back_oldest_first(adb):
     newest = await seed_memo(adb, user, created_at=datetime(2026, 6, 20, tzinfo=UTC))
     oldest = await seed_memo(adb, user, created_at=datetime(2026, 6, 2, tzinfo=UTC))
     middle = await seed_memo(adb, user, created_at=datetime(2026, 6, 10, tzinfo=UTC))
-    found = await digest_select.load_candidates(adb, _settings())
+    found = await digest_select.load_candidates(adb, _settings(), language="de")
     assert [c.memo_id for c in found] == [oldest.id, middle.id, newest.id]
 
 
@@ -209,7 +216,7 @@ async def test_attachments_are_split_into_photos_and_videos(adb):
     photo = await seed_attachment(adb, user, memo, mime="image/jpeg")
     video = await seed_attachment(adb, user, memo, mime="video/mp4", filename="clip.mp4")
     await seed_attachment(adb, user, memo, mime="application/pdf", filename="doc.pdf")
-    found = await digest_select.load_candidates(adb, _settings())
+    found = await digest_select.load_candidates(adb, _settings(), language="de")
     candidate = next(c for c in found if c.memo_id == memo.id)
     assert [ref.uid for ref in candidate.images] == [photo.uid]
     assert [ref.uid for ref in candidate.videos] == [video.uid]
@@ -231,7 +238,7 @@ async def test_select_for_run_reads_the_real_filesystem(adb, tmp_path, monkeypat
     await adb.flush()
 
     selection = await digest_select.select_for_run(
-        borrowed_session_factory(adb), _settings(), datetime.now(UTC)
+        borrowed_session_factory(adb), _settings(), datetime.now(UTC), language="de"
     )
     assert [c.memo_id for c in selection.included] == [ready.id, with_video.id]
     assert [d.uid for d in selection.deferred] == [pending.uid]
@@ -242,7 +249,7 @@ async def test_unresolved_attachment_ids_covers_photos_and_videos(adb):
     memo = await seed_memo(adb, user)
     photo = await seed_attachment(adb, user, memo, mime="image/jpeg")
     video = await seed_attachment(adb, user, memo, mime="video/mp4", filename="c.mp4")
-    found = await digest_select.load_candidates(adb, _settings())
+    found = await digest_select.load_candidates(adb, _settings(), language="de")
     ids = digest_select.unresolved_attachment_ids(
         digest_select.Selection(included=found, deferred=[])
     )
@@ -277,6 +284,8 @@ async def test_a_candidate_carries_its_memos_tags_sorted(adb):
     )
     await adb.flush()
     adb.expire(memo)
-    found = {c.memo_id: c for c in await digest_select.load_candidates(adb, _settings())}
+    found = {
+        c.memo_id: c for c in await digest_select.load_candidates(adb, _settings(), language="de")
+    }
     assert found[memo.id].tags == ("curated", "trip")
     assert found[untagged.id].tags == ()

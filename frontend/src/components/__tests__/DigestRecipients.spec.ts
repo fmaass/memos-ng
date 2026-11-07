@@ -1,5 +1,6 @@
 import { mount } from '@vue/test-utils'
 import PrimeVue from 'primevue/config'
+import Select from 'primevue/select'
 import { describe, expect, it } from 'vitest'
 
 import DigestRecipients from '@/components/DigestRecipients.vue'
@@ -11,6 +12,7 @@ function recipient(over: Partial<DigestRecipient> = {}): DigestRecipient {
     email: 'one@example.test',
     display_name: null,
     enabled: true,
+    language: 'de',
     added_by: 'fabian',
     added_at: '2026-08-30T10:00:00Z',
     ...over,
@@ -25,6 +27,19 @@ function mountRecipients(props: Partial<InstanceType<typeof DigestRecipients>['$
 }
 
 describe('DigestRecipients', () => {
+  it('shows each row in its language and emits a checked language change', async () => {
+    const wrapper = mountRecipients({
+      recipients: [recipient({ language: 'es' })],
+    })
+    const select = wrapper.findAllComponents(Select)[0]!
+    expect(select.props('modelValue')).toBe('es')
+    select.vm.$emit('update:modelValue', 'en')
+    select.vm.$emit('update:modelValue', 'fr')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.emitted('language')).toEqual([[{ id: 1, language: 'en' }]])
+    expect(wrapper.find('[data-test="digest-recipient-local-error"]').exists()).toBe(true)
+  })
+
   it('lists the addresses and says so when there are none', () => {
     expect(mountRecipients().find('[data-test="digest-recipients-empty"]').exists()).toBe(true)
     const wrapper = mountRecipients({
@@ -39,7 +54,9 @@ describe('DigestRecipients', () => {
     await wrapper.find('[data-test="digest-recipient-name"]').setValue(' Ada ')
     await wrapper.find('[data-test="digest-recipient-add"]').trigger('click')
 
-    expect(wrapper.emitted('add')).toEqual([[{ email: 'new@example.test', display_name: 'Ada' }]])
+    expect(wrapper.emitted('add')).toEqual([
+      [{ email: 'new@example.test', display_name: 'Ada', language: 'de' }],
+    ])
     // the form clears itself only once the entry was accepted
     expect(wrapper.find('[data-test="digest-recipient-local-error"]').exists()).toBe(false)
   })

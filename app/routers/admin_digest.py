@@ -15,7 +15,7 @@ decides whether the household gets its mail.
 """
 
 from datetime import UTC, date, datetime, time
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
@@ -40,6 +40,7 @@ from app.models import (
 from app.services.cursors import InvalidCursor, decode_cursor_payload, encode_cursor_payload
 from app.services.digest import domain as digest_domain
 from app.services.digest import hosting as digest_hosting
+from app.services.digest import ledger as digest_ledger
 from app.services.digest import metrics as digest_metrics
 from app.services.digest import runner as digest_runner
 from app.services.digest.domain import MAX_EMAIL_LENGTH, normalise_email
@@ -138,11 +139,17 @@ class DigestSettingsPut(BaseModel):
         return normalised
 
 
+# The languages a recipient can read (MEMNG-1245) — `app.models.DigestLanguage`, spelled as a
+# Literal so the schema publishes the enum and anything else is a 422 before a handler runs.
+DigestLanguageCode = Literal["de", "es", "en"]
+
+
 class DigestRecipientOut(BaseModel):
     id: int
     email: str
     display_name: str | None
     enabled: bool
+    language: str
     added_by: str | None
     added_at: Rfc3339Datetime
 
@@ -151,6 +158,7 @@ class DigestRecipientCreate(BaseModel):
     email: str = Field(min_length=3, max_length=MAX_EMAIL_LENGTH)
     display_name: str | None = Field(default=None, max_length=255)
     enabled: bool = True
+    language: DigestLanguageCode = "de"
 
 
 class DigestRecipientPatch(BaseModel):
@@ -165,6 +173,7 @@ class DigestRecipientPatch(BaseModel):
     # dies at the VARCHAR(255) on COMMIT, which the caller sees as a 500 for what is plainly a 422.
     display_name: str | None = Field(default=None, max_length=255)
     enabled: bool | None = None
+    language: DigestLanguageCode | None = None
 
 
 class DigestRunOut(BaseModel):
@@ -183,6 +192,9 @@ class DigestRunOut(BaseModel):
     recipients: int
     error: str | None
     local_date: date
+    # The language groups the run mailed, and those whose every part was accepted (MEMNG-1245).
+    groups_attempted: list[str]
+    groups_accepted: list[str]
 
 
 class DigestRunList(BaseModel):
@@ -281,6 +293,7 @@ def _recipient_out(row: DigestRecipient) -> DigestRecipientOut:
         email=row.email,
         display_name=row.display_name,
         enabled=row.enabled,
+        language=row.language,
         added_by=row.added_by,
         added_at=row.added_at,
     )
@@ -425,14 +438,20 @@ async def add_digest_recipient(
         # Compared against the NORMALISED form, so `A@B.com` collides with `a@b.com` — one mailbox
         # listed twice would receive the digest twice.
         raise HTTPException(status_code=409, detail="that address is already a recipient")
+    before = await digest_ledger.active_languages(db)
     row = DigestRecipient(
         email=email,
         display_name=body.display_name,
         enabled=body.enabled,
+        language=body.language,
         added_by=admin.subject,
     )
     db.add(row)
     try:
+        await db.flush()
+        # A language that just came alive inherits the delivered history (MEMNG-1245), in this
+        # same transaction, so its first run does not replay everything ever sent.
+        await digest_ledger.seed_newly_active(db, before)
         await db.commit()
     except IntegrityError as exc:
         # The check above loses to a concurrent POST of the same address; the unique index is what
@@ -454,12 +473,17 @@ async def update_digest_recipient(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="recipient not found")
+    before = await digest_ledger.active_languages(db)
     if "display_name" in body.model_fields_set:
         row.display_name = body.display_name
     if body.enabled is False:
         await _refuse_leaving_nobody_to_send_to(db, row)
     if body.enabled is not None:
         row.enabled = body.enabled
+    if body.language is not None:
+        row.language = body.language
+    await db.flush()
+    await digest_ledger.seed_newly_active(db, before)
     await db.commit()
     return _recipient_out(row)
 
@@ -497,6 +521,8 @@ def _run_out(row: DigestRun) -> DigestRunOut:
         recipients=row.recipients,
         error=row.error,
         local_date=row.local_date,
+        groups_attempted=list(row.groups_attempted or []),
+        groups_accepted=list(row.groups_accepted or []),
     )
 
 
@@ -663,6 +689,8 @@ class DigestTestSendIn(BaseModel):
     selection at all — the pure SMTP probe, and one that writes no settings anywhere in it."""
 
     empty: bool = False
+    # Which group's mail to send: that language's selection, words and dates (MEMNG-1245).
+    language: DigestLanguageCode = "de"
 
 
 class DigestTestSendOut(BaseModel):
@@ -735,7 +763,9 @@ async def test_send_digest(
     if not digest_domain.smtp_configured():
         raise HTTPException(status_code=422, detail=digest_runner.ERROR_SMTP_UNCONFIGURED)
     try:
-        memo_count = await digest_runner.test_send(address=admin.email, empty=body.empty)
+        memo_count = await digest_runner.test_send(
+            address=admin.email, empty=body.empty, language=body.language
+        )
     except digest_runner.SenderIsRecipient as exc:
         # The same refusal a real run applies. Answered 422 rather than sent-and-hoped: iCloud
         # drops From == To with attachments, so the probe would report success and deliver

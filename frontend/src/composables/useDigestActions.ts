@@ -11,7 +11,7 @@ import { ref } from 'vue'
 
 import type { components } from '@/api/schema'
 import { useApi } from '@/composables/useApi'
-import { apiErrorMessage } from '@/lib/digest'
+import { DEFAULT_DIGEST_LANGUAGE, type DigestLanguage, apiErrorMessage } from '@/lib/digest'
 
 export type DigestPreview = components['schemas']['DigestPreviewOut']
 export type DigestRunClaim = components['schemas']['DigestRunClaimOut']
@@ -97,12 +97,19 @@ export function useDigestActions(options: DigestActionOptions = {}) {
 
   /** One real mail to the calling admin's own address. `empty` asks for the "no memos selected"
    * body without consulting the selection at all — the SMTP probe, which sends nothing else. */
-  async function sendTest(empty = false): Promise<DigestTestSend | null> {
+  async function sendTest(
+    empty = false,
+    language: DigestLanguage = DEFAULT_DIGEST_LANGUAGE,
+  ): Promise<DigestTestSend | null> {
     if (sendingTest.value) return null
     sendingTest.value = true
     actionError.value = null
     try {
-      const data = unwrap(await api.POST('/api/admin/digest/test-send', { body: { empty } }))
+      const data = unwrap(
+        await api.POST('/api/admin/digest/test-send', {
+          body: { empty, language },
+        }),
+      )
       actionNotice.value = empty
         ? 'An empty test mail went out to your address.'
         : `A test mail with ${data.memo_count} memo${data.memo_count === 1 ? '' : 's'} went out to your address.`

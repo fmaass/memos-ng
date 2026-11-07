@@ -22,11 +22,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from anyio import to_thread
-from sqlalchemy import exists, select
+from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models import (
     DigestDelivery,
+    DigestGroupDelivery,
     DigestVisibilityScope,
     Memo,
     Visibility,
@@ -177,13 +179,16 @@ def _existing_paths_sync(paths: list[Path]) -> set[Path]:
     return {p for p in paths if p.exists()}
 
 
-async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Candidate]:
+async def load_candidates(
+    db: AsyncSession, settings: DigestConfig, *, language: str
+) -> list[Candidate]:
     """Every memo eligible by scope, archive state, start date and the delivery registry, oldest
-    first.
+    first — for ONE language group: a memo stays a candidate for `language` until a
+    `(memo, language)` row exists, whatever the other groups have had (MEMNG-1245).
 
-    `NOT EXISTS` against `digest_deliveries` rather than a LEFT JOIN … IS NULL: the registry's
-    primary key IS `memo_id`, so the anti-join is a single index probe per memo and cannot
-    duplicate a row if the table ever gains a second one per memo.
+    `NOT EXISTS` against `digest_group_deliveries` rather than a LEFT JOIN … IS NULL: the registry's
+    primary key IS `(memo_id, language)`, so the anti-join is a single index probe per memo and
+    cannot duplicate a row when a memo has rows for several languages.
     """
     visibilities = SCOPE_VISIBILITIES.get(
         settings.visibility_scope, SCOPE_VISIBILITIES[DigestVisibilityScope.PUBLIC_PROTECTED]
@@ -191,7 +196,17 @@ async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Cand
     # `exists().where(...)` rather than `select(...).exists()`: identical SQL, and the leading
     # `exists` is what tells `tests/test_no_blocking_io.py`'s AST scanner that this is a SQL
     # construct and not a `Path.exists()` on the request loop.
-    delivered = exists().where(DigestDelivery.memo_id == Memo.id)
+    delivered = exists().where(
+        DigestGroupDelivery.memo_id == Memo.id, DigestGroupDelivery.language == language
+    )
+    # A legacy row with no group row in ANY language was written by the previous image while it
+    # ran after a rollback: it mailed every recipient, so no group gets that memo again. Every
+    # legacy row this image writes has a group row beside it, so this matches nothing else.
+    any_group = aliased(DigestGroupDelivery)
+    mailed_by_previous_image = and_(
+        exists().where(DigestDelivery.memo_id == Memo.id),
+        ~exists().where(any_group.memo_id == Memo.id),
+    )
     statement = (
         select(Memo)
         .where(
@@ -199,6 +214,7 @@ async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Cand
             Memo.archived_at.is_(None),
             Memo.created_at >= start_of_local_day_utc(settings.start_date, settings.timezone),
             ~delivered,
+            ~mailed_by_previous_image,
         )
         .order_by(Memo.created_at.asc(), Memo.id.asc())
     )
@@ -224,7 +240,11 @@ async def load_candidates(db: AsyncSession, settings: DigestConfig) -> list[Cand
 
 
 async def select_for_run(
-    session_factory: Callable[[], AsyncSession], settings: DigestConfig, now_utc: datetime
+    session_factory: Callable[[], AsyncSession],
+    settings: DigestConfig,
+    now_utc: datetime,
+    *,
+    language: str,
 ) -> Selection:
     """Load the candidates and apply the readiness rule — the whole selection step of a run.
 
@@ -235,7 +255,7 @@ async def select_for_run(
     service shares with the rest of the app (ADR-0009).
     """
     async with session_factory() as db:
-        candidates = await load_candidates(db, settings)
+        candidates = await load_candidates(db, settings, language=language)
     if not candidates:
         return Selection(included=[], deferred=[])
     paths: list[Path] = []

@@ -31,6 +31,8 @@ DIGEST_TABLES = {
     "digest_runs",
     "digest_deliveries",
     "digest_hosted_media",
+    # MEMNG-1245: the per-language-group ledger, beside (not instead of) `digest_deliveries`.
+    "digest_group_deliveries",
 }
 
 # The revision immediately BELOW the first digest migration — i.e. the schema as it stood before
@@ -50,7 +52,7 @@ def _alembic_config() -> Config:
 # --- what the migration built -----------------------------------------------------------------
 
 
-def test_the_migration_creates_exactly_the_five_digest_tables(db_engine):
+def test_the_migrations_create_exactly_the_six_digest_tables(db_engine):
     with db_engine.connect() as conn:
         names = set(
             conn.execute(

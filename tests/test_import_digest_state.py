@@ -828,3 +828,58 @@ async def test_the_run_row_is_locked_and_its_total_is_counted_in_sql(
     assert any("count(" in one.lower() for one in rewrites), (
         "memos_sent must be counted in the UPDATE itself, never handed in from this process"
     )
+
+
+# --- the per-language-group ledger (MEMNG-1245) -------------------------------------------------
+
+
+async def _group_rows(adb) -> set[tuple[int, str]]:
+    rows = await adb.execute(text("SELECT memo_id, language FROM digest_group_deliveries"))
+    return {(row[0], row[1]) for row in rows}
+
+
+async def test_execute_mirrors_the_imported_history_into_the_de_group_ledger(adb, registry, env):
+    """The satellite mailed one group, today's single language; without the mirror that group's
+    first run would mail the whole imported history again."""
+    seeded = await _seed_memos(adb)
+    await importer.run_import(adb, registry=registry, env=env, execute=True)
+    await adb.flush()
+    assert await _group_rows(adb) == {(memo_id, "de") for memo_id in seeded.values()}
+
+
+async def test_an_import_that_brings_the_de_group_alive_seeds_it_from_every_language(
+    adb, registry, env
+):
+    """The import is a recipient writer too: a memo the es group already had is not news to the
+    de group the import just brought to life."""
+    seeded = await _seed_memos(adb)
+    first = await adb.get(Memo, next(iter(seeded.values())))
+    assert first is not None
+    extra_memo = Memo(uid="es0nlyhistory0001", owner_id=first.owner_id, content="es only")
+    adb.add(extra_memo)
+    await adb.flush()
+    extra = extra_memo.id
+    run_id = (
+        await adb.execute(
+            text(
+                "INSERT INTO digest_runs (trigger, status, local_date) "
+                "VALUES ('manual', 'sent', '2026-07-01') RETURNING id"
+            )
+        )
+    ).scalar_one()
+    await adb.execute(
+        text("INSERT INTO digest_recipients (email, language) VALUES ('tia@example.test', 'es')")
+    )
+    await adb.execute(
+        text(
+            "INSERT INTO digest_group_deliveries (memo_id, language, run_id) VALUES (:m, 'es', :r)"
+        ),
+        {"m": extra, "r": run_id},
+    )
+
+    await importer.run_import(adb, registry=registry, env=env, execute=True)
+    await adb.flush()
+
+    assert await _group_rows(adb) == (
+        {(memo_id, "de") for memo_id in seeded.values()} | {(extra, "es"), (extra, "de")}
+    )

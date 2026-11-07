@@ -11,7 +11,11 @@ import DigestRuns from '@/components/DigestRuns.vue'
 import { useDigest } from '@/composables/useDigest'
 import { useDigestActions } from '@/composables/useDigestActions'
 import {
+  DEFAULT_DIGEST_LANGUAGE,
+  DIGEST_LANGUAGES,
+  DIGEST_LANGUAGE_LABELS,
   type DigestConfigDraft,
+  type DigestLanguage,
   describeNextSend,
   dirtyConfigFields,
   draftFromSettings,
@@ -39,6 +43,7 @@ const {
   setEnabled,
   addRecipient,
   setRecipientEnabled,
+  setRecipientLanguage,
   removeRecipient,
   refreshRuns,
 } = useDigest()
@@ -58,6 +63,13 @@ const {
   // `POST /run` only CLAIMS the row — the worker executes it — so the table is refreshed twice:
   // once when the claim lands (it shows as running) and once when the watch settles on a status.
 } = useDigestActions({ onRunChanged: () => refreshRuns() })
+
+// Which group's mail "Send test to me" sends (MEMNG-1245).
+const testLanguage = ref<DigestLanguage>(DEFAULT_DIGEST_LANGUAGE)
+const languageOptions = DIGEST_LANGUAGES.map((value) => ({
+  value,
+  label: DIGEST_LANGUAGE_LABELS[value],
+}))
 
 // The grouped draft is seeded ONCE, when the settings first arrive, and re-seeded only by Save and
 // Discard. A background refetch must not silently overwrite what the admin is typing.
@@ -179,7 +191,17 @@ const scopeOptions = [
             outlined
             :loading="sendingTest"
             data-test="digest-test-send"
-            @click="sendTest(false)"
+            @click="sendTest(false, testLanguage)"
+          />
+          <SelectButton
+            v-model="testLanguage"
+            :options="languageOptions"
+            option-label="label"
+            option-value="value"
+            :allow-empty="false"
+            size="small"
+            aria-label="Test mail language"
+            data-test="digest-test-language"
           />
           <Button
             label="Send now"
@@ -303,6 +325,7 @@ const scopeOptions = [
         :error="recipientError"
         @add="addRecipient($event)"
         @toggle="setRecipientEnabled($event.id, $event.enabled)"
+        @language="setRecipientLanguage($event.id, $event.language)"
         @remove="removeRecipient($event)"
       />
 

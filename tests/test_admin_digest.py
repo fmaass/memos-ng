@@ -896,3 +896,64 @@ def test_an_over_long_display_name_is_refused_on_create_too(admin_client):
     )
     assert response.status_code == 422, response.text
     assert client.get(f"{PREFIX}/recipients").json() == []
+
+
+# --- recipient language (MEMNG-1245) -------------------------------------------------------------
+
+
+def test_a_new_recipient_reads_german_unless_told_otherwise(admin_client):
+    client, _ = admin_client
+    created = client.post(f"{PREFIX}/recipients", json={"email": "oma@example.com"})
+    assert created.status_code == 201, created.text
+    assert created.json()["language"] == "de"
+    spanish = client.post(
+        f"{PREFIX}/recipients", json={"email": "tia@example.com", "language": "es"}
+    )
+    assert spanish.json()["language"] == "es"
+    listed = {r["email"]: r["language"] for r in client.get(f"{PREFIX}/recipients").json()}
+    assert listed == {"oma@example.com": "de", "tia@example.com": "es"}
+
+
+def test_a_recipients_language_can_be_changed_alone(admin_client):
+    client, _ = admin_client
+    created = client.post(
+        f"{PREFIX}/recipients", json={"email": "uncle@example.com", "display_name": "Uncle"}
+    ).json()
+    patched = client.patch(f"{PREFIX}/recipients/{created['id']}", json={"language": "en"})
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["language"] == "en"
+    assert patched.json()["display_name"] == "Uncle"
+    assert patched.json()["enabled"] is True
+
+
+@pytest.mark.parametrize("language", ["fr", "DE", "", "deu"])
+def test_a_language_outside_de_es_en_is_422_and_writes_nothing(admin_client, language):
+    client, _ = admin_client
+    refused = client.post(
+        f"{PREFIX}/recipients", json={"email": "x@example.com", "language": language}
+    )
+    assert refused.status_code == 422
+    created = client.post(f"{PREFIX}/recipients", json={"email": "y@example.com"}).json()
+    patched = client.patch(f"{PREFIX}/recipients/{created['id']}", json={"language": language})
+    assert patched.status_code == 422
+    assert {r["email"]: r["language"] for r in client.get(f"{PREFIX}/recipients").json()} == {
+        "y@example.com": "de"
+    }
+
+
+def test_a_run_reports_its_groups(admin_client):
+    client, _ = admin_client
+    engine = create_engine(SYNC_URL)
+    with engine.begin() as conn:
+        run_id = conn.execute(
+            text(
+                "INSERT INTO digest_runs (trigger, status, local_date, groups_attempted, "
+                "groups_accepted) VALUES ('manual', 'partial', '2026-07-01', '{de,en}', '{en}') "
+                "RETURNING id"
+            )
+        ).scalar_one()
+    engine.dispose()
+    body = client.get(f"{PREFIX}/runs/{run_id}").json()
+    assert body["status"] == "partial"
+    assert body["groups_attempted"] == ["de", "en"]
+    assert body["groups_accepted"] == ["en"]

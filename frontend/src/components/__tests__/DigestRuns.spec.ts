@@ -7,6 +7,8 @@ import type { DigestRun } from '@/lib/digest'
 function run(over: Partial<DigestRun> = {}): DigestRun {
   return {
     id: 1,
+    groups_attempted: [],
+    groups_accepted: [],
     trigger: 'scheduled',
     started_at: '2026-08-30T05:00:00Z',
     finished_at: '2026-08-30T05:01:00Z',

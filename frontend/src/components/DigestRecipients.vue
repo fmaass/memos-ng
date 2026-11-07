@@ -1,10 +1,20 @@
 <script setup lang="ts">
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
+import Select from 'primevue/select'
 import ToggleSwitch from 'primevue/toggleswitch'
 import { computed, ref } from 'vue'
 
-import { type DigestRecipient, checkNewRecipient, recipientChangeGuard } from '@/lib/digest'
+import {
+  DEFAULT_DIGEST_LANGUAGE,
+  DIGEST_LANGUAGES,
+  DIGEST_LANGUAGE_LABELS,
+  type DigestLanguage,
+  type DigestRecipient,
+  checkNewRecipient,
+  checkRecipientLanguage,
+  recipientChangeGuard,
+} from '@/lib/digest'
 
 const props = defineProps<{
   recipients: DigestRecipient[] | undefined
@@ -14,13 +24,19 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  add: [{ email: string; display_name: string | null }]
+  add: [{ email: string; display_name: string | null; language: DigestLanguage }]
   toggle: [{ id: number; enabled: boolean }]
+  language: [{ id: number; language: DigestLanguage }]
   remove: [id: number]
 }>()
 
 const email = ref('')
 const displayName = ref('')
+const language = ref<DigestLanguage>(DEFAULT_DIGEST_LANGUAGE)
+const languageOptions = DIGEST_LANGUAGES.map((value) => ({
+  value,
+  label: DIGEST_LANGUAGE_LABELS[value],
+}))
 const localError = ref<string | null>(null)
 
 // Each row carries the client-side answer to "may this recipient change?" — the same rule the API
@@ -43,10 +59,32 @@ function submit() {
     localError.value = verdict.reason
     return
   }
+  const spoken = checkRecipientLanguage(language.value)
+  if (!spoken.ok) {
+    localError.value = spoken.reason
+    return
+  }
   localError.value = null
-  emit('add', { email: verdict.email, display_name: displayName.value.trim() || null })
+  emit('add', {
+    email: verdict.email,
+    display_name: displayName.value.trim() || null,
+    language: spoken.language,
+  })
   email.value = ''
   displayName.value = ''
+  language.value = DEFAULT_DIGEST_LANGUAGE
+}
+
+// A row's language is checked by the same pure rule before it is sent; anything else is refused
+// here rather than met as a 422.
+function changeLanguage(id: number, value: unknown) {
+  const spoken = checkRecipientLanguage(value)
+  if (!spoken.ok) {
+    localError.value = spoken.reason
+    return
+  }
+  localError.value = null
+  emit('language', { id, language: spoken.language })
 }
 </script>
 
@@ -77,6 +115,17 @@ function submit() {
             {{ r.reason }}
           </p>
         </div>
+        <Select
+          :model-value="r.language"
+          :options="languageOptions"
+          option-label="label"
+          option-value="value"
+          size="small"
+          :disabled="busy !== null"
+          :aria-label="`Language: ${r.email}`"
+          data-test="digest-recipient-language"
+          @update:model-value="changeLanguage(r.id, $event)"
+        />
         <ToggleSwitch
           :model-value="r.enabled"
           :disabled="busy !== null || (r.enabled && r.blocked)"
@@ -112,6 +161,14 @@ function submit() {
         aria-label="Recipient display name"
         data-test="digest-recipient-name"
         @keyup.enter="submit"
+      />
+      <Select
+        v-model="language"
+        :options="languageOptions"
+        option-label="label"
+        option-value="value"
+        aria-label="Recipient language"
+        data-test="digest-recipient-new-language"
       />
       <Button
         label="Add"

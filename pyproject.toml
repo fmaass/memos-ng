@@ -56,6 +56,7 @@ dependencies = [
     # Local password sign-in (MEMNG-1097): argon2id hashes. Its bindings ship abi3 manylinux wheels
     # for x86_64 and aarch64, so the slim image needs no compiler for it.
     "argon2-cffi>=25,<26",
+    "babel>=2.18.0",
 ]
 
 [dependency-groups]

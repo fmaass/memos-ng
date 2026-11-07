@@ -385,3 +385,28 @@ async def test_a_test_send_is_allowed_when_the_admin_is_not_the_sender(
     client, _ = admin_client
     assert client.post(f"{PREFIX}/test-send", json={}).status_code == 200
     assert [mail.recipients for mail in capture_sends.sent] == [["admin@x"]]
+
+
+@pytest.mark.parametrize(
+    ("language", "date_range"),
+    [("de", "20. Juni 2026"), ("es", "20 de junio de 2026"), ("en", "June 20, 2026")],
+)
+async def test_the_test_send_language_selector_picks_the_mails_language(
+    env, admin_client, capture_sends, language, date_range
+):
+    """MEMNG-1245: the admin chooses which group's mail the probe is."""
+    subject, data_root = env
+    await _seed_memo_with_photo(subject, data_root)
+    client, _ = admin_client
+    response = client.post(f"{PREFIX}/test-send", json={"language": language})
+    assert response.status_code == 200, response.text
+    assert capture_sends.sent[0].message["Subject"].endswith(date_range)
+
+
+async def test_a_test_send_in_an_unknown_language_is_422_and_sends_nothing(
+    env, admin_client, capture_sends
+):
+    client, _ = admin_client
+    response = client.post(f"{PREFIX}/test-send", json={"language": "fr"})
+    assert response.status_code == 422
+    assert capture_sends.sent == []
