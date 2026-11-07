@@ -39,7 +39,13 @@ from tests.ingest_support import (
 )
 from tests.test_attachments_taken import _sql
 from tests.test_lock_protocol_concurrency import Park
-from tests.test_uploads import _IDLE, _stalling_receive, _until_silent, _within_the_bound
+from tests.test_uploads import (
+    _IDLE,
+    _hold_idle_clock,
+    _stalling_receive,
+    _until_silent,
+    _within_the_bound,
+)
 
 
 async def _waiters(n: int, budget_s: float = 10.0) -> None:
@@ -958,6 +964,7 @@ async def test_an_idle_guest_body_ends_at_the_bound_and_frees_the_device_slot(
     monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
     # One slot per device, so a slot the stalled body kept would answer the next PATCH 429.
     monkeypatch.setattr(settings, "GUEST_BODIES_PER_DEVICE", 1)
+    clock = _hold_idle_clock(monkeypatch)
     _, secret = await seeded_pass(home_iface)
     token = (await redeem(door, secret))["device_token"]
     r = await door.post(
@@ -980,9 +987,11 @@ async def test_an_idle_guest_body_ends_at_the_bound_and_frees_the_device_slot(
             headers={**bearer(token), "Upload-Offset": "0"},
         )
         assert early.status_code == 429
+        assert not stalled.done()  # nothing but the bound ends it
 
-        elapsed = await _within_the_bound(stalled)
-        assert elapsed >= _IDLE * 0.5  # ended by the bound, not by something earlier
+        went_silent = clock.release()
+        elapsed = await _within_the_bound(stalled, since=went_silent)
+        assert elapsed >= _IDLE - 0.01  # cut by the bound, counted from the silence
         status, out = stalled.result()
         assert (status, out["bytes_received"]) == (200, half)
         assert _sql("SELECT bytes_received FROM guest_uploads") == [(half,)]

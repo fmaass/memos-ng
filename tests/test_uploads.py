@@ -1,9 +1,12 @@
 import asyncio
 import hashlib
+import math
 import os
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from anyio import CancelScope, current_time, move_on_after
 from app import auth
 from app.config import settings
 from app.csrf import canonical_origin
@@ -1903,14 +1906,60 @@ async def _until_silent(task, silent):
     assert not task.done(), "the stalled PATCH ended before it went silent"
 
 
-async def _within_the_bound(task):
-    """Wait for a stalled PATCH for at most the bound plus the margin; answer the elapsed time.
-    A task still running then is the defect itself, and is cancelled by the caller's cleanup."""
-    started = asyncio.get_running_loop().time()
+async def _within_the_bound(task, since=None):
+    """Wait for a stalled PATCH for at most the bound plus the margin; answer the elapsed time,
+    counted from `since` (a loop time) when given, else from now. A task still running then is
+    the defect itself, and is cancelled by the caller's cleanup."""
+    started = asyncio.get_running_loop().time() if since is None else since
     done, _ = await asyncio.wait({task}, timeout=_IDLE + _IDLE_MARGIN)
     elapsed = asyncio.get_running_loop().time() - started
     assert task in done, f"a stalled PATCH still held its request {elapsed:.1f}s after it went idle"
     return elapsed
+
+
+class _HeldIdleClock:
+    """The idle bound's clock, held still until the test releases it (MEMNG-1236).
+
+    While held, every idle wait of `_IDLE` seconds the upload code opens has no deadline, so what
+    a test does inside the stall — the admission probe, the overtaking retry — never races the
+    bound on a slow host. `release()` gives each open wait its true deadline, `_IDLE` after the
+    moment the wait began, which is the moment the receive went silent: a wait already past it is
+    cut at once, one still inside it when the bound runs out. Only the clock is controlled — the
+    upload code still opens its own scope and takes its own cut path, and a route that bounds
+    nothing opens no wait for `release()` to find. Every other `move_on_after` passes through."""
+
+    def __init__(self):
+        self.released = False
+        self.live = {}  # open idle wait -> the loop time it began
+
+    @contextmanager
+    def __call__(self, seconds, shield=False):
+        if seconds != _IDLE:
+            with move_on_after(seconds, shield=shield) as scope:
+                yield scope
+            return
+        began = current_time()
+        deadline = began + seconds if self.released else math.inf
+        with CancelScope(deadline=deadline, shield=shield) as scope:
+            self.live[scope] = began
+            try:
+                yield scope
+            finally:
+                del self.live[scope]
+
+    def release(self):
+        """Let the bound run; answer the loop time the stalled body went silent."""
+        assert len(self.live) == 1, f"{len(self.live)} idle waits open, expected the stalled one"
+        self.released = True
+        [(scope, began)] = self.live.items()
+        scope.deadline = began + _IDLE
+        return began
+
+
+def _hold_idle_clock(monkeypatch):
+    clock = _HeldIdleClock()
+    monkeypatch.setattr(svc, "move_on_after", clock)
+    return clock
 
 
 async def _settle(task):
@@ -1937,6 +1986,7 @@ async def test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot(
     monkeypatch.setattr(settings, "UPLOAD_BODY_IDLE_SECONDS", _IDLE)
     # One permit per account, so a permit the stalled body kept would answer the next PATCH 429.
     monkeypatch.setattr(settings, "UPLOAD_BODIES_PER_USER", 1)
+    clock = _hold_idle_clock(monkeypatch)
     content = os.urandom(10_000)
     uid = await _start_bearer(bearer, content)
     silent = asyncio.Event()
@@ -1957,9 +2007,11 @@ async def test_an_idle_body_ends_at_the_bound_and_frees_its_admission_slot(
             f"/api/uploads/{uid}", content=content, headers={"Upload-Offset": "0"}
         )
         assert early.status_code == 429
+        assert not stalled.done()  # nothing but the bound ends it
 
-        elapsed = await _within_the_bound(stalled)
-        assert elapsed >= _IDLE * 0.5  # ended by the bound, not by something earlier
+        went_silent = clock.release()
+        elapsed = await _within_the_bound(stalled, since=went_silent)
+        assert elapsed >= _IDLE - 0.01  # cut by the bound, counted from the silence
         # The answer of the existing cut path: 200 with the offset the bytes reached.
         status, out = stalled.result()
         assert (status, out["bytes_received"]) == (200, 4000)
@@ -2092,6 +2144,7 @@ async def test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_noth
     content = os.urandom(10_000)
     uid = await _start_bearer(bearer, content, "race.bin")
     stale = os.urandom(4000)  # different bytes, so a cut that DID land would corrupt the file
+    clock = _hold_idle_clock(monkeypatch)
     silent = asyncio.Event()
     stalled = None
     try:
@@ -2105,6 +2158,7 @@ async def test_a_retry_that_overtakes_a_stalled_body_wins_and_the_cut_lands_noth
         assert retry.status_code == 200 and retry.json()["bytes_received"] == len(content)
         # The retry really overtook: the stalled body was still open when the retry landed.
         assert not stalled.done()
+        clock.release()
         await _within_the_bound(stalled)
         status, out = stalled.result()
         assert (status, out["bytes_received"]) == (200, len(content))
